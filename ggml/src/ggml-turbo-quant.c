@@ -245,7 +245,7 @@ size_t quantize_turbo2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
     return nrows * row_size;
 }
 
-/* ---------- TURBO3_0: 2-bit PolarQuant + 1-bit QJL ---------- */
+/* ---------- TURBO3_0: 128-value classic 2-bit PolarQuant + 1-bit QJL ---------- */
 
 void quantize_row_turbo3_0_ref(const float * GGML_RESTRICT x, block_turbo3_0 * GGML_RESTRICT y, int64_t k) {
     // Stub — Metal shader handles quantize on GPU. CPU path is simplified.

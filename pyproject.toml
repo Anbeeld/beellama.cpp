@@ -1,12 +1,12 @@
 [tool.poetry]
 name = "llama-cpp-scripts"
 version = "0.0.0"
-description = "Scripts that ship with llama.cpp"
-authors = ["GGML <ggml@ggml.ai>"]
+description = "Scripts that ship with BeeLlama.cpp"
+authors = ["GGML <ggml@ggml.ai>", "Anbeeld"]
 readme = "README.md"
-homepage = "https://ggml.ai"
-repository = "https://github.com/ggml-org/llama.cpp"
-keywords = ["ggml", "gguf", "llama.cpp"]
+homepage = "https://github.com/Anbeeld/beellama.cpp"
+repository = "https://github.com/Anbeeld/beellama.cpp"
+keywords = ["ggml", "gguf", "llama.cpp", "beellama.cpp"]
 packages = [{ include = "*.py", from = "." }]
 classifiers = [
     "Programming Language :: Python :: 3",

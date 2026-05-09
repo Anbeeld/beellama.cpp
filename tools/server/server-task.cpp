@@ -12,6 +12,66 @@
 
 using json = nlohmann::ordered_json;
 
+static common_reasoning_loop_guard_mode server_reasoning_loop_guard_mode_from_name(const std::string & value) {
+    if (value == "off") {
+        return COMMON_REASONING_LOOP_GUARD_OFF;
+    }
+    if (value == "force-close") {
+        return COMMON_REASONING_LOOP_GUARD_FORCE_CLOSE;
+    }
+    if (value == "stop") {
+        return COMMON_REASONING_LOOP_GUARD_STOP;
+    }
+    throw std::runtime_error("Error: reasoning_loop_guard must be one of: off, force-close, stop");
+}
+
+static const char * server_reasoning_loop_guard_mode_name(common_reasoning_loop_guard_mode value) {
+    switch (value) {
+        case COMMON_REASONING_LOOP_GUARD_OFF:         return "off";
+        case COMMON_REASONING_LOOP_GUARD_FORCE_CLOSE: return "force-close";
+        case COMMON_REASONING_LOOP_GUARD_STOP:        return "stop";
+    }
+    return "unknown";
+}
+
+static void server_validate_reasoning_loop_guard_params(const common_reasoning_loop_guard_params & params) {
+    if (params.min_reasoning_tokens < 0) {
+        throw std::runtime_error("Error: reasoning_loop_min_tokens must be >= 0");
+    }
+    if (params.window_tokens <= 0) {
+        throw std::runtime_error("Error: reasoning_loop_window must be > 0");
+    }
+    if (params.max_period <= 0) {
+        throw std::runtime_error("Error: reasoning_loop_max_period must be > 0");
+    }
+    if (params.min_repeated_coverage <= 0) {
+        throw std::runtime_error("Error: reasoning_loop_min_coverage must be > 0");
+    }
+    if (params.check_interval <= 0) {
+        throw std::runtime_error("Error: reasoning_loop_check_interval must be > 0");
+    }
+    if (params.interventions_max < 0) {
+        throw std::runtime_error("Error: reasoning_loop_interventions must be >= 0");
+    }
+    if (params.window_tokens < params.min_repeated_coverage) {
+        throw std::runtime_error("Error: reasoning_loop_window must be >= reasoning_loop_min_coverage");
+    }
+    if (params.max_period > params.window_tokens / 3) {
+        throw std::runtime_error("Error: reasoning_loop_max_period must be <= reasoning_loop_window / 3");
+    }
+    if (params.min_reasoning_tokens < params.min_repeated_coverage) {
+        throw std::runtime_error("Error: reasoning_loop_min_tokens must be >= reasoning_loop_min_coverage");
+    }
+}
+
+static const char * server_speculative_dm_controller_name(common_speculative_dm_controller value) {
+    switch (value) {
+        case COMMON_SPECULATIVE_DM_CONTROLLER_FRINGE: return "fringe";
+        case COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT: return "profit";
+    }
+    return "unknown";
+}
+
 //
 // task_params
 //
@@ -73,10 +133,30 @@ json task_params::to_json(bool only_metrics) const {
             {"min_keep",                  sampling.min_keep},
             {"chat_format",               common_chat_format_name(chat_parser_params.format)},
             {"reasoning_format",          common_reasoning_format_name(chat_parser_params.reasoning_format)},
+            {"reasoning_loop_guard",       server_reasoning_loop_guard_mode_name(reasoning_loop_guard.mode)},
+            {"reasoning_loop_min_tokens",  reasoning_loop_guard.min_reasoning_tokens},
+            {"reasoning_loop_window",      reasoning_loop_guard.window_tokens},
+            {"reasoning_loop_max_period",  reasoning_loop_guard.max_period},
+            {"reasoning_loop_min_coverage", reasoning_loop_guard.min_repeated_coverage},
+            {"reasoning_loop_check_interval", reasoning_loop_guard.check_interval},
+            {"reasoning_loop_interventions", reasoning_loop_guard.interventions_max},
             {"reasoning_in_content",      chat_parser_params.reasoning_in_content},
             {"generation_prompt",         chat_parser_params.generation_prompt},
             {"samplers",                  samplers},
+            {"speculative.n_max",         speculative.n_max},
+            {"speculative.n_min",         speculative.n_min},
+            {"speculative.branch_budget", speculative.branch_budget},
+            {"speculative.draft_topk",    speculative.draft_topk},
+            {"speculative.p_split",       speculative.p_split},
+            {"speculative.p_min",         speculative.p_min},
             {"speculative.type",          common_speculative_type_to_str(speculative.type)},
+            {"speculative.dm_controller", server_speculative_dm_controller_name(speculative.dm_controller)},
+            {"speculative.dm_profit_min", speculative.dm_profit_min},
+            {"speculative.dm_profit_raise_margin", speculative.dm_profit_raise_margin},
+            {"speculative.dm_profit_lower_margin", speculative.dm_profit_lower_margin},
+            {"speculative.dm_profit_ewma_alpha", speculative.dm_profit_ewma_alpha},
+            {"speculative.dm_profit_min_samples", speculative.dm_profit_min_samples},
+            {"speculative.dm_profit_warmup",    speculative.dm_profit_warmup},
             {"timings_per_token",         timings_per_token},
             {"post_sampling_probs",       post_sampling_probs},
             {"backend_sampling",          sampling.backend_sampling},
@@ -130,10 +210,30 @@ json task_params::to_json(bool only_metrics) const {
         {"preserved_tokens",          sampling.preserved_tokens},
         {"chat_format",               common_chat_format_name(chat_parser_params.format)},
         {"reasoning_format",          common_reasoning_format_name(chat_parser_params.reasoning_format)},
+        {"reasoning_loop_guard",       server_reasoning_loop_guard_mode_name(reasoning_loop_guard.mode)},
+        {"reasoning_loop_min_tokens",  reasoning_loop_guard.min_reasoning_tokens},
+        {"reasoning_loop_window",      reasoning_loop_guard.window_tokens},
+        {"reasoning_loop_max_period",  reasoning_loop_guard.max_period},
+        {"reasoning_loop_min_coverage", reasoning_loop_guard.min_repeated_coverage},
+        {"reasoning_loop_check_interval", reasoning_loop_guard.check_interval},
+        {"reasoning_loop_interventions", reasoning_loop_guard.interventions_max},
         {"reasoning_in_content",      chat_parser_params.reasoning_in_content},
         {"generation_prompt",         chat_parser_params.generation_prompt},
         {"samplers",                  samplers},
+        {"speculative.n_max",         speculative.n_max},
+        {"speculative.n_min",         speculative.n_min},
+        {"speculative.branch_budget", speculative.branch_budget},
+        {"speculative.draft_topk",    speculative.draft_topk},
+        {"speculative.p_split",       speculative.p_split},
+        {"speculative.p_min",         speculative.p_min},
         {"speculative.type",          common_speculative_type_to_str(speculative.type)},
+        {"speculative.dm_controller", server_speculative_dm_controller_name(speculative.dm_controller)},
+        {"speculative.dm_profit_min", speculative.dm_profit_min},
+        {"speculative.dm_profit_raise_margin", speculative.dm_profit_raise_margin},
+        {"speculative.dm_profit_lower_margin", speculative.dm_profit_lower_margin},
+        {"speculative.dm_profit_ewma_alpha", speculative.dm_profit_ewma_alpha},
+        {"speculative.dm_profit_min_samples", speculative.dm_profit_min_samples},
+        {"speculative.dm_profit_warmup",    speculative.dm_profit_warmup},
         {"timings_per_token",         timings_per_token},
         {"post_sampling_probs",       post_sampling_probs},
         {"backend_sampling",          sampling.backend_sampling},
@@ -237,6 +337,7 @@ task_params server_task::params_from_json_cmpl(
     task_params defaults;
     defaults.sampling      = params_base.sampling;
     defaults.speculative   = params_base.speculative;
+    defaults.reasoning_loop_guard = params_base.reasoning_loop_guard;
     defaults.n_keep        = params_base.n_keep;
     defaults.n_predict     = params_base.n_predict;
     defaults.n_cache_reuse = params_base.n_cache_reuse;
@@ -295,8 +396,20 @@ task_params server_task::params_from_json_cmpl(
     params.post_sampling_probs         = json_value(data, "post_sampling_probs", defaults.post_sampling_probs);
 
     params.speculative = defaults.speculative;
+    params.speculative.n_min = json_value(data, "speculative.n_min", defaults.speculative.n_min);
+    params.speculative.n_max = json_value(data, "speculative.n_max", defaults.speculative.n_max);
+    params.speculative.branch_budget = json_value(data, "speculative.branch_budget", defaults.speculative.branch_budget);
+    const int legacy_tree_budget = json_value(data, "speculative.tree_budget", -1);
+    if (legacy_tree_budget >= 0 && !data.contains("speculative.branch_budget")) {
+        params.speculative.branch_budget = std::max(0, legacy_tree_budget - std::max(0, params.speculative.n_max));
+    }
+    params.speculative.p_min = json_value(data, "speculative.p_min", defaults.speculative.p_min);
 
-    // TODO: for now, be able to adjust only the draft-model based speculative parameters
+    params.speculative.n_min = std::min(params.speculative.n_max, params.speculative.n_min);
+    params.speculative.n_min = std::max(params.speculative.n_min, 0);
+    params.speculative.n_max = std::max(params.speculative.n_max, 0);
+    params.speculative.branch_budget = std::max(params.speculative.branch_budget, 0);
+
     params.speculative.draft.n_min = json_value(data, "speculative.n_min", defaults.speculative.draft.n_min);
     params.speculative.draft.n_max = json_value(data, "speculative.n_max", defaults.speculative.draft.n_max);
     params.speculative.draft.p_min = json_value(data, "speculative.p_min", defaults.speculative.draft.p_min);
@@ -304,6 +417,18 @@ task_params server_task::params_from_json_cmpl(
     params.speculative.draft.n_min = std::min(params.speculative.draft.n_max, params.speculative.draft.n_min);
     params.speculative.draft.n_min = std::max(params.speculative.draft.n_min, 0);
     params.speculative.draft.n_max = std::max(params.speculative.draft.n_max, 0);
+
+    params.reasoning_loop_guard = defaults.reasoning_loop_guard;
+    if (data.contains("reasoning_loop_guard")) {
+        params.reasoning_loop_guard.mode = server_reasoning_loop_guard_mode_from_name(data.at("reasoning_loop_guard").get<std::string>());
+    }
+    params.reasoning_loop_guard.min_reasoning_tokens = json_value(data, "reasoning_loop_min_tokens", params.reasoning_loop_guard.min_reasoning_tokens);
+    params.reasoning_loop_guard.window_tokens = json_value(data, "reasoning_loop_window", params.reasoning_loop_guard.window_tokens);
+    params.reasoning_loop_guard.max_period = json_value(data, "reasoning_loop_max_period", params.reasoning_loop_guard.max_period);
+    params.reasoning_loop_guard.min_repeated_coverage = json_value(data, "reasoning_loop_min_coverage", params.reasoning_loop_guard.min_repeated_coverage);
+    params.reasoning_loop_guard.check_interval = json_value(data, "reasoning_loop_check_interval", params.reasoning_loop_guard.check_interval);
+    params.reasoning_loop_guard.interventions_max = json_value(data, "reasoning_loop_interventions", params.reasoning_loop_guard.interventions_max);
+    server_validate_reasoning_loop_guard_params(params.reasoning_loop_guard);
 
 #if 0
     // for debugging and research purposes
@@ -496,6 +621,14 @@ task_params server_task::params_from_json_cmpl(
                 params.sampling.reasoning_budget_end.size(),
                 params.sampling.reasoning_budget_forced.size());
         }
+
+        const bool loop_guard_active =
+            params.reasoning_loop_guard.mode != COMMON_REASONING_LOOP_GUARD_OFF &&
+            params.chat_parser_params.reasoning_format != COMMON_REASONING_FORMAT_NONE;
+        const bool has_reasoning_tags =
+            !params.sampling.reasoning_budget_start.empty() &&
+            !params.sampling.reasoning_budget_end.empty();
+        params.sampling.reasoning_budget_tracking = loop_guard_active && has_reasoning_tags;
     }
 
     {
@@ -746,10 +879,20 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
         {"has_new_line",        has_new_line},
         {"truncated",           truncated},
         {"stop_type",           stop_type_to_str(stop)},
+        {"stop_detail",         stop_detail},
+        {"reasoning_tokens",    reasoning_output_tokens},
+        {"visible_completion_tokens", visible_output_tokens},
         {"stopping_word",       stopping_word},
         {"tokens_cached",       n_tokens_cached},
         {"timings",             timings.to_json()},
     };
+    if (loop_guard_triggered) {
+        res["loop_guard"] = json {
+            {"triggered", true},
+            {"action", loop_guard_action},
+            {"reason", loop_guard_reason},
+        };
+    }
     if (!stream && !probs_output.empty()) {
         res["completion_probabilities"] = completion_token_output::probs_vector_to_json(probs_output, post_sampling_probs);
     }
@@ -757,12 +900,19 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
 }
 
 json server_task_result_cmpl_final::usage_json_oaicompat() {
-    return json {
+    json usage = json {
         {"completion_tokens", n_decoded},
         {"prompt_tokens",     n_prompt_tokens},
         {"total_tokens",      n_decoded + n_prompt_tokens},
         {"prompt_tokens_details", json { {"cached_tokens", n_prompt_tokens_cache} }},
     };
+    if (reasoning_output_tokens >= 0 && visible_output_tokens >= 0) {
+        usage["completion_tokens_details"] = json {
+            {"reasoning_tokens", reasoning_output_tokens},
+            {"visible_tokens", visible_output_tokens},
+        };
+    }
+    return usage;
 }
 
 json server_task_result_cmpl_final::to_json_oaicompat() {

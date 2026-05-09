@@ -50,6 +50,11 @@ static bool ggml_type_is_turbo_tcq(enum ggml_type t) {
     return t == GGML_TYPE_TURBO3_TCQ || t == GGML_TYPE_TURBO2_TCQ;
 }
 
+static bool ggml_type_is_turbo_kv(enum ggml_type t) {
+    return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 ||
+           t == GGML_TYPE_TURBO4_0 || t == GGML_TYPE_TURBO3_TCQ || t == GGML_TYPE_TURBO2_TCQ;
+}
+
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
@@ -143,8 +148,7 @@ llama_kv_cache::llama_kv_cache(
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
 
     // create a context for each buffer type
-    const bool is_turbo = (type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO3_TCQ || type_k == GGML_TYPE_TURBO2_TCQ ||
-                           type_v == GGML_TYPE_TURBO2_0 || type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0 || type_v == GGML_TYPE_TURBO3_TCQ || type_v == GGML_TYPE_TURBO2_TCQ);
+    const bool is_turbo = ggml_type_is_turbo_kv(type_k) || ggml_type_is_turbo_kv(type_v);
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
@@ -242,8 +246,7 @@ llama_kv_cache::llama_kv_cache(
         // This allows --fit on / partial offload to work: GPU layers get turbo, CPU layers get q8_0.
         bool cpu_fallback = false;
         if (ggml_backend_buft_is_host(buft)) {
-            const bool layer_has_turbo = (type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO3_TCQ ||
-                                          type_v == GGML_TYPE_TURBO2_0 || type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0 || type_v == GGML_TYPE_TURBO3_TCQ || type_v == GGML_TYPE_TURBO2_TCQ);
+            const bool layer_has_turbo = ggml_type_is_turbo_kv(type_k) || ggml_type_is_turbo_kv(type_v);
             if (layer_has_turbo) {
                 cpu_fallback = true;
             }
@@ -283,8 +286,7 @@ llama_kv_cache::llama_kv_cache(
                 }
                 return mode;
             }();
-            const bool is_turbo = (type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO3_TCQ ||
-                                   type_v == GGML_TYPE_TURBO2_0 || type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0 || type_v == GGML_TYPE_TURBO3_TCQ || type_v == GGML_TYPE_TURBO2_TCQ);
+            const bool is_turbo = ggml_type_is_turbo_kv(type_k) || ggml_type_is_turbo_kv(type_v);
             const uint32_t n_layer = hparams.n_layer;
             bool promote_k = false;
             bool promote_v = false;
@@ -334,10 +336,7 @@ llama_kv_cache::llama_kv_cache(
         // Turbo FA vec kernel supports head_dim <= 512.
         // Fall back to f16 for layers with larger head dimensions.
         {
-            auto is_turbo = [](ggml_type t) {
-                return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0 ||
-                       t == GGML_TYPE_TURBO3_TCQ || t == GGML_TYPE_TURBO2_TCQ;
-            };
+            auto is_turbo = ggml_type_is_turbo_kv;
             const uint32_t head_k = hparams.n_embd_head_k(il);
             const uint32_t head_v = hparams.n_embd_head_v(il);
             if (is_turbo(layer_type_k) && head_k > 512) {
@@ -363,10 +362,7 @@ llama_kv_cache::llama_kv_cache(
         uint32_t n_embd_k_alloc = n_embd_k_gqa;
         uint32_t n_embd_v_alloc = n_embd_v_gqa;
         {
-            auto is_turbo = [](ggml_type t) {
-                return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0 ||
-                       t == GGML_TYPE_TURBO3_TCQ || t == GGML_TYPE_TURBO2_TCQ;
-            };
+            auto is_turbo = ggml_type_is_turbo_kv;
             if (is_turbo(layer_type_k)) {
                 uint32_t head_k = hparams.n_embd_head_k(il);
                 uint32_t padded = ((head_k + 127) / 128) * 128;
@@ -411,7 +407,7 @@ llama_kv_cache::llama_kv_cache(
 
         // TurboQuant: create rotation matrix tensors (once, shared across layers)
         if (turbo_rotation == nullptr &&
-            (type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO3_TCQ || type_k == GGML_TYPE_TURBO2_TCQ)) {
+            ggml_type_is_turbo_kv(type_k)) {
             turbo_rotation = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 128);
             ggml_format_name(turbo_rotation, "turbo_rotation");  // R^T
             turbo_rotation_inv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 128);
@@ -495,12 +491,8 @@ llama_kv_cache::llama_kv_cache(
     }
 
     // turbo types have their own FWHT rotation — skip upstream Hadamard rotation
-    const bool is_turbo_k = type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO3_0 ||
-                            type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO3_TCQ ||
-                            type_k == GGML_TYPE_TURBO2_TCQ;
-    const bool is_turbo_v = type_v == GGML_TYPE_TURBO2_0 || type_v == GGML_TYPE_TURBO3_0 ||
-                            type_v == GGML_TYPE_TURBO4_0 || type_v == GGML_TYPE_TURBO3_TCQ ||
-                            type_v == GGML_TYPE_TURBO2_TCQ;
+    const bool is_turbo_k = ggml_type_is_turbo_kv(type_k);
+    const bool is_turbo_v = ggml_type_is_turbo_kv(type_v);
 
     attn_rot_k =
         !attn_rot_disable &&
@@ -623,6 +615,37 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     }
 
     return true;
+}
+
+bool llama_kv_cache::seq_rm_cell(llama_seq_id seq_id, uint32_t cell_idx) {
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    auto & cells = v_cells[seq_to_stream[seq_id]];
+    auto & head  = v_heads[seq_to_stream[seq_id]];
+
+    if (cells.seq_rm_cell(cell_idx, seq_id)) {
+        if (cell_idx < head) {
+            head = cell_idx;
+        }
+    }
+
+    return true;
+}
+
+int llama_kv_cache::cells_at_pos(llama_seq_id seq_id, llama_pos pos, uint32_t * cell_indices, int n_max) {
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    const auto & cells = v_cells[seq_to_stream[seq_id]];
+    auto result = cells.cells_at(seq_id, pos);
+
+    if (cell_indices && n_max > 0) {
+        int n_copied = std::min((int)result.size(), n_max);
+        for (int i = 0; i < n_copied; ++i) {
+            cell_indices[i] = result[i];
+        }
+    }
+
+    return (int)result.size();
 }
 
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
@@ -1324,6 +1347,13 @@ uint32_t llama_kv_cache::get_size() const {
     const auto & cells = v_cells[seq_to_stream[0]];
 
     return cells.size();
+}
+
+std::vector<uint32_t> llama_kv_cache::cells_at(llama_seq_id seq_id, llama_pos p) const {
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    const auto & cells = v_cells[seq_to_stream[seq_id]];
+    return cells.cells_at(seq_id, p);
 }
 
 uint32_t llama_kv_cache::get_n_stream() const {

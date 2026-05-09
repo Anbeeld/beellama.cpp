@@ -825,8 +825,11 @@ void llm_graph_result::reset() {
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
     t_logits      = nullptr;
+    t_logits_argmax = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
+    dflash_k_update.clear();
+    dflash_v_update.clear();
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -867,6 +870,16 @@ void llm_graph_result::set_outputs() {
     }
     if (t_embd_pooled != nullptr) {
         ggml_set_output(t_embd_pooled);
+    }
+    for (auto * t : dflash_k_update) {
+        if (t != nullptr) {
+            ggml_set_output(t);
+        }
+    }
+    for (auto * t : dflash_v_update) {
+        if (t != nullptr) {
+            ggml_set_output(t);
+        }
     }
     for (auto & [seq_id, t] : t_sampled) {
         if (t != nullptr) {

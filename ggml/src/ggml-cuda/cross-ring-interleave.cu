@@ -124,6 +124,8 @@ extern "C" void dflash_cross_ring_gpu_write(
 
     if (layer < 0 || layer >= ring->n_layers) return;
     if (n_tokens <= 0) return;
+    if (n_embd != ring->n_embd) return;
+    if (ring->ring_size <= 0) return;
 
     // Ensure cudaStreamPerThread belongs to the ring's device regardless of
     // which GPU the caller (target model decode) last set as current.
@@ -133,6 +135,16 @@ extern "C" void dflash_cross_ring_gpu_write(
     const size_t stride = (size_t)n_embd * sizeof(float);
 
     int pos = ring_pos % ring->ring_size;
+    if (pos < 0) {
+        pos += ring->ring_size;
+    }
+    if (n_tokens > ring->ring_size) {
+        const int skip = n_tokens - ring->ring_size;
+        host_data += (size_t)skip * n_embd;
+        pos = (pos + skip) % ring->ring_size;
+        n_tokens = ring->ring_size;
+    }
+
     int first = ring->ring_size - pos;
     if (first >= n_tokens) {
         // no wrap
@@ -145,6 +157,214 @@ extern "C" void dflash_cross_ring_gpu_write(
         cudaMemcpyAsync(dst, host_data + (size_t)first * n_embd,
                          (size_t)(n_tokens - first) * stride, cudaMemcpyHostToDevice, cudaStreamPerThread);
     }
+}
+
+extern "C" bool dflash_cross_ring_gpu_write_d2d(
+        void * handle, int layer, int ring_pos,
+        const void * device_data, int n_tokens, int n_embd) {
+    if (!handle || !device_data) return false;
+    auto * ring = (dflash_cross_ring_gpu *)handle;
+
+    if (layer < 0 || layer >= ring->n_layers) return false;
+    if (n_tokens <= 0) return false;
+    if (n_embd != ring->n_embd) return false;
+    if (ring->ring_size <= 0) return false;
+
+    (void)cudaSetDevice(ring->device);
+
+    cudaPointerAttributes attr;
+    cudaError_t attr_err = cudaPointerGetAttributes(&attr, device_data);
+    if (attr_err != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+#if CUDART_VERSION >= 10000
+    if (attr.type != cudaMemoryTypeDevice || attr.device != ring->device) {
+        return false;
+    }
+#else
+    if (attr.memoryType != cudaMemoryTypeDevice || attr.device != ring->device) {
+        return false;
+    }
+#endif
+
+    float * dst = ring->h_layer_ptrs[layer];
+    const char * src = (const char *)device_data;
+    const size_t stride = (size_t)n_embd * sizeof(float);
+
+    int pos = ring_pos % ring->ring_size;
+    if (pos < 0) {
+        pos += ring->ring_size;
+    }
+    if (n_tokens > ring->ring_size) {
+        const int skip = n_tokens - ring->ring_size;
+        src += (size_t)skip * stride;
+        pos = (pos + skip) % ring->ring_size;
+        n_tokens = ring->ring_size;
+    }
+
+    int first = ring->ring_size - pos;
+    if (first >= n_tokens) {
+        cudaMemcpyAsync(dst + (size_t)pos * n_embd, src,
+                        (size_t)n_tokens * stride, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+    } else {
+        cudaMemcpyAsync(dst + (size_t)pos * n_embd, src,
+                        (size_t)first * stride, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+        cudaMemcpyAsync(dst, src + (size_t)first * stride,
+                        (size_t)(n_tokens - first) * stride, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+    }
+
+    return cudaGetLastError() == cudaSuccess;
+}
+
+__global__ static void k_dflash_rebuild_conv_state(
+        float * __restrict__ r_state,
+        const float * __restrict__ qkv,
+        const int n_accepted,
+        const int conv_ch,
+        const int conv_window) {
+    const int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= conv_ch) return;
+
+    float * dst = r_state + (size_t) ch * conv_window;
+    for (int w = 0; w < conv_window; ++w) {
+        const int src_pos = n_accepted + w;
+        dst[w] = src_pos < conv_window
+            ? dst[src_pos]
+            : qkv[(size_t)(src_pos - conv_window) * conv_ch + ch];
+    }
+}
+
+extern "C" bool dflash_rebuild_conv_state(
+        void * r_state, const void * qkv,
+        int n_accepted, int conv_ch, int conv_window) {
+    if (!r_state || !qkv) return false;
+    if (n_accepted <= 0 || conv_ch <= 0 || conv_window <= 0) return false;
+
+    cudaPointerAttributes r_attr;
+    cudaError_t r_err = cudaPointerGetAttributes(&r_attr, r_state);
+    if (r_err != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    cudaPointerAttributes qkv_attr;
+    cudaError_t qkv_err = cudaPointerGetAttributes(&qkv_attr, qkv);
+    if (qkv_err != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+#if CUDART_VERSION >= 10000
+    if (r_attr.type != cudaMemoryTypeDevice || qkv_attr.type != cudaMemoryTypeDevice ||
+            r_attr.device != qkv_attr.device) {
+        return false;
+    }
+#else
+    if (r_attr.memoryType != cudaMemoryTypeDevice || qkv_attr.memoryType != cudaMemoryTypeDevice ||
+            r_attr.device != qkv_attr.device) {
+        return false;
+    }
+#endif
+
+    (void)cudaSetDevice(r_attr.device);
+    const int block = 256;
+    const int grid = (conv_ch + block - 1) / block;
+    k_dflash_rebuild_conv_state<<<grid, block, 0, cudaStreamPerThread>>>(
+        (float *) r_state, (const float *) qkv, n_accepted, conv_ch, conv_window);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+extern "C" bool dflash_cuda_copy_d2d(void * dst, const void * src, size_t size) {
+    if (!dst || !src || size == 0) return false;
+
+    cudaPointerAttributes dst_attr;
+    cudaError_t dst_err = cudaPointerGetAttributes(&dst_attr, dst);
+    if (dst_err != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    cudaPointerAttributes src_attr;
+    cudaError_t src_err = cudaPointerGetAttributes(&src_attr, src);
+    if (src_err != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+#if CUDART_VERSION >= 10000
+    if (dst_attr.type != cudaMemoryTypeDevice || src_attr.type != cudaMemoryTypeDevice ||
+            dst_attr.device != src_attr.device) {
+        return false;
+    }
+    (void)cudaSetDevice(dst_attr.device);
+#else
+    if (dst_attr.memoryType != cudaMemoryTypeDevice || src_attr.memoryType != cudaMemoryTypeDevice ||
+            dst_attr.device != src_attr.device) {
+        return false;
+    }
+    (void)cudaSetDevice(dst_attr.device);
+#endif
+
+    cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+extern "C" bool dflash_cuda_prepare_ptr(const void * ptr) {
+    if (!ptr) return false;
+
+    cudaPointerAttributes attr;
+    cudaError_t err = cudaPointerGetAttributes(&attr, ptr);
+    if (err != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+#if CUDART_VERSION >= 10000
+    if (attr.type != cudaMemoryTypeDevice) {
+        return false;
+    }
+    (void)cudaSetDevice(attr.device);
+#else
+    if (attr.memoryType != cudaMemoryTypeDevice) {
+        return false;
+    }
+    (void)cudaSetDevice(attr.device);
+#endif
+
+    return true;
+}
+
+extern "C" bool dflash_cuda_copy_d2d_no_check(void * dst, const void * src, size_t size) {
+    if (!dst || !src || size == 0) return false;
+    cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+extern "C" bool dflash_cuda_synchronize_ptr(const void * ptr) {
+    if (!ptr) return false;
+
+    cudaPointerAttributes attr;
+    cudaError_t err = cudaPointerGetAttributes(&attr, ptr);
+    if (err != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+#if CUDART_VERSION >= 10000
+    if (attr.type != cudaMemoryTypeDevice) {
+        return false;
+    }
+    (void)cudaSetDevice(attr.device);
+#else
+    if (attr.memoryType != cudaMemoryTypeDevice) {
+        return false;
+    }
+    (void)cudaSetDevice(attr.device);
+#endif
+
+    return cudaStreamSynchronize(cudaStreamPerThread) == cudaSuccess;
+}
+
+extern "C" void dflash_cross_ring_gpu_synchronize(void * handle) {
+    if (!handle) return;
+    auto * ring = (dflash_cross_ring_gpu *)handle;
+    (void)cudaSetDevice(ring->device);
+    cudaStreamSynchronize(cudaStreamPerThread);
 }
 
 // Launch interleave kernel. Returns device pointer to interleaved staging buffer.
@@ -172,17 +392,263 @@ extern "C" const float * dflash_cross_ring_gpu_interleave(
         ring->n_layers,
         ring->n_embd);
 
-    // sync so staging is ready before drafter decode reads it
-    cudaStreamSynchronize(cudaStreamPerThread);
+    // Ordered with the following set_tensor copies on cudaStreamPerThread.
+    // set_tensor synchronizes before the GGML backend graph reads cross data.
 
     return ring->d_staging;
 }
 
 // D2D copy: from device source to device destination (raw pointers).
-// No sync needed — the drafter's graph execution orders against this on the same stream.
+// Synchronize because subsequent GGML backend graph reads run on backend streams.
 extern "C" void dflash_cross_ring_gpu_set_tensor(
         void * d_dst, const void * d_src, size_t offset, size_t size) {
     if (!d_dst || !d_src || size == 0) return;
     cudaMemcpyAsync((char *)d_dst + offset, d_src, size,
                      cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+    cudaStreamSynchronize(cudaStreamPerThread);
+}
+
+extern "C" bool dflash_kv_cache_write_d2d(
+        void * d_ring, const void * d_src,
+        int ring_size, int ring_pos, int n_tokens, int n_elem) {
+    if (!d_ring || !d_src) return false;
+    if (ring_size <= 0 || n_tokens <= 0 || n_elem <= 0) return false;
+
+    cudaPointerAttributes ring_attr;
+    cudaError_t ring_err = cudaPointerGetAttributes(&ring_attr, d_ring);
+    if (ring_err != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    cudaPointerAttributes src_attr;
+    cudaError_t src_err = cudaPointerGetAttributes(&src_attr, d_src);
+    if (src_err != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+#if CUDART_VERSION >= 10000
+    if (ring_attr.type != cudaMemoryTypeDevice || src_attr.type != cudaMemoryTypeDevice ||
+            ring_attr.device != src_attr.device) {
+        return false;
+    }
+    (void)cudaSetDevice(ring_attr.device);
+#else
+    if (ring_attr.memoryType != cudaMemoryTypeDevice || src_attr.memoryType != cudaMemoryTypeDevice ||
+            ring_attr.device != src_attr.device) {
+        return false;
+    }
+    (void)cudaSetDevice(ring_attr.device);
+#endif
+
+    const char * src = (const char *) d_src;
+    char * dst = (char *) d_ring;
+    const size_t stride = (size_t) n_elem * sizeof(float);
+
+    int pos = ring_pos % ring_size;
+    if (pos < 0) {
+        pos += ring_size;
+    }
+    if (n_tokens > ring_size) {
+        const int skip = n_tokens - ring_size;
+        src += (size_t) skip * stride;
+        pos = (pos + skip) % ring_size;
+        n_tokens = ring_size;
+    }
+
+    const int first = ring_size - pos;
+    if (first >= n_tokens) {
+        cudaMemcpyAsync(dst + (size_t) pos * stride, src,
+                        (size_t) n_tokens * stride, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+    } else {
+        cudaMemcpyAsync(dst + (size_t) pos * stride, src,
+                        (size_t) first * stride, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+        cudaMemcpyAsync(dst, src + (size_t) first * stride,
+                        (size_t) (n_tokens - first) * stride, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+    }
+
+    return cudaGetLastError() == cudaSuccess && cudaStreamSynchronize(cudaStreamPerThread) == cudaSuccess;
+}
+
+__global__ static void k_dflash_kv_cache_shift_left(
+        float * __restrict__ cache,
+        const int keep_tokens,
+        const int drop_tokens,
+        const int n_elem) {
+    const int64_t n = (int64_t) keep_tokens * n_elem;
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) blockDim.x * gridDim.x) {
+        cache[i] = cache[i + (int64_t) drop_tokens * n_elem];
+    }
+}
+
+extern "C" bool dflash_kv_cache_append_d2d(
+        void * d_cache, const void * d_src,
+        int cache_size, int filled, int n_tokens, int n_elem) {
+    if (!d_cache || !d_src) return false;
+    if (cache_size <= 0 || n_tokens <= 0 || n_elem <= 0) return false;
+
+    cudaPointerAttributes cache_attr;
+    cudaError_t cache_err = cudaPointerGetAttributes(&cache_attr, d_cache);
+    if (cache_err != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    cudaPointerAttributes src_attr;
+    cudaError_t src_err = cudaPointerGetAttributes(&src_attr, d_src);
+    if (src_err != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+#if CUDART_VERSION >= 10000
+    if (cache_attr.type != cudaMemoryTypeDevice || src_attr.type != cudaMemoryTypeDevice ||
+            cache_attr.device != src_attr.device) {
+        return false;
+    }
+    (void)cudaSetDevice(cache_attr.device);
+#else
+    if (cache_attr.memoryType != cudaMemoryTypeDevice || src_attr.memoryType != cudaMemoryTypeDevice ||
+            cache_attr.device != src_attr.device) {
+        return false;
+    }
+    (void)cudaSetDevice(cache_attr.device);
+#endif
+
+    filled = filled < 0 ? 0 : (filled > cache_size ? cache_size : filled);
+
+    const char * src = (const char *) d_src;
+    float * cache = (float *) d_cache;
+    const size_t stride = (size_t) n_elem * sizeof(float);
+
+    if (n_tokens >= cache_size) {
+        src += (size_t) (n_tokens - cache_size) * stride;
+        cudaMemcpyAsync(cache, src, (size_t) cache_size * stride,
+                        cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+        return cudaGetLastError() == cudaSuccess && cudaStreamSynchronize(cudaStreamPerThread) == cudaSuccess;
+    }
+
+    const int total = filled + n_tokens;
+    int keep = filled;
+    if (total > cache_size) {
+        const int drop = total - cache_size;
+        keep = filled - drop;
+        if (keep > 0) {
+            const int64_t n = (int64_t) keep * n_elem;
+            const int block = 256;
+            const int grid = (int) ((n + block - 1) / block);
+            k_dflash_kv_cache_shift_left<<<grid, block, 0, cudaStreamPerThread>>>(
+                cache, keep, drop, n_elem);
+        }
+    }
+
+    cudaMemcpyAsync(cache + (size_t) keep * n_elem, src, (size_t) n_tokens * stride,
+                    cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+    return cudaGetLastError() == cudaSuccess && cudaStreamSynchronize(cudaStreamPerThread) == cudaSuccess;
+}
+
+extern "C" bool dflash_kv_cache_append_d2d_no_check(
+        void * d_cache, const void * d_src,
+        int cache_size, int filled, int n_tokens, int n_elem) {
+    if (!d_cache || !d_src) return false;
+    if (cache_size <= 0 || n_tokens <= 0 || n_elem <= 0) return false;
+
+    filled = filled < 0 ? 0 : (filled > cache_size ? cache_size : filled);
+
+    const char * src = (const char *) d_src;
+    float * cache = (float *) d_cache;
+    const size_t stride = (size_t) n_elem * sizeof(float);
+
+    if (n_tokens >= cache_size) {
+        src += (size_t) (n_tokens - cache_size) * stride;
+        cudaMemcpyAsync(cache, src, (size_t) cache_size * stride,
+                        cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+        return cudaGetLastError() == cudaSuccess;
+    }
+
+    const int total = filled + n_tokens;
+    int keep = filled;
+    if (total > cache_size) {
+        const int drop = total - cache_size;
+        keep = filled - drop;
+        if (keep > 0) {
+            const int64_t n = (int64_t) keep * n_elem;
+            const int block = 256;
+            const int grid = (int) ((n + block - 1) / block);
+            k_dflash_kv_cache_shift_left<<<grid, block, 0, cudaStreamPerThread>>>(
+                cache, keep, drop, n_elem);
+        }
+    }
+
+    cudaMemcpyAsync(cache + (size_t) keep * n_elem, src, (size_t) n_tokens * stride,
+                    cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+__global__ static void k_dflash_kv_cache_interleave(
+        const float * __restrict__ ring,
+        float * __restrict__ stage,
+        const int ring_size,
+        const int read_start,
+        const int cross_len,
+        const int n_elem) {
+    const int t = blockIdx.x;
+    if (t >= cross_len) return;
+
+    const int slot = (read_start + t) % ring_size;
+    const float * src = ring + (size_t) slot * n_elem;
+    float * dst = stage + (size_t) t * n_elem;
+
+    for (int i = threadIdx.x; i < n_elem; i += blockDim.x) {
+        dst[i] = src[i];
+    }
+}
+
+extern "C" bool dflash_kv_cache_interleave(
+        const void * d_ring, void * d_stage,
+        int ring_size, int write_pos, int filled, int ctx_window, int n_elem) {
+    if (!d_ring || !d_stage) return false;
+    if (ring_size <= 0 || ctx_window <= 0 || n_elem <= 0) return false;
+
+    cudaPointerAttributes ring_attr;
+    cudaError_t ring_err = cudaPointerGetAttributes(&ring_attr, d_ring);
+    if (ring_err != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    cudaPointerAttributes stage_attr;
+    cudaError_t stage_err = cudaPointerGetAttributes(&stage_attr, d_stage);
+    if (stage_err != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+#if CUDART_VERSION >= 10000
+    if (ring_attr.type != cudaMemoryTypeDevice || stage_attr.type != cudaMemoryTypeDevice ||
+            ring_attr.device != stage_attr.device) {
+        return false;
+    }
+    (void)cudaSetDevice(ring_attr.device);
+#else
+    if (ring_attr.memoryType != cudaMemoryTypeDevice || stage_attr.memoryType != cudaMemoryTypeDevice ||
+            ring_attr.device != stage_attr.device) {
+        return false;
+    }
+    (void)cudaSetDevice(ring_attr.device);
+#endif
+
+    const int cross_len = filled < ctx_window ? filled : ctx_window;
+    if (cross_len <= 0) {
+        cudaMemsetAsync(d_stage, 0, (size_t) ctx_window * (size_t) n_elem * sizeof(float), cudaStreamPerThread);
+        return cudaGetLastError() == cudaSuccess;
+    }
+
+    const int read_start = ((write_pos - cross_len) % ring_size + ring_size) % ring_size;
+    k_dflash_kv_cache_interleave<<<cross_len, 256, 0, cudaStreamPerThread>>>(
+        (const float *) d_ring, (float *) d_stage,
+        ring_size, read_start, cross_len, n_elem);
+
+    if (cross_len < ctx_window) {
+        cudaMemsetAsync((float *) d_stage + (size_t) cross_len * n_elem, 0,
+                        (size_t) (ctx_window - cross_len) * (size_t) n_elem * sizeof(float),
+                        cudaStreamPerThread);
+    }
+
+    return cudaGetLastError() == cudaSuccess;
 }

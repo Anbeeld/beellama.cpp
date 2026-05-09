@@ -5,6 +5,8 @@
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
+#include "server-adaptive-dm.h"
+#include "server-loop-guard.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -18,9 +20,14 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <filesystem>
+#include <random>
+#include <cmath>
+#include <set>
 #include <utility>
 
 // fix problem with std::min and std::max
@@ -33,6 +40,276 @@
 #endif
 
 using json = nlohmann::ordered_json;
+
+static bool dflash_server_profile_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("GGML_DFLASH_PROFILE");
+        return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+struct log_norm_cache {
+    std::vector<float> cache;
+    float inv_temp;
+    int32_t n_vocab;
+    struct llama_context * ctx;
+
+    log_norm_cache(struct llama_context * ctx_, float temp, int32_t max_batch_idx = -1)
+        : cache(max_batch_idx >= 0 ? (size_t) max_batch_idx + 1 : 0, -INFINITY)
+        , inv_temp(temp > 0.0f ? 1.0f / temp : 1.0f)
+        , n_vocab(llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_))))
+        , ctx(ctx_) {}
+
+    float get(int32_t batch_idx) {
+        if (batch_idx < 0) {
+            return -FLT_MAX;
+        }
+        if (batch_idx < (int32_t)cache.size() && !std::isinf(cache[batch_idx])) {
+            return cache[batch_idx];
+        }
+        const float * logits = llama_get_logits_ith(ctx, batch_idx);
+        if (!logits) {
+            if (batch_idx >= (int32_t)cache.size()) {
+                cache.resize(batch_idx + 1, -INFINITY);
+            }
+            cache[batch_idx] = -FLT_MAX;
+            return -FLT_MAX;
+        }
+        float mx = -FLT_MAX;
+        double se = 0.0;
+        for (int32_t i = 0; i < n_vocab; i++) {
+            float s = logits[i] * inv_temp;
+            if (s > mx) {
+                se = se * expf(mx - s) + 1.0;
+                mx = s;
+            } else {
+                se += expf(s - mx);
+            }
+        }
+        float ln = mx + (float)log(se);
+        if (batch_idx >= (int32_t)cache.size()) {
+            cache.resize(batch_idx + 1, -INFINITY);
+        }
+        cache[batch_idx] = ln;
+        return ln;
+    }
+};
+
+static float target_prob_from_logits(struct llama_context * ctx_tgt, int32_t batch_idx, llama_token token, float temp) {
+    const float * logits = llama_get_logits_ith(ctx_tgt, batch_idx);
+    if (!logits) return 0.0f;
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_tgt)));
+    const float inv_temp = (temp > 0.0f) ? (1.0f / temp) : 1.0f;
+    float mx = -FLT_MAX;
+    double se = 0.0;
+    for (int32_t i = 0; i < n_vocab; i++) {
+        float s = logits[i] * inv_temp;
+        if (s > mx) {
+            se = se * expf(mx - s) + 1.0;
+            mx = s;
+        } else {
+            se += expf(s - mx);
+        }
+    }
+    const float log_norm = mx + (float)log(se);
+    const float log_prob = logits[token] * inv_temp - log_norm;
+    return expf(log_prob);
+}
+
+static std::vector<llama_token> speculative_reject_sample(
+        struct common_sampler * smpl,
+        struct llama_context  * ctx_tgt,
+        const llama_tokens    & draft,
+        const std::vector<int> & idxs,
+        const std::vector<float> & draft_log_probs,
+        float                   temp,
+        std::mt19937          & rng,
+        int32_t               & n_exact,
+        int32_t               & n_prob_accept,
+        int32_t               & n_reject,
+        int32_t               & n_no_prob) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+
+    std::vector<llama_token> result;
+    result.reserve(draft.size() + 1);
+    std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
+
+    const float inv_temp = (temp > 0.0f) ? (1.0f / temp) : 1.0f;
+    const int32_t max_batch_idx = idxs.empty() ? -1 :
+        *std::max_element(idxs.begin(), idxs.end());
+    log_norm_cache ln_cache(ctx_tgt, temp, max_batch_idx);
+
+    for (size_t i = 0; i < draft.size(); i++) {
+        const llama_token target_token = common_sampler_sample(smpl, ctx_tgt, idxs[i]);
+
+        if (target_token == draft[i]) {
+            common_sampler_accept(smpl, target_token, true);
+            result.push_back(target_token);
+            n_exact++;
+            continue;
+        }
+
+        if (i >= draft_log_probs.size()) {
+            common_sampler_accept(smpl, target_token, true);
+            result.push_back(target_token);
+            n_no_prob++;
+            break;
+        }
+
+        const float log_norm = ln_cache.get(idxs[i]);
+        const float log_prob = (log_norm > -FLT_MAX) ? llama_get_logits_ith(ctx_tgt, idxs[i])[draft[i]] * inv_temp - log_norm : -FLT_MAX;
+        const float target_prob = (log_prob > -FLT_MAX) ? expf(log_prob) : 0.0f;
+
+        const float q_log = draft_log_probs[i];
+        float accept_prob = (target_prob > 0.0f && std::isfinite(q_log) && q_log <= 0.0f) ? expf(log_prob - q_log) : 0.0f;
+        if (accept_prob > 1.0f) accept_prob = 1.0f;
+
+        if (uniform(rng) < accept_prob) {
+            common_sampler_accept(smpl, draft[i], true);
+            result.push_back(draft[i]);
+            n_prob_accept++;
+        } else {
+            common_sampler_accept(smpl, target_token, true);
+            result.push_back(target_token);
+            n_reject++;
+            break;
+        }
+    }
+
+    if (result.size() == draft.size()) {
+        const llama_token bonus = common_sampler_sample(smpl, ctx_tgt, idxs[draft.size()]);
+        common_sampler_accept(smpl, bonus, true);
+        result.push_back(bonus);
+    }
+
+    return result;
+}
+
+struct dflash_reduced_verify_plan {
+    bool enabled = false;
+    int top_k = 1;
+    const char * reason = "disabled";
+};
+
+static dflash_reduced_verify_plan dflash_select_reduced_verify_plan(
+        const common_params_sampling    & sampling,
+        const common_params_speculative & speculative,
+        bool                              use_rejection,
+        bool                              has_tree) {
+    dflash_reduced_verify_plan plan;
+
+    if (has_tree) {
+        plan.reason = "tree";
+        return plan;
+    }
+    if (use_rejection) {
+        plan.reason = "rejection";
+        return plan;
+    }
+    if (sampling.n_probs > 0) {
+        plan.reason = "prob-reporting";
+        return plan;
+    }
+    if (!sampling.grammar.empty() || sampling.grammar_lazy || !sampling.grammar_triggers.empty()) {
+        plan.reason = "grammar";
+        return plan;
+    }
+    if (sampling.has_logit_bias() || sampling.ignore_eos) {
+        plan.reason = "logit-bias";
+        return plan;
+    }
+    if (!(sampling.penalty_repeat == 1.0f && sampling.penalty_freq == 0.0f && sampling.penalty_present == 0.0f)) {
+        plan.reason = "penalties";
+        return plan;
+    }
+    if (sampling.dry_multiplier != 0.0f && sampling.dry_penalty_last_n != 0) {
+        plan.reason = "dry";
+        return plan;
+    }
+    if (sampling.top_n_sigma >= 0.0f) {
+        plan.reason = "top-n-sigma";
+        return plan;
+    }
+    if (sampling.xtc_probability > 0.0f) {
+        plan.reason = "xtc";
+        return plan;
+    }
+    if (sampling.mirostat != 0) {
+        plan.reason = "mirostat";
+        return plan;
+    }
+    if (sampling.adaptive_target >= 0.0f) {
+        plan.reason = "adaptive";
+        return plan;
+    }
+    if (sampling.dynatemp_range > 0.0f) {
+        plan.reason = "dynamic-temp";
+        return plan;
+    }
+    if (sampling.reasoning_budget_tokens >= 0) {
+        plan.reason = "finite-reasoning-budget";
+        return plan;
+    }
+    if (speculative.type != COMMON_SPECULATIVE_TYPE_DFLASH) {
+        plan.reason = "not-dflash";
+        return plan;
+    }
+
+    if (sampling.temp <= 0.0f) {
+        plan.enabled = true;
+        plan.top_k = 1;
+        plan.reason = "greedy";
+        return plan;
+    }
+
+    if (sampling.top_k <= 0) {
+        plan.reason = "unbounded-top-k";
+        return plan;
+    }
+    if (sampling.top_k > 64) {
+        plan.reason = "top-k-too-large";
+        return plan;
+    }
+
+    plan.enabled = true;
+    plan.top_k = std::max(1, sampling.top_k);
+    plan.reason = "top-k";
+    return plan;
+}
+
+static std::vector<llama_token> dflash_sample_reduced_verify(
+        struct common_sampler * smpl,
+        struct llama_context  * ctx,
+        const std::vector<int> & idxs,
+        const llama_tokens    & draft,
+        int                     top_k) {
+    if ((int) idxs.size() != (int) draft.size() + 1 || top_k <= 0) {
+        return {};
+    }
+    if (llama_get_logits_argmax_k(ctx) != top_k ||
+            llama_get_logits_argmax_n(ctx) < (int32_t) idxs.size()) {
+        return {};
+    }
+
+    std::vector<llama_token> candidate_ids((size_t) idxs.size() * (size_t) top_k);
+    std::vector<float> candidate_logits((size_t) idxs.size() * (size_t) top_k);
+
+    for (size_t row = 0; row < idxs.size(); ++row) {
+        const int32_t * ids = llama_get_logits_argmax_ith(ctx, idxs[row]);
+        const float * logits = llama_get_logits_argmax_probs_ith(ctx, idxs[row]);
+        if (!ids || !logits) {
+            return {};
+        }
+        for (int k = 0; k < top_k; ++k) {
+            candidate_ids[row * (size_t) top_k + (size_t) k] = (llama_token) ids[k];
+            candidate_logits[row * (size_t) top_k + (size_t) k] = logits[k];
+        }
+    }
+
+    return common_sampler_sample_reduced_and_accept_n(
+        smpl, candidate_ids.data(), candidate_logits.data(), (int32_t) idxs.size(), top_k, draft);
+}
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
@@ -76,7 +353,7 @@ enum server_state {
     SERVER_STATE_READY,          // Server is ready and model is loaded
 };
 
-struct server_slot {
+struct server_slot : server_adaptive_dm_state {
     int id;
 
     llama_context * ctx = nullptr;
@@ -89,6 +366,7 @@ struct server_slot {
     // speculative decoding
     llama_tokens spec_draft;
     std::vector<int32_t> spec_i_batch;
+    std::vector<int32_t> spec_pad_i_batch;
     server_prompt_checkpoint spec_ckpt;
     common_speculative_ptr spec;
 
@@ -123,6 +401,14 @@ struct server_slot {
     bool truncated      = false;
 
     stop_type stop;
+    std::string stop_detail;
+    server_loop_guard loop_guard;
+    int32_t loop_guard_interventions = 0;
+    bool loop_guard_triggered = false;
+    std::string loop_guard_action;
+    std::string loop_guard_reason;
+    int32_t reasoning_output_tokens = 0;
+    int32_t visible_output_tokens = 0;
 
     std::string stopping_word;
 
@@ -165,6 +451,7 @@ struct server_slot {
 
         llama_memory_seq_rm(llama_get_memory(ctx), id, -1, -1);
         prompt.tokens.clear();
+        prompt.checkpoints.clear();
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -176,6 +463,15 @@ struct server_slot {
     common_sampler_ptr smpl;
 
     llama_token sampled; // in speculative mode, this is the last accepted token
+    llama_tokens drafted;
+    common_speculative_tree draft_tree;
+    bool has_draft_tree = false;
+    std::vector<float> draft_log_probs;
+    std::mt19937 reject_rng;
+    int32_t n_reject_exact = 0;
+    int32_t n_reject_prob_accept = 0;
+    int32_t n_reject_reject = 0;
+    int32_t n_reject_no_prob = 0;
 
     // stats
     size_t n_sent_text = 0; // number of sent text character
@@ -194,7 +490,9 @@ struct server_slot {
 
     // Hybrid model: recurrent state backup for speculative decoding
     bool has_draft_backup = false;
+    bool has_recurrent_only_backup = false;
     int  n_tokens_before_draft = 0; // prompt token count before draft tokens were added
+    llama_pos n_pos_before_draft = 0; // KV position before draft tokens (accounts for mmproj position expansion)
 
     void reset() {
         SLT_DBG(*this, "%s", "\n");
@@ -206,23 +504,46 @@ struct server_slot {
         has_new_line   = false;
         truncated      = false;
         stop           = STOP_TYPE_NONE;
+        stop_detail    = "";
+        loop_guard.reset();
+        loop_guard_interventions = 0;
+        loop_guard_triggered = false;
+        loop_guard_action = "";
+        loop_guard_reason = "";
+        reasoning_output_tokens = 0;
+        visible_output_tokens = 0;
         stopping_word  = "";
         n_sent_text    = 0;
 
         if (can_speculate()) {
             spec_draft.clear();
             spec_i_batch.clear();
+            spec_pad_i_batch.clear();
             spec_ckpt.clear();
         }
+        drafted.clear();
+        draft_tree = common_speculative_tree();
+        has_draft_tree = false;
+        draft_log_probs.clear();
+        n_reject_exact = 0;
+        n_reject_prob_accept = 0;
+        n_reject_reject = 0;
+        n_reject_no_prob = 0;
+        spec_i_batch.clear();
+        spec_pad_i_batch.clear();
         generated_tokens.clear();
         generated_token_probs.clear();
         json_schema = json();
 
-        // clear speculative decoding stats
+        // Clear per-request speculative decoding stats. Adaptive controller
+        // state is reset or preserved when the next task selects this slot,
+        // based on prompt continuity.
         n_draft_total = 0;
         n_draft_accepted = 0;
         has_draft_backup = false;
+        has_recurrent_only_backup = false;
         n_tokens_before_draft = 0;
+        n_pos_before_draft = 0;
 
         task_prev = std::move(task);
         task.reset();
@@ -273,22 +594,61 @@ struct server_slot {
         return task->type == other_slot.task->type && are_lora_equal(lora, other_slot.lora);
     }
 
+    int32_t effective_n_predict(const common_params & global_params) const {
+        GGML_ASSERT(task);
+
+        if (task->params.n_predict != -1) {
+            return task->params.n_predict;
+        }
+        return global_params.n_predict;
+    }
+
+    int32_t remaining_generation_budget(const common_params & global_params) const {
+        const int32_t limit = effective_n_predict(global_params);
+        if (limit == -1) {
+            return -1;
+        }
+        return limit - n_decoded;
+    }
+
     bool has_budget(const common_params & global_params) {
         GGML_ASSERT(task);
 
-        if (task->params.n_predict == -1 && global_params.n_predict == -1) {
-            return true; // limitless
+        n_remaining = remaining_generation_budget(global_params);
+        return n_remaining == -1 || n_remaining > 0;
+    }
+
+    bool has_visible_chat_response() const {
+        GGML_ASSERT(task);
+
+        const auto & chat_parser_params = task->params.chat_parser_params;
+        if (chat_parser_params.reasoning_format == COMMON_REASONING_FORMAT_NONE) {
+            return true;
         }
 
-        n_remaining = -1;
+        try {
+            const common_chat_msg msg = common_chat_parse(generated_text, true, chat_parser_params);
+            return !msg.content.empty() || !msg.content_parts.empty() || !msg.tool_calls.empty() ||
+                   !msg.tool_name.empty() || !msg.tool_call_id.empty();
+        } catch (const std::exception & e) {
+            SLT_DBG(*this, "failed to parse partial chat response while checking token budget: %s\n", e.what());
+            return true;
+        }
+    }
 
-        if (task->params.n_predict != -1) {
-            n_remaining = task->params.n_predict - n_decoded;
-        } else if (global_params.n_predict != -1) {
-            n_remaining = global_params.n_predict - n_decoded;
+    bool should_defer_limit_for_reasoning() const {
+        GGML_ASSERT(task);
+
+        if (task->params.chat_parser_params.reasoning_format == COMMON_REASONING_FORMAT_NONE) {
+            return false;
         }
 
-        return n_remaining > 0; // no budget
+        const auto reasoning_state = common_sampler_get_reasoning_budget_state(smpl.get());
+        if (reasoning_state != REASONING_BUDGET_IDLE && reasoning_state != REASONING_BUDGET_DONE) {
+            return true;
+        }
+
+        return reasoning_state == REASONING_BUDGET_DONE && !has_visible_chat_response();
     }
 
     bool is_processing() const {
@@ -308,7 +668,7 @@ struct server_slot {
         generated_token_probs.push_back(token);
     }
 
-    int get_n_draft_max() const {
+    int get_n_draft_max(const common_params & global_params, bool advance_adaptive_probe = false) {
         GGML_ASSERT(task);
 
         if (!can_speculate()) {
@@ -317,15 +677,88 @@ struct server_slot {
 
         const int n_draft_min = common_speculative_n_min(spec.get(), task->params.speculative);
 
-        // determine the max draft that fits the current slot state
-        int n_draft_max = common_speculative_n_max(spec.get(), task->params.speculative);
+        const int base_n_max = common_speculative_n_max(spec.get(), task->params.speculative);
+        const int probe_n_max = server_adaptive_dm_probe_n_max(base_n_max, dm_probe_fraction);
+        int n_draft_max = (adaptive_n_max >= 0) ? adaptive_n_max : base_n_max;
+
+        if (dm_adaptive && dm_controller == COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT) {
+            if (profit_warmup_cycles > 0) {
+                n_draft_max = base_n_max;
+                if (advance_adaptive_probe) {
+                    profit_warmup_cycles--;
+                }
+            } else if (adaptive_n_max < 0) {
+                if (advance_adaptive_probe) {
+                    adaptive_n_max = base_n_max;
+                    const int32_t warmup = dm_profit_warmup > 0 ? dm_profit_warmup : dm_profit_min_samples;
+                    profit_warmup_cycles = warmup;
+                }
+                n_draft_max = base_n_max;
+            } else if (adaptive_n_max == 0) {
+                const bool probe_now = adaptive_probe_counter + 1 >= dm_probe_interval;
+                if (!probe_now) {
+                    if (advance_adaptive_probe) {
+                        adaptive_probe_counter++;
+                    }
+                    return 0;
+                }
+                if (advance_adaptive_probe) {
+                    adaptive_probe_counter = 0;
+                    adaptive_n_max = base_n_max;
+                }
+                n_draft_max = base_n_max;
+            } else {
+                n_draft_max = adaptive_n_max;
+                if (advance_adaptive_probe) {
+                    explore_counter++;
+                    if (explore_counter % dm_explore_interval == 0) {
+                        // Every 4th explore: full-depth probe to rediscover profitability.
+                        // Otherwise: probe next ladder rung.
+                        if ((explore_counter / dm_explore_interval) % 4 == 0) {
+                            n_draft_max = base_n_max;
+                        } else {
+                            n_draft_max = server_adaptive_dm_next_explore_depth(adaptive_n_max, base_n_max, dm_probe_fraction);
+                        }
+                    }
+                }
+            }
+        } else if (dm_adaptive && adaptive_n_max < 0) {
+            if (advance_adaptive_probe) {
+                adaptive_n_max = probe_n_max;
+            }
+            n_draft_max = probe_n_max;
+        } else if (adaptive_n_max == 0) {
+            // off state: probe periodically to check if fringe has recovered
+            const bool probe_now = adaptive_probe_counter + 1 >= dm_probe_interval;
+            if (!probe_now) {
+                if (advance_adaptive_probe) {
+                    adaptive_probe_counter++;
+                }
+                return 0;
+            }
+            if (advance_adaptive_probe) {
+                adaptive_probe_counter = 0;
+                adaptive_n_max = probe_n_max;
+            }
+            n_draft_max = probe_n_max;
+        } else if (dm_adaptive && adaptive_n_max > 0 && adaptive_n_max < base_n_max) {
+            // active but not at full draft: periodically draft at base_n_max to collect
+            // data beyond current n_max (exploration)
+            if (advance_adaptive_probe) {
+                explore_counter++;
+                if (explore_counter % dm_explore_interval == 0) {
+                    n_draft_max = base_n_max;
+                }
+            }
+        }
 
         // note: slot.prompt is not yet expanded with the `id` token sampled above
         //       also, need to leave space for 1 extra token to allow context shifts
         n_draft_max = std::min(n_draft_max, n_ctx - prompt.n_tokens() - 2);
 
-        if (n_remaining > 0) {
-            n_draft_max = std::min(n_draft_max, n_remaining - 1);
+        const int32_t remaining = remaining_generation_budget(global_params);
+        if (remaining > 0) {
+            n_draft_max = std::min(n_draft_max, remaining - 1);
         }
 
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
@@ -338,8 +771,8 @@ struct server_slot {
         return n_draft_max;
     }
 
-    void update_batch(llama_batch & batch) {
-        const int n_draft_max = get_n_draft_max();
+    void update_batch(llama_batch & batch, const common_params & global_params) {
+        const int n_draft_max = get_n_draft_max(global_params);
         if (n_draft_max > 0) {
             GGML_ASSERT(can_speculate());
 
@@ -509,6 +942,14 @@ struct server_slot {
                     "draft acceptance rate = %0.5f (%5d accepted / %5d generated)\n",
                     draft_ratio, n_draft_accepted, n_draft_total
             );
+            if (adaptive_n_max >= 0) {
+                SLT_CNT(*this, "adaptive dm: fringe=%.2f n_max=%d\n", rolling_fringe, adaptive_n_max);
+            }
+            const int32_t n_reject_tested = n_reject_exact + n_reject_prob_accept + n_reject_reject + n_reject_no_prob;
+            if (n_reject_tested > 0) {
+                SLT_CNT(*this, "rejection sampling: exact=%d prob_accept=%d reject=%d no_prob=%d\n",
+                        n_reject_exact, n_reject_prob_accept, n_reject_reject, n_reject_no_prob);
+            }
         }
 
         common_speculative_print_stats(spec.get());
@@ -566,6 +1007,76 @@ struct server_slot {
         other.init_sampler();
     }
 };
+
+
+static bool dflash_batch_view_is_reduced_verify(
+        const std::vector<server_slot> & slots,
+        int32_t                          view_start,
+        int32_t                          view_n_tokens,
+        int                              top_k,
+        const char                    ** reason) {
+    auto reject = [&](const char * why) {
+        if (reason) {
+            *reason = why;
+        }
+        return false;
+    };
+
+    if (view_n_tokens <= 0 || top_k <= 0) {
+        return reject("empty-view");
+    }
+
+    std::vector<uint8_t> covered((size_t) view_n_tokens, 0);
+    int covered_count = 0;
+
+    for (const auto & slot : slots) {
+        if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() || slot.has_draft_tree || slot.spec_draft.empty()) {
+            continue;
+        }
+        if (!common_sampler_supports_reduced(slot.smpl.get())) {
+            return reject("sampler");
+        }
+        if (slot.spec_i_batch.size() != slot.spec_draft.size() + 1) {
+            return reject("spec-index-count");
+        }
+
+        auto cover_index = [&](int idx) {
+            if (idx < view_start || idx >= view_start + view_n_tokens) {
+                return false;
+            }
+            const int rel = idx - view_start;
+            if (covered[(size_t) rel] != 0) {
+                return false;
+            }
+            covered[(size_t) rel] = 1;
+            covered_count++;
+            return true;
+        };
+
+        for (int idx : slot.spec_i_batch) {
+            if (!cover_index(idx)) {
+                return reject(idx < view_start || idx >= view_start + view_n_tokens
+                        ? "spec-index-outside-view" : "duplicate-index");
+            }
+        }
+        for (int idx : slot.spec_pad_i_batch) {
+            if (!cover_index(idx)) {
+                return reject(idx < view_start || idx >= view_start + view_n_tokens
+                        ? "pad-index-outside-view" : "duplicate-index");
+            }
+        }
+    }
+
+    if (covered_count != view_n_tokens ||
+            !std::all_of(covered.begin(), covered.end(), [](uint8_t v) { return v != 0; })) {
+        return reject("coverage");
+    }
+
+    if (reason) {
+        *reason = "eligible";
+    }
+    return true;
+}
 
 
 
@@ -807,6 +1318,16 @@ private:
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
+        if (!recurrent_expanded && needs_reeval) {
+            if (llama_context_recurrent_shrink(ctx, n_parallel_user)) {
+                SRV_INF("shrunk recurrent state to %d cells before draft load (deferred %d backup cells)\n",
+                        n_parallel_user, n_seq_max_full - n_parallel_user);
+            } else {
+                SRV_ERR("failed to shrink recurrent state to %d cells before draft load\n", n_parallel_user);
+                return false;
+            }
+        }
+
         if (params_base.speculative.has_dft()) {
             // TODO speculative: move to common/speculative.cpp?
             const auto & params_spec = params_base.speculative.draft;
@@ -902,12 +1423,22 @@ private:
                 SRV_WRN("%s\n", "cache_reuse is not supported by multimodal, it will be disabled");
             }
 
-            if (params_base.speculative.type != COMMON_SPECULATIVE_TYPE_NONE) {
-                params_base.speculative.type      = COMMON_SPECULATIVE_TYPE_NONE;
-                params_base.speculative.model_dft  = nullptr;
-                model_dft.reset();
+            // Tree DFlash is now supported with mmproj — positions are tracked
+            // correctly via n_pos_before_draft.  Only non-DFlash speculative
+            // types remain incompatible with multimodal.
+            if (params_base.speculative.type != COMMON_SPECULATIVE_TYPE_DFLASH &&
+                params_base.speculative.type != COMMON_SPECULATIVE_TYPE_NONE) {
                 SRV_WRN("%s\n", "speculative decoding is not supported by multimodal, it will be disabled");
+                params_base.speculative.type     = COMMON_SPECULATIVE_TYPE_NONE;
+                params_base.speculative.model_dft = nullptr;
+                model_dft.reset();
             }
+        }
+
+        if (params_base.speculative.branch_budget > 0 && params_base.speculative.draft_topk < 2) {
+            SRV_INF("auto-upgrading draft_topk from %d to 2 (branch_budget=%d requires top-K >= 2 for tree branching)\n",
+                     params_base.speculative.draft_topk, params_base.speculative.branch_budget);
+            params_base.speculative.draft_topk = 2;
         }
 
         if (!llama_memory_can_shift(llama_get_memory(ctx))) {
@@ -934,6 +1465,16 @@ private:
         // Necessary similarity of prompt for slot selection
         slot_prompt_similarity = params_base.slot_prompt_similarity;
 
+        if (!recurrent_expanded && needs_reeval) {
+            if (llama_context_recurrent_expand(ctx, n_seq_max_full)) {
+                SRV_INF("expanded recurrent state to %d cells before speculative GPU buffers\n", n_seq_max_full);
+                recurrent_expanded = true;
+            } else {
+                SRV_ERR("failed to expand recurrent state to %d cells before speculative GPU buffers\n", n_seq_max_full);
+                return false;
+            }
+        }
+
         // setup slots
         SRV_INF("initializing slots, n_slots = %d\n", params_base.n_parallel);
 
@@ -958,7 +1499,7 @@ private:
 
         const bool can_spec = (ctx_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO);
 
-        // DFlash multi-slot: --dflash-max-slots caps how many server slots keep DFlash state;
+        // DFlash multi-slot: --spec-dflash-max-slots caps how many server slots keep DFlash state;
         // slots above the cap fall back to non-speculative decode (slot.spec stays null). The
         // matching tape/hidden buffers are allocated after the per-slot init loop (set_dflash_capture
         // runs inside common_speculative_init for slot 0, so dflash_capture must exist first).
@@ -979,6 +1520,12 @@ private:
             // narrow (cheap), multi-slot servers get a compute buffer big enough for
             // the batched cross-attention. Runtime widening past this cap requires a
             // larger compute buffer than is available.
+
+            // Resolve --spec-draft-temp "auto" once target sampling temp is known.
+            if (params_base.speculative.sample_temp < 0.0f) {
+                params_base.speculative.sample_temp = params_base.sampling.temp;
+            }
+
             ctx_dft_shared.reset(common_speculative_create_ctx_dft(params_base.speculative, dflash_slots_cap));
             if (!ctx_dft_shared) {
                 SRV_ERR("%s", "failed to create shared DFlash drafter context\n");
@@ -997,14 +1544,32 @@ private:
             slot.id    = i;
             slot.ctx   = ctx;
             slot.n_ctx = n_ctx_slot;
+            slot.reject_rng.seed(i + 1);
 
             slot.ctx_seq_rm_type = ctx_seq_rm_type;
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
+            slot.dm_adaptive         = params_base.speculative.dm_adaptive;
+            slot.dm_fringe_min       = params_base.speculative.dm_fringe_min;
+            slot.dm_fringe_max       = params_base.speculative.dm_fringe_max;
+            slot.dm_off_dwell        = params_base.speculative.dm_off_dwell;
+            slot.dm_explore_interval = params_base.speculative.dm_explore_interval;
+            slot.dm_min_reach        = params_base.speculative.dm_min_reach;
+            slot.dm_probe_interval   = params_base.speculative.dm_probe_interval;
+            slot.dm_probe_fraction   = params_base.speculative.dm_probe_fraction;
+            slot.dm_fringe_window    = params_base.speculative.dm_fringe_window;
+            slot.dm_controller       = params_base.speculative.dm_controller;
+            slot.dm_profit_min       = params_base.speculative.dm_profit_min;
+            slot.dm_profit_raise_margin = params_base.speculative.dm_profit_raise_margin;
+            slot.dm_profit_lower_margin = params_base.speculative.dm_profit_lower_margin;
+            slot.dm_profit_ewma_alpha = params_base.speculative.dm_profit_ewma_alpha;
+            slot.dm_profit_min_samples = params_base.speculative.dm_profit_min_samples;
+            slot.dm_profit_warmup    = params_base.speculative.dm_profit_warmup;
 
             const bool slot_can_spec = can_spec &&
-                (params_base.speculative.type != COMMON_SPECULATIVE_TYPE_DFLASH || i < dflash_slots_cap);
+                (params_base.speculative.type != COMMON_SPECULATIVE_TYPE_DFLASH || i < dflash_slots_cap) &&
+                !(mctx && params_base.speculative.type != COMMON_SPECULATIVE_TYPE_DFLASH);
 
             // try speculative decoding
             if (slot_can_spec) {
@@ -1012,7 +1577,7 @@ private:
                 // speculative types, ctx_dft_shared is null and init creates its own.
                 slot.spec.reset(common_speculative_init(params_base.speculative, slot.ctx, ctx_dft_shared.get()));
                 if (slot.spec) {
-                    if (mctx) {
+                    if (mctx && params_base.speculative.type != COMMON_SPECULATIVE_TYPE_DFLASH) {
                         SRV_ERR("%s\n", "speculative decoding is not supported with multimodal");
                         return false;
                     }
@@ -1090,6 +1655,59 @@ private:
 
         model_aliases = params_base.model_alias;
         model_tags    = params_base.model_tags;
+
+        if (params_base.speculative.dm_adaptive) {
+            if (params_base.speculative.dm_off_dwell < 1 ||
+                    params_base.speculative.dm_explore_interval < 1 ||
+                    params_base.speculative.dm_probe_interval < 1 ||
+                    params_base.speculative.dm_probe_fraction < 0.01f ||
+                    params_base.speculative.dm_probe_fraction > 1.0f) {
+                SRV_ERR("%s: invalid shared adaptive DM parameters\n", __func__);
+                return false;
+            }
+
+            if (server_adaptive_dm_uses_fringe_controller(params_base.speculative.dm_controller)) {
+                if (params_base.speculative.dm_fringe_min >= params_base.speculative.dm_fringe_max) {
+                    SRV_ERR("%s: --spec-dm-fringe-min (%.2f) must be less than --spec-dm-fringe-max (%.2f)\n",
+                            __func__, (double)params_base.speculative.dm_fringe_min, (double)params_base.speculative.dm_fringe_max);
+                    return false;
+                }
+                if (params_base.speculative.dm_fringe_min < 0.0f || params_base.speculative.dm_fringe_max > 1.0f) {
+                    SRV_ERR("%s: --spec-dm-fringe-min and --spec-dm-fringe-max must be in [0, 1]\n", __func__);
+                    return false;
+                }
+                if (params_base.speculative.dm_min_reach < 1 || params_base.speculative.dm_min_reach > server_slot::FRINGE_WINDOW) {
+                    SRV_ERR("%s: --spec-dm-min-reach (%d) must be in [1, %d]\n",
+                            __func__, params_base.speculative.dm_min_reach, server_slot::FRINGE_WINDOW);
+                    return false;
+                }
+            } else if (server_adaptive_dm_uses_profit_controller(params_base.speculative.dm_controller)) {
+                if (params_base.speculative.dm_profit_min < 0.0f || params_base.speculative.dm_profit_min > 0.50f ||
+                        params_base.speculative.dm_profit_raise_margin < 0.0f || params_base.speculative.dm_profit_raise_margin > 1.0f ||
+                        params_base.speculative.dm_profit_lower_margin < 0.0f || params_base.speculative.dm_profit_lower_margin > 1.0f ||
+                        params_base.speculative.dm_profit_ewma_alpha < 0.01f || params_base.speculative.dm_profit_ewma_alpha > 1.0f ||
+                        params_base.speculative.dm_profit_min_samples < 1 || params_base.speculative.dm_profit_min_samples > 64 ||
+                        params_base.speculative.dm_profit_warmup < 0 || params_base.speculative.dm_profit_warmup > 64) {
+                    SRV_ERR("%s: invalid adaptive DM profit controller parameters\n", __func__);
+                    return false;
+                }
+            } else {
+                SRV_ERR("%s: invalid adaptive DM controller\n", __func__);
+                return false;
+            }
+        }
+
+        {
+            const auto & loop = params_base.reasoning_loop_guard;
+            if (loop.min_reasoning_tokens < 0 || loop.window_tokens <= 0 || loop.max_period <= 0 ||
+                    loop.min_repeated_coverage <= 0 || loop.check_interval <= 0 || loop.interventions_max < 0 ||
+                    loop.window_tokens < loop.min_repeated_coverage ||
+                    loop.max_period > loop.window_tokens / 3 ||
+                    loop.min_reasoning_tokens < loop.min_repeated_coverage) {
+                SRV_ERR("%s: invalid reasoning loop guard parameters\n", __func__);
+                return false;
+            }
+        }
 
         // propagate new defaults back to caller
         params = params_base;
@@ -1185,17 +1803,6 @@ private:
             };
         }
 
-        // Shrink recurrent state to free backup cells during prefill.
-        // Must happen after init-time decodes (common_speculative_is_compat, warmup)
-        // so the scheduler's CUDA graph state isn't stale.
-        if (!recurrent_expanded && needs_reeval) {
-            auto * mem = llama_get_memory(ctx);
-            if (llama_memory_recurrent_shrink(mem, n_parallel_user)) {
-                SRV_INF("shrunk recurrent state to %d cells for prefill (deferred %d backup cells)\n",
-                        n_parallel_user, n_seq_max_full - n_parallel_user);
-            }
-        }
-
         return true;
     }
 
@@ -1251,6 +1858,17 @@ private:
                 SLT_INF(*ret, "selected slot by LCP similarity, sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
                         sim_best, slot_prompt_similarity, f_keep);
 
+                if (ret->dm_adaptive) {
+                    if (server_adaptive_dm_should_preserve_for_continuation(sim_best, f_keep)) {
+                        SLT_INF(*ret, "adaptive dm: preserving state for continuation (sim=%.3f, keep=%.3f, n_max=%d)\n",
+                                sim_best, f_keep, ret->adaptive_n_max);
+                    } else {
+                        ret->reset_request_state();
+                        SLT_INF(*ret, "adaptive dm: reset state for prompt change (sim=%.3f, keep=%.3f)\n",
+                                sim_best, f_keep);
+                    }
+                }
+
                 // if we are about to lose a large portion of the existing context - save it in the prompt cache
                 if (f_keep < 0.5f) {
                     update_cache = true;
@@ -1283,6 +1901,11 @@ private:
 
             if (ret != nullptr) {
                 SLT_INF(*ret, "selected slot by LRU, t_last = %" PRId64 "\n", t_last);
+
+                if (ret->dm_adaptive) {
+                    ret->reset_request_state();
+                    SLT_INF(*ret, "%s", "adaptive dm: reset state for LRU slot selection\n");
+                }
 
                 update_cache = true;
             }
@@ -1467,10 +2090,61 @@ private:
             }
 
             SLT_INF(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
+            if (task.params.reasoning_loop_guard.mode == COMMON_REASONING_LOOP_GUARD_FORCE_CLOSE &&
+                    task.params.chat_parser_params.reasoning_format != COMMON_REASONING_FORMAT_NONE &&
+                    common_sampler_reasoning_forced_token_count(slot.smpl.get()) == 0) {
+                SLT_WRN(slot, "%s", "reasoning-loop-guard: force-close unavailable for this task, using stop mode\n");
+                task.params.reasoning_loop_guard.mode = COMMON_REASONING_LOOP_GUARD_STOP;
+            }
+            SLT_INF(slot,
+                    "spec dm controller: adaptive=%d controller=%s probe_fraction=%.4f explore_interval=%d "
+                    "profit_min=%.4f raise=%.4f lower=%.4f ewma=%.4f min_samples=%d warmup=%d "
+                    "p_min=%.4f draft_p_min=%.4f\n",
+                    task.params.speculative.dm_adaptive ? 1 : 0,
+                    server_adaptive_dm_controller_name(task.params.speculative.dm_controller),
+                    (double) task.params.speculative.dm_probe_fraction,
+                    task.params.speculative.dm_explore_interval,
+                    (double) task.params.speculative.dm_profit_min,
+                    (double) task.params.speculative.dm_profit_raise_margin,
+                    (double) task.params.speculative.dm_profit_lower_margin,
+                    (double) task.params.speculative.dm_profit_ewma_alpha,
+                    task.params.speculative.dm_profit_min_samples,
+                    task.params.speculative.dm_profit_warmup,
+                    (double) task.params.speculative.p_min,
+                    (double) task.params.speculative.draft.p_min);
+            SLT_INF(slot,
+                    "request sampling: n_predict=%d ignore_eos=%d stop=%zu reasoning_budget=%d "
+                    "reasoning_loop_guard=%d loop_min=%d loop_window=%d loop_period=%d loop_coverage=%d loop_interval=%d loop_interventions=%d "
+                    "repeat_penalty=%.3f "
+                    "presence_penalty=%.3f frequency_penalty=%.3f dry_multiplier=%.3f dry_allowed_length=%d "
+                    "adaptive_n_max=%d\n",
+                    task.params.n_predict,
+                    task.params.sampling.ignore_eos ? 1 : 0,
+                    task.params.antiprompt.size(),
+                    task.params.sampling.reasoning_budget_tokens,
+                    (int) task.params.reasoning_loop_guard.mode,
+                    task.params.reasoning_loop_guard.min_reasoning_tokens,
+                    task.params.reasoning_loop_guard.window_tokens,
+                    task.params.reasoning_loop_guard.max_period,
+                    task.params.reasoning_loop_guard.min_repeated_coverage,
+                    task.params.reasoning_loop_guard.check_interval,
+                    task.params.reasoning_loop_guard.interventions_max,
+                    task.params.sampling.penalty_repeat,
+                    task.params.sampling.penalty_present,
+                    task.params.sampling.penalty_freq,
+                    task.params.sampling.dry_multiplier,
+                    task.params.sampling.dry_allowed_length,
+                    slot.adaptive_n_max);
         } else {
             slot.smpl.reset();
         }
 
+        slot.loop_guard = server_loop_guard(task.params.reasoning_loop_guard);
+        if (slot.can_speculate() && task.need_sampling() && slot.dm_adaptive) {
+            const int base_n_max = common_speculative_n_max(slot.spec.get(), task.params.speculative);
+            slot.reset_profit_if_config_changed(task.params.speculative, base_n_max,
+                    (int32_t) slot.prompt.n_tokens());
+        }
         slot.task = std::make_unique<const server_task>(std::move(task));
 
         slot.state = slot.task->is_child()
@@ -1549,9 +2223,79 @@ private:
         // check the limits
         if (slot.n_decoded > 0 && slot.has_next_token && !slot.has_budget(params_base)) {
             slot.stop           = STOP_TYPE_LIMIT;
+            slot.stop_detail    = "token_limit";
             slot.has_next_token = false;
 
-            SLT_DBG(slot, "stopped by limit, n_decoded = %d, n_predict = %d\n", slot.n_decoded, slot.task->params.n_predict);
+            SLT_DBG(slot, "stopped by hard token limit, n_decoded = %d, n_predict = %d\n",
+                    slot.n_decoded, slot.effective_n_predict(params_base));
+        }
+
+        if (slot.has_next_token) {
+            const auto reasoning_state = common_sampler_get_reasoning_budget_state(slot.smpl.get());
+            const bool in_reasoning =
+                reasoning_state == REASONING_BUDGET_COUNTING ||
+                reasoning_state == REASONING_BUDGET_WAITING_UTF8;
+            const bool forcing_reasoning_end = reasoning_state == REASONING_BUDGET_FORCING;
+            const bool token_is_eog = llama_vocab_is_eog(vocab, result.tok);
+            const auto region = in_reasoning ? SERVER_LOOP_REGION_REASONING : SERVER_LOOP_REGION_VISIBLE;
+
+            if (!token_is_eog && !forcing_reasoning_end) {
+                if (in_reasoning) {
+                    slot.reasoning_output_tokens++;
+                } else {
+                    slot.visible_output_tokens++;
+                }
+
+                slot.loop_guard.accept(result.tok, region);
+                if (slot.loop_guard.should_check(region, false, false)) {
+                    const auto loop_result = slot.loop_guard.check(region);
+                    if (loop_result.triggered) {
+                        const auto & guard_params = slot.task->params.reasoning_loop_guard;
+
+                        slot.loop_guard_triggered = true;
+                        slot.loop_guard_reason = loop_result.kind;
+
+                        auto stop_due_to_loop_guard = [&]() {
+                            slot.loop_guard_action = "stop";
+                            slot.stop = STOP_TYPE_LIMIT;
+                            slot.stop_detail = "loop_guard";
+                            slot.has_next_token = false;
+                        };
+
+                        if (region == SERVER_LOOP_REGION_VISIBLE || guard_params.mode == COMMON_REASONING_LOOP_GUARD_STOP) {
+                            stop_due_to_loop_guard();
+                        } else if (guard_params.mode == COMMON_REASONING_LOOP_GUARD_FORCE_CLOSE &&
+                                slot.loop_guard_interventions < guard_params.interventions_max) {
+                            const int32_t remaining = slot.remaining_generation_budget(params_base);
+                            const size_t forced_n = common_sampler_reasoning_forced_token_count(slot.smpl.get());
+
+                            if (remaining != -1 && forced_n > (size_t) remaining) {
+                                stop_due_to_loop_guard();
+                            } else if (!common_sampler_force_reasoning_end(slot.smpl.get())) {
+                                SLT_WRN(slot, "%s", "reasoning-loop-guard: force-close unavailable, stopping instead\n");
+                                stop_due_to_loop_guard();
+                            } else {
+                                slot.loop_guard_interventions++;
+                                slot.loop_guard_action = "force-close";
+                            }
+                        } else {
+                            stop_due_to_loop_guard();
+                        }
+
+                        SLT_INF(slot,
+                                "reasoning-loop-guard: triggered region=%s kind=%s period=%d coverage=%d score=%.3f action=%s n_decoded=%d reasoning_tokens=%d visible_tokens=%d\n",
+                                region == SERVER_LOOP_REGION_REASONING ? "reasoning" : "visible",
+                                loop_result.kind.c_str(),
+                                loop_result.period,
+                                loop_result.coverage,
+                                (double) loop_result.score,
+                                slot.loop_guard_action.c_str(),
+                                slot.n_decoded,
+                                slot.reasoning_output_tokens,
+                                slot.visible_output_tokens);
+                    }
+                }
+            }
         }
 
         if (slot.has_new_line) {
@@ -1774,6 +2518,12 @@ private:
         res->has_new_line          = slot.has_new_line;
         res->stopping_word         = slot.stopping_word;
         res->stop                  = slot.stop;
+        res->stop_detail           = slot.stop_detail;
+        res->reasoning_output_tokens = slot.reasoning_output_tokens;
+        res->visible_output_tokens = slot.visible_output_tokens;
+        res->loop_guard_triggered  = slot.loop_guard_triggered;
+        res->loop_guard_action     = slot.loop_guard_action;
+        res->loop_guard_reason     = slot.loop_guard_reason;
         res->post_sampling_probs   = slot.task->params.post_sampling_probs;
 
         res->verbose           = slot.task->params.verbose;
@@ -2049,6 +2799,10 @@ private:
                     // release slot linked with the task id
                     for (auto & slot : slots) {
                         if (slot.task && slot.task->id == task.id_target) {
+                            if (slot.dm_adaptive) {
+                                slot.reset_request_state();
+                                SLT_INF(slot, "%s", "adaptive dm: reset state for canceled task\n");
+                            }
                             slot.release();
                             break;
                         }
@@ -2370,6 +3124,8 @@ private:
         int64_t t_verify_total = 0;
         int64_t t_accept_total = 0;
         int n_slots_drafted = 0;
+        server_slot * profit_baseline_slot = nullptr;
+        int n_profit_baseline_slots = 0;
 
         // DFlash: narrow the shared drafter graph when fewer than max slots are
         // actively drafting. When only 1 slot drafts, the graph builder uses
@@ -2382,22 +3138,24 @@ private:
         // decode. Results are stored in batched_drafts[] and consumed by the
         // per-slot loop below.
         std::vector<llama_tokens> batched_drafts(slots.size());
+        std::vector<std::vector<float>> batched_log_probs(slots.size());
+        const bool use_rejection_sampling = params_base.speculative.sample_temp > 0.0f && params_base.sampling.temp > 0.0f;
         if (ctx_dft_shared) {
             int n_drafting = 0;
-            for (const auto & slot : slots) {
-                if (slot.state == SLOT_STATE_GENERATING && slot.can_speculate() && slot.get_n_draft_max() > 0) {
+            for (auto & slot : slots) {
+                if (slot.state == SLOT_STATE_GENERATING && slot.can_speculate() && slot.get_n_draft_max(params_base, false) > 0) {
                     n_drafting++;
                 }
             }
             llama_set_dflash_n_slots(ctx_dft_shared.get(), std::max(1, n_drafting));
 
-            if (n_drafting >= 2 && params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+            if (n_drafting >= 2 && params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH && params_base.speculative.branch_budget == 0) {
                 std::vector<common_speculative *> batch_specs;
                 std::vector<llama_token>          batch_id_lasts;
                 std::vector<int>                  batch_slot_ids;
 
                 for (auto & slot : slots) {
-                    if (slot.state == SLOT_STATE_GENERATING && slot.can_speculate() && slot.get_n_draft_max() > 0) {
+                    if (slot.state == SLOT_STATE_GENERATING && slot.can_speculate() && slot.get_n_draft_max(params_base, false) > 0) {
                         batch_specs.push_back(slot.spec.get());
                         batch_id_lasts.push_back(slot.sampled);
                         batch_slot_ids.push_back(slot.id);
@@ -2405,17 +3163,24 @@ private:
                 }
 
                 std::vector<llama_tokens> batch_results;
+                std::vector<std::vector<float>> batch_log_probs;
                 const int64_t t_batch_start = ggml_time_us();
                 common_speculative_draft_batch(
                         batch_specs, ctx_dft_shared.get(),
-                        params_base.speculative, batch_id_lasts, batch_results);
+                        params_base.speculative, batch_id_lasts, batch_results,
+                        use_rejection_sampling ? &batch_log_probs : nullptr);
                 t_draft_total = ggml_time_us() - t_batch_start;
 
                 for (size_t i = 0; i < batch_slot_ids.size(); i++) {
                     batched_drafts[batch_slot_ids[i]] = std::move(batch_results[i]);
+                    if (use_rejection_sampling && i < batch_log_probs.size()) {
+                        batched_log_probs[batch_slot_ids[i]] = std::move(batch_log_probs[i]);
+                    }
                 }
             }
         }
+
+        bool ddtree_batch_active = false;
 
         // first, add sampled tokens from any ongoing sequences
         for (auto & slot : slots) {
@@ -2431,30 +3196,129 @@ private:
             }
 
             // generate draft tokens in speculative decoding mode
-            const int n_draft_max = slot.get_n_draft_max();
-            if (n_draft_max > 0) {
+            const int n_draft_max = slot.get_n_draft_max(params_base, true);
+
+            // For DFlash: when grammar is actively constraining, skip speculation
+            // instead of drafting and then falling back to full-vocab accept.
+            const bool dflash_grammar_active =
+                params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH &&
+                slot.smpl && !common_sampler_supports_reduced(slot.smpl.get());
+
+            if (n_draft_max > 0 && !dflash_grammar_active) {
                 const int64_t t_draft_slot_start = ggml_time_us();
-                if (mctx) {
-                    // we should never reach this, as speculative is automatically disabled if mmproj is loaded
+                if (mctx && params_base.speculative.type != COMMON_SPECULATIVE_TYPE_DFLASH) {
                     GGML_ABORT("not supported by multimodal");
+                }
+
+                auto params_spec = slot.task->params.speculative;
+                const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
+                const int original_n_max = params_spec.n_max;
+                params_spec.n_max = std::min(params_spec.n_max, n_draft_max);
+                const bool use_ddtree = params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH &&
+                    params_spec.branch_budget > 0 && batch.n_tokens == 0 && batched_drafts[slot.id].empty();
+
+                if (use_ddtree) {
+                    common_params_speculative params_tree = params_spec;
+                    params_tree.n_max_base = original_n_max; // original --draft-max before adaptive DM
+                    params_tree.n_max = std::min(params_tree.n_max, n_draft_max);
+
+                    int tree_budget = std::min<int>(params_tree.n_max_base + params_tree.branch_budget, params_tree.n_max_base * std::max<int>(1, params_tree.draft_topk));
+                    tree_budget = std::min(tree_budget, std::max(0, (int) llama_n_batch(ctx) - 1));
+                    tree_budget = std::min(tree_budget, std::max(0, (int) llama_n_ubatch(ctx) - 1));
+
+                    common_speculative_tree tree;
+                    if (tree_budget > 0) {
+                        tree = common_speculative_draft_tree(slot.spec.get(), params_tree, cached_text_tokens, slot.sampled, tree_budget);
+                    }
+
+                    if (tree.n_nodes > 0 && tree.main_path_len >= slot.task->params.speculative.n_min) {
+                        slot.n_tokens_before_draft = slot.prompt.n_tokens();
+                        slot.n_pos_before_draft = slot.prompt.tokens.pos_next();
+
+                        slot.spec_i_batch.push_back(batch.n_tokens);
+                        common_batch_add(batch, slot.sampled, slot.n_pos_before_draft, { slot.id }, true);
+                        slot.prompt.tokens.push_back(slot.sampled);
+
+                        for (int i = 0; i < tree.n_nodes; i++) {
+                            slot.spec_i_batch.push_back(batch.n_tokens);
+                            common_batch_add(batch, tree.tokens[i], slot.n_pos_before_draft + tree.depths[i], { slot.id }, true);
+                            slot.prompt.tokens.push_back(tree.tokens[i]);
+                        }
+
+                        slot.n_draft_total += tree.n_nodes;
+
+                        if (needs_reeval) {
+                            llama_tape_replay_sync(ctx);
+
+                            if (!recurrent_expanded) {
+                                if (llama_context_recurrent_expand(ctx, n_seq_max_full)) {
+                                    SRV_INF("expanded recurrent state to %d cells for speculative backup\n", n_seq_max_full);
+                                } else {
+                                    SRV_ERR("failed to expand recurrent state to %d cells\n", n_seq_max_full);
+                                    GGML_ABORT("failed to expand recurrent state for speculative backup; continuing would corrupt recurrent replay\n");
+                                }
+                                recurrent_expanded = true;
+                            }
+
+                            const llama_seq_id seq_backup = slot.id + n_parallel_user;
+                            auto * mem = llama_get_memory(ctx);
+                            llama_memory_seq_rm(mem, seq_backup, -1, -1);
+                            int n_branches = 0;
+                            for (size_t i = 1; i < tree.parents.size(); ++i) {
+                                if (tree.parents[i] != -1 && tree.parents[i] != (int32_t)(i - 1)) {
+                                    n_branches++;
+                                }
+                            }
+                            if (n_branches > 0) {
+                                llama_memory_seq_cp(mem, slot.id, seq_backup, -1, -1);
+                            } else {
+                                llama_memory_seq_cp_recurrent(mem, slot.id, seq_backup, -1, -1);
+                            }
+                            slot.has_draft_backup = true;
+                            slot.has_recurrent_only_backup = (n_branches == 0);
+                        }
+
+                        llama_set_tree_mask(ctx, tree.visibility.data(), tree.n_nodes + 1);
+                        llama_set_tree_parent_ids(ctx, tree.parents.data(), tree.n_nodes + 1);
+
+                        slot.drafted = tree.tokens;
+                        slot.draft_log_probs = tree.log_probs;
+                        slot.draft_tree = std::move(tree);
+                        slot.has_draft_tree = true;
+                        ddtree_batch_active = true;
+
+                        t_draft_total += ggml_time_us() - t_draft_slot_start;
+                        n_slots_drafted++;
+                        break;
+                    }
+
+                    SLT_DBG(slot, "%s", "DDTree draft unavailable, falling back to flat speculative decode\n");
                 }
 
                 // use pre-computed batched draft if available, else single-slot
                 llama_tokens draft;
                 if (!batched_drafts[slot.id].empty()) {
                     draft = std::move(batched_drafts[slot.id]);
+                    slot.draft_log_probs = std::move(batched_log_probs[slot.id]);
+                } else if (use_rejection_sampling) {
+                    slot.draft_log_probs.clear();
+                    draft = common_speculative_draft(slot.spec.get(), params_spec, cached_text_tokens, slot.sampled, &slot.draft_log_probs);
                 } else {
-                    const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
-                    const auto & params_spec = slot.task->params.speculative;
+                    slot.draft_log_probs.clear();
                     draft = common_speculative_draft(slot.spec.get(), params_spec, cached_text_tokens, slot.sampled);
                 }
+                slot.spec_pad_i_batch.clear();
 
                 if (draft.size() > (size_t) n_draft_max) {
                     SLT_WRN(slot, "draft size %d exceeds max %d, truncating\n", (int) draft.size(), n_draft_max);
                     draft.resize(n_draft_max);
+                    if (slot.draft_log_probs.size() > (size_t) n_draft_max) {
+                        slot.draft_log_probs.resize(n_draft_max);
+                    }
                 }
 
                 slot.n_tokens_before_draft = slot.prompt.n_tokens();
+                slot.n_pos_before_draft = slot.prompt.tokens.pos_next();
 
                 // add the sampled token to the batch
                 slot.spec_i_batch.push_back(batch.n_tokens);
@@ -2467,37 +3331,44 @@ private:
                     slot.i_batch = slot.spec_i_batch[0];
                     slot.spec_draft.clear();
                     slot.spec_i_batch.clear();
+                    slot.spec_pad_i_batch.clear();
                 } else {
                     // keep track of total number of drafted tokens tested
                     slot.n_draft_total += draft.size();
 
                     if (needs_reeval) {
-                        // DFlash: sync previous tape replay, set linear parent IDs for tree kernel
+                        // DFlash: sync previous tape replay
                         if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
                             llama_tape_replay_sync(ctx);
-                            const int n_batch_tokens = 1 + (int) draft.size();
-                            std::vector<int32_t> linear_parents(n_batch_tokens);
-                            linear_parents[0] = -1; // root loads initial state
-                            for (int i = 1; i < n_batch_tokens; i++) {
-                                linear_parents[i] = i - 1;
+                            // Only set tree parent IDs when tree budget > 0.
+                            // Flat mode uses standard (non-tree) kernels to avoid
+                            // tree-aware kernel divergence on hidden states.
+                            if (params_base.speculative.branch_budget > 0) {
+                                const int n_batch_tokens = 1 + (int) draft.size();
+                                std::vector<int32_t> linear_parents(n_batch_tokens);
+                                linear_parents[0] = -1; // root loads initial state
+                                for (int i = 1; i < n_batch_tokens; i++) {
+                                    linear_parents[i] = i - 1;
+                                }
+                                llama_set_tree_parent_ids(ctx, linear_parents.data(), n_batch_tokens);
                             }
-                            llama_set_tree_parent_ids(ctx, linear_parents.data(), n_batch_tokens);
                         }
 
                         if (!recurrent_expanded) {
-                            auto * mem = llama_get_memory(ctx);
-                            if (llama_memory_recurrent_expand(mem, n_seq_max_full)) {
+                            if (llama_context_recurrent_expand(ctx, n_seq_max_full)) {
                                 SRV_INF("expanded recurrent state to %d cells for speculative backup\n", n_seq_max_full);
                             } else {
                                 SRV_ERR("failed to expand recurrent state to %d cells\n", n_seq_max_full);
+                                GGML_ABORT("failed to expand recurrent state for speculative backup; continuing would corrupt recurrent replay\n");
                             }
                             recurrent_expanded = true;
                         }
                         const llama_seq_id seq_backup = slot.id + n_parallel_user;
                         auto * mem = llama_get_memory(ctx);
                         llama_memory_seq_rm(mem, seq_backup, -1, -1);
-                        llama_memory_seq_cp(mem, slot.id, seq_backup, -1, -1);
+                        llama_memory_seq_cp_recurrent(mem, slot.id, seq_backup, -1, -1);
                         slot.has_draft_backup = true;
+                        slot.has_recurrent_only_backup = true;
                     }
 
                     // add all drafted tokens to the batch
@@ -2506,11 +3377,40 @@ private:
                         common_batch_add(batch, draft[i], slot.prompt.tokens.pos_next(), { slot.id }, true);
                         slot.prompt.tokens.push_back(draft[i]);
                     }
+                    const int active_verify_draft_max = n_draft_max;
+                    if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH &&
+                            params_base.speculative.branch_budget == 0 &&
+                            !use_rejection_sampling &&
+                            draft.size() < (size_t) active_verify_draft_max &&
+                            common_sampler_supports_reduced(slot.smpl.get()) &&
+                            dflash_select_reduced_verify_plan(params_base.sampling, params_base.speculative,
+                                    use_rejection_sampling, false).enabled) {
+                        const int max_pad_draft = std::min<int>(active_verify_draft_max,
+                                std::min<int>((int) llama_n_batch(ctx) - 1, (int) llama_n_ubatch(ctx) - 1));
+                        const int max_rows = std::min<int>((int) llama_n_batch(ctx), (int) llama_n_ubatch(ctx));
+                        const int rows_available = std::max<int>(0, max_rows - batch.n_tokens);
+                        const int pad_count = std::min<int>(rows_available, std::max<int>(0, max_pad_draft - (int) draft.size()));
+                        const llama_pos pad_pos0 = slot.prompt.tokens.pos_next();
+                        for (int i = 0; i < pad_count; ++i) {
+                            slot.spec_pad_i_batch.push_back(batch.n_tokens);
+                            common_batch_add(batch, slot.sampled, pad_pos0 + i, { slot.id }, true);
+                        }
+                        if (pad_count > 0) {
+                            SLT_DBG(slot, "padded DFlash verifier batch by %d tokens to active graph shape\n", pad_count);
+                        }
+                    }
                     slot.spec_draft = std::move(draft);
                 }
                 t_draft_total += ggml_time_us() - t_draft_slot_start;
                 n_slots_drafted++;
             } else {
+                if (slot.can_speculate() && slot.dm_adaptive &&
+                        server_adaptive_dm_uses_profit_controller(slot.dm_controller) &&
+                        slot.adaptive_n_max == 0) {
+                    profit_baseline_slot = &slot;
+                    n_profit_baseline_slots++;
+                }
+
                 // no speculative decoding
                 slot.i_batch = batch.n_tokens;
 
@@ -2535,7 +3435,7 @@ private:
         size_t alora_disabled_id = 0;
 
         // next, batch any pending prompts without exceeding n_batch
-        if (params_base.cont_batching || batch.n_tokens == 0) {
+        if (!ddtree_batch_active && (params_base.cont_batching || batch.n_tokens == 0)) {
             for (auto & slot : slots) {
                 if (!slot.is_processing()) {
                     continue;
@@ -2896,11 +3796,11 @@ private:
                     // checkpoints are created only if:
                     // - the model does not support partial sequence removal
                     // - the model uses SWA (and we are not using `swa_full`)
-                    // - the model is hybrid (recurrent state can't be partially rolled back
-                    //   even though seq_rm returns true for speculative decode purposes)
+                    // - the model is recurrent or hybrid (needed for ring buffer state + prompt caching)
                     do_checkpoint = do_checkpoint && (
                             (slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) ||
                             (n_swa > 0) ||
+                            llama_model_is_recurrent(model) ||
                             llama_model_is_hybrid(model));
 
                     bool has_mtmd = false;
@@ -3133,6 +4033,27 @@ private:
             llama_set_force_split_seq(ctx, false);
         }
 
+        const dflash_reduced_verify_plan dflash_verify_plan =
+            dflash_select_reduced_verify_plan(params_base.sampling, params_base.speculative,
+                    use_rejection_sampling, ddtree_batch_active);
+        bool dflash_reduced_verify_ready = false;
+        int  dflash_reduced_verify_top_k = dflash_verify_plan.top_k;
+        int32_t dflash_reduced_verify_view_start = 0;
+        bool dflash_verify_graph_enabled = false;
+
+        if (dflash_verify_plan.enabled) {
+            for (int32_t j = 0; j < batch.n_tokens; j += std::min(n_batch, batch.n_tokens - j)) {
+                const int32_t n_tokens_probe = std::min(n_batch, batch.n_tokens - j);
+                const char * dflash_reduce_reason_probe = dflash_verify_plan.reason;
+                if (dflash_batch_view_is_reduced_verify(slots, j, n_tokens_probe,
+                            dflash_verify_plan.top_k, &dflash_reduce_reason_probe)) {
+                    dflash_verify_graph_enabled = true;
+                    break;
+                }
+            }
+        }
+        llama_set_dflash_verify_logits(ctx, dflash_verify_graph_enabled, dflash_verify_plan.top_k);
+
         // process the created batch of tokens
         for (int32_t i = 0; i < batch.n_tokens; i = i_next) {
             const int32_t n_tokens = std::min(n_batch, batch.n_tokens - i);
@@ -3147,11 +4068,33 @@ private:
                 batch.logits   + i,
             };
 
+            dflash_reduced_verify_ready = false;
+            const char * dflash_reduce_reason = dflash_verify_plan.reason;
+            bool dflash_reduce_this_view = false;
+            if (dflash_verify_plan.enabled) {
+                dflash_reduce_this_view =
+                    dflash_batch_view_is_reduced_verify(slots, i, n_tokens,
+                            dflash_verify_plan.top_k, &dflash_reduce_reason);
+            }
+            if (dflash_server_profile_enabled() && params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                SRV_INF("dflash reduced verifier: enabled=%d view_start=%d n_tokens=%d top_k=%d reason=%s\n",
+                        dflash_reduce_this_view ? 1 : 0, i, n_tokens,
+                        dflash_verify_plan.top_k, dflash_reduce_reason);
+            }
+            llama_set_dflash_consume_reduced(ctx, dflash_reduce_this_view);
+
             const int64_t t_verify_start = ggml_time_us();
             const int ret = llama_decode(ctx, batch_view);
+            if (ret == 0 && dflash_reduce_this_view &&
+                    llama_get_logits_argmax(ctx) != nullptr &&
+                    llama_get_logits_argmax_k(ctx) == dflash_verify_plan.top_k) {
+                dflash_reduced_verify_ready = true;
+                dflash_reduced_verify_top_k = dflash_verify_plan.top_k;
+                dflash_reduced_verify_view_start = i;
+            }
             const int64_t t_verify_elapsed = ggml_time_us() - t_verify_start;
             t_verify_total += t_verify_elapsed;
-            SRV_INF("  verify ubatch: %d tok, %.1fms (%.2fms/tok)\n",
+            SRV_INF("  decode ubatch: %d tok, %.1fms (%.2fms/tok)\n",
                     n_tokens, t_verify_elapsed / 1e3, t_verify_elapsed / 1e3 / std::max(1, n_tokens));
 
             metrics.on_decoded(slots);
@@ -3286,7 +4229,7 @@ private:
                     continue; // continue loop of slots
                 }
 
-                if (slot.can_speculate() && !slot.spec_draft.empty()) {
+                if (slot.can_speculate() && (!slot.spec_draft.empty() || slot.has_draft_tree)) {
                     continue; // sample using speculative decoding
                 }
 
@@ -3347,23 +4290,172 @@ private:
                 }
             }
 
+            if (ddtree_batch_active) {
+                llama_clear_tree_mask(ctx);
+                const bool has_pending_tree_slot = std::any_of(slots.begin(), slots.end(), [](const server_slot & s) {
+                    return s.state == SLOT_STATE_GENERATING && s.has_draft_tree && !s.spec_i_batch.empty();
+                });
+                if (!has_pending_tree_slot) {
+                    llama_clear_tree_parent_ids(ctx);
+                }
+            }
+
             // speculative decoding - main model sample and accept
             const int64_t t_accept_start = ggml_time_us();
             for (auto & slot : slots) {
-                if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() || slot.spec_draft.empty()) {
+                if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() || (slot.spec_draft.empty() && !slot.has_draft_tree)) {
                     continue;
                 }
 
-                // save the original draft size
-                const size_t n_draft = slot.spec_draft.size();
+                const bool is_draft_tree = slot.has_draft_tree;
+                const size_t n_draft = is_draft_tree ? (size_t) slot.draft_tree.n_nodes : slot.spec_draft.size();
+                const bool had_dflash_padding = !slot.spec_pad_i_batch.empty();
+                const bool profile_dflash_accept = dflash_server_profile_enabled() &&
+                        params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH;
+                const int64_t profile_accept_start = profile_dflash_accept ? ggml_time_us() : 0;
+                int64_t profile_accept_phase_start = profile_accept_start;
+                int64_t profile_accept_sample_us = 0;
+                int64_t profile_accept_update_us = 0;
+                int64_t profile_accept_book_us = 0;
+                int64_t profile_accept_rollback_us = 0;
+                int64_t profile_accept_emit_us = 0;
+                auto profile_accept_lap = [&](int64_t & dst) {
+                    if (!profile_dflash_accept) {
+                        return;
+                    }
+                    const int64_t now = ggml_time_us();
+                    dst += now - profile_accept_phase_start;
+                    profile_accept_phase_start = now;
+                };
 
-                // the accepted tokens from the speculation
-                const auto ids = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx, slot.spec_i_batch, slot.spec_draft);
+                llama_tokens ids;
+                int  tree_commit_n = 0;
+                bool tree_accepted_on_main_path = true;
+                std::vector<int> capture_indices;  // populated in tree path, used after rollback
 
-                // update DFlash hidden state ring + CopySpec prompt window with accepted tokens.
-                // Must run BEFORE rollback (matches speculative-simple ordering) and BEFORE clearing
-                // slot.spec_draft so batch_tokens reflects the full verification batch [id_last, drafts].
-                {
+                if (is_draft_tree) {
+                    const bool use_tree_rejection = params_base.speculative.sample_temp > 0.0f
+                                                   && params_base.sampling.temp > 0.0f
+                                                   && !slot.draft_log_probs.empty();
+                    const float inv_temp = (params_base.sampling.temp > 0.0f) ? (1.0f / params_base.sampling.temp) : 1.0f;
+                    const int32_t max_batch_idx = slot.spec_i_batch.empty() ? -1 :
+                        *std::max_element(slot.spec_i_batch.begin(), slot.spec_i_batch.end());
+                    log_norm_cache ln_cache(ctx, params_base.sampling.temp, max_batch_idx);
+                    int current = 0;
+                    while (true) {
+                        const llama_token id = common_sampler_sample(slot.smpl.get(), ctx, slot.spec_i_batch[current]);
+                        ids.push_back(id);
+
+                        auto it = slot.draft_tree.child_maps[current].find(id);
+                        if (it != slot.draft_tree.child_maps[current].end()) {
+                            common_sampler_accept(slot.smpl.get(), id, true);
+                            current = it->second;
+                            tree_commit_n = current;
+                            if (current > slot.draft_tree.main_path_len) {
+                                tree_accepted_on_main_path = false;
+                            }
+                            slot.n_reject_exact++;
+                            continue;
+                        }
+
+                        if (use_tree_rejection) {
+                            const auto & child_map = slot.draft_tree.child_maps[current];
+                            if (!child_map.empty()) {
+                                const float log_norm = ln_cache.get(slot.spec_i_batch[current]);
+                                const float * logits_ptr = (log_norm > -FLT_MAX) ? llama_get_logits_ith(ctx, slot.spec_i_batch[current]) : nullptr;
+                                int accepted_child = -1;
+                                for (const auto & [tok, child_idx] : child_map) {
+                                    if (child_idx < 1 || (size_t)child_idx > slot.draft_log_probs.size()) continue;
+                                    const float q_log = slot.draft_log_probs[child_idx - 1];
+                                    if (!std::isfinite(q_log) || q_log > 0.0f) continue;
+                                    const float log_prob = logits_ptr ? logits_ptr[tok] * inv_temp - log_norm : -FLT_MAX;
+                                    const float accept_prob = (log_prob > -FLT_MAX) ? std::min(1.0f, expf(log_prob - q_log)) : 0.0f;
+                                    std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
+                                    if (uniform(slot.reject_rng) < accept_prob) {
+                                        accepted_child = child_idx;
+                                        break;
+                                    }
+                                }
+                                if (accepted_child > 0) {
+                                    const llama_token accepted_token = slot.draft_tree.tokens[accepted_child - 1];
+                                    common_sampler_accept(slot.smpl.get(), accepted_token, true);
+                                    ids.back() = accepted_token;
+                                    current = accepted_child;
+                                    tree_commit_n = accepted_child;
+                                    if (accepted_child > slot.draft_tree.main_path_len) {
+                                        tree_accepted_on_main_path = false;
+                                    }
+                                    slot.n_reject_prob_accept++;
+                                    continue;
+                                }
+                            }
+                            slot.n_reject_reject++;
+                        }
+                        common_sampler_accept(slot.smpl.get(), id, true);
+                        break;
+                    }
+
+                    if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                        llama_dflash_set_active_slot(ctx, slot.id);
+                    }
+
+                    // Build capture-buffer indices for the accepted tree path.
+                    // Capture buffer order: [id_last(pos0), tree_node_0(pos1), tree_node_1(pos2), ...]
+                    // accepted_path contains 1-based tree node indices; capture-buffer index == node index.
+                    std::vector<int> accepted_path;
+                    for (int node = tree_commit_n; node > 0; node = slot.draft_tree.parents[node]) {
+                        accepted_path.push_back(node);
+                    }
+                    std::reverse(accepted_path.begin(), accepted_path.end());
+
+                    llama_tokens accepted_tokens;
+                    accepted_tokens.push_back(slot.sampled);
+                    capture_indices.clear();
+                    capture_indices.push_back(0);  // root (id_last) at capture-buffer position 0
+                    for (int node : accepted_path) {
+                        accepted_tokens.push_back(slot.draft_tree.tokens[node - 1]);
+                        capture_indices.push_back(node);  // node is 1-based, matches capture-buffer position
+                    }
+                    // Note: ring write deferred to AFTER rollback — off-main-path re-decode
+                    // overwrites the capture buffer, so we must write fresh hidden states.
+                } else {
+                    // the accepted tokens from the speculation
+                    const bool use_rejection = params_base.speculative.sample_temp > 0.0f
+                                            && params_base.sampling.temp > 0.0f
+                                            && !slot.draft_log_probs.empty();
+                    if (use_rejection) {
+                        ids = speculative_reject_sample(slot.smpl.get(), ctx, slot.spec_draft,
+                            slot.spec_i_batch, slot.draft_log_probs, params_base.sampling.temp, slot.reject_rng,
+                            slot.n_reject_exact, slot.n_reject_prob_accept, slot.n_reject_reject, slot.n_reject_no_prob);
+                    } else {
+                        if (dflash_reduced_verify_ready && dflash_verify_plan.enabled) {
+                            std::vector<int> reduced_idxs = slot.spec_i_batch;
+                            for (int & idx : reduced_idxs) {
+                                idx -= dflash_reduced_verify_view_start;
+                            }
+                            ids = dflash_sample_reduced_verify(slot.smpl.get(), ctx, reduced_idxs,
+                                    slot.spec_draft, dflash_reduced_verify_top_k);
+                            if (ids.empty()) {
+                                GGML_ABORT("DFlash reduced verifier output missing; falling back is unsafe because raw logits were not copied\n");
+                            }
+                        } else {
+                            ids = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx, slot.spec_i_batch, slot.spec_draft);
+                        }
+                    }
+                    profile_accept_lap(profile_accept_sample_us);
+
+                    const int32_t remaining = slot.remaining_generation_budget(params_base);
+                    if (remaining != -1 && (int32_t) ids.size() > remaining) {
+                        SLT_WRN(slot, "accepted draft tokens exceed remaining budget (%d > %d), truncating\n",
+                                (int) ids.size(), remaining);
+                        ids.resize((size_t) std::max<int32_t>(0, remaining));
+                    }
+                    GGML_ASSERT(slot.remaining_generation_budget(params_base) == -1 ||
+                            (int32_t) ids.size() <= slot.remaining_generation_budget(params_base));
+
+                    // update DFlash hidden state ring + CopySpec prompt window with accepted tokens.
+                    // Must run BEFORE rollback (matches speculative-simple ordering) and BEFORE clearing
+                    // slot.spec_draft so batch_tokens reflects the full verification batch [id_last, drafts].
                     if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
                         llama_dflash_set_active_slot(ctx, slot.id);
                     }
@@ -3371,60 +4463,285 @@ private:
                     batch_tokens.push_back(slot.sampled);
                     batch_tokens.insert(batch_tokens.end(), slot.spec_draft.begin(), slot.spec_draft.end());
                     common_speculative_update_logits(slot.spec.get(), ctx, batch_tokens, (int) ids.size());
+                    profile_accept_lap(profile_accept_update_us);
                 }
 
+                GGML_ASSERT(slot.remaining_generation_budget(params_base) == -1 ||
+                        (int32_t) ids.size() <= slot.remaining_generation_budget(params_base));
+
                 slot.spec_i_batch.clear();
+                slot.spec_pad_i_batch.clear();
                 slot.spec_draft.clear();
 
                 const int64_t t_current = ggml_time_us();
 
-                slot.n_decoded += ids.size();
-                slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
+                if (ids.empty()) {
+                    slot.stop = STOP_TYPE_LIMIT;
+                    slot.stop_detail = "token_limit";
+                    slot.has_next_token = false;
+                    slot.print_timings();
+                    send_final_response(slot);
+                    metrics.on_prediction(slot);
+                    slot.release();
+                    continue;
+                }
 
                 // update how many tokens out of those tested were accepted
                 slot.n_draft_accepted += ids.size() - 1;
 
+                // adaptive dm: collect shared telemetry, then let the selected controller own n_max.
+                if (slot.dm_adaptive && !is_draft_tree) {
+                    const int n_accepted = (int)ids.size() - 1;
+                    slot.observe_profit_acceptance((int) n_draft, n_accepted);
+                    slot.profit_pending = true;
+                    slot.profit_pending_n_draft = (int32_t) n_draft;
+                    slot.profit_pending_n_accepted = n_accepted;
+                    slot.profit_pending_tree = false;
+
+                    if (server_adaptive_dm_uses_fringe_controller(slot.dm_controller)) {
+                        const int32_t prev_adaptive_n_max = slot.adaptive_n_max;
+
+                        // record this cycle in the fringe ring buffer
+                        {
+                            server_slot::fringe_entry & e = slot.fringe_ring[slot.fringe_ring_idx];
+                            e.n_accepted = (int16_t) n_accepted;
+                            e.n_draft    = (int16_t) n_draft;
+                            e.epoch      = slot.fringe_epoch;
+                            slot.fringe_ring_idx = (slot.fringe_ring_idx + 1) % server_slot::FRINGE_WINDOW;
+                            if (slot.fringe_ring_count < server_slot::FRINGE_WINDOW) {
+                                slot.fringe_ring_count++;
+                            }
+                        }
+                        const int reached_positions = std::min<int>(n_draft, server_slot::FRINGE_REACH_POSITIONS);
+                        for (int pos = 0; pos < reached_positions; pos++) {
+                            slot.fringe_epoch_reached[pos]++;
+                        }
+                        const int accepted_positions = std::min<int>(n_accepted, server_slot::FRINGE_REACH_POSITIONS);
+                        for (int pos = 0; pos < accepted_positions; pos++) {
+                            slot.fringe_epoch_accepted[pos]++;
+                        }
+
+                        // compute fringe rate across trailing window at current n_max
+                        const int base_n_max = common_speculative_n_max(slot.spec.get(), slot.task->params.speculative);
+                        const int fringe_n_max = std::max(0, slot.adaptive_n_max > 0 ? slot.adaptive_n_max : base_n_max);
+
+                        const auto decision = slot.fringe_decision_at_window(fringe_n_max, slot.dm_fringe_window, slot.dm_min_reach);
+                        const float decision_fringe = decision.fringe;
+                        const int decision_reached = decision.reached;
+                        const int decision_accepted = decision.accepted;
+                        slot.rolling_fringe = decision_fringe;
+
+                        // fluid interpolation: fringe_min..fringe_max → n_max 2..base_n_max
+                        int target_n_max;
+                        if (decision_fringe < slot.dm_fringe_min) {
+                            target_n_max = 0; // off
+                        } else if (decision_fringe >= slot.dm_fringe_max) {
+                            target_n_max = base_n_max;
+                        } else {
+                            float t = (decision_fringe - slot.dm_fringe_min)
+                                    / (slot.dm_fringe_max - slot.dm_fringe_min);
+                            target_n_max = std::max(2, (int)(base_n_max * t + 0.5f));
+                            target_n_max = std::min(target_n_max, base_n_max);
+                        }
+
+                        // dwell time: require consecutive below-min readings before going off
+                        if (target_n_max == 0 && prev_adaptive_n_max > 0) {
+                            slot.off_dwell++;
+                            if (slot.off_dwell < slot.dm_off_dwell) {
+                                target_n_max = prev_adaptive_n_max; // stay on
+                            } else {
+                                slot.off_dwell = 0;
+                            }
+                        } else {
+                            slot.off_dwell = 0;
+                        }
+
+                        // rate limit: max +/-2 change per cycle to prevent whiplash
+                        if (target_n_max > 0 && prev_adaptive_n_max > 0) {
+                            int delta = target_n_max - prev_adaptive_n_max;
+                            delta = std::clamp(delta, -2, 2);
+                            target_n_max = prev_adaptive_n_max + delta;
+                        }
+
+                        if (target_n_max > prev_adaptive_n_max && target_n_max > 0 && prev_adaptive_n_max > 0) {
+                            const int win_start = std::max(0, target_n_max - slot.dm_fringe_window);
+                            int guard_reached = 0;
+                            int guard_accepted = 0;
+                            for (int pos = win_start; pos < target_n_max; pos++) {
+                                if (pos < server_slot::FRINGE_REACH_POSITIONS) {
+                                    guard_reached += slot.fringe_epoch_reached[pos];
+                                    guard_accepted += slot.fringe_epoch_accepted[pos];
+                                }
+                            }
+                            const float guard_fringe = guard_reached > 0 ? (float)guard_accepted / guard_reached : 0.0f;
+                            const float required_fringe = server_adaptive_dm_required_fringe_for_n_max(
+                                    target_n_max, base_n_max, slot.dm_fringe_min, slot.dm_fringe_max);
+                            if (guard_reached < slot.dm_min_reach || guard_fringe < required_fringe) {
+                                target_n_max = prev_adaptive_n_max;
+                            }
+                        }
+
+                        const bool demoting = prev_adaptive_n_max > 0 && target_n_max < prev_adaptive_n_max;
+                        const bool going_off = prev_adaptive_n_max > 0 && target_n_max == 0;
+                        if (demoting) {
+                            slot.fringe_epoch++;
+                            slot.reset_fringe_epoch_reached();
+                        }
+                        if (going_off) {
+                            slot.off_dwell = 0;
+                        }
+
+                        slot.adaptive_n_max = target_n_max;
+                        slot.adaptive_probe_counter = 0;
+                        if (slot.adaptive_n_max != prev_adaptive_n_max) {
+                            SLT_INF(slot, "adaptive dm: fringe=%.2f (win=%d, rch %d, acc %d) n_max=%d->%d\n",
+                                    slot.rolling_fringe, fringe_n_max, decision_reached, decision_accepted,
+                                    prev_adaptive_n_max, slot.adaptive_n_max);
+                        }
+                    }
+                }
+
+                // inform the speculative decoding about the number of accepted tokens
+                common_speculative_accept(slot.spec.get(), ids.size() - 1);
+
+                // rollback to the state before sampling the draft tokens
+                if (is_draft_tree) {
+                    slot.prompt.tokens.keep_first(slot.n_tokens_before_draft + 1);
+                } else {
+                    slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);
+                }
+
                 // add accepted tokens to the prompt
-                slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);
                 slot.prompt.tokens.insert(llama_tokens(ids.begin(), ids.end() - 1));
+                profile_accept_lap(profile_accept_book_us);
 
                 if (slot.has_draft_backup) {
                     const llama_seq_id seq_backup = slot.id + n_parallel_user;
-                    const bool all_accepted = (ids.size() == n_draft + 1);
+                    const bool all_accepted_flat = (ids.size() == n_draft + 1) && !had_dflash_padding;
 
-                    if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                    if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH && is_draft_tree) {
+                        llama_dflash_set_active_slot(ctx, slot.id);
+
+                        const int commit_depth = tree_commit_n > 0 ? slot.draft_tree.depths[tree_commit_n - 1] : 0;
+                        llama_tree_rollback_seq(ctx, slot.id, seq_backup, tree_commit_n, slot.draft_tree.parents.data(),
+                                slot.n_pos_before_draft + commit_depth);
+                        llama_clear_tree_parent_ids(ctx);
+
+                        auto * mem = llama_get_memory(ctx);
+                        const int n_branches = slot.draft_tree.n_nodes - slot.draft_tree.main_path_len;
+                        const bool all_accepted_tree = commit_depth == slot.draft_tree.main_path_len && tree_accepted_on_main_path;
+
+                        if (n_branches == 0 && tree_accepted_on_main_path) {
+                            if (!all_accepted_tree) {
+                                llama_memory_seq_rm(mem, slot.id, slot.n_pos_before_draft + commit_depth + 1, -1);
+                            }
+                            llama_memory_seq_rm(mem, seq_backup, -1, -1);
+                        } else if (tree_accepted_on_main_path) {
+                            // Selective branch-cell removal: keep main-path KV cells, remove branch cells.
+                            // For accepted main-path positions (1..commit_depth), remove extra cells at each position.
+                            // For rejected positions (> commit_depth), remove all cells.
+                            // The main-path cell at a position is the one with the lowest cell index
+                            // (because find_slot assigns cells in ubatch order, and main-path tokens
+                            // come first in the tree verify batch).
+
+                            const llama_pos n_before = slot.n_pos_before_draft;
+
+                            // Collect the set of depths that have branch nodes.
+                            // Only branch depths need cells_at_pos calls; main-path-only
+                            // depths always have exactly 1 cell (no removal needed).
+                            std::set<int> branch_depths;
+                            for (int i = slot.draft_tree.main_path_len; i < slot.draft_tree.n_nodes; ++i) {
+                                int d = slot.draft_tree.depths[i];
+                                if (d >= 1 && d <= commit_depth) {
+                                    branch_depths.insert(d);
+                                }
+                            }
+
+                            // 1. Remove branch cells at branch depths within committed range
+                            for (int d : branch_depths) {
+                                llama_pos pos = n_before + d;
+                                uint32_t cell_indices[64];
+                                int n_cells = llama_memory_cells_at_pos(mem, slot.id, pos, cell_indices, 64);
+                                if (n_cells > 1) {
+                                    std::sort(cell_indices, cell_indices + std::min(n_cells, 64));
+                                    for (int c = 1; c < std::min(n_cells, 64); ++c) {
+                                        llama_memory_seq_rm_cell(mem, slot.id, cell_indices[c]);
+                                    }
+                                }
+                            }
+
+                            // 2. Remove all cells at rejected positions (> commit_depth)
+                            //    Find max depth from tree
+                            int max_depth = 0;
+                            for (int i = 0; i < slot.draft_tree.n_nodes; ++i) {
+                                max_depth = std::max(max_depth, slot.draft_tree.depths[i]);
+                            }
+                            if (max_depth > commit_depth) {
+                                llama_memory_seq_rm(mem, slot.id, n_before + commit_depth + 1, n_before + max_depth + 1);
+                            }
+
+                            llama_memory_seq_rm(mem, seq_backup, -1, -1);
+                        } else {
+                            // Acceptance went off main path — full backup-restore + re-decode
+                            llama_memory_seq_rm(mem, slot.id, slot.n_pos_before_draft, -1);
+                            llama_memory_seq_cp(mem, seq_backup, slot.id, -1, -1);
+                            llama_memory_seq_rm(mem, seq_backup, -1, -1);
+
+                            const int n_reeval = slot.prompt.n_tokens() - slot.n_tokens_before_draft;
+                            if (n_reeval > 0) {
+                                llama_batch batch_reeval = llama_batch_init(n_reeval, 0, 1);
+                                for (int j = slot.n_tokens_before_draft; j < slot.prompt.n_tokens(); ++j) {
+                                    common_batch_add(batch_reeval, slot.prompt.tokens[j], slot.prompt.tokens.pos_next(j), { slot.id }, false);
+                                }
+                                llama_decode(ctx, batch_reeval);
+                                llama_batch_free(batch_reeval);
+
+                                capture_indices.clear();
+                                for (int j = 0; j < n_reeval; ++j) {
+                                    capture_indices.push_back(j);
+                                }
+                            }
+                        }
+
+                        // Write accepted hidden states to DFlash ring buffer AFTER rollback.
+                        // For off-main-path, the re-decode above refreshed the capture buffer.
+                        // For on-main-path, hidden states from tree verify decode are still valid.
+                        if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                            llama_dflash_set_active_slot(ctx, slot.id);
+                            common_speculative_update_logits_by_indices(slot.spec.get(), ctx, capture_indices);
+                        }
+                    } else if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
                         // DFlash: use tape replay for fast rollback (matches speculative-simple).
                         // Route replay through this slot's tape.
                         llama_dflash_set_active_slot(ctx, slot.id);
-                        if (all_accepted) {
+                        if (all_accepted_flat) {
                             llama_clear_tree_parent_ids(ctx);
                             auto * mem = llama_get_memory(ctx);
                             llama_memory_seq_rm(mem, seq_backup, -1, -1);
-                            llama_memory_seq_rm(mem, slot.id, slot.prompt.n_tokens(), -1);
+                            llama_memory_seq_rm(mem, slot.id, slot.prompt.tokens.pos_next(), -1);
                         } else {
                             llama_clear_tree_parent_ids(ctx);
-                            llama_dflash_rollback(ctx, slot.id, seq_backup, slot.n_tokens_before_draft, (int) ids.size());
+                            llama_dflash_rollback(ctx, slot.id, seq_backup, slot.n_pos_before_draft, (int) ids.size());
                         }
                     } else {
                         // Generic: backup-restore + re-decode for other speculative types
                         auto * mem = llama_get_memory(ctx);
 
-                        if (all_accepted) {
+                        if (all_accepted_flat) {
                             llama_memory_seq_rm(mem, seq_backup, -1, -1);
-                            llama_memory_seq_rm(mem, slot.id, slot.prompt.n_tokens(), -1);
+                            llama_memory_seq_rm(mem, slot.id, slot.prompt.tokens.pos_next(), -1);
                         } else {
-                            const int n_past_before = slot.n_tokens_before_draft;
+                            const llama_pos pos_before = slot.n_pos_before_draft;
 
-                            llama_memory_seq_rm(mem, slot.id, n_past_before, -1);
+                            llama_memory_seq_rm(mem, slot.id, pos_before, -1);
                             llama_memory_seq_cp(mem, seq_backup, slot.id, -1, -1);
                             llama_memory_seq_rm(mem, seq_backup, -1, -1);
 
-                            const int n_reeval = slot.prompt.n_tokens() - n_past_before;
+                            const int n_reeval = slot.prompt.n_tokens() - slot.n_tokens_before_draft;
                             if (n_reeval > 0) {
                                 llama_batch batch_reeval = llama_batch_init(n_reeval, 0, 1);
-                                const auto & toks = slot.prompt.tokens.get_text_tokens();
-                                for (int j = n_past_before; j < slot.prompt.n_tokens(); ++j) {
-                                    common_batch_add(batch_reeval, toks[j], j, { slot.id }, false);
+                                for (int j = slot.n_tokens_before_draft; j < slot.prompt.n_tokens(); ++j) {
+                                    common_batch_add(batch_reeval, slot.prompt.tokens[j], slot.prompt.tokens.pos_next(j), { slot.id }, false);
                                 }
                                 llama_decode(ctx, batch_reeval);
                                 llama_batch_free(batch_reeval);
@@ -3433,11 +4750,33 @@ private:
                     }
 
                     slot.has_draft_backup = false;
+                    slot.has_recurrent_only_backup = false;
                 } else {
-                    llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
+                    llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.tokens.pos_next(), -1);
+                    if (is_draft_tree) {
+                        llama_clear_tree_parent_ids(ctx);
+                    }
                 }
+                profile_accept_lap(profile_accept_rollback_us);
+
+                slot.spec_i_batch.clear();
+                slot.spec_pad_i_batch.clear();
+                slot.drafted.clear();
+                slot.draft_tree.tokens.clear();
+                slot.draft_tree.parents.clear();
+                slot.draft_tree.depths.clear();
+                slot.draft_tree.child_maps.clear();
+                slot.draft_tree.visibility.clear();
+                slot.draft_tree.log_probs.clear();
+                slot.draft_tree.n_nodes = 0;
+                slot.draft_tree.main_path_len = 0;
+                slot.has_draft_tree = false;
+                slot.draft_log_probs.clear();
 
                 for (size_t i = 0; i < ids.size(); ++i) {
+                    slot.n_decoded += 1;
+                    slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
+
                     completion_token_output result;
 
                     result.tok          = ids[i];
@@ -3455,10 +4794,90 @@ private:
                         break;
                     }
                 }
+                profile_accept_lap(profile_accept_emit_us);
+
+                if (profile_dflash_accept) {
+                    SLT_INF(slot,
+                            "dflash profile: accept n_draft=%zu ids=%zu sample=%.3f ms update=%.3f ms "
+                            "book=%.3f ms rollback=%.3f ms emit=%.3f ms total=%.3f ms\n",
+                            n_draft, ids.size(),
+                            profile_accept_sample_us / 1e3,
+                            profile_accept_update_us / 1e3,
+                            profile_accept_book_us / 1e3,
+                            profile_accept_rollback_us / 1e3,
+                            profile_accept_emit_us / 1e3,
+                            (ggml_time_us() - profile_accept_start) / 1e3);
+                }
 
                 SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) ids.size() - 1, (int) n_draft, slot.prompt.n_tokens());
             }
             t_accept_total += ggml_time_us() - t_accept_start;
+        }
+
+        const bool pure_tg_cycle = n_tg_tokens > 0 && batch.n_tokens == n_tg_tokens;
+        auto apply_profit_decision = [&](server_slot & slot) {
+            if (!slot.task || !server_adaptive_dm_uses_profit_controller(slot.dm_controller)) {
+                return;
+            }
+
+            const int base_n_max = common_speculative_n_max(slot.spec.get(), slot.task->params.speculative);
+            const int prev_n_max = slot.adaptive_n_max;
+            int recommended = slot.decide_profit_n_max(base_n_max);
+
+            slot.apply_profit_recommendation(recommended);
+            slot.adaptive_probe_counter = 0;
+            if (slot.adaptive_n_max != prev_n_max) {
+                SLT_INF(slot, "adaptive dm profit: cur=%d recommended=%d score=%.1f action=apply\n",
+                        prev_n_max, slot.adaptive_n_max, (double) slot.profit_current_score);
+            }
+        };
+
+        if (pure_tg_cycle && n_slots_drafted == 1) {
+            const int64_t t_cycle_total_now = ggml_time_us() - t_cycle_start;
+            for (auto & slot : slots) {
+                if (!slot.profit_pending || slot.profit_pending_tree || !slot.task) {
+                    continue;
+                }
+
+                slot.observe_profit_timing(
+                        slot.profit_pending_n_draft,
+                        t_draft_total / 1000.0f,
+                        t_verify_total / 1000.0f,
+                        t_accept_total / 1000.0f,
+                        t_cycle_total_now / 1000.0f);
+
+                LOG_DBG("profit telemetry: n_draft=%d n_accepted=%d "
+                        "draft_ms=%.1f verify_ms=%.1f accept_ms=%.1f cycle_ms=%.1f "
+                        "n_encoded=%d\n",
+                        slot.profit_pending_n_draft,
+                        slot.profit_pending_n_accepted,
+                        t_draft_total / 1000.0,
+                        t_verify_total / 1000.0,
+                        t_accept_total / 1000.0,
+                        t_cycle_total_now / 1000.0,
+                        slot.n_decoded);
+
+                apply_profit_decision(slot);
+                slot.profit_pending = false;
+            }
+        } else {
+            for (auto & slot : slots) {
+                slot.profit_pending = false;
+            }
+        }
+        llama_set_dflash_consume_reduced(ctx, false);
+
+        if (pure_tg_cycle && n_slots_drafted == 0 && n_profit_baseline_slots == 1 && n_tg_tokens == 1 &&
+                profit_baseline_slot && profit_baseline_slot->task &&
+                profit_baseline_slot->state == SLOT_STATE_GENERATING) {
+            const int64_t t_cycle_total_now = ggml_time_us() - t_cycle_start;
+            profit_baseline_slot->observe_profit_timing(
+                    0,
+                    t_draft_total / 1000.0f,
+                    t_verify_total / 1000.0f,
+                    t_accept_total / 1000.0f,
+                    t_cycle_total_now / 1000.0f);
+            apply_profit_decision(*profit_baseline_slot);
         }
 
         // --- profiling: log per-cycle breakdown ---

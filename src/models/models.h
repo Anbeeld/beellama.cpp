@@ -206,6 +206,10 @@ struct llm_build_dflash_draft : public llm_graph_context {
     llm_build_dflash_draft(const llama_model & model, const llm_graph_params & params);
 };
 
+struct llm_build_dflash_kv_update : public llm_graph_context {
+    llm_build_dflash_kv_update(const llama_model & model, const llm_graph_params & params);
+};
+
 struct llm_build_ernie4_5 : public llm_graph_context {
     llm_build_ernie4_5(const llama_model & model, const llm_graph_params & params);
 };

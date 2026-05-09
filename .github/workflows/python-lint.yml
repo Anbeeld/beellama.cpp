@@ -3,6 +3,7 @@ name: flake8 Lint
 on:
   push:
     branches:
+      - main
       - master
     paths: [
       '.github/workflows/python-lint.yml',

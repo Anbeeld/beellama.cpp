@@ -4,6 +4,7 @@ on:
   workflow_dispatch: # allows manual triggering
   push:
     branches:
+      - main
       - master
     paths: [
       '.github/workflows/build-openvino.yml',
@@ -69,7 +70,7 @@ jobs:
         with:
           key: ubuntu-24-openvino-${{ matrix.variant }}-no-preset-v1
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
 
       - name: Dependencies
         id: depends

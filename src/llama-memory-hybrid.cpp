@@ -133,15 +133,25 @@ void llama_memory_hybrid::clear(bool data) {
 }
 
 bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-    // Always attempt both removals. Attention cache must be cleaned up
-    // even if recurrent rollback fails (e.g. no checkpoint available).
     bool ok_recr = mem_recr->seq_rm(seq_id, p0, p1);
     bool ok_attn = mem_attn->seq_rm(seq_id, p0, p1);
     return ok_recr && ok_attn;
 }
 
+bool llama_memory_hybrid::seq_rm_cell(llama_seq_id seq_id, uint32_t cell_idx) {
+    return mem_attn->seq_rm_cell(seq_id, cell_idx);
+}
+
+int llama_memory_hybrid::cells_at_pos(llama_seq_id seq_id, llama_pos pos, uint32_t * cell_indices, int n_max) {
+    return mem_attn->cells_at_pos(seq_id, pos, cell_indices, n_max);
+}
+
 void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     mem_attn->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+    mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+}
+
+void llama_memory_hybrid::seq_cp_recurrent(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 

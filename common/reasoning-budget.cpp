@@ -248,3 +248,28 @@ common_reasoning_budget_state common_reasoning_budget_get_state(const struct lla
     }
     return ((const common_reasoning_budget_ctx *)smpl->ctx)->state;
 }
+
+bool common_reasoning_budget_force_end(struct llama_sampler * smpl) {
+    if (!smpl) {
+        return false;
+    }
+
+    auto * ctx = (common_reasoning_budget_ctx *) smpl->ctx;
+    if (ctx->forced_tokens.empty()) {
+        return false;
+    }
+
+    ctx->state = REASONING_BUDGET_FORCING;
+    ctx->force_pos = 0;
+    ctx->end_matcher.reset();
+    return true;
+}
+
+size_t common_reasoning_budget_forced_token_count(const struct llama_sampler * smpl) {
+    if (!smpl) {
+        return 0;
+    }
+
+    const auto * ctx = (const common_reasoning_budget_ctx *) smpl->ctx;
+    return ctx->forced_tokens.size();
+}

@@ -239,16 +239,29 @@ void ggml_cuda_op_ssm_conv_tree(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const struct ggml_tensor * src1 = dst->src[1];  // conv1d.weight
     const struct ggml_tensor * src2 = dst->src[2];  // parent_ids
 
+    GGML_ASSERT(src0 != nullptr);
+    GGML_ASSERT(src1 != nullptr);
+    GGML_ASSERT(src2 != nullptr);
+
     const int64_t nc  = src1->ne[0];                // d_conv
     const int64_t nr  = src0->ne[1];                // d_inner
     const int64_t n_t = dst->ne[1];                 // tokens per sequence
     const int64_t n_s = dst->ne[2];                 // number of sequences
 
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(src2->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(nc > 0);
+    GGML_ASSERT(n_t > 0);
+    GGML_ASSERT(n_s > 0);
     GGML_ASSERT(dst->ne[0] == nr);
+    GGML_ASSERT(src0->ne[0] == nc - 1 + n_t);
+    GGML_ASSERT(src1->ne[1] == nr);
+    GGML_ASSERT(ggml_nelements(src2) >= n_t);
     GGML_ASSERT(src0->nb[0] == sizeof(float));
     GGML_ASSERT(src1->nb[0] == sizeof(float));
     GGML_ASSERT(src0->nb[1] == src0->ne[0] * sizeof(float));
-    GGML_ASSERT(src2->type == GGML_TYPE_I32);
 
     const float *   src0_d = (const float *)   src0->data;
     const float *   src1_d = (const float *)   src1->data;
@@ -256,13 +269,11 @@ void ggml_cuda_op_ssm_conv_tree(ggml_backend_cuda_context & ctx, ggml_tensor * d
     float *         dst_d  = (float *) dst->data;
     cudaStream_t    stream = ctx.stream();
 
-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
-    GGML_ASSERT(dst->type == GGML_TYPE_F32);
-
     // Tree conv always fuses silu (same as normal decode path)
     ssm_conv_tree_f32_cuda<true>(src0_d, src1_d, pids_d,
         src0->nb[0], src0->nb[1], src0->nb[2], src1->nb[1],
         dst_d, dst->nb[0], dst->nb[1], dst->nb[2], nc, nr, n_t, n_s, stream);
+
 }
 
 void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node, ggml_tensor * silu_dst) {

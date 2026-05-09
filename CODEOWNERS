@@ -1,5 +1,42 @@
-# collaborators can optionally add themselves here to indicate their availability for reviewing related PRs
-# multiple collaborators per item can be specified
+# This is the CODEOWNERS file for BeeLlama.cpp (Anbeeld's fork of llama.cpp).
+#
+# Upstream ggml-org team references are retained for paths that track
+# upstream closely. Fork-specific paths are marked with BeeLlama owners.
+#
+# BeeLlama-specific areas:
+#   - DFlash speculative decoding (common/speculative.*, src/models/dflash_draft.*)
+#   - TurboQuant / TCQ KV cache (src/llama-graph.cpp turbo sections, codebooks/)
+#   - DDTree tree verification (server parent_ids, recurrent tree kernels)
+#   - CopySpec model-free speculation (common/suffix-tree.*, common/int32-map.h)
+#   - Adaptive draft-max controllers (tools/server/server-adaptive-dm.h)
+#   - Reasoning loop guard (tools/server/server-loop-guard.*)
+#   - Qwen3.5/3.6 model graphs (src/models/qwen35.cpp)
+#   - DFlash CUDA kernels (ggml/src/ggml-cuda/cross-ring-interleave.cu, gated_delta_net.cu, ssm-conv.cu)
+
+# BeeLlama fork-specific ownership
+/common/speculative.*                    @Anbeeld
+/src/models/dflash_draft.*               @Anbeeld
+/src/models/qwen35.cpp                   @Anbeeld
+/tools/server/server-adaptive-dm.h       @Anbeeld
+/tools/server/server-loop-guard.*        @Anbeeld
+/tools/server/server-context.cpp         @Anbeeld
+/ggml/src/ggml-cuda/cross-ring-interleave.cu  @Anbeeld
+/ggml/src/ggml-cuda/gated_delta_net.cu   @Anbeeld
+/ggml/src/ggml-cuda/ssm-conv.cu          @Anbeeld
+/codebooks/                              @Anbeeld
+/docs/beellama-features.md               @Anbeeld
+/docs/beellama-args.md                   @Anbeeld
+/docs/quickstart-qwen36-dflash.md        @Anbeeld
+/docs/preset.md                          @Anbeeld
+/tests/test-dflash-ring.cpp              @Anbeeld
+/tests/test-dflash-plumbing.cpp          @Anbeeld
+/tests/test-adaptive-dm.cpp              @Anbeeld
+/tests/test-server-loop-guard.cpp        @Anbeeld
+/README.md                               @Anbeeld
+/CONTRIBUTING.md                         @Anbeeld
+/SECURITY.md                             @Anbeeld
+
+# Upstream ggml-org references (retained for paths tracking upstream)
 #
 # ggml-org/ci               : CISC, danbev, ggerganov, netrunnereve, ngxson, taronaeo
 # ggml-org/ggml-cann        : hipudding

@@ -4,6 +4,7 @@ on:
   workflow_dispatch: # allows manual triggering
   push:
     branches:
+      - main
       - master
     paths: [
       '.github/workflows/build.yml',
@@ -73,7 +74,7 @@ jobs:
         with:
           key: macOS-latest-arm64
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
 
       - name: Build
         id: cmake_build
@@ -109,7 +110,7 @@ jobs:
         with:
           key: macOS-latest-x64
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
 
       - name: Build
         id: cmake_build
@@ -145,7 +146,7 @@ jobs:
         with:
           key: macOS-latest-arm64-webgpu
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
 
       - name: Dawn Dependency
         id: dawn-depends
@@ -199,7 +200,7 @@ jobs:
         with:
           key: ubuntu-cpu-${{ matrix.build }}
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
 
       - name: Build Dependencies
         id: build_depends
@@ -283,7 +284,7 @@ jobs:
         with:
           key: android-arm64
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
 
       - name: Set up JDK
         uses: actions/setup-java@v5
@@ -400,7 +401,7 @@ jobs:
         with:
           key: ubuntu-24-webgpu
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
 
       - name: Dependencies
         id: depends
@@ -514,7 +515,7 @@ jobs:
         with:
           key: ubuntu-22-hip
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
 
       - name: Build with native CMake HIP support
         id: cmake_build
@@ -546,7 +547,7 @@ jobs:
         with:
           key: ubuntu-22-musa
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
 
       - name: Build with native CMake MUSA support
         id: cmake_build
@@ -594,7 +595,7 @@ jobs:
           key: windows-latest-${{ matrix.build }}
           variant: ccache
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
 
       - name: Download OpenBLAS
         id: get_openblas
@@ -699,7 +700,7 @@ jobs:
           with:
             key: ubuntu-latest-cuda
             evict-old-files: 1d
-            save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+            save: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
 
         - name: Build with CMake
           # TODO: Remove GGML_CUDA_CUB_3DOT2 flag once CCCL 3.2 is bundled within CTK and that CTK version is used in this project
@@ -732,7 +733,7 @@ jobs:
           key: windows-cuda-${{ matrix.cuda }}
           variant: ccache
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
 
       - name: Install Cuda Toolkit
         uses: ./.github/actions/windows-setup-cuda
@@ -812,7 +813,7 @@ jobs:
         with:
           key: ${{ github.job }}
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
 
       - name: Build
         id: cmake_build
@@ -866,7 +867,7 @@ jobs:
         with:
           key: ubuntu-cpu-riscv64-native
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
 
       - name: Build
         id: cmake_build
@@ -903,7 +904,7 @@ jobs:
           ./bin/llama-completion -m stories260K.gguf -p "One day, Lily met a Shoggoth" -n 500 -c 256
 
 # TODO: simplify the following workflows using a matrix
-# TODO: run lighter CI on PRs and the full CI only on master (if needed)
+# TODO: run lighter CI on PRs and the full CI only on main/master (if needed)
   ggml-ci-x64-cpu-low-perf:
     runs-on: ubuntu-22.04
 
@@ -917,7 +918,7 @@ jobs:
         with:
           key: ggml-ci-x64-cpu-low-perf
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
 
       - name: Dependencies
         id: depends
@@ -943,7 +944,7 @@ jobs:
         with:
           key: ggml-ci-arm64-cpu-low-perf
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
 
       - name: Dependencies
         id: depends
@@ -969,7 +970,7 @@ jobs:
         with:
           key: ggml-ci-x64-cpu-high-perf
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
 
       - name: Dependencies
         id: depends
@@ -995,7 +996,7 @@ jobs:
         with:
           key: ggml-ci-arm64-cpu-high-perf
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
 
       - name: Dependencies
         id: depends
@@ -1021,7 +1022,7 @@ jobs:
         with:
           key: ggml-ci-arm64-cpu-high-perf-sve
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
 
       - name: Dependencies
         id: depends
@@ -1047,7 +1048,7 @@ jobs:
          with:
            key: ggml-ci-arm64-cpu-kleidiai
            evict-old-files: 1d
-           save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+           save: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
 
        - name: Dependencies
          id: depends
@@ -1099,7 +1100,7 @@ jobs:
          with:
            key: ggml-ci-arm64-cpu-kleidiai-graviton4
            evict-old-files: 1d
-           save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+           save: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
 
        - name: Test
          id: ggml-ci

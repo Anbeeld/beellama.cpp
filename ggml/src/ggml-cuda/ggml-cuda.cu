@@ -1493,12 +1493,8 @@ static void ggml_cuda_op_mul_mat_cublas(
     // ldc == nrows of the matrix that cuBLAS writes into
     int64_t ldc = id == ctx.device ? ne0 : row_diff;
 
-    // Guard: cuBLAS requires m >= 1, n >= 1, k >= 1 for Sgemm/GemmEx.
-    // During speculative decoding (DFlash/copyspec), draft verification can
-    // produce non-consecutive token positions which result in zero-size
-    // sub-matrices. cuBLAS treats these as invalid parameters and aborts
-    // with CUBLAS_STATUS_INVALID_VALUE. Zero-size GEMMs are defined as
-    // no-ops (no output written), matching OpenBLAS and MKL behavior.
+    // Speculative verification can create empty sub-matrices; cuBLAS rejects
+    // zero-size GEMMs even though they are no-op work.
     if (row_diff == 0 || src1_ncols == 0 || ne10 == 0 || ne00 == 0 || ldc == 0) {
         return;
     }
@@ -3140,6 +3136,20 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             }
         }
 
+        if (node->op == GGML_OP_SSM_CONV_TREE || node->op == GGML_OP_GATED_DELTA_NET_TREE) {
+            use_cuda_graph = false;
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: disabling CUDA graphs due to tree verify op\n", __func__);
+#endif
+        }
+
+        if (strncmp(node->name, "dflash_kv_update", 16) == 0) {
+            use_cuda_graph = false;
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: disabling CUDA graphs for DFlash K/V update graph\n", __func__);
+#endif
+        }
+
         if (!use_cuda_graph) {
             break;
         }
@@ -3426,8 +3436,9 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
     };
 
     bool is_ok = true;
-    // exception for topk-moe, as each row is read entirely before writing
-    if (ggml_nrows(cgraph->nodes[node_idx]) == 1 && is_topk_moe) {
+    // for nrows=1, all fusion operations correctly read the src
+    // before writing dst or do it elementwise, so we should be ok
+    if (ggml_nrows(cgraph->nodes[node_idx]) == 1) {
         return true;
     }
 
@@ -5423,8 +5434,20 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 extern "C" void * dflash_cross_ring_gpu_alloc(int, int, int);
 extern "C" void   dflash_cross_ring_gpu_free(void *);
 extern "C" void   dflash_cross_ring_gpu_write(void *, int, int, const float *, int, int);
+extern "C" bool   dflash_cross_ring_gpu_write_d2d(void *, int, int, const void *, int, int);
+extern "C" bool   dflash_rebuild_conv_state(void *, const void *, int, int, int);
+extern "C" bool   dflash_cuda_copy_d2d(void *, const void *, size_t);
+extern "C" bool   dflash_cuda_prepare_ptr(const void *);
+extern "C" bool   dflash_cuda_copy_d2d_no_check(void *, const void *, size_t);
+extern "C" bool   dflash_cuda_synchronize_ptr(const void *);
+extern "C" bool   dflash_replay_gdn_state_no_check(void *, const void *, const void *, const void *, const void *, int, int, int, int);
+extern "C" void   dflash_cross_ring_gpu_synchronize(void *);
 extern "C" const float * dflash_cross_ring_gpu_interleave(void *, int, int, int);
 extern "C" void   dflash_cross_ring_gpu_set_tensor(void *, const void *, size_t, size_t);
+extern "C" bool   dflash_kv_cache_write_d2d(void *, const void *, int, int, int, int);
+extern "C" bool   dflash_kv_cache_append_d2d(void *, const void *, int, int, int, int);
+extern "C" bool   dflash_kv_cache_append_d2d_no_check(void *, const void *, int, int, int, int);
+extern "C" bool   dflash_kv_cache_interleave(const void *, void *, int, int, int, int, int);
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
@@ -5458,11 +5481,47 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "dflash_cross_ring_gpu_write") == 0) {
         return (void *)dflash_cross_ring_gpu_write;
     }
+    if (strcmp(name, "dflash_cross_ring_gpu_write_d2d") == 0) {
+        return (void *)dflash_cross_ring_gpu_write_d2d;
+    }
+    if (strcmp(name, "dflash_rebuild_conv_state") == 0) {
+        return (void *)dflash_rebuild_conv_state;
+    }
+    if (strcmp(name, "dflash_cuda_copy_d2d") == 0) {
+        return (void *)dflash_cuda_copy_d2d;
+    }
+    if (strcmp(name, "dflash_cuda_prepare_ptr") == 0) {
+        return (void *)dflash_cuda_prepare_ptr;
+    }
+    if (strcmp(name, "dflash_cuda_copy_d2d_no_check") == 0) {
+        return (void *)dflash_cuda_copy_d2d_no_check;
+    }
+    if (strcmp(name, "dflash_cuda_synchronize_ptr") == 0) {
+        return (void *)dflash_cuda_synchronize_ptr;
+    }
+    if (strcmp(name, "dflash_replay_gdn_state_no_check") == 0) {
+        return (void *)dflash_replay_gdn_state_no_check;
+    }
+    if (strcmp(name, "dflash_cross_ring_gpu_synchronize") == 0) {
+        return (void *)dflash_cross_ring_gpu_synchronize;
+    }
     if (strcmp(name, "dflash_cross_ring_gpu_interleave") == 0) {
         return (void *)dflash_cross_ring_gpu_interleave;
     }
     if (strcmp(name, "dflash_cross_ring_gpu_set_tensor") == 0) {
         return (void *)dflash_cross_ring_gpu_set_tensor;
+    }
+    if (strcmp(name, "dflash_kv_cache_write_d2d") == 0) {
+        return (void *)dflash_kv_cache_write_d2d;
+    }
+    if (strcmp(name, "dflash_kv_cache_append_d2d") == 0) {
+        return (void *)dflash_kv_cache_append_d2d;
+    }
+    if (strcmp(name, "dflash_kv_cache_append_d2d_no_check") == 0) {
+        return (void *)dflash_kv_cache_append_d2d_no_check;
+    }
+    if (strcmp(name, "dflash_kv_cache_interleave") == 0) {
+        return (void *)dflash_kv_cache_interleave;
     }
     return nullptr;
 }

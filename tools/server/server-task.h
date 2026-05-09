@@ -74,6 +74,7 @@ struct task_params {
 
     struct common_params_sampling sampling;
     struct common_params_speculative speculative;
+    common_reasoning_loop_guard_params reasoning_loop_guard;
 
     // response formatting
     bool               verbose  = false;
@@ -351,6 +352,12 @@ struct server_task_result_cmpl_final : server_task_result {
     bool has_new_line;
     std::string stopping_word;
     stop_type stop = STOP_TYPE_NONE;
+    std::string stop_detail;
+    int32_t reasoning_output_tokens = -1;
+    int32_t visible_output_tokens = -1;
+    bool loop_guard_triggered = false;
+    std::string loop_guard_action;
+    std::string loop_guard_reason;
 
     bool post_sampling_probs;
     std::vector<completion_token_output> probs_output;
@@ -586,7 +593,8 @@ struct server_prompt_checkpoint {
         pos_min = 0;
         pos_max = 0;
         n_tokens = 0;
-        data.clear();
+        std::vector<uint8_t>().swap(data);
+        std::vector<uint8_t>().swap(ring_data);
     }
 };
 

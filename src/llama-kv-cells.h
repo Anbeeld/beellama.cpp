@@ -257,6 +257,19 @@ public:
         return false;
     }
 
+    // remove seq_id from a specific cell by index, regardless of position
+    // return true if the cell becomes empty
+    bool seq_rm_cell(uint32_t i, llama_seq_id seq_id) {
+        assert(i < pos.size());
+        assert(seq_id >= 0);
+
+        if (pos[i] == -1 || !seq[i].test(seq_id)) {
+            return false;
+        }
+
+        return seq_rm(i, seq_id);
+    }
+
     // return true if the cell becomes empty (i.e. it did not contain seq_id before the call)
     bool seq_keep(uint32_t i, llama_seq_id seq_id) {
         assert(i < pos.size());
@@ -387,6 +400,18 @@ public:
         assert(i < pos.size());
 
         return pos[i] >= p0 && pos[i] < p1;
+    }
+
+    // return all cell indices that have seq_id and match the given position
+    std::vector<uint32_t> cells_at(llama_seq_id seq_id, llama_pos p) const {
+        assert(seq_id >= 0);
+        std::vector<uint32_t> result;
+        for (const auto & i : used) {
+            if (pos[i] == p && seq[i].test(seq_id)) {
+                result.push_back(i);
+            }
+        }
+        return result;
     }
 
     // set the position of an empty cell

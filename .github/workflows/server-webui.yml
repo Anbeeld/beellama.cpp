@@ -9,6 +9,7 @@ on:
         type: string
   push:
     branches:
+      - main
       - master
     paths: [
       '.github/workflows/server-webui.yml',

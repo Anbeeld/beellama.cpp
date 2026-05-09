@@ -33,6 +33,20 @@ enum llm_graph_type {
     LLM_GRAPH_TYPE_DEFAULT,
     LLM_GRAPH_TYPE_ENCODER,
     LLM_GRAPH_TYPE_DECODER,
+    LLM_GRAPH_TYPE_DFLASH_KV_UPDATE,
+};
+
+struct llama_dflash_kv_cache_view {
+    int n_layers = 0;
+    int64_t n_embd_head = 0;
+    int64_t n_head_kv = 0;
+    int64_t ctx_len = 0;
+    int64_t n_filled = 0;
+    int64_t ring_size = 0;
+    int64_t write_pos = 0;
+
+    std::vector<ggml_tensor *> k_ring;
+    std::vector<ggml_tensor *> v_ring;
 };
 
 enum llm_ffn_op_type {
@@ -77,6 +91,15 @@ struct llama_cross {
     int64_t v_embd_gpu_n_enc_real = 0;
     void (*fn_set_tensor_d2d)(void * d_dst, const void * d_src, size_t offset, size_t size) = nullptr;
 
+    // Temporary DFlash K/V-update input. This lets the drafter-side projection
+    // cache read newly committed hidden states without mutating the main cross
+    // window shape, which would otherwise force a scheduler reserve before each
+    // draft decode.
+    const void * dflash_kv_update_gpu = nullptr;
+    int64_t dflash_kv_update_n_embd = 0;
+    int64_t dflash_kv_update_n_enc_real = 0;
+    void (*dflash_kv_update_fn_set_tensor_d2d)(void * d_dst, const void * d_src, size_t offset, size_t size) = nullptr;
+
     // Per-seq cross buffers for DFlash multi-slot.
     // When non-empty, graph builders should pack these into target_hidden per slot
     // instead of reading v_embd. Empty ⇒ fall through to the legacy v_embd path.
@@ -88,6 +111,12 @@ struct llama_cross {
         int64_t v_embd_gpu_n_enc_real = 0;
     };
     std::map<llama_seq_id, seq_cross> v_embd_per_seq;
+
+    // DFlash drafter-side cache of projected cross-attention K/V. When this is
+    // present and filled for the current window, the drafter graph consumes the
+    // staged K/V tensors directly instead of recomputing wk/wv over the whole
+    // cross window every speculative cycle.
+    llama_dflash_kv_cache_view * dflash_kv_cache = nullptr;
 
     // needed to construct the cross-attention mask in the decoder
     std::vector<std::set<llama_seq_id>> seq_ids_enc;
@@ -655,6 +684,12 @@ struct llm_graph_params {
         return
             cparams.embeddings  == other.cparams.embeddings  &&
             cparams.causal_attn == other.cparams.causal_attn &&
+            cparams.dflash_verify_logits == other.cparams.dflash_verify_logits &&
+            cparams.dflash_verify_topk   == other.cparams.dflash_verify_topk &&
+            cparams.cb_eval              == other.cparams.cb_eval &&
+            cparams.cb_eval_user_data    == other.cparams.cb_eval_user_data &&
+            cparams.hidden_gpu_n_seqs    == other.cparams.hidden_gpu_n_seqs &&
+            (cparams.tape_gpu != nullptr) == (other.cparams.tape_gpu != nullptr) &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -703,6 +738,9 @@ public:
     ggml_tensor * t_logits_argmax = nullptr; // [n_tokens] int32, GPU argmax of logits
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
+
+    std::vector<ggml_tensor *> dflash_k_update;
+    std::vector<ggml_tensor *> dflash_v_update;
 
     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor*> t_candidates;

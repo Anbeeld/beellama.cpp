@@ -1,12 +1,13 @@
 # Extensions
 
 *.a
+*.bak
 *.bat
 *.bin
-!codebooks/**/*.bin
 *.d
 *.dll
 *.dot
+*.env
 *.etag
 *.exe
 *.gcda
@@ -14,6 +15,7 @@
 *.gcov
 *.gguf
 *.gguf.json
+*.key
 *.lastModified
 *.log
 *.metallib
@@ -21,6 +23,7 @@
 *.so
 *.swp
 *.tmp
+*.zip
 *.DS_Store
 
 # IDE / OS
@@ -106,6 +109,8 @@
 __pycache__/
 */poetry.lock
 poetry.toml
+poetry.lock
+uv.lock
 
 # Nix
 
@@ -158,3 +163,11 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# BeeLlama local artifacts
+
+/artifacts/
+/servers
+
+# Codebooks are intentionally tracked despite *.bin
+!codebooks/**/*.bin

@@ -430,6 +430,23 @@ static bool parse_bool_value(const std::string & value) {
     }
 }
 
+static void common_params_speculative_normalize(common_params & params) {
+    auto & s = params.speculative;
+
+    s.n_max   = s.draft.n_max;
+    s.n_min   = s.draft.n_min;
+    if (s.legacy_tree_budget_explicit && !s.branch_budget_explicit) {
+        s.branch_budget = std::max(0, s.tree_budget - std::max(0, s.n_max));
+    } else if (s.legacy_tree_budget_explicit && s.branch_budget_explicit) {
+        LOG_WRN("warning: both --spec-branch-budget and legacy --tree-budget were supplied; ignoring --tree-budget\n");
+    }
+
+    s.branch_budget = std::max(0, s.branch_budget);
+    if (s.branch_budget == 0) {
+        s.draft_topk = 1;
+    }
+}
+
 //
 // CLI argument parsing functions
 //
@@ -580,6 +597,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
 
     postprocess_cpu_params(params.speculative.draft.cpuparams,       &params.cpuparams);
     postprocess_cpu_params(params.speculative.draft.cpuparams_batch, &params.cpuparams_batch);
+    common_params_speculative_normalize(params);
 
     if (params.prompt_cache_all && (params.interactive || params.interactive_first)) {
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
@@ -900,6 +918,76 @@ bool common_params_to_map(int argc, char ** argv, llama_example ex, std::map<com
     return true;
 }
 
+static common_speculative_dm_controller common_speculative_dm_controller_from_name(const std::string & value) {
+    if (value == "fringe") {
+        return COMMON_SPECULATIVE_DM_CONTROLLER_FRINGE;
+    }
+    if (value == "profit") {
+        return COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT;
+    }
+    throw std::invalid_argument("invalid spec-dm-controller, expected one of: fringe, profit");
+}
+
+static const char * common_speculative_dm_controller_name(common_speculative_dm_controller value) {
+    switch (value) {
+        case COMMON_SPECULATIVE_DM_CONTROLLER_FRINGE: return "fringe";
+        case COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT: return "profit";
+    }
+    return "unknown";
+}
+
+static common_reasoning_loop_guard_mode common_reasoning_loop_guard_mode_from_name(const std::string & value) {
+    if (value == "off") {
+        return COMMON_REASONING_LOOP_GUARD_OFF;
+    }
+    if (value == "force-close") {
+        return COMMON_REASONING_LOOP_GUARD_FORCE_CLOSE;
+    }
+    if (value == "stop") {
+        return COMMON_REASONING_LOOP_GUARD_STOP;
+    }
+    throw std::invalid_argument("invalid reasoning-loop-guard, expected one of: off, force-close, stop");
+}
+
+static const char * common_reasoning_loop_guard_mode_name(common_reasoning_loop_guard_mode value) {
+    switch (value) {
+        case COMMON_REASONING_LOOP_GUARD_OFF:         return "off";
+        case COMMON_REASONING_LOOP_GUARD_FORCE_CLOSE: return "force-close";
+        case COMMON_REASONING_LOOP_GUARD_STOP:        return "stop";
+    }
+    return "unknown";
+}
+
+static void common_validate_reasoning_loop_guard_params(const common_reasoning_loop_guard_params & params) {
+    if (params.min_reasoning_tokens < 0) {
+        throw std::invalid_argument("reasoning-loop-min-tokens must be >= 0");
+    }
+    if (params.window_tokens <= 0) {
+        throw std::invalid_argument("reasoning-loop-window must be > 0");
+    }
+    if (params.max_period <= 0) {
+        throw std::invalid_argument("reasoning-loop-max-period must be > 0");
+    }
+    if (params.min_repeated_coverage <= 0) {
+        throw std::invalid_argument("reasoning-loop-min-coverage must be > 0");
+    }
+    if (params.check_interval <= 0) {
+        throw std::invalid_argument("reasoning-loop-check-interval must be > 0");
+    }
+    if (params.interventions_max < 0) {
+        throw std::invalid_argument("reasoning-loop-interventions must be >= 0");
+    }
+    if (params.window_tokens < params.min_repeated_coverage) {
+        throw std::invalid_argument("reasoning-loop-window must be >= reasoning-loop-min-coverage");
+    }
+    if (params.max_period > params.window_tokens / 3) {
+        throw std::invalid_argument("reasoning-loop-max-period must be <= reasoning-loop-window / 3");
+    }
+    if (params.min_reasoning_tokens < params.min_repeated_coverage) {
+        throw std::invalid_argument("reasoning-loop-min-tokens must be >= reasoning-loop-min-coverage");
+    }
+}
+
 bool common_params_parse(int argc, char ** argv, common_params & params, llama_example ex, void(*print_usage)(int, char **)) {
     auto ctx_arg = common_params_parser_init(params, ex, print_usage);
     const common_params params_org = ctx_arg.params; // the example can modify the default params
@@ -921,6 +1009,7 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             exit(0);
         }
         params.lr.init();
+        common_validate_reasoning_loop_guard_params(params.reasoning_loop_guard);
 
         // DFlash-safe defaults. The drafter's block_size=16 / internal max
         // batch=64 means it only needs a tiny graph, and multi-slot target
@@ -3167,6 +3256,56 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET_MESSAGE"));
     add_opt(common_arg(
+        {"--reasoning-loop-guard"}, "MODE",
+        string_format("reasoning loop guard mode: off, force-close, or stop (default: %s)",
+            common_reasoning_loop_guard_mode_name(params.reasoning_loop_guard.mode)),
+        [](common_params & params, const std::string & value) {
+            params.reasoning_loop_guard.mode = common_reasoning_loop_guard_mode_from_name(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_LOOP_GUARD"));
+    add_opt(common_arg(
+        {"--reasoning-loop-min-tokens"}, "N",
+        string_format("minimum hidden reasoning tokens before loop checks (default: %d)", params.reasoning_loop_guard.min_reasoning_tokens),
+        [](common_params & params, int value) {
+            params.reasoning_loop_guard.min_reasoning_tokens = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_LOOP_MIN_TOKENS"));
+    add_opt(common_arg(
+        {"--reasoning-loop-window"}, "N",
+        string_format("token tail window for reasoning loop checks (default: %d)", params.reasoning_loop_guard.window_tokens),
+        [](common_params & params, int value) {
+            params.reasoning_loop_guard.window_tokens = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_LOOP_WINDOW"));
+    add_opt(common_arg(
+        {"--reasoning-loop-max-period"}, "N",
+        string_format("maximum periodic loop length to check (default: %d)", params.reasoning_loop_guard.max_period),
+        [](common_params & params, int value) {
+            params.reasoning_loop_guard.max_period = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_LOOP_MAX_PERIOD"));
+    add_opt(common_arg(
+        {"--reasoning-loop-min-coverage"}, "N",
+        string_format("minimum repeated token coverage before loop trigger (default: %d)", params.reasoning_loop_guard.min_repeated_coverage),
+        [](common_params & params, int value) {
+            params.reasoning_loop_guard.min_repeated_coverage = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_LOOP_MIN_COVERAGE"));
+    add_opt(common_arg(
+        {"--reasoning-loop-check-interval"}, "N",
+        string_format("accepted-token interval between loop checks (default: %d)", params.reasoning_loop_guard.check_interval),
+        [](common_params & params, int value) {
+            params.reasoning_loop_guard.check_interval = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_LOOP_CHECK_INTERVAL"));
+    add_opt(common_arg(
+        {"--reasoning-loop-interventions"}, "N",
+        string_format("maximum force-close interventions before stop (default: %d)", params.reasoning_loop_guard.interventions_max),
+        [](common_params & params, int value) {
+            params.reasoning_loop_guard.interventions_max = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_LOOP_INTERVENTIONS"));
+    add_opt(common_arg(
         {"--chat-template"}, "JINJA_TEMPLATE",
         string_format(
             "set custom jinja chat template (default: template taken from model's metadata)\n"
@@ -3485,39 +3624,68 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"--draft", "--draft-n", "--draft-max"}, "N",
-        string_format("number of tokens to draft for speculative decoding (default: %d)", params.speculative.n_max),
+        string_format("legacy alias for --spec-draft-n-max (default: %d)", params.speculative.draft.n_max),
         [](common_params & params, int value) {
+            params.speculative.draft.n_max = value;
             params.speculative.n_max = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_DRAFT_MAX"));
     add_opt(common_arg(
         {"--draft-min", "--draft-n-min"}, "N",
-        string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.n_min),
+        string_format("legacy alias for --spec-draft-n-min (default: %d)", params.speculative.draft.n_min),
         [](common_params & params, int value) {
+            params.speculative.draft.n_min = value;
             params.speculative.n_min = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_DRAFT_MIN"));
     add_opt(common_arg(
-        {"--tree-budget"}, "N",
-        string_format("DDTree node budget for tree verification (default: %d, 0 = flat)", params.speculative.tree_budget),
+        {"--spec-branch-budget"}, "N",
+        string_format("DDTree branch nodes beyond the main draft path (default: %d, 0 = flat)", params.speculative.branch_budget),
         [](common_params & params, int value) {
-            params.speculative.tree_budget = value;
+            params.speculative.branch_budget = std::max(0, value);
+            params.speculative.branch_budget_explicit = true;
         }
-    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE}).set_env("LLAMA_ARG_TREE_BUDGET"));
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_BRANCH_BUDGET"));
     add_opt(common_arg(
-        {"--dflash-max-slots"}, "N",
+        {"--tree-budget"}, "N",
+        "legacy total DDTree node budget; converted to --spec-branch-budget=max(0, tree-budget - draft-max)",
+        [](common_params & params, int value) {
+            params.speculative.tree_budget = std::max(0, value);
+            params.speculative.legacy_tree_budget_explicit = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_TREE_BUDGET"));
+    add_opt(common_arg(
+        {"--spec-dflash-max-slots"}, "N",
         string_format("max concurrent server slots with DFlash state; higher slots fall back to non-speculative decode (default: %d)", params.speculative.dflash_max_slots),
         [](common_params & params, int value) {
             params.speculative.dflash_max_slots = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_SPECULATIVE}).set_env("LLAMA_ARG_DFLASH_MAX_SLOTS"));
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_SPECULATIVE}).set_env("LLAMA_ARG_SPEC_DFLASH_MAX_SLOTS"));
     add_opt(common_arg(
-        {"--draft-topk"}, "N",
+        {"--spec-dflash-cross-ctx"}, "N",
+        string_format("DFlash cross-attention window in tokens; how many target hidden states the drafter sees (default: %d)", params.speculative.dflash_cross_ctx),
+        [](common_params & params, int value) {
+            params.speculative.dflash_cross_ctx = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_SPECULATIVE}).set_env("LLAMA_ARG_SPEC_DFLASH_CROSS_CTX"));
+    add_opt(common_arg(
+        {"--spec-draft-top-k", "--draft-topk"}, "N",
         string_format("top-K candidates per drafter position for tree branching (default: %d)", params.speculative.draft_topk),
         [](common_params & params, int value) {
-            params.speculative.draft_topk = value;
+            params.speculative.draft_topk = std::max(1, value);
         }
-    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE}).set_env("LLAMA_ARG_DRAFT_TOPK"));
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_TOP_K"));
+    add_opt(common_arg(
+        {"--spec-draft-temp"}, "T",
+        string_format("drafter sampling temperature for Gumbel sampling (default: %.1f, 0 = greedy, >0 = Gumbel, auto = mirror target)", (double)params.speculative.sample_temp),
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.speculative.sample_temp = -1.0f;
+            } else {
+                params.speculative.sample_temp = std::stof(value);
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_TEMP"));
     add_opt(common_arg(
         {"--spec-draft-type-k", "-ctkd", "--cache-type-k-draft"}, "TYPE",
         string_format(
@@ -3544,6 +3712,135 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.cache_type_v = kv_cache_type_from_str(value);
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V"));
+    add_opt(common_arg(
+        {"--spec-dm-adaptive"},
+        {"--no-spec-dm-adaptive"},
+        string_format("enable adaptive draft-max controller (default: %s)", params.speculative.dm_adaptive ? "true" : "false"),
+        [](common_params & params, bool value) {
+            params.speculative.dm_adaptive = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_ADAPTIVE"));
+    add_opt(common_arg(
+        {"--spec-dm-fringe-min"}, "F",
+        string_format("fringe controller only: rate below which DFlash is disabled after off-dwell (default: %.2f)", (double)params.speculative.dm_fringe_min),
+        [](common_params & params, const std::string & value) {
+            params.speculative.dm_fringe_min = std::clamp(std::stof(value), 0.0f, 1.0f);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_FRINGE_MIN"));
+    add_opt(common_arg(
+        {"--spec-dm-fringe-max"}, "F",
+        string_format("fringe controller only: rate above which full base_n_max is used (default: %.2f)", (double)params.speculative.dm_fringe_max),
+        [](common_params & params, const std::string & value) {
+            params.speculative.dm_fringe_max = std::clamp(std::stof(value), 0.0f, 1.0f);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_FRINGE_MAX"));
+    add_opt(common_arg(
+        {"--spec-dm-off-dwell"}, "N",
+        string_format("consecutive weak spec cycles before DFlash is disabled (default: %d)", params.speculative.dm_off_dwell),
+        [](common_params & params, int value) {
+            params.speculative.dm_off_dwell = std::max(1, value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_OFF_DWELL"));
+    add_opt(common_arg(
+        {"--spec-dm-explore-interval"}, "N",
+        string_format("draft at an exploratory depth every N spec cycles (default: %d)", params.speculative.dm_explore_interval),
+        [](common_params & params, int value) {
+            params.speculative.dm_explore_interval = std::max(1, value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_EXPLORE_INTERVAL"));
+    add_opt(common_arg(
+        {"--spec-dm-min-reach"}, "N",
+        string_format("fringe controller only: min current-epoch samples at target position before promotion (default: %d)", params.speculative.dm_min_reach),
+        [](common_params & params, int value) {
+            params.speculative.dm_min_reach = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_MIN_REACH"));
+    add_opt(common_arg(
+        {"--spec-dm-probe-interval"}, "N",
+        string_format("cycles to wait before probing with n_max>0 when DM is disabled (default: %d)", params.speculative.dm_probe_interval),
+        [](common_params & params, int value) {
+            params.speculative.dm_probe_interval = std::max(1, value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_PROBE_INTERVAL"));
+    add_opt(common_arg(
+        {"--spec-dm-probe-fraction"}, "F",
+        string_format("fraction of base n_max to use when probing from disabled state (default: %.2f)", (double)params.speculative.dm_probe_fraction),
+        [](common_params & params, const std::string & value) {
+            params.speculative.dm_probe_fraction = std::clamp(std::stof(value), 0.01f, 1.0f);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_PROBE_FRACTION"));
+    add_opt(common_arg(
+        {"--spec-dm-controller"}, "MODE",
+        string_format("adaptive draft-max controller: fringe or profit (default: %s)",
+            common_speculative_dm_controller_name(params.speculative.dm_controller)),
+        [](common_params & params, const std::string & value) {
+            params.speculative.dm_controller = common_speculative_dm_controller_from_name(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_CONTROLLER"));
+    add_opt(common_arg(
+        {"--spec-dm-profit-min"}, "F",
+        string_format("minimum profit margin over no-spec baseline before disabling dwell clears (default: %.4f)", (double)params.speculative.dm_profit_min),
+        [](common_params & params, const std::string & value) {
+            const float f = std::stof(value);
+            if (f < 0.0f || f > 0.50f) {
+                throw std::invalid_argument("spec-dm-profit-min must be in [0.0, 0.50]");
+            }
+            params.speculative.dm_profit_min = f;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_PROFIT_MIN"));
+    add_opt(common_arg(
+        {"--spec-dm-profit-raise-margin"}, "F",
+        string_format("relative profit margin required to raise adaptive draft depth (default: %.4f)", (double)params.speculative.dm_profit_raise_margin),
+        [](common_params & params, const std::string & value) {
+            const float f = std::stof(value);
+            if (f < 0.0f || f > 1.0f) {
+                throw std::invalid_argument("spec-dm-profit-raise-margin must be in [0.0, 1.0]");
+            }
+            params.speculative.dm_profit_raise_margin = f;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_PROFIT_RAISE_MARGIN"));
+    add_opt(common_arg(
+        {"--spec-dm-profit-lower-margin"}, "F",
+        string_format("relative profit margin required to lower adaptive draft depth (default: %.4f)", (double)params.speculative.dm_profit_lower_margin),
+        [](common_params & params, const std::string & value) {
+            const float f = std::stof(value);
+            if (f < 0.0f || f > 1.0f) {
+                throw std::invalid_argument("spec-dm-profit-lower-margin must be in [0.0, 1.0]");
+            }
+            params.speculative.dm_profit_lower_margin = f;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_PROFIT_LOWER_MARGIN"));
+    add_opt(common_arg(
+        {"--spec-dm-profit-ewma-alpha"}, "F",
+        string_format("EWMA alpha for adaptive DM profit stats (default: %.4f)", (double)params.speculative.dm_profit_ewma_alpha),
+        [](common_params & params, const std::string & value) {
+            const float f = std::stof(value);
+            if (f < 0.01f || f > 1.0f) {
+                throw std::invalid_argument("spec-dm-profit-ewma-alpha must be in [0.01, 1.0]");
+            }
+            params.speculative.dm_profit_ewma_alpha = f;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_PROFIT_EWMA_ALPHA"));
+    add_opt(common_arg(
+        {"--spec-dm-profit-min-samples"}, "N",
+        string_format("minimum samples before adaptive DM profit position/depth is ready (default: %d)", params.speculative.dm_profit_min_samples),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 64) {
+                throw std::invalid_argument("spec-dm-profit-min-samples must be in [1, 64]");
+            }
+            params.speculative.dm_profit_min_samples = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_PROFIT_MIN_SAMPLES"));
+    add_opt(common_arg(
+        {"--spec-dm-profit-warmup"}, "N",
+        string_format("warmup cycles at base_n_max before profit decisions (default: %d, 0 = auto from --spec-dm-profit-min-samples)", params.speculative.dm_profit_warmup),
+        [](common_params & params, int value) {
+            if (value < 0 || value > 64) {
+                throw std::invalid_argument("spec-dm-profit-warmup must be in [0, 64]");
+            }
+            params.speculative.dm_profit_warmup = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_PROFIT_WARMUP"));
     add_opt(common_arg(
         {"--spec-draft-override-tensor", "-otd", "--override-tensor-draft"}, "<tensor name pattern>=<buffer type>,...",
         "override tensor buffer type for draft model", [](common_params & params, const std::string & value) {
@@ -3577,6 +3874,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("number of tokens to draft for speculative decoding (default: %d)", params.speculative.draft.n_max),
         [](common_params & params, int value) {
             params.speculative.draft.n_max = value;
+            params.speculative.n_max = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
     add_opt(common_arg(
@@ -3584,6 +3882,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),
         [](common_params & params, int value) {
             params.speculative.draft.n_min = value;
+            params.speculative.n_min = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
 
@@ -3592,11 +3891,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("speculative decoding split probability (default: %.2f)", (double)params.speculative.draft.p_split),
         [](common_params & params, const std::string & value) {
             params.speculative.draft.p_split = std::stof(value);
+            params.speculative.p_split       = std::stof(value);
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_SPLIT"));
     add_opt(common_arg(
         {"--spec-draft-p-min", "--draft-p-min"}, "P",
-        string_format("minimum speculative decoding probability (greedy) (default: %.2f)", (double)params.speculative.draft.p_min),
+        string_format("minimum speculative decoding probability (default: %.4f)", (double)params.speculative.draft.p_min),
         [](common_params & params, const std::string & value) {
             params.speculative.draft.p_min = std::stof(value);
             params.speculative.p_min       = std::stof(value);
@@ -3809,22 +4109,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     // removed params
     //
 
-    add_opt(common_arg(
-        {"--draft", "--draft-n", "--draft-max"}, "N",
-        string_format("(compat alias for --spec-draft-n-max) max draft tokens (default: %d)", params.speculative.draft.n_max),
-        [](common_params & params, int value) {
-            params.speculative.draft.n_max = value;
-            params.speculative.n_max       = value;
-        }
-    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_DRAFT_MAX"));
-    add_opt(common_arg(
-        {"--draft-min", "--draft-n-min"}, "N",
-        string_format("(compat alias for --spec-draft-n-min) min draft tokens (default: %d)", params.speculative.draft.n_min),
-        [](common_params & params, int value) {
-            params.speculative.draft.n_min = value;
-            params.speculative.n_min       = value;
-        }
-    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_DRAFT_MIN"));
     add_opt(common_arg(
         {"--spec-ngram-size-n"}, "N",
         "the argument has been removed. use the respective --spec-ngram-*-size-n or --spec-ngram-mod-n-match",
@@ -4179,7 +4463,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params) {
             params.speculative.type = COMMON_SPECULATIVE_TYPE_DFLASH;
             params.speculative.p_min = 0.0f;
-            params.speculative.n_max = 7;
+            params.speculative.n_max = 16;
             params.speculative.n_min = 0;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SPECULATIVE}));

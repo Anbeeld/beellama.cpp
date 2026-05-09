@@ -13,6 +13,7 @@ on:
         type: boolean
   push:
     branches:
+      - main
       - master
     paths: [
       '.github/workflows/server-self-hosted.yml',

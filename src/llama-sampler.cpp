@@ -2617,6 +2617,23 @@ struct llama_sampler * llama_sampler_init_grammar_lazy_patterns(
     return llama_sampler_init_grammar_impl(vocab, grammar_str, grammar_root, /* lazy= */ true, nullptr, 0, trigger_tokens, num_trigger_tokens, trigger_patterns, num_trigger_patterns);
 }
 
+bool llama_sampler_grammar_is_active(const struct llama_sampler * smpl) {
+    if (!smpl) {
+        return false;
+    }
+    // Only safe to cast if this is actually a grammar sampler
+    if (strcmp(llama_sampler_name(smpl), "grammar") != 0) {
+        return false;
+    }
+    auto * ctx = (llama_sampler_grammar *) smpl->ctx;
+    if (!ctx || !ctx->grammar) {
+        return false;
+    }
+    // For lazy grammars: only active if trigger has fired (awaiting_trigger == false).
+    // For non-lazy grammars: always active.
+    return !ctx->grammar->lazy || !ctx->grammar->awaiting_trigger;
+}
+
 // penalties
 
 struct llama_sampler_penalties {

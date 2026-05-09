@@ -23,6 +23,8 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
 
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
+    const int64_t n_seqs       = ubatch.n_seqs;
+    const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * inpSA = inpL;
@@ -68,6 +70,28 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
 
+        if (cparams.hidden_gpu_n_seqs > 0) {
+            for (int s = 0; s < (int)n_seqs && s < cparams.hidden_gpu_n_seqs; ++s) {
+                auto * hgpu = cparams.hidden_gpu_seqs[s];
+                if (!hgpu) continue;
+
+                int hi = -1;
+                for (int i = 0; i < (int)hgpu->layer_ids.size(); ++i) {
+                    if (hgpu->layer_ids[i] == il) { hi = i; break; }
+                }
+                if (hi < 0 || n_seq_tokens > hgpu->max_tokens) continue;
+
+                ggml_tensor * h_slice = ggml_view_2d(ctx0, cur,
+                    cur->ne[0], n_seq_tokens,
+                    cur->nb[1], (size_t)s * (size_t)n_seq_tokens * cur->nb[1]);
+                ggml_tensor * h_cont = ggml_cont(ctx0, h_slice);
+                ggml_tensor * h_dst = ggml_view_2d(ctx0, hgpu->layers[hi],
+                    hgpu->layers[hi]->ne[0], (int64_t)n_seq_tokens,
+                    hgpu->layers[hi]->nb[1], 0);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, h_cont, h_dst));
+            }
+        }
+
         // Input for next layer
         inpL = cur;
     }
@@ -84,6 +108,19 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;
+
+    if (cparams.dflash_verify_logits) {
+        const int topk = std::max(1, std::min(cparams.dflash_verify_topk, 64));
+        if (topk > 1) {
+            // Emit deterministic top-K raw logits. The server then runs
+            // the existing sampler chain over K candidates, preserving top-p/min-p/temp
+            // behavior without a full-vocab CPU transfer.
+            res->t_logits_argmax = ggml_topk_ext(ctx0, cur, topk, 0.0f, 0);
+        } else {
+            res->t_logits_argmax = ggml_argmax_ext(ctx0, cur, 0.0f, 0);
+        }
+        ggml_build_forward_expand(gf, res->t_logits_argmax);
+    }
 
     ggml_build_forward_expand(gf, cur);
 }
@@ -261,7 +298,8 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
     cb(conv_states, "conv_states_reshaped", il);
 
-    cb(qkv_mixed, "qkv_mixed_pretranspose", il);  // tape captures contiguous [conv_channels, n_tokens]
+    ggml_tensor * qkv_mixed_pretranspose = qkv_mixed;
+    cb(qkv_mixed_pretranspose, "qkv_mixed_pretranspose", il);  // tape captures contiguous [conv_channels, n_tokens]
     qkv_mixed = ggml_transpose(ctx0, qkv_mixed);
 
     ggml_tensor * conv_input = ggml_concat(ctx0, conv_states, qkv_mixed, 0);
@@ -389,12 +427,16 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
             ggml_tensor * b_slice = ggml_view_3d(ctx0, beta_presigmoid,
                 beta_presigmoid->ne[0], beta_presigmoid->ne[1], n_seq_tokens,
                 beta_presigmoid->nb[1], beta_presigmoid->nb[2], s * beta_presigmoid->nb[3]);
+            ggml_tensor * qkv_slice = ggml_view_2d(ctx0, qkv_mixed_pretranspose,
+                qkv_mixed_pretranspose->ne[0], n_seq_tokens,
+                qkv_mixed_pretranspose->nb[1], s * qkv_mixed_pretranspose->nb[2]);
 
             // make contiguous (v_conv is a non-contiguous view)
             ggml_tensor * k_cont = ggml_cont(ctx0, k_slice);
             ggml_tensor * v_cont = ggml_cont(ctx0, v_slice);
             ggml_tensor * g_cont = ggml_cont(ctx0, g_slice);
             ggml_tensor * b_cont = ggml_cont(ctx0, b_slice);
+            ggml_tensor * qkv_cont = ggml_cont(ctx0, qkv_slice);
 
             // destination views (sliced to actual n_tokens from max_tokens allocation)
             ggml_tensor * k_dst = ggml_view_3d(ctx0, tl.k,
@@ -409,11 +451,15 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
             ggml_tensor * b_dst = ggml_view_3d(ctx0, tl.beta,
                 tl.beta->ne[0], tl.beta->ne[1], (int64_t)n_seq_tokens,
                 tl.beta->nb[1], tl.beta->nb[2], 0);
+            ggml_tensor * qkv_dst = ggml_view_2d(ctx0, tl.qkv,
+                tl.qkv->ne[0], (int64_t)n_seq_tokens,
+                tl.qkv->nb[1], 0);
 
             ggml_build_forward_expand(gf, ggml_cpy(ctx0, k_cont, k_dst));
             ggml_build_forward_expand(gf, ggml_cpy(ctx0, v_cont, v_dst));
             ggml_build_forward_expand(gf, ggml_cpy(ctx0, g_cont, g_dst));
             ggml_build_forward_expand(gf, ggml_cpy(ctx0, b_cont, b_dst));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, qkv_cont, qkv_dst));
         }
     }
 

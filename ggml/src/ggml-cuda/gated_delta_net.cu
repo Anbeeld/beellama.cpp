@@ -285,6 +285,119 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
     }
 }
 
+template <int S_v>
+__global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, GGML_GDN_MIN_BLOCKS_PER_SM)
+dflash_gdn_state_replay_cuda(
+        float * __restrict__ state,
+        const float * __restrict__ k,
+        const float * __restrict__ v,
+        const float * __restrict__ g,
+        const float * __restrict__ beta,
+        const int n_tokens,
+        const int H_k,
+        const int H_v) {
+    const int h_idx = blockIdx.x;
+    const int lane  = threadIdx.x;
+    const int col   = blockIdx.z * blockDim.y + threadIdx.y;
+
+    if (h_idx >= H_v || col >= S_v) {
+        return;
+    }
+
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v;
+    static_assert(S_v % warp_size == 0, "S_v must be a multiple of warp_size");
+    constexpr int rows_per_lane = (S_v + warp_size - 1) / warp_size;
+
+    float * state_h = state + (size_t) h_idx * S_v * S_v + (size_t) col * S_v;
+    float s_shard[rows_per_lane];
+
+#pragma unroll
+    for (int r = 0; r < rows_per_lane; ++r) {
+        const int i = r * warp_size + lane;
+        s_shard[r] = state_h[i];
+    }
+
+    const int hk = h_idx % H_k;
+    for (int t = 0; t < n_tokens; ++t) {
+        const float * k_t = k + ((size_t) t * H_k + hk) * S_v;
+        const float * v_t = v + ((size_t) t * H_v + h_idx) * S_v;
+        const float g_val = GDN_EXPF(g[(size_t) t * H_v + h_idx]);
+        const float beta_val = 1.0f / (1.0f + expf(-beta[(size_t) t * H_v + h_idx]));
+
+        float k_reg[rows_per_lane];
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; ++r) {
+            const int i = r * warp_size + lane;
+            k_reg[r] = k_t[i];
+        }
+
+        float kv_shard = 0.0f;
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; ++r) {
+            kv_shard += s_shard[r] * k_reg[r];
+        }
+        const float kv_col = warp_reduce_sum<warp_size>(kv_shard);
+        const float delta_col = (v_t[col] - g_val * kv_col) * beta_val;
+
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; ++r) {
+            s_shard[r] = g_val * s_shard[r] + k_reg[r] * delta_col;
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < rows_per_lane; ++r) {
+        const int i = r * warp_size + lane;
+        state_h[i] = s_shard[r];
+    }
+}
+
+extern "C" bool dflash_replay_gdn_state_no_check(
+        void * state,
+        const void * k,
+        const void * v,
+        const void * g,
+        const void * beta,
+        int n_tokens,
+        int S_v,
+        int H_k,
+        int H_v) {
+    if (!state || !k || !v || !g || !beta) return false;
+    if (n_tokens <= 0 || H_k <= 0 || H_v <= 0) return false;
+
+    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+    const int num_warps = 4;
+    const dim3 grid_dims(H_v, 1, (S_v + num_warps - 1) / num_warps);
+    const dim3 block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
+
+    switch (S_v) {
+        case 16:
+            dflash_gdn_state_replay_cuda<16><<<grid_dims, block_dims, 0, cudaStreamPerThread>>>(
+                    (float *) state, (const float *) k, (const float *) v,
+                    (const float *) g, (const float *) beta, n_tokens, H_k, H_v);
+            break;
+        case 32:
+            dflash_gdn_state_replay_cuda<32><<<grid_dims, block_dims, 0, cudaStreamPerThread>>>(
+                    (float *) state, (const float *) k, (const float *) v,
+                    (const float *) g, (const float *) beta, n_tokens, H_k, H_v);
+            break;
+        case 64:
+            dflash_gdn_state_replay_cuda<64><<<grid_dims, block_dims, 0, cudaStreamPerThread>>>(
+                    (float *) state, (const float *) k, (const float *) v,
+                    (const float *) g, (const float *) beta, n_tokens, H_k, H_v);
+            break;
+        case 128:
+            dflash_gdn_state_replay_cuda<128><<<grid_dims, block_dims, 0, cudaStreamPerThread>>>(
+                    (float *) state, (const float *) k, (const float *) v,
+                    (const float *) g, (const float *) beta, n_tokens, H_k, H_v);
+            break;
+        default:
+            return false;
+    }
+
+    return cudaGetLastError() == cudaSuccess;
+}
+
 // ============================================================================
 // Tree-mode Gated Delta Net
 // ============================================================================
@@ -529,6 +642,15 @@ void ggml_cuda_op_gated_delta_net_tree(ggml_backend_cuda_context & ctx, ggml_ten
     ggml_tensor * src_parents = dst->src[6];
     ggml_tensor * src_inter   = dst->src[7];
 
+    GGML_ASSERT(src_q       != nullptr);
+    GGML_ASSERT(src_k       != nullptr);
+    GGML_ASSERT(src_v       != nullptr);
+    GGML_ASSERT(src_g       != nullptr);
+    GGML_ASSERT(src_beta    != nullptr);
+    GGML_ASSERT(src_state   != nullptr);
+    GGML_ASSERT(src_parents != nullptr);
+    GGML_ASSERT(src_inter   != nullptr);
+
     GGML_TENSOR_LOCALS(int64_t, neq, src_q, ne);
     GGML_TENSOR_LOCALS(size_t , nbq, src_q, nb);
     GGML_TENSOR_LOCALS(int64_t, nek, src_k, ne);
@@ -544,7 +666,18 @@ void ggml_cuda_op_gated_delta_net_tree(ggml_backend_cuda_context & ctx, ggml_ten
 
     const bool kda = (src_g->ne[0] == S_v);
 
+    GGML_ASSERT(src_q->type     == GGML_TYPE_F32);
+    GGML_ASSERT(src_k->type     == GGML_TYPE_F32);
+    GGML_ASSERT(src_v->type     == GGML_TYPE_F32);
+    GGML_ASSERT(src_g->type     == GGML_TYPE_F32);
+    GGML_ASSERT(src_beta->type  == GGML_TYPE_F32);
+    GGML_ASSERT(src_state->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type       == GGML_TYPE_F32);
+    GGML_ASSERT(n_tokens > 0);
+    GGML_ASSERT(n_seqs > 0);
     GGML_ASSERT(neq1 == nek1);
+    GGML_ASSERT(neq3 > 0);
+    GGML_ASSERT(nev3 % neq3 == 0);
     const int64_t neqk1 = neq1;
 
     const int64_t rq3 = nev3 / neq3;
@@ -570,6 +703,11 @@ void ggml_cuda_op_gated_delta_net_tree(ggml_backend_cuda_context & ctx, ggml_ten
     GGML_ASSERT(ggml_is_contiguous(src_state));
     GGML_ASSERT(src_parents->type == GGML_TYPE_I32);
     GGML_ASSERT(src_inter->type == GGML_TYPE_F16);
+    GGML_ASSERT(ggml_nelements(src_parents) >= n_tokens);
+    GGML_ASSERT(ggml_nelements(src_state) == S_v * S_v * H * n_seqs);
+    GGML_ASSERT(ggml_nelements(src_inter) >= S_v * S_v * H * n_tokens * n_seqs);
+    GGML_ASSERT(dst->ne[0] == S_v * H);
+    GGML_ASSERT(dst->ne[1] == n_tokens * n_seqs + S_v * n_seqs);
 
     const int64_t sq1 = nbq1 / sizeof(float);
     const int64_t sq2 = nbq2 / sizeof(float);
@@ -594,4 +732,5 @@ void ggml_cuda_op_gated_delta_net_tree(ggml_backend_cuda_context & ctx, ggml_ten
             S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
             sb1, sb2, sb3, neqk1, rq3, scale, stream);
     }
+
 }

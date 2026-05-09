@@ -6,6 +6,7 @@
 #include <vector>
 
 struct dflash_tape_gpu;
+struct dflash_hidden_gpu;
 
 #define LLAMA_MAX_SEQ 256
 
@@ -54,8 +55,19 @@ struct llama_cparams {
     // DFlash: top-K candidates per position (1 = argmax only, >1 = tree branching)
     int dflash_topk = 1;
 
+    // DFlash target verifier: emit compact per-output logits for the server fast path.
+    // top_k = 1 means greedy argmax. top_k > 1 emits top-K ids plus raw logits
+    // so the server can run the sampler chain on K candidates instead of
+    // copying the full vocabulary row to the CPU.
+    bool dflash_verify_logits = false;
+    int  dflash_verify_topk = 1;
+    bool dflash_reduced_consumer_active = false;
+
+    // DFlash: cross-attention window in tokens (how many target hidden states the drafter sees)
+    int dflash_cross_ctx = 512;
+
     // DFlash drafter: number of concurrent slots the batched drafter graph is reserved
-    // for. ctx_len in the drafter graph = dflash_n_slots * LLAMA_DFLASH_PER_SLOT_CTX,
+    // for. ctx_len in the drafter graph = dflash_n_slots * dflash_cross_ctx,
     // and drafter n_tokens reservation = dflash_n_slots * block_size. Set on the
     // drafter context (not the target) via llama_set_dflash_n_slots(). Default 1
     // (single-slot) so the drafter graph stays narrow when no batching is configured.
@@ -71,6 +83,11 @@ struct llama_cparams {
     // Populated by the decode loop before each process_ubatch().
     dflash_tape_gpu * tape_gpu_seqs[LLAMA_DFLASH_MAX_SLOTS] = {};
     int tape_gpu_n_seqs = 0;
+
+    // DFlash GPU-resident hidden capture for verifier decodes. When non-empty,
+    // supported target graphs copy l_out tensors directly to these per-slot buffers.
+    dflash_hidden_gpu * hidden_gpu_seqs[LLAMA_DFLASH_MAX_SLOTS] = {};
+    int hidden_gpu_n_seqs = 0;
 
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;

@@ -596,8 +596,7 @@ static __global__ void k_turbo4_dequant_f16(
 }
 
 // turbo3 K dequant with inverse FWHT: produces K in original (unrotated) domain
-// so Q does NOT need pre-rotation. 128 threads per block, loops over 128-element FWHT groups
-// (each group spans 4 turbo3 storage blocks of 32 elements; all 4 blocks share the same norm).
+// so Q does NOT need pre-rotation. 128 threads per block, one 128-element storage block per FWHT group.
 // In-place 128-point inverse FWHT spread across 128 threads, one element per thread.
 // h=1..16 use intra-warp __shfl_xor_sync (no smem, no syncthreads).
 // h=32 and h=64 cross warp boundaries, so we fall back to smem with syncs.
@@ -657,18 +656,18 @@ static __global__ void k_turbo3_dequant_f16_inv_fwht(
     const float * s2 = d_turbo_wht_signs2_fattn;
     constexpr float inv_sqrt_128 = 0.08838834764831845f;
 
-    // ne0 in elements, FWHT group = 128 elements = 4 turbo3 blocks of 32
+    // ne0 in elements, FWHT group = 128 elements = one classic turbo3 block.
     const int n_groups = (int)(ne0 / 128);
-    constexpr int blocks_per_group = 128 / QK_TURBO3; // 4
+    constexpr int blocks_per_group = 128 / QK_TURBO3;
 
     for (int g = 0; g < n_groups; g++) {
         // Element index within the FWHT group
         const int j_in_grp = tid;            // 0..127
-        const int blk_in_grp = j_in_grp / QK_TURBO3;  // 0..3
-        const int j_in_blk  = j_in_grp % QK_TURBO3;   // 0..31
+        const int blk_in_grp = j_in_grp / QK_TURBO3;  // 0
+        const int j_in_blk  = j_in_grp % QK_TURBO3;   // 0..127
 
         const block_turbo3_0 * blk = (const block_turbo3_0 *)src_row + g * blocks_per_group + blk_in_grp;
-        const float norm = __half2float(blk->norm);   // same for all 4 blocks in this group
+        const float norm = __half2float(blk->norm);   // shared across the block
 
         const uint8_t low2 = (blk->qs[j_in_blk / 4] >> ((j_in_blk % 4) * 2)) & 0x3;
         const uint8_t hi1  = (blk->signs[j_in_blk / 8] >> (j_in_blk % 8)) & 0x1;
@@ -721,8 +720,8 @@ static __global__ void k_turbo4_dequant_f16_inv_fwht(
 }
 
 // turbo2 K dequant with inverse FWHT: produces K in original (unrotated) domain.
-// 128 threads per block, loops over 128-element FWHT groups (each group spans
-// 4 turbo2 storage blocks of 32 elements; all 4 blocks share the same norm).
+// 128 threads per block, loops over 128-element FWHT groups.
+// Each group is one turbo2 storage block of 128 elements.
 static __global__ void k_turbo2_dequant_f16_inv_fwht(
         const char * __restrict__ src, half * __restrict__ dst,
         const int64_t ne0, const int64_t ne1, const int64_t ne2,
@@ -742,12 +741,12 @@ static __global__ void k_turbo2_dequant_f16_inv_fwht(
     constexpr float inv_sqrt_128 = 0.08838834764831845f;
 
     const int n_groups = (int)(ne0 / 128);
-    constexpr int blocks_per_group = 128 / QK_TURBO2; // 4
+    constexpr int blocks_per_group = 128 / QK_TURBO2; // 1
 
     for (int g = 0; g < n_groups; g++) {
         const int j_in_grp = tid;            // 0..127
-        const int blk_in_grp = j_in_grp / QK_TURBO2;  // 0..3
-        const int j_in_blk  = j_in_grp % QK_TURBO2;   // 0..31
+        const int blk_in_grp = j_in_grp / QK_TURBO2;  // 0
+        const int j_in_blk  = j_in_grp % QK_TURBO2;   // 0..127
 
         const block_turbo2_0 * blk = (const block_turbo2_0 *)src_row + g * blocks_per_group + blk_in_grp;
         const float norm = __half2float(blk->norm);
@@ -1233,6 +1232,8 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_TURBO2_TCQ, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_Q8_0,       GGML_TYPE_TURBO3_TCQ)
     FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_Q8_0,       GGML_TYPE_TURBO2_TCQ)
+    FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_TURBO4_0,   GGML_TYPE_TURBO3_TCQ)
+    FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_TURBO3_0,   GGML_TYPE_TURBO3_TCQ)
 #else
     FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_F16,  GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
@@ -1257,6 +1258,8 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_TURBO2_TCQ, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_Q8_0,       GGML_TYPE_TURBO3_TCQ)
     FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_Q8_0,       GGML_TYPE_TURBO2_TCQ)
+    FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_TURBO4_0,   GGML_TYPE_TURBO3_TCQ)
+    FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_TURBO3_0,   GGML_TYPE_TURBO3_TCQ)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
     GGML_ABORT("fatal error");

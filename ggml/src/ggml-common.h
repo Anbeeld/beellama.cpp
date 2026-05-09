@@ -278,35 +278,36 @@ typedef struct {
 static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
 
 // TurboQuant 3-bit MSE-only: 3-bit PolarQuant indices (no QJL)
-// Storage block size = 32 (matches q4_0 for optimal GPU parallelism)
+// Storage block size = 128 values.
 // Transform group size = 128 (head_dim, for rotation Gaussianization)
-// Per block: norm(fp16) + 2-bit indices (8 bytes) + 1-bit extra (4 bytes) = 14 bytes per 32 values
-// = 3.5 bits/value → 4.6× compression vs fp16
+// Per block: norm(fp16) + 2-bit indices (32 bytes) + 1-bit extra (16 bytes) = 50 bytes per 128 values
+// = 3.125 bits/value -> 5.12x storage compression vs fp16
 // The 3-bit index is split: lower 2 bits in qs[], upper 1 bit in signs[]
-#define QK_TURBO3 32   // Block size 32: matches q4_0 parallelism, graph handles WHT rotation
+#define QK_TURBO3 128
 #define QK_TURBO3_GROUP 128  // rotation group size = head_dim
 typedef struct {
     ggml_half  norm;                    //  2 bytes: vector L2 norm (for rescaling)
-    uint8_t    qs[QK_TURBO3 / 4];      //  8 bytes: lower 2-bit indices (4 per byte)
-    uint8_t    signs[QK_TURBO3 / 8];   //  4 bytes: upper 1-bit of 3-bit index (8 per byte)
-} block_turbo3_0;                       // 14 bytes total
+    uint8_t    qs[QK_TURBO3 / 4];      // 32 bytes: lower 2-bit indices (4 per byte)
+    uint8_t    signs[QK_TURBO3 / 8];   // 16 bytes: upper 1-bit of 3-bit index (8 per byte)
+} block_turbo3_0;                       // 50 bytes total
 static_assert(sizeof(block_turbo3_0) == sizeof(ggml_half) + QK_TURBO3/4 + QK_TURBO3/8, "wrong turbo3_0 block size/padding");
 
 // TurboQuant 2-bit: 2-bit PolarQuant indices, no QJL
-// Per block: norm(fp16) + 2-bit indices (8 bytes) = 10 bytes per 32 values
-// = 2.5 bits/value → 6.4× compression vs fp16
-#define QK_TURBO2 32
+// One block = one 128-element rotation group.
+// Per block: norm(fp16) + 2-bit indices (QK_TURBO2/4 bytes)
+// = 34 bytes per 128 values = 2.125 bits/value → 7.53x storage compression vs fp16
+#define QK_TURBO2 128
 #define QK_TURBO2_GROUP 128
 typedef struct {
     ggml_half  norm;                    //  2 bytes: corrected vector L2 norm
-    uint8_t    qs[QK_TURBO2 / 4];      //  8 bytes: 2-bit indices (4 per byte)
-} block_turbo2_0;                       // 10 bytes total
+    uint8_t    qs[QK_TURBO2 / 4];      // 32 bytes: 2-bit indices (4 per byte)
+} block_turbo2_0;                       // 34 bytes total
 static_assert(sizeof(block_turbo2_0) == sizeof(ggml_half) + QK_TURBO2/4, "wrong turbo2_0 block size/padding");
 
 // TurboQuant 3-bit TCQ: Trellis-Coded Quantization (right-shift bitshift trellis, k=3, L=9)
-// One block = one 128-element rotation group. Bitstream: 6 zero-prefix + 128×3-bit outputs = 390 bits = 49 bytes.
+// One block = one 128-element rotation group. Bitstream: 6 zero-prefix + 128*3-bit outputs = 390 bits = 49 bytes.
 // Decode: state_t = read_9_bits(qs, t*3), recon_t = codebook[state_t] * norm
-// = 3.1875 bits/value → 5.0× compression vs fp16
+// Stored struct size is 52 bytes per 128 values = 3.25 bits/value -> 4.92x storage compression vs fp16
 #define QK_TURBO3_TCQ 128
 typedef struct {
     ggml_half  norm;                    //  2 bytes: corrected group L2 norm
@@ -316,9 +317,9 @@ typedef struct {
 static_assert(sizeof(block_turbo3_tcq) == sizeof(ggml_half) + 50, "wrong turbo3_tcq block size/padding");
 
 // TurboQuant 2-bit TCQ: Trellis-Coded Quantization (right-shift bitshift trellis, k=2, L=8)
-// One block = one 128-element rotation group. Bitstream: 6 prefix + 128×2-bit outputs = 262 bits = 33 bytes.
+// One block = one 128-element rotation group. Bitstream: 6 prefix + 128*2-bit outputs = 262 bits = 33 bytes.
 // Decode: state_t = read_8_bits(qs, t*2), recon_t = codebook[state_t] * norm
-// = 2.25 bits/value → 7.1× compression vs fp16
+// Stored struct size is 36 bytes per 128 values = 2.25 bits/value -> 7.11x storage compression vs fp16
 #define QK_TURBO2_TCQ 128
 typedef struct {
     ggml_half  norm;                    //  2 bytes: corrected group L2 norm
@@ -329,7 +330,7 @@ static_assert(sizeof(block_turbo2_tcq) == sizeof(ggml_half) + 34, "wrong turbo2_
 
 // TurboQuant 4-bit: 16-level PolarQuant (Lloyd-Max optimal for post-WHT Gaussian)
 // Per block: norm(fp16) + 4-bit indices (64 bytes)
-// = 66 bytes per 128 values = 4.125 bits/value → 3.9× compression vs fp16
+// = 66 bytes per 128 values = 4.125 bits/value -> 3.88x storage compression vs fp16
 #define QK_TURBO4 128
 typedef struct {
     ggml_half  norm;                    //  2 bytes: L2 norm for rescaling

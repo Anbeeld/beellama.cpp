@@ -9155,7 +9155,11 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             } break;
         case LLM_ARCH_DFLASH_DRAFT:
             {
-                llm = std::make_unique<llm_build_dflash_draft>(*this, params);
+                if (params.gtype == LLM_GRAPH_TYPE_DFLASH_KV_UPDATE) {
+                    llm = std::make_unique<llm_build_dflash_kv_update>(*this, params);
+                } else {
+                    llm = std::make_unique<llm_build_dflash_draft>(*this, params);
+                }
             } break;
         default:
             GGML_ABORT("fatal error");

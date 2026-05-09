@@ -8,6 +8,14 @@
 
 struct common_speculative;
 
+struct common_dflash_ring_write {
+    int ring_pos;
+    int n_tokens;
+    int src_token_offset;
+};
+
+common_dflash_ring_write common_dflash_ring_write_plan(int ring_size, int ring_pos, int n_tokens);
+
 // DDTree: tree of likely continuations built from draft logits
 struct common_speculative_tree {
     std::vector<llama_token> tokens;   // [n_nodes] tree node tokens (topological order)
@@ -15,6 +23,7 @@ struct common_speculative_tree {
     std::vector<int32_t>     depths;   // [n_nodes] depth (1-based: root's children = 1)
     std::vector<std::unordered_map<llama_token, int>> child_maps; // [n_nodes+1] token → child node index (1-based)
     std::vector<uint8_t>     visibility; // [(n_nodes+1)²] row-major: visibility[i*(n+1)+j] = node i can attend to node j
+    std::vector<float>       log_probs;  // [n_nodes] draft log-probability per node (for rejection sampling)
     int n_nodes = 0;
     int main_path_len = 0; // number of main-path nodes (indices 1..main_path_len in batch)
 };
@@ -39,8 +48,8 @@ bool common_speculative_is_compat(llama_context * ctx_tgt);
 // topk / sample_temp / other per-ctx_dft config is applied here so the shared
 // context is fully configured before it is wired into any common_speculative.
 // dflash_n_slots: initial DFlash drafter graph width (1 for non-DFlash or single-slot).
-// Sets cparams_dft.dflash_n_slots before llama_init_from_model so the initial reserve
-// allocates a compute buffer sized for the target slot count.
+// Sets DFlash graph sizing params before llama_init_from_model so the initial reserve
+// allocates compute buffers sized for the target slot count and cross-attention window.
 llama_context * common_speculative_create_ctx_dft(const common_params_speculative & params, int dflash_n_slots = 1);
 
 common_speculative * common_speculative_init(
@@ -76,13 +85,18 @@ void common_speculative_draft_batch(
         llama_context                     * ctx_dft,
         const common_params_speculative   & params,
         const std::vector<llama_token>    & id_last_per_spec,
-        std::vector<llama_tokens>         & result_per_spec);
+        std::vector<llama_tokens>         & result_per_spec,
+        std::vector<std::vector<float>>   * log_probs_per_spec = nullptr);
 
 // informs the speculative decoder that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, uint16_t n_accepted);
 
 // update implementations with logits from the verification decode
 void common_speculative_update_logits(common_speculative * spec, llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted);
+
+// tree variant: update ring buffer with specific capture-buffer indices
+// (for tree verify where accepted tokens may be non-contiguous in the capture buffer)
+void common_speculative_update_logits_by_indices(common_speculative * spec, llama_context * ctx, const std::vector<int> & capture_indices);
 
 // flush hidden states captured during the current prefill sub-batch into
 // the DFlash ring buffer. Call after each llama_decode during split prefill
@@ -97,7 +111,8 @@ void   common_speculative_ring_state_save(const common_speculative * spec, uint8
 bool   common_speculative_ring_state_load(common_speculative * spec, const uint8_t * buf, size_t size);
 
 // DDTree: build a tree of likely continuations from draft logits
-// tree_budget: max tree nodes (0 = flat DFlash, >0 = DDTree)
+// tree_budget: internal total tree nodes for one draft call.
+// Public configuration uses branch_budget, then runtime adds the main draft path.
 common_speculative_tree common_speculative_draft_tree(
                      common_speculative * spec,
         const common_params_speculative & params,

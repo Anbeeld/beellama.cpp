@@ -220,6 +220,41 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     return true;
 }
 
+bool llama_memory_recurrent::seq_rm_cell(llama_seq_id seq_id, uint32_t cell_idx) {
+    if (cell_idx >= size) {
+        return false;
+    }
+
+    if (seq_id < 0 || !cells[cell_idx].has_seq_id(seq_id)) {
+        return false;
+    }
+
+    cells[cell_idx].seq_id.erase(seq_id);
+
+    if (cells[cell_idx].is_empty()) {
+        if (cells[cell_idx].pos >= 0) {
+            used--;
+        }
+        cells[cell_idx].pos = -1;
+        cells[cell_idx].src = -1;
+
+        if (cell_idx < head) {
+            head = cell_idx;
+        }
+    }
+
+    return true;
+}
+
+int llama_memory_recurrent::cells_at_pos(llama_seq_id seq_id, llama_pos pos, uint32_t * cell_indices, int n_max) {
+    GGML_UNUSED(seq_id);
+    GGML_UNUSED(pos);
+    GGML_UNUSED(cell_indices);
+    GGML_UNUSED(n_max);
+
+    return 0;
+}
+
 void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     if (seq_id_src == seq_id_dst) {
         return;
@@ -272,6 +307,13 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
             }
         }
     }
+}
+
+void llama_memory_recurrent::seq_cp_recurrent_no_sync(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    const bool copy_cell_synchronize_prev = copy_cell_synchronize;
+    copy_cell_synchronize = false;
+    seq_cp(seq_id_src, seq_id_dst, p0, p1);
+    copy_cell_synchronize = copy_cell_synchronize_prev;
 }
 
 void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
@@ -397,6 +439,78 @@ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
 void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
     if (i_src == i_dst || i_src < 0 || i_dst < 0) {
         return;
+    }
+
+    // CUDA's generic buffer copy path synchronizes every tensor copy. DFlash
+    // rollback copies both recurrent states across many layers, so enqueue all
+    // D2D copies first and synchronize once when CUDA pointers are available.
+    {
+        using copy_d2d_fn_t = bool (*)(void *, const void *, size_t);
+        using prepare_ptr_fn_t = bool (*)(const void *);
+        using sync_ptr_fn_t = bool (*)(const void *);
+        ggml_backend_reg_t cuda_reg = ggml_backend_reg_by_name("CUDA");
+        auto fn_prepare = cuda_reg
+            ? (prepare_ptr_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cuda_prepare_ptr")
+            : nullptr;
+        auto fn_copy = cuda_reg
+            ? (copy_d2d_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cuda_copy_d2d_no_check")
+            : nullptr;
+        auto fn_sync = cuda_reg
+            ? (sync_ptr_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cuda_synchronize_ptr")
+            : nullptr;
+
+        if (fn_prepare && fn_copy && fn_sync) {
+            bool any_queued = false;
+            bool all_queued = true;
+            const void * sync_ptr = nullptr;
+            const void * first_ptr = nullptr;
+
+            auto enqueue_copy = [&](ggml_tensor * tensor, uint32_t n_embd) {
+                if (!tensor || !tensor->data) {
+                    return true;
+                }
+                const char * buffer_name = tensor->buffer ? ggml_backend_buffer_name(tensor->buffer) : nullptr;
+                if (!buffer_name || std::strncmp(buffer_name, "CUDA", 4) != 0) {
+                    return false;
+                }
+
+                const size_t row_bytes = ggml_row_size(tensor->type, n_embd);
+                const char * src = (const char *) tensor->data + (size_t) i_src * row_bytes;
+                char * dst = (char *) tensor->data + (size_t) i_dst * row_bytes;
+                if (!first_ptr) {
+                    first_ptr = dst;
+                    if (!fn_prepare(first_ptr)) {
+                        return false;
+                    }
+                }
+                if (!fn_copy(dst, src, row_bytes)) {
+                    return false;
+                }
+
+                any_queued = true;
+                sync_ptr = dst;
+                return true;
+            };
+
+            for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                all_queued = all_queued && enqueue_copy(r_l[il], hparams.n_embd_r());
+                all_queued = all_queued && enqueue_copy(s_l[il], hparams.n_embd_s());
+                if (!all_queued) {
+                    break;
+                }
+            }
+
+            if (any_queued && !copy_cell_synchronize && all_queued) {
+                return;
+            }
+
+            if (any_queued) {
+                const bool synced = fn_sync(sync_ptr);
+                if (all_queued && synced) {
+                    return;
+                }
+            }
+        }
     }
 
     // create one shared ggml context for all view pairs
@@ -791,13 +905,40 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         const int32_t cell_id = s + min;
         auto & cell = cells[cell_id];
 
-        if (cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens) {
-            // What should happen when the pos backtracks or skips a value?
-            // Clearing the state mid-batch would require special-casing which isn't done.
-            LLAMA_LOG_WARN("%s: non-consecutive token position %d after %d for sequence %d with %u new tokens\n",
+        // For tree-structured speculative batches, branch tokens share positions with
+        // main-path tokens (same depth = same position) and appear after deeper tokens
+        // in batch order. Detect this by checking for non-monotonic positions — if any
+        // position is less than its predecessor within this sequence, it's a tree batch.
+        // In that case skip the consecutiveness check; tree_rollback corrects cell.pos
+        // after the verify pass.
+        // For tree-structured speculative batches, branch tokens share positions with
+        // main-path tokens (same depth = same position) and appear after deeper tokens
+        // in batch order. Detect this by checking whether the position span matches
+        // the token count — for a linear batch, max_pos - min_pos + 1 == n_seq_tokens
+        // (consecutive positions). For a tree batch, max_pos - min_pos + 1 < n_seq_tokens
+        // because branches reuse positions at the same depth.
+        // Also detect by checking for duplicate positions (branches share depths).
+        bool is_tree_batch = false;
+        if (n_seq_tokens > 2 && cell.pos >= 0) {
+            const llama_pos min_pos = *std::min_element(ubatch.pos + i, ubatch.pos + i + n_seq_tokens);
+            const llama_pos max_pos = *std::max_element(ubatch.pos + i, ubatch.pos + i + n_seq_tokens);
+            // Linear batch: positions are consecutive, so span == count.
+            // Tree batch: span < count because branches reuse positions.
+            if (max_pos - min_pos + 1 < (llama_pos) n_seq_tokens) {
+                is_tree_batch = true;
+            }
+        }
+
+        if (cell.pos >= 0 && !is_tree_batch && last_pos != cell.pos + (llama_pos) n_seq_tokens) {
+            // Non-consecutive token positions are expected during speculative decoding:
+            // cell.pos sits at the last accepted position, while the verify forward
+            // pass and DFlash reduced-verify padding can produce position spans that
+            // differ from a strict linear progression. Rollback/tape_replay corrects
+            // cell.pos afterward in all cases.
+            LLAMA_LOG_DEBUG("%s: non-consecutive token position %d after %d for sequence %d with %u new tokens\n",
                 __func__, last_pos, cell.pos, ubatch.seq_id[i][0], n_seq_tokens);
         }
-        cell.pos = last_pos;
+        cell.pos = is_tree_batch ? *std::max_element(ubatch.pos + i, ubatch.pos + i + n_seq_tokens) : last_pos;
         cell.seq_id.clear();
         for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
             const llama_seq_id seq_id = ubatch.seq_id[i][j];

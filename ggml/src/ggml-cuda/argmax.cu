@@ -5,6 +5,15 @@
 #include "common.cuh"
 #include "sum.cuh"
 
+#if defined(__has_include)
+#    if __has_include(<cub/cub.cuh>)
+#        include <cub/cub.cuh>
+#        if (CCCL_MAJOR_VERSION > 3) || (CCCL_MAJOR_VERSION == 3 && CCCL_MINOR_VERSION >= 2)
+#            define GGML_CUDA_DFLASH_CUB_TOP_K_AVAILABLE
+#        endif
+#    endif
+#endif
+
 // philox-style counter-based PRNG: fast, stateless, deterministic per (seed, counter)
 static __device__ __forceinline__ uint32_t philox_hash(uint64_t seed, uint64_t counter) {
     uint32_t lo = (uint32_t)(counter);
@@ -173,7 +182,10 @@ static __global__ void argmax_f32(
             memcpy(&prob_bits, &log_prob, sizeof(float));
             dst[nrows + row] = prob_bits;
         } else {
-            dst[nrows + row] = 0;  // unused but zero-fill for consistency
+            int32_t logit_bits;
+            const float raw_logit = rowx[argmax];
+            memcpy(&logit_bits, &raw_logit, sizeof(float));
+            dst[nrows + row] = logit_bits;
         }
     }
 }
@@ -286,6 +298,20 @@ static __global__ void topk_f32(
 
     // Warp 0 has best K for intra-warp; for multi-warp, merge across warps
     if (n_warps > 1) {
+        // Reduce softmax within each warp first
+        if (output_logprob) {
+            for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+                float other_max = __shfl_xor_sync(0xFFFFFFFFULL, logit_max, offset, WARP_SIZE);
+                float other_sum = __shfl_xor_sync(0xFFFFFFFFULL, sum_exp, offset, WARP_SIZE);
+                if (other_max > logit_max) {
+                    sum_exp = sum_exp * expf(logit_max - other_max) + other_sum;
+                    logit_max = other_max;
+                } else {
+                    sum_exp = sum_exp + other_sum * expf(other_max - logit_max);
+                }
+            }
+        }
+
         // Each warp leader writes its K candidates to shared memory
         if (lane_id == 0) {
             for (int i = 0; i < K; i++) {
@@ -387,11 +413,49 @@ static __global__ void topk_f32(
             }
         } else {
             for (int i = 0; i < K; i++) {
-                dst[K * nrows + row * K + i] = 0;
+                int32_t logit_bits;
+                const float raw_logit = heap_idx[i] >= 0 ? rowx[heap_idx[i]] : -FLT_MAX;
+                memcpy(&logit_bits, &raw_logit, sizeof(float));
+                dst[K * nrows + row * K + i] = logit_bits;
             }
         }
     }
 }
+
+#ifdef GGML_CUDA_DFLASH_CUB_TOP_K_AVAILABLE
+static void topk_raw_cub(
+        ggml_cuda_pool & pool,
+        const float    * src,
+        int32_t        * dst,
+        const int64_t    ncols,
+        const int64_t    nrows,
+        const int        K,
+        cudaStream_t     stream) {
+    auto requirements = cuda::execution::require(cuda::execution::determinism::not_guaranteed,
+                                                 cuda::execution::output_ordering::unsorted);
+    auto stream_env   = cuda::stream_ref{ stream };
+    auto env          = cuda::std::execution::env{ stream_env, requirements };
+    auto indexes_in   = cuda::make_counting_iterator(0);
+
+    float * vals_out = (float *) (dst + (size_t) K * (size_t) nrows);
+
+    for (int64_t row = 0; row < nrows; ++row) {
+        const float * row_src  = src + row * ncols;
+        int32_t     * row_ids  = dst + row * K;
+        float       * row_vals = vals_out + row * K;
+
+        size_t temp_storage_bytes = 0;
+        CUDA_CHECK(cub::DeviceTopK::MaxPairs(nullptr, temp_storage_bytes,
+                    row_src, row_vals, indexes_in, row_ids, (int) ncols, K, env));
+
+        ggml_cuda_pool_alloc<uint8_t> temp_storage_alloc(pool, temp_storage_bytes);
+        void * d_temp_storage = temp_storage_alloc.get();
+
+        CUDA_CHECK(cub::DeviceTopK::MaxPairs(d_temp_storage, temp_storage_bytes,
+                    row_src, row_vals, indexes_in, row_ids, (int) ncols, K, env));
+    }
+}
+#endif
 
 void ggml_cuda_argmax(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
@@ -424,7 +488,19 @@ void ggml_cuda_argmax(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if (K <= 0) K = 1;
 
     const float inv_temp = (temp > 0.0f) ? (1.0f / temp) : 1.0f;
-    const bool output_logprob = true; // always output log-probs (needed for p_min early stopping + DDTree)
+    // Seeded draft sampling needs full-vocab log-probs for acceptance tests.
+    // Deterministic top-K verifier reduction only needs raw logits; adding or
+    // subtracting a per-row constant does not affect the downstream sampler chain.
+    const bool output_logprob = temp > 0.0f && seed != 0;
+
+    ggml_cuda_pool & pool = ctx.pool();
+
+#ifdef GGML_CUDA_DFLASH_CUB_TOP_K_AVAILABLE
+    if (K > 1 && !output_logprob && seed == 0) {
+        topk_raw_cub(pool, src0_d, dst_d, ne00, nrows, K, stream);
+        return;
+    }
+#endif
 
     const int64_t num_blocks = nrows;
     const int64_t num_threads = std::min<int64_t>(1024, (ne00 + WARP_SIZE - 1) / WARP_SIZE * WARP_SIZE);

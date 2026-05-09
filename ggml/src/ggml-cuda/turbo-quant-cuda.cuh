@@ -485,7 +485,7 @@ void dequantize_turbo3_0(const void * vx, const int64_t ib, const int iqs, float
       const uint8_t low2 = (x[ib].qs[j/4] >> ((j%4)*2)) & 0x3;
       const uint8_t hi1  = (x[ib].signs[j/8] >> (j%8)) & 0x1;
       v.x = d_turbo_centroids_3bit[low2 | (hi1 << 2)] * norm; }
-    { const int j = iqs + 16;
+    { const int j = iqs + QK_TURBO3 / 2;
       const uint8_t low2 = (x[ib].qs[j/4] >> ((j%4)*2)) & 0x3;
       const uint8_t hi1  = (x[ib].signs[j/8] >> (j%8)) & 0x1;
       v.y = d_turbo_centroids_3bit[low2 | (hi1 << 2)] * norm; }
@@ -609,7 +609,7 @@ void dequantize_turbo2_0(const void * vx, const int64_t ib, const int iqs, float
     { const int j = iqs;
       const uint8_t idx = (x[ib].qs[j/4] >> ((j%4)*2)) & 0x3;
       v.x = d_turbo_centroids_2bit[idx] * norm; }
-    { const int j = iqs + 16;
+    { const int j = iqs + QK_TURBO2 / 2;
       const uint8_t idx = (x[ib].qs[j/4] >> ((j%4)*2)) & 0x3;
       v.y = d_turbo_centroids_2bit[idx] * norm; }
 }

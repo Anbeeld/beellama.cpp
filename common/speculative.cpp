@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <iomanip>
 #include <map>
 #include <cinttypes>
@@ -51,6 +52,48 @@ const std::map<std::string, enum common_speculative_type> common_speculative_typ
     {"recycle",       COMMON_SPECULATIVE_TYPE_RECYCLE},
     {"dflash",        COMMON_SPECULATIVE_TYPE_DFLASH}
 };
+
+static bool common_dflash_profile_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_DFLASH_PROFILE");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static bool common_dflash_kv_cache_disabled() {
+    static const bool disabled = [] {
+        const char * env = std::getenv("GGML_DFLASH_DISABLE_KV_CACHE");
+        if (env && std::atoi(env) != 0) {
+            return true;
+        }
+
+        const char * mode = std::getenv("GGML_DFLASH_KV_CACHE_MODE");
+        return mode && (std::strcmp(mode, "off") == 0 ||
+                        std::strcmp(mode, "none") == 0 ||
+                        std::strcmp(mode, "disabled") == 0);
+    }();
+    return disabled;
+}
+
+common_dflash_ring_write common_dflash_ring_write_plan(int ring_size, int ring_pos, int n_tokens) {
+    if (ring_size <= 0 || n_tokens <= 0) {
+        return { 0, 0, 0 };
+    }
+
+    int normalized_pos = ring_pos % ring_size;
+    if (normalized_pos < 0) {
+        normalized_pos += ring_size;
+    }
+
+    if (n_tokens <= ring_size) {
+        return { normalized_pos, n_tokens, 0 };
+    }
+
+    const int skip = n_tokens - ring_size;
+    normalized_pos = (normalized_pos + skip) % ring_size;
+    return { normalized_pos, ring_size, skip };
+}
 
 struct common_speculative_config {
     common_speculative_type type;
@@ -214,6 +257,10 @@ struct common_speculative_state {
     // batch_tokens: tokens that were in the batch [id_last, draft0, draft1, ...]
     // n_accepted: how many were accepted (ids.size(), including the bonus token)
     virtual void update_logits(llama_context * /*ctx*/, const llama_tokens & /*batch_tokens*/, int /*n_accepted*/) {}
+
+    // tree variant: accept specific capture-buffer indices instead of a contiguous block.
+    // capture_indices[0] = id_last (root), capture_indices[1..] = accepted tree node indices.
+    virtual void update_logits_by_indices(llama_context * /*ctx*/, const std::vector<int> & /*capture_indices*/) {}
 
     // flush captured hidden states into the ring buffer during prefill.
     // called after each llama_decode sub-batch so checkpoint splits don't
@@ -1432,14 +1479,18 @@ struct common_speculative_state_dflash : public common_speculative_state {
     bool prefill_flushed = false; // true if flush_prefill() was called during this request
 
     // Interleaved cross-attention buffer — rebuilt from ring on each draft call
-    // Only holds ctx_window tokens worth of data
+    // Only holds cross_ctx tokens worth of data
     std::vector<float> cross_buf;
+    std::vector<float> gpu_restore_staging;
 
     // A2: sliding window limit for drafter context (0 = unlimited)
-    static constexpr int ctx_window = LLAMA_DFLASH_PER_SLOT_CTX;
+    int cross_ctx; // from cparams, default 512
 
     // GPU cross-attention ring (nullptr = CPU fallback)
     void * gpu_ring_handle = nullptr;
+    bool profile = common_dflash_profile_enabled();
+    bool kv_cache_init_attempted = false;
+    bool kv_cache_enabled = false;
 
     // Adaptive draft length tracking
     int n_low_accept = 0;
@@ -1448,14 +1499,16 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
     // build interleaved cross-attention data from ring buffer (GPU or CPU path)
     int build_cross_data(llama_context * ctx) {
+        LOG_DBG("DFLASH_DBG build_cross_data: ring_write_pos=%d ring_filled=%d committed_len=%d cross_ctx=%d gpu=%d\n",
+            ring_write_pos, ring_filled, committed_len, cross_ctx, gpu_ring_handle ? 1 : 0);
         if (gpu_ring_handle) {
-            int gpu_write_pos = ring_write_pos % ctx_window;
-            int gpu_filled = std::min(ring_filled, ctx_window);
+            int gpu_write_pos = ring_write_pos % cross_ctx;
+            int gpu_filled = std::min(ring_filled, cross_ctx);
             llama_dflash_cross_ring_gpu_set_cross(ctx, gpu_ring_handle, seq_id,
-                gpu_write_pos, gpu_filled, n_target_layers, n_embd, ctx_window);
+                gpu_write_pos, gpu_filled, n_target_layers, n_embd, cross_ctx);
             return gpu_filled;
         }
-        int cross_len = std::min(ring_filled, ctx_window > 0 ? ctx_window : ring_filled);
+        int cross_len = std::min(ring_filled, cross_ctx > 0 ? cross_ctx : ring_filled);
         cross_buf.resize((size_t)n_target_features * cross_len);
         int read_start = (ring_write_pos - cross_len + RING_SIZE) % RING_SIZE;
         for (int t = 0; t < cross_len; ++t) {
@@ -1470,18 +1523,65 @@ struct common_speculative_state_dflash : public common_speculative_state {
         return cross_len;
     }
 
+    void update_drafter_kv_cache(int n_written) {
+        if (!gpu_ring_handle || n_written <= 0) {
+            return;
+        }
+        if (common_dflash_kv_cache_disabled()) {
+            return;
+        }
+
+        if (!kv_cache_init_attempted) {
+            kv_cache_init_attempted = true;
+            kv_cache_enabled = llama_dflash_kv_cache_init(ctx_dft, cross_ctx);
+            if (kv_cache_enabled) {
+                LOG_INF("dflash: drafter K/V projection cache enabled (%d-token window)\n", cross_ctx);
+            } else {
+                LOG_WRN("dflash: drafter K/V projection cache unavailable; using full-window K/V projection\n");
+            }
+        }
+        if (!kv_cache_enabled) {
+            return;
+        }
+
+        const int n_update = std::min(n_written, cross_ctx);
+        const int gpu_write_pos = ring_write_pos % cross_ctx;
+        const int gpu_filled = std::min(ring_filled, cross_ctx);
+
+        const int64_t t_start = profile ? ggml_time_us() : 0;
+        const bool ok = llama_dflash_kv_cache_update_from_ring(ctx_dft, gpu_ring_handle,
+                gpu_write_pos, gpu_filled, n_target_layers, n_embd, n_update);
+        if (profile) {
+            LOG_INF("dflash profile: kv_cache_update requested=%d update=%d ok=%d time=%.3f ms ring_pos=%d filled=%d committed=%d\n",
+                    n_written, n_update, ok ? 1 : 0, (ggml_time_us() - t_start) / 1e3,
+                    gpu_write_pos, gpu_filled, committed_len);
+        }
+
+        if (!ok) {
+            static bool warned = false;
+            if (!warned) {
+                LOG_WRN("dflash: drafter K/V projection cache update failed; falling back to full-window projection\n");
+                warned = true;
+            }
+            llama_dflash_kv_cache_reset(ctx_dft);
+            kv_cache_enabled = false;
+        }
+    }
+
     llama_batch batch_dft;
 
     common_speculative_state_dflash(
             llama_context * ctx_tgt_,
             llama_context * ctx_dft_,
             llama_model   * model_dft_,
-            bool            owns_ctx_dft_ = true)
+            bool            owns_ctx_dft_ = true,
+            int             cross_ctx_ = 512)
         : common_speculative_state(COMMON_SPECULATIVE_TYPE_DFLASH)
         , ctx_tgt(ctx_tgt_)
         , ctx_dft(ctx_dft_)
         , model_dft(model_dft_)
         , owns_ctx_dft(owns_ctx_dft_)
+        , cross_ctx(cross_ctx_ > 0 ? cross_ctx_ : 512)
     {
         block_size        = llama_model_dflash_block_size(model_dft_);
         mask_token_id     = (llama_token) llama_model_dflash_mask_token_id(model_dft_);
@@ -1505,10 +1605,10 @@ struct common_speculative_state_dflash : public common_speculative_state {
         batch_dft = llama_batch_init(block_size, 0, 1);
 
         // try to allocate GPU ring buffer on drafter's GPU
-        gpu_ring_handle = llama_dflash_cross_ring_gpu_init(ctx_dft, n_target_layers, n_embd, ctx_window);
+        gpu_ring_handle = llama_dflash_cross_ring_gpu_init(ctx_dft, n_target_layers, n_embd, cross_ctx);
         if (gpu_ring_handle) {
             LOG_INF("dflash: GPU cross ring enabled (%d layers x %d slots x %d embd)\n",
-                    n_target_layers, ctx_window, n_embd);
+                    n_target_layers, cross_ctx, n_embd);
         }
 
         LOG_INF("dflash: block_size=%d, mask_token=%d, n_target_layers=%d, n_embd=%d\n",
@@ -1558,15 +1658,20 @@ struct common_speculative_state_dflash : public common_speculative_state {
         int64_t n_tokens = llama_get_layer_hidden_n_tokens(ctx_tgt, 0);
         if (n_tokens <= 0) return;
 
+        LOG_DBG("DFLASH_DBG flush_prefill: n_tokens=%lld prefill_flushed=%d ring_write_pos=%d ring_filled=%d committed_len=%d\n",
+            (long long)n_tokens, (int)prefill_flushed, ring_write_pos, ring_filled, committed_len);
+
         if (!prefill_flushed) {
             // first flush for this request — reset ring
             ring_write_pos = 0;
             ring_filled = 0;
             committed_len = 0;
+            llama_dflash_kv_cache_reset(ctx_dft);
         }
 
-        ring_write((int)n_tokens);
-        committed_len += (int)n_tokens;
+        const int actual_written = ring_write((int)n_tokens, 0, true);
+        committed_len += actual_written;
+        update_drafter_kv_cache(actual_written);
         prefill_flushed = true;
     }
 
@@ -1622,9 +1727,11 @@ struct common_speculative_state_dflash : public common_speculative_state {
         }
 
         if (saved_write_pos < 0 || saved_write_pos >= RING_SIZE ||
-            saved_filled < 0 || saved_entries < 0 || saved_entries > RING_SIZE) {
-            LOG_WRN("dflash: ring state corrupt: write_pos=%d, filled=%d, entries=%d\n",
-                    saved_write_pos, saved_filled, saved_entries);
+            saved_filled < 0 || saved_filled > RING_SIZE ||
+            saved_entries < 0 || saved_entries != saved_filled ||
+            saved_committed < saved_filled) {
+            LOG_WRN("dflash: ring state corrupt: write_pos=%d, filled=%d, committed=%d, entries=%d\n",
+                    saved_write_pos, saved_filled, saved_committed, saved_entries);
             return false;
         }
 
@@ -1632,8 +1739,11 @@ struct common_speculative_state_dflash : public common_speculative_state {
         if (size < 6 * sizeof(int32_t) + layer_bytes * n_target_layers) return false;
 
         ring_write_pos = saved_write_pos;
-        ring_filled    = saved_filled;
-        committed_len  = saved_committed;
+        ring_filled = saved_filled;
+        committed_len = saved_committed;
+
+        LOG_WRN("DFLASH_DBG ring_state_load: write_pos=%d filled=%d committed=%d entries=%d gpu=%d\n",
+            saved_write_pos, saved_filled, saved_committed, saved_entries, gpu_ring_handle ? 1 : 0);
 
         const uint8_t * src = buf + 6 * sizeof(int32_t);
         for (int l = 0; l < n_target_layers; ++l) {
@@ -1643,19 +1753,24 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
         // sync GPU ring with restored CPU ring — batch per layer to avoid N*L individual H2D calls
         if (gpu_ring_handle) {
-            int gpu_entries = std::min(ring_filled, ctx_window);
-            std::vector<float> tmp((size_t)gpu_entries * n_embd);
+            int gpu_entries = std::min(ring_filled, cross_ctx);
+            const size_t layer_floats = (size_t) gpu_entries * n_embd;
+            gpu_restore_staging.resize(layer_floats * n_target_layers);
             for (int l = 0; l < n_target_layers; ++l) {
+                float * tmp = gpu_restore_staging.data() + layer_floats * l;
                 for (int t = 0; t < gpu_entries; ++t) {
                     int cpu_slot = (ring_write_pos - gpu_entries + t + RING_SIZE) % RING_SIZE;
-                    memcpy(tmp.data() + (size_t)t * n_embd,
+                    memcpy(tmp + (size_t)t * n_embd,
                            ring_buf[l].data() + (size_t)cpu_slot * n_embd,
                            n_embd * sizeof(float));
                 }
-                int gpu_pos = ((ring_write_pos - gpu_entries) % ctx_window + ctx_window) % ctx_window;
+                int gpu_pos = ((ring_write_pos - gpu_entries) % cross_ctx + cross_ctx) % cross_ctx;
                 llama_dflash_cross_ring_gpu_write(gpu_ring_handle, l, gpu_pos,
-                    tmp.data(), gpu_entries, n_embd);
+                    tmp, gpu_entries, n_embd);
             }
+            llama_dflash_cross_ring_gpu_synchronize(gpu_ring_handle);
+            llama_dflash_kv_cache_reset(ctx_dft);
+            update_drafter_kv_cache(gpu_entries);
         }
 
         // mark as flushed so subsequent flush_prefill() calls from suffix
@@ -1749,9 +1864,18 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
         n_draft_last = (int) result.size();
 
-        LOG_DBG("dflash draft breakdown (ctx=%d): concat=%.1fms cross=%.1fms decode=%.1fms argmax=%.1fms total=%.1fms\n",
-                committed_len,
-                (t1 - t0) / 1e3, (t2 - t1) / 1e3, (t3 - t2) / 1e3, (t4 - t3) / 1e3, (t4 - t0) / 1e3);
+        if (profile) {
+            const llama_perf_context_data perf_dft = llama_perf_context(ctx_dft);
+            LOG_INF("dflash profile: draft ctx=%d cross_len=%d n_draft=%d produced=%d "
+                    "cross=%.3f ms batch=%.3f ms decode=%.3f ms argmax=%.3f ms total=%.3f ms gpu_ring=%d graph_reuse=%d\n",
+                    committed_len, cross_len, n_draft, (int) result.size(),
+                    (t1 - t0) / 1e3, (t2 - t1) / 1e3, (t3 - t2) / 1e3, (t4 - t3) / 1e3,
+                    (t4 - t0) / 1e3, gpu_ring_handle ? 1 : 0, perf_dft.n_reused);
+        } else {
+            LOG_DBG("dflash draft breakdown (ctx=%d): concat=%.1fms cross=%.1fms decode=%.1fms argmax=%.1fms total=%.1fms\n",
+                    committed_len,
+                    (t1 - t0) / 1e3, (t2 - t1) / 1e3, (t3 - t2) / 1e3, (t4 - t3) / 1e3, (t4 - t0) / 1e3);
+        }
     }
 
     void accept(uint16_t n_accepted) override {
@@ -1803,9 +1927,35 @@ struct common_speculative_state_dflash : public common_speculative_state {
             LOG_ERR("dflash: drafter decode failed with %d\n", ret);
             return;
         }
+
+        const int64_t t_gpu = ggml_time_us();
         // --- end shared draft setup ---
 
         const int draft_horizon = std::min(n_draft, block_size - 1);
+
+        const int K = llama_get_logits_argmax_k(ctx_dft);
+        const bool can_branch = (K > 1);
+
+        // n_max_base is the user's original --draft-max before adaptive DM reduction.
+        // It determines whether the user intended branches:
+        //   tree_budget <= n_max_base → pure chain (user didn't allocate extra for branches)
+        //   tree_budget >  n_max_base → branches (user explicitly allocated beyond main path)
+        // When adaptive DM reduces n_max, branch_budget scales proportionally — branches
+        // shrink when the model is less confident, matching adaptive DM's intent.
+        const int n_max_original = (params.n_max_base > 0) ? params.n_max_base : params.n_max;
+        const int original_horizon = std::min(n_max_original, block_size - 1);
+
+        int branch_budget = 0;
+        if (can_branch && tree_budget > original_horizon) {
+            const int base_branch_budget = tree_budget - original_horizon;
+            const float ratio = (float)base_branch_budget / original_horizon;
+            branch_budget = std::min(
+                (int)std::round(draft_horizon * ratio),
+                std::max(0, tree_budget - draft_horizon));
+            branch_budget = std::max(0, branch_budget);
+        }
+
+        const int main_path_len = std::min(draft_horizon, std::max(1, tree_budget - branch_budget));
         const int depth_limit = draft_horizon;
 
         // Use GPU argmax/topk for tree building
@@ -1814,7 +1964,6 @@ struct common_speculative_state_dflash : public common_speculative_state {
             LOG_ERR("draft_tree: no GPU argmax available\n");
             return;
         }
-        const int K = llama_get_logits_argmax_k(ctx_dft);
         float * argmax_probs = llama_get_logits_argmax_probs(ctx_dft);
 
         // Build tree using best-first heap expansion with chain-seed backbone
@@ -1823,6 +1972,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
         tree.depths.clear();
         tree.child_maps.clear();
         tree.visibility.clear();
+        tree.log_probs.clear();
 
         tree.parents.push_back(-1); // root parent
         tree.child_maps.push_back({}); // root child_map
@@ -1830,15 +1980,18 @@ struct common_speculative_state_dflash : public common_speculative_state {
         tree.main_path_len = 0;
 
         // Chain-seed: pre-insert greedy backbone (top-1 at each depth)
+        // Only insert up to main_path_len nodes; reserve remaining budget for branches
         {
             int parent = 0;
-            for (int d = 1; d <= depth_limit && tree.n_nodes < tree_budget; ++d) {
+            for (int d = 1; d <= depth_limit && d <= main_path_len && tree.n_nodes < tree_budget; ++d) {
                 llama_token token_id = (llama_token) argmax[d * K];
+                float log_prob = argmax_probs ? argmax_probs[d * K + 0] : -INFINITY;
 
                 int current_idx = tree.n_nodes + 1;
                 tree.tokens.push_back(token_id);
                 tree.parents.push_back(parent);
                 tree.depths.push_back(d);
+                tree.log_probs.push_back(log_prob);
                 tree.child_maps.push_back({});
                 tree.child_maps[parent][token_id] = current_idx;
                 tree.n_nodes++;
@@ -1849,7 +2002,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
         }
 
         // Best-first expansion using log-prob heap (DDTree Algorithm 1)
-        if (K > 1 && tree.n_nodes < tree_budget && argmax_probs) {
+        if (K > 1 && branch_budget > 0 && argmax_probs) {
             // Heap entry: (cumulative_log_prob, parent_tree_idx, depth, rank)
             struct heap_entry {
                 float  log_w;
@@ -1862,17 +2015,18 @@ struct common_speculative_state_dflash : public common_speculative_state {
             std::priority_queue<heap_entry> heap;
 
             // Seed heap: siblings of the main chain at each depth
-            // cumulative log-prob along main path up to parent
+            // Only seed depths where main path has a node (1..main_path_len)
             float cum_log_prob = 0.0f;
-            int main_parent = 0;
-            for (int d = 1; d <= depth_limit; ++d) {
+            for (int d = 1; d <= main_path_len; ++d) {
                 float sibling_lp = cum_log_prob + argmax_probs[d * K + 1];
-                heap.push({sibling_lp, main_parent, d, 1});
+                // Parent of sibling at depth d is the main path node at depth d-1.
+                // Main path nodes are 1-indexed: depth1=node1, depth2=node2, etc.
+                int sibling_parent = (d == 1) ? 0 : d - 1;
+                heap.push({sibling_lp, sibling_parent, d, 1});
                 cum_log_prob += argmax_probs[d * K + 0];
-                main_parent = d; // main path nodes are 1-indexed
             }
 
-            while (!heap.empty() && tree.n_nodes < tree_budget) {
+            while (!heap.empty() && (tree.n_nodes - tree.main_path_len) < branch_budget) {
                 auto top = heap.top();
                 heap.pop();
 
@@ -1884,6 +2038,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
                 tree.tokens.push_back(token_id);
                 tree.parents.push_back(top.parent_idx);
                 tree.depths.push_back(top.depth);
+                tree.log_probs.push_back(argmax_probs ? argmax_probs[top.depth * K + top.rank] : -INFINITY);
                 tree.child_maps.push_back({});
                 tree.child_maps[top.parent_idx][token_id] = current_idx;
                 tree.n_nodes++;
@@ -1902,24 +2057,25 @@ struct common_speculative_state_dflash : public common_speculative_state {
                     heap.push({child_lp, current_idx, child_depth, 0});
                 }
             }
-        } else if (K > 1 && tree.n_nodes < tree_budget) {
+        } else if (K > 1 && branch_budget > 0) {
             // Fallback without log-probs: uniform sibling addition
-            int main_parent = 0;
-            for (int d = 1; d <= depth_limit && tree.n_nodes < tree_budget; ++d) {
-                for (int ki = 1; ki < K && tree.n_nodes < tree_budget; ++ki) {
+            // Add siblings at main path depths only (same rule as heap seeding)
+            for (int d = 1; d <= main_path_len && (tree.n_nodes - tree.main_path_len) < branch_budget; ++d) {
+                int parent_idx = (d == 1) ? 0 : d - 1;
+                for (int ki = 1; ki < K && (tree.n_nodes - tree.main_path_len) < branch_budget; ++ki) {
                     llama_token alt_token = (llama_token) argmax[d * K + ki];
                     if (alt_token < 0) continue;
-                    if (tree.child_maps[main_parent].count(alt_token)) continue;
+                    if (tree.child_maps[parent_idx].count(alt_token)) continue;
 
                     int current_idx = tree.n_nodes + 1;
                     tree.tokens.push_back(alt_token);
-                    tree.parents.push_back(main_parent);
+                    tree.parents.push_back(parent_idx);
                     tree.depths.push_back(d);
+                    tree.log_probs.push_back(-INFINITY);
                     tree.child_maps.push_back({});
-                    tree.child_maps[main_parent][alt_token] = current_idx;
+                    tree.child_maps[parent_idx][alt_token] = current_idx;
                     tree.n_nodes++;
                 }
-                main_parent = d;
             }
         }
 
@@ -1937,9 +2093,11 @@ struct common_speculative_state_dflash : public common_speculative_state {
         }
 
         const int64_t t1 = ggml_time_us();
-        LOG_INF("ddtree: built tree with %d nodes (%d main + %d branch, budget %d) in %.1fms\n",
+        const int64_t gpu_ms = (t_gpu - t0) / 1000;
+        const int64_t cpu_ms = (t1 - t_gpu) / 1000;
+        LOG_INF("ddtree: built tree with %d nodes (%d main + %d branch, budget %d) in %.1fms (gpu=%.0fms cpu=%.0fms)\n",
                 tree.n_nodes, tree.main_path_len, tree.n_nodes - tree.main_path_len,
-                tree_budget, (t1 - t0) / 1e3);
+                tree_budget, (t1 - t0) / 1e3, (double)gpu_ms, (double)cpu_ms);
 
         GGML_UNUSED(prompt_tgt);
     }
@@ -1954,35 +2112,215 @@ struct common_speculative_state_dflash : public common_speculative_state {
         append_target_hiddens(n_accepted);
     }
 
+    // tree variant: write specific capture-buffer indices to the ring
+    void update_logits_by_indices(llama_context * ctx, const std::vector<int> & capture_indices) override {
+        GGML_UNUSED(ctx);
+        llama_dflash_set_active_slot(ctx_tgt, seq_id);
+
+        int32_t n_slots = llama_get_n_layer_hiddens(ctx_tgt);
+        if (n_slots == 0 || capture_indices.empty()) {
+            return;
+        }
+
+        const int actual_written = ring_write_by_indices(capture_indices);
+        committed_len += actual_written;
+        update_drafter_kv_cache(actual_written);
+    }
+
 private:
+    void log_ring_profile(const char * name, int n_tokens, int actual_written,
+            int64_t cpu_copy_us, int64_t gpu_enqueue_us, int64_t gpu_sync_us) const {
+        if (!profile) {
+            return;
+        }
+        LOG_INF("dflash profile: %s requested=%d written=%d cpu_copy=%.3f ms gpu_enqueue=%.3f ms gpu_sync=%.3f ms ring_filled_before=%d committed_before=%d gpu=%d\n",
+                name, n_tokens, actual_written,
+                cpu_copy_us / 1e3, gpu_enqueue_us / 1e3, gpu_sync_us / 1e3,
+                ring_filled, committed_len, gpu_ring_handle ? 1 : 0);
+    }
+
     // write n_tokens into ring buffer from captured hidden states
     // write n_tokens from the capture buffer into the ring, starting at
     // src_offset in the capture buffer. wraps circularly in the ring.
-    void ring_write(int n_tokens, int src_offset = 0) {
+    int ring_write(int n_tokens, int src_offset = 0, bool force_cpu_ring = false) {
+        if (n_tokens <= 0) return 0;
+
         int32_t n_slots = llama_get_n_layer_hiddens(ctx_tgt);
+        int actual_written = n_tokens;
+        bool first_layer = true;
+        bool any_layer = false;
+        for (int layer = 0; layer < n_target_layers && layer < n_slots; ++layer) {
+            float * data = llama_get_layer_hidden(ctx_tgt, layer);
+            int64_t ntok = llama_get_layer_hidden_n_tokens(ctx_tgt, layer);
+            if ((!data && !gpu_ring_handle) || ntok <= 0) continue;
+
+            int to_write = std::min(n_tokens, std::max(0, (int)ntok - src_offset));
+
+            if (to_write < n_tokens) {
+                LOG_WRN("DFLASH_DBG ring_write MISMATCH: requested=%d actual=%d ntok=%lld src_offset=%d ring_write_pos=%d ring_filled=%d committed_len=%d\n",
+                    n_tokens, to_write, (long long)ntok, src_offset, ring_write_pos, ring_filled, committed_len);
+            }
+            if (first_layer) {
+                actual_written = to_write;
+                first_layer = false;
+            } else {
+                actual_written = std::min(actual_written, to_write);
+            }
+            any_layer = true;
+        }
+        if (!any_layer || actual_written <= 0) return 0;
+
+        bool gpu_upload_queued = false;
+        bool gpu_d2d_failed = false;
+        int64_t cpu_copy_us = 0;
+        int64_t gpu_enqueue_us = 0;
+        for (int layer = 0; layer < n_target_layers && layer < n_slots; ++layer) {
+            float * data = llama_get_layer_hidden(ctx_tgt, layer);
+            int64_t embd = llama_get_layer_hidden_n_embd(ctx_tgt, layer);
+            int64_t ntok = llama_get_layer_hidden_n_tokens(ctx_tgt, layer);
+            if ((!data && !gpu_ring_handle) || ntok <= 0) continue;
+
+            // Keep the CPU ring valid during prefill because prompt checkpoints serialize it.
+            // Decode append can skip the CPU copy when GPU ring is active.
+            if ((force_cpu_ring || !gpu_ring_handle) && data) {
+                const int64_t t_start = profile ? ggml_time_us() : 0;
+                for (int t = 0; t < actual_written; ++t) {
+                    int slot = (ring_write_pos + t) % RING_SIZE;
+                    memcpy(ring_buf[layer].data() + (size_t)slot * embd,
+                           data + (size_t)(src_offset + t) * embd,
+                           embd * sizeof(float));
+                }
+                if (profile) {
+                    cpu_copy_us += ggml_time_us() - t_start;
+                }
+            }
+
+            // GPU ring upload (capture buffer is contiguous, write fn handles wrap)
+            if (gpu_ring_handle) {
+                const auto plan = common_dflash_ring_write_plan(cross_ctx, ring_write_pos, actual_written);
+                if (plan.n_tokens > 0) {
+                    const int64_t t_start = profile ? ggml_time_us() : 0;
+                    bool used_d2d = false;
+                    if (!data) {
+                        used_d2d = llama_dflash_cross_ring_gpu_write_hidden(gpu_ring_handle, ctx_tgt, layer, plan.ring_pos,
+                            src_offset + plan.src_token_offset, plan.n_tokens, embd);
+                        gpu_d2d_failed = gpu_d2d_failed || !used_d2d;
+                    }
+                    if (!used_d2d && data) {
+                        llama_dflash_cross_ring_gpu_write(gpu_ring_handle, layer, plan.ring_pos,
+                            data + (size_t)(src_offset + plan.src_token_offset) * embd,
+                            plan.n_tokens, embd);
+                    }
+                    if (profile) {
+                        gpu_enqueue_us += ggml_time_us() - t_start;
+                    }
+                    gpu_upload_queued = true;
+                }
+            }
+        }
+        if (gpu_d2d_failed) {
+            LOG_WRN("dflash: GPU hidden D2D ring write failed; accepted hiddens were not appended\n");
+            return 0;
+        }
+        int64_t gpu_sync_us = 0;
+        if (gpu_upload_queued) {
+            // Hidden capture storage is reused on the next target decode; keep
+            // async H2D uploads from reading freed or overwritten vectors.
+            const int64_t t_start = profile ? ggml_time_us() : 0;
+            llama_dflash_cross_ring_gpu_synchronize(gpu_ring_handle);
+            if (profile) {
+                gpu_sync_us += ggml_time_us() - t_start;
+            }
+        }
+        log_ring_profile("ring_write", n_tokens, actual_written, cpu_copy_us, gpu_enqueue_us, gpu_sync_us);
+        ring_write_pos = (ring_write_pos + actual_written) % RING_SIZE;
+        ring_filled = std::min(ring_filled + actual_written, RING_SIZE);
+        return actual_written;
+    }
+
+    // tree variant: write specific capture-buffer indices to the ring.
+    // indices may be non-contiguous (e.g. when tree walk skips siblings).
+    int ring_write_by_indices(const std::vector<int> & indices) {
+        const int n_tokens = (int)indices.size();
+        if (n_tokens <= 0) return 0;
+
+        int32_t n_slots = llama_get_n_layer_hiddens(ctx_tgt);
+        int actual_written = n_tokens;
+        bool first_layer = true;
+        bool any_layer = false;
+        for (int layer = 0; layer < n_target_layers && layer < n_slots; ++layer) {
+            float * data = llama_get_layer_hidden(ctx_tgt, layer);
+            int64_t ntok = llama_get_layer_hidden_n_tokens(ctx_tgt, layer);
+            if (!data || ntok <= 0) continue;
+
+            int wrote_this_layer = 0;
+            for (int t = 0; t < n_tokens; ++t) {
+                int src_idx = indices[t];
+                if (src_idx < 0 || src_idx >= (int)ntok) {
+                    break;
+                }
+                wrote_this_layer++;
+            }
+            if (wrote_this_layer < n_tokens) {
+                LOG_WRN("DFLASH_DBG ring_write_by_indices MISMATCH: requested=%d prefix=%d ntok=%lld ring_write_pos=%d ring_filled=%d committed_len=%d\n",
+                    n_tokens, wrote_this_layer, (long long)ntok, ring_write_pos, ring_filled, committed_len);
+            }
+            if (first_layer) {
+                actual_written = wrote_this_layer;
+                first_layer = false;
+            } else {
+                actual_written = std::min(actual_written, wrote_this_layer);
+            }
+            any_layer = true;
+        }
+
+        if (!any_layer || actual_written <= 0) return 0;
+
+        bool gpu_upload_queued = false;
+        int64_t cpu_copy_us = 0;
+        int64_t gpu_enqueue_us = 0;
         for (int layer = 0; layer < n_target_layers && layer < n_slots; ++layer) {
             float * data = llama_get_layer_hidden(ctx_tgt, layer);
             int64_t embd = llama_get_layer_hidden_n_embd(ctx_tgt, layer);
             int64_t ntok = llama_get_layer_hidden_n_tokens(ctx_tgt, layer);
             if (!data || ntok <= 0) continue;
 
-            int to_write = std::min(n_tokens, (int)ntok - src_offset);
-            for (int t = 0; t < to_write; ++t) {
-                int slot = (ring_write_pos + t) % RING_SIZE;
-                memcpy(ring_buf[layer].data() + (size_t)slot * embd,
-                       data + (size_t)(src_offset + t) * embd,
+            for (int t = 0; t < actual_written; ++t) {
+                int src_idx = indices[t];
+                int ring_slot = (ring_write_pos + t) % RING_SIZE;
+                const int64_t t_cpu_start = profile ? ggml_time_us() : 0;
+                memcpy(ring_buf[layer].data() + (size_t)ring_slot * embd,
+                       data + (size_t)src_idx * embd,
                        embd * sizeof(float));
-            }
-
-            // GPU ring upload (capture buffer is contiguous, write fn handles wrap)
-            if (gpu_ring_handle && to_write > 0) {
-                int gpu_pos = ring_write_pos % ctx_window;
-                llama_dflash_cross_ring_gpu_write(gpu_ring_handle, layer, gpu_pos,
-                    data + (size_t)src_offset * embd, to_write, embd);
+                if (profile) {
+                    cpu_copy_us += ggml_time_us() - t_cpu_start;
+                }
+                if (gpu_ring_handle) {
+                    int gpu_pos = (ring_write_pos + t) % cross_ctx;
+                    const int64_t t_gpu_start = profile ? ggml_time_us() : 0;
+                    llama_dflash_cross_ring_gpu_write(gpu_ring_handle, layer, gpu_pos,
+                        data + (size_t)src_idx * embd, 1, embd);
+                    if (profile) {
+                        gpu_enqueue_us += ggml_time_us() - t_gpu_start;
+                    }
+                    gpu_upload_queued = true;
+                }
             }
         }
-        ring_write_pos = (ring_write_pos + n_tokens) % RING_SIZE;
-        ring_filled = std::min(ring_filled + n_tokens, RING_SIZE);
+        int64_t gpu_sync_us = 0;
+        if (gpu_upload_queued) {
+            // Hidden capture storage is reused on the next target decode; keep
+            // async H2D uploads from reading freed or overwritten vectors.
+            const int64_t t_start = profile ? ggml_time_us() : 0;
+            llama_dflash_cross_ring_gpu_synchronize(gpu_ring_handle);
+            if (profile) {
+                gpu_sync_us += ggml_time_us() - t_start;
+            }
+        }
+        log_ring_profile("ring_write_by_indices", n_tokens, actual_written, cpu_copy_us, gpu_enqueue_us, gpu_sync_us);
+        ring_write_pos = (ring_write_pos + actual_written) % RING_SIZE;
+        ring_filled = std::min(ring_filled + actual_written, RING_SIZE);
+        return actual_written;
     }
 
     // called after initial prefill — grab all hidden states
@@ -1995,14 +2333,19 @@ private:
         int64_t n_tokens = llama_get_layer_hidden_n_tokens(ctx_tgt, 0);
         if (n_tokens <= 0) return;
 
+        LOG_DBG("DFLASH_DBG capture_target_hiddens: n_tokens=%lld ring_write_pos=%d ring_filled=%d committed_len=%d\n",
+            (long long)n_tokens, ring_write_pos, ring_filled, committed_len);
+
         // only keep last RING_SIZE tokens if prompt exceeds ring capacity
         int start_offset = std::max(0, (int)n_tokens - RING_SIZE);
         int to_store = (int)n_tokens - start_offset;
 
         ring_write_pos = 0;
         ring_filled = 0;
-        ring_write(to_store, start_offset);
-        committed_len = (int)n_tokens;
+        llama_dflash_kv_cache_reset(ctx_dft);
+        const int actual_written = ring_write(to_store, start_offset, true);
+        committed_len = start_offset + actual_written;
+        update_drafter_kv_cache(actual_written);
     }
 
     // called after each verification decode — append only the accepted tokens' hidden states
@@ -2014,8 +2357,25 @@ private:
             return;
         }
 
-        ring_write(n_accepted);
-        committed_len += n_accepted;
+        // DEBUG: log capture buffer vs n_accepted to detect counter mismatch
+        {
+            int64_t ntok = llama_get_layer_hidden_n_tokens(ctx_tgt, 0);
+            int64_t embd = llama_get_layer_hidden_n_embd(ctx_tgt, 0);
+            const float * data = llama_get_layer_hidden(ctx_tgt, 0);
+            float first5[5] = {}, last5[5] = {};
+            if (data && ntok > 0 && embd >= 5) {
+                memcpy(first5, data, 5 * sizeof(float));
+                memcpy(last5, data + (ntok - 1) * embd + embd - 5, 5 * sizeof(float));
+            }
+            LOG_DBG("DFLASH_DBG append_target_hiddens: n_accepted=%d ntok=%lld embd=%lld ring_write_pos=%d ring_filled=%d committed_len=%d layer0_first=[%.4f,%.4f,%.4f,%.4f,%.4f] last=[%.4f,%.4f,%.4f,%.4f,%.4f]\n",
+                n_accepted, (long long)ntok, (long long)embd, ring_write_pos, ring_filled, committed_len,
+                first5[0], first5[1], first5[2], first5[3], first5[4],
+                last5[0], last5[1], last5[2], last5[3], last5[4]);
+        }
+
+        const int actual_written = ring_write(n_accepted);
+        committed_len += actual_written;
+        update_drafter_kv_cache(actual_written);
     }
 
     int32_t n_max(const common_params_speculative & params) const override {
@@ -2103,6 +2463,7 @@ llama_context * common_speculative_create_ctx_dft(const common_params_speculativ
     }
     llama_context_params cparams_dft = params.cparams_dft;
     cparams_dft.dflash_n_slots = dflash_n_slots;
+    cparams_dft.dflash_cross_ctx = params.dflash_cross_ctx;
     llama_context * ctx_dft = llama_init_from_model(params.model_dft, cparams_dft);
     if (ctx_dft == nullptr) {
         LOG_ERR("%s", "failed to create draft context\n");
@@ -2233,8 +2594,6 @@ common_speculative * common_speculative_init(
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_SUFFIX, params));
         }
         if (has_dflash) {
-            // CopySpec before DFlash: fires as primary only for long matches (2*n_max+)
-            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_COPYSPEC, params));
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DFLASH, params));
         }
         if (has_draft) {
@@ -2259,7 +2618,8 @@ common_speculative * common_speculative_init(
                     ctx_tgt,
                     ctx_dft,
                     params.model_dft,
-                    owns_ctx_dft
+                    owns_ctx_dft,
+                    params.dflash_cross_ctx
                 ));
                 if (owns_ctx_dft) {
                     ctx_dft = nullptr; // ownership transferred to the state
@@ -2476,10 +2836,15 @@ void common_speculative_draft_batch(
         llama_context                     * ctx_dft,
         const common_params_speculative   & params,
         const std::vector<llama_token>    & id_last_per_spec,
-        std::vector<llama_tokens>         & result_per_spec) {
+        std::vector<llama_tokens>         & result_per_spec,
+        std::vector<std::vector<float>>   * log_probs_per_spec) {
     const int n_specs = (int) specs.size();
     result_per_spec.clear();
     result_per_spec.resize(n_specs);
+    if (log_probs_per_spec) {
+        log_probs_per_spec->clear();
+        log_probs_per_spec->resize(n_specs);
+    }
 
     if (n_specs == 0 || !ctx_dft) {
         return;
@@ -2553,13 +2918,14 @@ void common_speculative_draft_batch(
     const int64_t t2 = ggml_time_us();
 
     // read per-spec argmax results
-    int32_t * argmax       = llama_get_logits_argmax(ctx_dft);
+    int32_t * argmax  = llama_get_logits_argmax(ctx_dft);
     float   * argmax_probs = llama_get_logits_argmax_probs(ctx_dft);
-    const int K_flat       = llama_get_logits_argmax_k(ctx_dft);
+    const int K_flat  = llama_get_logits_argmax_k(ctx_dft);
 
     for (int r = 0; r < n_ready; r++) {
         auto & rs     = ready[r];
         auto & result = result_per_spec[rs.spec_idx];
+        std::vector<float> * log_probs = log_probs_per_spec ? &(*log_probs_per_spec)[rs.spec_idx] : nullptr;
         const int offset = r * batch_len;
 
         if (argmax) {
@@ -2571,6 +2937,9 @@ void common_speculative_draft_batch(
                     }
                 }
                 result.push_back((llama_token) argmax[(offset + i) * K_flat]);
+                if (log_probs && argmax_probs) {
+                    log_probs->push_back(argmax_probs[(offset + i) * K_flat]);
+                }
             }
         } else {
             const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
@@ -2656,6 +3025,15 @@ void common_speculative_update_logits(common_speculative * spec, llama_context *
     }
     for (auto & impl : spec->impls) {
         impl->update_logits(ctx, batch_tokens, n_accepted);
+    }
+}
+
+void common_speculative_update_logits_by_indices(common_speculative * spec, llama_context * ctx, const std::vector<int> & capture_indices) {
+    if (spec == nullptr) {
+        return;
+    }
+    for (auto & impl : spec->impls) {
+        impl->update_logits_by_indices(ctx, capture_indices);
     }
 }
 

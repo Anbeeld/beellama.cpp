@@ -279,6 +279,7 @@ struct common_params_sampling {
     std::vector<llama_token> reasoning_budget_end;             // end tag token sequence
     std::vector<llama_token> reasoning_budget_forced;          // forced sequence (message + end tag)
     std::string              reasoning_budget_message;         // message injected before end tag when budget exhausted
+    bool                     reasoning_budget_tracking = false; // track reasoning state even with unlimited budget
 
     bool backend_sampling = false;
 
@@ -307,7 +308,7 @@ struct common_params_speculative_draft {
     int32_t n_min = 0;  // minimum number of draft tokens to use for speculative decoding
 
     float p_split = 0.1f;  // speculative decoding split probability
-    float p_min   = 0.75f; // minimum speculative decoding probability (greedy)
+    float p_min   = 0.0f;  // minimum speculative decoding probability (greedy)
 
     common_params_model mparams;
 
@@ -351,6 +352,11 @@ struct common_params_speculative_ngram_cache {
     std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding
 };
 
+enum common_speculative_dm_controller {
+    COMMON_SPECULATIVE_DM_CONTROLLER_FRINGE,
+    COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT,
+};
+
 struct common_params_speculative {
     // TODO: become a vector in order to support "chains of speculators"
     common_speculative_type type = COMMON_SPECULATIVE_TYPE_NONE;
@@ -366,13 +372,36 @@ struct common_params_speculative {
 
     // DFlash-specific params (top-level for fork compat)
     int32_t n_max        = 16; // maximum number of tokens to draft during speculative decoding
+    int32_t n_max_base   = 0;  // user's original --draft-max before adaptive DM reduction (0 = use n_max)
     int32_t n_min        = 0;  // minimum number of draft tokens to use for speculative decoding
-    int32_t tree_budget  = 0;  // DDTree node budget (0 = flat DFlash, >0 = tree verification)
+    int32_t branch_budget = 0; // DDTree branch nodes beyond the main draft path (0 = flat DFlash)
+    int32_t tree_budget   = -1; // legacy total-node --tree-budget input; normalized after parsing
+    bool    branch_budget_explicit = false;
+    bool    legacy_tree_budget_explicit = false;
     int32_t dflash_max_slots = 1; // max concurrent server slots that keep DFlash state
     float   p_split = 0.1f;   // speculative decoding split probability
     float   p_min   = 0.0f;   // minimum speculative decoding probability (0 = disabled)
     float   sample_temp = 0.0f; // drafter sampling temperature (0 = greedy, >0 = Gumbel sampling)
     int32_t draft_topk  = 1;   // top-K candidates per drafter position (1 = argmax only)
+    int32_t dflash_cross_ctx = 512; // DFlash cross-attention window: tokens of target hidden states the drafter sees (default: 512)
+
+    // adaptive draft-max management
+    bool    dm_adaptive         = true;  // enable adaptive draft-max
+    float   dm_fringe_min       = 0.30f;// fringe below this → DFlash off (after off-dwell)
+    float   dm_fringe_max       = 0.50f;// fringe above this → full base_n_max
+    int32_t dm_off_dwell        = 8;    // consecutive weak cycles before going off
+    int32_t dm_explore_interval = 12;   // cycles between exploration drafts
+    int32_t dm_min_reach        = 3;    // fringe controller: min current-epoch samples before promotion
+    int32_t dm_probe_interval   = 16;   // cycles to wait before probing at n_max=0
+    float   dm_probe_fraction   = 0.25f;// fraction of base n_max to use as probe when disabled
+    int32_t dm_fringe_window    = 3;    // fringe controller: trailing positions to average over
+    common_speculative_dm_controller dm_controller = COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT;
+    float   dm_profit_min          = 0.05f;
+    float   dm_profit_raise_margin = 0.05f;
+float dm_profit_lower_margin = 0.05f;
+    float   dm_profit_ewma_alpha   = 0.15f;
+    int32_t dm_profit_min_samples  = 3;
+    int32_t dm_profit_warmup       = 0;     // warmup cycles at base_n_max before profit decisions (0 = auto from min_samples)
 
     // DFlash draft model (separate from upstream's draft.model)
     struct common_params_model mparams_dft;
@@ -428,6 +457,22 @@ enum common_reasoning_format {
     // do not extend this enum unless you absolutely have to
     // in most cases, use COMMON_REASONING_FORMAT_AUTO
     // see: https://github.com/ggml-org/llama.cpp/pull/15408
+};
+
+enum common_reasoning_loop_guard_mode {
+    COMMON_REASONING_LOOP_GUARD_OFF,
+    COMMON_REASONING_LOOP_GUARD_FORCE_CLOSE,
+    COMMON_REASONING_LOOP_GUARD_STOP,
+};
+
+struct common_reasoning_loop_guard_params {
+    common_reasoning_loop_guard_mode mode = COMMON_REASONING_LOOP_GUARD_FORCE_CLOSE;
+    int32_t min_reasoning_tokens = 1024;
+    int32_t window_tokens = 2048;
+    int32_t max_period = 512;
+    int32_t min_repeated_coverage = 768;
+    int32_t check_interval = 32;
+    int32_t interventions_max = 1;
 };
 
 
@@ -500,6 +545,7 @@ struct common_params {
 
     struct common_params_sampling    sampling;
     struct common_params_speculative speculative;
+    common_reasoning_loop_guard_params reasoning_loop_guard;
     struct common_params_vocoder     vocoder;
     struct common_params_diffusion   diffusion;
 
