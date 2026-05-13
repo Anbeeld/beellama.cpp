@@ -10,8 +10,8 @@ static void assert_close(float actual, float expected) {
 }
 
 static std::vector<int> build_candidates(int base_n_max) {
-    int out[16];
-    const int n = server_adaptive_dm_build_candidates(base_n_max, out, 16);
+    int out[160];
+    const int n = server_adaptive_dm_build_candidates(base_n_max, out, 160);
     return std::vector<int>(out, out + n);
 }
 
@@ -42,7 +42,7 @@ int main() {
     assert_candidates(1,  {0, 1});
     assert_candidates(2,  {0, 1, 2});
     assert_candidates(8,  {0, 1, 2, 3, 4, 5, 6, 7, 8});
-    assert_candidates(16, {0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16});
+    assert_candidates(16, {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16});
 
     assert(server_adaptive_dm_next_explore_depth(0, 8, 0.25f) == 2);
     assert(server_adaptive_dm_next_explore_depth(2, 8, 0.25f) == 3);
@@ -94,8 +94,8 @@ int main() {
     }
 
     {
-        int cand[16];
-        const int nc8 = server_adaptive_dm_build_candidates(8, cand, 16);
+        int cand[160];
+        const int nc8 = server_adaptive_dm_build_candidates(8, cand, 160);
         assert(server_adaptive_dm_apply_profit_hysteresis(2, 4, 30.0f, 30.9f, 0.06f, 0.02f, cand, nc8) == 2);
         assert(server_adaptive_dm_apply_profit_hysteresis(2, 8, 30.0f, 33.0f, 0.06f, 0.02f, cand, nc8) == 4);
         assert(server_adaptive_dm_apply_profit_hysteresis(6, 2, 30.0f, 31.5f, 0.06f, 0.02f, cand, nc8) == 5);
@@ -133,6 +133,9 @@ int main() {
     state.profit_pending = true;
     state.profit_last_recommended_n = 4;
     state.profit_consecutive_below_profit = 2;
+    state.profit_cycles_since_baseline = 9;
+    state.profit_baseline_probe_pending = true;
+    state.profit_baseline_probe_resume_n = 6;
     state.reset_request_state();
 
     assert(state.fringe_ring_idx == 0);
@@ -155,6 +158,9 @@ int main() {
     assert(state.profit_last_recommended_n == -1);
     assert(state.profit_consecutive_below_profit == 0);
     assert(state.profit_warmup_cycles == 0);
+    assert(state.profit_cycles_since_baseline == 0);
+    assert(!state.profit_baseline_probe_pending);
+    assert(state.profit_baseline_probe_resume_n == -1);
 
     state.fringe_epoch = 2;
     state.fringe_ring_idx = 0;
@@ -209,21 +215,23 @@ int main() {
     state.observe_profit_timing(2, 15.0f, 60.0f, 5.0f, 80.0f);
     {
         const int recommended = state.decide_profit_n_max(8);
-        assert(recommended == 1);
+        assert(recommended == 0);
         state.apply_profit_recommendation(recommended);
     }
     state.observe_profit_timing(0, 0.0f, 30.0f, 0.0f, 30.0f);
     assert(state.decide_profit_n_max(8) == 0);
 
-    // test warmup: during warmup, decide_profit_n_max returns base_n_max
+    // test warmup: seed no-spec baseline before positive-depth warmup/probing
     state.reset_profit_state();
-    state.dm_profit_min_samples = 1;
+    state.dm_profit_min_samples = 2;
     state.dm_off_dwell = 1;
     state.profit_warmup_cycles = 3;
     state.adaptive_n_max = 8;
+    assert(state.decide_profit_n_max(8) == 0);
+    state.observe_profit_timing(0, 0.0f, 30.0f, 0.0f, 30.0f);
+    assert(state.decide_profit_n_max(8) == 0);
+    state.observe_profit_timing(0, 0.0f, 28.0f, 0.0f, 28.0f);
     assert(state.decide_profit_n_max(8) == 8);
-    state.profit_warmup_cycles = 0;
-    // after warmup ends, decisions proceed normally
 
     // test reset_request_state preserves profit data but resets request counters
     state.reset_profit_state();
@@ -284,11 +292,47 @@ int main() {
             est.observe_profit_timing(8, 10.0f, 55.0f, 2.0f, 67.0f);
         }
         // baseline
-        est.observe_profit_timing(0, 0.0f, 22.0f, 0.0f, 22.0f);
+        for (int i = 0; i < 3; i++) {
+            est.observe_profit_timing(0, 0.0f, 22.0f, 0.0f, 22.0f);
+        }
 
         // depth 8 should be ready, depth 4 should be estimated
         const int recommended = est.decide_profit_n_max(8);
         assert(recommended > 0);
+    }
+
+    // test baseline-best shuts speculation fully off after dwell instead of only downshifting
+    {
+        server_adaptive_dm_state weak;
+        weak.dm_profit_min_samples = 1;
+        weak.dm_off_dwell = 2;
+        weak.adaptive_n_max = 8;
+        weak.observe_profit_timing(0, 0.0f, 25.0f, 0.0f, 25.0f);
+        weak.observe_profit_acceptance(8, 0);
+        weak.observe_profit_timing(8, 10.0f, 90.0f, 5.0f, 105.0f);
+        assert(weak.decide_profit_n_max(8) == 8);
+        assert(weak.decide_profit_n_max(8) == 0);
+    }
+
+    // test active profit cycles trigger periodic no-spec baseline reprobes
+    {
+        server_adaptive_dm_state reprobe;
+        reprobe.dm_profit_min_samples = 1;
+        reprobe.dm_profit_baseline_interval = 3;
+        reprobe.adaptive_n_max = 8;
+        reprobe.observe_profit_timing(0, 0.0f, 40.0f, 0.0f, 40.0f);
+        reprobe.observe_profit_acceptance(8, 7);
+        reprobe.observe_profit_timing(8, 8.0f, 30.0f, 2.0f, 40.0f);
+        assert(!reprobe.profit_should_probe_baseline());
+        reprobe.observe_profit_timing(8, 8.0f, 30.0f, 2.0f, 40.0f);
+        reprobe.observe_profit_timing(8, 8.0f, 30.0f, 2.0f, 40.0f);
+        assert(reprobe.profit_should_probe_baseline());
+        reprobe.profit_mark_baseline_probe();
+        assert(reprobe.adaptive_n_max == 0);
+        assert(reprobe.profit_baseline_probe_pending);
+        reprobe.observe_profit_timing(0, 0.0f, 42.0f, 0.0f, 42.0f);
+        assert(!reprobe.profit_should_probe_baseline());
+        assert(reprobe.decide_profit_n_max(8) == 8);
     }
 
     return 0;

@@ -3833,7 +3833,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_PROFIT_MIN_SAMPLES"));
     add_opt(common_arg(
         {"--spec-dm-profit-warmup"}, "N",
-        string_format("warmup cycles at base_n_max before profit decisions (default: %d, 0 = auto from --spec-dm-profit-min-samples)", params.speculative.dm_profit_warmup),
+        string_format("positive-depth warmup cycles after no-spec baseline seeding (default: %d, 0 = auto from --spec-dm-profit-min-samples)", params.speculative.dm_profit_warmup),
         [](common_params & params, int value) {
             if (value < 0 || value > 64) {
                 throw std::invalid_argument("spec-dm-profit-warmup must be in [0, 64]");
@@ -3841,6 +3841,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.dm_profit_warmup = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_PROFIT_WARMUP"));
+    add_opt(common_arg(
+        {"--spec-dm-profit-baseline-interval"}, "N",
+        string_format("active profit-controller cycles between no-spec baseline reprobes (default: %d, 0 = disabled)", params.speculative.dm_profit_baseline_interval),
+        [](common_params & params, int value) {
+            if (value < 0 || value > 4096) {
+                throw std::invalid_argument("spec-dm-profit-baseline-interval must be in [0, 4096]");
+            }
+            params.speculative.dm_profit_baseline_interval = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_PROFIT_BASELINE_INTERVAL"));
     add_opt(common_arg(
         {"--spec-draft-override-tensor", "-otd", "--override-tensor-draft"}, "<tensor name pattern>=<buffer type>,...",
         "override tensor buffer type for draft model", [](common_params & params, const std::string & value) {

@@ -8,6 +8,10 @@
 #include <cmath>
 #include <cstdint>
 
+static constexpr int SERVER_ADAPTIVE_DM_PROFIT_POSITIONS  = 128;
+static constexpr int SERVER_ADAPTIVE_DM_PROFIT_DEPTHS     = SERVER_ADAPTIVE_DM_PROFIT_POSITIONS + 1;
+static constexpr int SERVER_ADAPTIVE_DM_PROFIT_CANDIDATES = SERVER_ADAPTIVE_DM_PROFIT_DEPTHS + 1;
+
 static inline int server_adaptive_dm_probe_n_max(int base_n_max, float probe_fraction) {
     if (base_n_max <= 0) {
         return 0;
@@ -70,27 +74,25 @@ static inline int server_adaptive_dm_build_candidates(int base_n_max, int * out,
         return 0;
     }
 
-    const int ladder[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, base_n_max};
     int n = 0;
-    for (int candidate : ladder) {
-        if (candidate < 0 || candidate > base_n_max) {
-            continue;
-        }
+
+    const int max_depth = std::clamp(base_n_max, 0, SERVER_ADAPTIVE_DM_PROFIT_DEPTHS - 1);
+    for (int candidate = 0; candidate <= max_depth && n < out_cap; ++candidate) {
+        out[n++] = candidate;
+    }
+
+    if (base_n_max > max_depth && n < out_cap) {
         bool exists = false;
         for (int i = 0; i < n; ++i) {
-            if (out[i] == candidate) {
+            if (out[i] == base_n_max) {
                 exists = true;
                 break;
             }
         }
         if (!exists) {
-            out[n++] = candidate;
-            if (n >= out_cap) {
-                break;
-            }
+            out[n++] = base_n_max;
         }
     }
-    std::sort(out, out + n);
     return n;
 }
 
@@ -102,8 +104,9 @@ static inline int server_adaptive_dm_next_explore_depth(int current_n, int base_
         return server_adaptive_dm_probe_n_max(base_n_max, probe_fraction);
     }
 
-    int candidates[17];
-    const int n_candidates = server_adaptive_dm_build_candidates(base_n_max, candidates, 17);
+    int candidates[SERVER_ADAPTIVE_DM_PROFIT_CANDIDATES];
+    const int n_candidates = server_adaptive_dm_build_candidates(
+            base_n_max, candidates, SERVER_ADAPTIVE_DM_PROFIT_CANDIDATES);
     for (int i = 0; i < n_candidates; ++i) {
         if (candidates[i] > current_n) {
             return candidates[i];
@@ -233,9 +236,10 @@ static inline int server_adaptive_dm_apply_profit_hysteresis(
 
 struct server_adaptive_dm_state {
     static constexpr int FRINGE_WINDOW = 32;
-    static constexpr int FRINGE_REACH_POSITIONS = 128;
-    static constexpr int PROFIT_POSITIONS = FRINGE_REACH_POSITIONS;
-    static constexpr int PROFIT_DEPTHS = 17;
+    static constexpr int FRINGE_REACH_POSITIONS = SERVER_ADAPTIVE_DM_PROFIT_POSITIONS;
+    static constexpr int PROFIT_POSITIONS = SERVER_ADAPTIVE_DM_PROFIT_POSITIONS;
+    static constexpr int PROFIT_DEPTHS = SERVER_ADAPTIVE_DM_PROFIT_DEPTHS;
+    static constexpr int PROFIT_CANDIDATES = SERVER_ADAPTIVE_DM_PROFIT_CANDIDATES;
 
     struct fringe_entry {
         int16_t  n_accepted;
@@ -267,10 +271,11 @@ struct server_adaptive_dm_state {
     common_speculative_dm_controller dm_controller = COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT;
     float   dm_profit_min          = 0.05f;
     float   dm_profit_raise_margin = 0.05f;
-float dm_profit_lower_margin = 0.05f;
+    float   dm_profit_lower_margin = 0.05f;
     float   dm_profit_ewma_alpha   = 0.15f;
     int32_t dm_profit_min_samples  = 3;
     int32_t dm_profit_warmup       = 0;
+    int32_t dm_profit_baseline_interval = 128;
 
     struct profit_depth_stats {
         int32_t samples = 0;
@@ -314,6 +319,9 @@ float dm_profit_lower_margin = 0.05f;
     int32_t profit_last_recommended_n = -1;
     int32_t profit_consecutive_below_profit = 0;
     int32_t profit_warmup_cycles  = 0;
+    int32_t profit_cycles_since_baseline = 0;
+    bool    profit_baseline_probe_pending = false;
+    int32_t profit_baseline_probe_resume_n = -1;
 
     struct fringe_decision {
         float fringe = 0.0f;
@@ -349,6 +357,9 @@ float dm_profit_lower_margin = 0.05f;
         profit_current_score = 0.0f;
         profit_last_recommended_n = -1;
         profit_warmup_cycles = 0;
+        profit_cycles_since_baseline = 0;
+        profit_baseline_probe_pending = false;
+        profit_baseline_probe_resume_n = -1;
     }
 
     void reset_profit_state() {
@@ -389,6 +400,33 @@ float dm_profit_lower_margin = 0.05f;
         reset_profit_state();
         profit_key = next;
         profit_has_key = true;
+    }
+
+    bool profit_baseline_ready() const {
+        return profit_baseline.samples >= dm_profit_min_samples && profit_baseline.cycle_ms > 0.0f;
+    }
+
+    bool profit_has_ready_positive_depth() const {
+        for (int d = 1; d < PROFIT_DEPTHS; ++d) {
+            if (profit_depth[d].samples >= dm_profit_min_samples && profit_depth[d].cycle_ms > 0.0f) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool profit_should_probe_baseline() const {
+        return dm_profit_baseline_interval > 0 &&
+            profit_baseline_ready() &&
+            !profit_baseline_probe_pending &&
+            adaptive_n_max > 0 &&
+            profit_cycles_since_baseline >= dm_profit_baseline_interval;
+    }
+
+    void profit_mark_baseline_probe() {
+        profit_baseline_probe_pending = true;
+        profit_baseline_probe_resume_n = adaptive_n_max;
+        adaptive_n_max = 0;
     }
 
     void apply_profit_recommendation(int recommended_n) {
@@ -432,6 +470,13 @@ float dm_profit_lower_margin = 0.05f;
         server_adaptive_dm_ewma_init_or_update(dst->accept_ms, accept_ms, dm_profit_ewma_alpha, dst->samples);
         server_adaptive_dm_ewma_init_or_update(dst->cycle_ms, cycle_ms, dm_profit_ewma_alpha, dst->samples);
         dst->samples++;
+
+        if (n_draft == 0) {
+            profit_cycles_since_baseline = 0;
+            profit_baseline_probe_pending = false;
+        } else if (profit_baseline_ready()) {
+            profit_cycles_since_baseline++;
+        }
     }
 
     int decide_profit_n_max(int base_n_max) {
@@ -440,40 +485,47 @@ float dm_profit_lower_margin = 0.05f;
             return 0;
         }
 
-        if (profit_warmup_cycles > 0) {
+        const bool baseline_ready = profit_baseline_ready();
+        if (!baseline_ready) {
+            profit_current_score = 0.0f;
+            profit_last_recommended_n = 0;
+            return 0;
+        }
+
+        if (profit_warmup_cycles > 0 || !profit_has_ready_positive_depth()) {
+            profit_current_score = server_adaptive_dm_score(1.0f, profit_baseline.cycle_ms);
             profit_last_recommended_n = base_n_max;
             return base_n_max;
         }
 
-        const int current_n = adaptive_n_max < 0
-            ? base_n_max
-            : std::clamp<int>(adaptive_n_max, 0, base_n_max);
+        const int current_n = profit_baseline_probe_resume_n > 0
+            ? std::clamp<int>(profit_baseline_probe_resume_n, 0, base_n_max)
+            : (adaptive_n_max < 0
+                ? 0
+                : std::clamp<int>(adaptive_n_max, 0, base_n_max));
 
-        int candidates[17];
-        int n_candidates = server_adaptive_dm_build_candidates(base_n_max, candidates, 17);
+        int candidates[PROFIT_CANDIDATES];
+        int n_candidates = server_adaptive_dm_build_candidates(base_n_max, candidates, PROFIT_CANDIDATES);
         {
             bool found = false;
             for (int i = 0; i < n_candidates; i++) {
                 if (candidates[i] == current_n) { found = true; break; }
             }
-            if (!found && n_candidates < 17 && current_n > 0) {
+            if (!found && n_candidates < PROFIT_CANDIDATES && current_n > 0) {
                 candidates[n_candidates++] = current_n;
                 std::sort(candidates, candidates + n_candidates);
             }
         }
 
-        bool ready[17] = {};
-        bool estimated[17] = {};
-        float expected_accept[17] = {};
-        float cycle_ms[17] = {};
+        bool ready[PROFIT_CANDIDATES] = {};
+        bool estimated[PROFIT_CANDIDATES] = {};
+        float expected_accept[PROFIT_CANDIDATES] = {};
+        float cycle_ms[PROFIT_CANDIDATES] = {};
 
         float current_score = 0.0f;
         bool current_ready = false;
         float baseline_score = 0.0f;
-        const bool baseline_ready = profit_baseline.samples >= dm_profit_min_samples && profit_baseline.cycle_ms > 0.0f;
-        if (baseline_ready) {
-            baseline_score = server_adaptive_dm_score(1.0f, profit_baseline.cycle_ms);
-        }
+        baseline_score = server_adaptive_dm_score(1.0f, profit_baseline.cycle_ms);
 
         for (int i = 0; i < n_candidates; ++i) {
             const int n = candidates[i];
@@ -572,7 +624,10 @@ float dm_profit_lower_margin = 0.05f;
         }
 
         int recommended = best.n;
-        if (baseline_ready && best.n > 0 && best.score < baseline_score * (1.0f + dm_profit_min)) {
+        const bool baseline_wins =
+            best.n == 0 ||
+            (best.n > 0 && best.score < baseline_score * (1.0f + dm_profit_min));
+        if (baseline_ready && baseline_wins) {
             profit_consecutive_below_profit++;
             recommended = profit_consecutive_below_profit >= dm_off_dwell ? 0 : current_n;
         } else {
@@ -591,6 +646,7 @@ float dm_profit_lower_margin = 0.05f;
         recommended = std::clamp(recommended, 0, base_n_max);
         profit_current_score = best.score;
         profit_last_recommended_n = recommended;
+        profit_baseline_probe_resume_n = -1;
 
         LOG_DBG("profit decide: current_n=%d best_n=%d rec=%d "
                 "best_ready=%d best_est=%d best_score=%.3f "

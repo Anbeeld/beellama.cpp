@@ -116,7 +116,7 @@ Flat mode forces `--spec-draft-top-k` back to `1`, because there are no branch a
 
 Bee's DFlash depth can adapt per server slot. `--spec-draft-n-max` is the base ceiling. The active depth can be lower, can probe after being turned off, and can return upward when telemetry supports it.
 
-The default controller is `profit`, with a second `fringe` controller available through `--spec-dm-controller fringe`. The profit controller starts at full base depth with a configurable warmup burst, uses cross-depth timing estimation to score all depths from one measured depth, tracks acceptance and timing via EWMA, and preserves adaptive state for continuation-like prompts when the prompt similarity and kept-context fraction are high enough.
+The default controller is `profit`, with a second `fringe` controller available through `--spec-dm-controller fringe`. The profit controller first seeds a no-spec baseline, then runs a configurable positive-depth warmup, uses cross-depth timing estimation to score measured and estimated depths, periodically reprobes the baseline as context grows, tracks acceptance and timing via EWMA, and preserves adaptive state for continuation-like prompts when the prompt similarity and kept-context fraction are high enough.
 
 This is not the same as public buun's checked DFlash adaptive tracking. Bee adds the server controller layer and the `--spec-dm-*` command-line surface:
 
@@ -124,10 +124,11 @@ This is not the same as public buun's checked DFlash adaptive tracking. Bee adds
 --spec-dm-controller profit
 --spec-dm-profit-min 0.05
 --spec-dm-profit-raise-margin 0.05
---spec-dm-profit-lower-margin 0.08
+--spec-dm-profit-lower-margin 0.05
 --spec-dm-profit-ewma-alpha 0.15
 --spec-dm-profit-min-samples 3
 --spec-dm-profit-warmup 0
+--spec-dm-profit-baseline-interval 128
 ```
 
 Use `--no-spec-dm-adaptive` when you need a fixed-depth benchmark. Otherwise, adaptive mode is the safer default for live serving because it can back away from weak drafts without changing the process command line.

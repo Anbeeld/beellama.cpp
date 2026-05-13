@@ -766,18 +766,35 @@ struct server_slot : server_adaptive_dm_state {
         int n_draft_max = (adaptive_n_max >= 0) ? adaptive_n_max : base_n_max;
 
         if (dm_adaptive && dm_controller == COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT) {
+            if (adaptive_n_max < 0) {
+                if (advance_adaptive_probe) {
+                    adaptive_n_max = 0;
+                    const int32_t warmup = dm_profit_warmup > 0 ? dm_profit_warmup : dm_profit_min_samples;
+                    profit_warmup_cycles = warmup;
+                }
+                return 0;
+            }
+
+            if (!profit_baseline_ready()) {
+                return 0;
+            }
+
+            if (profit_baseline_probe_pending) {
+                return 0;
+            }
+
+            if (profit_should_probe_baseline()) {
+                if (advance_adaptive_probe) {
+                    profit_mark_baseline_probe();
+                }
+                return 0;
+            }
+
             if (profit_warmup_cycles > 0) {
                 n_draft_max = base_n_max;
                 if (advance_adaptive_probe) {
                     profit_warmup_cycles--;
                 }
-            } else if (adaptive_n_max < 0) {
-                if (advance_adaptive_probe) {
-                    adaptive_n_max = base_n_max;
-                    const int32_t warmup = dm_profit_warmup > 0 ? dm_profit_warmup : dm_profit_min_samples;
-                    profit_warmup_cycles = warmup;
-                }
-                n_draft_max = base_n_max;
             } else if (adaptive_n_max == 0) {
                 const bool probe_now = adaptive_probe_counter + 1 >= dm_probe_interval;
                 if (!probe_now) {
@@ -788,9 +805,9 @@ struct server_slot : server_adaptive_dm_state {
                 }
                 if (advance_adaptive_probe) {
                     adaptive_probe_counter = 0;
-                    adaptive_n_max = base_n_max;
+                    adaptive_n_max = probe_n_max;
                 }
-                n_draft_max = base_n_max;
+                n_draft_max = probe_n_max;
             } else {
                 n_draft_max = adaptive_n_max;
                 if (advance_adaptive_probe) {
@@ -1654,6 +1671,7 @@ private:
             slot.dm_profit_ewma_alpha = params_base.speculative.dm_profit_ewma_alpha;
             slot.dm_profit_min_samples = params_base.speculative.dm_profit_min_samples;
             slot.dm_profit_warmup    = params_base.speculative.dm_profit_warmup;
+            slot.dm_profit_baseline_interval = params_base.speculative.dm_profit_baseline_interval;
 
             const bool slot_can_spec = can_spec &&
                 (params_base.speculative.type != COMMON_SPECULATIVE_TYPE_DFLASH || i < dflash_slots_cap) &&
@@ -1775,7 +1793,9 @@ private:
                         params_base.speculative.dm_profit_lower_margin < 0.0f || params_base.speculative.dm_profit_lower_margin > 1.0f ||
                         params_base.speculative.dm_profit_ewma_alpha < 0.01f || params_base.speculative.dm_profit_ewma_alpha > 1.0f ||
                         params_base.speculative.dm_profit_min_samples < 1 || params_base.speculative.dm_profit_min_samples > 64 ||
-                        params_base.speculative.dm_profit_warmup < 0 || params_base.speculative.dm_profit_warmup > 64) {
+                        params_base.speculative.dm_profit_warmup < 0 || params_base.speculative.dm_profit_warmup > 64 ||
+                        params_base.speculative.dm_profit_baseline_interval < 0 ||
+                        params_base.speculative.dm_profit_baseline_interval > 4096) {
                     SRV_ERR("%s: invalid adaptive DM profit controller parameters\n", __func__);
                     return false;
                 }
@@ -2186,7 +2206,7 @@ private:
             }
             SLT_INF(slot,
                     "spec dm controller: adaptive=%d controller=%s probe_fraction=%.4f explore_interval=%d "
-                    "profit_min=%.4f raise=%.4f lower=%.4f ewma=%.4f min_samples=%d warmup=%d "
+                    "profit_min=%.4f raise=%.4f lower=%.4f ewma=%.4f min_samples=%d warmup=%d baseline_interval=%d "
                     "p_min=%.4f draft_p_min=%.4f\n",
                     task.params.speculative.dm_adaptive ? 1 : 0,
                     server_adaptive_dm_controller_name(task.params.speculative.dm_controller),
@@ -2198,6 +2218,7 @@ private:
                     (double) task.params.speculative.dm_profit_ewma_alpha,
                     task.params.speculative.dm_profit_min_samples,
                     task.params.speculative.dm_profit_warmup,
+                    task.params.speculative.dm_profit_baseline_interval,
                     (double) task.params.speculative.p_min,
                     (double) task.params.speculative.draft.p_min);
             SLT_INF(slot,
@@ -4961,8 +4982,8 @@ private:
             int recommended = slot.decide_profit_n_max(base_n_max);
 
             slot.apply_profit_recommendation(recommended);
-            slot.adaptive_probe_counter = 0;
             if (slot.adaptive_n_max != prev_n_max) {
+                slot.adaptive_probe_counter = 0;
                 SLT_INF(slot, "adaptive dm profit: cur=%d recommended=%d score=%.1f action=apply\n",
                         prev_n_max, slot.adaptive_n_max, (double) slot.profit_current_score);
             }

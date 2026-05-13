@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.1.2
+
+- Fixed the adaptive `profit` controller's no-spec baseline path. Profit mode now seeds baseline samples before positive-depth warmup, can shut DFlash fully off when the measured baseline wins, and no longer makes speculative decisions from draft-only telemetry.
+- Added periodic profit-controller baseline reprobes with `--spec-dm-profit-baseline-interval` / `LLAMA_ARG_SPEC_DM_PROFIT_BASELINE_INTERVAL` so long-context runs can refresh target-only timing as context grows. Off-state probes now restart with the configured probe depth instead of jumping straight to full draft depth.
+- Made profit depth selection less coarse by scoring every integer draft depth up to the supported telemetry window, preserving the previous active depth across baseline reprobes, and avoiding off-probe counter starvation from repeated baseline cycles.
+- Hardened active-reasoning EOS handling. When an end-of-generation token appears while reasoning output is still active, the sampler now forces the reasoning-end sequence through the normal full-logits path; reduced DFlash verification rejects that case instead of accepting an unsafe reduced candidate set.
+- Hardened DFlash on split CUDA / multi-GPU placement. GPU cross-ring setup, hidden capture, CUDA graph capture, K/V projection cache updates, recurrent replay, conv replay, and async tensor get/set paths now check buffer/backend ownership and fall back to safer CPU or owning-buffer paths instead of reading or writing recurrent state through the wrong CUDA backend.
+- Added clearer diagnostics and regression coverage for multi-GPU DFlash fallback decisions, CUDA graph buffer visibility, wrong-device async tensor access, active-reasoning reduced-sampling rejection, adaptive DM defaults, and profit-controller baseline behavior.
+- Known limitation: the current multi-GPU DFlash path is a correctness fallback, not a performant split-GPU implementation. On split target placement it can be slower than non-speculative decoding because recurrent replay and hidden capture avoid unsafe single-backend GPU fast paths. A performant implementation still needs per-device replay graphs or a scheduler that follows ggml's split-buffer ownership model.
+
 ## v0.1.1
 
 - Improved agentic tool-call reliability with lazy grammars. DFlash now remains enabled before a lazy grammar trigger, but stops speculating once grammar-constrained output or reasoning-budget forcing requires normal token-by-token sampling.

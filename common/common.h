@@ -398,10 +398,11 @@ struct common_params_speculative {
     common_speculative_dm_controller dm_controller = COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT;
     float   dm_profit_min          = 0.05f;
     float   dm_profit_raise_margin = 0.05f;
-float dm_profit_lower_margin = 0.05f;
+    float   dm_profit_lower_margin = 0.05f;
     float   dm_profit_ewma_alpha   = 0.15f;
     int32_t dm_profit_min_samples  = 3;
-    int32_t dm_profit_warmup       = 0;     // warmup cycles at base_n_max before profit decisions (0 = auto from min_samples)
+    int32_t dm_profit_warmup       = 0;     // positive-depth warmup cycles after baseline seeding (0 = auto from min_samples)
+    int32_t dm_profit_baseline_interval = 128; // active spec cycles between no-spec baseline reprobes (0 = disabled)
 
     // DFlash draft model (separate from upstream's draft.model)
     struct common_params_model mparams_dft;

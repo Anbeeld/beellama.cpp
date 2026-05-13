@@ -141,10 +141,11 @@ int main(void) {
     assert(params.speculative.p_min == 0.0f);
     assert(params.speculative.dm_profit_min == 0.05f);
     assert(params.speculative.dm_profit_raise_margin == 0.05f);
-    assert(params.speculative.dm_profit_lower_margin == 0.08f);
+    assert(params.speculative.dm_profit_lower_margin == 0.05f);
     assert(params.speculative.dm_controller == COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT);
     assert(params.speculative.dm_profit_min_samples == 3);
     assert(params.speculative.dm_profit_warmup == 0);
+    assert(params.speculative.dm_profit_baseline_interval == 128);
 
     argv = {"binary_name", "--spec-draft-p-min", "0"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
@@ -172,6 +173,7 @@ int main(void) {
         "--spec-dm-profit-ewma-alpha", "0.15",
         "--spec-dm-profit-min-samples", "6",
         "--spec-dm-profit-warmup", "4",
+        "--spec-dm-profit-baseline-interval", "256",
     };
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
     assert(params.speculative.dm_controller == COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT);
@@ -181,6 +183,7 @@ int main(void) {
     assert(params.speculative.dm_profit_ewma_alpha == 0.15f);
     assert(params.speculative.dm_profit_min_samples == 6);
     assert(params.speculative.dm_profit_warmup == 4);
+    assert(params.speculative.dm_profit_baseline_interval == 256);
 
     argv = {"binary_name", "--spec-dm-controller", std::string("profit-") + "shadow"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
