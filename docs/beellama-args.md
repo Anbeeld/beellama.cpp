@@ -310,7 +310,7 @@ Adaptive Draft-Max is enabled by default for DFlash. It can reduce the active dr
 | `--spec-dm-profit-ewma-alpha F` | `0.15` | Smoothing factor for acceptance and timing running averages. |
 | `--spec-dm-profit-min-samples N` | `3` | Minimum observations per position/depth before scoring that depth as ready. |
 | `--spec-dm-profit-warmup N` | `0` | Positive-depth warmup cycles after the no-spec baseline is seeded (0 = use --spec-dm-profit-min-samples). |
-| `--spec-dm-profit-baseline-interval N` | `128` | Active speculative cycles between no-spec baseline reprobes (0 = disabled). |
+| `--spec-dm-profit-baseline-interval N` | `512` | Active speculative cycles between long-context no-spec baseline reprobes (0 = disabled). |
 
 Use `profit` for normal serving. Use `fringe` when you want behavior tied more directly to observed draft acceptance near the active tail. Use `--no-spec-dm-adaptive` only when comparing fixed `--spec-draft-n-max` values or reproducing a narrow benchmark.
 

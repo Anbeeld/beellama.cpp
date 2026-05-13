@@ -3541,7 +3541,7 @@ private:
             } else {
                 if (slot.can_speculate() && slot.dm_adaptive &&
                         server_adaptive_dm_uses_profit_controller(slot.dm_controller) &&
-                        slot.adaptive_n_max == 0) {
+                        slot.profit_expects_baseline_sample()) {
                     profit_baseline_slot = &slot;
                     n_profit_baseline_slots++;
                 }

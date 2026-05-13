@@ -145,7 +145,7 @@ int main(void) {
     assert(params.speculative.dm_controller == COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT);
     assert(params.speculative.dm_profit_min_samples == 3);
     assert(params.speculative.dm_profit_warmup == 0);
-    assert(params.speculative.dm_profit_baseline_interval == 128);
+    assert(params.speculative.dm_profit_baseline_interval == 512);
 
     argv = {"binary_name", "--spec-draft-p-min", "0"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));

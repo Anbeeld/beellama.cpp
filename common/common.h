@@ -402,7 +402,7 @@ struct common_params_speculative {
     float   dm_profit_ewma_alpha   = 0.15f;
     int32_t dm_profit_min_samples  = 3;
     int32_t dm_profit_warmup       = 0;     // positive-depth warmup cycles after baseline seeding (0 = auto from min_samples)
-    int32_t dm_profit_baseline_interval = 128; // active spec cycles between no-spec baseline reprobes (0 = disabled)
+    int32_t dm_profit_baseline_interval = 512; // active spec cycles between long-context no-spec baseline reprobes (0 = disabled)
 
     // DFlash draft model (separate from upstream's draft.model)
     struct common_params_model mparams_dft;

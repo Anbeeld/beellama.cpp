@@ -128,7 +128,7 @@ This is not the same as public buun's checked DFlash adaptive tracking. Bee adds
 --spec-dm-profit-ewma-alpha 0.15
 --spec-dm-profit-min-samples 3
 --spec-dm-profit-warmup 0
---spec-dm-profit-baseline-interval 128
+--spec-dm-profit-baseline-interval 512
 ```
 
 Use `--no-spec-dm-adaptive` when you need a fixed-depth benchmark. Otherwise, adaptive mode is the safer default for live serving because it can back away from weak drafts without changing the process command line.

@@ -42,7 +42,7 @@ int main() {
     assert_candidates(1,  {0, 1});
     assert_candidates(2,  {0, 1, 2});
     assert_candidates(8,  {0, 1, 2, 3, 4, 5, 6, 7, 8});
-    assert_candidates(16, {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16});
+    assert_candidates(16, {0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16});
 
     assert(server_adaptive_dm_next_explore_depth(0, 8, 0.25f) == 2);
     assert(server_adaptive_dm_next_explore_depth(2, 8, 0.25f) == 3);
@@ -99,6 +99,10 @@ int main() {
         assert(server_adaptive_dm_apply_profit_hysteresis(2, 4, 30.0f, 30.9f, 0.06f, 0.02f, cand, nc8) == 2);
         assert(server_adaptive_dm_apply_profit_hysteresis(2, 8, 30.0f, 33.0f, 0.06f, 0.02f, cand, nc8) == 4);
         assert(server_adaptive_dm_apply_profit_hysteresis(6, 2, 30.0f, 31.5f, 0.06f, 0.02f, cand, nc8) == 5);
+
+        int cand16[160];
+        const int nc16 = server_adaptive_dm_build_candidates(16, cand16, 160);
+        assert(server_adaptive_dm_apply_profit_hysteresis(16, 8, 30.0f, 36.0f, 0.06f, 0.02f, cand16, nc16) == 14);
     }
 
     assert(server_adaptive_dm_should_preserve_for_continuation(0.995f, 1.000f));
@@ -271,12 +275,40 @@ int main() {
     state.reset_profit_if_config_changed(spec, 8, 0);
     assert(state.profit_has_key);
     assert(state.profit_depth[2].samples == 0);
+    assert(state.adaptive_n_max == -1);
     state.observe_profit_timing(2, 10.0f, 20.0f, 5.0f, 35.0f);
     state.reset_profit_if_config_changed(spec, 8, 0);
     assert(state.profit_depth[2].samples == 1);
+    state.adaptive_n_max = 8;
     spec.dflash_cross_ctx = 2048;
     state.reset_profit_if_config_changed(spec, 8, 0);
     assert(state.profit_depth[2].samples == 0);
+    assert(state.adaptive_n_max == -1);
+
+    // test a bucket transition cannot leave baseline collection invisible
+    {
+        server_adaptive_dm_state bucket;
+        common_params_speculative bucket_spec;
+        bucket_spec.n_max = 16;
+        bucket_spec.branch_budget = 0;
+        bucket_spec.draft_topk = 1;
+        bucket_spec.dflash_cross_ctx = 1024;
+        bucket_spec.sample_temp = 0.0f;
+        bucket_spec.p_min = 0.0f;
+
+        bucket.reset_profit_if_config_changed(bucket_spec, 16, 1000);
+        bucket.observe_profit_timing(0, 0.0f, 30.0f, 0.0f, 30.0f);
+        bucket.observe_profit_timing(0, 0.0f, 31.0f, 0.0f, 31.0f);
+        bucket.observe_profit_timing(0, 0.0f, 32.0f, 0.0f, 32.0f);
+        bucket.apply_profit_recommendation(14);
+        assert(bucket.profit_baseline_ready());
+        assert(!bucket.profit_expects_baseline_sample());
+
+        bucket.reset_profit_if_config_changed(bucket_spec, 16, 9000);
+        assert(bucket.adaptive_n_max == -1);
+        assert(!bucket.profit_baseline_ready());
+        assert(bucket.profit_expects_baseline_sample());
+    }
 
     // test cross-depth estimation
     {
@@ -319,6 +351,14 @@ int main() {
         server_adaptive_dm_state reprobe;
         reprobe.dm_profit_min_samples = 1;
         reprobe.dm_profit_baseline_interval = 3;
+        common_params_speculative reprobe_spec;
+        reprobe_spec.n_max = 8;
+        reprobe_spec.branch_budget = 0;
+        reprobe_spec.draft_topk = 1;
+        reprobe_spec.dflash_cross_ctx = 1024;
+        reprobe_spec.sample_temp = 0.0f;
+        reprobe_spec.p_min = 0.0f;
+        reprobe.reset_profit_if_config_changed(reprobe_spec, 8, 40000);
         reprobe.adaptive_n_max = 8;
         reprobe.observe_profit_timing(0, 0.0f, 40.0f, 0.0f, 40.0f);
         reprobe.observe_profit_acceptance(8, 7);
@@ -333,6 +373,26 @@ int main() {
         reprobe.observe_profit_timing(0, 0.0f, 42.0f, 0.0f, 42.0f);
         assert(!reprobe.profit_should_probe_baseline());
         assert(reprobe.decide_profit_n_max(8) == 8);
+    }
+
+    // test periodic baseline reprobes wait until longer context buckets
+    {
+        server_adaptive_dm_state early;
+        early.dm_profit_min_samples = 1;
+        early.dm_profit_baseline_interval = 1;
+        common_params_speculative early_spec;
+        early_spec.n_max = 8;
+        early_spec.branch_budget = 0;
+        early_spec.draft_topk = 1;
+        early_spec.dflash_cross_ctx = 1024;
+        early_spec.sample_temp = 0.0f;
+        early_spec.p_min = 0.0f;
+        early.reset_profit_if_config_changed(early_spec, 8, 4096);
+        early.adaptive_n_max = 8;
+        early.observe_profit_timing(0, 0.0f, 40.0f, 0.0f, 40.0f);
+        early.observe_profit_acceptance(8, 7);
+        early.observe_profit_timing(8, 8.0f, 30.0f, 2.0f, 40.0f);
+        assert(!early.profit_should_probe_baseline());
     }
 
     return 0;

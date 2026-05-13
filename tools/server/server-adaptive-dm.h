@@ -11,6 +11,7 @@
 static constexpr int SERVER_ADAPTIVE_DM_PROFIT_POSITIONS  = 128;
 static constexpr int SERVER_ADAPTIVE_DM_PROFIT_DEPTHS     = SERVER_ADAPTIVE_DM_PROFIT_POSITIONS + 1;
 static constexpr int SERVER_ADAPTIVE_DM_PROFIT_CANDIDATES = SERVER_ADAPTIVE_DM_PROFIT_DEPTHS + 1;
+static constexpr int SERVER_ADAPTIVE_DM_PROFIT_BASELINE_REPROBE_MIN_BUCKET = 3;
 
 static inline int server_adaptive_dm_probe_n_max(int base_n_max, float probe_fraction) {
     if (base_n_max <= 0) {
@@ -75,24 +76,26 @@ static inline int server_adaptive_dm_build_candidates(int base_n_max, int * out,
     }
 
     int n = 0;
-
-    const int max_depth = std::clamp(base_n_max, 0, SERVER_ADAPTIVE_DM_PROFIT_DEPTHS - 1);
-    for (int candidate = 0; candidate <= max_depth && n < out_cap; ++candidate) {
-        out[n++] = candidate;
-    }
-
-    if (base_n_max > max_depth && n < out_cap) {
+    const int ladder[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, base_n_max};
+    for (const int candidate : ladder) {
+        if (candidate < 0 || candidate > base_n_max) {
+            continue;
+        }
         bool exists = false;
         for (int i = 0; i < n; ++i) {
-            if (out[i] == base_n_max) {
+            if (out[i] == candidate) {
                 exists = true;
                 break;
             }
         }
         if (!exists) {
-            out[n++] = base_n_max;
+            out[n++] = candidate;
+            if (n >= out_cap) {
+                break;
+            }
         }
     }
+    std::sort(out, out + n);
     return n;
 }
 
@@ -275,7 +278,7 @@ struct server_adaptive_dm_state {
     float   dm_profit_ewma_alpha   = 0.15f;
     int32_t dm_profit_min_samples  = 3;
     int32_t dm_profit_warmup       = 0;
-    int32_t dm_profit_baseline_interval = 128;
+    int32_t dm_profit_baseline_interval = 512;
 
     struct profit_depth_stats {
         int32_t samples = 0;
@@ -371,6 +374,10 @@ struct server_adaptive_dm_state {
         profit_has_key = false;
         profit_epoch++;
         reset_request_profit_state();
+        adaptive_n_max = -1;
+        adaptive_probe_counter = 0;
+        explore_counter = 0;
+        off_dwell = 0;
     }
 
     void reset_profit_if_config_changed(const common_params_speculative & spec, int base_n_max, int32_t n_past) {
@@ -420,7 +427,14 @@ struct server_adaptive_dm_state {
             profit_baseline_ready() &&
             !profit_baseline_probe_pending &&
             adaptive_n_max > 0 &&
+            profit_key.context_bucket >= SERVER_ADAPTIVE_DM_PROFIT_BASELINE_REPROBE_MIN_BUCKET &&
             profit_cycles_since_baseline >= dm_profit_baseline_interval;
+    }
+
+    bool profit_expects_baseline_sample() const {
+        return !profit_baseline_ready() ||
+            profit_baseline_probe_pending ||
+            adaptive_n_max <= 0;
     }
 
     void profit_mark_baseline_probe() {

@@ -3843,7 +3843,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_PROFIT_WARMUP"));
     add_opt(common_arg(
         {"--spec-dm-profit-baseline-interval"}, "N",
-        string_format("active profit-controller cycles between no-spec baseline reprobes (default: %d, 0 = disabled)", params.speculative.dm_profit_baseline_interval),
+        string_format("active profit-controller cycles between long-context no-spec baseline reprobes (default: %d, 0 = disabled)", params.speculative.dm_profit_baseline_interval),
         [](common_params & params, int value) {
             if (value < 0 || value > 4096) {
                 throw std::invalid_argument("spec-dm-profit-baseline-interval must be in [0, 4096]");
