@@ -8,6 +8,16 @@
 #include <cstring>
 
 // GPU cross-attention ring buffer for DFlash speculative decoding.
+
+static bool dflash_cuda_debug_enabled() {
+    static const bool v = [] {
+        const char * e = getenv("GGML_DFLASH_CUDA_DEBUG");
+        return e && e[0] != '\0' && strcmp(e, "0") != 0;
+    }();
+    return v;
+}
+
+// GPU cross-attention ring buffer for DFlash speculative decoding.
 // Keeps per-layer ring buffers on GPU and interleaves them into the layout
 // expected by the drafter's target_hidden tensor, avoiding the CPU round-trip.
 
@@ -169,6 +179,11 @@ extern "C" bool dflash_cross_ring_gpu_write_d2d(
     if (n_tokens <= 0) return false;
     if (n_embd != ring->n_embd) return false;
     if (ring->ring_size <= 0) return false;
+
+    if (dflash_cuda_debug_enabled()) {
+        fprintf(stderr, "dflash cuda: write_d2d layer=%d ring_pos=%d n_tokens=%d n_embd=%d ring_size=%d\n",
+                layer, ring_pos, n_tokens, n_embd, ring->ring_size);
+    }
 
     (void)cudaSetDevice(ring->device);
 
@@ -636,6 +651,11 @@ extern "C" bool dflash_kv_cache_interleave(
         int ring_size, int write_pos, int filled, int ctx_window, int n_elem) {
     if (!d_ring || !d_stage) return false;
     if (ring_size <= 0 || ctx_window <= 0 || n_elem <= 0) return false;
+
+    if (dflash_cuda_debug_enabled()) {
+        fprintf(stderr, "dflash cuda: kv_cache_interleave ring_size=%d write_pos=%d filled=%d ctx_window=%d n_elem=%d\n",
+                ring_size, write_pos, filled, ctx_window, n_elem);
+    }
 
     cudaPointerAttributes ring_attr;
     cudaError_t ring_err = cudaPointerGetAttributes(&ring_attr, d_ring);
