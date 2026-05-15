@@ -66,6 +66,14 @@ static dflash_kv_cache_mode dflash_kv_cache_mode_env() {
     return mode;
 }
 
+static bool dflash_input_shape_debug() {
+    static const bool v = [] {
+        const char * e = getenv("GGML_DFLASH_INPUT_DEBUG");
+        return e && e[0] != '\0' && std::strcmp(e, "0") != 0;
+    }();
+    return v;
+}
+
 static bool dflash_kv_cache_ready_for_window(const llama_cross * cross, int64_t ctx_len) {
     const auto * kv_cache = cross ? cross->dflash_kv_cache : nullptr;
     if (!kv_cache || dflash_kv_cache_mode_env() == DFLASH_KV_CACHE_OFF) {
@@ -264,6 +272,13 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
             const size_t tensor_bytes = ggml_nbytes(target_hidden);
 
             if (n_feat != target_hidden->ne[0]) {
+                if (dflash_input_shape_debug()) {
+                    fprintf(stderr, "dflash input: feature mismatch single-slot n_feat=%lld target_hidden_ne0=%lld ctx_len=%lld n_copy=%lld\n",
+                        (long long) n_feat,
+                        (long long) target_hidden->ne[0],
+                        (long long) ctx_len,
+                        (long long) n_copy);
+                }
                 ggml_backend_tensor_memset(target_hidden, 0, 0, tensor_bytes);
             } else {
                 const size_t copy_bytes  = (size_t) n_feat * (size_t) n_copy * sizeof(float);
@@ -387,6 +402,12 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
                     const size_t dst_offset = (size_t) s * (size_t) per_slot_ctx * n_feat * sizeof(float);
                     ggml_backend_tensor_set(target_hidden, src, dst_offset, copy_bytes);
                 }
+            } else if (dflash_input_shape_debug()) {
+                fprintf(stderr, "dflash input: feature mismatch multi-slot n_feat=%zu target_hidden_ne0=%lld n_seqs=%d per_slot_ctx=%d\n",
+                    n_feat,
+                    (long long) target_hidden->ne[0],
+                    n_seqs,
+                    per_slot_ctx);
             }
         }
 
