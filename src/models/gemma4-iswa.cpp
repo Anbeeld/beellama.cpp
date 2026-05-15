@@ -222,12 +222,16 @@ llm_build_gemma4_iswa::llm_build_gemma4_iswa(const llama_model & model, const ll
             cur = ggml_gelu(ctx0, cur);
 
             ggml_tensor * inp_this_layer = ggml_view_2d_slice(ctx0, inp_per_layer, il); // [n_embd_per_layer, n_tokens]
-            cb(inp_this_layer, "inp_this_layer", il);
 
-            // TODO @ngxson : improve this
+            // TODO(Gemma4 perf): strip unused output rows right after the last KV-producing layer.
+            // Do not implement this as a simple ggml_get_rows(cur/inpL) patch.
+            // Gemma4 ISWA attention masks are built from the original ubatch.n_tokens before
+            // the layer loop, and non-KV upper layers still consume those masks. Early row
+            // compaction needs a compact post-KV attention input/mask path first.
             if (il == n_layer - 1 && inp_out_ids) {
                 inp_this_layer = ggml_get_rows(ctx0, inp_this_layer, inp_out_ids);
             }
+            cb(inp_this_layer, "inp_this_layer", il);
 
             cur = ggml_mul(ctx0, cur, inp_this_layer);
             cur = build_lora_mm(model.layers[il].per_layer_proj, cur); // [n_embd, n_tokens]
@@ -322,10 +326,13 @@ ggml_tensor * llm_build_gemma4_iswa::build_inp_per_layer() {
         inp_per_layer = ggml_get_rows  (ctx0, model.per_layer_tok_embd, inp->tokens);
         cb(inp_per_layer, "inp_per_layer_get_rows", -1);
         inp_per_layer = ggml_reshape_3d(ctx0, inp_per_layer, n_embd_per_layer, n_layer, n_tokens);
+        cb(inp_per_layer, "inp_per_layer_reshape", -1);
         // BF16 precision: match training-time BF16 rounding for per-layer embedding scale
         // (preserved across upstream #21612 + #21625 refactors — see fork commit dc5189961, -27% PPL win)
         inp_per_layer = ggml_cast(ctx0, inp_per_layer, GGML_TYPE_BF16);
+        cb(inp_per_layer, "inp_per_layer_bf16", -1);
         inp_per_layer = ggml_scale(ctx0, inp_per_layer, ggml_bf16_to_fp32(ggml_fp32_to_bf16(tok_embd_scale)));
+        cb(inp_per_layer, "inp_per_layer_scaled", -1);
         inp_per_layer = ggml_cast(ctx0, inp_per_layer, GGML_TYPE_F32);
         cb(inp_per_layer, "inp_per_layer_selected", -1);
 
