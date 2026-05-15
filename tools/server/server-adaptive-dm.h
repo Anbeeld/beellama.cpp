@@ -641,7 +641,14 @@ struct server_adaptive_dm_state {
             (best.n > 0 && best.score < baseline_score * (1.0f + dm_profit_min));
         if (baseline_ready && baseline_wins) {
             profit_consecutive_below_profit++;
-            recommended = profit_consecutive_below_profit >= dm_off_dwell ? 0 : current_n;
+            const bool disable_now = profit_consecutive_below_profit >= dm_off_dwell;
+            recommended = disable_now ? 0 : current_n;
+            if (disable_now && current_n > 0) {
+                LOG_INF("adaptive-dm: disabling speculative depth at ctx_bucket=%d "
+                        "(best_score=%.3f baseline=%.3f profit_min=%.3f below_count=%d)\n",
+                        profit_key.context_bucket, best.score, baseline_score,
+                        dm_profit_min, profit_consecutive_below_profit);
+            }
         } else {
             profit_consecutive_below_profit = 0;
             recommended = server_adaptive_dm_apply_profit_hysteresis(
