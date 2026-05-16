@@ -371,13 +371,31 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
         const size_t n_feat       = cross ? (size_t) cross->n_embd : 0;
 
         // collect per-slot cross data
-        struct { const float * data; int64_t n_real; } slot_info[LLAMA_DFLASH_MAX_SLOTS] = {};
+        // collect per-slot cross data. Each slot may be CPU-backed or GPU-backed.
+        struct slot_cross_info {
+            const float * data = nullptr;
+            const void  * gpu  = nullptr;
+            int64_t       n_real = 0;
+        };
+        slot_cross_info slot_info[LLAMA_DFLASH_MAX_SLOTS] = {};
+
         for (int s = 0; s < n_seqs && s < LLAMA_DFLASH_MAX_SLOTS; s++) {
-            llama_seq_id seq = ubatch->seq_id_unq[s];
-            if (!cross) { continue; }
+            if (!cross) {
+                continue;
+            }
+
+            const llama_seq_id seq = ubatch->seq_id_unq[s];
             auto it = cross->v_embd_per_seq.find(seq);
-            if (it != cross->v_embd_per_seq.end() && !it->second.v_embd.empty()) {
-                slot_info[s] = { it->second.v_embd.data(), it->second.n_enc_real };
+            if (it == cross->v_embd_per_seq.end()) {
+                continue;
+            }
+
+            if (it->second.v_embd_gpu) {
+                slot_info[s].gpu = it->second.v_embd_gpu;
+                slot_info[s].n_real = it->second.v_embd_gpu_n_enc_real;
+            } else if (!it->second.v_embd.empty()) {
+                slot_info[s].data = it->second.v_embd.data();
+                slot_info[s].n_real = it->second.n_enc_real;
             }
         }
 
@@ -396,11 +414,41 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
 
             if ((int64_t) n_feat == target_hidden->ne[0]) {
                 for (int s = 0; s < n_seqs; s++) {
-                    if (!slot_info[s].data || slot_n_copy[s] <= 0) { continue; }
-                    const float * src = slot_info[s].data + slot_win_off[s] * n_feat;
-                    const size_t copy_bytes = n_feat * (size_t) slot_n_copy[s] * sizeof(float);
-                    const size_t dst_offset = (size_t) s * (size_t) per_slot_ctx * n_feat * sizeof(float);
-                    ggml_backend_tensor_set(target_hidden, src, dst_offset, copy_bytes);
+                    if (slot_n_copy[s] <= 0) {
+                        continue;
+                    }
+
+                    const size_t copy_bytes =
+                        n_feat * (size_t) slot_n_copy[s] * sizeof(float);
+                    const size_t dst_offset =
+                        (size_t) s * (size_t) per_slot_ctx * n_feat * sizeof(float);
+
+                    if (slot_info[s].gpu && cross && cross->fn_set_tensor_d2d) {
+                        const void * gpu_src =
+                            (const char *) slot_info[s].gpu +
+                            (size_t) slot_win_off[s] * n_feat * sizeof(float);
+
+                        cross->fn_set_tensor_d2d(
+                            target_hidden->data,
+                            gpu_src,
+                            dst_offset,
+                            copy_bytes);
+                    } else if (slot_info[s].data) {
+                        const float * src =
+                            slot_info[s].data + slot_win_off[s] * n_feat;
+
+                        ggml_backend_tensor_set(
+                            target_hidden,
+                            src,
+                            dst_offset,
+                            copy_bytes);
+                    } else if (dflash_input_shape_debug()) {
+                        fprintf(stderr,
+                            "dflash input: missing cross data for multi-slot seq_index=%d n_real=%lld n_copy=%lld\n",
+                            s,
+                            (long long) slot_info[s].n_real,
+                            (long long) slot_n_copy[s]);
+                    }
                 }
             } else if (dflash_input_shape_debug()) {
                 fprintf(stderr, "dflash input: feature mismatch multi-slot n_feat=%zu target_hidden_ne0=%lld n_seqs=%d per_slot_ctx=%d\n",
