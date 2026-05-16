@@ -45,6 +45,13 @@ static inline int llama_dflash_capture_tokens_per_seq(uint32_t n_tokens, uint32_
     return n_seqs_unq > 1 ? (int) n_seq_tokens : (int) n_tokens;
 }
 
+static inline bool llama_dflash_suppress_callback_for_prefill_ubatch_for_test(
+        bool prefill_plan_active,
+        bool use_prefill_staging,
+        bool has_intersection) {
+    return prefill_plan_active && use_prefill_staging && !has_intersection;
+}
+
 struct llama_memory_recurrent;
 
 struct llama_model;

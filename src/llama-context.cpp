@@ -1104,6 +1104,14 @@ static bool dflash_profile_enabled() {
     return enabled;
 }
 
+static bool dflash_diagnostic_debug_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_DFLASH_DEBUG");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 static void dflash_profile_reset(dflash_capture_data & cap) {
     cap.profile_decode_us = 0;
     cap.profile_raw_logits_us = 0;
@@ -5002,6 +5010,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
                     // populate per-seq DFlash GPU capture pointers for graph builder
                     bool dflash_graph_hidden_ready = false;
+                    bool dflash_suppress_callback_for_view = false;
                     const int ns = std::min((int) ubatch.n_seqs_unq, (int) LLAMA_DFLASH_MAX_SLOTS);
 
                     // DFlash hidden capture is indexed by unique logical seq/slot.
@@ -5028,7 +5037,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         prefill_plan_active &&
                         dflash_capture_n_tokens > LLAMA_DFLASH_MAX_VERIFY_TOKENS;
 
-                    if (dflash_capture && dflash_capture->profile && prefill_plan_active) {
+                    if (dflash_capture && dflash_diagnostic_debug_enabled() && prefill_plan_active) {
                         LLAMA_LOG_INFO(
                             "%s: dflash capture route: n_tokens=%u n_seq_tokens=%u n_seqs=%u n_seqs_unq=%u capture_n_tokens=%d use_prefill_staging=%d\n",
                             __func__,
@@ -5109,19 +5118,29 @@ int llama_context::decode(const llama_batch & batch_inp) {
                                 // but allow decode to continue for the non-suffix portion.
                                 cparams.prefill_gpu_n_seqs = 0;
                                 cparams.dflash_prefill_capture_active = false;
+
+                                // This ubatch belongs to a prefill decode whose
+                                // overall outer batch overlaps the useful suffix,
+                                // but this specific internal ubatch does not.
+                                // Do not fall back to eval callback here: there is
+                                // nothing useful to capture and CPU readback is pure
+                                // overhead / stale side data.
+                                dflash_suppress_callback_for_view = true;
                                 dflash_graph_hidden_ready = false;
                             } else {
                                 cparams.prefill_gpu_n_seqs = ns;
                             }
 
-                            LLAMA_LOG_INFO("%s: dflash prefill capture ubatch: slot=%d ubatch=[%d,%d) inter=[%d,%d) src_offset=%d dst_offset=%d n_tokens=%d\n",
-                                __func__,
-                                (int) ubatch.seq_id_unq[0],
-                                (int) ubatch_pos_min, (int) ubatch_end,
-                                (int) inter_begin, (int) inter_end,
-                                (int) cparams.dflash_prefill_src_offset,
-                                (int) cparams.dflash_prefill_dst_offset,
-                                (int) cparams.dflash_prefill_n_tokens);
+                            if (dflash_diagnostic_debug_enabled()) {
+                                LLAMA_LOG_INFO("%s: dflash prefill capture ubatch: slot=%d ubatch=[%d,%d) inter=[%d,%d) src_offset=%d dst_offset=%d n_tokens=%d\n",
+                                    __func__,
+                                    (int) ubatch.seq_id_unq[0],
+                                    (int) ubatch_pos_min, (int) ubatch_end,
+                                    (int) inter_begin, (int) inter_end,
+                                    (int) cparams.dflash_prefill_src_offset,
+                                    (int) cparams.dflash_prefill_dst_offset,
+                                    (int) cparams.dflash_prefill_n_tokens);
+                            }
                         }
                     } else {
                         cparams.dflash_prefill_capture_active = false;
@@ -5209,8 +5228,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         }
                     }
 
-                    ggml_backend_sched_eval_callback cb_eval_new = dflash_graph_hidden_ready ? nullptr : dflash_eval_callback;
-                    void * cb_eval_user_data_new = dflash_graph_hidden_ready ? nullptr : dflash_capture.get();
+                    const bool dflash_skip_eval_callback =
+                        dflash_graph_hidden_ready || dflash_suppress_callback_for_view;
+
+                    ggml_backend_sched_eval_callback cb_eval_new =
+                        dflash_skip_eval_callback ? nullptr : dflash_eval_callback;
+                    void * cb_eval_user_data_new =
+                        dflash_skip_eval_callback ? nullptr : dflash_capture.get();
                     cparams.cb_eval = cb_eval_new;
                     cparams.cb_eval_user_data = cb_eval_user_data_new;
                 }
