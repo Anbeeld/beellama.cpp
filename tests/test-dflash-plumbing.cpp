@@ -150,7 +150,7 @@ int main(int argc, char ** argv) {
     ok &= expect(context_cpp.find("allocate_hidden_gpu(n_slots, max_tokens)") != std::string::npos, "GPU tape allocation must allocate hidden capture buffers too");
     ok &= expect(context_cpp.find("dflash_graph_hidden_ready ? nullptr : dflash_eval_callback") != std::string::npos, "eligible DFlash verifier graph must disable eval callback");
     ok &= expect(context_cpp.find("const bool dflash_graph_tape_ready") != std::string::npos, "DFlash decode must gate GPU tape copies separately from hidden capture");
-    ok &= expect(context_cpp.find("dflash_graph_hidden_ready =\n                    !dflash_capture->hidden_gpu.empty()") != std::string::npos, "GPU hidden graph capture must not depend on active tape recording");
+    ok &= expect(context_cpp.find("dflash_graph_hidden_ready =\n                            !dflash_capture->hidden_gpu.empty()") != std::string::npos, "GPU hidden graph capture must not depend on active tape recording");
     ok &= expect(context_cpp.find("dflash_tape_gpu * graph_tp = dflash_graph_tape_ready ? tp : nullptr") != std::string::npos, "GPU tape graph pointers must be disabled when tape recording is inactive");
     ok &= expect(context_cpp.find("multi-GPU target detected") != std::string::npos, "multi-GPU target must fall back from graph-embedded DFlash GPU capture");
     ok &= expect(context_cpp.find("const bool dflash_gpu_capture_ready = model.n_devices() <= 1 && dflash_capture->gpu_capture_enabled") != std::string::npos, "DFlash graph capture must be gated to single-GPU target placement and explicit GPU capture policy");
@@ -337,8 +337,8 @@ int main(int argc, char ** argv) {
         "server must log suffix DFlash prefill flushes under DFlash profiling");
     ok &= expect(server_context.find("params_base.speculative.dflash_cross_ctx") != std::string::npos,
         "DFlash prefill gate must use --spec-dflash-cross-ctx");
-    ok &= expect(server_context.find("batch_end > capture_from") != std::string::npos,
-        "DFlash prefill gate must flush only batches overlapping the final cross-context suffix");
+    ok &= expect(server_context.find("batch_end <= capture_from") != std::string::npos,
+        "DFlash prefill gate must skip batches entirely before the useful suffix");
 
     ok &= expect(speculative_h.find("common_speculative_set_prefill_capture_enabled") != std::string::npos,
         "DFlash must expose a prefill hidden-capture toggle");
@@ -386,6 +386,64 @@ int main(int argc, char ** argv) {
 
     ok &= expect(context_cpp.find("capture_active && !dflash_capture->layer_ids.empty()") != std::string::npos,
         "capture re-enable must check both active flag and layer config");
+
+    // Prefill GPU staging buffer
+    ok &= expect(context_h.find("prefill_gpu") != std::string::npos,
+        "dflash_capture_data must declare prefill GPU staging buffers");
+    ok &= expect(context_h.find("allocate_prefill_gpu") != std::string::npos,
+        "llama_context must declare lazy prefill GPU allocation");
+    ok &= expect(context_cpp.find("allocate_prefill_gpu(ns, ubatch_size)") != std::string::npos,
+        "decode loop must lazily allocate prefill GPU staging on first suffix batch");
+    ok &= expect(context_h.find("prefill_gpu_active()") != std::string::npos,
+        "llama_context must expose prefill GPU active check");
+    ok &= expect(context_h.find("prefill_gpu_n_tokens") != std::string::npos,
+        "llama_context must expose prefill GPU token count query");
+    ok &= expect(context_h.find("prefill_gpu_write_hidden") != std::string::npos,
+        "llama_context must expose prefill GPU hidden write method");
+    ok &= expect(llama_h.find("llama_dflash_prefill_gpu_write_hidden") != std::string::npos,
+        "public API must expose prefill GPU hidden D2D ring writes");
+    ok &= expect(llama_h.find("llama_dflash_prefill_gpu_active") != std::string::npos,
+        "public API must expose prefill GPU active check");
+    ok &= expect(llama_h.find("llama_dflash_prefill_gpu_n_tokens") != std::string::npos,
+        "public API must expose prefill GPU token count query");
+    ok &= expect(cparams_h.find("prefill_gpu_seqs") != std::string::npos,
+        "cparams must declare prefill GPU seq pointers for graph builder");
+    ok &= expect(cparams_h.find("prefill_gpu_n_seqs") != std::string::npos,
+        "cparams must declare prefill GPU seq count for graph builder");
+    ok &= expect(graph_h.find("cparams.prefill_gpu_n_seqs") != std::string::npos,
+        "graph reuse must key on prefill GPU staging topology");
+    ok &= expect(context_cpp.find("use_prefill_staging") != std::string::npos,
+        "decode loop must choose between prefill staging and verify hidden_gpu");
+    ok &= expect(context_cpp.find("ubatch.n_seq_tokens > LLAMA_DFLASH_MAX_VERIFY_TOKENS") != std::string::npos,
+        "prefill staging must be selected when ubatch exceeds verify token capacity");
+
+    // Prefill span math and flush
+    ok &= expect(speculative_h.find("common_dflash_prefill_span") != std::string::npos,
+        "DFlash must declare prefill span struct");
+    ok &= expect(speculative_h.find("common_speculative_flush_prefill") != std::string::npos,
+        "DFlash must expose prefill flush API");
+    ok &= expect(speculative.find("flush_prefill(int src_offset") != std::string::npos,
+        "speculative state must implement flush_prefill with span parameters");
+    ok &= expect(speculative.find("common_speculative_flush_prefill") != std::string::npos,
+        "speculative module must implement prefill flush dispatch");
+
+    // Explicit capture source for ring_write
+    ok &= expect(speculative.find("dflash_capture_source") != std::string::npos,
+        "DFlash ring write must use explicit capture source enum");
+    ok &= expect(speculative.find("dflash_capture_source::prefill_gpu_hidden") != std::string::npos,
+        "DFlash capture source must distinguish prefill GPU staging");
+
+    // Prefill suffix tracking
+    ok &= expect(speculative.find("prefill_suffix_seen") != std::string::npos,
+        "DFlash state must track whether suffix prefill was seen");
+    ok &= expect(speculative.find("prefill_flushed") != std::string::npos,
+        "DFlash state must track whether prefill flush was called");
+
+    // Persistent pre-decode flush decisions
+    ok &= expect(server_context.find("pending_prefill_flushes") != std::string::npos,
+        "server must persist pre-decode flush decisions through decode");
+    ok &= expect(server_context.find("common_speculative_flush_prefill") != std::string::npos,
+        "server must call prefill flush after decode regardless of slot state");
 
     return ok ? 0 : 1;
 }
