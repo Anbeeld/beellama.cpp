@@ -144,6 +144,12 @@ bool common_dflash_cpu_ring_valid_after_write_for_test(
         bool has_gpu_ring,
         bool cpu_ring_written_all);
 
+// test helper: returns true when large prefill should refuse CPU fallback
+bool common_dflash_should_refuse_large_prefill_fallback_for_test(
+        int requested,
+        bool use_prefill_gpu,
+        bool has_gpu_ring);
+
 // DDTree: build a tree of likely continuations from draft logits
 // tree_budget: internal total tree nodes for one draft call.
 // Public configuration uses branch_budget, then runtime adds the main draft path.

@@ -65,6 +65,14 @@ static bool common_dflash_profile_enabled() {
     return enabled;
 }
 
+static bool common_dflash_debug_logs_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_DFLASH_DEBUG");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 static bool common_dflash_kv_cache_disabled() {
     static const bool disabled = [] {
         const char * env = std::getenv("GGML_DFLASH_DISABLE_KV_CACHE");
@@ -1756,7 +1764,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
             fail_contract("n_target_features must equal n_embd * n_target_layers");
         }
 
-        std::vector<int32_t> capture_layers(n_target_layers);
+        capture_layers.assign(n_target_layers, 0);
         const int n_read = llama_model_dflash_target_layer_ids(model_dft_, capture_layers.data(), n_target_layers);
         if (n_read != n_target_layers) {
             fail_contract(string_format("target_layer_ids read count mismatch: read %d expected %d", n_read, n_target_layers));
@@ -1812,8 +1820,6 @@ struct common_speculative_state_dflash : public common_speculative_state {
         // (done in speculative-simple.cpp before common_speculative_init)
 
         // configure target context to capture hidden states
-        capture_layers.resize(n_target_layers);
-        llama_model_dflash_target_layer_ids(model_dft_, capture_layers.data(), n_target_layers);
         llama_set_dflash_capture(ctx_tgt, capture_layers.data(), n_target_layers);
         target_capture_enabled = true;
 
@@ -1989,6 +1995,12 @@ struct common_speculative_state_dflash : public common_speculative_state {
                 return 0;
             }
         } else {
+            if (!use_prefill_gpu && n_tokens > LLAMA_DFLASH_MAX_VERIFY_TOKENS && gpu_ring_handle) {
+                LOG_ERR("dflash prefill flush expected GPU staging for large suffix span but prefill_gpu is inactive: requested=%d seq=%d; refusing fallback ring write\n",
+                        n_tokens, seq_id);
+                return 0;
+            }
+
             source = dflash_capture_source::cpu_hidden;
             n_src_layers = llama_get_n_layer_hiddens(ctx_tgt);
             if (n_src_layers == 0) {
@@ -2595,8 +2607,10 @@ private:
             int to_write = std::min(n_tokens, std::max(0, (int)ntok - src_offset));
 
             if (to_write < n_tokens) {
-                LOG_WRN("DFLASH_DBG ring_write MISMATCH: requested=%d actual=%d ntok=%lld src_offset=%d ring_write_pos=%d ring_filled=%d committed_len=%d\n",
-                    n_tokens, to_write, (long long)ntok, src_offset, ring_write_pos, ring_filled, committed_len);
+                if (common_dflash_debug_logs_enabled()) {
+                    LOG_WRN("DFLASH_DBG ring_write MISMATCH: requested=%d actual=%d ntok=%lld src_offset=%d ring_write_pos=%d ring_filled=%d committed_len=%d\n",
+                        n_tokens, to_write, (long long)ntok, src_offset, ring_write_pos, ring_filled, committed_len);
+                }
             }
             if (first_layer) {
                 actual_written = to_write;
@@ -3638,4 +3652,11 @@ bool common_dflash_cpu_ring_valid_after_write_for_test(
     }
 
     return cpu_ring_valid;
+}
+
+bool common_dflash_should_refuse_large_prefill_fallback_for_test(
+        int requested,
+        bool use_prefill_gpu,
+        bool has_gpu_ring) {
+    return !use_prefill_gpu && requested > LLAMA_DFLASH_MAX_VERIFY_TOKENS && has_gpu_ring;
 }
