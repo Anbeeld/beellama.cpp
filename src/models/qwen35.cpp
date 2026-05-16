@@ -26,6 +26,12 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
     const int64_t n_seqs       = ubatch.n_seqs;
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
+    const int64_t dflash_capture_n_seqs =
+        ubatch.n_seqs_unq > 1 ? (int64_t) ubatch.n_seqs_unq : 1;
+
+    const int64_t dflash_capture_n_tokens =
+        ubatch.n_seqs_unq > 1 ? n_seq_tokens : (int64_t) ubatch.n_tokens;
+
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * inpSA = inpL;
 
@@ -71,7 +77,7 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
         cb(cur, "l_out", il);
 
         if (cparams.hidden_gpu_n_seqs > 0) {
-            for (int s = 0; s < (int)n_seqs && s < cparams.hidden_gpu_n_seqs; ++s) {
+            for (int s = 0; s < (int)dflash_capture_n_seqs && s < cparams.hidden_gpu_n_seqs; ++s) {
                 auto * hgpu = cparams.hidden_gpu_seqs[s];
                 if (!hgpu) continue;
 
@@ -79,14 +85,14 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
                 for (int i = 0; i < (int)hgpu->layer_ids.size(); ++i) {
                     if (hgpu->layer_ids[i] == il) { hi = i; break; }
                 }
-                if (hi < 0 || n_seq_tokens > hgpu->max_tokens) continue;
+                if (hi < 0 || dflash_capture_n_tokens > hgpu->max_tokens) continue;
 
                 ggml_tensor * h_slice = ggml_view_2d(ctx0, cur,
-                    cur->ne[0], n_seq_tokens,
-                    cur->nb[1], (size_t)s * (size_t)n_seq_tokens * cur->nb[1]);
+                    cur->ne[0], dflash_capture_n_tokens,
+                    cur->nb[1], (size_t)s * (size_t)dflash_capture_n_tokens * cur->nb[1]);
                 ggml_tensor * h_cont = ggml_cont(ctx0, h_slice);
                 ggml_tensor * h_dst = ggml_view_2d(ctx0, hgpu->layers[hi],
-                    hgpu->layers[hi]->ne[0], (int64_t)n_seq_tokens,
+                    hgpu->layers[hi]->ne[0], (int64_t)dflash_capture_n_tokens,
                     hgpu->layers[hi]->nb[1], 0);
                 ggml_build_forward_expand(gf, ggml_cpy(ctx0, h_cont, h_dst));
             }
@@ -103,7 +109,7 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
             const int src_off = cparams.dflash_prefill_src_offset;
             const int dst_off = cparams.dflash_prefill_dst_offset;
 
-            for (int s = 0; s < (int)n_seqs && s < cparams.prefill_gpu_n_seqs; ++s) {
+            for (int s = 0; s < (int)dflash_capture_n_seqs && s < cparams.prefill_gpu_n_seqs; ++s) {
                 auto * pgpu = cparams.prefill_gpu_seqs[s];
                 if (!pgpu) continue;
 
@@ -116,7 +122,7 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
 
                 ggml_tensor * h_slice = ggml_view_2d(ctx0, cur,
                     cur->ne[0], (int64_t)n_copy,
-                    cur->nb[1], (size_t)s * (size_t)n_seq_tokens * cur->nb[1] + (size_t)src_off * cur->nb[1]);
+                    cur->nb[1], (size_t)s * (size_t)dflash_capture_n_tokens * cur->nb[1] + (size_t)src_off * cur->nb[1]);
                 ggml_tensor * h_cont = ggml_cont(ctx0, h_slice);
                 ggml_tensor * h_dst = ggml_view_2d(ctx0, pgpu->layers[hi],
                     pgpu->layers[hi]->ne[0], (int64_t)n_copy,
@@ -283,6 +289,12 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     const int64_t head_v_dim   = d_inner / num_v_heads;
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
+    const int64_t dflash_capture_n_seqs =
+        ubatch.n_seqs_unq > 1 ? (int64_t) ubatch.n_seqs_unq : 1;
+
+    const int64_t dflash_capture_n_tokens =
+        ubatch.n_seqs_unq > 1 ? n_seq_tokens : (int64_t) ubatch.n_tokens;
+
     const auto kv_head = mctx_cur->get_head();
 
     GGML_ASSERT(n_seqs != 0);
@@ -434,8 +446,8 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     // GPU tape: copy k/v/gate/beta directly to persistent per-slot GPU buffers.
     // Per-seq loop extracts each seq's 3D slice from the 4D source tensors.
     // For n_seqs==1 this degenerates to a single copy at offset 0.
-    if (cparams.tape_gpu_n_seqs > 0) {
-        for (int s = 0; s < (int)n_seqs && s < cparams.tape_gpu_n_seqs; ++s) {
+        if (cparams.tape_gpu_n_seqs > 0) {
+            for (int s = 0; s < (int)dflash_capture_n_seqs && s < cparams.tape_gpu_n_seqs; ++s) {
             auto * tgpu = cparams.tape_gpu_seqs[s];
             if (!tgpu) continue;
 
@@ -443,7 +455,7 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
             for (int i = 0; i < (int)tgpu->layer_ids.size(); ++i) {
                 if (tgpu->layer_ids[i] == il) { li = i; break; }
             }
-            if (li < 0 || n_seq_tokens > tgpu->max_tokens) continue;
+            if (li < 0 || dflash_capture_n_tokens > tgpu->max_tokens) continue;
 
             auto & tl = tgpu->layers[li];
 

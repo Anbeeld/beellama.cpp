@@ -38,6 +38,12 @@ llm_build_gemma4_iswa::llm_build_gemma4_iswa(const llama_model & model, const ll
     const int64_t n_seqs       = ubatch.n_seqs;
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
+    const int64_t dflash_capture_n_seqs =
+        ubatch.n_seqs_unq > 1 ? (int64_t) ubatch.n_seqs_unq : 1;
+
+    const int64_t dflash_capture_n_tokens =
+        ubatch.n_seqs_unq > 1 ? n_seq_tokens : (int64_t) ubatch.n_tokens;
+
     ggml_tensor * inp_per_layer = nullptr;
     if (model.per_layer_tok_embd) {
         inp_per_layer = build_inp_per_layer();
@@ -252,8 +258,9 @@ llm_build_gemma4_iswa::llm_build_gemma4_iswa(const llama_model & model, const ll
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
 
-        if (cparams.hidden_gpu_n_seqs > 0 && cur->ne[1] == n_seq_tokens * n_seqs) {
-            for (int s = 0; s < (int) n_seqs && s < cparams.hidden_gpu_n_seqs; ++s) {
+        if (cparams.hidden_gpu_n_seqs > 0 &&
+            cur->ne[1] == dflash_capture_n_tokens * dflash_capture_n_seqs) {
+            for (int s = 0; s < (int) dflash_capture_n_seqs && s < cparams.hidden_gpu_n_seqs; ++s) {
                 auto * hgpu = cparams.hidden_gpu_seqs[s];
                 if (!hgpu) continue;
 
@@ -261,14 +268,15 @@ llm_build_gemma4_iswa::llm_build_gemma4_iswa(const llama_model & model, const ll
                 for (int i = 0; i < (int) hgpu->layer_ids.size(); ++i) {
                     if (hgpu->layer_ids[i] == il) { hi = i; break; }
                 }
-                if (hi < 0 || n_seq_tokens > hgpu->max_tokens) continue;
+                if (hi < 0 || dflash_capture_n_tokens > hgpu->max_tokens) continue;
 
                 ggml_tensor * h_slice = ggml_view_2d(ctx0, cur,
-                    cur->ne[0], n_seq_tokens,
-                    cur->nb[1], (size_t) s * (size_t) n_seq_tokens * cur->nb[1]);
+                    cur->ne[0], dflash_capture_n_tokens,
+                    cur->nb[1],
+                    (size_t) s * (size_t) dflash_capture_n_tokens * cur->nb[1]);
                 ggml_tensor * h_cont = ggml_cont(ctx0, h_slice);
                 ggml_tensor * h_dst = ggml_view_2d(ctx0, hgpu->layers[hi],
-                    hgpu->layers[hi]->ne[0], (int64_t) n_seq_tokens,
+                    hgpu->layers[hi]->ne[0], (int64_t) dflash_capture_n_tokens,
                     hgpu->layers[hi]->nb[1], 0);
                 ggml_build_forward_expand(gf, ggml_cpy(ctx0, h_cont, h_dst));
             }
@@ -281,13 +289,13 @@ llm_build_gemma4_iswa::llm_build_gemma4_iswa(const llama_model & model, const ll
         if (cparams.prefill_gpu_n_seqs > 0 &&
             cparams.dflash_prefill_capture_active &&
             cparams.dflash_prefill_n_tokens > 0 &&
-            cur->ne[1] == n_seq_tokens * n_seqs) {
+            cur->ne[1] == dflash_capture_n_tokens * dflash_capture_n_seqs) {
             const int n_copy  = cparams.dflash_prefill_n_tokens;
             const int src_off = cparams.dflash_prefill_src_offset;
             const int dst_off = cparams.dflash_prefill_dst_offset;
 
-            if (src_off >= 0 && src_off + n_copy <= n_seq_tokens) {
-                for (int s = 0; s < (int) n_seqs && s < cparams.prefill_gpu_n_seqs; ++s) {
+            if (src_off >= 0 && src_off + n_copy <= dflash_capture_n_tokens) {
+                for (int s = 0; s < (int) dflash_capture_n_seqs && s < cparams.prefill_gpu_n_seqs; ++s) {
                     auto * pgpu = cparams.prefill_gpu_seqs[s];
                     if (!pgpu) {
                         continue;
@@ -310,7 +318,7 @@ llm_build_gemma4_iswa::llm_build_gemma4_iswa(const llama_model & model, const ll
                     ggml_tensor * h_slice = ggml_view_2d(ctx0, cur,
                         cur->ne[0], (int64_t) n_copy,
                         cur->nb[1],
-                        (size_t) s * (size_t) n_seq_tokens * cur->nb[1] +
+                        (size_t) s * (size_t) dflash_capture_n_tokens * cur->nb[1] +
                         (size_t) src_off * cur->nb[1]);
 
                     ggml_tensor * h_cont = ggml_cont(ctx0, h_slice);
