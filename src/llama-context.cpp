@@ -1399,6 +1399,35 @@ void llama_context::set_dflash_n_slots(int n) {
 }
 
 void llama_context::set_dflash_capture(const int32_t * layer_ids, int32_t n_layers) {
+    if (layer_ids == nullptr || n_layers <= 0) {
+        // Clear DFlash hidden capture. Subsequent graph builds and eval callbacks
+        // must not ask/read l_out tensors for DFlash hidden layers.
+        cparams.dflash_capture_layers.clear();
+
+        if (dflash_capture) {
+            dflash_capture->layer_ids.clear();
+            dflash_capture->hidden_name_idx.clear();
+            dflash_capture->tensor_names.clear();
+            dflash_capture->profile_cb_hidden_ask = 0;
+            dflash_capture->profile_cb_hidden_read = 0;
+        }
+
+        // Remove eval callback so target graph builds skip hidden outputs
+        // and the callback is not invoked at all for disabled layers.
+        cparams.cb_eval = nullptr;
+        cparams.cb_eval_user_data = nullptr;
+
+        // Clear captured hidden state buffers
+        for (auto & slot_bufs : layer_hiddens) {
+            for (auto & buf : slot_bufs) {
+                buf.n_tokens = 0;
+                std::vector<float>().swap(buf.data);
+            }
+        }
+
+        return;
+    }
+
     // store layer IDs for the graph builder (still needed so qwen35.cpp knows which layers)
     cparams.dflash_capture_layers.clear();
     for (int32_t i = 0; i < n_layers; ++i) {

@@ -290,6 +290,10 @@ struct common_speculative_state {
     // lose hidden state context between sub-batches.
     virtual void flush_prefill() {}
 
+    // Enable/disable target hidden capture during prefill.
+    // No-op in base class. DFlash overrides to toggle llama_set_dflash_capture.
+    virtual void set_prefill_capture_enabled(bool /*enabled*/) {}
+
     // save/restore ring buffer state for checkpoint persistence.
     // allows hidden states captured during prefill to survive checkpoint restore.
     virtual size_t ring_state_size() const { return 0; }
@@ -1520,6 +1524,11 @@ struct common_speculative_state_dflash : public common_speculative_state {
     int n_draft_last = 0;
     int adaptive_n_draft = -1; // -1 = use default
 
+    // Stored target capture layer IDs for toggling prefill hidden capture on/off.
+    std::vector<int32_t> capture_layers;
+    bool target_capture_enabled = true;
+    bool gpu_capture_available = false;
+
     // build interleaved cross-attention data from ring buffer (GPU or CPU path)
     int build_cross_data(llama_context * ctx) {
         LOG_DBG("DFLASH_DBG build_cross_data: ring_write_pos=%d ring_filled=%d committed_len=%d cross_ctx=%d gpu=%d\n",
@@ -1621,9 +1630,10 @@ struct common_speculative_state_dflash : public common_speculative_state {
         // (done in speculative-simple.cpp before common_speculative_init)
 
         // configure target context to capture hidden states
-        std::vector<int32_t> capture_layers(n_target_layers);
+        capture_layers.resize(n_target_layers);
         llama_model_dflash_target_layer_ids(model_dft_, capture_layers.data(), n_target_layers);
         llama_set_dflash_capture(ctx_tgt, capture_layers.data(), n_target_layers);
+        target_capture_enabled = true;
 
         batch_dft = llama_batch_init(block_size, 0, 1);
 
@@ -1638,6 +1648,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
         if (gpu_ring_handle) {
             LOG_INF("dflash: GPU cross ring enabled (%d layers x %d slots x %d embd)\n",
                     n_target_layers, cross_ctx, n_embd);
+            gpu_capture_available = true;
         } else if (gpu_ring_requested) {
             llama_set_dflash_gpu_capture(ctx_tgt, false);
             LOG_WRN("dflash: GPU cross ring unavailable; using CPU hidden capture\n");
@@ -1657,6 +1668,31 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
     void set_seq_id(llama_seq_id seq_id_) override {
         seq_id = seq_id_;
+    }
+
+    void set_prefill_capture_enabled(bool enabled) override {
+        if (target_capture_enabled == enabled) {
+            return;
+        }
+
+        target_capture_enabled = enabled;
+
+        if (enabled) {
+            if (!capture_layers.empty()) {
+                llama_set_dflash_capture(ctx_tgt, capture_layers.data(), (int32_t) capture_layers.size());
+            }
+            llama_set_dflash_gpu_capture(ctx_tgt, gpu_capture_available);
+            if (profile) {
+                LOG_INF("dflash prefill capture: enabled hidden capture gpu=%d layers=%d\n",
+                        gpu_capture_available ? 1 : 0, (int) capture_layers.size());
+            }
+        } else {
+            llama_set_dflash_capture(ctx_tgt, nullptr, 0);
+            llama_set_dflash_gpu_capture(ctx_tgt, false);
+            if (profile) {
+                LOG_INF("dflash prefill capture: disabled hidden capture for non-suffix prompt chunk\n");
+            }
+        }
     }
 
     // prepare cross-attention data for batched draft decode.
@@ -3075,6 +3111,15 @@ void common_speculative_flush_prefill(common_speculative * spec) {
     }
     for (auto & impl : spec->impls) {
         impl->flush_prefill();
+    }
+}
+
+void common_speculative_set_prefill_capture_enabled(common_speculative * spec, bool enabled) {
+    if (spec == nullptr) {
+        return;
+    }
+    for (auto & impl : spec->impls) {
+        impl->set_prefill_capture_enabled(enabled);
     }
 }
 

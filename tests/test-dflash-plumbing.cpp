@@ -51,6 +51,7 @@ int main(int argc, char ** argv) {
     const std::string server_task = read_file(root + "/tools/server/server-task.cpp");
     const std::string chat_auto_parser_generator = read_file(root + "/common/chat-auto-parser-generator.cpp");
     const std::string speculative = read_file(root + "/common/speculative.cpp");
+    const std::string speculative_h = read_file(root + "/common/speculative.h");
     const std::string dflash_draft = read_file(root + "/src/models/dflash_draft.cpp");
     const std::string memory_recurrent = read_file(root + "/src/llama-memory-recurrent.cpp");
     const std::string qwen35 = read_file(root + "/src/models/qwen35.cpp");
@@ -327,6 +328,46 @@ int main(int argc, char ** argv) {
     ok &= expect(server_context.find("for (int idx : slot.spec_pad_i_batch)") != std::string::npos, "reduced verifier coverage must account for explicit padding rows");
     ok &= expect(server_context.find("const bool had_dflash_padding = !slot.spec_pad_i_batch.empty()") != std::string::npos, "server must remember verifier padding through accept bookkeeping");
     ok &= expect(server_context.find("const bool all_accepted_flat = (n_accepted_draft == (int) n_draft) && !had_dflash_padding") != std::string::npos, "DFlash verifier padding must force rollback even when all real draft tokens were accepted");
+
+    ok &= expect(server_context.find("should_flush_dflash_prefill") != std::string::npos,
+        "server must gate DFlash prefill flushes to the useful suffix");
+    ok &= expect(server_context.find("dflash prefill: skip flush") != std::string::npos,
+        "server must log skipped DFlash prefill flushes under DFlash profiling");
+    ok &= expect(server_context.find("dflash prefill: suffix flush") != std::string::npos,
+        "server must log suffix DFlash prefill flushes under DFlash profiling");
+    ok &= expect(server_context.find("params_base.speculative.dflash_cross_ctx") != std::string::npos,
+        "DFlash prefill gate must use --spec-dflash-cross-ctx");
+    ok &= expect(server_context.find("batch_end > capture_from") != std::string::npos,
+        "DFlash prefill gate must flush only batches overlapping the final cross-context suffix");
+
+    ok &= expect(speculative_h.find("common_speculative_set_prefill_capture_enabled") != std::string::npos,
+        "DFlash must expose a prefill hidden-capture toggle");
+
+    ok &= expect(speculative.find("set_prefill_capture_enabled(bool") != std::string::npos,
+        "DFlash state must implement hidden-capture enable/disable");
+
+    ok &= expect(speculative.find("llama_set_dflash_capture(ctx_tgt, nullptr, 0)") != std::string::npos,
+        "DFlash hidden capture must be disabled by clearing capture layers");
+
+    ok &= expect(speculative.find("dflash prefill capture: disabled hidden capture") != std::string::npos,
+        "DFlash capture disable path must be profile-loggable");
+
+    ok &= expect(speculative.find("dflash prefill capture: enabled hidden capture") != std::string::npos,
+        "DFlash capture re-enable path must be profile-loggable");
+
+    ok &= expect(server_context.find("dflash_capture_needed_for_view") != std::string::npos,
+        "server must decide whether DFlash hidden capture is needed before llama_decode");
+
+    ok &= expect(server_context.find("common_speculative_set_prefill_capture_enabled(slot.spec.get(), dflash_capture_needed_for_view)") != std::string::npos,
+        "server must toggle DFlash hidden capture before target decode");
+
+    ok &= expect(server_context.find("SLOT_STATE_GENERATING") != std::string::npos &&
+                 server_context.find("dflash_capture_needed_for_view = true") != std::string::npos,
+        "server must keep DFlash hidden capture enabled for generation/verification");
+
+    ok &= expect(context_cpp.find("layer_ids == nullptr") != std::string::npos &&
+                 context_cpp.find("n_layers <= 0") != std::string::npos,
+        "llama_set_dflash_capture must support clearing capture layers");
 
     return ok ? 0 : 1;
 }

@@ -103,6 +103,12 @@ void common_speculative_update_logits_by_indices(common_speculative * spec, llam
 // so checkpoint placement doesn't lose hidden state context.
 void common_speculative_flush_prefill(common_speculative * spec);
 
+// Enable/disable target hidden capture for DFlash prefill.
+// No-op for non-DFlash speculative implementations.
+// Used by the server to skip useless hidden capture before the final DFlash
+// cross-context suffix during long prompt processing.
+void common_speculative_set_prefill_capture_enabled(common_speculative * spec, bool enabled);
+
 // save/restore ring buffer state for checkpoint persistence.
 // the ring contains target hidden states needed by the DFlash drafter's
 // cross-attention. Without this, checkpoint-restored prefills lose context.

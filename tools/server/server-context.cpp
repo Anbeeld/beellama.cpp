@@ -4189,6 +4189,79 @@ private:
         }
         llama_set_dflash_verify_logits(ctx, dflash_verify_graph_enabled, dflash_verify_plan.top_k);
 
+        auto should_flush_dflash_prefill = [&](const server_slot & slot, const llama_batch & view, bool log_decision) -> bool {
+            if (!slot.can_speculate()) {
+                return false;
+            }
+
+            // Non-DFlash specs do not maintain a DFlash hidden ring. Keep their existing behavior.
+            if (params_base.speculative.type != COMMON_SPECULATIVE_TYPE_DFLASH) {
+                return true;
+            }
+
+            if (!slot.task) {
+                return false;
+            }
+
+            bool found_slot_token = false;
+            llama_pos batch_pos_min = 0;
+            llama_pos batch_pos_max = 0;
+
+            for (int32_t j = 0; j < view.n_tokens; ++j) {
+                bool belongs_to_slot = false;
+                for (int32_t k = 0; k < view.n_seq_id[j]; ++k) {
+                    if (view.seq_id[j][k] == slot.id) {
+                        belongs_to_slot = true;
+                        break;
+                    }
+                }
+
+                if (!belongs_to_slot) {
+                    continue;
+                }
+
+                const llama_pos pos = view.pos[j];
+                if (!found_slot_token) {
+                    batch_pos_min = pos;
+                    batch_pos_max = pos;
+                    found_slot_token = true;
+                } else {
+                    batch_pos_min = std::min(batch_pos_min, pos);
+                    batch_pos_max = std::max(batch_pos_max, pos);
+                }
+            }
+
+            if (!found_slot_token) {
+                return false;
+            }
+
+            const int32_t prompt_total = slot.task->n_tokens();
+            const int32_t cross_ctx = std::max<int32_t>(1, params_base.speculative.dflash_cross_ctx);
+
+            // Positions are zero-based; end is exclusive.
+            const int32_t batch_end = (int32_t) batch_pos_max + 1;
+            const int32_t capture_from = std::max<int32_t>(0, prompt_total - cross_ctx);
+
+            // Capture the whole first batch that overlaps the useful suffix.
+            // This may over-capture up to one batch, but skips all earlier chunks
+            // that would be overwritten before generation.
+            const bool should_flush = batch_end > capture_from;
+
+            if (log_decision && dflash_server_profile_enabled()) {
+                if (should_flush) {
+                    SLT_INF(slot,
+                            "dflash prefill: suffix flush, batch_pos=[%d,%d], batch_end=%d, prompt_total=%d, cross_ctx=%d, capture_from=%d\n",
+                            (int) batch_pos_min, (int) batch_pos_max, batch_end, prompt_total, cross_ctx, capture_from);
+                } else {
+                    SLT_INF(slot,
+                            "dflash prefill: skip flush, batch_pos=[%d,%d], batch_end=%d, prompt_total=%d, cross_ctx=%d, capture_from=%d\n",
+                            (int) batch_pos_min, (int) batch_pos_max, batch_end, prompt_total, cross_ctx, capture_from);
+                }
+            }
+
+            return should_flush;
+        };
+
         // process the created batch of tokens
         for (int32_t i = 0; i < batch.n_tokens; i = i_next) {
             const int32_t n_tokens = std::min(n_batch, batch.n_tokens - i);
@@ -4217,6 +4290,56 @@ private:
                         dflash_verify_plan.top_k, dflash_reduce_reason);
             }
             llama_set_dflash_consume_reduced(ctx, dflash_reduce_this_view);
+
+            // DFlash: decide whether target hidden capture is needed for this
+            // decode view. During prompt prefill, only capture for views that
+            // overlap the final cross-context suffix. During generation, capture
+            // must stay enabled so accepted tokens can update the ring.
+            bool dflash_capture_needed_for_view = false;
+
+            if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                for (auto & slot : slots) {
+                    if (!slot.can_speculate() || !slot.spec) {
+                        continue;
+                    }
+
+                    bool slot_in_view = false;
+                    for (int32_t j = 0; j < batch_view.n_tokens && !slot_in_view; ++j) {
+                        for (int32_t k = 0; k < batch_view.n_seq_id[j]; ++k) {
+                            if (batch_view.seq_id[j][k] == slot.id) {
+                                slot_in_view = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (!slot_in_view) {
+                        continue;
+                    }
+
+                    if (slot.state == SLOT_STATE_GENERATING) {
+                        dflash_capture_needed_for_view = true;
+                        break;
+                    }
+
+                    if ((slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) &&
+                            should_flush_dflash_prefill(slot, batch_view, true)) {
+                        dflash_capture_needed_for_view = true;
+                        break;
+                    }
+                }
+
+                for (auto & slot : slots) {
+                    if (slot.can_speculate() && slot.spec) {
+                        common_speculative_set_prefill_capture_enabled(slot.spec.get(), dflash_capture_needed_for_view);
+                    }
+                }
+
+                if (dflash_server_profile_enabled()) {
+                    SRV_INF("dflash prefill capture: view_start=%d n_tokens=%d enabled=%d\n",
+                            i, n_tokens, dflash_capture_needed_for_view ? 1 : 0);
+                }
+            }
 
             const int64_t t_verify_start = ggml_time_us();
             const int ret = llama_decode(ctx, batch_view);
@@ -4290,10 +4413,19 @@ private:
             n_batch = llama_n_batch(ctx);
 
             // DFlash: flush captured hidden states into the ring buffer before
-            // the next llama_decode resets the capture buffer. This lets
-            // checkpoint-split prefill preserve all hidden states incrementally.
+            // the next llama_decode resets the capture buffer.
+            //
+            // For DFlash, do not maintain the ring for the entire prompt prefill.
+            // The drafter only consumes the last --spec-dflash-cross-ctx target
+            // hidden states before generation. Earlier prompt chunks are overwritten
+            // before the first draft and only add PP overhead.
+            //
+            // First safe implementation: flush only the full batch_view that overlaps
+            // the final useful suffix. Do not attempt partial-row capture here.
             for (auto & slot : slots) {
-                if ((slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) && slot.can_speculate()) {
+                if ((slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) &&
+                        slot.can_speculate() &&
+                        should_flush_dflash_prefill(slot, batch_view, false)) {
                     common_speculative_flush_prefill(slot.spec.get());
                 }
             }
@@ -4357,6 +4489,7 @@ private:
                     if (slot.can_speculate()) {
                         if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
                             llama_dflash_set_active_slot(ctx, slot.id);
+                            common_speculative_set_prefill_capture_enabled(slot.spec.get(), true);
                         }
                         common_speculative_begin(slot.spec.get(), slot.prompt.tokens.get_text_tokens());
                     }
