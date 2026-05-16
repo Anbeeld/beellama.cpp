@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "speculative.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -656,6 +657,65 @@ int main(int argc, char ** argv) {
         "set_dflash_capture_active(false) must clear dflash_prefill_capture_active");
     ok &= expect(context_cpp.find("prefill_gpu_seqs[s] = nullptr") != std::string::npos,
         "set_dflash_capture_active(false) must clear prefill_gpu_seqs");
+
+    // Gemma4 is hidden-supported but not tape-supported
+    ok &= expect(llama_dflash_gpu_hidden_supported_arch(LLM_ARCH_GEMMA4),
+        "Gemma4 must support GPU hidden capture");
+    ok &= expect(!llama_dflash_gpu_tape_supported_arch(LLM_ARCH_GEMMA4),
+        "Gemma4 must NOT support GPU tape replay");
+
+    // Gemma4 graph builder must have prefill_gpu staging copy (like Qwen35)
+    ok &= expect(gemma4_iswa.find("prefill_gpu_n_seqs") != std::string::npos,
+        "Gemma4 graph builder must check prefill_gpu_n_seqs");
+    ok &= expect(gemma4_iswa.find("dflash_prefill_capture_active") != std::string::npos,
+        "Gemma4 graph builder must check dflash_prefill_capture_active");
+    ok &= expect(gemma4_iswa.find("dflash_prefill_src_offset") != std::string::npos,
+        "Gemma4 graph builder must use prefill src_offset");
+    ok &= expect(gemma4_iswa.find("dflash_prefill_dst_offset") != std::string::npos,
+        "Gemma4 graph builder must use prefill dst_offset");
+
+    // flush_prefill must use source-first (prefill_gpu check before CPU validation)
+    ok &= expect(speculative.find("use_prefill_gpu && !validate_target_hiddens") != std::string::npos
+              || (speculative.find("use_prefill_gpu = llama_dflash_prefill_gpu_active") != std::string::npos
+                  && speculative.find("!use_prefill_gpu && !validate_target_hiddens") != std::string::npos),
+        "flush_prefill must check prefill GPU before CPU hidden validation");
+
+    // Partial prefill GPU capture must refuse ring write
+    ok &= expect(speculative.find("refusing partial ring write") != std::string::npos,
+        "flush_prefill must refuse partial GPU capture instead of clamping");
+
+    // Prefill flush log must show capture_source and ring_dst
+    ok &= expect(speculative.find("capture_source=") != std::string::npos,
+        "prefill flush log must show capture_source");
+    ok &= expect(speculative.find("ring_dst=") != std::string::npos,
+        "prefill flush log must show ring_dst");
+
+    // Multi-slot DFlash drafter must handle GPU per-seq cross data
+    ok &= expect(dflash_draft.find("slot_info[s].gpu") != std::string::npos,
+        "multi-slot dflash input must read v_embd_gpu from per-seq cross data");
+    ok &= expect(dflash_draft.find("fn_set_tensor_d2d") != std::string::npos
+                  && dflash_draft.find("gpu_src") != std::string::npos,
+        "multi-slot dflash input must use D2D path for GPU cross data");
+
+    // Invalid mask token must fail at DFlash startup
+    ok &= expect(speculative.find("mask_token_id must match target vocab mask token") != std::string::npos,
+        "DFlash constructor must validate mask_token_id against target vocab mask");
+
+    // CPU ring validity must gate ring state saving
+    ok &= expect(speculative.find("cpu_ring_valid") != std::string::npos,
+        "ring state must track cpu_ring_valid to prevent saving stale GPU-only prefill data");
+
+    // Prefill capture complete guard (test helper)
+    ok &= expect(common_dflash_prefill_capture_complete_for_test(287, 287),
+        "capture complete: captured==requested must be complete");
+    ok &= expect(!common_dflash_prefill_capture_complete_for_test(286, 287),
+        "capture incomplete: captured<requested must not be complete");
+    ok &= expect(common_dflash_prefill_capture_complete_for_test(0, 0),
+        "capture complete: zero requested must be complete");
+
+    // Mismatch in server must disable DFlash drafting
+    ok &= expect(server_context.find("common_speculative_set_prefill_capture_enabled(pf.spec, false)") != std::string::npos,
+        "prefill flush mismatch must disable DFlash capture for the affected slot");
 
     return ok ? 0 : 1;
 }
