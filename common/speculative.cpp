@@ -309,7 +309,8 @@ struct common_speculative_state {
     // lose hidden state context between sub-batches.
     // src_offset and n_tokens: which contiguous span of the capture buffer
     // to write.  When n_tokens=0, write the entire capture buffer (legacy).
-    virtual void flush_prefill(int src_offset = 0, int n_tokens = 0) {}
+    // Returns the number of tokens actually written to the ring.
+    virtual int flush_prefill(int src_offset = 0, int n_tokens = 0) { return 0; }
 
     // Enable/disable target hidden capture during prefill.
     // No-op in base class. DFlash overrides to toggle llama_set_dflash_capture.
@@ -1885,13 +1886,21 @@ struct common_speculative_state_dflash : public common_speculative_state {
     // called after initial prefill — extract hidden states from target
     void begin(const llama_tokens & prompt) override {
         GGML_UNUSED(prompt);
+
+        // Invariant: if suffix prefill was seen but the ring was never flushed,
+        // the drafter will start with insufficient cross-context data.
+        if (prefill_suffix_seen && !prefill_flushed) {
+            LOG_ERR("dflash: prefill suffix was seen but flush_prefill() was never called (ring_filled=%d committed_len=%d)\n",
+                ring_filled, committed_len);
+        }
+        if (prefill_suffix_seen && ring_filled <= 0) {
+            LOG_ERR("dflash: prefill suffix was captured but ring is empty (ring_filled=%d committed_len=%d)\n",
+                ring_filled, committed_len);
+        }
+
         if (prefill_flushed) {
             // ring was already populated incrementally by flush_prefill() calls
             // during checkpoint-split prefill — nothing to do
-            if (prefill_suffix_seen && ring_filled <= 0) {
-                LOG_ERR("dflash: prefill suffix was captured but ring is empty (ring_filled=%d committed_len=%d)\n",
-                    ring_filled, committed_len);
-            }
             prefill_flushed = false;
             prefill_suffix_seen = false;
             return;
@@ -1902,7 +1911,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
         capture_target_hiddens();
     }
 
-    void flush_prefill(int src_offset = 0, int n_tokens = 0) override {
+    int flush_prefill(int src_offset = 0, int n_tokens = 0) override {
         llama_dflash_set_active_slot(ctx_tgt, seq_id);
 
         if (!validate_target_hiddens("flush_prefill")) {
@@ -1910,7 +1919,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
         }
 
         int32_t n_slots = llama_get_n_layer_hiddens(ctx_tgt);
-        if (n_slots == 0) return;
+        if (n_slots == 0) return 0;
 
         // Determine capture source: CPU callback or GPU prefill staging.
         const bool use_prefill_gpu = llama_dflash_prefill_gpu_active(ctx_tgt);
@@ -1932,7 +1941,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
                     source == dflash_capture_source::prefill_gpu_hidden ? "prefill_gpu" : "cpu",
                     n_tokens, src_offset);
             }
-            return;
+            return 0;
         }
 
         // When n_tokens=0, flush the entire capture buffer (legacy path).
@@ -1945,7 +1954,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
         if (offset + to_write > (int)captured) {
             to_write = std::max(0, (int)captured - offset);
         }
-        if (to_write <= 0) return;
+        if (to_write <= 0) return 0;
 
         if (profile) {
             LOG_INF("dflash prefill flush: source=%s captured=%lld src_offset=%d n_tokens=%d to_write=%d prefill_flushed=%d ring_write_pos=%d ring_filled=%d committed_len=%d gpu=%d\n",
@@ -1966,6 +1975,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
         committed_len += actual_written;
         update_drafter_kv_cache(actual_written);
         prefill_flushed = true;
+        return actual_written;
     }
 
     // Ring state serialization for checkpoint persistence.
@@ -3367,13 +3377,15 @@ void common_speculative_update_logits_by_indices(common_speculative * spec, llam
     }
 }
 
-void common_speculative_flush_prefill(common_speculative * spec, int src_offset, int n_tokens) {
+int common_speculative_flush_prefill(common_speculative * spec, int src_offset, int n_tokens) {
     if (spec == nullptr) {
-        return;
+        return 0;
     }
+    int total_written = 0;
     for (auto & impl : spec->impls) {
-        impl->flush_prefill(src_offset, n_tokens);
+        total_written += impl->flush_prefill(src_offset, n_tokens);
     }
+    return total_written;
 }
 
 void common_speculative_set_prefill_capture_enabled(common_speculative * spec, bool enabled) {

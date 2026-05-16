@@ -114,7 +114,8 @@ void common_speculative_update_logits_by_indices(common_speculative * spec, llam
 // src_offset and n_tokens specify which contiguous span of the captured
 // hidden buffer to write into the ring (from the prefill span calculation).
 // Pass src_offset=0, n_tokens=0 for the default (write entire buffer).
-void common_speculative_flush_prefill(common_speculative * spec, int src_offset = 0, int n_tokens = 0);
+// Returns the number of tokens actually written to the ring.
+int common_speculative_flush_prefill(common_speculative * spec, int src_offset = 0, int n_tokens = 0);
 
 // Enable/disable target hidden capture for DFlash prefill.
 // No-op for non-DFlash speculative implementations.

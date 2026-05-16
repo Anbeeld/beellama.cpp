@@ -4317,6 +4317,15 @@ private:
             // must stay enabled so accepted tokens can update the ring.
             bool dflash_capture_needed_for_view = false;
 
+            // Persist pre-decode flush decisions so we can flush after decode
+            // even if the slot transitions out of PROCESSING_PROMPT state.
+            struct pending_dflash_prefill_flush {
+                common_speculative * spec;
+                int slot_id;
+                common_dflash_prefill_span span;
+            };
+            std::vector<pending_dflash_prefill_flush> pending_prefill_flushes;
+
             if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
                 for (auto & slot : slots) {
                     if (!slot.can_speculate() || !slot.spec) {
@@ -4342,16 +4351,28 @@ private:
                         break;
                     }
 
-                    if ((slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) &&
-                            should_flush_dflash_prefill(slot, batch_view, true).should_flush) {
-                        dflash_capture_needed_for_view = true;
-                        break;
+                    if ((slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT)) {
+                        auto span = should_flush_dflash_prefill(slot, batch_view, true);
+                        if (span.should_flush) {
+                            dflash_capture_needed_for_view = true;
+                            // Store the flush decision so we can execute it after
+                            // decode regardless of slot state transitions.
+                            pending_prefill_flushes.push_back({ slot.spec.get(), slot.id, span });
+                        }
                     }
                 }
 
                 for (auto & slot : slots) {
                     if (slot.can_speculate() && slot.spec) {
                         common_speculative_set_prefill_capture_enabled(slot.spec.get(), dflash_capture_needed_for_view);
+                    }
+                }
+
+                // Log scheduled flushes for this view
+                for (auto & pf : pending_prefill_flushes) {
+                    if (dflash_server_profile_enabled()) {
+                        SRV_INF("dflash prefill schedule: slot=%d src_offset=%d n_tokens=%d\n",
+                                pf.slot_id, pf.span.src_offset, pf.span.n_tokens);
                     }
                 }
 
@@ -4435,21 +4456,15 @@ private:
             // DFlash: flush captured hidden states into the ring buffer before
             // the next llama_decode resets the capture buffer.
             //
-            // For DFlash, do not maintain the ring for the entire prompt prefill.
-            // The drafter only consumes the last --spec-dflash-cross-ctx target
-            // hidden states before generation. Earlier prompt chunks are overwritten
-            // before the first draft and only add PP overhead.
-            //
-            // Compute the exact suffix span [capture_from, prompt_total) and pass
-            // only the useful tokens to flush_prefill. This avoids overcapture:
-            // tokens before capture_from in the sub-batch are skipped via src_offset.
-            for (auto & slot : slots) {
-                if ((slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) &&
-                        slot.can_speculate()) {
-                    auto span = should_flush_dflash_prefill(slot, batch_view, false);
-                    if (span.should_flush) {
-                        common_speculative_flush_prefill(slot.spec.get(), span.src_offset, span.n_tokens);
-                    }
+            // Use the pre-decode stored flush decisions rather than re-checking
+            // slot state. After decode, the slot may have transitioned from
+            // PROCESSING_PROMPT to GENERATING, but the capture data was produced
+            // during this decode and must be flushed now.
+            for (auto & pf : pending_prefill_flushes) {
+                int written = common_speculative_flush_prefill(pf.spec, pf.span.src_offset, pf.span.n_tokens);
+                if (written != pf.span.n_tokens) {
+                    SRV_ERR("dflash prefill flush mismatch: slot=%d requested=%d written=%d src_offset=%d\n",
+                            pf.slot_id, pf.span.n_tokens, written, pf.span.src_offset);
                 }
             }
 
