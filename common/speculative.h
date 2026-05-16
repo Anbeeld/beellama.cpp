@@ -20,8 +20,12 @@ struct common_dflash_ring_write {
 // When should_flush is false, no capture is needed for this sub-batch.
 struct common_dflash_prefill_span {
     bool should_flush = false;
-    int  src_offset   = 0;   // first token offset in the capture buffer
-    int  n_tokens     = 0;   // number of tokens to flush from that offset
+
+    int32_t capture_begin = 0;
+    int32_t capture_end   = 0;
+
+    int  src_offset   = 0;
+    int  n_tokens     = 0;
 };
 
 common_dflash_ring_write common_dflash_ring_write_plan(int ring_size, int ring_pos, int n_tokens);

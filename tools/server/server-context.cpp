@@ -4270,13 +4270,15 @@ private:
 
             common_dflash_prefill_span span;
             span.should_flush = true;
+            span.capture_begin = capture_from;
+            span.capture_end   = prompt_total;
             span.src_offset   = src_offset;
             span.n_tokens     = n_tokens;
 
             if (log_decision && dflash_server_profile_enabled()) {
                 SLT_INF(slot,
-                        "dflash prefill: suffix flush, batch_pos=[%d,%d], batch_end=%d, prompt_total=%d, cross_ctx=%d, capture_from=%d, src_offset=%d, n_tokens=%d\n",
-                        (int) batch_pos_min, (int) batch_pos_max, batch_end, prompt_total, cross_ctx, capture_from, span.src_offset, span.n_tokens);
+                        "dflash prefill: suffix flush, batch_pos=[%d,%d], batch_end=%d, prompt_total=%d, cross_ctx=%d, capture_from=%d, capture_begin=%d, capture_end=%d, src_offset=%d, n_tokens=%d\n",
+                        (int) batch_pos_min, (int) batch_pos_max, batch_end, prompt_total, cross_ctx, capture_from, span.capture_begin, span.capture_end, span.src_offset, span.n_tokens);
             }
 
             return span;
@@ -4358,6 +4360,10 @@ private:
                             // Store the flush decision so we can execute it after
                             // decode regardless of slot state transitions.
                             pending_prefill_flushes.push_back({ slot.spec.get(), slot.id, span });
+
+                            // Tell llama_context that the upcoming decode must accumulate
+                            // exactly this useful suffix window into prefill GPU staging.
+                            llama_dflash_prefill_capture_begin(ctx, slot.id, span.capture_begin, span.capture_end);
                         }
                     }
                 }
@@ -4371,8 +4377,8 @@ private:
                 // Log scheduled flushes for this view
                 for (auto & pf : pending_prefill_flushes) {
                     if (dflash_server_profile_enabled()) {
-                        SRV_INF("dflash prefill schedule: slot=%d src_offset=%d n_tokens=%d\n",
-                                pf.slot_id, pf.span.src_offset, pf.span.n_tokens);
+                        SRV_INF("dflash prefill schedule: slot=%d capture_begin=%d capture_end=%d src_offset=%d n_tokens=%d\n",
+                                pf.slot_id, pf.span.capture_begin, pf.span.capture_end, pf.span.src_offset, pf.span.n_tokens);
                     }
                 }
 
@@ -4399,6 +4405,11 @@ private:
             metrics.on_decoded(slots);
 
             if (ret != 0) {
+                // End prefill capture plan on decode failure.
+                if (!pending_prefill_flushes.empty()) {
+                    llama_dflash_prefill_capture_end(ctx);
+                }
+
                 {
                     std::string err;
 
@@ -4461,11 +4472,21 @@ private:
             // PROCESSING_PROMPT to GENERATING, but the capture data was produced
             // during this decode and must be flushed now.
             for (auto & pf : pending_prefill_flushes) {
-                int written = common_speculative_flush_prefill(pf.spec, pf.span.src_offset, pf.span.n_tokens);
+                // For GPU prefill staging, the staging buffer is window-relative
+                // (accumulated from offset 0), so flush with src_offset=0.
+                int src_offset_for_flush = 0;
+                (void)src_offset_for_flush;
+
+                int written = common_speculative_flush_prefill(pf.spec, 0, pf.span.n_tokens);
                 if (written != pf.span.n_tokens) {
-                    SRV_ERR("dflash prefill flush mismatch: slot=%d requested=%d written=%d src_offset=%d\n",
-                            pf.slot_id, pf.span.n_tokens, written, pf.span.src_offset);
+                    SRV_ERR("dflash prefill flush mismatch: slot=%d requested=%d written=%d src_offset=0\n",
+                            pf.slot_id, pf.span.n_tokens, written);
                 }
+            }
+
+            // End prefill capture plan after flush.
+            if (!pending_prefill_flushes.empty()) {
+                llama_dflash_prefill_capture_end(ctx);
             }
 
             // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too

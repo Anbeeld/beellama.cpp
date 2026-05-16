@@ -1913,6 +1913,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
             prefill_flush_requested = 0;
             prefill_flush_written = 0;
             prefill_suffix_seen = false;
+            llama_dflash_prefill_capture_end(ctx_tgt);
             return;
         }
         if (!validate_target_hiddens("begin")) {
@@ -1943,11 +1944,30 @@ struct common_speculative_state_dflash : public common_speculative_state {
         dflash_capture_source source;
         int64_t captured = 0;
         int32_t n_src_layers = 0;
+        int offset = 0;
 
         if (use_prefill_gpu) {
             source = dflash_capture_source::prefill_gpu_hidden;
-            captured = llama_dflash_prefill_gpu_n_tokens(ctx_tgt, seq_id);
             n_src_layers = n_target_layers;
+
+            // For GPU prefill staging, the buffer is window-relative:
+            // tokens were accumulated starting at offset 0 in the staging buffer.
+            // Use capture plan info for the accumulated count.
+            int32_t planned = 0;
+            int32_t written = 0;
+            if (llama_dflash_prefill_capture_info(ctx_tgt, seq_id, &planned, &written)) {
+                captured = written;
+            } else {
+                captured = llama_dflash_prefill_gpu_n_tokens(ctx_tgt, seq_id);
+            }
+
+            // GPU staging flush is window-relative — always flush from offset 0.
+            offset = 0;
+
+            if (n_tokens > 0 && captured < n_tokens) {
+                LOG_WRN("dflash prefill flush incomplete GPU capture: captured=%lld requested=%d seq=%d\n",
+                    (long long) captured, n_tokens, seq_id);
+            }
         } else {
             source = dflash_capture_source::cpu_hidden;
             n_src_layers = llama_get_n_layer_hiddens(ctx_tgt);
@@ -1958,6 +1978,10 @@ struct common_speculative_state_dflash : public common_speculative_state {
                 return 0;
             }
             captured = llama_get_layer_hidden_n_tokens(ctx_tgt, 0);
+
+            // CPU hidden path uses the original src_offset which is
+            // outer-batch-relative into the CPU hidden buffer.
+            offset = n_tokens > 0 ? src_offset : 0;
         }
 
         if (captured <= 0) {
@@ -1970,9 +1994,8 @@ struct common_speculative_state_dflash : public common_speculative_state {
         }
 
         // When n_tokens=0, flush the entire capture buffer (legacy path).
-        // When n_tokens>0, flush only the span [src_offset, src_offset+n_tokens).
+        // When n_tokens>0, flush only the span [offset, offset+n_tokens).
         int to_write = n_tokens > 0 ? n_tokens : (int)captured;
-        int offset    = n_tokens > 0 ? src_offset : 0;
 
         // Clamp to available captured tokens.
         if (offset < 0) offset = 0;
@@ -1989,7 +2012,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
         }
 
         if (profile) {
-            LOG_INF("dflash prefill flush: source=%s captured=%lld src_offset=%d n_tokens=%d to_write=%d n_src_layers=%d prefill_flushed=%d ring_write_pos=%d ring_filled=%d committed_len=%d gpu=%d\n",
+            LOG_INF("dflash prefill flush: source=%s captured=%lld offset=%d n_tokens=%d to_write=%d n_src_layers=%d prefill_flushed=%d ring_write_pos=%d ring_filled=%d committed_len=%d gpu=%d\n",
                 source == dflash_capture_source::prefill_gpu_hidden ? "prefill_gpu" : "cpu",
                 (long long)captured, offset, n_tokens, to_write, n_src_layers, (int)prefill_flushed, ring_write_pos, ring_filled, committed_len,
                 gpu_ring_handle ? 1 : 0);
