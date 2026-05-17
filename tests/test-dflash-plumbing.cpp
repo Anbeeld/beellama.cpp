@@ -452,6 +452,12 @@ int main(int argc, char ** argv) {
         "flat DFlash verifier must cap draft max to the drafter's effective block_size-1 horizon");
     ok &= expect(server_context.find("n_draft_max = dflash_flat_effective_draft_max(ctx_dft_shared.get(), n_draft_max)") != std::string::npos,
         "server must avoid padding flat DFlash verifier batches to unreachable draft rows");
+    ok &= expect(dflash_draft.find("skip_target_hidden_upload") != std::string::npos &&
+                 dflash_draft.find("use_kv_cache && dflash_kv_cache_mode_env() == DFLASH_KV_CACHE_BOTH") != std::string::npos,
+        "DFlash drafter must skip unused cross-hidden uploads when the full K/V projection cache is active");
+    ok &= expect(speculative.find("if (common_dflash_debug_logs_enabled())") != std::string::npos &&
+                 speculative.find("DFLASH_DBG append_target_hiddens") != std::string::npos,
+        "DFlash append-target diagnostics must stay behind the debug logging gate");
     ok &= expect(server_context.find("shrunk recurrent state to %d cells before draft load") != std::string::npos, "server must shrink recurrent backup cells before draft model load");
     ok &= expect(server_context.find("expanded recurrent state to %d cells before speculative GPU buffers") != std::string::npos, "server must expand recurrent backup cells before DFlash slot/GPU buffer init");
     ok &= expect(llama_h.find("llama_context_recurrent_expand") != std::string::npos, "public API must expose context-level recurrent expansion with graph invalidation");

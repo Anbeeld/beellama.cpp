@@ -267,7 +267,12 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
         const int64_t n_copy  = std::min(src_real, ctx_len);
         const int64_t win_off = (src_real > ctx_len) ? (src_real - ctx_len) : 0;
 
-        if (target_hidden && target_hidden->buffer && target_hidden->data && (src_data || src_gpu) && n_copy > 0) {
+        const bool skip_target_hidden_upload =
+            use_kv_cache && dflash_kv_cache_mode_env() == DFLASH_KV_CACHE_BOTH;
+
+        if (!skip_target_hidden_upload &&
+                target_hidden && target_hidden->buffer && target_hidden->data &&
+                (src_data || src_gpu) && n_copy > 0) {
             const int64_t n_feat = cross ? cross->n_embd : 0;
             const size_t tensor_bytes = ggml_nbytes(target_hidden);
 
@@ -297,7 +302,7 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
                     ggml_backend_tensor_memset(target_hidden, 0, copy_bytes, tensor_bytes - copy_bytes);
                 }
             }
-        } else if (target_hidden && target_hidden->buffer && target_hidden->data) {
+        } else if (!skip_target_hidden_upload && target_hidden && target_hidden->buffer && target_hidden->data) {
             ggml_backend_tensor_memset(target_hidden, 0, 0, ggml_nbytes(target_hidden));
         }
 
