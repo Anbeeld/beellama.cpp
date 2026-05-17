@@ -427,6 +427,14 @@ int main(int argc, char ** argv) {
     ok &= expect(sampling_cpp.find("common_reasoning_budget_get_state(gsmpl->rbudget) != REASONING_BUDGET_FORCING") != std::string::npos, "reduced verifier must allow passthrough reasoning-budget tracking");
     ok &= expect(sampling_cpp.find("llama_sampler_apply(gsmpl->rbudget, &gsmpl->cur_p)") != std::string::npos, "reduced verifier must preserve reasoning-budget sampler state");
     ok &= expect(server_context.find("dflash_select_reduced_verify_plan") != std::string::npos, "server must explicitly choose reduced verifier eligibility");
+    ok &= expect(server_context.find("dflash_reduced_sampler_chain_supported") != std::string::npos &&
+                 server_context.find("sampler-order") != std::string::npos,
+        "server reduced verifier eligibility must reject sampler chains that can select outside compact candidates");
+    ok &= expect(server_context.find("dflash_select_batch_reduced_verify_plan") != std::string::npos &&
+                 server_context.find("slot.task->params.sampling") != std::string::npos,
+        "server reduced verifier eligibility must use the active slot/request sampling params");
+    ok &= expect(server_context.find("top-k-mismatch") != std::string::npos,
+        "batched reduced verifier must reject mixed top-K requirements under one target graph");
     ok &= expect(server_context.find("common_sampler_blocks_speculative(slot.smpl.get())") != std::string::npos, "DFlash server path must skip drafting when grammar/reasoning guard requires full sampling");
     ok &= expect(server_context.find("common_sampler_blocks_speculative(smpl)") != std::string::npos, "DFlash rejection sampling must stop at grammar/reasoning boundaries");
     ok &= expect(server_context.find("speculative_flat_result_has_bonus") != std::string::npos, "server must distinguish grammar-boundary stops from bonus-token accepts");

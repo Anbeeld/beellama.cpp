@@ -272,6 +272,81 @@ struct dflash_reduced_verify_plan {
     const char * reason = "disabled";
 };
 
+static bool dflash_reduced_sampler_chain_supported(
+        const common_params_sampling & sampling,
+        bool                           stochastic,
+        const char                  ** reason) {
+    auto reject = [&](const char * why) {
+        if (reason) {
+            *reason = why;
+        }
+        return false;
+    };
+
+    bool saw_top_k = false;
+    for (const auto sampler : sampling.samplers) {
+        switch (sampler) {
+            case COMMON_SAMPLER_TYPE_NONE:
+                break;
+            case COMMON_SAMPLER_TYPE_PENALTIES:
+                if (!(sampling.penalty_repeat == 1.0f && sampling.penalty_freq == 0.0f && sampling.penalty_present == 0.0f)) {
+                    return reject("penalties");
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_DRY:
+                if (sampling.dry_multiplier != 0.0f && sampling.dry_penalty_last_n != 0) {
+                    return reject("dry");
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+                if (sampling.top_n_sigma >= 0.0f) {
+                    return reject("top-n-sigma");
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TOP_K:
+                saw_top_k = true;
+                break;
+            case COMMON_SAMPLER_TYPE_TYPICAL_P:
+                if (sampling.typ_p < 1.0f) {
+                    if (!stochastic) {
+                        return reject("typical");
+                    }
+                    if (!saw_top_k) {
+                        return reject("sampler-order");
+                    }
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TOP_P:
+                if (stochastic && sampling.top_p < 1.0f && !saw_top_k) {
+                    return reject("sampler-order");
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_MIN_P:
+                if (stochastic && sampling.min_p > 0.0f && !saw_top_k) {
+                    return reject("sampler-order");
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_XTC:
+                if (sampling.xtc_probability > 0.0f) {
+                    return reject("xtc");
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TEMPERATURE:
+                break;
+            case COMMON_SAMPLER_TYPE_INFILL:
+                return reject("infill");
+            case COMMON_SAMPLER_TYPE_ADAPTIVE_P:
+                return reject("adaptive");
+        }
+    }
+
+    if (stochastic && !saw_top_k) {
+        return reject("top-k-sampler");
+    }
+
+    return true;
+}
+
 static dflash_reduced_verify_plan dflash_select_reduced_verify_plan(
         const common_params_sampling    & sampling,
         const common_params_speculative & speculative,
@@ -333,6 +408,13 @@ static dflash_reduced_verify_plan dflash_select_reduced_verify_plan(
     }
     if (speculative.type != COMMON_SPECULATIVE_TYPE_DFLASH) {
         plan.reason = "not-dflash";
+        return plan;
+    }
+
+    const bool stochastic = sampling.temp > 0.0f;
+    const char * sampler_reason = nullptr;
+    if (!dflash_reduced_sampler_chain_supported(sampling, stochastic, &sampler_reason)) {
+        plan.reason = sampler_reason;
         return plan;
     }
 
@@ -1112,6 +1194,10 @@ struct server_slot : server_adaptive_dm_state {
 
 static bool dflash_batch_view_is_reduced_verify(
         const std::vector<server_slot> & slots,
+        const common_params_sampling   & fallback_sampling,
+        const common_params_speculative & speculative,
+        bool                             use_rejection,
+        bool                             has_tree,
         int32_t                          view_start,
         int32_t                          view_n_tokens,
         int                              top_k,
@@ -1139,6 +1225,15 @@ static bool dflash_batch_view_is_reduced_verify(
         // source of truth for whether reduced verifier candidates are safe.
         if (!common_sampler_supports_reduced(slot.smpl.get())) {
             return reject("sampler");
+        }
+        const common_params_sampling & slot_sampling = slot.task ? slot.task->params.sampling : fallback_sampling;
+        const dflash_reduced_verify_plan slot_plan =
+            dflash_select_reduced_verify_plan(slot_sampling, speculative, use_rejection, has_tree);
+        if (!slot_plan.enabled) {
+            return reject(slot_plan.reason);
+        }
+        if (slot_plan.top_k != top_k) {
+            return reject("top-k-mismatch");
         }
         if (slot.spec_i_batch.size() != slot.spec_draft.size() + 1) {
             return reject("spec-index-count");
@@ -1180,6 +1275,48 @@ static bool dflash_batch_view_is_reduced_verify(
         *reason = "eligible";
     }
     return true;
+}
+
+static dflash_reduced_verify_plan dflash_select_batch_reduced_verify_plan(
+        const std::vector<server_slot> & slots,
+        const common_params_sampling   & fallback_sampling,
+        const common_params_speculative & speculative,
+        bool                             use_rejection,
+        bool                             has_tree) {
+    dflash_reduced_verify_plan selected;
+    bool found = false;
+
+    for (const auto & slot : slots) {
+        if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() || slot.has_draft_tree || slot.spec_draft.empty()) {
+            continue;
+        }
+
+        const common_params_sampling & slot_sampling = slot.task ? slot.task->params.sampling : fallback_sampling;
+        const dflash_reduced_verify_plan slot_plan =
+            dflash_select_reduced_verify_plan(slot_sampling, speculative, use_rejection, has_tree);
+
+        if (!slot_plan.enabled) {
+            continue;
+        }
+
+        if (!found) {
+            selected = slot_plan;
+            found = true;
+            continue;
+        }
+
+        if (slot_plan.top_k != selected.top_k) {
+            selected.enabled = false;
+            selected.reason = "top-k-mismatch";
+            return selected;
+        }
+    }
+
+    if (!found) {
+        selected.reason = "no-eligible-slot";
+    }
+
+    return selected;
 }
 
 static int dflash_flat_effective_draft_max(llama_context * ctx_dft, int n_draft_max) {
@@ -3532,12 +3669,14 @@ private:
                         slot.prompt.tokens.push_back(draft[i]);
                     }
                     const int active_verify_draft_max = n_draft_max;
+                    const common_params_sampling & slot_sampling =
+                        slot.task ? slot.task->params.sampling : params_base.sampling;
                     if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH &&
                             params_base.speculative.branch_budget == 0 &&
                             !use_rejection_sampling &&
                             draft.size() < (size_t) active_verify_draft_max &&
                             common_sampler_supports_reduced(slot.smpl.get()) &&
-                            dflash_select_reduced_verify_plan(params_base.sampling, params_base.speculative,
+                            dflash_select_reduced_verify_plan(slot_sampling, params_base.speculative,
                                     use_rejection_sampling, false).enabled) {
                         const int max_pad_draft = std::min<int>(active_verify_draft_max,
                                 std::min<int>((int) llama_n_batch(ctx) - 1, (int) llama_n_ubatch(ctx) - 1));
@@ -4188,7 +4327,7 @@ private:
         }
 
         const dflash_reduced_verify_plan dflash_verify_plan =
-            dflash_select_reduced_verify_plan(params_base.sampling, params_base.speculative,
+            dflash_select_batch_reduced_verify_plan(slots, params_base.sampling, params_base.speculative,
                     use_rejection_sampling, ddtree_batch_active);
         bool dflash_reduced_verify_ready = false;
         int  dflash_reduced_verify_top_k = dflash_verify_plan.top_k;
@@ -4199,7 +4338,8 @@ private:
             for (int32_t j = 0; j < batch.n_tokens; j += std::min(n_batch, batch.n_tokens - j)) {
                 const int32_t n_tokens_probe = std::min(n_batch, batch.n_tokens - j);
                 const char * dflash_reduce_reason_probe = dflash_verify_plan.reason;
-                if (dflash_batch_view_is_reduced_verify(slots, j, n_tokens_probe,
+                if (dflash_batch_view_is_reduced_verify(slots, params_base.sampling, params_base.speculative,
+                            use_rejection_sampling, ddtree_batch_active, j, n_tokens_probe,
                             dflash_verify_plan.top_k, &dflash_reduce_reason_probe)) {
                     dflash_verify_graph_enabled = true;
                     break;
@@ -4325,7 +4465,8 @@ private:
             bool dflash_reduce_this_view = false;
             if (dflash_verify_plan.enabled) {
                 dflash_reduce_this_view =
-                    dflash_batch_view_is_reduced_verify(slots, i, n_tokens,
+                    dflash_batch_view_is_reduced_verify(slots, params_base.sampling, params_base.speculative,
+                            use_rejection_sampling, ddtree_batch_active, i, n_tokens,
                             dflash_verify_plan.top_k, &dflash_reduce_reason);
             }
             if (dflash_server_profile_enabled() && params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
