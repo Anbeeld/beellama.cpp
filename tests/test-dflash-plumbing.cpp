@@ -66,6 +66,10 @@ int main(int argc, char ** argv) {
     const std::string cuda_argmax = read_file(root + "/ggml/src/ggml-cuda/argmax.cu");
     const std::string cuda_gdn = read_file(root + "/ggml/src/ggml-cuda/gated_delta_net.cu");
     const std::string cuda_reg = read_file(root + "/ggml/src/ggml-cuda/ggml-cuda.cu");
+    const std::string cuda_fattn = read_file(root + "/ggml/src/ggml-cuda/fattn.cu");
+    const std::string cuda_fattn_vec_q4_0_q4_0 = read_file(root + "/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_0-q4_0.cu");
+    const std::string cuda_fattn_vec_q5_0_q5_1 = read_file(root + "/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q5_0-q5_1.cu");
+    const std::string cuda_template_generator = read_file(root + "/ggml/src/ggml-cuda/template-instances/generate_cu_files.py");
 
     const size_t pretranspose = qwen35moe.find("\"qkv_mixed_pretranspose\"");
     const size_t transpose    = qwen35moe.find("qkv_mixed = ggml_transpose(ctx0, qkv_mixed)");
@@ -88,6 +92,16 @@ int main(int argc, char ** argv) {
     ok &= expect(context_cpp.find("logits_argmax_buf.clear();") != std::string::npos, "decode must clear stale reduced logits ids");
     ok &= expect(context_cpp.find("logits_argmax_prob_buf.clear();") != std::string::npos, "decode must clear stale reduced logits probabilities");
     ok &= expect(context_cpp.find("const int64_t step = 128;") != std::string::npos, "DFlash cross buckets must avoid the 513-to-1024 latency cliff");
+    ok &= expect(cuda_fattn.find("FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)") != std::string::npos,
+        "CUDA FlashAttention must dispatch q4_0/q4_0 D=512 for Gemma4 non-SWA KV cache");
+    ok &= expect(cuda_fattn.find("FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_Q5_0, GGML_TYPE_Q5_1)") != std::string::npos,
+        "CUDA FlashAttention all-quant dispatch must include D=512 q5 K/V cache pairs");
+    ok &= expect(cuda_fattn_vec_q4_0_q4_0.find("DECL_FATTN_VEC_CASE(512, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0);") != std::string::npos,
+        "q4_0/q4_0 FlashAttention template instance must include D=512");
+    ok &= expect(cuda_fattn_vec_q5_0_q5_1.find("DECL_FATTN_VEC_CASE(512, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1);") != std::string::npos,
+        "q5_0/q5_1 FlashAttention template instance must include D=512");
+    ok &= expect(cuda_template_generator.find("DECL_FATTN_VEC_CASE(512, {type_k}, {type_v});") != std::string::npos,
+        "CUDA template generator must preserve D=512 quantized FlashAttention vector instances");
     ok &= expect(dflash_draft.find("bool can_reuse(const llm_graph_params & params) override") != std::string::npos, "DFlash drafter graph input must opt into graph reuse");
     ok &= expect(dflash_draft.find("dflash_draft_ctx_len(params.cross, params.cparams) != ctx_len") != std::string::npos, "DFlash drafter reuse must invalidate on cross bucket shape changes");
     ok &= expect(dflash_draft.find("dflash_kv_cache_ready_for_window(params.cross, ctx_len) != use_kv_cache") != std::string::npos, "DFlash drafter reuse must invalidate when K/V cache topology changes");
