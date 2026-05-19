@@ -51,7 +51,8 @@ const std::map<std::string, enum common_speculative_type> common_speculative_typ
     {"suffix",        COMMON_SPECULATIVE_TYPE_SUFFIX},
     {"copyspec",      COMMON_SPECULATIVE_TYPE_COPYSPEC},
     {"recycle",       COMMON_SPECULATIVE_TYPE_RECYCLE},
-    {"dflash",        COMMON_SPECULATIVE_TYPE_DFLASH}
+    {"dflash",        COMMON_SPECULATIVE_TYPE_DFLASH},
+    {"draft-mtp",    COMMON_SPECULATIVE_TYPE_DRAFT_MTP}
 };
 
 static bool common_dflash_profile_enabled() {
@@ -726,6 +727,155 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
 
     void accept(uint16_t n_accepted) override {
         // noop
+        GGML_UNUSED(n_accepted);
+    }
+
+    int32_t n_max(const common_params_speculative & params) const override {
+        return params.draft.n_max;
+    }
+
+    int32_t n_min(const common_params_speculative & params) const override {
+        return params.draft.n_min;
+    }
+};
+
+// MTP (Multi-Token Prediction) speculative decoding state.
+// After the target model decodes, the pre-norm hidden state is extracted from
+// the embeddings buffer (enabled via llama_set_embeddings_pre_norm) and fed
+// alongside shifted token ids into an MTP context (LLAMA_CONTEXT_TYPE_MTP)
+// which runs a single MTP decoder block and produces logits for the next token.
+struct common_speculative_state_draft_mtp : public common_speculative_state {
+    llama_context * ctx_tgt;
+    llama_context * ctx_mtp; // MTP context (LLAMA_CONTEXT_TYPE_MTP), owned
+
+    common_sampler * smpl;
+
+    llama_batch batch;
+
+    common_speculative_state_draft_mtp(
+            llama_context * ctx_tgt,
+            llama_context * ctx_mtp)
+        : common_speculative_state(COMMON_SPECULATIVE_TYPE_DRAFT_MTP)
+        , ctx_tgt(ctx_tgt)
+        , ctx_mtp(ctx_mtp)
+    {
+        batch = llama_batch_init(llama_n_batch(ctx_mtp), 0, 1);
+        smpl = nullptr;
+
+        {
+            common_params_sampling params;
+            params.no_perf = false;
+            params.top_k = 10;
+            params.samplers = {
+                COMMON_SAMPLER_TYPE_TOP_K,
+            };
+
+            smpl = common_sampler_init(llama_get_model(ctx_mtp), params);
+        }
+
+        // Enable pre-norm hidden state output on the target context
+        llama_set_embeddings(ctx_tgt, true);
+        llama_set_embeddings_pre_norm(ctx_tgt, true);
+    }
+
+    ~common_speculative_state_draft_mtp() override {
+        llama_perf_context_print(ctx_mtp);
+
+        llama_free(ctx_mtp);
+
+        common_sampler_free(smpl);
+
+        llama_batch_free(batch);
+    }
+
+    void begin(const llama_tokens & /*prompt*/) override {
+    }
+
+    void draft(
+            const common_params_speculative & params,
+            const llama_tokens & prompt_tgt,
+            llama_token id_last,
+            llama_tokens & result,
+            std::vector<float> * draft_log_probs = nullptr) override {
+        GGML_UNUSED(prompt_tgt);
+        GGML_UNUSED(draft_log_probs);
+        const auto & sparams = params.draft;
+
+        result.clear();
+        result.reserve(sparams.n_max);
+
+        // Get pre-norm hidden state from target model's last output position
+        const float * h_pre_norm = llama_get_embeddings(ctx_tgt);
+        if (!h_pre_norm) {
+            LOG_WRN("%s: failed to get pre-norm hidden state from target context\n", __func__);
+            return;
+        }
+
+        // Clear MTP KV cache for a fresh single-pass decode
+        llama_memory_clear(llama_get_memory(ctx_mtp), false);
+
+        // The MTP block takes the hidden state + shifted token as input
+        // For the first MTP draft: token = id_last, hidden = target's pre-norm output
+        llama_token cur_token = id_last;
+
+        common_sampler_reset(smpl);
+
+        for (int i = 0; i < sparams.n_max; ++i) {
+            common_batch_clear(batch);
+
+            // Add token + position
+            common_batch_add(batch, cur_token, i, { 0 }, true);
+
+            // Set the hidden state embedding input for the MTP block.
+            // The batch normally carries either tokens or embd, but MTP needs
+            // both: tokens for shifted embedding lookup and embd for hidden state.
+            batch.embd = const_cast<float *>(h_pre_norm);
+
+            int ret = llama_decode(ctx_mtp, batch);
+            if (ret != 0) {
+                LOG_WRN("%s: llama_decode[%d] returned %d\n", __func__, i, ret);
+                break;
+            }
+
+            // Reset embd after decode (don't leave dangling pointer)
+            batch.embd = nullptr;
+
+            common_sampler_sample(smpl, ctx_mtp, 0, true);
+
+            const auto * cur_p = common_sampler_get_candidates(smpl, true);
+
+            for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+                LOG_DBG(" - mtp draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+                        k, i, cur_p->data[k].id, cur_p->data[k].p, common_token_to_piece(ctx_mtp, cur_p->data[k].id).c_str());
+            }
+
+            const llama_token id = cur_p->data[0].id;
+
+            common_sampler_accept(smpl, id, true);
+
+            if (cur_p->data[0].p < sparams.p_min) {
+                break;
+            }
+
+            result.push_back(id);
+
+            if (sparams.n_max <= (int) result.size()) {
+                break;
+            }
+
+            // For multi-step MTP, the next iteration would use the MTP block's
+            // own hidden state output. For now (single MTP block), we stop after
+            // one prediction — multi-step support would carry over t_h_pre_norm.
+            // TODO: multi-step MTP with hidden state carryover
+            break;
+        }
+
+        if (result.size() < (size_t) sparams.n_min) {
+            result.clear();
+        }
+    }
+
+    void accept(uint16_t n_accepted) override {
         GGML_UNUSED(n_accepted);
     }
 
@@ -2475,6 +2625,7 @@ std::string common_speculative_type_to_str(enum common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_COPYSPEC:      return "copyspec";
         case COMMON_SPECULATIVE_TYPE_RECYCLE:       return "recycle";
         case COMMON_SPECULATIVE_TYPE_DFLASH:        return "dflash";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:     return "draft-mtp";
         default:                                    return "unknown";
     }
 }
@@ -2577,6 +2728,7 @@ common_speculative * common_speculative_init(
         bool has_copyspec      = (params.type == COMMON_SPECULATIVE_TYPE_COPYSPEC);
         bool has_recycle       = (params.type == COMMON_SPECULATIVE_TYPE_RECYCLE);
         bool has_dflash        = (params.type == COMMON_SPECULATIVE_TYPE_DFLASH);
+        bool has_draft_mtp     = (params.type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
 
         // DFlash uses --model-draft but is NOT a standard draft model
         if (has_dflash) {
@@ -2628,6 +2780,10 @@ common_speculative * common_speculative_init(
         if (has_dflash) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DFLASH, params));
         }
+        if (has_draft_mtp) {
+            has_draft = false; // MTP uses the same model, no separate draft model
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, params));
+        }
         if (has_draft) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT, params));
         }
@@ -2667,6 +2823,33 @@ common_speculative * common_speculative_init(
                     /* .replacements = */ params.draft.replacements,
                     /* .use_ckpt     = */ use_ckpt
                 ));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
+                // Create an MTP context from the same model as the target
+                const auto * model_tgt = llama_get_model(ctx_tgt);
+
+                llama_context_params mtp_cparams = llama_context_default_params();
+                mtp_cparams.n_ctx       = llama_n_ctx(ctx_tgt);
+                mtp_cparams.n_batch     = llama_n_batch(ctx_tgt);
+                mtp_cparams.n_ubatch    = llama_n_batch(ctx_tgt);
+                mtp_cparams.n_seq_max   = 1;
+                mtp_cparams.ctx_type    = LLAMA_CONTEXT_TYPE_MTP;
+                mtp_cparams.flash_attn_type = params.draft.cparams.flash_attn_type;
+                mtp_cparams.offload_kqv = true;
+
+                llama_context * ctx_mtp = llama_init_from_model(
+                    const_cast<llama_model *>(model_tgt), mtp_cparams);
+
+                if (!ctx_mtp) {
+                    LOG_ERR("%s: failed to create MTP context\n", __func__);
+                    break;
+                }
+
+                impls.push_back(std::make_unique<common_speculative_state_draft_mtp>(
+                    ctx_tgt, ctx_mtp
+                ));
+                LOG_INF("%s: MTP speculative decoding enabled\n", __func__);
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_EAGLE3: {
