@@ -34,6 +34,7 @@ enum llm_graph_type {
     LLM_GRAPH_TYPE_ENCODER,
     LLM_GRAPH_TYPE_DECODER,
     LLM_GRAPH_TYPE_DFLASH_KV_UPDATE,
+    LLM_GRAPH_TYPE_DECODER_MTP,
 };
 
 struct llama_dflash_kv_cache_view {
@@ -738,6 +739,7 @@ public:
     ggml_tensor * t_logits_argmax = nullptr; // [n_tokens] int32, GPU argmax of logits
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
+    ggml_tensor * t_h_pre_norm  = nullptr; // pre-normalization hidden state for MTP
 
     std::vector<ggml_tensor *> dflash_k_update;
     std::vector<ggml_tensor *> dflash_v_update;

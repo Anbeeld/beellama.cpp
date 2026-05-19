@@ -58,6 +58,8 @@ llama_context::llama_context(
     cparams.yarn_beta_fast   = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
     cparams.yarn_beta_slow   = params.yarn_beta_slow   >= 0.0f ? params.yarn_beta_slow   : hparams.yarn_beta_slow;
     cparams.embeddings       = params.embeddings;
+    cparams.embeddings_pre_norm = false;
+    cparams.ctx_type         = params.ctx_type;
     cparams.offload_kqv      = params.offload_kqv;
     cparams.no_perf          = params.no_perf;
     cparams.pooling_type     = params.pooling_type;
@@ -4023,6 +4025,12 @@ void llama_context::set_embeddings(bool value) {
     //sched_need_reserve = true;
 }
 
+void llama_context::set_embeddings_pre_norm(bool value) {
+    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+
+    cparams.embeddings_pre_norm = value;
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -4806,7 +4814,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         ggml_status status;
         const int64_t t_dflash_decode_start_us = dflash_capture && dflash_capture->profile ? ggml_time_us() : 0;
-        const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, mctx.get(), status);
+        const auto gtype = (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) ? LLM_GRAPH_TYPE_DECODER_MTP : LLM_GRAPH_TYPE_DECODER;
+        const auto * res = process_ubatch(ubatch, gtype, mctx.get(), status);
         // DFlash: synchronize backends before ring_write reads GPU-rendered
         // hidden tensors via cudaStreamPerThread (different stream than ggml's
         // private CUDA stream, so no implicit ordering)
@@ -4855,6 +4864,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         auto * t_logits = res->get_logits();
         auto * t_embd   = cparams.embeddings ? res->get_embd() : nullptr;
+
+        // MTP: when pre-norm output is requested, replace t_embd with
+        // the pre-normalization hidden state so llama_get_embeddings()
+        // returns the input that the MTP block needs.
+        if (cparams.embeddings_pre_norm && res->t_h_pre_norm) {
+            t_embd = res->t_h_pre_norm;
+        }
 
         if (t_embd && res->get_embd_pooled()) {
             t_embd = res->get_embd_pooled();
@@ -5299,7 +5315,8 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
-    const auto gparams = graph_params(res, ubatch, mctx, LLM_GRAPH_TYPE_DEFAULT);
+    const auto reserve_gtype = (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) ? LLM_GRAPH_TYPE_DECODER_MTP : LLM_GRAPH_TYPE_DEFAULT;
+    const auto gparams = graph_params(res, ubatch, mctx, reserve_gtype);
 
     res->reset();
 
@@ -6122,6 +6139,7 @@ llama_context_params llama_context_default_params() {
         /*.n_sampler                   =*/ 0,
         /*.dflash_n_slots              =*/ 1,
         /*.dflash_cross_ctx            =*/ 512,
+        /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,
     };
 
     return result;
@@ -6287,6 +6305,10 @@ void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void *
 
 void llama_set_embeddings(llama_context * ctx, bool embeddings) {
     ctx->set_embeddings(embeddings);
+}
+
+void llama_set_embeddings_pre_norm(llama_context * ctx, bool pre_norm) {
+    ctx->set_embeddings_pre_norm(pre_norm);
 }
 
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
