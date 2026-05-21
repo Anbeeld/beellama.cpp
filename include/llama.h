@@ -191,6 +191,14 @@ extern "C" {
 
     LLAMA_API const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_type);
 
+    // Context type — selects the memory layout and graph topology for the context.
+    // MTP contexts use a plain KV cache and the MTP decoder graph instead of the
+    // full hybrid recurrent+attention memory that Qwen3.5 trunk layers need.
+    enum llama_context_type {
+        LLAMA_CONTEXT_TYPE_DEFAULT = 0,
+        LLAMA_CONTEXT_TYPE_MTP     = 1,
+    };
+
     enum llama_split_mode {
         LLAMA_SPLIT_MODE_NONE   = 0, // single GPU
         LLAMA_SPLIT_MODE_LAYER  = 1, // split layers and KV across GPUs
@@ -391,6 +399,11 @@ extern "C" {
         // DFlash drafter: cross-attention window in tokens.
         // How many target hidden states the drafter sees (default: 512).
         int32_t dflash_cross_ctx;
+
+        // Context type — controls memory layout and graph selection.
+        // Set to LLAMA_CONTEXT_TYPE_MTP for MTP draft contexts that only
+        // need a plain KV cache (no recurrent state).
+        enum llama_context_type ctx_type;
     };
 
     struct llama_model_tensor_override {
@@ -564,6 +577,9 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_head     (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head_kv  (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_swa      (const struct llama_model * model);
+
+    // Get the number of nextn (MTP) prediction layers in the model (0 = no MTP support)
+    LLAMA_API int32_t llama_model_n_nextn_predict_layers(const struct llama_model * model);
 
     // Get the model's RoPE frequency scaling factor
     LLAMA_API float llama_model_rope_freq_scale_train(const struct llama_model * model);
@@ -1012,6 +1028,11 @@ extern "C" {
     // Set whether the context outputs embeddings or not
     // TODO: rename to avoid confusion with llama_get_embeddings()
     LLAMA_API void llama_set_embeddings(struct llama_context * ctx, bool embeddings);
+
+    // Set whether to output pre-normalization hidden states instead of post-norm.
+    // Required by MTP speculative decoding: the MTP block consumes the hidden
+    // state before the final output-norm + LM-head, not after.
+    LLAMA_API void llama_set_embeddings_pre_norm(struct llama_context * ctx, bool pre_norm);
 
     // Set whether to use causal attention or not
     // If set to true, the model will only attend to the past tokens

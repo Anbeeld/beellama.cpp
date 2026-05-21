@@ -31,6 +31,7 @@ struct llama_cparams {
     float yarn_beta_slow;
 
     bool embeddings;
+    bool embeddings_pre_norm; // output pre-norm hidden states (for MTP)
     bool causal_attn;
     bool offload_kqv;
     bool flash_attn;
@@ -43,6 +44,8 @@ struct llama_cparams {
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;
+
+    enum llama_context_type ctx_type;
 
     enum llama_pooling_type pooling_type;
 

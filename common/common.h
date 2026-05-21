@@ -168,6 +168,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_COPYSPEC,      // model-free copy-from-context speculative decoding
     COMMON_SPECULATIVE_TYPE_RECYCLE,       // model-free token recycling (adjacency matrix)
     COMMON_SPECULATIVE_TYPE_DFLASH,        // DFlash block-diffusion speculative decoding
+    COMMON_SPECULATIVE_TYPE_DRAFT_MTP,     // MTP (Multi-Token Prediction) speculative decoding
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 

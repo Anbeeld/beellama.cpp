@@ -1604,6 +1604,17 @@ private:
 
         const bool can_spec = (ctx_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO);
 
+        // MTP auto-detection: if the model has nextn_predict_layers and no spec type
+        // was explicitly set, auto-select draft-mtp speculative decoding.
+        if (can_spec &&
+            params_base.speculative.type == COMMON_SPECULATIVE_TYPE_NONE &&
+            params_base.speculative.draft.mparams.path.empty() &&
+            llama_model_n_nextn_predict_layers(model) > 0) {
+            params_base.speculative.type = COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+            SRV_INF("MTP auto-detected: model has %d nextn prediction layer(s) — enabling draft-mtp speculative decoding\n",
+                     llama_model_n_nextn_predict_layers(model));
+        }
+
         // DFlash multi-slot: --spec-dflash-max-slots caps how many server slots keep DFlash state;
         // slots above the cap fall back to non-speculative decode (slot.spec stays null). The
         // matching tape/hidden buffers are allocated after the per-slot init loop (set_dflash_capture

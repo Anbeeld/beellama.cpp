@@ -657,6 +657,14 @@ private:
     const llama_model & model;
 };
 
+struct llm_build_qwen35_mtp : public llm_graph_context {
+    llm_build_qwen35_mtp(const llama_model & model, const llm_graph_params & params);
+};
+
+struct llm_build_qwen35moe_mtp : public llm_graph_context {
+    llm_build_qwen35moe_mtp(const llama_model & model, const llm_graph_params & params);
+};
+
 struct llm_build_qwen : public llm_graph_context {
     llm_build_qwen(const llama_model & model, const llm_graph_params & params);
 };
