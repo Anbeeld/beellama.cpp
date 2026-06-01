@@ -1,0 +1,160 @@
+# .github/workflows/build-cuda-docker.yml
+#
+# Nightly + on-push CUDA server image for beellama.cpp, pushed to this repo's GHCR.
+# Lets dual+/single-GPU testers `docker pull` instead of compiling from source
+# (the main barrier to community multi-GPU reports — see club-3090 disc #288 / issue #39).
+#
+# REQUIRES one Dockerfile change: `.devops/cuda.Dockerfile` must build with
+#   -DGGML_CUDA_FA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON
+# These are NOT on by default and are REQUIRED for the turbo / TCQ KV cache types
+# (turbo2/3/4, turbo2_tcq, turbo3_tcq). Without them the image builds fine but the
+# turbo KV types fail at runtime. See the companion one-line diff in the PR/issue.
+#
+# NOTE: scheduled workflows only run from the DEFAULT branch — keep this file on the
+# default branch for the nightly cron to fire (the checkout below still builds v0.3.0).
+#
+# Arch scope: defaults to the FULL set sm_86;89;120 (RTX 3090/4090/5090) so one image
+# covers every card being tested. Honest caveat: a full multi-arch + FA_ALL_QUANTS build
+# emits a LOT of flash-attn template instances and is heavy on a free GitHub-hosted runner
+# (disk ~14 GB + time). The disk-freeing step helps; if it still OOMs/fills disk/times out,
+# either drop an arch via the workflow_dispatch input (e.g. "86;89") or move to a larger /
+# self-hosted runner (see the `runs-on:` comment below).
+
+name: build-cuda-docker
+
+on:
+  schedule:
+    - cron: '0 4 * * *'          # nightly 04:00 UTC
+  push:
+    branches: [ v0.3.0 ]         # build on every push to the dev branch
+    paths:                       # ...but only when something build-affecting changes
+      - 'ggml/**'
+      - 'src/**'
+      - 'common/**'
+      - 'tools/**'
+      - 'include/**'
+      - '.devops/cuda.Dockerfile'
+      - '.github/workflows/build-cuda-docker.yml'
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch/ref to build'
+        default: 'v0.3.0'
+        required: false
+      cuda_arch:
+        description: 'CUDA arch list (default covers 3090/4090/5090; drop one if a free runner cant fit it)'
+        default: '86;89;120'
+        required: false
+
+# Avoid piling up nightly runs if one is slow.
+concurrency:
+  group: build-cuda-docker-${{ github.event.inputs.branch || 'v0.3.0' }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write              # push to GHCR with the built-in GITHUB_TOKEN
+
+jobs:
+  build:
+    # Default build is full multi-arch 86;89;120 (3090/4090/5090) — heavy. If it times
+    # out or fills disk on this free runner, drop an arch (workflow_dispatch input) or
+    # use a bigger runner, e.g.  runs-on: ubuntu-latest-4-core
+    # or a self-hosted GPU box:  runs-on: [self-hosted, linux, cuda]
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_BASENAME: beellama.cpp
+      TARGET_BRANCH: ${{ github.event.inputs.branch || 'v0.3.0' }}
+      CUDA_ARCH: ${{ github.event.inputs.cuda_arch || '86;89;120' }}
+
+    steps:
+      # CUDA devel base + build artifacts overflow the default ~14 GB free runner.
+      # Reclaim the ~25 GB of preinstalled toolchains we don't need.
+      - name: Maximize build disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune -af || true
+          df -h /
+
+      - name: Checkout ${{ env.TARGET_BRANCH }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0          # need history so the build can derive its version
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve tags & nightly skip-guard
+        id: meta
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"          # GHCR requires lowercase
+          sha="$(git rev-parse --short HEAD)"
+          base="${REGISTRY}/${owner}/${IMAGE_BASENAME}"
+          rolling="${base}:server-cuda-${TARGET_BRANCH}"
+          immutable="${base}:server-cuda-${TARGET_BRANCH}-${sha}"
+          {
+            echo "image=${base}"
+            echo "sha=${sha}"
+            echo "tags=${rolling},${immutable}"
+          } >> "$GITHUB_OUTPUT"
+
+          # Skip-guard: if the NIGHTLY cron fires but v0.3.0 hasn't moved since the
+          # last build, the per-commit image already exists in GHCR — skip the
+          # redundant recompile. `push` (new commit) and `workflow_dispatch` (manual
+          # rebuild — e.g. changed arch / refreshed base image) ALWAYS build.
+          skip=false
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            if docker buildx imagetools inspect "${immutable}" >/dev/null 2>&1; then
+              echo ":zzz: \`${TARGET_BRANCH}\` unchanged since last build (\`${sha}\`) — skipping nightly rebuild." >> "$GITHUB_STEP_SUMMARY"
+              skip=true
+            fi
+          fi
+          echo "skip=${skip}" >> "$GITHUB_OUTPUT"
+          echo "skip=${skip}  (event=${{ github.event_name }}, sha=${sha})"
+
+      - name: Build & push CUDA server image
+        if: steps.meta.outputs.skip != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: .devops/cuda.Dockerfile
+          target: server
+          push: true
+          provenance: false       # plain image, no attestation manifest
+          build-args: |
+            CUDA_DOCKER_ARCH=${{ env.CUDA_ARCH }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            org.opencontainers.image.title=beellama.cpp
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.meta.outputs.sha }}
+            org.opencontainers.image.version=server-cuda-${{ env.TARGET_BRANCH }}-${{ steps.meta.outputs.sha }}
+          # Cache layers between nightly runs so unchanged sources don't recompile.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        if: steps.meta.outputs.skip != 'true'
+        run: |
+          {
+            echo "### beellama.cpp CUDA image pushed :rocket:"
+            echo ""
+            echo "- \`${{ steps.meta.outputs.image }}:server-cuda-${{ env.TARGET_BRANCH }}\`"
+            echo "- \`${{ steps.meta.outputs.image }}:server-cuda-${{ env.TARGET_BRANCH }}-${{ steps.meta.outputs.sha }}\`"
+            echo ""
+            echo "Arches: \`${{ env.CUDA_ARCH }}\` · commit \`${{ steps.meta.outputs.sha }}\`"
+            echo ""
+            echo "Pull:  \`docker pull ${{ steps.meta.outputs.image }}:server-cuda-${{ env.TARGET_BRANCH }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
