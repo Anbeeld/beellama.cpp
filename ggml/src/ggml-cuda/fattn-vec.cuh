@@ -28,7 +28,7 @@ static constexpr __host__ __device__ int ggml_cuda_fattn_vec_get_min_blocks() {
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
 template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
-__launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), ggml_cuda_fattn_vec_get_min_blocks<type_K, type_V>())
+__launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), (ggml_cuda_fattn_vec_get_min_blocks<type_K, type_V>()))
 static __global__ void flash_attn_ext_vec(
         const char * Q_ptr,
         const char * K_ptr,
