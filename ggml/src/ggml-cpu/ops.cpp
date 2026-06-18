@@ -11467,10 +11467,12 @@ void ggml_compute_forward_kvarn_store(const ggml_compute_params * params, ggml_t
         return sg > 1 ? sg : 3;
     }();
     const int tail_groups = stage_groups - 1;
+    assert(stage_groups >= 2 && stage->ne[2] % (128 * stage_groups) == 0);
     const int64_t n_heads = current->ne[1];
     const int64_t n_tokens = current->ne[2];
     const int64_t * idx_data = (const int64_t *) indices->data;
     const int64_t n_stream = stage->ne[2] / (128 * stage_groups);
+    GGML_ASSERT(n_stream > 0 && records->ne[2] % n_stream == 0);
     const int64_t groups_per_stream = records->ne[2] / n_stream;
 
     for (int64_t t = 0; t < n_tokens; ++t) {
@@ -11538,11 +11540,14 @@ void ggml_compute_forward_kvarn_materialize(const ggml_compute_params * params, 
         return sg > 1 ? sg : 3;
     }();
     const int tail_groups = stage_groups - 1;
+    assert(stage_groups >= 2 && stage->ne[2] % (128 * stage_groups) == 0);
     const int64_t n_heads = dst->ne[1];
     const int64_t n_kv = dst->ne[2];
     const int64_t * idx_data = (const int64_t *) indices->data;
     const int64_t n_total_stream = stage->ne[2] / (128 * stage_groups);
     const int64_t groups_per_stream = records->ne[2] / n_total_stream;
+    GGML_ASSERT(n_total_stream > 0 && records->ne[2] % n_total_stream == 0);
+    GGML_ASSERT(stream_start + n_stream <= n_total_stream);
     std::vector<int64_t> live_groups(n_stream, 0);
     for (int64_t i = 0; i < indices->ne[0]; ++i) {
         const int64_t idx = idx_data[i];
@@ -11570,6 +11575,10 @@ void ggml_compute_forward_kvarn_materialize(const ggml_compute_params * params, 
         const int64_t stream = stream_start + out_stream;
         const int64_t live_group = live_groups[out_stream];
         const int64_t cell = w - out_stream * n_kv;
+        // Non-SWA materialize uses the cell index as the absolute position. This
+        // matches the production cache where cells are assigned sequential
+        // positions from 0. SWA ring materialize reads per-cell absolute
+        // positions from the indices tensor (idx < 0 marks empty window cells).
         const int64_t abs_pos = swa ? idx_data[cell] : cell;
         const int64_t group = abs_pos / 128;
         const int64_t pos = abs_pos % 128;

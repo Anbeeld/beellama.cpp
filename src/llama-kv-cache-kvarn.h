@@ -144,7 +144,8 @@ public:
     //   stage_groups = tail_groups + 1
     // The +1 is the permanent sink slot for non-SWA, or the extra ping-pong slot
     // for SWA. KVarN cache state is versioned to carry stage_groups so restore can
-    // remap logical live groups when the configured ubatch changes.
+    // validate the saved layout against the current cache. The W2 gate rejects
+    // any stage_groups mismatch; remap for differing save/restore ubatch is future.
     uint32_t get_stage_groups() const { return stage_groups; }
     uint32_t get_tail_groups()  const { return tail_groups; }
 

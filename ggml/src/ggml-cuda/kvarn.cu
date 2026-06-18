@@ -1910,8 +1910,10 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     GGML_ASSERT(ggml_cuda_kvarn_valid_bits(bits));
     GGML_ASSERT((KVAR_N_TILE_VALUES * bits) % 8 == 0);
     GGML_ASSERT((KVAR_N_DIM * bits) % 8 == 0);
+    GGML_ASSERT(stage_groups >= 2 && stage->ne[2] % (KVAR_N_DIM * stage_groups) == 0);
     const int n_stream = (int) (stage->ne[2] / (KVAR_N_DIM * stage_groups));
     const int groups_per_stream = (int) (records->ne[2] / n_stream);
+    GGML_ASSERT(n_stream > 0 && records->ne[2] % n_stream == 0);
     if (swa) {
         GGML_ASSERT(n_stream == 1 && "SWA KVarN ring requires a single stream");
     }
@@ -2155,8 +2157,11 @@ void ggml_cuda_op_kvarn_materialize(ggml_backend_cuda_context & ctx, ggml_tensor
     GGML_ASSERT(ggml_cuda_kvarn_valid_bits(bits));
     GGML_ASSERT((KVAR_N_TILE_VALUES * bits) % 8 == 0);
     GGML_ASSERT((KVAR_N_DIM * bits) % 8 == 0);
+    GGML_ASSERT(stage_groups >= 2 && stage->ne[2] % (KVAR_N_DIM * stage_groups) == 0);
     const int n_total_stream = (int) (stage->ne[2] / (KVAR_N_DIM * stage_groups));
     const int groups_per_stream = (int) (records->ne[2] / n_total_stream);
+    GGML_ASSERT(n_total_stream > 0 && records->ne[2] % n_total_stream == 0);
+    GGML_ASSERT(stream_start + n_stream <= n_total_stream);
     ggml_cuda_pool_alloc<int> live_groups(ctx.pool(), n_stream);
     cudaStream_t stream = ctx.stream();
 

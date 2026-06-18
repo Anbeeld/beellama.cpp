@@ -20,11 +20,11 @@ namespace {
 constexpr uint32_t KVAR_N_GROUP = 128;
 constexpr uint32_t KVAR_N_STAGE_GROUPS = 3; // legacy default; production caches carry stage_groups in op_params[7]
 constexpr uint32_t KVAR_N_STATE_MAGIC = 0x4e52564b; // "KVRN"
-// Version 5: adds stage_groups to the state header so restore can validate and
-// remap stage slots when the configured physical ubatch differs between save
-// and restore. Version 4 states are still accepted when current stage_groups == 3
-// (byte-compatible three-slot layout); other configurations require a version 5
-// state whose stage_groups matches the current cache or fits within it.
+// Version 5: adds stage_groups to the state header so restore can validate the
+// saved stage layout against the current cache. The initial W2 gate rejects any
+// stage_groups mismatch (including version-4 states restored into a cache whose
+// configured ubatch is not 256) rather than silently corrupting the stage. Stage-
+// slot remap for differing save/restore ubatch settings is future work.
 constexpr uint32_t KVAR_N_STATE_VERSION = 5;
 constexpr uint32_t KVAR_N_STATE_RECORDS_FULL = 0;
 constexpr uint32_t KVAR_N_STATE_STAGE_ONLY_PARTIAL = 1;
@@ -892,9 +892,9 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
     }
     const uint32_t state_kind = partial_state ? KVAR_N_STATE_STAGE_ONLY_PARTIAL : KVAR_N_STATE_RECORDS_FULL;
     io.write(&state_kind, sizeof(state_kind));
-    // Version 5: record the stage depth so the reader can validate that the
-    // saved stage tensor layout matches the current cache, or remap when the
-    // configured ubatch differs between save and restore.
+    // Version 5: record the stage depth so the reader can validate that the saved
+    // stage tensor layout matches the current cache. The W2 gate rejects any
+    // mismatch; remap for differing save/restore ubatch is future work.
     io.write(&stage_groups, sizeof(stage_groups));
 
     // n_groups_used is single-valued across all saved streams. This is correct

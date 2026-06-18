@@ -9165,14 +9165,16 @@ static void ggml_vk_kvarn_store(ggml_backend_vk_context * ctx, vk_context& subct
     const int iterations = ggml_get_op_params_i32(dst, 1);
     const bool value = ggml_get_op_params_i32(dst, 2) != 0;
     const bool swa = ggml_get_op_params_i32(dst, 4) != 0; // KVAR_N_OP_PARAM_STORE_SWA
-    const int stage_groups = [] {
+    const int stage_groups = [dst] {
         const int sg = ggml_get_op_params_i32(dst, 7);
         return sg > 1 ? sg : 3;
     }();
     const int tail_groups = stage_groups - 1;
     GGML_ASSERT(ggml_vk_kvarn_valid_bits(bits));
+    GGML_ASSERT(stage_groups >= 2 && stage->ne[2] % (128 * stage_groups) == 0);
     const int n_stream = (int) (stage->ne[2] / (128 * stage_groups));
     const int groups_per_stream = (int) (records->ne[2] / n_stream);
+    GGML_ASSERT(n_stream > 0 && records->ne[2] % n_stream == 0);
     if (swa) {
         GGML_ASSERT(n_stream == 1 && "SWA KVarN ring requires a single stream");
     }
@@ -9220,14 +9222,17 @@ static void ggml_vk_kvarn_materialize(ggml_backend_vk_context * ctx, vk_context&
     const int n_stream = ggml_get_op_params_i32(dst, 3);
     const bool emit_rotated = ggml_get_op_params_i32(dst, 5) != 0;
     const bool swa = ggml_get_op_params_i32(dst, 6) != 0; // KVAR_N_OP_PARAM_MAT_SWA
-    const int stage_groups = [] {
+    const int stage_groups = [dst] {
         const int sg = ggml_get_op_params_i32(dst, 7);
         return sg > 1 ? sg : 3;
     }();
     const int tail_groups = stage_groups - 1;
     GGML_ASSERT(ggml_vk_kvarn_valid_bits(bits));
+    GGML_ASSERT(stage_groups >= 2 && stage->ne[2] % (128 * stage_groups) == 0);
     const int n_total_stream = (int) (stage->ne[2] / (128 * stage_groups));
     const int groups_per_stream = (int) (records->ne[2] / n_total_stream);
+    GGML_ASSERT(n_total_stream > 0 && records->ne[2] % n_total_stream == 0);
+    GGML_ASSERT(stream_start + n_stream <= n_total_stream);
     if (swa) {
         GGML_ASSERT(n_stream == 1 && "SWA KVarN ring materialize requires a single stream");
     }
