@@ -11250,9 +11250,22 @@ void ggml_compute_forward_turbo_wht(
 
 // ggml_compute_forward_kvarn_store / ggml_compute_forward_kvarn_materialize
 
+static constexpr int KVAR_N_GROUP = 128;
+static constexpr int KVAR_N_OP_PARAM_BITS = 0;
+static constexpr int KVAR_N_OP_PARAM_ITERS = 1;
+static constexpr int KVAR_N_OP_PARAM_MAT_VALUE = 1;
+static constexpr int KVAR_N_OP_PARAM_STORE_VALUE = 2;
+static constexpr int KVAR_N_OP_PARAM_TOKENS_PER_STREAM = 3;
+static constexpr int KVAR_N_OP_PARAM_STORE_SWA = 4;
+static constexpr int KVAR_N_OP_PARAM_MAT_STREAM_START = 2;
+static constexpr int KVAR_N_OP_PARAM_MAT_N_STREAM = 3;
+static constexpr int KVAR_N_OP_PARAM_MAT_EMIT_ROTATED = 5;
+static constexpr int KVAR_N_OP_PARAM_MAT_SWA = 6;
+static constexpr int KVAR_N_OP_PARAM_STAGE_GROUPS = 7;
+
 static void kvarn_cpu_hadamard(float * values) {
-    for (int stride = 1; stride < 128; stride *= 2) {
-        for (int base = 0; base < 128; base += 2 * stride) {
+    for (int stride = 1; stride < KVAR_N_GROUP; stride *= 2) {
+        for (int base = 0; base < KVAR_N_GROUP; base += 2 * stride) {
             for (int i = 0; i < stride; ++i) {
                 const float a = values[base + i];
                 const float b = values[base + stride + i];
@@ -11262,7 +11275,7 @@ static void kvarn_cpu_hadamard(float * values) {
         }
     }
     constexpr float inv_sqrt_128 = 0.08838834764831845f;
-    for (int i = 0; i < 128; ++i) {
+    for (int i = 0; i < KVAR_N_GROUP; ++i) {
         values[i] *= inv_sqrt_128;
     }
 }
@@ -11451,28 +11464,25 @@ void ggml_compute_forward_kvarn_store(const ggml_compute_params * params, ggml_t
     const ggml_tensor * indices = dst->src[1];
     ggml_tensor * stage = dst->src[2];
     ggml_tensor * records = dst->src[3];
-    const int bits = ggml_get_op_params_i32(dst, 0);
-    const int iterations = ggml_get_op_params_i32(dst, 1);
-    const bool value = ggml_get_op_params_i32(dst, 2) != 0;
+    const int bits = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_BITS);
+    const int iterations = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_ITERS);
+    const bool value = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_STORE_VALUE) != 0;
     // SWA sliding-window ring mode: records form a circular buffer of
     // groups_per_stream tiles (single stream); the index carries the absolute
     // token position, there is no permanent group-0 sink, and the fp16 staging
     // is a ping-pong over the most recent tiles.
-    const bool swa = ggml_get_op_params_i32(dst, 4) != 0;
+    const bool swa = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_STORE_SWA) != 0;
     // Dynamic stage depth: op_params[7] carries stage_groups (tail_groups + 1).
-    // Direct op tests that do not set it fall back to the legacy three-slot
-    // stride (stage_groups = 3, tail_groups = 2).
-    const int stage_groups = [dst] {
-        const int sg = ggml_get_op_params_i32(dst, 7);
-        return sg > 1 ? sg : 3;
-    }();
+    const int stage_groups = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_STAGE_GROUPS);
     const int tail_groups = stage_groups - 1;
-    assert(stage_groups >= 2 && stage->ne[2] % (128 * stage_groups) == 0);
+    GGML_ASSERT(stage_groups >= 2);
+    GGML_ASSERT(stage->ne[2] % (KVAR_N_GROUP * stage_groups) == 0);
     const int64_t n_heads = current->ne[1];
     const int64_t n_tokens = current->ne[2];
     const int64_t * idx_data = (const int64_t *) indices->data;
-    const int64_t n_stream = stage->ne[2] / (128 * stage_groups);
-    GGML_ASSERT(n_stream > 0 && records->ne[2] % n_stream == 0);
+    const int64_t n_stream = stage->ne[2] / (KVAR_N_GROUP * stage_groups);
+    GGML_ASSERT(n_stream > 0);
+    GGML_ASSERT(records->ne[2] % n_stream == 0);
     const int64_t groups_per_stream = records->ne[2] / n_stream;
 
     for (int64_t t = 0; t < n_tokens; ++t) {
@@ -11521,32 +11531,30 @@ void ggml_compute_forward_kvarn_materialize(const ggml_compute_params * params, 
     const ggml_tensor * records = dst->src[0];
     const ggml_tensor * stage = dst->src[1];
     const ggml_tensor * indices = dst->src[2];
-    const int bits = ggml_get_op_params_i32(dst, 0);
-    const bool value = ggml_get_op_params_i32(dst, 1) != 0;
-    const int64_t stream_start = ggml_get_op_params_i32(dst, 2);
-    const int64_t n_stream = ggml_get_op_params_i32(dst, 3);
-    const bool emit_rotated = ggml_get_op_params_i32(dst, 5) != 0;
+    const int bits = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_BITS);
+    const bool value = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_MAT_VALUE) != 0;
+    const int64_t stream_start = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_MAT_STREAM_START);
+    const int64_t n_stream = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_MAT_N_STREAM);
+    const bool emit_rotated = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_MAT_EMIT_ROTATED) != 0;
     // SWA sliding-window ring mode (single stream): the indices tensor carries
     // one absolute token position per output cell (idx < 0 marks an empty window
     // cell). Records are a circular buffer (slot = group % groups_per_stream);
     // the newest tail_groups tiles live in the fp16 staging ping-pong; there is
     // no permanent group-0 sink.
-    const bool swa = ggml_get_op_params_i32(dst, 6) != 0;
+    const bool swa = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_MAT_SWA) != 0;
     // Dynamic stage depth: op_params[7] carries stage_groups (tail_groups + 1).
-    // Direct op tests that do not set it fall back to the legacy three-slot
-    // stride (stage_groups = 3, tail_groups = 2).
-    const int stage_groups = [dst] {
-        const int sg = ggml_get_op_params_i32(dst, 7);
-        return sg > 1 ? sg : 3;
-    }();
+    const int stage_groups = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_STAGE_GROUPS);
     const int tail_groups = stage_groups - 1;
-    assert(stage_groups >= 2 && stage->ne[2] % (128 * stage_groups) == 0);
+    GGML_ASSERT(stage_groups >= 2);
+    GGML_ASSERT(stream_start >= 0 && n_stream > 0);
+    GGML_ASSERT(stage->ne[2] % (KVAR_N_GROUP * stage_groups) == 0);
     const int64_t n_heads = dst->ne[1];
     const int64_t n_kv = dst->ne[2];
     const int64_t * idx_data = (const int64_t *) indices->data;
-    const int64_t n_total_stream = stage->ne[2] / (128 * stage_groups);
+    const int64_t n_total_stream = stage->ne[2] / (KVAR_N_GROUP * stage_groups);
+    GGML_ASSERT(n_total_stream > 0);
+    GGML_ASSERT(records->ne[2] % n_total_stream == 0);
     const int64_t groups_per_stream = records->ne[2] / n_total_stream;
-    GGML_ASSERT(n_total_stream > 0 && records->ne[2] % n_total_stream == 0);
     GGML_ASSERT(stream_start + n_stream <= n_total_stream);
     std::vector<int64_t> live_groups(n_stream, 0);
     for (int64_t i = 0; i < indices->ne[0]; ++i) {

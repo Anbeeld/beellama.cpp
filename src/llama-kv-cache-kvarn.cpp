@@ -1113,10 +1113,10 @@ ggml_tensor * llama_kv_cache_kvarn::store(
         value ? layer.v_records : layer.k_records,
         value ? params.value_bits : params.key_bits,
         params.sinkhorn_iters,
-        value);
+        value,
+        int32_t(stage_groups));
     result->op_params[3] = kvarn_contiguous_tokens_per_stream_hint(sinfo);
     result->op_params[4] = swa ? 1 : 0; // SWA sliding-window ring store
-    result->op_params[7] = int32_t(stage_groups); // dynamic stage depth
     return result;
 }
 
@@ -1146,10 +1146,10 @@ ggml_tensor * llama_kv_cache_kvarn::materialize(
         stream_start,
         stream_count,
         value ? params.value_bits : params.key_bits,
-        value);
+        value,
+        int32_t(stage_groups));
     result->op_params[5] = emit_rotated ? 1 : 0;
     result->op_params[6] = swa ? 1 : 0; // SWA sliding-window ring materialize
-    result->op_params[7] = int32_t(stage_groups); // dynamic stage depth
     const uint32_t slices = value ? layer.v_slices : layer.k_slices;
     if (slices > 1) {
         result = ggml_reshape_4d(

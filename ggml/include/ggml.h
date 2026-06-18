@@ -2644,7 +2644,8 @@ extern "C" {
             struct ggml_tensor  * records,
             int                   bits,
             int                   sinkhorn_iters,
-            bool                  value);
+            bool                  value,
+            int                   stage_groups);
 
     GGML_API struct ggml_tensor * ggml_kvarn_materialize(
             struct ggml_context * ctx,
@@ -2655,7 +2656,8 @@ extern "C" {
             int                   stream_start,
             int                   n_stream,
             int                   bits,
-            bool                  value);
+            bool                  value,
+            int                   stage_groups);
 
     // custom operators
 

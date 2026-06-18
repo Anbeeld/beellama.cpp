@@ -345,8 +345,8 @@ static void test_cache_ops(enum ggml_backend_dev_type device_type, bool required
     ggml_tensor * stage = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, n_heads, 384);
     ggml_tensor * records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, record_bytes, n_heads, 4);
 
-    ggml_tensor * stored = ggml_kvarn_store(ctx, current, indices, stage, records, bits, 16, false);
-    ggml_tensor * materialized = ggml_kvarn_materialize(ctx, records, stored, indices, n_tokens, 0, 1, bits, false);
+    ggml_tensor * stored = ggml_kvarn_store(ctx, current, indices, stage, records, bits, 16, false, 3);
+    ggml_tensor * materialized = ggml_kvarn_materialize(ctx, records, stored, indices, n_tokens, 0, 1, bits, false, 3);
     if (device_type == GGML_BACKEND_DEVICE_TYPE_GPU) {
         // Regression guard: materialize live groups are per-execution state and
         // must be derived from the current indices tensor, not frozen op params.
@@ -451,9 +451,9 @@ static void test_cache_ops_multi_stream(enum ggml_backend_dev_type device_type, 
     ggml_tensor * stage = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, n_heads, 384 * n_stream);
     ggml_tensor * records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, record_bytes, n_heads, n_groups_per_stream * n_stream);
 
-    ggml_tensor * stored = ggml_kvarn_store(ctx, current, indices, stage, records, bits, 16, false);
+    ggml_tensor * stored = ggml_kvarn_store(ctx, current, indices, stage, records, bits, 16, false, 3);
     ggml_tensor * materialized = ggml_kvarn_materialize(
-            ctx, records, stored, indices, n_tokens_per_stream, 0, n_stream, bits, false);
+            ctx, records, stored, indices, n_tokens_per_stream, 0, n_stream, bits, false, 3);
 
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, stored);
@@ -573,9 +573,9 @@ static void test_cache_ops_swa(enum ggml_backend_dev_type device_type, bool requ
     ggml_tensor * stage = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, n_heads, 384);
     ggml_tensor * records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, record_bytes, n_heads, gps);
 
-    ggml_tensor * stored = ggml_kvarn_store(ctx, current, indices, stage, records, bits, 16, false);
+    ggml_tensor * stored = ggml_kvarn_store(ctx, current, indices, stage, records, bits, 16, false, 3);
     stored->op_params[4] = 1; // SWA ring store
-    ggml_tensor * materialized = ggml_kvarn_materialize(ctx, records, stored, mat_indices, n_kv, 0, 1, bits, false);
+    ggml_tensor * materialized = ggml_kvarn_materialize(ctx, records, stored, mat_indices, n_kv, 0, 1, bits, false, 3);
     materialized->op_params[6] = 1; // SWA ring materialize (per-cell positions)
 
     ggml_cgraph * graph = ggml_new_graph(ctx);
@@ -668,9 +668,9 @@ static std::vector<ggml_fp16_t> test_materialize_output(
     ggml_tensor * stage = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, n_heads, 384 * n_stream);
     ggml_tensor * records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, record_bytes, n_heads, n_groups_per_stream * n_stream);
 
-    ggml_tensor * stored = ggml_kvarn_store(ctx, current, indices, stage, records, bits, 16, value);
+    ggml_tensor * stored = ggml_kvarn_store(ctx, current, indices, stage, records, bits, 16, value, 3);
     stored->op_params[3] = n_tokens_per_stream;
-    ggml_tensor * materialized = ggml_kvarn_materialize(ctx, records, stored, indices, n_kv, 0, n_stream, bits, value);
+    ggml_tensor * materialized = ggml_kvarn_materialize(ctx, records, stored, indices, n_kv, 0, n_stream, bits, value, 3);
 
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, stored);
@@ -860,9 +860,9 @@ static void test_materialize_rotated_parity(enum ggml_backend_dev_type device_ty
     ggml_tensor * stage = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, n_heads, 384 * n_stream);
     ggml_tensor * records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, record_bytes, n_heads, n_groups_per_stream * n_stream);
 
-    ggml_tensor * stored = ggml_kvarn_store(ctx, current, indices, stage, records, bits, 16, false);
-    ggml_tensor * m_orig = ggml_kvarn_materialize(ctx, records, stored, indices, n_tokens, 0, n_stream, bits, false);
-    ggml_tensor * m_rot  = ggml_kvarn_materialize(ctx, records, stored, indices, n_tokens, 0, n_stream, bits, false);
+    ggml_tensor * stored = ggml_kvarn_store(ctx, current, indices, stage, records, bits, 16, false, 3);
+    ggml_tensor * m_orig = ggml_kvarn_materialize(ctx, records, stored, indices, n_tokens, 0, n_stream, bits, false, 3);
+    ggml_tensor * m_rot  = ggml_kvarn_materialize(ctx, records, stored, indices, n_tokens, 0, n_stream, bits, false, 3);
     m_rot->op_params[5] = 1; // emit rotated-domain values (skip inverse-WHT)
 
     ggml_cgraph * graph = ggml_new_graph(ctx);
@@ -955,10 +955,8 @@ static void test_cache_ops_dynamic_stage(enum ggml_backend_dev_type device_type,
     ggml_tensor * stage    = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, n_heads, 128 * stage_groups);
     ggml_tensor * records  = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, record_bytes, n_heads, n_groups_per_stream);
 
-    ggml_tensor * stored = ggml_kvarn_store(ctx, current, indices, stage, records, bits, 16, false);
-    stored->op_params[7] = stage_groups; // dynamic stage depth
-    ggml_tensor * materialized = ggml_kvarn_materialize(ctx, records, stored, indices, n_tokens, 0, 1, bits, false);
-    materialized->op_params[7] = stage_groups;
+    ggml_tensor * stored = ggml_kvarn_store(ctx, current, indices, stage, records, bits, 16, false, stage_groups);
+    ggml_tensor * materialized = ggml_kvarn_materialize(ctx, records, stored, indices, n_tokens, 0, 1, bits, false, stage_groups);
 
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, stored);
@@ -1041,22 +1039,11 @@ static void test_cache_ops_dynamic_stage(enum ggml_backend_dev_type device_type,
     ggml_backend_free(backend);
 }
 
-// W2 unaligned-start test: verifies store/materialize correctness when a physical
-// work item begins at a non-group-aligned offset. The test pre-fills the stage
-// with earlier tokens (simulating a previous ubatch) so the store sees a stage
-// that already has groups from the prior batch. The current ubatch then writes
-// tokens starting at a non-128-aligned position, which means the first group
-// touched by this ubatch was partially written by the previous batch.
-//
-// The non-SWA store/materialize uses the cell index as the absolute position
-// (matching production cache fills which are sequential from 0). To exercise
-// unaligned starts within this contract, the test writes two contiguous batches:
-// first batch fills groups 0..N, second batch continues from where the first
-// left off, starting at a non-128 boundary. This verifies that the stage slot
-// math and flush predicates work when a ubatch doesn't start at a group boundary.
-//
-// Covers: start_offset in {1, 64, 127} (non-group-aligned), n_ubatch in
-// {256, 512, 513}, stage_groups in {3, 5, 6}.
+// W2 unaligned-start persistence test: first store a prefix into stage/records,
+// then run a second store whose first absolute index is inside an already-open
+// non-sink group. Materialization covers the whole logical range, while the
+// live-group input is only the second store's indices, matching the production
+// non-SWA contract.
 static void test_unaligned_start(enum ggml_backend_dev_type device_type, bool required,
                                   int start_offset, int n_tokens, int stage_groups) {
     ggml_backend_t backend = init_test_backend(device_type, required);
@@ -1072,10 +1059,11 @@ static void test_unaligned_start(enum ggml_backend_dev_type device_type, bool re
     ggml_context * ctx = ggml_init(params);
     require(ctx != nullptr, "unaligned-start: failed to initialize ggml context");
 
-    // Write start_offset pre-fill tokens (0..start_offset-1) plus n_tokens
-    // main tokens (start_offset..start_offset+n_tokens-1) in one batch so the
-    // store sees a non-group-aligned start within a single contiguous index range.
-    const int total_tokens = start_offset + n_tokens;
+    // Start the second store inside group 1 so the unaligned group is non-sink.
+    // For stage_groups 3 and 5, these cases also cross enough boundaries to
+    // reuse a transient slot and flush group 1 from the second store.
+    const int second_start = 128 + start_offset;
+    const int total_tokens = second_start + n_tokens;
     constexpr int n_heads = 1;
     const int tail_groups = stage_groups - 1;
     const int bits = 4;
@@ -1083,46 +1071,66 @@ static void test_unaligned_start(enum ggml_backend_dev_type device_type, bool re
     const int n_groups_per_stream = std::max(8, last_group + 1);
     const int record_bytes = int(llama_kvarn_packed_bytes(128 * 128, bits) + 3 * 128 * sizeof(ggml_fp16_t));
 
-    ggml_tensor * current  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, n_heads, total_tokens);
-    ggml_tensor * indices  = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, total_tokens);
+    ggml_tensor * current_prefix = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, n_heads, second_start);
+    ggml_tensor * indices_prefix = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, second_start);
+    ggml_tensor * current        = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, n_heads, n_tokens);
+    ggml_tensor * indices        = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
     ggml_tensor * stage    = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, n_heads, 128 * stage_groups);
     ggml_tensor * records  = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, record_bytes, n_heads, n_groups_per_stream);
 
-    ggml_tensor * stored = ggml_kvarn_store(ctx, current, indices, stage, records, bits, 16, false);
-    stored->op_params[7] = stage_groups;
-    // Materialize outputs n_kv cells indexed 0..n_kv-1; non-SWA uses cell as
-    // abs_pos, so n_kv = total_tokens and cell t maps to abs_pos t.
-    ggml_tensor * materialized = ggml_kvarn_materialize(ctx, records, stored, indices, total_tokens, 0, 1, bits, false);
-    materialized->op_params[7] = stage_groups;
+    ggml_tensor * stored_prefix = ggml_kvarn_store(ctx, current_prefix, indices_prefix, stage, records, bits, 16, false, stage_groups);
+    stored_prefix->op_params[3] = second_start;
+    ggml_tensor * stored = ggml_kvarn_store(ctx, current, indices, stored_prefix, records, bits, 16, false, stage_groups);
+    stored->op_params[3] = n_tokens;
+    // Non-SWA materialize uses output cell t as absolute position t. The indices
+    // tensor is still the second store's index range, which supplies the current
+    // live group exactly as production graph construction does.
+    ggml_tensor * materialized = ggml_kvarn_materialize(ctx, records, stored, indices, total_tokens, 0, 1, bits, false, stage_groups);
 
     ggml_cgraph * graph = ggml_new_graph(ctx);
-    ggml_build_forward_expand(graph, stored);
     ggml_build_forward_expand(graph, materialized);
 
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     require(buffer != nullptr, "unaligned-start: failed to allocate tensors");
 
-    std::vector<float> input(128 * n_heads * total_tokens);
+    auto sample = [](int abs_pos, int d) {
+        return std::sin(float(d) * 0.071f) +
+            std::cos(float(abs_pos) * 0.037f) +
+            float((d * 13 + abs_pos * 17) % 31 - 15) * 0.01f;
+    };
+    std::vector<float> prefix_input(128 * n_heads * second_start);
+    std::vector<float> input(128 * n_heads * n_tokens);
+    std::vector<float> expected(128 * n_heads * total_tokens);
     for (int t = 0; t < total_tokens; ++t) {
         for (int d = 0; d < 128; ++d) {
-            input[t * 128 + d] =
-                std::sin(float(d) * 0.071f) +
-                std::cos(float(t) * 0.037f) +
-                float((d * 13 + t * 17) % 31 - 15) * 0.01f;
+            const float value = sample(t, d);
+            expected[t * 128 + d] = value;
+            if (t < second_start) {
+                prefix_input[t * 128 + d] = value;
+            } else {
+                input[(t - second_start) * 128 + d] = value;
+            }
         }
     }
-    // Contiguous indices from 0 — the "unaligned" aspect is that the ubatch
-    // boundary (start_offset) falls mid-group, not that indices are non-zero.
-    std::vector<int64_t> idx(total_tokens);
-    for (int i = 0; i < total_tokens; ++i) {
-        idx[i] = int64_t(i);
+    std::vector<int64_t> idx_prefix(second_start);
+    for (int i = 0; i < second_start; ++i) {
+        idx_prefix[i] = int64_t(i);
     }
-    std::vector<uint8_t> zeros(ggml_nbytes(stage) + ggml_nbytes(records), 0);
+    std::vector<int64_t> idx(n_tokens);
+    for (int i = 0; i < n_tokens; ++i) {
+        idx[i] = int64_t(second_start + i);
+    }
+    require(idx.front() == second_start && (idx.front() % 128) == start_offset,
+            "unaligned-start: second store did not start at the requested unaligned absolute position");
+    std::vector<uint8_t> stage_zeros(ggml_nbytes(stage), 0);
+    std::vector<uint8_t> record_zeros(ggml_nbytes(records), 0);
 
+    ggml_backend_tensor_set(current_prefix, prefix_input.data(), 0, ggml_nbytes(current_prefix));
+    ggml_backend_tensor_set(indices_prefix, idx_prefix.data(), 0, ggml_nbytes(indices_prefix));
     ggml_backend_tensor_set(current, input.data(), 0, ggml_nbytes(current));
     ggml_backend_tensor_set(indices, idx.data(), 0, ggml_nbytes(indices));
-    ggml_backend_tensor_set(stage, zeros.data(), 0, ggml_nbytes(stage));
-    ggml_backend_tensor_set(records, zeros.data(), 0, ggml_nbytes(records));
+    ggml_backend_tensor_set(stage, stage_zeros.data(), 0, stage_zeros.size());
+    ggml_backend_tensor_set(records, record_zeros.data(), 0, record_zeros.size());
 
     require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
             "unaligned-start: graph compute failed");
@@ -1132,26 +1140,38 @@ static void test_unaligned_start(enum ggml_backend_dev_type device_type, bool re
     ggml_backend_tensor_get(materialized, output_f16.data(), 0, ggml_nbytes(materialized));
     ggml_fp16_to_fp32_row(output_f16.data(), output.data(), output.size());
 
-    // Verify reconstruction across the full range including the mid-group start.
+    // Verify reconstruction across prefix and second store, including the group
+    // partially filled by the prefix and completed by the second store.
     double mse = 0.0;
     double max_diff = 0.0;
     for (int t = 0; t < total_tokens; ++t) {
         for (int d = 0; d < 128; ++d) {
-            const double diff = double(input[t * 128 + d]) - double(output[t * 128 + d]);
+            const double diff = double(expected[t * 128 + d]) - double(output[t * 128 + d]);
             mse += diff * diff;
             max_diff = std::max(max_diff, std::fabs(diff));
         }
     }
     const double rmse = std::sqrt(mse / double(total_tokens * 128));
     if (!std::isfinite(rmse) || rmse >= 0.30) {
-        std::fprintf(stderr, "unaligned-start: reconstruction RMSE too high (start=%d n=%d sg=%d rmse=%g max=%g)\n",
-                start_offset, n_tokens, stage_groups, rmse, max_diff);
+        std::fprintf(stderr, "unaligned-start: reconstruction RMSE too high (start=%d abs=%d n=%d sg=%d rmse=%g max=%g)\n",
+                start_offset, second_start, n_tokens, stage_groups, rmse, max_diff);
         require(false, "unaligned-start: reconstruction RMSE too high");
     }
     if (max_diff >= 2.0) {
-        std::fprintf(stderr, "unaligned-start: max reconstruction error too high (start=%d n=%d sg=%d max=%g)\n",
-                start_offset, n_tokens, stage_groups, max_diff);
+        std::fprintf(stderr, "unaligned-start: max reconstruction error too high (start=%d abs=%d n=%d sg=%d max=%g)\n",
+                start_offset, second_start, n_tokens, stage_groups, max_diff);
         require(false, "unaligned-start: max reconstruction error too high");
+    }
+
+    if (last_group > tail_groups) {
+        std::vector<uint8_t> record_data(ggml_nbytes(records));
+        ggml_backend_tensor_get(records, record_data.data(), 0, record_data.size());
+        const int flushed_group = last_group - tail_groups;
+        const size_t off = size_t(flushed_group) * size_t(record_bytes);
+        require(std::any_of(record_data.begin() + ptrdiff_t(off),
+                            record_data.begin() + ptrdiff_t(off + record_bytes),
+                            [](uint8_t v) { return v != 0; }),
+                "unaligned-start: second store did not flush the reused transient slot");
     }
 
     ggml_backend_buffer_free(buffer);
@@ -1190,11 +1210,10 @@ int main() {
     // W2 dynamic stage-depth coverage: stage_groups=5 (n_ubatch=512).
     test_cache_ops_dynamic_stage(GGML_BACKEND_DEVICE_TYPE_CPU, true, 4);
     test_cache_ops_dynamic_stage(GGML_BACKEND_DEVICE_TYPE_GPU, false, 4);
-    // W2 unaligned-start coverage: start offsets 1, 64, 127 with n_ubatch 256, 512, 513
-    // and stage_groups 3, 5, 6. The test writes total_tokens = start_offset + n_tokens
-    // in one contiguous batch (indices 0..total_tokens-1), so the store processes a
-    // range that starts mid-group. This verifies stage slot math, flush predicates,
-    // and materialize residency for non-group-aligned token counts.
+    // W2 unaligned-start coverage: first persist a prefix, then run a second
+    // store whose first index is 128 + {1, 64, 127}. The 256/512 cases force a
+    // transient slot reuse/flush from the second store; all cases materialize
+    // the full prefix + second-store range from the same stage/records.
     for (int start : { 1, 64, 127 }) {
         test_unaligned_start(GGML_BACKEND_DEVICE_TYPE_CPU, true,  start, 256, 3);
         test_unaligned_start(GGML_BACKEND_DEVICE_TYPE_GPU, false, start, 256, 3);

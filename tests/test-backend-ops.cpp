@@ -7281,9 +7281,9 @@ struct test_kvarn_roundtrip : public test_case {
         ggml_set_name(stage, "stage");
         ggml_set_name(records, "records");
 
-        ggml_tensor * stored = ggml_kvarn_store(ctx, current, indices, stage, records, bits, 16, value);
+        ggml_tensor * stored = ggml_kvarn_store(ctx, current, indices, stage, records, bits, 16, value, 3);
         stored->op_params[3] = n_tokens;
-        ggml_tensor * out = ggml_kvarn_materialize(ctx, records, stored, indices, start_idx + n_tokens, 0, n_stream, bits, value);
+        ggml_tensor * out = ggml_kvarn_materialize(ctx, records, stored, indices, start_idx + n_tokens, 0, n_stream, bits, value, 3);
         ggml_set_name(out, "out");
         return out;
     }
@@ -7327,7 +7327,7 @@ struct test_kvarn_store_only : public test_case {
         ggml_set_name(stage, "stage");
         ggml_set_name(records, "records");
 
-        ggml_tensor * out = ggml_kvarn_store(ctx, current, indices, stage, records, bits, 16, value);
+        ggml_tensor * out = ggml_kvarn_store(ctx, current, indices, stage, records, bits, 16, value, 3);
         out->op_params[3] = n_tokens;
         ggml_set_name(out, "out");
         return out;
@@ -7380,9 +7380,9 @@ struct test_kvarn_irregular_roundtrip : public test_case {
         ggml_set_name(stage, "stage");
         ggml_set_name(records, "records");
 
-        ggml_tensor * stored = ggml_kvarn_store(ctx, current, idxs, stage, records, bits, 16, value);
+        ggml_tensor * stored = ggml_kvarn_store(ctx, current, idxs, stage, records, bits, 16, value, 3);
         stored->op_params[3] = n_tokens;
-        ggml_tensor * out = ggml_kvarn_materialize(ctx, records, stored, idxs, n_kv, 0, 1, bits, value);
+        ggml_tensor * out = ggml_kvarn_materialize(ctx, records, stored, idxs, n_kv, 0, 1, bits, value, 3);
         ggml_set_name(out, "out");
         return out;
     }
@@ -7424,7 +7424,7 @@ struct test_kvarn_materialize_only : public test_case {
         ggml_set_name(stage, "stage");
         ggml_set_name(records, "records");
 
-        ggml_tensor * out = ggml_kvarn_materialize(ctx, records, stage, indices, n_kv, 0, n_stream, bits, value);
+        ggml_tensor * out = ggml_kvarn_materialize(ctx, records, stage, indices, n_kv, 0, n_stream, bits, value, 3);
         ggml_set_name(out, "out");
         return out;
     }
@@ -7492,13 +7492,13 @@ struct test_kvarn_flash_attn_ext : public test_case {
         ggml_set_name(k_records, "k_records");
         ggml_set_name(v_records, "v_records");
 
-        ggml_tensor * stored_k = ggml_kvarn_store(ctx, current_k, indices, k_stage, k_records, bits_k, 16, false);
-        ggml_tensor * stored_v = ggml_kvarn_store(ctx, current_v, indices, v_stage, v_records, bits_v, 16, true);
+        ggml_tensor * stored_k = ggml_kvarn_store(ctx, current_k, indices, k_stage, k_records, bits_k, 16, false, 3);
+        ggml_tensor * stored_v = ggml_kvarn_store(ctx, current_v, indices, v_stage, v_records, bits_v, 16, true, 3);
         stored_k->op_params[3] = n_kv;
         stored_v->op_params[3] = n_kv;
 
-        ggml_tensor * k_mat = ggml_kvarn_materialize(ctx, k_records, stored_k, indices, n_kv, 0, n_stream, bits_k, false);
-        ggml_tensor * v_mat = ggml_kvarn_materialize(ctx, v_records, stored_v, indices, n_kv, 0, n_stream, bits_v, true);
+        ggml_tensor * k_mat = ggml_kvarn_materialize(ctx, k_records, stored_k, indices, n_kv, 0, n_stream, bits_k, false, 3);
+        ggml_tensor * v_mat = ggml_kvarn_materialize(ctx, v_records, stored_v, indices, n_kv, 0, n_stream, bits_v, true, 3);
         ggml_set_name(k_mat, "k_mat");
         ggml_set_name(v_mat, "v_mat");
 

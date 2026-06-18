@@ -8,10 +8,7 @@
 #include <vector>
 
 static constexpr int KVAR_N_DIM = 128;
-// Dynamic stage depth: stage_groups is carried in op_params[7] by the cache.
-// KVAR_N_STAGE_GROUPS remains the legacy default for direct-op tests that do
-// not set op_params[7]; production caches always set it to tail_groups + 1.
-static constexpr int KVAR_N_STAGE_GROUPS = 3;
+// Dynamic stage depth: stage_groups is carried explicitly in op_params[7].
 static constexpr int KVAR_N_TILE_VALUES = KVAR_N_DIM * KVAR_N_DIM;
 static constexpr int KVAR_N_SHARED_FLOATS = KVAR_N_TILE_VALUES + 8 * KVAR_N_DIM + 2;
 static constexpr int KVAR_N_SHARED_BYTES = KVAR_N_SHARED_FLOATS * sizeof(float);
@@ -21,17 +18,20 @@ static constexpr int KVAR_N_STAGE_CHUNK = 4;
 static constexpr int KVAR_N_MATERIALIZE_FAST_CHUNK = 16;
 static constexpr int KVAR_N_OP_PARAM_BITS = 0;
 static constexpr int KVAR_N_OP_PARAM_ITERS = 1;
-static constexpr int KVAR_N_OP_PARAM_VALUE = 2;
+static constexpr int KVAR_N_OP_PARAM_MAT_VALUE = 1;
+static constexpr int KVAR_N_OP_PARAM_STORE_VALUE = 2;
 static constexpr int KVAR_N_OP_PARAM_TOKENS_PER_STREAM = 3;
 static constexpr int KVAR_N_OP_PARAM_STORE_SWA = 4;     // store: SWA sliding-window ring mode
+static constexpr int KVAR_N_OP_PARAM_MAT_STREAM_START = 2;
+static constexpr int KVAR_N_OP_PARAM_MAT_N_STREAM = 3;
+static constexpr int KVAR_N_OP_PARAM_MAT_EMIT_ROTATED = 5;
 static constexpr int KVAR_N_OP_PARAM_MAT_SWA = 6;       // materialize: SWA ring (indices carry per-cell positions)
 static constexpr int KVAR_N_OP_PARAM_STAGE_GROUPS = 7;  // dynamic stage depth (tail_groups + 1)
 
-// Resolve stage_groups from op_params[7], falling back to the legacy three-slot
-// stride when unset (direct-op tests). tail_groups = stage_groups - 1.
+// Resolve stage_groups from op_params[7]. Constructors set this explicitly;
+// backends assert it before deriving stream counts.
 static int kvarn_resolve_stage_groups(const ggml_tensor * dst) {
-    const int sg = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_STAGE_GROUPS);
-    return sg > 1 ? sg : KVAR_N_STAGE_GROUPS;
+    return ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_STAGE_GROUPS);
 }
 
 enum class kvarn_prof_kind : uint8_t {
@@ -1111,7 +1111,9 @@ static __global__ void kvarn_store_workspace_flush_kernel(
         int flush_candidates,
         int bits,
         int iterations,
-        bool value) {
+        bool value,
+        int stage_groups,
+        int tail_groups) {
     extern __shared__ float shared[];
     const int head = blockIdx.x;
     const int active_stream = blockIdx.y / flush_candidates;
@@ -1138,17 +1140,17 @@ static __global__ void kvarn_store_workspace_flush_kernel(
     const int start_local = first_group * KVAR_N_DIM + first_pos;
     const int end_local = start_local + tokens_per_stream;
     const int boundary_group = (start_local + KVAR_N_DIM - 1) / KVAR_N_DIM + candidate;
-    if (boundary_group * KVAR_N_DIM >= end_local || boundary_group <= 2) {
+    if (boundary_group * KVAR_N_DIM >= end_local || boundary_group <= tail_groups) {
         return;
     }
 
-    const int flush_group = boundary_group - 2;
+    const int flush_group = boundary_group - tail_groups;
     if (flush_group < 1 || flush_group >= groups_per_stream) {
         return;
     }
 
     const int flush_start = flush_group * KVAR_N_DIM;
-    const int stage_base = stream * KVAR_N_DIM * KVAR_N_STAGE_GROUPS;
+    const int stage_base = stream * KVAR_N_DIM * stage_groups;
     float * tile = shared;
     for (int i = threadIdx.x; i < KVAR_N_TILE_VALUES; i += blockDim.x) {
         const int row = i / KVAR_N_DIM;
@@ -1160,7 +1162,8 @@ static __global__ void kvarn_store_workspace_flush_kernel(
             const int src_token = token_base + local_pos - start_local;
             tile[i] = __half2float(workspace[((int64_t) src_token * n_heads + head) * KVAR_N_DIM + dim]);
         } else {
-            const int stage_pos = stage_base + KVAR_N_DIM + ((flush_group - 1) & 1) * KVAR_N_DIM + token;
+            const int stage_slot = 1 + ((flush_group - 1) % tail_groups);
+            const int stage_pos = stage_base + stage_slot * KVAR_N_DIM + token;
             tile[i] = __half2float(stage[(stage_pos * n_heads + head) * KVAR_N_DIM + dim]);
         }
     }
@@ -1220,7 +1223,7 @@ static __global__ void kvarn_store_workspace_commit_kernel(
         if (max_group < 1) {
             return;
         }
-        if (((max_group - 1) % tail_groups) != slot) {
+        while (max_group >= 1 && ((max_group - 1) % tail_groups) != slot) {
             --max_group;
         }
         if (max_group < 1) {
@@ -1902,7 +1905,7 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
     const int bits = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_BITS);
     const int iterations = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_ITERS);
-    const bool value = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_VALUE) != 0;
+    const bool value = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_STORE_VALUE) != 0;
     const int tokens_per_stream_hint = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_TOKENS_PER_STREAM);
     const bool swa = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_STORE_SWA) != 0;
     const int stage_groups = kvarn_resolve_stage_groups(dst);
@@ -1910,10 +1913,12 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     GGML_ASSERT(ggml_cuda_kvarn_valid_bits(bits));
     GGML_ASSERT((KVAR_N_TILE_VALUES * bits) % 8 == 0);
     GGML_ASSERT((KVAR_N_DIM * bits) % 8 == 0);
-    GGML_ASSERT(stage_groups >= 2 && stage->ne[2] % (KVAR_N_DIM * stage_groups) == 0);
+    GGML_ASSERT(stage_groups >= 2);
+    GGML_ASSERT(stage->ne[2] % (KVAR_N_DIM * stage_groups) == 0);
     const int n_stream = (int) (stage->ne[2] / (KVAR_N_DIM * stage_groups));
+    GGML_ASSERT(n_stream > 0);
+    GGML_ASSERT(records->ne[2] % n_stream == 0);
     const int groups_per_stream = (int) (records->ne[2] / n_stream);
-    GGML_ASSERT(n_stream > 0 && records->ne[2] % n_stream == 0);
     if (swa) {
         GGML_ASSERT(n_stream == 1 && "SWA KVarN ring requires a single stream");
     }
@@ -1929,13 +1934,9 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         tokens_per_stream_hint <= n_tokens &&
         n_tokens % tokens_per_stream_hint == 0;
     const int active_streams = hint_well_formed ? n_tokens / tokens_per_stream_hint : 0;
-    // The workspace path is only enabled for the legacy three-slot stride while
-    // W2 validation is ongoing. The plan allows this as a diagnostic step but
-    // requires the workspace route to use the same dynamic stage-depth math at
-    // the W2 exit gate. For now, fall back to the hishmem path for stage_groups != 3.
-    const bool workspace_hint = hint_well_formed && tokens_per_stream_hint >= 384 && stage_groups == KVAR_N_STAGE_GROUPS;
+    const bool workspace_hint = hint_well_formed && tokens_per_stream_hint >= 384;
     const bool direct_hint = hint_well_formed && tokens_per_stream_hint <= KVAR_N_DIM;
-    const int flush_candidates = workspace_hint ? (tokens_per_stream_hint + KVAR_N_DIM - 1) / KVAR_N_DIM + 3 : 0;
+    const int flush_candidates = workspace_hint ? (tokens_per_stream_hint + KVAR_N_DIM - 1) / KVAR_N_DIM + stage_groups : 0;
     const bool grid_fits = n_tokens <= 65535 && active_streams * flush_candidates <= 65535;
     const bool use_workspace =
         smpbo >= KVAR_N_SHARED_BYTES &&
@@ -2003,7 +2004,9 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             flush_candidates,
             bits,
             iterations,
-            value);
+            value,
+            stage_groups,
+            tail_groups);
         dim3 blocks_commit(n_heads, active_streams * KVAR_N_DIM * stage_groups, 1);
         kvarn_store_workspace_commit_kernel<<<blocks_commit, KVAR_N_DIM, 0, stream>>>(
             (const int64_t *) indices->data,
@@ -2146,21 +2149,25 @@ void ggml_cuda_op_kvarn_materialize(ggml_backend_cuda_context & ctx, ggml_tensor
     GGML_ASSERT(ggml_is_contiguous(indices));
     GGML_ASSERT(ggml_is_contiguous(dst));
 
-    const int bits = ggml_get_op_params_i32(dst, 0);
-    const bool value = ggml_get_op_params_i32(dst, 1) != 0;
-    const int stream_start = ggml_get_op_params_i32(dst, 2);
-    const int n_stream = ggml_get_op_params_i32(dst, 3);
-    const bool emit_rotated = ggml_get_op_params_i32(dst, 5) != 0;
+    const int bits = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_BITS);
+    const bool value = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_MAT_VALUE) != 0;
+    const int stream_start = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_MAT_STREAM_START);
+    const int n_stream = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_MAT_N_STREAM);
+    const bool emit_rotated = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_MAT_EMIT_ROTATED) != 0;
     const bool swa = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_MAT_SWA) != 0;
     const int stage_groups = kvarn_resolve_stage_groups(dst);
     const int tail_groups = stage_groups - 1;
     GGML_ASSERT(ggml_cuda_kvarn_valid_bits(bits));
     GGML_ASSERT((KVAR_N_TILE_VALUES * bits) % 8 == 0);
     GGML_ASSERT((KVAR_N_DIM * bits) % 8 == 0);
-    GGML_ASSERT(stage_groups >= 2 && stage->ne[2] % (KVAR_N_DIM * stage_groups) == 0);
+    GGML_ASSERT(stage_groups >= 2);
+    GGML_ASSERT(n_stream > 0);
+    GGML_ASSERT(stream_start >= 0);
+    GGML_ASSERT(stage->ne[2] % (KVAR_N_DIM * stage_groups) == 0);
     const int n_total_stream = (int) (stage->ne[2] / (KVAR_N_DIM * stage_groups));
+    GGML_ASSERT(n_total_stream > 0);
+    GGML_ASSERT(records->ne[2] % n_total_stream == 0);
     const int groups_per_stream = (int) (records->ne[2] / n_total_stream);
-    GGML_ASSERT(n_total_stream > 0 && records->ne[2] % n_total_stream == 0);
     GGML_ASSERT(stream_start + n_stream <= n_total_stream);
     ggml_cuda_pool_alloc<int> live_groups(ctx.pool(), n_stream);
     cudaStream_t stream = ctx.stream();
