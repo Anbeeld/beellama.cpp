@@ -14,6 +14,8 @@ layout(push_constant) uniform parameter {
     uint n_indices;
     uint emit_rotated;
     uint swa; // SWA sliding-window ring materialize (indices carry per-cell positions)
+    uint stage_groups; // dynamic stage depth (tail_groups + 1)
+    uint tail_groups;  // ceil(n_ubatch / 128)
 } p;
 
 layout(binding = 0, std430) readonly buffer Records { uint data_records[]; };
@@ -22,7 +24,7 @@ layout(binding = 2, std430) readonly buffer Indices { uint data_indices[]; };
 layout(binding = 3, std430) buffer Dst { uint data_dst[]; };
 
 const uint KVAR_N_DIM = 128;
-const uint KVAR_N_STAGE_GROUPS = 3;
+// Dynamic stage depth: stage_groups and tail_groups arrive via push constants.
 const float KVAR_N_WHT_SCALE = 0.08838834764831845;
 
 shared float sh_wht[128];
@@ -120,7 +122,7 @@ void main() {
     const uint stream = p.stream_start + out_stream;
 
     const uint live_group = compute_live_group(stream, lane);
-    const uint stage_base = stream * KVAR_N_DIM * KVAR_N_STAGE_GROUPS;
+    const uint stage_base = stream * KVAR_N_DIM * p.stage_groups;
 
     uint group;
     uint pos;
@@ -137,18 +139,21 @@ void main() {
         }
         group = uint(abs_pos) / KVAR_N_DIM;
         pos = uint(abs_pos) % KVAR_N_DIM;
-        from_stage  = (group + 1u >= live_group) && (group <= live_group);
-        from_record = (!from_stage) && (group < live_group) && (live_group - group < p.groups_per_stream);
+        // Dynamic SWA residency: stage holds the last tail_groups groups.
+        // tail_groups = stage_groups - 1; stage_begin = max(0, live_group - (tail_groups - 1)).
+        const uint stage_begin = live_group >= (p.tail_groups - 1u) ? live_group - (p.tail_groups - 1u) : 0u;
+        from_stage  = (group >= stage_begin) && (group <= live_group);
+        from_record = (!from_stage) && (group < stage_begin) && (live_group - group < p.groups_per_stream);
     } else {
         group = token / KVAR_N_DIM;
         pos = token % KVAR_N_DIM;
-        from_stage  = group == 0u || (group > 0u && group <= live_group && group + 1u >= live_group);
+        from_stage  = group == 0u || (group > 0u && group <= live_group && group + (p.tail_groups - 1u) >= live_group);
         from_record = (!from_stage) && group < live_group && group < p.groups_per_stream;
     }
 
     float x = 0.0;
     if (from_stage) {
-        const uint stage_slot = p.swa != 0u ? (group % KVAR_N_STAGE_GROUPS) : (group == 0u ? 0u : 1u + ((group - 1u) & 1u));
+        const uint stage_slot = p.swa != 0u ? (group % p.stage_groups) : (group == 0u ? 0u : 1u + ((group - 1u) % p.tail_groups));
         const uint stage_pos = stage_base + stage_slot * KVAR_N_DIM + pos;
         x = load_stage_value(stage_pos, head, lane);
     } else if (from_record) {

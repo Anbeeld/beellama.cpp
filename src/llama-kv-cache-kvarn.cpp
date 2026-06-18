@@ -18,9 +18,14 @@
 namespace {
 
 constexpr uint32_t KVAR_N_GROUP = 128;
-constexpr uint32_t KVAR_N_STAGE_GROUPS = 3;
+constexpr uint32_t KVAR_N_STAGE_GROUPS = 3; // legacy default; production caches carry stage_groups in op_params[7]
 constexpr uint32_t KVAR_N_STATE_MAGIC = 0x4e52564b; // "KVRN"
-constexpr uint32_t KVAR_N_STATE_VERSION = 4;
+// Version 5: adds stage_groups to the state header so restore can validate and
+// remap stage slots when the configured physical ubatch differs between save
+// and restore. Version 4 states are still accepted when current stage_groups == 3
+// (byte-compatible three-slot layout); other configurations require a version 5
+// state whose stage_groups matches the current cache or fits within it.
+constexpr uint32_t KVAR_N_STATE_VERSION = 5;
 constexpr uint32_t KVAR_N_STATE_RECORDS_FULL = 0;
 constexpr uint32_t KVAR_N_STATE_STAGE_ONLY_PARTIAL = 1;
 
@@ -406,6 +411,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         bool unified,
         uint32_t kv_size,
         uint32_t n_seq_max,
+        uint32_t n_ubatch,
         uint32_t n_pad,
         uint32_t n_swa,
         llama_swa_type swa_type,
@@ -420,6 +426,13 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     // a slot collision and to keep (live_group - group) < groups_per_stream.
     n_groups_per_stream(((kv_size + KVAR_N_GROUP - 1) / KVAR_N_GROUP) +
         ((n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE) ? 2u : 0u)),
+    // Dynamic staging: size the lossless F16 ring from the configured physical
+    // ubatch. tail_groups = ceil(n_ubatch / 128); stage_groups = tail_groups + 1.
+    // The +1 reserves the permanent sink slot for non-SWA caches and the extra
+    // ping-pong slot for SWA. Clamp n_ubatch to at least one group so degenerate
+    // configurations (n_ubatch == 0 in edge tests) do not produce zero-depth stage.
+    tail_groups(std::max<uint32_t>(1u, (n_ubatch + KVAR_N_GROUP - 1u) / KVAR_N_GROUP)),
+    stage_groups(tail_groups + 1u),
     swa(n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE),
     metadata(std::make_unique<llama_kv_cache>(
         model,
@@ -440,6 +453,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         nullptr)) {
     GGML_ASSERT(n_stream > 0);
     GGML_ASSERT(swa || kv_size % KVAR_N_GROUP == 0);
+    GGML_ASSERT(stage_groups >= 2 && "KVarN stage depth must be at least 2 (sink + one transient)");
     if (swa) {
         GGML_ASSERT(n_stream == 1 && "SWA KVarN ring requires a unified (single-stream) cache");
         // Backstop for the ring-size invariant above: the record ring must have
@@ -448,6 +462,11 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         GGML_ASSERT(n_groups_per_stream > (kv_size + KVAR_N_GROUP - 1) / KVAR_N_GROUP &&
             "SWA KVarN record ring is too small for the sliding window");
     }
+    // Dynamic staging keeps the F16/compressed mix independent of physical
+    // ubatch. Log the configured stage depth and its memory cost at cache
+    // creation so regressions in the propagation are visible at startup.
+    LLAMA_LOG_INFO("KVarN cache: stage_groups=%u tail_groups=%u n_ubatch=%u%s\n",
+            stage_groups, tail_groups, n_ubatch, swa ? " (SWA ring)" : "");
 
     struct buft_comparator {
         bool operator()(ggml_backend_buffer_type_t lhs, ggml_backend_buffer_type_t rhs) const {
@@ -481,7 +500,10 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     const size_t k_record_size = kvarn_record_bytes(params.key_bits);
     const size_t v_record_size = kvarn_record_bytes(params.value_bits);
     const int64_t n_record_groups = int64_t(n_groups_per_stream) * n_stream;
-    const int64_t n_stage_tokens = int64_t(KVAR_N_GROUP) * KVAR_N_STAGE_GROUPS * n_stream;
+    // Stage depth is now a cache property derived from the configured physical
+    // ubatch (tail_groups = ceil(n_ubatch/128), stage_groups = tail_groups + 1).
+    // Backends read stage_groups from op_params[7] instead of assuming 3.
+    const int64_t n_stage_tokens = int64_t(KVAR_N_GROUP) * int64_t(stage_groups) * n_stream;
     size_t raw_bytes = 0;
 
     for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
@@ -552,14 +574,14 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
                     size_t(s) * n_groups_per_stream * v_records->nb[2]);
             auto * k_stage_view = ggml_view_3d(
                     ctx, k_stage,
-                    KVAR_N_GROUP, n_head_k_sliced, KVAR_N_GROUP * KVAR_N_STAGE_GROUPS,
+                    KVAR_N_GROUP, n_head_k_sliced, KVAR_N_GROUP * stage_groups,
                     k_stage->nb[1], k_stage->nb[2],
-                    size_t(s) * KVAR_N_GROUP * KVAR_N_STAGE_GROUPS * k_stage->nb[2]);
+                    size_t(s) * KVAR_N_GROUP * stage_groups * k_stage->nb[2]);
             auto * v_stage_view = ggml_view_3d(
                     ctx, v_stage,
-                    KVAR_N_GROUP, n_head_v_sliced, KVAR_N_GROUP * KVAR_N_STAGE_GROUPS,
+                    KVAR_N_GROUP, n_head_v_sliced, KVAR_N_GROUP * stage_groups,
                     v_stage->nb[1], v_stage->nb[2],
-                    size_t(s) * KVAR_N_GROUP * KVAR_N_STAGE_GROUPS * v_stage->nb[2]);
+                    size_t(s) * KVAR_N_GROUP * stage_groups * v_stage->nb[2]);
 
             ggml_format_name(k_records_view, "cache_kvarn_k_records_l%d_s%d", il, s);
             ggml_format_name(v_records_view, "cache_kvarn_v_records_l%d_s%d", il, s);
@@ -870,6 +892,10 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
     }
     const uint32_t state_kind = partial_state ? KVAR_N_STATE_STAGE_ONLY_PARTIAL : KVAR_N_STATE_RECORDS_FULL;
     io.write(&state_kind, sizeof(state_kind));
+    // Version 5: record the stage depth so the reader can validate that the
+    // saved stage tensor layout matches the current cache, or remap when the
+    // configured ubatch differs between save and restore.
+    io.write(&stage_groups, sizeof(stage_groups));
 
     // n_groups_used is single-valued across all saved streams. This is correct
     // because when seq_id >= 0, saved_streams has exactly 1 entry (the stream
@@ -960,6 +986,27 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
         if (state_kind != KVAR_N_STATE_RECORDS_FULL && state_kind != KVAR_N_STATE_STAGE_ONLY_PARTIAL) {
             throw std::runtime_error("invalid KVarN cache state kind");
         }
+    }
+
+    // Version 5 carries stage_groups. Version 4 states were written with the
+    // legacy three-slot stage layout. The initial W2 gate does not implement
+    // stage-slot remap on restore (the plan's full save/restore matrix allows
+    // remapping logical live groups into differently-sized stages). For now,
+    // any stage_groups mismatch — including version-4 states restored into a
+    // cache whose configured ubatch is not 256 — is rejected explicitly so the
+    // stage is never silently corrupted. Remap support is a follow-up.
+    uint32_t saved_stage_groups = KVAR_N_STAGE_GROUPS;
+    if (version >= 5) {
+        io.read(&saved_stage_groups, sizeof(saved_stage_groups));
+        if (saved_stage_groups < 2) {
+            throw std::runtime_error("invalid KVarN cache stage depth");
+        }
+    }
+    if (saved_stage_groups != stage_groups) {
+        throw std::runtime_error(format(
+            "KVarN cache stage depth mismatch: state has %u stage groups, cache has %u; "
+            "re-save the prompt cache with the current --ubatch setting",
+            saved_stage_groups, stage_groups));
     }
 
     uint32_t n_groups_used = n_groups_per_stream;
@@ -1069,6 +1116,7 @@ ggml_tensor * llama_kv_cache_kvarn::store(
         value);
     result->op_params[3] = kvarn_contiguous_tokens_per_stream_hint(sinfo);
     result->op_params[4] = swa ? 1 : 0; // SWA sliding-window ring store
+    result->op_params[7] = int32_t(stage_groups); // dynamic stage depth
     return result;
 }
 
@@ -1101,6 +1149,7 @@ ggml_tensor * llama_kv_cache_kvarn::materialize(
         value);
     result->op_params[5] = emit_rotated ? 1 : 0;
     result->op_params[6] = swa ? 1 : 0; // SWA sliding-window ring materialize
+    result->op_params[7] = int32_t(stage_groups); // dynamic stage depth
     const uint32_t slices = value ? layer.v_slices : layer.k_slices;
     if (slices > 1) {
         result = ggml_reshape_4d(

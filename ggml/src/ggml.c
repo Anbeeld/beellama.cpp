@@ -6557,12 +6557,20 @@ struct ggml_tensor * ggml_kvarn_store(
     GGML_ASSERT(stage->type == GGML_TYPE_F16);
     GGML_ASSERT(records->type == GGML_TYPE_I8);
     GGML_ASSERT(current->ne[0] == 128);
-    GGML_ASSERT(stage->ne[0] == 128 && stage->ne[2] % 384 == 0);
+    // Dynamic stage depth: the stage's third dimension is 128 * stage_groups * n_stream.
+    // op_params[7] (set by the cache after construction) carries stage_groups so
+    // backends can generalize slot math without deriving it from stage->ne[2]/384.
+    // Direct op tests still build 384-token stages; the cache builds
+    // 128 * stage_groups * n_stream stages. Both must satisfy divisibility by 128.
+    GGML_ASSERT(stage->ne[0] == 128 && stage->ne[2] % 128 == 0);
     GGML_ASSERT(current->ne[1] == stage->ne[1] && stage->ne[1] == records->ne[1]);
     GGML_ASSERT(current->ne[2] == indices->ne[0]);
     GGML_ASSERT(ggml_kvarn_valid_bits(bits) && sinkhorn_iters > 0);
-    const int64_t n_stream = stage->ne[2] / 384;
-    GGML_ASSERT(n_stream > 0 && records->ne[2] % n_stream == 0);
+    // n_stream validation is deferred to backend compute time, where stage_groups
+    // is read from op_params[7]. The cache always sets op_params[7] before graph
+    // compute, so deriving n_stream there (stage->ne[2] / (128 * stage_groups))
+    // is correct for both legacy 384-token test stages and dynamic production stages.
+    GGML_ASSERT(stage->ne[2] > 0 && records->ne[2] > 0);
 
     struct ggml_tensor * result = ggml_view_tensor(ctx, stage);
     result->op = GGML_OP_KVARN_STORE;
@@ -6573,6 +6581,13 @@ struct ggml_tensor * ggml_kvarn_store(
     ggml_set_op_params_i32(result, 0, bits);
     ggml_set_op_params_i32(result, 1, sinkhorn_iters);
     ggml_set_op_params_i32(result, 2, value ? 1 : 0);
+    // op_params[3..6] are reserved for the cache to set at graph construction
+    // (tokens_per_stream_hint, swa flag, and materialize-side live/rotated/swa
+    // markers). op_params[7] carries the dynamic stage_groups depth so backends
+    // can generalize slot math without deriving it from stage->ne[2]/384.
+    // Default to 0 here; backends treat 0 as "use the legacy three-slot stride"
+    // for backward compatibility with direct-op tests that do not set it.
+    ggml_set_op_params_i32(result, 7, 0);
     return result;
 }
 
@@ -6591,13 +6606,15 @@ struct ggml_tensor * ggml_kvarn_materialize(
     GGML_ASSERT(records->type == GGML_TYPE_I8);
     GGML_ASSERT(stage_after_store->type == GGML_TYPE_F16);
     GGML_ASSERT(indices->type == GGML_TYPE_I64);
-    GGML_ASSERT(stage_after_store->ne[0] == 128 && stage_after_store->ne[2] % 384 == 0);
+    // Dynamic stage depth: see ggml_kvarn_store. op_params[7] carries stage_groups.
+    GGML_ASSERT(stage_after_store->ne[0] == 128 && stage_after_store->ne[2] % 128 == 0);
     GGML_ASSERT(stage_after_store->ne[1] == records->ne[1]);
     GGML_ASSERT(n_kv > 0 && ggml_kvarn_valid_bits(bits));
-    const int64_t n_total_stream = stage_after_store->ne[2] / 384;
-    GGML_ASSERT(n_total_stream > 0 && records->ne[2] % n_total_stream == 0);
+    // n_total_stream validation is deferred to backend compute time, where
+    // stage_groups is read from op_params[7]. The caller passes n_stream
+    // explicitly, so we only need stream_start/n_stream positivity here.
+    GGML_ASSERT(stage_after_store->ne[2] > 0 && records->ne[2] > 0);
     GGML_ASSERT(stream_start >= 0 && n_stream > 0);
-    GGML_ASSERT((int64_t) stream_start + n_stream <= n_total_stream);
 
     struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 128, stage_after_store->ne[1], n_kv, n_stream);
     result->op = GGML_OP_KVARN_MATERIALIZE;
@@ -6608,6 +6625,9 @@ struct ggml_tensor * ggml_kvarn_materialize(
     ggml_set_op_params_i32(result, 1, value ? 1 : 0);
     ggml_set_op_params_i32(result, 2, stream_start);
     ggml_set_op_params_i32(result, 3, n_stream);
+    // op_params[4..6] are set by the cache (live_group runtime, emit_rotated, swa).
+    // op_params[7] carries the dynamic stage_groups depth (set by the cache).
+    ggml_set_op_params_i32(result, 7, 0);
     return result;
 }
 

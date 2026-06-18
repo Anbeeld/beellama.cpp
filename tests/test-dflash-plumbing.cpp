@@ -2633,7 +2633,7 @@ int main(int argc, char ** argv) {
     ok &= expect(kv_cache_kvarn_cpp.find("GGML_ABORT(\"KVarN does not support position shifts\")") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("GGML_ABORT(\"KVarN does not support position division\")") != std::string::npos,
         "KVarN seq_add/seq_div must fail fast instead of logging and continuing");
-    ok &= expect(kv_cache_kvarn_cpp.find("constexpr uint32_t KVAR_N_STATE_VERSION = 4") != std::string::npos &&
+    ok &= expect(kv_cache_kvarn_cpp.find("constexpr uint32_t KVAR_N_STATE_VERSION = 5") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("KVAR_N_STATE_RECORDS_FULL") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("KVAR_N_STATE_STAGE_ONLY_PARTIAL") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("const uint32_t state_kind = partial_state ? KVAR_N_STATE_STAGE_ONLY_PARTIAL : KVAR_N_STATE_RECORDS_FULL;") != std::string::npos &&
@@ -2647,7 +2647,9 @@ int main(int argc, char ** argv) {
                  kv_cache_kvarn_cpp.find("if (state_kind == KVAR_N_STATE_RECORDS_FULL)") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("if (state_kind == KVAR_N_STATE_STAGE_ONLY_PARTIAL)") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("ggml_backend_tensor_memset") != std::string::npos &&
-                 kv_cache_kvarn_cpp.find("const uint64_t size64 = size") != std::string::npos,
+                 kv_cache_kvarn_cpp.find("const uint64_t size64 = size") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("io.write(&stage_groups, sizeof(stage_groups))") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("io.read(&saved_stage_groups, sizeof(saved_stage_groups))") != std::string::npos,
         "KVarN sequence state must serialize full records compactly and partial checkpoints as stage-only overlays");
     ok &= expect(kv_cache_kvarn_cpp.find("pending_stream_copies") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("llama_synchronize(lctx)") != std::string::npos &&

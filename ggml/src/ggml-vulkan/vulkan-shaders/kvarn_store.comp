@@ -12,6 +12,8 @@ layout(push_constant) uniform parameter {
     uint iterations;
     uint value;
     uint swa; // SWA sliding-window ring store (absolute-position indices, no group-0 sink)
+    uint stage_groups; // dynamic stage depth (tail_groups + 1)
+    uint tail_groups;  // ceil(n_ubatch / 128)
 } p;
 
 layout(binding = 0, std430) readonly buffer Current { float data_current[]; };
@@ -20,7 +22,8 @@ layout(binding = 2, std430) buffer Stage { uint data_stage[]; };
 layout(binding = 3, std430) buffer Records { uint data_records[]; };
 
 const uint KVAR_N_DIM = 128;
-const uint KVAR_N_STAGE_GROUPS = 3;
+// Dynamic stage depth: stage_groups and tail_groups arrive via push constants so
+// the slot math generalizes beyond the legacy three-slot stride.
 const float KVAR_N_WHT_SCALE = 0.08838834764831845;
 
 shared float sh_wht[128];
@@ -72,8 +75,9 @@ void wht_128(uint lane) {
 float stage_matrix_value(uint head, uint stage_base, uint stage_group, uint row, uint col) {
     const uint token = p.value != 0 ? row : col;
     const uint dim = p.value != 0 ? col : row;
-    // SWA: 3-deep ping-pong over absolute tiles; non-SWA: tile 0 sink + slots 1/2.
-    const uint stage_slot = p.swa != 0u ? (stage_group % KVAR_N_STAGE_GROUPS) : (1u + ((stage_group - 1u) & 1u));
+    // SWA: stage_groups-deep ping-pong over absolute tiles; non-SWA: tile 0 sink
+    // and tail_groups transient slots. tail_groups = stage_groups - 1.
+    const uint stage_slot = p.swa != 0u ? (stage_group % p.stage_groups) : (1u + ((stage_group - 1u) % p.tail_groups));
     const uint stage_pos = stage_base + stage_slot * KVAR_N_DIM + token;
     return load_stage_value(stage_pos, head, dim);
 }
@@ -252,9 +256,9 @@ void main() {
             return;
         }
 
-        const uint stage_base = stream * KVAR_N_DIM * KVAR_N_STAGE_GROUPS;
-        if (pos == 0 && (p.swa != 0u ? group >= 2u : group > 2u)) {
-            const uint flush_group = group - 2u;
+        const uint stage_base = stream * KVAR_N_DIM * p.stage_groups;
+        if (pos == 0 && (p.swa != 0u ? group >= p.tail_groups : group > p.tail_groups)) {
+            const uint flush_group = group - p.tail_groups;
             const uint flush_ring = p.swa != 0u ? flush_group % p.groups_per_stream : flush_group;
             const uint flush_record_group = stream * p.groups_per_stream + flush_ring;
             const uint record_base = (flush_record_group * p.n_heads + head) * p.record_words;
@@ -263,7 +267,7 @@ void main() {
 
         sh_wht[lane] = data_current[(token * p.n_heads + head) * KVAR_N_DIM + lane];
         wht_128(lane);
-        const uint stage_slot = p.swa != 0u ? (group % KVAR_N_STAGE_GROUPS) : (group == 0u ? 0u : 1u + ((group - 1u) & 1u));
+        const uint stage_slot = p.swa != 0u ? (group % p.stage_groups) : (group == 0u ? 0u : 1u + ((group - 1u) % p.tail_groups));
         const uint stage_pos = stage_base + stage_slot * KVAR_N_DIM + pos;
         store_stage_pair(stage_pos, head, lane);
         barrier();

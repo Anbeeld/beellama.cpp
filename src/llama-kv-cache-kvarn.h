@@ -92,6 +92,7 @@ public:
             bool unified,
             uint32_t kv_size,
             uint32_t n_seq_max,
+            uint32_t n_ubatch,
             uint32_t n_pad = 1,
             uint32_t n_swa = 0,
             llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE,
@@ -137,6 +138,16 @@ public:
     bool apply_pending_stream_copies(llama_context * lctx);
     bool is_swa() const { return swa; }
 
+    // Dynamic staging: the lossless F16 ring is sized from the configured physical
+    // ubatch so attention sees the same F16/compressed mix regardless of ubatch.
+    //   tail_groups  = ceil(n_ubatch / KVAR_N_GROUP)
+    //   stage_groups = tail_groups + 1
+    // The +1 is the permanent sink slot for non-SWA, or the extra ping-pong slot
+    // for SWA. KVarN cache state is versioned to carry stage_groups so restore can
+    // remap logical live groups when the configured ubatch changes.
+    uint32_t get_stage_groups() const { return stage_groups; }
+    uint32_t get_tail_groups()  const { return tail_groups; }
+
     ggml_tensor * store(
             ggml_context * ctx,
             ggml_tensor * current,
@@ -180,6 +191,10 @@ private:
     const llama_kvarn_params params;
     const uint32_t n_stream;
     const uint32_t n_groups_per_stream;
+    // Declaration order matters: stage_groups depends on tail_groups, so
+    // tail_groups must be declared first (C++ initializes members in order).
+    const uint32_t tail_groups;   // ceil(n_ubatch / 128)
+    const uint32_t stage_groups;   // F16 stage depth (tail_groups + 1)
     const bool swa;
 
     std::unique_ptr<llama_kv_cache> metadata;

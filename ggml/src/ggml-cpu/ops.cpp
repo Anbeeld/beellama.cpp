@@ -11457,12 +11457,20 @@ void ggml_compute_forward_kvarn_store(const ggml_compute_params * params, ggml_t
     // SWA sliding-window ring mode: records form a circular buffer of
     // groups_per_stream tiles (single stream); the index carries the absolute
     // token position, there is no permanent group-0 sink, and the fp16 staging
-    // is a 3-deep ping-pong over the most recent tiles.
+    // is a ping-pong over the most recent tiles.
     const bool swa = ggml_get_op_params_i32(dst, 4) != 0;
+    // Dynamic stage depth: op_params[7] carries stage_groups (tail_groups + 1).
+    // Direct op tests that do not set it fall back to the legacy three-slot
+    // stride (stage_groups = 3, tail_groups = 2).
+    const int stage_groups = [dst] {
+        const int sg = ggml_get_op_params_i32(dst, 7);
+        return sg > 1 ? sg : 3;
+    }();
+    const int tail_groups = stage_groups - 1;
     const int64_t n_heads = current->ne[1];
     const int64_t n_tokens = current->ne[2];
     const int64_t * idx_data = (const int64_t *) indices->data;
-    const int64_t n_stream = stage->ne[2] / 384;
+    const int64_t n_stream = stage->ne[2] / (128 * stage_groups);
     const int64_t groups_per_stream = records->ne[2] / n_stream;
 
     for (int64_t t = 0; t < n_tokens; ++t) {
@@ -11477,12 +11485,12 @@ void ggml_compute_forward_kvarn_store(const ggml_compute_params * params, ggml_t
             GGML_ASSERT(group >= 0 && group < groups_per_stream);
         }
 
-        const int64_t stage_base = stream * 384;
+        const int64_t stage_base = stream * 128 * stage_groups;
 
-        if (pos == 0 && (swa ? group >= 2 : group > 2)) {
-            const int64_t flush_group = group - 2;
+        if (pos == 0 && (swa ? group >= tail_groups : group > tail_groups)) {
+            const int64_t flush_group = group - tail_groups;
             const int64_t flush_ring = swa ? flush_group % groups_per_stream : flush_group;
-            const int64_t flush_slot = swa ? flush_group % 3 : 1 + ((flush_group - 1) & 1);
+            const int64_t flush_slot = swa ? flush_group % stage_groups : 1 + ((flush_group - 1) % tail_groups);
             const int64_t flush_record_group = stream * groups_per_stream + flush_ring;
             for (int64_t h = 0; h < n_heads; ++h) {
                 uint8_t * record = (uint8_t *) records->data + h * records->nb[1] + flush_record_group * records->nb[2];
@@ -11490,7 +11498,7 @@ void ggml_compute_forward_kvarn_store(const ggml_compute_params * params, ggml_t
             }
         }
 
-        const int64_t stage_slot = swa ? group % 3 : (group == 0 ? 0 : 1 + ((group - 1) & 1));
+        const int64_t stage_slot = swa ? group % stage_groups : (group == 0 ? 0 : 1 + ((group - 1) % tail_groups));
         const int64_t stage_pos = stage_base + stage_slot * 128 + pos;
         for (int64_t h = 0; h < n_heads; ++h) {
             float rotated[128];
@@ -11519,13 +11527,21 @@ void ggml_compute_forward_kvarn_materialize(const ggml_compute_params * params, 
     // SWA sliding-window ring mode (single stream): the indices tensor carries
     // one absolute token position per output cell (idx < 0 marks an empty window
     // cell). Records are a circular buffer (slot = group % groups_per_stream);
-    // the two newest tiles live in the 3-deep fp16 staging ping-pong; there is
+    // the newest tail_groups tiles live in the fp16 staging ping-pong; there is
     // no permanent group-0 sink.
     const bool swa = ggml_get_op_params_i32(dst, 6) != 0;
+    // Dynamic stage depth: op_params[7] carries stage_groups (tail_groups + 1).
+    // Direct op tests that do not set it fall back to the legacy three-slot
+    // stride (stage_groups = 3, tail_groups = 2).
+    const int stage_groups = [dst] {
+        const int sg = ggml_get_op_params_i32(dst, 7);
+        return sg > 1 ? sg : 3;
+    }();
+    const int tail_groups = stage_groups - 1;
     const int64_t n_heads = dst->ne[1];
     const int64_t n_kv = dst->ne[2];
     const int64_t * idx_data = (const int64_t *) indices->data;
-    const int64_t n_total_stream = stage->ne[2] / 384;
+    const int64_t n_total_stream = stage->ne[2] / (128 * stage_groups);
     const int64_t groups_per_stream = records->ne[2] / n_total_stream;
     std::vector<int64_t> live_groups(n_stream, 0);
     for (int64_t i = 0; i < indices->ne[0]; ++i) {
@@ -11557,7 +11573,15 @@ void ggml_compute_forward_kvarn_materialize(const ggml_compute_params * params, 
         const int64_t abs_pos = swa ? idx_data[cell] : cell;
         const int64_t group = abs_pos / 128;
         const int64_t pos = abs_pos % 128;
-        const int64_t stage_base = stream * 384;
+        const int64_t stage_base = stream * 128 * stage_groups;
+        // Residency rules from the KVarN faithful-precision plan:
+        //   non-SWA: stage holds group 0 (sink) and the last tail_groups groups
+        //           (tail_groups = stage_groups - 1).
+        //   SWA:    stage holds the last tail_groups groups (no permanent sink);
+        //           older in-window groups come from the circular record ring.
+        const int64_t stage_begin = swa
+            ? (live_group >= (tail_groups - 1) ? live_group - (tail_groups - 1) : 0)
+            : 0;
         for (int64_t h = 0; h < n_heads; ++h) {
             float rotated[128] = {};
             bool from_stage;
@@ -11565,15 +11589,17 @@ void ggml_compute_forward_kvarn_materialize(const ggml_compute_params * params, 
             int64_t stage_pos = 0;
             int64_t record_group = 0;
             if (swa) {
-                from_stage  = group >= live_group - 1 && group <= live_group;
-                from_record = !from_stage && group >= 0 && group < live_group - 1 &&
+                from_stage  = group >= stage_begin && group <= live_group;
+                from_record = !from_stage && group >= 0 && group < stage_begin &&
                               (live_group - group) < groups_per_stream;
-                stage_pos    = stage_base + (group % 3) * 128 + pos;
+                stage_pos    = stage_base + (group % stage_groups) * 128 + pos;
                 record_group = stream * groups_per_stream + (group % groups_per_stream);
             } else {
-                from_stage  = group == 0 || (group > 0 && group <= live_group && group + 1 >= live_group);
+                from_stage  = group == 0 ||
+                              (group > 0 && group <= live_group &&
+                               group + (tail_groups - 1) >= live_group);
                 from_record = !from_stage && group < live_group;
-                stage_pos    = stage_base + (group == 0 ? pos : 128 + ((group - 1) & 1) * 128 + pos);
+                stage_pos    = stage_base + (group == 0 ? pos : 128 + ((group - 1) % tail_groups) * 128 + pos);
                 record_group = stream * groups_per_stream + group;
             }
             if (from_stage) {

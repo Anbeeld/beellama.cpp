@@ -919,6 +919,128 @@ static void test_materialize_rotated_parity(enum ggml_backend_dev_type device_ty
     ggml_backend_free(backend);
 }
 
+// W2 dynamic-stage-depth test: verifies the store/materialize path honors
+// stage_groups carried in op_params[7] instead of the legacy three-slot stride.
+// Writes 768 tokens (6 groups) through a 5-deep stage (tail_groups=4, n_ubatch=512)
+// and checks reconstruction of sink, compressed, previous-tail, and live-tail
+// groups. Writing 6 groups with stage_groups=5 forces group 5 to reuse transient
+// slot 1, flushing the completed group 1 to records — exercising the dynamic
+// tail_groups flush predicate (group > tail_groups instead of group > 2) and
+// the slot reuse modulo (1 + ((group - 1) % tail_groups)).
+static void test_cache_ops_dynamic_stage(enum ggml_backend_dev_type device_type, bool required, int bits) {
+    ggml_backend_t backend = init_test_backend(device_type, required);
+    if (backend == nullptr) {
+        return;
+    }
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ 8 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr, "dynamic-stage: failed to initialize ggml context");
+
+    constexpr int n_tokens = 768;     // 6 complete groups (0..5)
+    constexpr int n_heads   = 1;
+    constexpr int stage_groups = 5;   // tail_groups = 4, n_ubatch = 512
+    constexpr int tail_groups  = stage_groups - 1;
+    // 8 record groups per stream (kv_size = 1024) — enough to hold 6 groups with
+    // room for the flush ring to grow without collision.
+    constexpr int n_groups_per_stream = 8;
+    const int record_bytes = int(llama_kvarn_packed_bytes(128 * 128, bits) + 3 * 128 * sizeof(ggml_fp16_t));
+
+    ggml_tensor * current  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, n_heads, n_tokens);
+    ggml_tensor * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
+    ggml_tensor * stage    = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, n_heads, 128 * stage_groups);
+    ggml_tensor * records  = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, record_bytes, n_heads, n_groups_per_stream);
+
+    ggml_tensor * stored = ggml_kvarn_store(ctx, current, indices, stage, records, bits, 16, false);
+    stored->op_params[7] = stage_groups; // dynamic stage depth
+    ggml_tensor * materialized = ggml_kvarn_materialize(ctx, records, stored, indices, n_tokens, 0, 1, bits, false);
+    materialized->op_params[7] = stage_groups;
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, stored);
+    ggml_build_forward_expand(graph, materialized);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    require(buffer != nullptr, "dynamic-stage: failed to allocate tensors");
+
+    std::vector<float> input(128 * n_heads * n_tokens);
+    for (int t = 0; t < n_tokens; ++t) {
+        for (int d = 0; d < 128; ++d) {
+            input[t * 128 + d] =
+                std::sin(float(d) * 0.071f) +
+                std::cos(float(t) * 0.037f) +
+                float((d * 13 + t * 17) % 31 - 15) * 0.01f;
+        }
+    }
+    std::vector<int64_t> idx(n_tokens);
+    for (int i = 0; i < n_tokens; ++i) {
+        idx[i] = i;
+    }
+    std::vector<uint8_t> zeros(ggml_nbytes(stage) + ggml_nbytes(records), 0);
+
+    ggml_backend_tensor_set(current, input.data(), 0, ggml_nbytes(current));
+    ggml_backend_tensor_set(indices, idx.data(), 0, ggml_nbytes(indices));
+    ggml_backend_tensor_set(stage, zeros.data(), 0, ggml_nbytes(stage));
+    ggml_backend_tensor_set(records, zeros.data(), 0, ggml_nbytes(records));
+
+    require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
+            "dynamic-stage: graph compute failed");
+
+    std::vector<ggml_fp16_t> output_f16(ggml_nelements(materialized));
+    std::vector<float> output(output_f16.size());
+    ggml_backend_tensor_get(materialized, output_f16.data(), 0, ggml_nbytes(materialized));
+    ggml_fp16_to_fp32_row(output_f16.data(), output.data(), output.size());
+
+    // Group decomposition for n_tokens=768, stage_groups=5, tail_groups=4:
+    //   group 0: tokens   0..127  (permanent sink, slot 0)
+    //   group 1: tokens 128..255  (transient slot 1, flushed to records when group 5 begins)
+    //   group 2: tokens 256..383  (transient slot 2)
+    //   group 3: tokens 384..511  (transient slot 3)
+    //   group 4: tokens 512..639  (transient slot 4)
+    //   group 5: tokens 640..767  (reuses transient slot 1, group 1 must be in records)
+    // live_group after processing = 5. Stage holds groups 2..5 (tail_groups=4 groups);
+    // group 1 comes from records; group 0 is the sink.
+    double sink_error = 0.0;          // group 0
+    double compressed_error = 0.0;    // group 1 (flushed to records)
+    double stage_transit_error = 0.0; // groups 2, 3, 4, 5 (in stage transient slots)
+    for (int t = 0; t < n_tokens; ++t) {
+        const int group = t / 128;
+        for (int d = 0; d < 128; ++d) {
+            const double diff = double(input[t * 128 + d]) - double(output[t * 128 + d]);
+            if (group == 0) {
+                sink_error += diff * diff;
+            } else if (group == 1) {
+                compressed_error += diff * diff;
+            } else {
+                stage_transit_error += diff * diff;
+            }
+        }
+    }
+    sink_error          = std::sqrt(sink_error          / (128 * 128));
+    compressed_error   = std::sqrt(compressed_error    / (128 * 128));
+    stage_transit_error = std::sqrt(stage_transit_error / (128 * 512));
+    require(sink_error < 0.01,          "dynamic-stage: sink reconstruction error too high");
+    require(compressed_error < 0.25,   "dynamic-stage: compressed reconstruction error too high");
+    require(stage_transit_error < 0.01, "dynamic-stage: in-stage transient reconstruction error too high");
+
+    // Group 1 must have been flushed to records when group 5 began (reusing slot 1).
+    std::vector<uint8_t> record_data(ggml_nbytes(records));
+    ggml_backend_tensor_get(records, record_data.data(), 0, record_data.size());
+    const size_t group1_off = size_t(1) * record_bytes;
+    require(std::any_of(record_data.begin() + ptrdiff_t(group1_off),
+                        record_data.begin() + ptrdiff_t(group1_off + record_bytes),
+                        [](uint8_t v) { return v != 0; }),
+            "dynamic-stage: completed group 1 was not flushed to records");
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+}
+
 int main() {
     ggml_backend_load_all();
 
@@ -947,6 +1069,9 @@ int main() {
         test_cache_ops(GGML_BACKEND_DEVICE_TYPE_CPU, true, bits);
         test_cache_ops(GGML_BACKEND_DEVICE_TYPE_GPU, false, bits);
     }
+    // W2 dynamic stage-depth coverage: stage_groups=5 (n_ubatch=512).
+    test_cache_ops_dynamic_stage(GGML_BACKEND_DEVICE_TYPE_CPU, true, 4);
+    test_cache_ops_dynamic_stage(GGML_BACKEND_DEVICE_TYPE_GPU, false, 4);
     test_cache_ops_multi_stream(GGML_BACKEND_DEVICE_TYPE_CPU, true, 6);
     test_cache_ops_multi_stream(GGML_BACKEND_DEVICE_TYPE_GPU, false, 6);
     test_cache_ops_swa(GGML_BACKEND_DEVICE_TYPE_CPU, true);

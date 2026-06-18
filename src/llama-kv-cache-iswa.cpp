@@ -80,6 +80,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                     unified,
                     size,
                     n_seq_max,
+                    n_ubatch,
                     n_pad,
                     n_swa,
                     swa_type,

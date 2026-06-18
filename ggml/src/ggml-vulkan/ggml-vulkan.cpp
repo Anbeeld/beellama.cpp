@@ -1199,6 +1199,8 @@ struct vk_op_kvarn_store_push_constants {
     uint32_t iterations;
     uint32_t value;
     uint32_t swa; // SWA sliding-window ring store (absolute-position indices, no sink)
+    uint32_t stage_groups; // dynamic stage depth (tail_groups + 1)
+    uint32_t tail_groups;  // ceil(n_ubatch / 128)
 };
 static_assert(sizeof(vk_op_kvarn_store_push_constants) <= 128, "sizeof(vk_op_kvarn_store_push_constants) must be <= 128");
 
@@ -1214,6 +1216,8 @@ struct vk_op_kvarn_materialize_push_constants {
     uint32_t n_indices;
     uint32_t emit_rotated;
     uint32_t swa; // SWA sliding-window ring materialize (indices carry per-cell positions)
+    uint32_t stage_groups; // dynamic stage depth (tail_groups + 1)
+    uint32_t tail_groups;  // ceil(n_ubatch / 128)
 };
 static_assert(sizeof(vk_op_kvarn_materialize_push_constants) <= 128, "sizeof(vk_op_kvarn_materialize_push_constants) must be <= 128");
 
@@ -9161,8 +9165,13 @@ static void ggml_vk_kvarn_store(ggml_backend_vk_context * ctx, vk_context& subct
     const int iterations = ggml_get_op_params_i32(dst, 1);
     const bool value = ggml_get_op_params_i32(dst, 2) != 0;
     const bool swa = ggml_get_op_params_i32(dst, 4) != 0; // KVAR_N_OP_PARAM_STORE_SWA
+    const int stage_groups = [] {
+        const int sg = ggml_get_op_params_i32(dst, 7);
+        return sg > 1 ? sg : 3;
+    }();
+    const int tail_groups = stage_groups - 1;
     GGML_ASSERT(ggml_vk_kvarn_valid_bits(bits));
-    const int n_stream = (int) (stage->ne[2] / 384);
+    const int n_stream = (int) (stage->ne[2] / (128 * stage_groups));
     const int groups_per_stream = (int) (records->ne[2] / n_stream);
     if (swa) {
         GGML_ASSERT(n_stream == 1 && "SWA KVarN ring requires a single stream");
@@ -9178,6 +9187,8 @@ static void ggml_vk_kvarn_store(ggml_backend_vk_context * ctx, vk_context& subct
         (uint32_t) iterations,
         value ? 1u : 0u,
         swa ? 1u : 0u,
+        (uint32_t) stage_groups,
+        (uint32_t) tail_groups,
     };
 
     const vk_subbuffer current_buf = ggml_vk_tensor_subbuffer(ctx, current);
@@ -9209,8 +9220,13 @@ static void ggml_vk_kvarn_materialize(ggml_backend_vk_context * ctx, vk_context&
     const int n_stream = ggml_get_op_params_i32(dst, 3);
     const bool emit_rotated = ggml_get_op_params_i32(dst, 5) != 0;
     const bool swa = ggml_get_op_params_i32(dst, 6) != 0; // KVAR_N_OP_PARAM_MAT_SWA
+    const int stage_groups = [] {
+        const int sg = ggml_get_op_params_i32(dst, 7);
+        return sg > 1 ? sg : 3;
+    }();
+    const int tail_groups = stage_groups - 1;
     GGML_ASSERT(ggml_vk_kvarn_valid_bits(bits));
-    const int n_total_stream = (int) (stage->ne[2] / 384);
+    const int n_total_stream = (int) (stage->ne[2] / (128 * stage_groups));
     const int groups_per_stream = (int) (records->ne[2] / n_total_stream);
     if (swa) {
         GGML_ASSERT(n_stream == 1 && "SWA KVarN ring materialize requires a single stream");
@@ -9228,6 +9244,8 @@ static void ggml_vk_kvarn_materialize(ggml_backend_vk_context * ctx, vk_context&
         (uint32_t) indices->ne[0],
         emit_rotated ? 1u : 0u,
         swa ? 1u : 0u,
+        (uint32_t) stage_groups,
+        (uint32_t) tail_groups,
     };
 
     const vk_subbuffer records_buf = ggml_vk_tensor_subbuffer(ctx, records);
@@ -17192,7 +17210,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 ggml_vk_kvarn_valid_bits(ggml_get_op_params_i32(op, 0)) &&
                 op->src[0]->ne[0] == 128 &&
                 op->src[2]->ne[0] == 128 &&
-                op->src[2]->ne[2] % 384 == 0 &&
+                op->src[2]->ne[2] % 128 == 0 &&
                 op->src[3]->ne[0] % 4 == 0;
         case GGML_OP_KVARN_MATERIALIZE:
             return ggml_backend_vk_kvarn_native_ops(dev) &&
@@ -17206,7 +17224,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 ggml_vk_kvarn_valid_bits(ggml_get_op_params_i32(op, 0)) &&
                 op->src[0]->ne[0] % 4 == 0 &&
                 op->src[1]->ne[0] == 128 &&
-                op->src[1]->ne[2] % 384 == 0;
+                op->src[1]->ne[2] % 128 == 0;
         case GGML_OP_IM2COL:
             return ggml_is_contiguous(op->src[1])
                 && op->src[1]->type == GGML_TYPE_F32
