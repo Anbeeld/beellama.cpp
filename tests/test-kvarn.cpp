@@ -833,7 +833,7 @@ static void test_materialize_paths_gpu() {
 // inverse-WHT) and then applying R on the host must reproduce the normal
 // materialize output (X_orig = R*K_rot). The same store feeds both, so this
 // holds for sink/record/stage groups alike.
-static void test_materialize_rotated_parity(enum ggml_backend_dev_type device_type, bool required) {
+static void test_materialize_rotated_transform_consistency(enum ggml_backend_dev_type device_type, bool required) {
     ggml_backend_t backend = init_test_backend(device_type, required);
     if (backend == nullptr) {
         return;
@@ -898,7 +898,9 @@ static void test_materialize_rotated_parity(enum ggml_backend_dev_type device_ty
     ggml_backend_tensor_get(m_orig, orig_h.data(), 0, ggml_nbytes(m_orig));
     ggml_backend_tensor_get(m_rot, rot_h.data(), 0, ggml_nbytes(m_rot));
 
-    double max_abs = 0.0, max_diff = 0.0;
+    double sum_sq = 0.0;
+    double max_diff = 0.0;
+    size_t count = 0;
     std::array<float, 128> buf;
     for (int t = 0; t < n_tokens; ++t) {
         for (int h = 0; h < n_heads; ++h) {
@@ -907,12 +909,17 @@ static void test_materialize_rotated_parity(enum ggml_backend_dev_type device_ty
             llama_kvarn_hadamard_128(buf.data());
             for (int d = 0; d < 128; ++d) {
                 const float ref = ggml_fp16_to_fp32(orig_h[base + d]);
-                max_abs  = std::max(max_abs, double(std::fabs(ref)));
-                max_diff = std::max(max_diff, double(std::fabs(ref - buf[d])));
+                require(std::isfinite(ref) && std::isfinite(buf[d]), "rotated materialize transform produced non-finite value");
+                const double diff = double(ref) - double(buf[d]);
+                sum_sq += diff * diff;
+                max_diff = std::max(max_diff, std::fabs(diff));
+                ++count;
             }
         }
     }
-    require(max_diff < 5e-2 * (1.0 + max_abs), "rotated materialize != inverse-WHT of normal materialize");
+    const double rmse = std::sqrt(sum_sq / std::max<size_t>(count, 1));
+    require(rmse <= 5e-4, "rotated materialize inverse-WHT RMSE too high");
+    require(max_diff <= 2e-3, "rotated materialize inverse-WHT max error too high");
 
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
@@ -1228,8 +1235,8 @@ int main() {
     test_cache_ops_swa(GGML_BACKEND_DEVICE_TYPE_GPU, false); // CUDA SWA ring parity
     test_store_paths_gpu();
     test_materialize_paths_gpu();
-    test_materialize_rotated_parity(GGML_BACKEND_DEVICE_TYPE_CPU, true);
-    test_materialize_rotated_parity(GGML_BACKEND_DEVICE_TYPE_GPU, false);
+    test_materialize_rotated_transform_consistency(GGML_BACKEND_DEVICE_TYPE_CPU, true);
+    test_materialize_rotated_transform_consistency(GGML_BACKEND_DEVICE_TYPE_GPU, false);
 
     std::printf("test-kvarn: all tests OK\n");
     return 0;

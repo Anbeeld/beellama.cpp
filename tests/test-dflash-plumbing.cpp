@@ -2688,11 +2688,11 @@ int main(int argc, char ** argv) {
         "Vulkan KVarN shaders must be generated and preserve packed F16/record materialization semantics");
     ok &= expect(llama_kvarn_h.find("LLAMA_API") == std::string::npos,
         "internal C++ KVarN helper declarations must not be exported from the public DLL ABI");
-    ok &= expect(kv_cache_iswa_cpp.find("KVarN enabled for non-SWA layers; SWA layers use compact normal KV cache") != std::string::npos &&
+    ok &= expect(kv_cache_iswa_cpp.find("KVarN enabled for all layers (non-SWA full-context and SWA sliding-window ring)") != std::string::npos &&
                  kv_cache_iswa_cpp.find("make_cache(size_base, 0, LLAMA_SWA_TYPE_NONE, filter_base, mem_other_base, use_kvarn)") != std::string::npos &&
-                 kv_cache_iswa_cpp.find("make_cache(size_swa, hparams.n_swa, hparams.swa_type, filter_swa, mem_other_swa, false)") != std::string::npos &&
-                 kv_cache_iswa_cpp.find("KVarN requires full-size SWA cache for now") == std::string::npos,
-        "ISWA with KVarN must keep SWA layers on compact normal KV instead of expanding SWA to full-size KVarN");
+                 kv_cache_iswa_cpp.find("make_cache(size_swa, hparams.n_swa, hparams.swa_type, filter_swa, mem_other_swa, use_kvarn)") != std::string::npos &&
+                 kv_cache_iswa_cpp.find("SWA KVarN ring requires a unified (single-stream) cache") != std::string::npos,
+        "ISWA with KVarN must keep KVarN on validated SWA ring layers and fall back only for unsupported multi-stream SWA");
     ok &= expect(context_cpp.find("is experimental; only kvarn_k4v2_g128 is reference-aligned") == std::string::npos,
         "KVarN presets must not emit experimental/reference-aligned startup warnings");
     ok &= expect(llama_bench.find("bench_cache_type_from_name") != std::string::npos &&
@@ -2739,7 +2739,7 @@ int main(int argc, char ** argv) {
                  kv_cache_kvarn_cpp.find("static const std::vector<float> data = []") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("const auto & data = kvarn_hadamard_128()") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("result->op_params[5] = emit_rotated ? 1 : 0") != std::string::npos &&
-                 vulkan_cpp.find("const bool emit_rotated = ggml_get_op_params_i32(dst, 5) != 0") != std::string::npos &&
+                 vulkan_cpp.find("const bool emit_rotated = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_MAT_EMIT_ROTATED) != 0") != std::string::npos &&
                  vulkan_cpp.find("emit_rotated ? 1u : 0u") != std::string::npos &&
                  vulkan_cpp.find("1.0f / std::sqrt((float)src->ne[0])") != std::string::npos &&
                  vulkan_kvarn_materialize.find("uint emit_rotated") != std::string::npos &&
