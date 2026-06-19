@@ -747,10 +747,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         if constexpr (nstages <= 1) {
             if constexpr (!is_turbo_kv) {
                 if constexpr (type_K == GGML_CUDA_FATTN_KVARN_TYPE) {
-                    static_assert(nbatch_K2 == DKQ/2, "KVarN native MMA requires full-width K tiles");
                     constexpr int nthreads_kvarn = nwarps * ggml_cuda_get_physical_warp_size();
                     flash_attn_ext_kvarn_load_tile<DKQ, stride_tile_K, nbatch_fa, nthreads_kvarn, oob_check>
-                        ((const char *) K_h2, tile_K, k_VKQ_0, k_VKQ_sup);
+                        ((const char *) K_h2, tile_K, k_VKQ_0, k_VKQ_sup, k0_start, k0_stop - k0_start);
                 } else {
                     const int k0_diff = k0_stop - k0_start;
                     constexpr bool use_cp_async = nstages == 1;
@@ -1125,10 +1124,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         if constexpr (nstages <= 1) {
             if constexpr (!is_turbo_kv) {
                 if constexpr (type_V == GGML_CUDA_FATTN_KVARN_TYPE) {
-                    static_assert(nbatch_V2 == DV/2, "KVarN native MMA requires full-width V tiles");
                     constexpr int nthreads_kvarn = nwarps * ggml_cuda_get_physical_warp_size();
                     flash_attn_ext_kvarn_load_tile<DV, stride_tile_V, nbatch_fa, nthreads_kvarn, oob_check>
-                        ((const char *) V_h2, tile_V, k_VKQ_0, k_VKQ_sup);
+                        ((const char *) V_h2, tile_V, k_VKQ_0, k_VKQ_sup, i0_start / 2, nbatch_V2);
                     __syncthreads();
                 } else {
                     if (!V_is_K_view || i0_stop > 2*nbatch_K2) {

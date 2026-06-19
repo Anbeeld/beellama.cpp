@@ -1176,6 +1176,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     [GGML_OP_SSM_CONV_TREE]         = "SSM_CONV_TREE",
     [GGML_OP_TURBO_WHT]             = "TURBO_WHT",
     [GGML_OP_KVARN_STORE]           = "KVARN_STORE",
+    [GGML_OP_KVARN_VIEW]            = "KVARN_VIEW",
     [GGML_OP_KVARN_MATERIALIZE]     = "KVARN_MATERIALIZE",
     [GGML_OP_UNARY]                  = "UNARY",
     [GGML_OP_MAP_CUSTOM1]            = "MAP_CUSTOM1",
@@ -1189,7 +1190,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     [GGML_OP_GLU]                     = "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     [GGML_OP_NONE]                  = "none",
@@ -1283,6 +1284,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     [GGML_OP_SSM_CONV_TREE]         = "ssm_conv_tree(x, c, parents)",
     [GGML_OP_TURBO_WHT]             = "turbo_wht(a)",
     [GGML_OP_KVARN_STORE]           = "kvarn_store(cur, idx, stage, records)",
+    [GGML_OP_KVARN_VIEW]            = "kvarn_view(records, stage, idx)",
     [GGML_OP_KVARN_MATERIALIZE]     = "kvarn_materialize(records, stage, idx)",
     [GGML_OP_UNARY]                  = "unary(x)",
     [GGML_OP_MAP_CUSTOM1]            = "map_custom(x)",
@@ -1296,7 +1298,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     [GGML_OP_GLU]                     = "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5521,6 +5523,29 @@ struct ggml_tensor * ggml_arange(
 
 // ggml_flash_attn_ext
 
+static struct ggml_tensor * ggml_kvarn_view_base(struct ggml_tensor * t) {
+    while (t != NULL && (t->op == GGML_OP_PERMUTE || t->op == GGML_OP_RESHAPE)) {
+        t = t->src[0];
+    }
+    return t != NULL && t->op == GGML_OP_KVARN_VIEW ? t : NULL;
+}
+
+static void ggml_flash_attn_ext_add_kvarn_deps(
+        struct ggml_tensor * result,
+        struct ggml_tensor * k,
+        struct ggml_tensor * v) {
+    struct ggml_tensor * k_view = ggml_kvarn_view_base(k);
+    struct ggml_tensor * v_view = ggml_kvarn_view_base(v);
+    if (k_view == NULL && v_view == NULL) {
+        return;
+    }
+    GGML_ASSERT(k_view != NULL && v_view != NULL);
+    result->src[5] = k_view->src[1];
+    result->src[6] = k_view->src[2];
+    result->src[7] = v_view->src[1];
+    result->src[8] = v_view->src[2];
+}
+
 struct ggml_tensor * ggml_flash_attn_ext(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
@@ -5561,6 +5586,7 @@ struct ggml_tensor * ggml_flash_attn_ext(
     result->src[1] = k;
     result->src[2] = v;
     result->src[3] = mask;
+    ggml_flash_attn_ext_add_kvarn_deps(result, k, v);
 
     return result;
 }
@@ -6636,6 +6662,44 @@ struct ggml_tensor * ggml_kvarn_materialize(
     return result;
 }
 
+// ggml_kvarn_view
+
+struct ggml_tensor * ggml_kvarn_view(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * records,
+        struct ggml_tensor  * stage_after_store,
+        struct ggml_tensor  * indices,
+        int                   n_kv,
+        int                   stream_start,
+        int                   n_stream,
+        int                   bits,
+        bool                  value,
+        int                   stage_groups) {
+    GGML_ASSERT(records->type == GGML_TYPE_I8);
+    GGML_ASSERT(stage_after_store->type == GGML_TYPE_F16);
+    GGML_ASSERT(indices->type == GGML_TYPE_I64);
+    GGML_ASSERT(stage_groups >= 2);
+    GGML_ASSERT(stage_after_store->ne[0] == 128 && stage_after_store->ne[2] % (128 * stage_groups) == 0);
+    GGML_ASSERT(stage_after_store->ne[1] == records->ne[1]);
+    GGML_ASSERT(n_kv > 0 && ggml_kvarn_valid_bits(bits));
+    const int64_t n_total_stream = stage_after_store->ne[2] / (128 * stage_groups);
+    GGML_ASSERT(n_total_stream > 0 && records->ne[2] > 0 && records->ne[2] % n_total_stream == 0);
+    GGML_ASSERT(stream_start >= 0 && n_stream > 0);
+    GGML_ASSERT((int64_t) stream_start + n_stream <= n_total_stream);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 128, stage_after_store->ne[1], n_kv, n_stream);
+    result->op = GGML_OP_KVARN_VIEW;
+    result->src[0] = records;
+    result->src[1] = stage_after_store;
+    result->src[2] = indices;
+    ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_BITS, bits);
+    ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_MAT_VALUE, value ? 1 : 0);
+    ggml_set_op_params_i32(result, 2, stream_start);
+    ggml_set_op_params_i32(result, 3, n_stream);
+    ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_STAGE_GROUPS, stage_groups);
+    return result;
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 
 struct ggml_hash_set ggml_hash_set_new(size_t size) {
@@ -7440,7 +7504,8 @@ void ggml_build_backward_expand(
 
         // inplace operations are currently not supported
         GGML_ASSERT(!node->view_src || node->op == GGML_OP_CPY || node->op == GGML_OP_VIEW ||
-            node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE);
+            node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE ||
+            node->op == GGML_OP_KVARN_VIEW);
 
         const size_t ihash = ggml_hash_find(&cgraph->visited_hash_set, node);
         GGML_ASSERT(ihash != GGML_HASHSET_FULL);

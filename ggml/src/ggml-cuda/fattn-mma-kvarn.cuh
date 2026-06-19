@@ -1,6 +1,5 @@
 #pragma once
 
-#include <cstdlib>
 #include <vector>
 
 static constexpr int GGML_CUDA_FATTN_KVARN_DIM = 128;
@@ -11,7 +10,6 @@ enum {
     GGML_CUDA_FATTN_KVARN_OP_PARAM_MAT_VALUE         = 1,
     GGML_CUDA_FATTN_KVARN_OP_PARAM_MAT_STREAM_START  = 2,
     GGML_CUDA_FATTN_KVARN_OP_PARAM_MAT_N_STREAM      = 3,
-    GGML_CUDA_FATTN_KVARN_OP_PARAM_MAT_EMIT_ROTATED  = 5,
     GGML_CUDA_FATTN_KVARN_OP_PARAM_MAT_SWA           = 6,
     GGML_CUDA_FATTN_KVARN_OP_PARAM_STAGE_GROUPS      = 7,
 };
@@ -31,12 +29,11 @@ struct ggml_cuda_fattn_kvarn_desc {
     int tail_groups;
     int bits;
     int value;
-    int emit_rotated;
     int swa;
 };
 
 struct ggml_cuda_fattn_kvarn_plan_side {
-    const ggml_tensor * materialize = nullptr;
+    const ggml_tensor * view        = nullptr;
     const ggml_tensor * records     = nullptr;
     const ggml_tensor * stage       = nullptr;
     const ggml_tensor * indices     = nullptr;
@@ -46,7 +43,6 @@ struct ggml_cuda_fattn_kvarn_plan_side {
     int stage_groups  = 0;
     int groups_per_stream = 0;
     bool value        = false;
-    bool emit_rotated = false;
     bool swa          = false;
 };
 
@@ -145,19 +141,21 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
         const char * __restrict__ desc_raw,
         half2      * __restrict__ tile_KV,
         const int k_start,
-        const int i_sup) {
+        const int i_sup,
+        const int dim2_start,
+        const int dim2_count) {
     const ggml_cuda_fattn_kvarn_desc & desc = *(const ggml_cuda_fattn_kvarn_desc *) desc_raw;
     constexpr int slices = D / GGML_CUDA_FATTN_KVARN_DIM;
-    static_assert(D == 128 || D == 256, "KVarN native MMA supports D=128/256 initially");
-    constexpr float inv_sqrt_128 = 0.08838834764831845f;
+    static_assert(D % GGML_CUDA_FATTN_KVARN_DIM == 0 && D <= 512, "KVarN native MMA supports 128-wide slices through D=512");
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     const int tid = threadIdx.y * warp_size + threadIdx.x;
+    const int dim2_end = dim2_start + dim2_count;
     __shared__ float sh[GGML_CUDA_FATTN_KVARN_DIM];
 
     for (int row = 0; row < nbatch_fa; ++row) {
         const bool valid_row = !oob_check || row < i_sup;
         if (!valid_row) {
-            for (int b = tid; b < D / 2; b += nthreads) {
+            for (int b = tid; b < dim2_count; b += nthreads) {
                 tile_KV[row * stride_tile + b] = make_half2(0.0f, 0.0f);
             }
             __syncthreads();
@@ -166,30 +164,23 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
 
         const int token = k_start + row;
         for (int slice = 0; slice < slices; ++slice) {
-            __syncthreads();
+            const int slice_dim2_start = slice * (GGML_CUDA_FATTN_KVARN_DIM / 2);
+            const int slice_dim2_end   = slice_dim2_start + GGML_CUDA_FATTN_KVARN_DIM / 2;
+            const int out_dim2_start   = max(dim2_start, slice_dim2_start);
+            const int out_dim2_end     = min(dim2_end, slice_dim2_end);
+            if (out_dim2_start >= out_dim2_end) {
+                continue;
+            }
+
             for (int dim = tid; dim < GGML_CUDA_FATTN_KVARN_DIM; dim += nthreads) {
                 sh[dim] = ggml_cuda_fattn_kvarn_load_rotated(desc, token, slice, dim);
             }
             __syncthreads();
 
-            if (!desc.emit_rotated) {
-                for (int stride = 1; stride < GGML_CUDA_FATTN_KVARN_DIM; stride <<= 1) {
-                    for (int dim = tid; dim < GGML_CUDA_FATTN_KVARN_DIM; dim += nthreads) {
-                        if ((dim & stride) == 0) {
-                            const float a = sh[dim];
-                            const float b = sh[dim + stride];
-                            sh[dim] = a + b;
-                            sh[dim + stride] = a - b;
-                        }
-                    }
-                    __syncthreads();
-                }
-            }
-
-            const float scale = desc.emit_rotated ? 1.0f : inv_sqrt_128;
-            for (int b = tid; b < GGML_CUDA_FATTN_KVARN_DIM / 2; b += nthreads) {
-                tile_KV[row * stride_tile + slice * (GGML_CUDA_FATTN_KVARN_DIM / 2) + b] =
-                    make_half2(sh[2 * b] * scale, sh[2 * b + 1] * scale);
+            for (int global_b = out_dim2_start + tid; global_b < out_dim2_end; global_b += nthreads) {
+                const int local_b = global_b - slice_dim2_start;
+                tile_KV[row * stride_tile + global_b - dim2_start] =
+                    make_half2(sh[2 * local_b], sh[2 * local_b + 1]);
             }
             __syncthreads();
         }
@@ -244,12 +235,7 @@ static inline bool ggml_cuda_fattn_kvarn_valid_bits(const int bits) {
     return bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 8;
 }
 
-static inline bool ggml_cuda_fattn_kvarn_force_materialize_enabled() {
-    const char * env = getenv("GGML_KVARN_FORCE_MATERIALIZE");
-    return env != nullptr && env[0] != '\0' && atoi(env) != 0;
-}
-
-static inline bool ggml_cuda_fattn_kvarn_unwrap_materialize(
+static inline bool ggml_cuda_fattn_kvarn_unwrap_view(
         const ggml_tensor * t,
         ggml_cuda_fattn_kvarn_plan_side & side) {
     if (t == nullptr || t->type != GGML_TYPE_F16) {
@@ -273,11 +259,11 @@ static inline bool ggml_cuda_fattn_kvarn_unwrap_materialize(
         cur = cur->src[0];
     }
 
-    if (cur == nullptr || cur->op != GGML_OP_KVARN_MATERIALIZE) {
+    if (cur == nullptr || cur->op != GGML_OP_KVARN_VIEW) {
         return false;
     }
 
-    side.materialize = cur;
+    side.view = cur;
     side.records = cur->src[0];
     side.stage   = cur->src[1];
     side.indices = cur->src[2];
@@ -289,7 +275,6 @@ static inline bool ggml_cuda_fattn_kvarn_unwrap_materialize(
     side.value = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_MAT_VALUE) != 0;
     side.stream_start = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_MAT_STREAM_START);
     side.n_stream = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_MAT_N_STREAM);
-    side.emit_rotated = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_MAT_EMIT_ROTATED) != 0;
     side.swa = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_MAT_SWA) != 0;
     side.stage_groups = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_STAGE_GROUPS);
 
@@ -314,16 +299,10 @@ static inline bool ggml_cuda_fattn_kvarn_supported(
         const int device,
         const ggml_tensor * dst,
         ggml_cuda_fattn_kvarn_plan * out = nullptr) {
-    GGML_UNUSED(device);
-
     if (dst == nullptr || dst->op != GGML_OP_FLASH_ATTN_EXT || dst->src[0] == nullptr ||
             dst->src[1] == nullptr || dst->src[2] == nullptr) {
         return false;
     }
-    if (ggml_cuda_fattn_kvarn_force_materialize_enabled()) {
-        return false;
-    }
-
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
@@ -333,10 +312,12 @@ static inline bool ggml_cuda_fattn_kvarn_supported(
     if (!turing_mma_available(ggml_cuda_info().devices[device].cc)) {
         return false;
     }
-    if (!((Q->ne[0] == 128 && V->ne[0] == 128) || (Q->ne[0] == 256 && V->ne[0] == 256))) {
+    if (!((Q->ne[0] == 128 && V->ne[0] == 128) ||
+          (Q->ne[0] == 256 && V->ne[0] == 256) ||
+          (Q->ne[0] == 512 && V->ne[0] == 512))) {
         return false;
     }
-    if (K->ne[0] != Q->ne[0] || V->ne[0] != Q->ne[0] || Q->ne[1] > 8) {
+    if (K->ne[0] != Q->ne[0] || V->ne[0] != Q->ne[0]) {
         return false;
     }
     if (Q->ne[2] % K->ne[2] != 0 || V->ne[2] != K->ne[2] || K->ne[1] != V->ne[1] || K->ne[3] != V->ne[3]) {
@@ -344,20 +325,17 @@ static inline bool ggml_cuda_fattn_kvarn_supported(
     }
 
     ggml_cuda_fattn_kvarn_plan plan;
-    if (!ggml_cuda_fattn_kvarn_unwrap_materialize(K, plan.k) ||
-        !ggml_cuda_fattn_kvarn_unwrap_materialize(V, plan.v)) {
+    if (!ggml_cuda_fattn_kvarn_unwrap_view(K, plan.k) ||
+        !ggml_cuda_fattn_kvarn_unwrap_view(V, plan.v)) {
         return false;
     }
     if (plan.k.value || !plan.v.value) {
         return false;
     }
-    if (plan.k.swa || plan.v.swa) {
-        return false;
-    }
     if (plan.k.indices->ne[0] != plan.v.indices->ne[0] ||
         plan.k.stream_start != plan.v.stream_start ||
         plan.k.n_stream != plan.v.n_stream ||
-        plan.k.emit_rotated != plan.v.emit_rotated) {
+        plan.k.swa != plan.v.swa) {
         return false;
     }
 
@@ -369,10 +347,10 @@ static inline bool ggml_cuda_fattn_kvarn_supported(
     if (plan.n_stream != plan.k.n_stream || plan.n_stream != plan.v.n_stream) {
         return false;
     }
-    if (plan.k.materialize->ne[1] != (int64_t) plan.n_kv_heads * plan.slices ||
-        plan.v.materialize->ne[1] != (int64_t) plan.n_kv_heads * plan.slices ||
-        plan.k.materialize->ne[2] != plan.n_kv || plan.v.materialize->ne[2] != plan.n_kv ||
-        plan.k.materialize->ne[3] != plan.n_stream || plan.v.materialize->ne[3] != plan.n_stream) {
+    if (plan.k.view->ne[1] != (int64_t) plan.n_kv_heads * plan.slices ||
+        plan.v.view->ne[1] != (int64_t) plan.n_kv_heads * plan.slices ||
+        plan.k.view->ne[2] != plan.n_kv || plan.v.view->ne[2] != plan.n_kv ||
+        plan.k.view->ne[3] != plan.n_stream || plan.v.view->ne[3] != plan.n_stream) {
         return false;
     }
 
@@ -399,7 +377,7 @@ static inline void ggml_cuda_fattn_kvarn_fill_descs(
             desc.stage = (const half *) side.stage->data;
             desc.indices = (const int64_t *) side.indices->data;
             desc.live_groups = live_groups;
-            desc.n_record_heads = (int) side.materialize->ne[1];
+            desc.n_record_heads = (int) side.view->ne[1];
             desc.out_stream = s;
             desc.stream = side.stream_start + s;
             desc.head_base = h * plan.slices;
@@ -409,7 +387,6 @@ static inline void ggml_cuda_fattn_kvarn_fill_descs(
             desc.tail_groups = side.stage_groups - 1;
             desc.bits = side.bits;
             desc.value = side.value ? 1 : 0;
-            desc.emit_rotated = side.emit_rotated ? 1 : 0;
             desc.swa = side.swa ? 1 : 0;
         }
     }
@@ -455,7 +432,7 @@ void ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, gg
         plan.k.stream_start,
         plan.n_stream,
         plan.k.groups_per_stream,
-        false,
+        plan.k.swa,
         live_groups_k.get());
     ggml_cuda_fattn_kvarn_live_groups_kernel<<<plan.n_stream, GGML_CUDA_FATTN_KVARN_DIM, 0, stream>>>(
         (const int64_t *) plan.v.indices->data,
@@ -463,7 +440,7 @@ void ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, gg
         plan.v.stream_start,
         plan.n_stream,
         plan.v.groups_per_stream,
-        false,
+        plan.v.swa,
         live_groups_v.get());
 
     std::vector<ggml_cuda_fattn_kvarn_desc> k_desc_host;

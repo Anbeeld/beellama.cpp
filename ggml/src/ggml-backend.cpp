@@ -744,7 +744,24 @@ static struct ggml_tensor * ggml_dup_tensor_layout(struct ggml_context * ctx, co
 }
 
 static bool ggml_is_view_op(enum ggml_op op) {
-    return op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE;
+    return op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE || op == GGML_OP_KVARN_VIEW;
+}
+
+static const struct ggml_tensor * ggml_backend_sched_kvarn_view_base(const struct ggml_tensor * t) {
+    while (t != NULL && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE)) {
+        t = t->src[0];
+    }
+
+    return t != NULL && t->op == GGML_OP_KVARN_VIEW ? t : NULL;
+}
+
+static bool ggml_backend_sched_allows_bufferless_kvarn_src(
+        const struct ggml_tensor * node,
+        int src_index,
+        const struct ggml_tensor * src) {
+    return node->op == GGML_OP_FLASH_ATTN_EXT &&
+        (src_index == 1 || src_index == 2) &&
+        ggml_backend_sched_kvarn_view_base(src) != NULL;
 }
 
 // scheduler
@@ -1272,9 +1289,13 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             // check if we should start a new split based on the sources of the current node
             bool need_new_split = false;
             if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
+                int pending_new_split_inputs = 0;
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     struct ggml_tensor * src = node->src[j];
                     if (src == NULL) {
+                        continue;
+                    }
+                    if (ggml_backend_sched_allows_bufferless_kvarn_src(node, j, src)) {
                         continue;
                     }
                     // check if a weight is on a different and incompatible backend
@@ -1286,13 +1307,13 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             break;
                         }
                     }
-                    // check if the split has too many inputs
-                    // FIXME: count the number of inputs instead of only checking when full
-                    if (split->n_inputs == GGML_SCHED_MAX_SPLIT_INPUTS) {
-                        const size_t id = hash_id(src);
-                        int src_backend_id = sched->hv_tensor_backend_ids[id];
-                        bool supported = ggml_backend_sched_buffer_supported(sched, src, cur_backend_id);
-                        if (src_backend_id != cur_backend_id && tensor_id_copy(id, cur_backend_id, 0) == NULL && !supported) {
+                    // Check whether all new cross-backend inputs for this node still fit in the current split.
+                    const size_t id = hash_id(src);
+                    int src_backend_id = sched->hv_tensor_backend_ids[id];
+                    bool supported = ggml_backend_sched_buffer_supported(sched, src, cur_backend_id);
+                    if (src_backend_id != cur_backend_id && tensor_id_copy(id, cur_backend_id, 0) == NULL && !supported) {
+                        pending_new_split_inputs++;
+                        if (split->n_inputs + pending_new_split_inputs > GGML_SCHED_MAX_SPLIT_INPUTS) {
                             need_new_split = true;
                             break;
                         }
@@ -1349,7 +1370,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     }
                 }
 
-                if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                if (!ggml_backend_sched_allows_bufferless_kvarn_src(node, j, src) &&
+                        src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
                     // create a copy of the input in the split's backend
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];

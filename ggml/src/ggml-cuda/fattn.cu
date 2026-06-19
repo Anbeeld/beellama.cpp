@@ -53,7 +53,7 @@ static inline void ggml_cuda_fattn_kvarn_fill_descs_host(
             desc.stage = (const half *) side.stage->data;
             desc.indices = (const int64_t *) side.indices->data;
             desc.live_groups = live_groups;
-            desc.n_record_heads = (int) side.materialize->ne[1];
+            desc.n_record_heads = (int) side.view->ne[1];
             desc.out_stream = s;
             desc.stream = side.stream_start + s;
             desc.head_base = h * plan.slices;
@@ -63,7 +63,6 @@ static inline void ggml_cuda_fattn_kvarn_fill_descs_host(
             desc.tail_groups = side.stage_groups - 1;
             desc.bits = side.bits;
             desc.value = side.value ? 1 : 0;
-            desc.emit_rotated = side.emit_rotated ? 1 : 0;
             desc.swa = side.swa ? 1 : 0;
         }
     }
@@ -84,9 +83,6 @@ void ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, gg
     const int  nbatch_V2      = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols, cc);
     const int  nbatch_combine = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols, cc);
     const bool Q_in_reg       = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols, cc);
-
-    GGML_ASSERT(nbatch_K2 == DKQ/2);
-    GGML_ASSERT(nbatch_V2 == DV/2);
 
     const int cols_per_warp = std::min(ncols, get_cols_per_warp(cc));
     const int warp_size_host = ggml_cuda_info().devices[ctx.device].warp_size;
@@ -111,7 +107,7 @@ void ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, gg
         plan.k.stream_start,
         plan.n_stream,
         plan.k.groups_per_stream,
-        false,
+        plan.k.swa,
         live_groups_k.get());
     ggml_cuda_fattn_kvarn_live_groups_kernel<<<plan.n_stream, GGML_CUDA_FATTN_KVARN_DIM, 0, stream>>>(
         (const int64_t *) plan.v.indices->data,
@@ -119,7 +115,7 @@ void ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, gg
         plan.v.stream_start,
         plan.n_stream,
         plan.v.groups_per_stream,
-        false,
+        plan.v.swa,
         live_groups_v.get());
 
     std::vector<ggml_cuda_fattn_kvarn_desc> k_desc_host;
@@ -650,8 +646,12 @@ static void ggml_cuda_flash_attn_ext_mma_kvarn(ggml_backend_cuda_context & ctx, 
             GGML_ASSERT(V->ne[0] == 256);
             ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols2<256, 256>(ctx, dst);
             break;
+        case 512:
+            GGML_ASSERT(V->ne[0] == 512);
+            ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols2<512, 512>(ctx, dst);
+            break;
         default:
-            GGML_ABORT("fatal error");
+            GGML_ABORT("unsupported KVarN native FlashAttention head_dim");
     }
 }
 

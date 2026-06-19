@@ -34,11 +34,13 @@ public:
 
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const override;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const override;
-    ggml_tensor * get_k_rotated(ggml_context * ctx, int32_t il) const;
-    ggml_tensor * get_v_rotated(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_k_native(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_v_native(ggml_context * ctx, int32_t il) const;
 
     // SWA sliding-window ring: per-cell absolute positions for materialize.
     // Built as a graph input sized [n_kv]; set on the host from cells.pos_get(cell).
+    ggml_tensor * build_input_kvarn_rot(ggml_context * ctx) const;
+    void set_input_kvarn_rot(ggml_tensor * dst) const;
     ggml_tensor * build_input_kvarn_mat_idxs(ggml_context * ctx) const;
     void set_input_kvarn_mat_idxs(ggml_tensor * dst) const;
     void set_mat_idxs(ggml_tensor * idxs) const { mat_idxs = idxs; }
@@ -55,7 +57,6 @@ public:
     ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const override;
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const override;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const override;
-    ggml_tensor * build_input_kvarn_rot(ggml_context * ctx) const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const override;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const override;
@@ -68,7 +69,6 @@ public:
     void set_input_v_rot(ggml_tensor * dst) const override;
     void set_input_k_rot_backend(ggml_tensor * dst) const override;
     void set_input_v_rot_backend(ggml_tensor * dst) const override;
-    void set_input_kvarn_rot(ggml_tensor * dst) const;
 
 private:
     llama_kv_cache_context * base() const;
@@ -164,7 +164,14 @@ public:
             uint32_t n_kv,
             const llama_kv_cache::slot_info & sinfo,
             bool value,
-            bool emit_rotated = false,
+            ggml_tensor * mat_idxs = nullptr) const;
+    ggml_tensor * view(
+            ggml_context * ctx,
+            ggml_tensor * stored,
+            int32_t il,
+            uint32_t n_kv,
+            const llama_kv_cache::slot_info & sinfo,
+            bool value,
             ggml_tensor * mat_idxs = nullptr) const;
 
 private:

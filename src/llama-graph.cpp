@@ -62,14 +62,6 @@ static bool can_reuse_kq_mask(
     return res;
 }
 
-static bool kvarn_force_materialize_enabled() {
-    static const bool enabled = [] {
-        const char * env = std::getenv("GGML_KVARN_FORCE_MATERIALIZE");
-        return env != nullptr && env[0] != '\0' && std::atoi(env) != 0;
-    }();
-    return enabled;
-}
-
 // impl
 
 static ggml_tensor * ggml_mul_mat_aux(
@@ -533,6 +525,7 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         GGML_ASSERT(kvarn != nullptr);
         kvarn->set_input_kvarn_rot(self_kvarn_rot);
     }
+
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
@@ -629,9 +622,10 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     }
 
     if (self_kvarn_rot) {
-        const auto * kvarn = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx->get_base());
-        GGML_ASSERT(kvarn != nullptr);
-        kvarn->set_input_kvarn_rot(self_kvarn_rot);
+        const auto * kvarn_base = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx->get_base());
+        const auto * kvarn_swa  = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx->get_swa());
+        GGML_ASSERT(kvarn_base != nullptr || kvarn_swa != nullptr);
+        (kvarn_base ? kvarn_base : kvarn_swa)->set_input_kvarn_rot(self_kvarn_rot);
     }
 
     if (self_kvarn_mat_idxs_swa && self_kvarn_mat_idxs_swa->buffer) {
@@ -2349,10 +2343,8 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
-    if (!kvarn_force_materialize_enabled()) {
-        if (const auto * kvarn = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur)) {
-            inp->self_kvarn_rot = kvarn->build_input_kvarn_rot(ctx0);
-        }
+    if (const auto * kvarn = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur)) {
+        inp->self_kvarn_rot = kvarn->build_input_kvarn_rot(ctx0);
     }
 
     return inp;
@@ -2382,14 +2374,13 @@ ggml_tensor * llm_graph_context::build_attn(
     GGML_ASSERT(v_mla == nullptr);
 
     const auto * mctx_cur = inp->mctx;
-    const auto * kvarn_ctx =
-        (!kvarn_force_materialize_enabled() && inp->self_kvarn_rot) ?
-            dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur) : nullptr;
-    const bool use_kvarn_rotated = kvarn_ctx != nullptr && q_cur->ne[0] % 128 == 0;
+    const auto * kvarn_ctx = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur);
+    const bool use_kvarn_native = kvarn_ctx != nullptr && q_cur->ne[0] % 128 == 0;
 
-    if (use_kvarn_rotated) {
+    if (use_kvarn_native) {
         GGML_ASSERT(inp->self_k_rot == nullptr);
         GGML_ASSERT(inp->self_v_rot == nullptr);
+        GGML_ASSERT(inp->self_kvarn_rot != nullptr);
     }
 
     if (inp->self_k_rot) {
@@ -2420,10 +2411,10 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kq_mask = inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = use_kvarn_rotated ? kvarn_ctx->get_k_rotated(ctx0, il) : mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = use_kvarn_rotated ? kvarn_ctx->get_v_rotated(ctx0, il) : mctx_cur->get_v(ctx0, il);
+    ggml_tensor * k = use_kvarn_native ? kvarn_ctx->get_k_native(ctx0, il) : mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = use_kvarn_native ? kvarn_ctx->get_v_native(ctx0, il) : mctx_cur->get_v(ctx0, il);
 
-    if (use_kvarn_rotated) {
+    if (use_kvarn_native) {
         GGML_ASSERT(q->type == GGML_TYPE_F32);
         q = ggml_mul_mat_aux(ctx0, q, inp->self_kvarn_rot);
     }
@@ -2443,9 +2434,8 @@ ggml_tensor * llm_graph_context::build_attn(
     cb(cur, "kqv_out", il);
 
     // TurboQuant V un-rotation at graph level (CUDA graph compatible)
-    if (use_kvarn_rotated) {
+    if (use_kvarn_native) {
         GGML_ASSERT(cur->type == GGML_TYPE_F32);
-        cur = ggml_cont(ctx0, cur);
         cur = ggml_mul_mat_aux(ctx0, cur, inp->self_kvarn_rot);
     } else if (v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO4_TCQ || v->type == GGML_TYPE_TURBO3_TCQ || v->type == GGML_TYPE_TURBO2_TCQ) {
         if (cur->ne[0] % 128 == 0) {
@@ -2673,19 +2663,15 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * mctx_iswa = inp->mctx;
     const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
-    // KVarN rotated-domain attention: available on both non-SWA (full-context) and
-    // SWA (sliding-window ring) layers when the cache is a KVarN cache, the rotation
-    // matrix input is present, Flash Attention is enabled, and the head dim is a
-    // multiple of 128 (the KVarN tile/Hadamard dimension). SWA KVarN layers carry their
-    // own per-cell position index for materialize; the KQ mask still enforces the window.
-    const auto * kvarn_ctx =
-        (!kvarn_force_materialize_enabled() && inp->self_kvarn_rot) ?
-            dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur) : nullptr;
-    const bool use_kvarn_rotated = kvarn_ctx != nullptr && q_cur->ne[0] % 128 == 0;
+    // KVarN native attention consumes raw records/stage directly. SWA layers carry
+    // their own per-cell position index; the KQ mask still enforces the window.
+    const auto * kvarn_ctx = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur);
+    const bool use_kvarn_native = kvarn_ctx != nullptr && q_cur->ne[0] % 128 == 0;
 
-    if (use_kvarn_rotated) {
+    if (use_kvarn_native) {
         GGML_ASSERT(k_rot == nullptr);
         GGML_ASSERT(v_rot == nullptr);
+        GGML_ASSERT(inp->self_kvarn_rot != nullptr);
     }
 
     if (k_rot) {
@@ -2728,10 +2714,10 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = use_kvarn_rotated ? kvarn_ctx->get_k_rotated(ctx0, il) : mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = use_kvarn_rotated ? kvarn_ctx->get_v_rotated(ctx0, il) : mctx_cur->get_v(ctx0, il);
+    ggml_tensor * k = use_kvarn_native ? kvarn_ctx->get_k_native(ctx0, il) : mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = use_kvarn_native ? kvarn_ctx->get_v_native(ctx0, il) : mctx_cur->get_v(ctx0, il);
 
-    if (use_kvarn_rotated) {
+    if (use_kvarn_native) {
         GGML_ASSERT(q->type == GGML_TYPE_F32);
         q = ggml_mul_mat_aux(ctx0, q, inp->self_kvarn_rot);
     }
@@ -2740,9 +2726,8 @@ ggml_tensor * llm_graph_context::build_attn(
     cb(cur, "kqv_out", il);
 
     // TurboQuant V un-rotation at graph level (CUDA graph compatible)
-    if (use_kvarn_rotated) {
+    if (use_kvarn_native) {
         GGML_ASSERT(cur->type == GGML_TYPE_F32);
-        cur = ggml_cont(ctx0, cur);
         cur = ggml_mul_mat_aux(ctx0, cur, inp->self_kvarn_rot);
     } else if (v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO4_TCQ || v->type == GGML_TYPE_TURBO3_TCQ || v->type == GGML_TYPE_TURBO2_TCQ) {
         if (cur->ne[0] % 128 == 0) {
@@ -2883,22 +2868,20 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
 
     inp->self_k_rot = mctx_cur->get_base()->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->get_base()->build_input_v_rot(ctx0);
-    if (!kvarn_force_materialize_enabled()) {
-        if (const auto * kvarn = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur->get_base())) {
-            inp->self_kvarn_rot = kvarn->build_input_kvarn_rot(ctx0);
-        }
+    if (const auto * kvarn_base = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur->get_base())) {
+        inp->self_kvarn_rot = kvarn_base->build_input_kvarn_rot(ctx0);
     }
 
     inp->self_k_rot_swa = mctx_cur->get_swa()->build_input_k_rot(ctx0);
     inp->self_v_rot_swa = mctx_cur->get_swa()->build_input_v_rot(ctx0);
-    // SWA KVarN materialize needs per-cell positions on BOTH the rotated and the
-    // force-materialize (non-rotated) paths, so build them whenever the SWA cache
-    // is a KVarN cache — independent of kvarn_force_materialize_enabled(). Omitting
-    // them under force-materialize left mat_idxs null and crashed in materialize().
+    // SWA KVarN native attention needs one absolute token position per cache cell.
     if (const auto * kvarn_swa = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur->get_swa())) {
+        if (inp->self_kvarn_rot == nullptr) {
+            inp->self_kvarn_rot = kvarn_swa->build_input_kvarn_rot(ctx0);
+        }
         inp->self_kvarn_mat_idxs_swa = kvarn_swa->build_input_kvarn_mat_idxs(ctx0);
-        // make the materialize indices available to the context at graph build time
-        // (get_k/get_v/materialize run during build, before set_input populates them)
+        // make the SWA indices available to the context at graph build time
+        // (get_k_native/get_v_native run during build, before set_input populates them)
         const_cast<llama_kv_cache_kvarn_context *>(kvarn_swa)->set_mat_idxs(inp->self_kvarn_mat_idxs_swa);
     }
 

@@ -24,6 +24,7 @@
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
+#include "fattn-mma-kvarn.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
@@ -3395,13 +3396,27 @@ static void ggml_cuda_log_nonlocal_src_buffer(
             ptr_device);
 }
 
+static const ggml_tensor * ggml_cuda_kvarn_view_base(const ggml_tensor * t) {
+    while (t != nullptr && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE)) {
+        t = t->src[0];
+    }
+
+    return t != nullptr && t->op == GGML_OP_KVARN_VIEW ? t : nullptr;
+}
+
+static bool ggml_cuda_allows_bufferless_kvarn_src(const ggml_tensor * node, int src_index, const ggml_tensor * src) {
+    return node->op == GGML_OP_FLASH_ATTN_EXT &&
+        (src_index == 1 || src_index == 2) &&
+        ggml_cuda_kvarn_view_base(src) != nullptr;
+}
+
 static bool ggml_cuda_graph_node_buffers_visible(
         ggml_backend_cuda_context * cuda_ctx,
         const ggml_tensor * node,
         bool integrated,
         bool log_errors) {
     if (!node || ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
-            node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE ||
+            node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_KVARN_VIEW || node->op == GGML_OP_NONE ||
             (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
         return true;
     }
@@ -3416,6 +3431,9 @@ static bool ggml_cuda_graph_node_buffers_visible(
     for (int j = 0; j < GGML_MAX_SRC; ++j) {
         const ggml_tensor * src = node->src[j];
         if (!src) {
+            continue;
+        }
+        if (ggml_cuda_allows_bufferless_kvarn_src(node, j, src)) {
             continue;
         }
         if (!src->buffer || !ggml_cuda_buffer_visible_to_backend(cuda_ctx, src->buffer->buft, integrated)) {
@@ -3439,8 +3457,16 @@ static bool ggml_cuda_graph_check_compability(ggml_backend_cuda_context * cuda_c
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
 
-        if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
+        if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_KVARN_VIEW || node->op == GGML_OP_NONE) {
             continue;
+        }
+
+        if (node->op == GGML_OP_FLASH_ATTN_EXT && ggml_cuda_fattn_kvarn_supported(cuda_ctx->device, node)) {
+            use_cuda_graph = false;
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: disabling CUDA graphs due to native KVarN FlashAttention descriptors\n", __func__);
+#endif
+            break;
         }
 
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
@@ -4591,7 +4617,7 @@ static enum ggml_status ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_c
 #endif
                 prev_i = i;
 
-                if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
+                if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_KVARN_VIEW || node->op == GGML_OP_NONE) {
                     continue;
                 }
 
@@ -4811,7 +4837,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 
     const auto & is_noop = [](const ggml_tensor * node) -> bool {
         return ggml_is_empty(node) || node->op == GGML_OP_NONE || node->op == GGML_OP_RESHAPE ||
-               node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE;
+               node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_KVARN_VIEW;
     };
 
     const auto & depends_on = [](const ggml_tensor * dst, const ggml_tensor * src) -> bool {

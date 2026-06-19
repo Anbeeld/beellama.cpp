@@ -425,7 +425,7 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     const struct ggml_tensor * src1 = op->src[1];
     const struct ggml_tensor * src2 = op->src[2];
 
-    if (op->op == GGML_OP_NONE || op->op == GGML_OP_RESHAPE || op->op == GGML_OP_VIEW || op->op == GGML_OP_PERMUTE || op->op == GGML_OP_TRANSPOSE) {
+    if (op->op == GGML_OP_NONE || op->op == GGML_OP_RESHAPE || op->op == GGML_OP_VIEW || op->op == GGML_OP_PERMUTE || op->op == GGML_OP_TRANSPOSE || op->op == GGML_OP_KVARN_VIEW) {
         return true;
     }
 

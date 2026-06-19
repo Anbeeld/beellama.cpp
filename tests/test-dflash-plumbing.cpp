@@ -440,17 +440,33 @@ int main(int argc, char ** argv) {
                  cuda_fattn.find("K->type == GGML_TYPE_TURBO3_0 ||") != std::string::npos &&
                  cuda_fattn.find("K->type == GGML_TYPE_TURBO2_0") != std::string::npos,
         "fused Turbo MMA must stay limited to decode-sized batches and straight turbo K/V pairs");
+    ok &= expect(ggml_h.find("GGML_OP_KVARN_VIEW") != std::string::npos &&
+                 ggml_h.find("ggml_kvarn_view") != std::string::npos &&
+                 ggml_c.find("GGML_OP_KVARN_VIEW") != std::string::npos &&
+                 ggml_c.find("ggml_kvarn_view") != std::string::npos &&
+                 ggml_c.find("ggml_flash_attn_ext_add_kvarn_deps") != std::string::npos &&
+                 ggml_c.find("result->src[8] = v_view->src[2];") != std::string::npos,
+        "GGML must expose a no-materialize KVarN view/proxy op and keep raw KVarN FA dependencies alive");
+    ok &= expect(ggml_backend_cpp.find("pending_new_split_inputs") != std::string::npos &&
+                 ggml_backend_cpp.find("split->n_inputs + pending_new_split_inputs > GGML_SCHED_MAX_SPLIT_INPUTS") != std::string::npos,
+        "backend scheduler must pre-count all new cross-backend inputs for a node before deciding whether to start a new split");
+    ok &= expect(ggml_backend_cpp.find("ggml_backend_sched_allows_bufferless_kvarn_src") != std::string::npos &&
+                 ggml_backend_cpp.find("node->op == GGML_OP_FLASH_ATTN_EXT") != std::string::npos &&
+                 ggml_backend_cpp.find("src_index == 1 || src_index == 2") != std::string::npos,
+        "backend scheduler must not copy bufferless KVarN native K/V proxy sources as split inputs");
     ok &= expect(cuda_fattn.find("#include \"fattn-mma-kvarn.cuh\"") != std::string::npos &&
                  cuda_fattn.find("ggml_cuda_flash_attn_ext_mma_kvarn_case") != std::string::npos &&
-                 cuda_fattn.find("ggml_cuda_fattn_kvarn_supported") != std::string::npos,
-        "CUDA FlashAttention must recognize KVarN materialize inputs and route supported decode batches to native MMA KVarN");
+                 cuda_fattn.find("ggml_cuda_fattn_kvarn_supported") != std::string::npos &&
+                 cuda_fattn_mma_kvarn.find("ggml_cuda_fattn_kvarn_unwrap_view") != std::string::npos &&
+                 cuda_fattn_mma_kvarn.find("GGML_OP_KVARN_MATERIALIZE") == std::string::npos,
+        "CUDA FlashAttention must recognize KVarN view inputs directly and avoid materialize ancestry in the native route");
     ok &= expect(cuda_fattn_mma_kvarn.find("ggml_cuda_flash_attn_ext_mma_kvarn_case") != std::string::npos &&
                  cuda_fattn_mma_kvarn.find("flash_attn_ext_f16") != std::string::npos &&
                  cuda_fattn_mma_kvarn.find("need_f16_K=false") != std::string::npos &&
                  cuda_fattn_mma_kvarn.find("need_f16_V=false") != std::string::npos &&
-                 cuda_fattn_mma_kvarn.find("GGML_KVARN_FORCE_MATERIALIZE") != std::string::npos &&
-                 cuda_fattn_mma_kvarn.find("ggml_cuda_fattn_kvarn_force_materialize_enabled") != std::string::npos,
-        "native KVarN FlashAttention must reuse the MMA F16 kernel template without F16 materialize buffers while honoring FORCE_MATERIALIZE");
+                 cuda_fattn_mma_kvarn.find("GGML_KVARN_FORCE_MATERIALIZE") == std::string::npos &&
+                 cuda_fattn_mma_kvarn.find("ggml_cuda_fattn_kvarn_force_materialize_enabled") == std::string::npos,
+        "native KVarN FlashAttention must reuse the MMA F16 kernel template without F16 materialize buffers or materialize fallback env gates");
     ok &= expect(cuda_fattn.find("D=512: MMA/TILE templates don't support this head_dim, use VEC unconditionally") == std::string::npos &&
                  cuda_fattn.find("if (Q->ne[0] == 512) {\n        return BEST_FATTN_KERNEL_VEC;") == std::string::npos,
         "CUDA FlashAttention must not force all D=512 non-turbo attention onto the vector kernel; Gemma4 global layers need the MMA selector path");
@@ -2733,31 +2749,22 @@ int main(int argc, char ** argv) {
                  cuda_cpp.find("GGML_KVARN_FUSED") == std::string::npos &&
                  cuda_cpp.find("GGML_KVARN_NATIVE_FA") == std::string::npos,
         "CUDA KVarN native/fused FlashAttention path and route envs must be removed");
-    ok &= expect(graph_cpp.find("GGML_KVARN_FORCE_MATERIALIZE") != std::string::npos &&
-                 graph_cpp.find("kvarn_force_materialize_enabled") != std::string::npos &&
+    ok &= expect(graph_cpp.find("GGML_KVARN_FORCE_MATERIALIZE") == std::string::npos &&
+                 graph_cpp.find("kvarn_force_materialize_enabled") == std::string::npos &&
                  graph_cpp.find("GGML_KVARN_ROTATED_FA") == std::string::npos &&
-                 graph_cpp.find("get_k_rotated") != std::string::npos &&
-                 graph_cpp.find("get_v_rotated") != std::string::npos &&
-                 graph_cpp.find("self_kvarn_rot") != std::string::npos &&
-                 graph_cpp.find("GGML_ASSERT(inp->self_k_rot == nullptr)") != std::string::npos &&
-                 graph_cpp.find("GGML_ASSERT(inp->self_v_rot == nullptr)") != std::string::npos &&
-                 graph_cpp.find("GGML_ASSERT(k_rot == nullptr)") != std::string::npos &&
-                 graph_cpp.find("GGML_ASSERT(v_rot == nullptr)") != std::string::npos &&
-                 count_occurrences(graph_cpp, "GGML_ASSERT(q->type == GGML_TYPE_F32);") >= 2 &&
-                 count_occurrences(graph_cpp, "GGML_ASSERT(cur->type == GGML_TYPE_F32);") >= 2 &&
+                 graph_cpp.find("get_k_rotated") == std::string::npos &&
+                 graph_cpp.find("get_v_rotated") == std::string::npos &&
                  graph_cpp.find("ggml_mul_mat_aux(ctx0, q, inp->self_kvarn_rot)") != std::string::npos &&
                  graph_cpp.find("ggml_mul_mat_aux(ctx0, cur, inp->self_kvarn_rot)") != std::string::npos &&
+                 kv_cache_kvarn_h.find("get_k_native") != std::string::npos &&
+                 kv_cache_kvarn_h.find("get_v_native") != std::string::npos &&
+                 kv_cache_kvarn_h.find("get_k_rotated") == std::string::npos &&
+                 kv_cache_kvarn_h.find("get_v_rotated") == std::string::npos &&
                  kv_cache_kvarn_h.find("build_input_kvarn_rot") != std::string::npos &&
-                 kv_cache_kvarn_cpp.find("static const std::vector<float> data = []") != std::string::npos &&
-                 kv_cache_kvarn_cpp.find("const auto & data = kvarn_hadamard_128()") != std::string::npos &&
-                 kv_cache_kvarn_cpp.find("result->op_params[5] = emit_rotated ? 1 : 0") != std::string::npos &&
-                 vulkan_cpp.find("const bool emit_rotated = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_MAT_EMIT_ROTATED) != 0") != std::string::npos &&
-                 vulkan_cpp.find("emit_rotated ? 1u : 0u") != std::string::npos &&
-                 vulkan_cpp.find("1.0f / std::sqrt((float)src->ne[0])") != std::string::npos &&
-                 vulkan_kvarn_materialize.find("uint emit_rotated") != std::string::npos &&
-                 vulkan_kvarn_materialize.find("if (p.emit_rotated != 0u)") != std::string::npos &&
-                 vulkan_kvarn_materialize.find("barrier();") != std::string::npos,
-        "KVarN rotated-domain FA must default on, use one materialize fallback env, rotate Q/output exactly once, and preserve Vulkan FWHT/rotated materialize plumbing");
+                 kv_cache_kvarn_cpp.find("ggml_kvarn_view") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("result->op_params[5] = emit_rotated ? 1 : 0") == std::string::npos &&
+                 cuda_fattn_mma_kvarn.find("for (int stride = 1; stride < GGML_CUDA_FATTN_KVARN_DIM; stride <<= 1)") == std::string::npos,
+        "KVarN attention graph must keep native K/V views, rotate only Q/output once, and avoid per-tile inverse-WHT in native FA");
 
     return ok ? 0 : 1;
 }

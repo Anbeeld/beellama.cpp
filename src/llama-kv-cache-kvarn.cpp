@@ -201,25 +201,25 @@ ggml_type llama_kv_cache_kvarn_context::type_v() const {
 ggml_tensor * llama_kv_cache_kvarn_context::get_k(ggml_context * ctx, int32_t il) const {
     const auto it = stored_k.find(cache->mapped_layer_id(il));
     GGML_ASSERT(it != stored_k.end());
-    return cache->materialize(ctx, it->second, il, get_n_kv(), current_sinfo(), false, false, mat_idxs);
+    return cache->materialize(ctx, it->second, il, get_n_kv(), current_sinfo(), false, mat_idxs);
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::get_v(ggml_context * ctx, int32_t il) const {
     const auto it = stored_v.find(cache->mapped_layer_id(il));
     GGML_ASSERT(it != stored_v.end());
-    return cache->materialize(ctx, it->second, il, get_n_kv(), current_sinfo(), true, false, mat_idxs);
+    return cache->materialize(ctx, it->second, il, get_n_kv(), current_sinfo(), true, mat_idxs);
 }
 
-ggml_tensor * llama_kv_cache_kvarn_context::get_k_rotated(ggml_context * ctx, int32_t il) const {
+ggml_tensor * llama_kv_cache_kvarn_context::get_k_native(ggml_context * ctx, int32_t il) const {
     const auto it = stored_k.find(cache->mapped_layer_id(il));
     GGML_ASSERT(it != stored_k.end());
-    return cache->materialize(ctx, it->second, il, get_n_kv(), current_sinfo(), false, true, mat_idxs);
+    return cache->view(ctx, it->second, il, get_n_kv(), current_sinfo(), false, mat_idxs);
 }
 
-ggml_tensor * llama_kv_cache_kvarn_context::get_v_rotated(ggml_context * ctx, int32_t il) const {
+ggml_tensor * llama_kv_cache_kvarn_context::get_v_native(ggml_context * ctx, int32_t il) const {
     const auto it = stored_v.find(cache->mapped_layer_id(il));
     GGML_ASSERT(it != stored_v.end());
-    return cache->materialize(ctx, it->second, il, get_n_kv(), current_sinfo(), true, true, mat_idxs);
+    return cache->view(ctx, it->second, il, get_n_kv(), current_sinfo(), true, mat_idxs);
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::get_turbo_rotation() const {
@@ -236,6 +236,13 @@ ggml_tensor * llama_kv_cache_kvarn_context::get_turbo_rot_forward() const {
 
 ggml_tensor * llama_kv_cache_kvarn_context::get_turbo_rot_inverse() const {
     return nullptr;
+}
+
+ggml_tensor * llama_kv_cache_kvarn_context::build_input_kvarn_rot(ggml_context * ctx) const {
+    ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, KVAR_N_GROUP, KVAR_N_GROUP);
+    ggml_set_input(res);
+    ggml_set_name(res, "attn_inp_kvarn_rot");
+    return res;
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::cpy_k(
@@ -272,13 +279,6 @@ ggml_tensor * llama_kv_cache_kvarn_context::build_input_k_rot(ggml_context * ctx
 
 ggml_tensor * llama_kv_cache_kvarn_context::build_input_v_rot(ggml_context * ctx) const {
     return base()->build_input_v_rot(ctx);
-}
-
-ggml_tensor * llama_kv_cache_kvarn_context::build_input_kvarn_rot(ggml_context * ctx) const {
-    ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, KVAR_N_GROUP, KVAR_N_GROUP);
-    ggml_set_input(res);
-    ggml_set_name(res, "attn_inp_kvarn_rot");
-    return res;
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::build_input_kvarn_mat_idxs(ggml_context * ctx) const {
@@ -1130,7 +1130,6 @@ ggml_tensor * llama_kv_cache_kvarn::materialize(
         uint32_t n_kv,
         const llama_kv_cache::slot_info & sinfo,
         bool value,
-        bool emit_rotated,
         ggml_tensor * mat_idxs) const {
     const auto & layer = layer_for(il);
     const uint32_t stream_start = sinfo.s0;
@@ -1151,8 +1150,46 @@ ggml_tensor * llama_kv_cache_kvarn::materialize(
         value ? params.value_bits : params.key_bits,
         value,
         int32_t(stage_groups));
-    result->op_params[5] = emit_rotated ? 1 : 0;
     result->op_params[6] = swa ? 1 : 0; // SWA sliding-window ring materialize
+    const uint32_t slices = value ? layer.v_slices : layer.k_slices;
+    if (slices > 1) {
+        result = ggml_reshape_4d(
+                ctx,
+                result,
+                value ? layer.head_dim_v : layer.head_dim_k,
+                layer.n_head_kv,
+                n_kv,
+                stream_count);
+    }
+
+    return result;
+}
+
+ggml_tensor * llama_kv_cache_kvarn::view(
+        ggml_context * ctx,
+        ggml_tensor * stored,
+        int32_t il,
+        uint32_t n_kv,
+        const llama_kv_cache::slot_info & sinfo,
+        bool value,
+        ggml_tensor * mat_idxs) const {
+    const auto & layer = layer_for(il);
+    const uint32_t stream_start = sinfo.s0;
+    const uint32_t stream_count = sinfo.s1 - sinfo.s0 + 1;
+    ggml_tensor * indices = swa ? mat_idxs : stored->src[1];
+
+    ggml_tensor * result = ggml_kvarn_view(
+        ctx,
+        value ? layer.v_records : layer.k_records,
+        stored,
+        indices,
+        n_kv,
+        stream_start,
+        stream_count,
+        value ? params.value_bits : params.key_bits,
+        value,
+        int32_t(stage_groups));
+    result->op_params[6] = swa ? 1 : 0;
     const uint32_t slices = value ? layer.v_slices : layer.k_slices;
     if (slices > 1) {
         result = ggml_reshape_4d(

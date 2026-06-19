@@ -2187,6 +2187,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_kvarn_store(params, tensor);
             } break;
+        case GGML_OP_KVARN_VIEW:
+            {
+                // no-op proxy consumed by native KVarN FlashAttention backends
+            } break;
         case GGML_OP_KVARN_MATERIALIZE:
             {
                 ggml_compute_forward_kvarn_materialize(params, tensor);
@@ -2378,6 +2382,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 n_tasks = n_threads;
             } break;
         case GGML_OP_KVARN_STORE:
+        case GGML_OP_KVARN_VIEW:
             {
                 n_tasks = 1;
             } break;
@@ -3107,6 +3112,7 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_TURBO_WHT:
                 case GGML_OP_KVARN_STORE:
+                case GGML_OP_KVARN_VIEW:
                 case GGML_OP_KVARN_MATERIALIZE:
                     {
                         cur = 0;  // no extra workspace needed

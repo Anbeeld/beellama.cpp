@@ -751,6 +751,223 @@ static void require_close_f16_rmse(
     }
 }
 
+static void fill_hadamard_matrix_128(std::vector<float> & data) {
+    constexpr int n = 128;
+    data.assign(n * n, 0.0f);
+    data[0] = 1.0f / std::sqrt(float(n));
+
+    for (int s = 1; s < n; s *= 2) {
+        for (int i = 0; i < s; ++i) {
+            for (int j = 0; j < s; ++j) {
+                const float val = data[i * n + j];
+
+                data[(i + s) * n + j]       =  val;
+                data[i * n + (j + s)]       =  val;
+                data[(i + s) * n + (j + s)] = -val;
+            }
+        }
+    }
+}
+
+static ggml_tensor * apply_hadamard_128(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * rot) {
+    const int64_t n = rot->ne[0];
+    ggml_tensor * res = nullptr;
+
+    if (!ggml_is_contiguous(cur)) {
+        res = ggml_cont_2d(ctx, cur, n, ggml_nelements(cur) / n);
+    } else {
+        res = ggml_reshape_2d(ctx, cur, n, ggml_nelements(cur) / n);
+    }
+    res = ggml_mul_mat(ctx, rot, res);
+    ggml_mul_mat_set_hint(res, GGML_HINT_SRC0_IS_HADAMARD);
+    return ggml_reshape_4d(ctx, res, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
+}
+
+static std::vector<float> test_native_flash_attention_output(
+        ggml_backend_t backend,
+        bool           native_view,
+        int            head_dim,
+        int            bits_k,
+        int            bits_v,
+        int            n_q) {
+    ggml_init_params params = {
+        /*.mem_size   =*/ 32 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr, "native FA: failed to initialize ggml context");
+
+    constexpr int n_stream   = 1;
+    constexpr int n_q_heads  = 1;
+    constexpr int n_kv_heads = 1;
+    constexpr int n_kv       = 512;
+    constexpr int stage_groups = 3;
+    const int slices = head_dim / 128;
+    const int record_heads = n_kv_heads * slices;
+    const int groups_per_stream = std::max(4, (n_kv + 127) / 128);
+    const int k_record_bytes = int(llama_kvarn_packed_bytes(128 * 128, bits_k) + 3 * 128 * sizeof(ggml_fp16_t));
+    const int v_record_bytes = int(llama_kvarn_packed_bytes(128 * 128, bits_v) + 3 * 128 * sizeof(ggml_fp16_t));
+
+    ggml_tensor * q_in = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_dim, n_q, n_q_heads, n_stream);
+    ggml_tensor * kvarn_rot = native_view ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 128) : nullptr;
+    ggml_tensor * q = native_view ? apply_hadamard_128(ctx, q_in, kvarn_rot) : q_in;
+    ggml_tensor * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_kv * n_stream);
+    ggml_tensor * current_k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, record_heads, n_kv * n_stream);
+    ggml_tensor * current_v = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, record_heads, n_kv * n_stream);
+    ggml_tensor * k_stage = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, record_heads, 128 * stage_groups * n_stream);
+    ggml_tensor * v_stage = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, record_heads, 128 * stage_groups * n_stream);
+    ggml_tensor * k_records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, k_record_bytes, record_heads, groups_per_stream * n_stream);
+    ggml_tensor * v_records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, v_record_bytes, record_heads, groups_per_stream * n_stream);
+
+    ggml_tensor * stored_k = ggml_kvarn_store(ctx, current_k, indices, k_stage, k_records, bits_k, 16, false, stage_groups);
+    ggml_tensor * stored_v = ggml_kvarn_store(ctx, current_v, indices, v_stage, v_records, bits_v, 16, true,  stage_groups);
+    stored_k->op_params[3] = n_kv;
+    stored_v->op_params[3] = n_kv;
+
+    ggml_tensor * k = native_view ?
+        ggml_kvarn_view(ctx, k_records, stored_k, indices, n_kv, 0, n_stream, bits_k, false, stage_groups) :
+        ggml_kvarn_materialize(ctx, k_records, stored_k, indices, n_kv, 0, n_stream, bits_k, false, stage_groups);
+    ggml_tensor * v = native_view ?
+        ggml_kvarn_view(ctx, v_records, stored_v, indices, n_kv, 0, n_stream, bits_v, true,  stage_groups) :
+        ggml_kvarn_materialize(ctx, v_records, stored_v, indices, n_kv, 0, n_stream, bits_v, true,  stage_groups);
+
+    if (slices > 1) {
+        k = ggml_reshape_4d(ctx, k, head_dim, n_kv_heads, n_kv, n_stream);
+        v = ggml_reshape_4d(ctx, v, head_dim, n_kv_heads, n_kv, n_stream);
+    }
+    k = ggml_permute(ctx, k, 0, 2, 1, 3);
+    v = ggml_permute(ctx, v, 0, 2, 1, 3);
+
+    ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_q, 1, n_stream);
+    ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, mask, 1.0f / std::sqrt(float(head_dim)), 0.0f, 0.0f);
+    ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+    if (native_view) {
+        out = ggml_cont(ctx, out);
+        out = apply_hadamard_128(ctx, out, kvarn_rot);
+    }
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, out);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    require(buffer != nullptr, "native FA: failed to allocate tensors");
+
+    std::vector<float> q_data((size_t) head_dim * n_q * n_q_heads * n_stream);
+    for (int iq = 0; iq < n_q; ++iq) {
+        for (int d = 0; d < head_dim; ++d) {
+            q_data[(size_t) iq * head_dim + d] =
+                0.09f * std::sin(float(d) * 0.017f + float(iq) * 0.13f) +
+                0.07f * std::cos(float(d) * 0.031f - float(iq) * 0.05f);
+        }
+    }
+
+    std::vector<float> k_data((size_t) 128 * record_heads * n_kv * n_stream);
+    std::vector<float> v_data(k_data.size());
+    for (int t = 0; t < n_kv; ++t) {
+        for (int h = 0; h < n_kv_heads; ++h) {
+            for (int slice = 0; slice < slices; ++slice) {
+                const int record_head = h * slices + slice;
+                for (int d = 0; d < 128; ++d) {
+                    const int full_d = slice * 128 + d;
+                    const size_t off = ((size_t) t * record_heads + record_head) * 128 + d;
+                    k_data[off] =
+                        0.80f * std::sin(float(full_d) * 0.011f + float(t) * 0.021f) +
+                        0.10f * std::cos(float(t) * 0.009f + float(h) * 0.17f);
+                    v_data[off] =
+                        0.75f * std::cos(float(full_d) * 0.013f - float(t) * 0.019f) +
+                        0.08f * std::sin(float(t) * 0.015f + float(h) * 0.23f);
+                }
+            }
+        }
+    }
+
+    std::vector<int64_t> idx(n_kv * n_stream);
+    for (int i = 0; i < n_kv * n_stream; ++i) {
+        idx[i] = i;
+    }
+
+    std::vector<ggml_fp16_t> mask_data((size_t) n_kv * n_q * n_stream);
+    for (int iq = 0; iq < n_q; ++iq) {
+        for (int ikv = 0; ikv < n_kv; ++ikv) {
+            mask_data[(size_t) iq * n_kv + ikv] = ggml_fp32_to_fp16(ikv <= iq + n_kv - n_q ? 0.0f : -INFINITY);
+        }
+    }
+
+    std::vector<uint8_t> k_stage_zeros(ggml_nbytes(k_stage), 0);
+    std::vector<uint8_t> v_stage_zeros(ggml_nbytes(v_stage), 0);
+    std::vector<uint8_t> k_record_zeros(ggml_nbytes(k_records), 0);
+    std::vector<uint8_t> v_record_zeros(ggml_nbytes(v_records), 0);
+
+    ggml_backend_tensor_set(q_in, q_data.data(), 0, ggml_nbytes(q_in));
+    if (kvarn_rot != nullptr) {
+        std::vector<float> rot_data;
+        fill_hadamard_matrix_128(rot_data);
+        ggml_backend_tensor_set(kvarn_rot, rot_data.data(), 0, ggml_nbytes(kvarn_rot));
+    }
+    ggml_backend_tensor_set(indices, idx.data(), 0, ggml_nbytes(indices));
+    ggml_backend_tensor_set(current_k, k_data.data(), 0, ggml_nbytes(current_k));
+    ggml_backend_tensor_set(current_v, v_data.data(), 0, ggml_nbytes(current_v));
+    ggml_backend_tensor_set(k_stage, k_stage_zeros.data(), 0, k_stage_zeros.size());
+    ggml_backend_tensor_set(v_stage, v_stage_zeros.data(), 0, v_stage_zeros.size());
+    ggml_backend_tensor_set(k_records, k_record_zeros.data(), 0, k_record_zeros.size());
+    ggml_backend_tensor_set(v_records, v_record_zeros.data(), 0, v_record_zeros.size());
+    ggml_backend_tensor_set(mask, mask_data.data(), 0, ggml_nbytes(mask));
+
+    require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
+            native_view ? "native FA: native-view graph compute failed" : "native FA: materialized graph compute failed");
+
+    std::vector<float> output(ggml_nelements(out));
+    ggml_backend_tensor_get(out, output.data(), 0, ggml_nbytes(out));
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    return output;
+}
+
+static void require_close_f32_rmse(
+        const std::vector<float> & actual,
+        const std::vector<float> & expected,
+        float                      rmse_limit,
+        const char *               message) {
+    require(actual.size() == expected.size(), "f32 RMSE parity size mismatch");
+    double mse = 0.0;
+    double max_diff = 0.0;
+    for (size_t i = 0; i < actual.size(); ++i) {
+        require(std::isfinite(actual[i]) && std::isfinite(expected[i]), "f32 parity output contained non-finite value");
+        const double diff = double(actual[i]) - double(expected[i]);
+        mse += diff * diff;
+        max_diff = std::max(max_diff, std::fabs(diff));
+    }
+
+    const double rmse = std::sqrt(mse / double(actual.size()));
+    if (!std::isfinite(rmse) || rmse > rmse_limit) {
+        std::fprintf(stderr,
+                "KVarN native FA parity mismatch: rmse=%g max_diff=%g limit=%g\n",
+                rmse, max_diff, double(rmse_limit));
+        require(false, message);
+    }
+}
+
+static void test_native_flash_attention_gpu() {
+    ggml_backend_t gpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
+    if (gpu_backend == nullptr) {
+        return;
+    }
+    ggml_backend_t cpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_CPU, true);
+
+    for (int head_dim : { 128, 256, 512 }) {
+        const int n_q = head_dim == 512 ? 64 : 4;
+        const std::vector<float> expected = test_native_flash_attention_output(cpu_backend, false, head_dim, 4, 3, n_q);
+        const std::vector<float> actual   = test_native_flash_attention_output(gpu_backend, true,  head_dim, 4, 3, n_q);
+        require_close_f32_rmse(actual, expected, head_dim == 512 ? 2e-2f : 1e-2f,
+                "native KVarN FlashAttention output differs from materialized CPU reference");
+    }
+
+    ggml_backend_free(cpu_backend);
+    ggml_backend_free(gpu_backend);
+}
+
 static void test_store_paths_gpu() {
     ggml_backend_t gpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
     if (gpu_backend == nullptr) {
@@ -1235,6 +1452,7 @@ int main() {
     test_cache_ops_swa(GGML_BACKEND_DEVICE_TYPE_GPU, false); // CUDA SWA ring parity
     test_store_paths_gpu();
     test_materialize_paths_gpu();
+    test_native_flash_attention_gpu();
     test_materialize_rotated_transform_consistency(GGML_BACKEND_DEVICE_TYPE_CPU, true);
     test_materialize_rotated_transform_consistency(GGML_BACKEND_DEVICE_TYPE_GPU, false);
 
