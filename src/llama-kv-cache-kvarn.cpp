@@ -427,11 +427,13 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     n_groups_per_stream(((kv_size + KVAR_N_GROUP - 1) / KVAR_N_GROUP) +
         ((n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE) ? 2u : 0u)),
     // Dynamic staging: size the lossless F16 ring from the configured physical
-    // ubatch. tail_groups = ceil(n_ubatch / 128); stage_groups = tail_groups + 1.
-    // The +1 reserves the permanent sink slot for non-SWA caches and the extra
-    // ping-pong slot for SWA. Clamp n_ubatch to at least one group so degenerate
-    // configurations (n_ubatch == 0 in edge tests) do not produce zero-depth stage.
-    tail_groups(std::max<uint32_t>(1u, (n_ubatch + KVAR_N_GROUP - 1u) / KVAR_N_GROUP)),
+    // ubatch. Non-SWA KVarN keeps at least four transient tail groups; Qwen KLD
+    // is sensitive to the compression boundary at common -ub 256 settings. SWA
+    // keeps the smaller ring because it has no permanent sink and stores a
+    // sliding window rather than a full-context cache.
+    tail_groups(std::max<uint32_t>(
+        (n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE) ? 1u : 4u,
+        (n_ubatch + KVAR_N_GROUP - 1u) / KVAR_N_GROUP)),
     stage_groups(tail_groups + 1u),
     swa(n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE),
     metadata(std::make_unique<llama_kv_cache>(
@@ -501,7 +503,8 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     const size_t v_record_size = kvarn_record_bytes(params.value_bits);
     const int64_t n_record_groups = int64_t(n_groups_per_stream) * n_stream;
     // Stage depth is now a cache property derived from the configured physical
-    // ubatch (tail_groups = ceil(n_ubatch/128), stage_groups = tail_groups + 1).
+    // ubatch. Non-SWA caches keep at least four transient tail groups; SWA uses
+    // the raw ubatch-derived tail because its staging area is a sliding ring.
     // Backends read stage_groups from op_params[7] instead of assuming 3.
     const int64_t n_stage_tokens = int64_t(KVAR_N_GROUP) * int64_t(stage_groups) * n_stream;
     size_t raw_bytes = 0;

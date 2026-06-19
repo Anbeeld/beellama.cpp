@@ -139,9 +139,10 @@ public:
     bool is_swa() const { return swa; }
 
     // Dynamic staging: the lossless F16 ring is sized from the configured physical
-    // ubatch so attention sees the same F16/compressed mix regardless of ubatch.
-    //   tail_groups  = ceil(n_ubatch / KVAR_N_GROUP)
-    //   stage_groups = tail_groups + 1
+    // ubatch, with a non-SWA precision floor for common small ubatches.
+    //   non-SWA tail_groups = max(4, ceil(n_ubatch / KVAR_N_GROUP))
+    //   SWA tail_groups     = max(1, ceil(n_ubatch / KVAR_N_GROUP))
+    //   stage_groups        = tail_groups + 1
     // The +1 is the permanent sink slot for non-SWA, or the extra ping-pong slot
     // for SWA. KVarN cache state is versioned to carry stage_groups so restore can
     // validate the saved layout against the current cache. The W2 gate rejects
@@ -194,7 +195,7 @@ private:
     const uint32_t n_groups_per_stream;
     // Declaration order matters: stage_groups depends on tail_groups, so
     // tail_groups must be declared first (C++ initializes members in order).
-    const uint32_t tail_groups;   // ceil(n_ubatch / 128)
+    const uint32_t tail_groups;   // non-SWA max(4, ceil(n_ubatch / 128)); SWA max(1, ceil(...))
     const uint32_t stage_groups;   // F16 stage depth (tail_groups + 1)
     const bool swa;
 
