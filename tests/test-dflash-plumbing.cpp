@@ -177,6 +177,7 @@ int main(int argc, char ** argv) {
     const std::string cuda_fattn_common = read_file(root + "/ggml/src/ggml-cuda/fattn-common.cuh");
     const std::string cuda_fattn_vec = read_file(root + "/ggml/src/ggml-cuda/fattn-vec.cuh");
     const std::string cuda_fattn_kvarn = read_file_optional(root + "/ggml/src/ggml-cuda/fattn-kvarn.cuh");
+    const std::string cuda_fattn_mma_kvarn = read_file_optional(root + "/ggml/src/ggml-cuda/fattn-mma-kvarn.cuh");
     const std::string cuda_turbo_quant = read_file(root + "/ggml/src/ggml-cuda/turbo-quant-cuda.cuh");
     const std::string cuda_cmake = read_file(root + "/ggml/src/ggml-cuda/CMakeLists.txt");
     const std::string cuda_fattn_h = read_file(root + "/ggml/src/ggml-cuda/fattn.cuh");
@@ -439,6 +440,17 @@ int main(int argc, char ** argv) {
                  cuda_fattn.find("K->type == GGML_TYPE_TURBO3_0 ||") != std::string::npos &&
                  cuda_fattn.find("K->type == GGML_TYPE_TURBO2_0") != std::string::npos,
         "fused Turbo MMA must stay limited to decode-sized batches and straight turbo K/V pairs");
+    ok &= expect(cuda_fattn.find("#include \"fattn-mma-kvarn.cuh\"") != std::string::npos &&
+                 cuda_fattn.find("ggml_cuda_flash_attn_ext_mma_kvarn_case") != std::string::npos &&
+                 cuda_fattn.find("ggml_cuda_fattn_kvarn_supported") != std::string::npos,
+        "CUDA FlashAttention must recognize KVarN materialize inputs and route supported decode batches to native MMA KVarN");
+    ok &= expect(cuda_fattn_mma_kvarn.find("ggml_cuda_flash_attn_ext_mma_kvarn_case") != std::string::npos &&
+                 cuda_fattn_mma_kvarn.find("flash_attn_ext_f16") != std::string::npos &&
+                 cuda_fattn_mma_kvarn.find("need_f16_K=false") != std::string::npos &&
+                 cuda_fattn_mma_kvarn.find("need_f16_V=false") != std::string::npos &&
+                 cuda_fattn_mma_kvarn.find("GGML_KVARN_FORCE_MATERIALIZE") != std::string::npos &&
+                 cuda_fattn_mma_kvarn.find("ggml_cuda_fattn_kvarn_force_materialize_enabled") != std::string::npos,
+        "native KVarN FlashAttention must reuse the MMA F16 kernel template without F16 materialize buffers while honoring FORCE_MATERIALIZE");
     ok &= expect(cuda_fattn.find("D=512: MMA/TILE templates don't support this head_dim, use VEC unconditionally") == std::string::npos &&
                  cuda_fattn.find("if (Q->ne[0] == 512) {\n        return BEST_FATTN_KERNEL_VEC;") == std::string::npos,
         "CUDA FlashAttention must not force all D=512 non-turbo attention onto the vector kernel; Gemma4 global layers need the MMA selector path");

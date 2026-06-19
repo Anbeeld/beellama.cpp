@@ -2,6 +2,7 @@
 #include "cp-async.cuh"
 #include "mma.cuh"
 #include "fattn-common.cuh"
+#include "fattn-mma-kvarn.cuh"
 
 using namespace ggml_cuda_mma;
 
@@ -703,8 +704,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr int  nbatch_K2       = ggml_cuda_fattn_mma_get_nbatch_K2(DKQ, DV, ncols);
     constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg (DKQ, DV, ncols);
-    constexpr bool is_turbo_kv     = (type_K != GGML_TYPE_F16 || type_V != GGML_TYPE_F16);
-    constexpr int  nstages         = is_turbo_kv ? 0 : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2);
+    constexpr bool is_kvarn_kv     = (type_K == GGML_CUDA_FATTN_KVARN_TYPE || type_V == GGML_CUDA_FATTN_KVARN_TYPE);
+    constexpr bool is_turbo_kv     = !is_kvarn_kv && (type_K != GGML_TYPE_F16 || type_V != GGML_TYPE_F16);
+    constexpr int  nstages         = (is_turbo_kv || is_kvarn_kv) ? 0 : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2);
 
     constexpr int stride_tile_K = nbatch_K2 + 4;
 
@@ -744,12 +746,19 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
         if constexpr (nstages <= 1) {
             if constexpr (!is_turbo_kv) {
-                const int k0_diff = k0_stop - k0_start;
-                constexpr bool use_cp_async = nstages == 1;
-                flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
-                    (K_h2 + int64_t(k_VKQ_0)*stride_K + k0_start, tile_K, k0_diff, stride_K, k_VKQ_sup);
-                if (use_cp_async) {
-                    cp_async_wait_all();
+                if constexpr (type_K == GGML_CUDA_FATTN_KVARN_TYPE) {
+                    static_assert(nbatch_K2 == DKQ/2, "KVarN native MMA requires full-width K tiles");
+                    constexpr int nthreads_kvarn = nwarps * ggml_cuda_get_physical_warp_size();
+                    flash_attn_ext_kvarn_load_tile<DKQ, stride_tile_K, nbatch_fa, nthreads_kvarn, oob_check>
+                        ((const char *) K_h2, tile_K, k_VKQ_0, k_VKQ_sup);
+                } else {
+                    const int k0_diff = k0_stop - k0_start;
+                    constexpr bool use_cp_async = nstages == 1;
+                    flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
+                        (K_h2 + int64_t(k_VKQ_0)*stride_K + k0_start, tile_K, k0_diff, stride_K, k_VKQ_sup);
+                    if (use_cp_async) {
+                        cp_async_wait_all();
+                    }
                 }
             } else if constexpr (type_K == GGML_TYPE_TURBO4_0) {
                 // stride_K is nb11 (byte stride) for turbo; K_h2 reinterpreted as char*
@@ -1115,15 +1124,23 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
         if constexpr (nstages <= 1) {
             if constexpr (!is_turbo_kv) {
-                if (!V_is_K_view || i0_stop > 2*nbatch_K2) {
-                    const int i0_diff = i0_stop - i0_start;
-                    constexpr bool use_cp_async = nstages == 1;
-                    flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check>
-                        (V_h2 + int64_t(k_VKQ_0)*stride_V + i0_start/2, tile_V, i0_diff/2, stride_V, k_VKQ_sup);
-                    if (use_cp_async) {
-                        cp_async_wait_all();
-                    }
+                if constexpr (type_V == GGML_CUDA_FATTN_KVARN_TYPE) {
+                    static_assert(nbatch_V2 == DV/2, "KVarN native MMA requires full-width V tiles");
+                    constexpr int nthreads_kvarn = nwarps * ggml_cuda_get_physical_warp_size();
+                    flash_attn_ext_kvarn_load_tile<DV, stride_tile_V, nbatch_fa, nthreads_kvarn, oob_check>
+                        ((const char *) V_h2, tile_V, k_VKQ_0, k_VKQ_sup);
                     __syncthreads();
+                } else {
+                    if (!V_is_K_view || i0_stop > 2*nbatch_K2) {
+                        const int i0_diff = i0_stop - i0_start;
+                        constexpr bool use_cp_async = nstages == 1;
+                        flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check>
+                            (V_h2 + int64_t(k_VKQ_0)*stride_V + i0_start/2, tile_V, i0_diff/2, stride_V, k_VKQ_sup);
+                        if (use_cp_async) {
+                            cp_async_wait_all();
+                        }
+                        __syncthreads();
+                    }
                 }
             } else if constexpr (type_V == GGML_TYPE_TURBO4_0) {
                 const char * V_raw = (const char *)V_h2;
@@ -1963,7 +1980,8 @@ static __global__ void flash_attn_ext_f16(
 
     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
 
-    constexpr bool is_turbo_kv = (type_K != GGML_TYPE_F16 || type_V != GGML_TYPE_F16);
+    constexpr bool is_kvarn_kv = (type_K == GGML_CUDA_FATTN_KVARN_TYPE || type_V == GGML_CUDA_FATTN_KVARN_TYPE);
+    constexpr bool is_turbo_kv = !is_kvarn_kv && (type_K != GGML_TYPE_F16 || type_V != GGML_TYPE_F16);
 
     const int stride_Q1   = nb01 / sizeof(float2);
     const int stride_Q2   = nb02 / sizeof(float2);
