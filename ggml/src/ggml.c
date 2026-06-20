@@ -1177,7 +1177,6 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     [GGML_OP_TURBO_WHT]             = "TURBO_WHT",
     [GGML_OP_KVARN_STORE]           = "KVARN_STORE",
     [GGML_OP_KVARN_VIEW]            = "KVARN_VIEW",
-    [GGML_OP_KVARN_MATERIALIZE]     = "KVARN_MATERIALIZE",
     [GGML_OP_UNARY]                  = "UNARY",
     [GGML_OP_MAP_CUSTOM1]            = "MAP_CUSTOM1",
     [GGML_OP_MAP_CUSTOM2]            = "MAP_CUSTOM2",
@@ -1190,7 +1189,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     [GGML_OP_GLU]                     = "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     [GGML_OP_NONE]                  = "none",
@@ -1285,7 +1284,6 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     [GGML_OP_TURBO_WHT]             = "turbo_wht(a)",
     [GGML_OP_KVARN_STORE]           = "kvarn_store(cur, idx, stage, records)",
     [GGML_OP_KVARN_VIEW]            = "kvarn_view(records, stage, idx)",
-    [GGML_OP_KVARN_MATERIALIZE]     = "kvarn_materialize(records, stage, idx)",
     [GGML_OP_UNARY]                  = "unary(x)",
     [GGML_OP_MAP_CUSTOM1]            = "map_custom(x)",
     [GGML_OP_MAP_CUSTOM2]            = "map_custom(x,y)",
@@ -1298,7 +1296,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     [GGML_OP_GLU]                     = "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6572,12 +6570,9 @@ static bool ggml_kvarn_valid_bits(int bits) {
 enum {
     GGML_KVARN_OP_PARAM_BITS              = 0,
     GGML_KVARN_OP_PARAM_ITERS             = 1,
-    GGML_KVARN_OP_PARAM_MAT_VALUE         = 1,
+    GGML_KVARN_OP_PARAM_VIEW_VALUE        = 1,
     GGML_KVARN_OP_PARAM_STORE_VALUE       = 2,
-    GGML_KVARN_OP_PARAM_TOKENS_PER_STREAM = 3,
     GGML_KVARN_OP_PARAM_STORE_SWA         = 4,
-    GGML_KVARN_OP_PARAM_MAT_EMIT_ROTATED  = 5,
-    GGML_KVARN_OP_PARAM_MAT_SWA           = 6,
     GGML_KVARN_OP_PARAM_STAGE_GROUPS      = 7,
 };
 
@@ -6615,48 +6610,7 @@ struct ggml_tensor * ggml_kvarn_store(
     ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_ITERS, sinkhorn_iters);
     ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_STORE_VALUE, value ? 1 : 0);
     // op_params[3..6] are reserved for the cache to set at graph construction
-    // (tokens_per_stream_hint, swa flag, and materialize-side live/rotated/swa
-    // markers). op_params[7] carries the explicit dynamic stage_groups depth.
-    ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_STAGE_GROUPS, stage_groups);
-    return result;
-}
-
-// ggml_kvarn_materialize
-
-struct ggml_tensor * ggml_kvarn_materialize(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * records,
-        struct ggml_tensor  * stage_after_store,
-        struct ggml_tensor  * indices,
-        int                   n_kv,
-        int                   stream_start,
-        int                   n_stream,
-        int                   bits,
-        bool                  value,
-        int                   stage_groups) {
-    GGML_ASSERT(records->type == GGML_TYPE_I8);
-    GGML_ASSERT(stage_after_store->type == GGML_TYPE_F16);
-    GGML_ASSERT(indices->type == GGML_TYPE_I64);
-    // Dynamic stage depth: see ggml_kvarn_store. op_params[7] carries stage_groups.
-    GGML_ASSERT(stage_groups >= 2);
-    GGML_ASSERT(stage_after_store->ne[0] == 128 && stage_after_store->ne[2] % (128 * stage_groups) == 0);
-    GGML_ASSERT(stage_after_store->ne[1] == records->ne[1]);
-    GGML_ASSERT(n_kv > 0 && ggml_kvarn_valid_bits(bits));
-    const int64_t n_total_stream = stage_after_store->ne[2] / (128 * stage_groups);
-    GGML_ASSERT(n_total_stream > 0 && records->ne[2] > 0 && records->ne[2] % n_total_stream == 0);
-    GGML_ASSERT(stream_start >= 0 && n_stream > 0);
-    GGML_ASSERT((int64_t) stream_start + n_stream <= n_total_stream);
-
-    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 128, stage_after_store->ne[1], n_kv, n_stream);
-    result->op = GGML_OP_KVARN_MATERIALIZE;
-    result->src[0] = records;
-    result->src[1] = stage_after_store;
-    result->src[2] = indices;
-    ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_BITS, bits);
-    ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_MAT_VALUE, value ? 1 : 0);
-    ggml_set_op_params_i32(result, 2, stream_start);
-    ggml_set_op_params_i32(result, 3, n_stream);
-    // op_params[4..6] are set by the cache (live_group runtime, emit_rotated, swa).
+    // (tokens_per_stream_hint, swa flag, and native-view live/swa markers).
     // op_params[7] carries the explicit dynamic stage_groups depth.
     ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_STAGE_GROUPS, stage_groups);
     return result;
@@ -6693,7 +6647,7 @@ struct ggml_tensor * ggml_kvarn_view(
     result->src[1] = stage_after_store;
     result->src[2] = indices;
     ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_BITS, bits);
-    ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_MAT_VALUE, value ? 1 : 0);
+    ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_VIEW_VALUE, value ? 1 : 0);
     ggml_set_op_params_i32(result, 2, stream_start);
     ggml_set_op_params_i32(result, 3, n_stream);
     ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_STAGE_GROUPS, stage_groups);

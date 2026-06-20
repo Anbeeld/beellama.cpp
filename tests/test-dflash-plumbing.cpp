@@ -208,7 +208,7 @@ int main(int argc, char ** argv) {
     const std::string vulkan_cpp = read_file(root + "/ggml/src/ggml-vulkan/ggml-vulkan.cpp");
     const std::string vulkan_shader_gen = read_file(root + "/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp");
     const std::string vulkan_kvarn_store = read_file(root + "/ggml/src/ggml-vulkan/vulkan-shaders/kvarn_store.comp");
-    const std::string vulkan_kvarn_materialize = read_file(root + "/ggml/src/ggml-vulkan/vulkan-shaders/kvarn_materialize.comp");
+    const std::string vulkan_kvarn_materialize = read_file_optional(root + "/ggml/src/ggml-vulkan/vulkan-shaders/kvarn_materialize.comp");
     const std::string readme_md = read_file(root + "/README.md");
     const std::string agents_md = read_file(root + "/AGENTS.md");
     const std::string claude_md = read_file(root + "/CLAUDE.md");
@@ -442,11 +442,19 @@ int main(int argc, char ** argv) {
         "fused Turbo MMA must stay limited to decode-sized batches and straight turbo K/V pairs");
     ok &= expect(ggml_h.find("GGML_OP_KVARN_VIEW") != std::string::npos &&
                  ggml_h.find("ggml_kvarn_view") != std::string::npos &&
+                 ggml_h.find("GGML_OP_KVARN_MATERIALIZE") == std::string::npos &&
+                 ggml_h.find("ggml_kvarn_materialize") == std::string::npos &&
                  ggml_c.find("GGML_OP_KVARN_VIEW") != std::string::npos &&
                  ggml_c.find("ggml_kvarn_view") != std::string::npos &&
+                 ggml_c.find("GGML_OP_KVARN_MATERIALIZE") == std::string::npos &&
+                 ggml_c.find("ggml_kvarn_materialize") == std::string::npos &&
                  ggml_c.find("ggml_flash_attn_ext_add_kvarn_deps") != std::string::npos &&
                  ggml_c.find("result->src[8] = v_view->src[2];") != std::string::npos,
-        "GGML must expose a no-materialize KVarN view/proxy op and keep raw KVarN FA dependencies alive");
+        "GGML must expose only the no-materialize KVarN view/proxy op and keep raw KVarN FA dependencies alive");
+    ok &= expect(kv_cache_kvarn_cpp.find("return cache->materialize") == std::string::npos &&
+                 kv_cache_kvarn_cpp.find("llama_kv_cache_kvarn::materialize") == std::string::npos &&
+                 kv_cache_kvarn_cpp.find("ggml_kvarn_materialize") == std::string::npos,
+        "KVarN cache get_k/get_v must not retain a materialize graph path");
     ok &= expect(ggml_backend_cpp.find("pending_new_split_inputs") != std::string::npos &&
                  ggml_backend_cpp.find("split->n_inputs + pending_new_split_inputs > GGML_SCHED_MAX_SPLIT_INPUTS") != std::string::npos,
         "backend scheduler must pre-count all new cross-backend inputs for a node before deciding whether to start a new split");
@@ -2696,24 +2704,24 @@ int main(int argc, char ** argv) {
                  cuda_reg.find("GGML_USE_MUSA") != std::string::npos,
         "CUDA/HIP backend registry must expose a KVarN native-op capability hook and keep MUSA disabled");
     ok &= expect(vulkan_cpp.find("pipeline_kvarn_store") != std::string::npos &&
-                 vulkan_cpp.find("pipeline_kvarn_materialize") != std::string::npos &&
+                 vulkan_cpp.find("pipeline_kvarn_materialize") == std::string::npos &&
                  vulkan_cpp.find("ggml_backend_vk_kvarn_native_ops") != std::string::npos &&
+                 vulkan_cpp.find("return false;") != std::string::npos &&
                  vulkan_cpp.find("ggml_backend_kvarn_native_ops") != std::string::npos &&
                  vulkan_cpp.find("GGML_OP_KVARN_STORE") != std::string::npos &&
-                 vulkan_cpp.find("GGML_OP_KVARN_MATERIALIZE") != std::string::npos &&
+                 vulkan_cpp.find("case GGML_OP_KVARN_VIEW") == std::string::npos &&
+                 vulkan_cpp.find("GGML_OP_KVARN_MATERIALIZE") == std::string::npos &&
                  vulkan_cpp.find("ggml_vk_kvarn_store") != std::string::npos &&
-                 vulkan_cpp.find("ggml_vk_kvarn_materialize") != std::string::npos &&
+                 vulkan_cpp.find("ggml_vk_kvarn_materialize") == std::string::npos &&
                  vulkan_cpp.find("get_proc_address = */ ggml_backend_vk_reg_get_proc_address") != std::string::npos,
-        "Vulkan backend must expose real KVarN pipelines, dispatch, support checks, and capability hook");
+        "Vulkan backend must keep KVarN store support but not advertise full native view support without a view consumer");
     ok &= expect(vulkan_shader_gen.find("kvarn_store.comp") != std::string::npos &&
-                 vulkan_shader_gen.find("kvarn_materialize.comp") != std::string::npos &&
+                 vulkan_shader_gen.find("kvarn_materialize.comp") == std::string::npos &&
                  vulkan_kvarn_store.find("layout(local_size_x = 128") != std::string::npos &&
                  vulkan_kvarn_store.find("packHalf2x16") != std::string::npos &&
                  vulkan_kvarn_store.find("data_records") != std::string::npos &&
-                 vulkan_kvarn_materialize.find("layout(local_size_x = 128") != std::string::npos &&
-                 vulkan_kvarn_materialize.find("unpackHalf2x16") != std::string::npos &&
-                 vulkan_kvarn_materialize.find("compute_live_group") != std::string::npos,
-        "Vulkan KVarN shaders must be generated and preserve packed F16/record materialization semantics");
+                 vulkan_kvarn_materialize.empty(),
+        "Vulkan KVarN shaders must not generate a materialize shader");
     ok &= expect(llama_kvarn_h.find("LLAMA_API") == std::string::npos,
         "internal C++ KVarN helper declarations must not be exported from the public DLL ABI");
     ok &= expect(kv_cache_iswa_cpp.find("KVarN enabled for all layers (non-SWA full-context and SWA sliding-window ring)") != std::string::npos &&
@@ -2730,10 +2738,10 @@ int main(int argc, char ** argv) {
                  llama_bench.find("cparams.kvarn") != std::string::npos &&
                  llama_bench.find("bench_cache_type_name(type_k)") != std::string::npos,
         "llama-bench must accept cache-type KVarN pseudo names and pass KVarN params to llama_context_params");
-    ok &= expect(ggml_cuda_kvarn.find("kvarn_live_groups_kernel") != std::string::npos &&
-                 ggml_cuda_kvarn.find("ggml_cuda_pool_alloc<int> live_groups") != std::string::npos &&
-                 ggml_cuda_kvarn.find("live_groups[out_stream]") != std::string::npos,
-        "CUDA KVarN materialization must precompute live groups once per stream instead of scanning indices inside every output block");
+    ok &= expect(cuda_fattn_mma_kvarn.find("ggml_cuda_fattn_kvarn_live_groups_kernel") != std::string::npos &&
+                 cuda_fattn_mma_kvarn.find("ggml_cuda_pool_alloc<int> live_groups") != std::string::npos &&
+                 cuda_fattn_mma_kvarn.find("live_groups[out_stream]") != std::string::npos,
+        "CUDA native KVarN FlashAttention must precompute live groups once per stream instead of scanning indices inside every output block");
     ok &= expect(ggml_cuda_kvarn_h.find("ggml_cuda_kvarn_required_shared_bytes") != std::string::npos &&
                  ggml_cuda_kvarn.find("KVAR_N_LOWSHMEM_BYTES") != std::string::npos &&
                  ggml_cuda_kvarn.find("kvarn_store_kernel_hishmem") != std::string::npos &&

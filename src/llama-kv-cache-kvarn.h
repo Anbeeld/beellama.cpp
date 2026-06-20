@@ -37,7 +37,7 @@ public:
     ggml_tensor * get_k_native(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v_native(ggml_context * ctx, int32_t il) const;
 
-    // SWA sliding-window ring: per-cell absolute positions for materialize.
+    // SWA sliding-window ring: per-cell absolute positions for native KVarN views.
     // Built as a graph input sized [n_kv]; set on the host from cells.pos_get(cell).
     ggml_tensor * build_input_kvarn_rot(ggml_context * ctx) const;
     void set_input_kvarn_rot(ggml_tensor * dst) const;
@@ -79,7 +79,7 @@ private:
 
     mutable std::unordered_map<int32_t, ggml_tensor *> stored_k;
     mutable std::unordered_map<int32_t, ggml_tensor *> stored_v;
-    mutable ggml_tensor * mat_idxs = nullptr; // SWA per-cell absolute positions for materialize
+    mutable ggml_tensor * mat_idxs = nullptr; // SWA per-cell absolute positions for native KVarN views
 };
 
 class llama_kv_cache_kvarn : public llama_memory_i {
@@ -157,14 +157,6 @@ public:
             int32_t il,
             const llama_kv_cache::slot_info & sinfo,
             bool value) const;
-    ggml_tensor * materialize(
-            ggml_context * ctx,
-            ggml_tensor * stored,
-            int32_t il,
-            uint32_t n_kv,
-            const llama_kv_cache::slot_info & sinfo,
-            bool value,
-            ggml_tensor * mat_idxs = nullptr) const;
     ggml_tensor * view(
             ggml_context * ctx,
             ggml_tensor * stored,

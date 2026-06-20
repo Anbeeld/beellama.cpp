@@ -891,7 +891,6 @@ struct vk_device_struct {
     vk_pipeline pipeline_sum_rows_f32;
     vk_pipeline pipeline_fwht_f32[4];
     vk_pipeline pipeline_kvarn_store;
-    vk_pipeline pipeline_kvarn_materialize;
     vk_pipeline pipeline_cumsum_f32;
     vk_pipeline pipeline_cumsum_small_f32;
     vk_pipeline pipeline_cumsum_multipass1_f32;
@@ -1203,23 +1202,6 @@ struct vk_op_kvarn_store_push_constants {
     uint32_t tail_groups;  // ceil(n_ubatch / 128)
 };
 static_assert(sizeof(vk_op_kvarn_store_push_constants) <= 128, "sizeof(vk_op_kvarn_store_push_constants) must be <= 128");
-
-struct vk_op_kvarn_materialize_push_constants {
-    uint32_t n_heads;
-    uint32_t n_kv;
-    uint32_t stream_start;
-    uint32_t n_stream;
-    uint32_t groups_per_stream;
-    uint32_t record_words;
-    uint32_t bits;
-    uint32_t value;
-    uint32_t n_indices;
-    uint32_t emit_rotated;
-    uint32_t swa; // SWA sliding-window ring materialize (indices carry per-cell positions)
-    uint32_t stage_groups; // dynamic stage depth (tail_groups + 1)
-    uint32_t tail_groups;  // ceil(n_ubatch / 128)
-};
-static_assert(sizeof(vk_op_kvarn_materialize_push_constants) <= 128, "sizeof(vk_op_kvarn_materialize_push_constants) must be <= 128");
 
 struct vk_op_count_experts_push_constants {
     uint32_t ne00;
@@ -3636,13 +3618,8 @@ static bool ggml_vk_kvarn_valid_bits(int bits) {
 static constexpr int KVAR_N_GROUP = 128;
 static constexpr int KVAR_N_OP_PARAM_BITS = 0;
 static constexpr int KVAR_N_OP_PARAM_STORE_ITERS = 1;
-static constexpr int KVAR_N_OP_PARAM_MAT_VALUE = 1;
 static constexpr int KVAR_N_OP_PARAM_STORE_VALUE = 2;
-static constexpr int KVAR_N_OP_PARAM_STREAM_START = 2;
-static constexpr int KVAR_N_OP_PARAM_N_STREAM = 3;
 static constexpr int KVAR_N_OP_PARAM_STORE_SWA = 4;
-static constexpr int KVAR_N_OP_PARAM_MAT_EMIT_ROTATED = 5;
-static constexpr int KVAR_N_OP_PARAM_MAT_SWA = 6;
 static constexpr int KVAR_N_OP_PARAM_STAGE_GROUPS = 7;
 
 static bool ggml_vk_kvarn_stage_shape_valid(const ggml_tensor * stage, const ggml_tensor * records, int stage_groups) {
@@ -5201,7 +5178,6 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     if (ggml_vk_kvarn_limits_supported(device)) {
         ggml_vk_create_pipeline(device, device->pipeline_kvarn_store, "kvarn_store", kvarn_store_len, kvarn_store_data, "main", 4, sizeof(vk_op_kvarn_store_push_constants), {1, 1, 1}, {}, 1);
-        ggml_vk_create_pipeline(device, device->pipeline_kvarn_materialize, "kvarn_materialize", kvarn_materialize_len, kvarn_materialize_data, "main", 4, sizeof(vk_op_kvarn_materialize_push_constants), {1, 1, 1}, {}, 1);
     }
 
     const uint32_t cumsum_elem_per_thread = (device->vendor_id == VK_VENDOR_ID_AMD || device->vendor_id == VK_VENDOR_ID_INTEL) ? 2 : 4;
@@ -9219,67 +9195,6 @@ static void ggml_vk_kvarn_store(ggml_backend_vk_context * ctx, vk_context& subct
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         { current_buf, indices_buf, stage_buf, records_buf }, pc, { pc.n_heads, 1, 1 });
-}
-
-static void ggml_vk_kvarn_materialize(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
-    const ggml_tensor * records = dst->src[0];
-    const ggml_tensor * stage = dst->src[1];
-    const ggml_tensor * indices = dst->src[2];
-    GGML_ASSERT(ggml_is_contiguous(records));
-    GGML_ASSERT(ggml_is_contiguous(stage));
-    GGML_ASSERT(ggml_is_contiguous(indices));
-    GGML_ASSERT(ggml_is_contiguous(dst));
-    GGML_ASSERT(records->ne[0] % 4 == 0);
-
-    vk_pipeline pipeline = ctx->device->pipeline_kvarn_materialize;
-    GGML_ASSERT(pipeline != nullptr);
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
-
-    const int bits = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_BITS);
-    const bool value = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_MAT_VALUE) != 0;
-    const int stream_start = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_STREAM_START);
-    const int n_stream = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_N_STREAM);
-    const bool emit_rotated = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_MAT_EMIT_ROTATED) != 0;
-    const bool swa = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_MAT_SWA) != 0;
-    const int stage_groups = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_STAGE_GROUPS);
-    const int tail_groups = stage_groups - 1;
-    GGML_ASSERT(ggml_vk_kvarn_valid_bits(bits));
-    GGML_ASSERT(stage_groups >= 2);
-    GGML_ASSERT(stream_start >= 0 && n_stream > 0);
-    GGML_ASSERT(stage->ne[2] % (KVAR_N_GROUP * stage_groups) == 0);
-    const int n_total_stream = (int) (stage->ne[2] / (KVAR_N_GROUP * stage_groups));
-    GGML_ASSERT(n_total_stream > 0);
-    GGML_ASSERT(records->ne[2] % n_total_stream == 0);
-    const int groups_per_stream = (int) (records->ne[2] / n_total_stream);
-    GGML_ASSERT(stream_start + n_stream <= n_total_stream);
-    if (swa) {
-        GGML_ASSERT(n_stream == 1 && "SWA KVarN ring materialize requires a single stream");
-    }
-
-    vk_op_kvarn_materialize_push_constants pc = {
-        (uint32_t) dst->ne[1],
-        (uint32_t) dst->ne[2],
-        (uint32_t) stream_start,
-        (uint32_t) n_stream,
-        (uint32_t) groups_per_stream,
-        (uint32_t) (records->ne[0] / 4),
-        (uint32_t) bits,
-        value ? 1u : 0u,
-        (uint32_t) indices->ne[0],
-        emit_rotated ? 1u : 0u,
-        swa ? 1u : 0u,
-        (uint32_t) stage_groups,
-        (uint32_t) tail_groups,
-    };
-
-    const vk_subbuffer records_buf = ggml_vk_tensor_subbuffer(ctx, records);
-    const vk_subbuffer stage_buf = ggml_vk_tensor_subbuffer(ctx, stage);
-    const vk_subbuffer indices_buf = ggml_vk_tensor_subbuffer(ctx, indices);
-    const vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
-
-    const uint32_t blocks = (uint32_t) (dst->ne[3] * dst->ne[2] * dst->ne[1]);
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        { records_buf, stage_buf, indices_buf, dst_buf }, pc, { blocks, 1, 1 });
 }
 
 static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -14505,10 +14420,6 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         ggml_vk_kvarn_store(ctx, compute_ctx, node);
 
         break;
-    case GGML_OP_KVARN_MATERIALIZE:
-        ggml_vk_kvarn_materialize(ctx, compute_ctx, node);
-
-        break;
     case GGML_OP_SOLVE_TRI:
         ggml_vk_solve_tri(ctx, compute_ctx, src0, src1, node);
 
@@ -16764,13 +16675,10 @@ static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const 
 }
 
 static bool ggml_backend_vk_kvarn_native_ops(ggml_backend_dev_t dev) {
-    if (dev == nullptr || dev->context == nullptr) {
-        return false;
-    }
-
-    ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
-    const vk_device& device = ggml_vk_get_device(ctx->device);
-    return ggml_vk_kvarn_limits_supported(device);
+    UNUSED(dev);
+    // Vulkan currently has a native store shader only. Do not advertise full
+    // KVarN cache support until FLASH_ATTN_EXT can consume GGML_OP_KVARN_VIEW.
+    return false;
 }
 
 static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
@@ -17221,7 +17129,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_I32
                 && ggml_is_contiguous(op->src[1]) && op->src[1]->type == GGML_TYPE_I32;
         case GGML_OP_KVARN_STORE:
-            return ggml_backend_vk_kvarn_native_ops(dev) &&
+            return ggml_vk_kvarn_limits_supported(device) &&
                 op->type == GGML_TYPE_F16 &&
                 op->src[0]->type == GGML_TYPE_F32 &&
                 op->src[1]->type == GGML_TYPE_I64 &&
@@ -17236,24 +17144,6 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 op->src[2]->ne[0] == KVAR_N_GROUP &&
                 ggml_vk_kvarn_stage_shape_valid(op->src[2], op->src[3], ggml_get_op_params_i32(op, KVAR_N_OP_PARAM_STAGE_GROUPS)) &&
                 op->src[3]->ne[0] % 4 == 0;
-        case GGML_OP_KVARN_MATERIALIZE:
-            return ggml_backend_vk_kvarn_native_ops(dev) &&
-                op->type == GGML_TYPE_F16 &&
-                op->src[0]->type == GGML_TYPE_I8 &&
-                op->src[1]->type == GGML_TYPE_F16 &&
-                op->src[2]->type == GGML_TYPE_I64 &&
-                ggml_is_contiguous(op->src[0]) &&
-                ggml_is_contiguous(op->src[1]) &&
-                ggml_is_contiguous(op->src[2]) &&
-                ggml_vk_kvarn_valid_bits(ggml_get_op_params_i32(op, KVAR_N_OP_PARAM_BITS)) &&
-                op->src[0]->ne[0] % 4 == 0 &&
-                op->src[1]->ne[0] == KVAR_N_GROUP &&
-                ggml_vk_kvarn_stage_shape_valid(op->src[1], op->src[0], ggml_get_op_params_i32(op, KVAR_N_OP_PARAM_STAGE_GROUPS)) &&
-                ggml_get_op_params_i32(op, KVAR_N_OP_PARAM_STREAM_START) >= 0 &&
-                ggml_get_op_params_i32(op, KVAR_N_OP_PARAM_N_STREAM) > 0 &&
-                (int64_t) ggml_get_op_params_i32(op, KVAR_N_OP_PARAM_STREAM_START) +
-                    ggml_get_op_params_i32(op, KVAR_N_OP_PARAM_N_STREAM) <=
-                    op->src[1]->ne[2] / (KVAR_N_GROUP * ggml_get_op_params_i32(op, KVAR_N_OP_PARAM_STAGE_GROUPS));
         case GGML_OP_IM2COL:
             return ggml_is_contiguous(op->src[1])
                 && op->src[1]->type == GGML_TYPE_F32

@@ -7,10 +7,10 @@ static constexpr ggml_type GGML_CUDA_FATTN_KVARN_TYPE = GGML_TYPE_COUNT;
 
 enum {
     GGML_CUDA_FATTN_KVARN_OP_PARAM_BITS              = 0,
-    GGML_CUDA_FATTN_KVARN_OP_PARAM_MAT_VALUE         = 1,
-    GGML_CUDA_FATTN_KVARN_OP_PARAM_MAT_STREAM_START  = 2,
-    GGML_CUDA_FATTN_KVARN_OP_PARAM_MAT_N_STREAM      = 3,
-    GGML_CUDA_FATTN_KVARN_OP_PARAM_MAT_SWA           = 6,
+    GGML_CUDA_FATTN_KVARN_OP_PARAM_VIEW_VALUE        = 1,
+    GGML_CUDA_FATTN_KVARN_OP_PARAM_VIEW_STREAM_START = 2,
+    GGML_CUDA_FATTN_KVARN_OP_PARAM_VIEW_N_STREAM     = 3,
+    GGML_CUDA_FATTN_KVARN_OP_PARAM_VIEW_SWA          = 6,
     GGML_CUDA_FATTN_KVARN_OP_PARAM_STAGE_GROUPS      = 7,
 };
 
@@ -272,10 +272,10 @@ static inline bool ggml_cuda_fattn_kvarn_unwrap_view(
     }
 
     side.bits = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_BITS);
-    side.value = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_MAT_VALUE) != 0;
-    side.stream_start = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_MAT_STREAM_START);
-    side.n_stream = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_MAT_N_STREAM);
-    side.swa = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_MAT_SWA) != 0;
+    side.value = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_VIEW_VALUE) != 0;
+    side.stream_start = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_VIEW_STREAM_START);
+    side.n_stream = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_VIEW_N_STREAM);
+    side.swa = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_VIEW_SWA) != 0;
     side.stage_groups = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_STAGE_GROUPS);
 
     if (!ggml_cuda_fattn_kvarn_valid_bits(side.bits) || side.n_stream <= 0 || side.stage_groups < 2) {

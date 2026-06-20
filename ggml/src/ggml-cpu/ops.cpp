@@ -11248,19 +11248,13 @@ void ggml_compute_forward_turbo_wht(
     }
 }
 
-// ggml_compute_forward_kvarn_store / ggml_compute_forward_kvarn_materialize
+// ggml_compute_forward_kvarn_store
 
 static constexpr int KVAR_N_GROUP = 128;
 static constexpr int KVAR_N_OP_PARAM_BITS = 0;
 static constexpr int KVAR_N_OP_PARAM_ITERS = 1;
-static constexpr int KVAR_N_OP_PARAM_MAT_VALUE = 1;
 static constexpr int KVAR_N_OP_PARAM_STORE_VALUE = 2;
-static constexpr int KVAR_N_OP_PARAM_TOKENS_PER_STREAM = 3;
 static constexpr int KVAR_N_OP_PARAM_STORE_SWA = 4;
-static constexpr int KVAR_N_OP_PARAM_MAT_STREAM_START = 2;
-static constexpr int KVAR_N_OP_PARAM_MAT_N_STREAM = 3;
-static constexpr int KVAR_N_OP_PARAM_MAT_EMIT_ROTATED = 5;
-static constexpr int KVAR_N_OP_PARAM_MAT_SWA = 6;
 static constexpr int KVAR_N_OP_PARAM_STAGE_GROUPS = 7;
 
 static void kvarn_cpu_hadamard(float * values) {
@@ -11374,16 +11368,6 @@ static void kvarn_cpu_pack(const std::vector<uint8_t> & values, int bits, uint8_
     }
 }
 
-static uint8_t kvarn_cpu_unpack(const uint8_t * payload, int index, int bits) {
-    uint8_t value = 0;
-    const size_t bit_offset = size_t(index) * size_t(bits);
-    for (int bit = 0; bit < bits; ++bit) {
-        const size_t src_bit = bit_offset + size_t(bit);
-        value |= uint8_t(((payload[src_bit / 8] >> (src_bit % 8)) & 1u) << bit);
-    }
-    return value;
-}
-
 static void kvarn_cpu_quantize_stage(
         const ggml_tensor * stage,
         int64_t head,
@@ -11433,26 +11417,6 @@ static void kvarn_cpu_quantize_stage(
         memcpy(record + other_axis_off + i * sizeof(other_fp16), &other_fp16, sizeof(other_fp16));
     }
     kvarn_cpu_pack(q, bits, record);
-}
-
-static float kvarn_cpu_record_value(const uint8_t * record, int bits, bool value, int token, int dim) {
-    const size_t payload_bytes = (size_t(128) * 128 * bits + 7) / 8;
-    const size_t scale_axis_off = payload_bytes;
-    const size_t zp_axis_off = scale_axis_off + 128 * sizeof(ggml_fp16_t);
-    const size_t other_axis_off = zp_axis_off + 128 * sizeof(ggml_fp16_t);
-    const int row = value ? token : dim;
-    const int col = value ? dim : token;
-    ggml_fp16_t scale_fp16;
-    ggml_fp16_t zp_fp16;
-    ggml_fp16_t other_fp16;
-    memcpy(&scale_fp16, record + scale_axis_off + row * sizeof(scale_fp16), sizeof(scale_fp16));
-    memcpy(&zp_fp16, record + zp_axis_off + row * sizeof(zp_fp16), sizeof(zp_fp16));
-    memcpy(&other_fp16, record + other_axis_off + col * sizeof(other_fp16), sizeof(other_fp16));
-    const float scale = ggml_fp16_to_fp32(scale_fp16);
-    const float zp = ggml_fp16_to_fp32(zp_fp16);
-    const float other = ggml_fp16_to_fp32(other_fp16);
-    const uint8_t q = kvarn_cpu_unpack(record, row * 128 + col, bits);
-    return (float(q) * scale + zp) * other;
 }
 
 void ggml_compute_forward_kvarn_store(const ggml_compute_params * params, ggml_tensor * dst) {
@@ -11521,120 +11485,6 @@ void ggml_compute_forward_kvarn_store(const ggml_compute_params * params, ggml_t
             kvarn_cpu_hadamard(rotated);
             for (int d = 0; d < 128; ++d) {
                 char * out = (char *) stage->data + d * stage->nb[0] + h * stage->nb[1] + stage_pos * stage->nb[2];
-                *(ggml_fp16_t *) out = ggml_fp32_to_fp16(rotated[d]);
-            }
-        }
-    }
-}
-
-void ggml_compute_forward_kvarn_materialize(const ggml_compute_params * params, ggml_tensor * dst) {
-    const ggml_tensor * records = dst->src[0];
-    const ggml_tensor * stage = dst->src[1];
-    const ggml_tensor * indices = dst->src[2];
-    const int bits = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_BITS);
-    const bool value = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_MAT_VALUE) != 0;
-    const int64_t stream_start = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_MAT_STREAM_START);
-    const int64_t n_stream = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_MAT_N_STREAM);
-    const bool emit_rotated = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_MAT_EMIT_ROTATED) != 0;
-    // SWA sliding-window ring mode (single stream): the indices tensor carries
-    // one absolute token position per output cell (idx < 0 marks an empty window
-    // cell). Records are a circular buffer (slot = group % groups_per_stream);
-    // the newest tail_groups tiles live in the fp16 staging ping-pong; there is
-    // no permanent group-0 sink.
-    const bool swa = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_MAT_SWA) != 0;
-    // Dynamic stage depth: op_params[7] carries stage_groups (tail_groups + 1).
-    const int stage_groups = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_STAGE_GROUPS);
-    const int tail_groups = stage_groups - 1;
-    GGML_ASSERT(stage_groups >= 2);
-    GGML_ASSERT(stream_start >= 0 && n_stream > 0);
-    GGML_ASSERT(stage->ne[2] % (KVAR_N_GROUP * stage_groups) == 0);
-    const int64_t n_heads = dst->ne[1];
-    const int64_t n_kv = dst->ne[2];
-    const int64_t * idx_data = (const int64_t *) indices->data;
-    const int64_t n_total_stream = stage->ne[2] / (KVAR_N_GROUP * stage_groups);
-    GGML_ASSERT(n_total_stream > 0);
-    GGML_ASSERT(records->ne[2] % n_total_stream == 0);
-    const int64_t groups_per_stream = records->ne[2] / n_total_stream;
-    GGML_ASSERT(stream_start + n_stream <= n_total_stream);
-    std::vector<int64_t> live_groups(n_stream, 0);
-    for (int64_t i = 0; i < indices->ne[0]; ++i) {
-        const int64_t idx = idx_data[i];
-        if (idx < 0) {
-            GGML_ASSERT(swa); // only SWA window cells may be empty
-            continue;
-        }
-        const int64_t group_global = idx / 128;
-        if (swa) {
-            live_groups[0] = std::max(live_groups[0], group_global);
-        } else {
-            const int64_t stream = group_global / groups_per_stream;
-            if (stream >= stream_start && stream < stream_start + n_stream) {
-                const int64_t group = group_global - stream * groups_per_stream;
-                live_groups[stream - stream_start] = std::max(live_groups[stream - stream_start], group);
-            }
-        }
-    }
-
-    const int64_t n_work = n_kv * n_stream;
-    const int64_t t0 = n_work * params->ith / params->nth;
-    const int64_t t1 = n_work * (params->ith + 1) / params->nth;
-    for (int64_t w = t0; w < t1; ++w) {
-        const int64_t out_stream = w / n_kv;
-        const int64_t stream = stream_start + out_stream;
-        const int64_t live_group = live_groups[out_stream];
-        const int64_t cell = w - out_stream * n_kv;
-        // Non-SWA materialize uses the cell index as the absolute position. This
-        // matches the production cache where cells are assigned sequential
-        // positions from 0. SWA ring materialize reads per-cell absolute
-        // positions from the indices tensor (idx < 0 marks empty window cells).
-        const int64_t abs_pos = swa ? idx_data[cell] : cell;
-        const int64_t group = abs_pos / 128;
-        const int64_t pos = abs_pos % 128;
-        const int64_t stage_base = stream * 128 * stage_groups;
-        // Residency rules from the KVarN faithful-precision plan:
-        //   non-SWA: stage holds group 0 (sink) and the last tail_groups groups
-        //           (tail_groups = stage_groups - 1).
-        //   SWA:    stage holds the last tail_groups groups (no permanent sink);
-        //           older in-window groups come from the circular record ring.
-        const int64_t stage_begin = swa
-            ? (live_group >= (tail_groups - 1) ? live_group - (tail_groups - 1) : 0)
-            : 0;
-        for (int64_t h = 0; h < n_heads; ++h) {
-            float rotated[128] = {};
-            bool from_stage;
-            bool from_record;
-            int64_t stage_pos = 0;
-            int64_t record_group = 0;
-            if (swa) {
-                from_stage  = group >= stage_begin && group <= live_group;
-                from_record = !from_stage && group >= 0 && group < stage_begin &&
-                              (live_group - group) < groups_per_stream;
-                stage_pos    = stage_base + (group % stage_groups) * 128 + pos;
-                record_group = stream * groups_per_stream + (group % groups_per_stream);
-            } else {
-                from_stage  = group == 0 ||
-                              (group > 0 && group <= live_group &&
-                               group + (tail_groups - 1) >= live_group);
-                from_record = !from_stage && group < live_group;
-                stage_pos    = stage_base + (group == 0 ? pos : 128 + ((group - 1) % tail_groups) * 128 + pos);
-                record_group = stream * groups_per_stream + group;
-            }
-            if (from_stage) {
-                for (int d = 0; d < 128; ++d) {
-                    const char * src = (const char *) stage->data + d * stage->nb[0] + h * stage->nb[1] + stage_pos * stage->nb[2];
-                    rotated[d] = ggml_fp16_to_fp32(*(const ggml_fp16_t *) src);
-                }
-            } else if (from_record) {
-                const uint8_t * record = (const uint8_t *) records->data + h * records->nb[1] + record_group * records->nb[2];
-                for (int d = 0; d < 128; ++d) {
-                    rotated[d] = kvarn_cpu_record_value(record, bits, value, pos, d);
-                }
-            }
-            if (!emit_rotated) {
-                kvarn_cpu_hadamard(rotated);
-            }
-            for (int d = 0; d < 128; ++d) {
-                char * out = (char *) dst->data + d * dst->nb[0] + h * dst->nb[1] + cell * dst->nb[2] + out_stream * dst->nb[3];
                 *(ggml_fp16_t *) out = ggml_fp32_to_fp16(rotated[d]);
             }
         }

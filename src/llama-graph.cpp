@@ -670,7 +670,7 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
         res &= can_reuse_kq_mask(self_kq_mask_swa, mctx->get_swa(), params.ubatch, params.cparams);
     }
 
-    // re-bind the SWA KVarN materialize indices to the (possibly new) SWA context
+    // re-bind the SWA KVarN view indices to the (possibly new) SWA context
     if (self_kvarn_mat_idxs_swa && self_kvarn_mat_idxs_swa->buffer) {
         if (const auto * kvarn_swa = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx->get_swa())) {
             const_cast<llama_kv_cache_kvarn_context *>(kvarn_swa)->set_mat_idxs(self_kvarn_mat_idxs_swa);

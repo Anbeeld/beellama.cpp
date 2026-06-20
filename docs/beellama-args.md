@@ -205,7 +205,9 @@ For current long-context Qwen and Gemma DFlash serving, the common asymmetric ch
 
 Do not assume enum compatibility with TheTom's public TurboQuant fork. Bee uses the buun enum order for Turbo/TCQ cache types while keeping a 128-value `turbo3` block. Bee keeps TCQ cache IDs at `45` and `46`; Tom's `TQ3_1S` and `TQ4_1S` model weight formats use new GGML type IDs `47` and `48`.
 
-KVarN pseudo types are accepted only on the target `--cache-type-k` / `--cache-type-v` path. Draft cache arguments intentionally reject them. If only one side is specified, Bee mirrors that KVarN bit width to the other side; all K/V pairs over `2`, `3`, `4`, `5`, `6`, and `8` bits are selectable. KVarN supports both normal per-sequence KV streams and `--kv-unified`, and still requires a supported attention/cache path, 128-slice-compatible key/value head dimensions, and backend native KVarN ops unless `--kv-kvarn-fallback` is enabled.
+KVarN pseudo types are accepted only on the target `--cache-type-k` / `--cache-type-v` path. Draft cache arguments intentionally reject them. If only one side is specified, Bee mirrors that KVarN bit width to the other side; all K/V pairs over `2`, `3`, `4`, `5`, `6`, and `8` bits are selectable. KVarN supports both normal per-sequence KV streams and `--kv-unified`, and still requires a supported attention/cache path, 128-slice-compatible key/value head dimensions, and backend native KVarN cache support unless `--kv-kvarn-fallback` is enabled.
+
+On CUDA, KVarN reads are consumed through native view inputs in FlashAttention, without graph-level materialization into full F16 K/V tensors. Other backends must either expose equivalent native view/attention support or decline full KVarN cache placement; Vulkan currently keeps KVarN store plumbing but does not advertise full native KVarN cache support.
 
 When KVarN runs with `--kv-unified`, it uses one physical structured stream and standard KV metadata for sequence isolation. Per-sequence prompt-cache state restore is used only when that shared stream is exclusive; otherwise the server keeps correctness by skipping the RAM state restore and processing the prompt normally.
 

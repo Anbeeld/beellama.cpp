@@ -199,15 +199,11 @@ ggml_type llama_kv_cache_kvarn_context::type_v() const {
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::get_k(ggml_context * ctx, int32_t il) const {
-    const auto it = stored_k.find(cache->mapped_layer_id(il));
-    GGML_ASSERT(it != stored_k.end());
-    return cache->materialize(ctx, it->second, il, get_n_kv(), current_sinfo(), false, mat_idxs);
+    return get_k_native(ctx, il);
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::get_v(ggml_context * ctx, int32_t il) const {
-    const auto it = stored_v.find(cache->mapped_layer_id(il));
-    GGML_ASSERT(it != stored_v.end());
-    return cache->materialize(ctx, it->second, il, get_n_kv(), current_sinfo(), true, mat_idxs);
+    return get_v_native(ctx, il);
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::get_k_native(ggml_context * ctx, int32_t il) const {
@@ -282,7 +278,7 @@ ggml_tensor * llama_kv_cache_kvarn_context::build_input_v_rot(ggml_context * ctx
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::build_input_kvarn_mat_idxs(ggml_context * ctx) const {
-    // SWA ring materialize: one absolute token position per output cache cell.
+    // SWA ring view: one absolute token position per output cache cell.
     // Sized to the padded n_kv so the graph is reusable across batches; empty
     // window cells are marked with idx < 0 and produce zero output.
     const uint32_t n_kv = get_n_kv();
@@ -460,7 +456,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         GGML_ASSERT(n_stream == 1 && "SWA KVarN ring requires a unified (single-stream) cache");
         // Backstop for the ring-size invariant above: the record ring must have
         // strictly more slots than the metadata window's worst-case tile span so
-        // the oldest in-window tile still materializes from records.
+        // the oldest in-window tile still decodes from records.
         GGML_ASSERT(n_groups_per_stream > (kv_size + KVAR_N_GROUP - 1) / KVAR_N_GROUP &&
             "SWA KVarN record ring is too small for the sliding window");
     }
@@ -911,7 +907,7 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
         const llama_pos pos_max = metadata->seq_pos_max(seq_id);
         if (pos_max >= 0) {
             // ceil((pos_max + 1) / KVAR_N_GROUP) — covers all groups that the
-            // materialize kernel might read. After restore the next store will
+            // native view might read. After restore the next store will
             // compute live_group ≤ pos_max / KVAR_N_GROUP < n_groups_used, so
             // every accessed group stays within the restored range.
             n_groups_used = std::min(n_groups_per_stream, (uint32_t) ((pos_max + KVAR_N_GROUP) / KVAR_N_GROUP));
@@ -1120,48 +1116,6 @@ ggml_tensor * llama_kv_cache_kvarn::store(
         int32_t(stage_groups));
     result->op_params[3] = kvarn_contiguous_tokens_per_stream_hint(sinfo);
     result->op_params[4] = swa ? 1 : 0; // SWA sliding-window ring store
-    return result;
-}
-
-ggml_tensor * llama_kv_cache_kvarn::materialize(
-        ggml_context * ctx,
-        ggml_tensor * stored,
-        int32_t il,
-        uint32_t n_kv,
-        const llama_kv_cache::slot_info & sinfo,
-        bool value,
-        ggml_tensor * mat_idxs) const {
-    const auto & layer = layer_for(il);
-    const uint32_t stream_start = sinfo.s0;
-    const uint32_t stream_count = sinfo.s1 - sinfo.s0 + 1;
-
-    // SWA ring materialize consumes per-cell absolute positions (mat_idxs);
-    // the non-SWA path consumes the store indices (stored->src[1]) unchanged.
-    ggml_tensor * indices = swa ? mat_idxs : stored->src[1];
-
-    ggml_tensor * result = ggml_kvarn_materialize(
-        ctx,
-        value ? layer.v_records : layer.k_records,
-        stored,
-        indices,
-        n_kv,
-        stream_start,
-        stream_count,
-        value ? params.value_bits : params.key_bits,
-        value,
-        int32_t(stage_groups));
-    result->op_params[6] = swa ? 1 : 0; // SWA sliding-window ring materialize
-    const uint32_t slices = value ? layer.v_slices : layer.k_slices;
-    if (slices > 1) {
-        result = ggml_reshape_4d(
-                ctx,
-                result,
-                value ? layer.head_dim_v : layer.head_dim_k,
-                layer.n_head_kv,
-                n_kv,
-                stream_count);
-    }
-
     return result;
 }
 

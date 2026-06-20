@@ -68,8 +68,8 @@ Key binaries: `build/bin/llama-server`, `build/bin/llama-cli`, `build/bin/llama-
 - `ggml/src/ggml-cuda/turbo-quant-cuda.cuh` - CUDA set-rows/dequantize kernels for all TurboQuant types.
 - `src/llama-kvarn.cpp` / `.h` - KVarN type descriptors, tile layout, bit-width presets, and runtime validation.
 - `src/llama-kv-cache-kvarn.cpp` / `.h` - target-context KVarN KV cache and group-range state serialization.
-- `ggml/src/ggml-cuda/kvarn.cu` / `.cuh` - CUDA KVarN store/materialize ops, including rotated-domain materialization.
-- `ggml/src/ggml-vulkan/vulkan-shaders/kvarn_store.comp` / `kvarn_materialize.comp` - Vulkan KVarN store/materialize shaders.
+- `ggml/src/ggml-cuda/kvarn.cu` / `.cuh` - CUDA KVarN store ops and native KVarN support helpers.
+- `ggml/src/ggml-vulkan/vulkan-shaders/kvarn_store.comp` - Vulkan KVarN store shader.
 - `ggml/src/ggml-cuda/cross-ring-interleave.cu` - GPU cross-ring management and interleave kernel.
 - `ggml/src/ggml-cuda/gated_delta_net.cu` - DeltaNet CUDA kernels.
 - `ggml/src/ggml-cuda/ssm-conv.cu` - SSM convolution CUDA kernels.
