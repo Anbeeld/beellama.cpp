@@ -1214,6 +1214,33 @@ static void test_native_flash_attention_gpu() {
                 "large-prefill multi-head KVarN FlashAttention fallback differs from CPU reference decode");
     }
 
+    {
+        constexpr int head_dim = 256;
+        constexpr int n_q_decode = 1;
+        constexpr int n_q_heads = 6;
+        constexpr int n_kv_heads = 1;
+        constexpr int stage_groups = 5;
+        for (int bits_k : { 2, 3, 4, 5, 6, 8 }) {
+            for (int bits_v : { 2, 3, 4, 5, 6, 8 }) {
+                constexpr int n_kv_matrix = 1024;
+                const std::vector<float> expected_decode = test_native_flash_attention_output(
+                        cpu_backend, false, false, head_dim, bits_k, bits_v, n_q_decode, n_q_heads, n_kv_heads, n_kv_matrix, stage_groups);
+                const std::vector<float> actual_decode = test_native_flash_attention_output(
+                        gpu_backend, true, true, head_dim, bits_k, bits_v, n_q_decode, n_q_heads, n_kv_heads, n_kv_matrix, stage_groups);
+                require_close_f32_rmse(actual_decode, expected_decode, 1e-2f,
+                        "single-token GQA mixed-bit native KVarN FlashAttention output differs from CPU reference decode");
+            }
+        }
+
+        constexpr int n_kv_deep = 4096;
+        const std::vector<float> expected_deep = test_native_flash_attention_output(
+                cpu_backend, false, false, head_dim, 4, 4, n_q_decode, n_q_heads, n_kv_heads, n_kv_deep, stage_groups);
+        const std::vector<float> actual_deep = test_native_flash_attention_output(
+                gpu_backend, true, true, head_dim, 4, 4, n_q_decode, n_q_heads, n_kv_heads, n_kv_deep, stage_groups);
+        require_close_f32_rmse(actual_deep, expected_deep, 1e-2f,
+                "single-token GQA deep K4/V4 native KVarN FlashAttention output differs from CPU reference decode");
+    }
+
     ggml_backend_free(cpu_backend);
     ggml_backend_free(gpu_backend);
 }

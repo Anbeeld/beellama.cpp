@@ -383,6 +383,392 @@ static void ggml_cuda_fattn_kvarn_materialize_side(
     }
 }
 
+static constexpr int GGML_CUDA_FATTN_KVARN_DECODE_D          = 256;
+static constexpr int GGML_CUDA_FATTN_KVARN_DECODE_THREADS    = 256;
+static constexpr int GGML_CUDA_FATTN_KVARN_DECODE_MAX_GQA    = 8;
+static constexpr int GGML_CUDA_FATTN_KVARN_DECODE_SPLIT_TOKENS = 128;
+
+static __host__ __device__ __forceinline__ int ggml_cuda_fattn_kvarn_record_payload_bytes(const int bits) {
+    return GGML_CUDA_FATTN_KVARN_DIM * GGML_CUDA_FATTN_KVARN_DIM * bits / 8;
+}
+
+static __device__ __forceinline__ bool ggml_cuda_fattn_kvarn_decode_group_from_record(
+        const ggml_cuda_fattn_kvarn_desc & desc,
+        const int group) {
+    if (desc.swa) {
+        return false;
+    }
+    const int live_group = desc.live_groups[desc.out_stream];
+    const bool from_stage = group == 0 ||
+        (group > 0 && group <= live_group && group + (desc.tail_groups - 1) >= live_group);
+    return !from_stage && group < live_group && group < desc.groups_per_stream;
+}
+
+static __device__ __forceinline__ float ggml_cuda_fattn_kvarn_load_rotated_record_smem(
+        const ggml_cuda_fattn_kvarn_desc & desc,
+        const uint8_t * records_smem,
+        const int token,
+        const int slice,
+        const int dim) {
+    const int pos = token - (token / GGML_CUDA_FATTN_KVARN_DIM) * GGML_CUDA_FATTN_KVARN_DIM;
+    const uint8_t * record = records_smem + slice * desc.record_bytes;
+    const int payload_bytes = ggml_cuda_fattn_kvarn_record_payload_bytes(desc.bits);
+    const half * scale_axis = (const half *) (record + payload_bytes);
+    const half * zp_axis    = scale_axis + GGML_CUDA_FATTN_KVARN_DIM;
+    const half * other_axis = zp_axis + GGML_CUDA_FATTN_KVARN_DIM;
+    const int row = desc.value ? pos : dim;
+    const int col = desc.value ? dim : pos;
+    const uint8_t q = ggml_cuda_fattn_kvarn_unpack_record(record, row * GGML_CUDA_FATTN_KVARN_DIM + col, desc.bits);
+    return (float(q) * __half2float(scale_axis[row]) + __half2float(zp_axis[row])) * __half2float(other_axis[col]);
+}
+
+template<int MAX_GQA>
+static __global__ void ggml_cuda_fattn_kvarn_decode_split_d256_kernel(
+        const char * Q,
+        const ggml_cuda_fattn_kvarn_desc * k_descs,
+        const ggml_cuda_fattn_kvarn_desc * v_descs,
+        const char * mask,
+        float * partial,
+        float2 * partial_meta,
+        float scale,
+        float logit_softcap,
+        int64_t nb02,
+        int64_t nb03,
+        int64_t nb33,
+        int ne33,
+        int n_kv,
+        int n_q_heads,
+        int n_kv_heads,
+        int gqa_ratio,
+        int n_splits) {
+    const int split   = blockIdx.x;
+    const int kv_head = blockIdx.y;
+    const int stream  = blockIdx.z;
+    const int tid     = threadIdx.x;
+    const int warp    = tid / WARP_SIZE;
+    const int lane    = tid % WARP_SIZE;
+
+    constexpr int D = GGML_CUDA_FATTN_KVARN_DECODE_D;
+    constexpr int nwarps = GGML_CUDA_FATTN_KVARN_DECODE_THREADS / WARP_SIZE;
+    constexpr int slices = GGML_CUDA_FATTN_KVARN_DECODE_D / GGML_CUDA_FATTN_KVARN_DIM;
+    __shared__ float warp_sums[MAX_GQA][nwarps];
+    __shared__ float m_new_sh[MAX_GQA];
+    __shared__ float scale_sh[MAX_GQA];
+    __shared__ float weight_sh[MAX_GQA];
+    extern __shared__ uint8_t records_smem[];
+
+    const ggml_cuda_fattn_kvarn_desc & k_desc = k_descs[stream * n_kv_heads + kv_head];
+    const ggml_cuda_fattn_kvarn_desc & v_desc = v_descs[stream * n_kv_heads + kv_head];
+    const int q_head0 = kv_head * gqa_ratio;
+    const int token_begin = split * GGML_CUDA_FATTN_KVARN_DECODE_SPLIT_TOKENS;
+    const int token_end = min(n_kv, token_begin + GGML_CUDA_FATTN_KVARN_DECODE_SPLIT_TOKENS);
+    const int group = split;
+    const bool k_from_record = ggml_cuda_fattn_kvarn_decode_group_from_record(k_desc, group);
+    const bool v_from_record = ggml_cuda_fattn_kvarn_decode_group_from_record(v_desc, group);
+    uint8_t * k_records_smem = records_smem;
+    uint8_t * v_records_smem = k_records_smem + k_desc.record_bytes * slices;
+
+    if (k_from_record) {
+        const int record_group = k_desc.stream * k_desc.groups_per_stream + group;
+        const uint8_t * src = k_desc.records + ((int64_t) record_group * k_desc.n_record_heads + k_desc.head_base) * k_desc.record_bytes;
+        for (int i = tid; i < k_desc.record_bytes * slices; i += blockDim.x) {
+            k_records_smem[i] = src[i];
+        }
+    }
+    if (v_from_record) {
+        const int record_group = v_desc.stream * v_desc.groups_per_stream + group;
+        const uint8_t * src = v_desc.records + ((int64_t) record_group * v_desc.n_record_heads + v_desc.head_base) * v_desc.record_bytes;
+        for (int i = tid; i < v_desc.record_bytes * slices; i += blockDim.x) {
+            v_records_smem[i] = src[i];
+        }
+    }
+    __syncthreads();
+
+    float m[MAX_GQA];
+    float denom[MAX_GQA];
+    float acc[MAX_GQA];
+#pragma unroll
+    for (int h = 0; h < MAX_GQA; ++h) {
+        m[h] = -FLT_MAX / 2.0f;
+        denom[h] = 0.0f;
+        acc[h] = 0.0f;
+    }
+
+    for (int token = token_begin; token < token_end; ++token) {
+        const int slice = tid / GGML_CUDA_FATTN_KVARN_DIM;
+        const int dim = tid % GGML_CUDA_FATTN_KVARN_DIM;
+        const float kval = k_from_record ?
+            ggml_cuda_fattn_kvarn_load_rotated_record_smem(k_desc, k_records_smem, token, slice, dim) :
+            ggml_cuda_fattn_kvarn_load_rotated(k_desc, token, slice, dim);
+
+#pragma unroll
+        for (int h = 0; h < MAX_GQA; ++h) {
+            const int q_head = q_head0 + h;
+            float qk = 0.0f;
+            if (h < gqa_ratio && q_head < n_q_heads) {
+                const float * q = (const float *) (Q + nb03 * stream + nb02 * q_head);
+                qk = q[tid] * kval * scale;
+            }
+            qk = warp_reduce_sum<WARP_SIZE>(qk);
+            if (lane == 0) {
+                warp_sums[h][warp] = qk;
+            }
+        }
+        __syncthreads();
+
+        if (tid < MAX_GQA) {
+            const int h = tid;
+            const int q_head = q_head0 + h;
+            if (h < gqa_ratio && q_head < n_q_heads) {
+                float score = 0.0f;
+#pragma unroll
+                for (int w = 0; w < nwarps; ++w) {
+                    score += warp_sums[h][w];
+                }
+                if (logit_softcap != 0.0f) {
+                    score = logit_softcap * tanhf(score);
+                }
+                if (mask != nullptr) {
+                    const half * mask_h = (const half *) (mask + nb33 * (stream % ne33));
+                    score += __half2float(mask_h[token]);
+                }
+                const float m_new = fmaxf(m[h], score + FATTN_KQ_MAX_OFFSET);
+                m_new_sh[h] = m_new;
+                scale_sh[h] = __expf(m[h] - m_new);
+                weight_sh[h] = __expf(score - m_new);
+            } else {
+                m_new_sh[h] = -FLT_MAX / 2.0f;
+                scale_sh[h] = 0.0f;
+                weight_sh[h] = 0.0f;
+            }
+        }
+        __syncthreads();
+
+        const float vval = v_from_record ?
+            ggml_cuda_fattn_kvarn_load_rotated_record_smem(v_desc, v_records_smem, token, slice, dim) :
+            ggml_cuda_fattn_kvarn_load_rotated(v_desc, token, slice, dim);
+#pragma unroll
+        for (int h = 0; h < MAX_GQA; ++h) {
+            const int q_head = q_head0 + h;
+            if (h < gqa_ratio && q_head < n_q_heads) {
+                acc[h] = acc[h] * scale_sh[h] + weight_sh[h] * vval;
+                denom[h] = denom[h] * scale_sh[h] + weight_sh[h];
+                m[h] = m_new_sh[h];
+            }
+        }
+    }
+
+#pragma unroll
+    for (int h = 0; h < MAX_GQA; ++h) {
+        const int q_head = q_head0 + h;
+        if (h < gqa_ratio && q_head < n_q_heads) {
+            const size_t base = ((size_t) stream * n_q_heads + q_head) * n_splits + split;
+            partial[base * D + tid] = acc[h];
+            if (tid == 0) {
+                partial_meta[base] = make_float2(m[h], denom[h]);
+            }
+        }
+    }
+}
+
+static __global__ void ggml_cuda_fattn_kvarn_decode_combine_d256_kernel(
+        const float * partial,
+        const float2 * partial_meta,
+        float * dst,
+        int n_splits,
+        int n_q_heads,
+        int n_stream) {
+    const int q_head = blockIdx.x;
+    const int stream = blockIdx.y;
+    const int tid = threadIdx.x;
+    constexpr int D = GGML_CUDA_FATTN_KVARN_DECODE_D;
+
+    __shared__ float m_sh;
+    __shared__ float denom_sh;
+
+    if (tid == 0) {
+        float m = -FLT_MAX / 2.0f;
+        for (int split = 0; split < n_splits; ++split) {
+            const float2 meta = partial_meta[((size_t) stream * n_q_heads + q_head) * n_splits + split];
+            if (meta.y > 0.0f) {
+                m = fmaxf(m, meta.x);
+            }
+        }
+
+        float denom = 0.0f;
+        for (int split = 0; split < n_splits; ++split) {
+            const float2 meta = partial_meta[((size_t) stream * n_q_heads + q_head) * n_splits + split];
+            if (meta.y > 0.0f) {
+                denom += __expf(meta.x - m) * meta.y;
+            }
+        }
+        m_sh = m;
+        denom_sh = denom;
+    }
+    __syncthreads();
+
+    float out = 0.0f;
+    if (denom_sh > 0.0f) {
+        for (int split = 0; split < n_splits; ++split) {
+            const size_t base = ((size_t) stream * n_q_heads + q_head) * n_splits + split;
+            const float2 meta = partial_meta[base];
+            if (meta.y > 0.0f) {
+                out += __expf(meta.x - m_sh) * partial[base * D + tid];
+            }
+        }
+        out /= denom_sh;
+    }
+    dst[((size_t) stream * n_q_heads + q_head) * D + tid] = out;
+
+    GGML_UNUSED(n_stream);
+}
+
+static bool ggml_cuda_flash_attn_ext_kvarn_decode_supported(
+        const ggml_cuda_fattn_kvarn_plan & plan,
+        const ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const ggml_tensor * sinks = dst->src[4];
+
+    float max_bias = 0.0f;
+    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+
+    if (Q->ne[0] != GGML_CUDA_FATTN_KVARN_DECODE_D || V->ne[0] != GGML_CUDA_FATTN_KVARN_DECODE_D || K->ne[0] != GGML_CUDA_FATTN_KVARN_DECODE_D) {
+        return false;
+    }
+    if (Q->ne[1] != 1 || Q->ne[3] != plan.n_stream || plan.n_stream <= 0) {
+        return false;
+    }
+    if (plan.k.swa || plan.v.swa || sinks != nullptr || max_bias != 0.0f) {
+        return false;
+    }
+    if (plan.n_kv <= GGML_CUDA_FATTN_KVARN_DIM * std::max(plan.k.stage_groups, plan.v.stage_groups)) {
+        return false;
+    }
+    if (Q->ne[2] % plan.n_kv_heads != 0) {
+        return false;
+    }
+    const int gqa_ratio = (int) (Q->ne[2] / plan.n_kv_heads);
+    return gqa_ratio > 0 && gqa_ratio <= GGML_CUDA_FATTN_KVARN_DECODE_MAX_GQA;
+}
+
+static bool ggml_cuda_flash_attn_ext_kvarn_decode(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * dst,
+        const ggml_cuda_fattn_kvarn_plan & plan) {
+    if (!ggml_cuda_flash_attn_ext_kvarn_decode_supported(plan, dst)) {
+        return false;
+    }
+
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * mask = dst->src[3];
+    const int n_q_heads = (int) Q->ne[2];
+    const int gqa_ratio = n_q_heads / plan.n_kv_heads;
+    const int n_splits = (plan.n_kv + GGML_CUDA_FATTN_KVARN_DECODE_SPLIT_TOKENS - 1) / GGML_CUDA_FATTN_KVARN_DECODE_SPLIT_TOKENS;
+    const size_t nbytes_shared_records = (size_t) (plan.k.records->ne[0] + plan.v.records->ne[0]) * plan.slices;
+
+    float scale = 1.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    if (logit_softcap != 0.0f) {
+        scale /= logit_softcap;
+    }
+
+    ggml_cuda_pool & pool = ctx.pool();
+    cudaStream_t stream = ctx.stream();
+    ggml_cuda_pool_alloc<int> live_groups_k(pool, plan.n_stream);
+    ggml_cuda_pool_alloc<int> live_groups_v(pool, plan.n_stream);
+    ggml_cuda_fattn_kvarn_live_groups_kernel<<<plan.n_stream, GGML_CUDA_FATTN_KVARN_DIM, 0, stream>>>(
+        (const int64_t *) plan.k.indices->data,
+        (int) plan.k.indices->ne[0],
+        plan.k.stream_start,
+        plan.n_stream,
+        plan.k.groups_per_stream,
+        plan.k.swa,
+        live_groups_k.get());
+    ggml_cuda_fattn_kvarn_live_groups_kernel<<<plan.n_stream, GGML_CUDA_FATTN_KVARN_DIM, 0, stream>>>(
+        (const int64_t *) plan.v.indices->data,
+        (int) plan.v.indices->ne[0],
+        plan.v.stream_start,
+        plan.n_stream,
+        plan.v.groups_per_stream,
+        plan.v.swa,
+        live_groups_v.get());
+
+    std::vector<ggml_cuda_fattn_kvarn_desc> k_desc_host;
+    std::vector<ggml_cuda_fattn_kvarn_desc> v_desc_host;
+    ggml_cuda_fattn_kvarn_fill_descs_host(plan.k, plan, live_groups_k.get(), k_desc_host);
+    ggml_cuda_fattn_kvarn_fill_descs_host(plan.v, plan, live_groups_v.get(), v_desc_host);
+
+    ggml_cuda_pool_alloc<ggml_cuda_fattn_kvarn_desc> k_desc(pool, k_desc_host.size());
+    ggml_cuda_pool_alloc<ggml_cuda_fattn_kvarn_desc> v_desc(pool, v_desc_host.size());
+    CUDA_CHECK(cudaMemcpyAsync(k_desc.get(), k_desc_host.data(), k_desc_host.size() * sizeof(k_desc_host[0]), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(v_desc.get(), v_desc_host.data(), v_desc_host.size() * sizeof(v_desc_host[0]), cudaMemcpyHostToDevice, stream));
+
+    const size_t partial_count = (size_t) plan.n_stream * n_q_heads * n_splits * GGML_CUDA_FATTN_KVARN_DECODE_D;
+    const size_t meta_count = (size_t) plan.n_stream * n_q_heads * n_splits;
+    ggml_cuda_pool_alloc<float> partial(pool, partial_count);
+    ggml_cuda_pool_alloc<float2> partial_meta(pool, meta_count);
+
+    if (getenv("GGML_CUDA_FA_ROUTE_DEBUG") != nullptr) {
+        fprintf(stderr,
+            "CUDA_FA_ROUTE_EXEC_DISPATCH kernel=KVARN_DECODE_SPLIT "
+            "Q=[%lld,%lld,%lld,%lld] bits=[%d,%d] n_kv=%d n_kv_heads=%d n_stream=%d gqa=%d n_splits=%d split_tokens=%d\n",
+            (long long) Q->ne[0], (long long) Q->ne[1], (long long) Q->ne[2], (long long) Q->ne[3],
+            plan.k.bits, plan.v.bits, plan.n_kv, plan.n_kv_heads, plan.n_stream, gqa_ratio, n_splits, GGML_CUDA_FATTN_KVARN_DECODE_SPLIT_TOKENS);
+        fflush(stderr);
+    }
+
+    const dim3 blocks_split((uint32_t) n_splits, (uint32_t) plan.n_kv_heads, (uint32_t) plan.n_stream);
+#if !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
+    static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
+    const int id = ggml_cuda_get_device();
+    if (!shared_memory_limit_raised[id]) {
+        const int max_record_bytes = ggml_cuda_fattn_kvarn_record_payload_bytes(8) + 3 * GGML_CUDA_FATTN_KVARN_DIM * (int) sizeof(half);
+        const int max_dynamic_smem = 2 * (GGML_CUDA_FATTN_KVARN_DECODE_D / GGML_CUDA_FATTN_KVARN_DIM) * max_record_bytes;
+        CUDA_CHECK(cudaFuncSetAttribute(
+            ggml_cuda_fattn_kvarn_decode_split_d256_kernel<GGML_CUDA_FATTN_KVARN_DECODE_MAX_GQA>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            max_dynamic_smem));
+        shared_memory_limit_raised[id] = true;
+    }
+#endif
+    ggml_cuda_fattn_kvarn_decode_split_d256_kernel<GGML_CUDA_FATTN_KVARN_DECODE_MAX_GQA>
+        <<<blocks_split, GGML_CUDA_FATTN_KVARN_DECODE_THREADS, nbytes_shared_records, stream>>>(
+            (const char *) Q->data,
+            k_desc.get(),
+            v_desc.get(),
+            mask ? (const char *) mask->data : nullptr,
+            partial.get(),
+            partial_meta.get(),
+            scale,
+            logit_softcap,
+            Q->nb[2],
+            Q->nb[3],
+            mask ? mask->nb[3] : 0,
+            mask ? (int) mask->ne[3] : 1,
+            plan.n_kv,
+            n_q_heads,
+            plan.n_kv_heads,
+            gqa_ratio,
+            n_splits);
+    CUDA_CHECK(cudaGetLastError());
+
+    const dim3 blocks_combine((uint32_t) n_q_heads, (uint32_t) plan.n_stream, 1);
+    ggml_cuda_fattn_kvarn_decode_combine_d256_kernel
+        <<<blocks_combine, GGML_CUDA_FATTN_KVARN_DECODE_THREADS, 0, stream>>>(
+            partial.get(),
+            partial_meta.get(),
+            (float *) dst->data,
+            n_splits,
+            n_q_heads,
+            plan.n_stream);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 void turbo_q_calibrate_init() {
     const char * env = getenv("TURBO_Q_CALIBRATE");
     if (!env || atoi(env) != 1) return;
@@ -3205,6 +3591,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     }
 
     if (plan.native_kvarn_mma) {
+        if (ggml_cuda_flash_attn_ext_kvarn_decode(ctx, dst, plan.kvarn_plan)) {
+            return;
+        }
         if (ggml_cuda_fattn_route_debug_enabled()) {
             fprintf(stderr,
                 "CUDA_FA_ROUTE_EXEC_DISPATCH kernel=MMA_KVARN need_f16_K=0 need_f16_V=0 "
