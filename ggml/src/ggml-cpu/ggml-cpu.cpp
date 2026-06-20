@@ -425,6 +425,13 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     const struct ggml_tensor * src1 = op->src[1];
     const struct ggml_tensor * src2 = op->src[2];
 
+    const auto kvarn_view_base = [](const struct ggml_tensor * t) {
+        while (t != nullptr && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE)) {
+            t = t->src[0];
+        }
+        return t != nullptr && t->op == GGML_OP_KVARN_VIEW ? t : nullptr;
+    };
+
     if (op->op == GGML_OP_NONE || op->op == GGML_OP_RESHAPE || op->op == GGML_OP_VIEW || op->op == GGML_OP_PERMUTE || op->op == GGML_OP_TRANSPOSE || op->op == GGML_OP_KVARN_VIEW) {
         return true;
     }
@@ -470,6 +477,9 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             return src0 != nullptr && src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_FLASH_ATTN_EXT: {
             if (src0 == nullptr || src1 == nullptr || src2 == nullptr) {
+                return false;
+            }
+            if (kvarn_view_base(src1) != nullptr || kvarn_view_base(src2) != nullptr) {
                 return false;
             }
 

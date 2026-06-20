@@ -74,7 +74,7 @@ static void test_head_dimension_slicing() {
     require(llama_kvarn_head_slices(128) == 1, "128-dim head should use one KVarN slice");
     require(llama_kvarn_head_slices(256) == 2, "256-dim head should use two KVarN slices");
     require(llama_kvarn_head_slices(512) == 4, "512-dim head should use four KVarN slices");
-    require(llama_kvarn_head_slices(384) == 3, "384-dim head should use three KVarN slices");
+    require(llama_kvarn_head_slices(384) == 0, "384-dim head has no native KVarN FA route");
     require(llama_kvarn_head_slices(64)  == 0, "64-dim head is not KVarN slice-compatible");
     require(llama_kvarn_head_slices(513) == 0, "non-128-multiple head is not KVarN slice-compatible");
 }
@@ -83,6 +83,8 @@ static void test_runtime_validation() {
     llama_kvarn_runtime_requirements supported = {};
     supported.attention_supported = true;
     supported.head_dims_supported = true;
+    supported.kv_offload = true;
+    supported.native_backend_supported = true;
     supported.n_seq_max = 1;
     supported.kv_unified = false;
 
@@ -113,6 +115,16 @@ static void test_runtime_validation() {
     requirements.head_dims_supported = false;
     require(llama_kvarn_validate_runtime(llama_kvarn_params_for_type(LLAMA_KVARN_K4V2_G128), requirements) != nullptr,
             "unsupported head dimension accepted");
+
+    requirements = supported;
+    requirements.kv_offload = false;
+    require(llama_kvarn_validate_runtime(llama_kvarn_params_for_type(LLAMA_KVARN_K4V2_G128), requirements) != nullptr,
+            "CPU KV placement accepted");
+
+    requirements = supported;
+    requirements.native_backend_supported = false;
+    require(llama_kvarn_validate_runtime(llama_kvarn_params_for_type(LLAMA_KVARN_K4V2_G128), requirements) != nullptr,
+            "backend without native KVarN FA accepted");
 
     requirements = supported;
     requirements.kv_unified = true;
@@ -1098,6 +1110,71 @@ static void require_close_f32_rmse(
     }
 }
 
+static bool backend_supports_kvarn_flash_attention_shape(ggml_backend_t backend, int head_dim) {
+    ggml_init_params params = {
+        /*.mem_size   =*/ 8 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr, "support gate: failed to initialize ggml context");
+
+    constexpr int n_q          = 4;
+    constexpr int n_kv         = 128;
+    constexpr int n_stream     = 1;
+    constexpr int stage_groups = 3;
+    const int slices = head_dim / 128;
+    const int record_heads = slices;
+    const int record_bytes = int(llama_kvarn_packed_bytes(128 * 128, 4) + 3 * 128 * sizeof(ggml_fp16_t));
+
+    ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_dim, n_q, 1, n_stream);
+    ggml_tensor * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_kv);
+    ggml_tensor * current = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, record_heads, n_kv);
+    ggml_tensor * k_stage = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, record_heads, 128 * stage_groups);
+    ggml_tensor * v_stage = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, record_heads, 128 * stage_groups);
+    ggml_tensor * k_records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, record_bytes, record_heads, 1);
+    ggml_tensor * v_records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, record_bytes, record_heads, 1);
+    ggml_tensor * stored_k = ggml_kvarn_store(ctx, current, indices, k_stage, k_records, 4, 16, false, stage_groups);
+    ggml_tensor * stored_v = ggml_kvarn_store(ctx, current, indices, v_stage, v_records, 4, 16, true,  stage_groups);
+    ggml_tensor * k = ggml_kvarn_view(ctx, k_records, stored_k, indices, n_kv, 0, n_stream, 4, false, stage_groups);
+    ggml_tensor * v = ggml_kvarn_view(ctx, v_records, stored_v, indices, n_kv, 0, n_stream, 4, true,  stage_groups);
+    if (slices > 1) {
+        k = ggml_reshape_4d(ctx, k, head_dim, 1, n_kv, n_stream);
+        v = ggml_reshape_4d(ctx, v, head_dim, 1, n_kv, n_stream);
+    }
+    k = ggml_permute(ctx, k, 0, 2, 1, 3);
+    v = ggml_permute(ctx, v, 0, 2, 1, 3);
+    ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_q, 1, n_stream);
+    ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, mask, 1.0f / std::sqrt(float(head_dim)), 0.0f, 0.0f);
+
+    const bool supported = ggml_backend_supports_op(backend, out);
+    ggml_free(ctx);
+    return supported;
+}
+
+static void test_native_flash_attention_support_gates() {
+    ggml_backend_t cpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_CPU, true);
+    require(!backend_supports_kvarn_flash_attention_shape(cpu_backend, 128),
+            "CPU backend accepted KVarN view FlashAttention as ordinary F16");
+    ggml_backend_free(cpu_backend);
+
+    ggml_backend_t gpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
+    if (gpu_backend == nullptr) {
+        return;
+    }
+
+    if (backend_supports_kvarn_flash_attention_shape(gpu_backend, 128)) {
+        require( backend_supports_kvarn_flash_attention_shape(gpu_backend, 256),
+                "native KVarN FlashAttention rejected supported 256-dim heads");
+        require( backend_supports_kvarn_flash_attention_shape(gpu_backend, 512),
+                "native KVarN FlashAttention rejected supported 512-dim heads");
+        require(!backend_supports_kvarn_flash_attention_shape(gpu_backend, 384),
+                "GPU backend accepted unsupported 384-dim KVarN view FlashAttention as ordinary F16");
+    }
+
+    ggml_backend_free(gpu_backend);
+}
+
 static void test_native_flash_attention_gpu() {
     ggml_backend_t gpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
     if (gpu_backend == nullptr) {
@@ -1560,6 +1637,7 @@ int main() {
     test_cache_ops_swa(GGML_BACKEND_DEVICE_TYPE_CPU, true);
     test_cache_ops_swa(GGML_BACKEND_DEVICE_TYPE_GPU, false); // CUDA SWA ring parity
     test_store_paths_gpu();
+    test_native_flash_attention_support_gates();
     test_native_flash_attention_gpu();
     test_rotated_decode_transform_consistency(GGML_BACKEND_DEVICE_TYPE_CPU, true);
     test_rotated_decode_transform_consistency(GGML_BACKEND_DEVICE_TYPE_GPU, false);

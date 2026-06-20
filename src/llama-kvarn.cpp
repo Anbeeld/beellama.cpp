@@ -163,7 +163,13 @@ const char * llama_kvarn_validate_runtime(
         return "KVarN is not supported by this attention/cache path";
     }
     if (!requirements.head_dims_supported) {
-        return "KVarN requires key and value head dimensions to be 128-slice-compatible";
+        return "KVarN native FlashAttention requires 128-, 256-, or 512-dimensional key/value heads";
+    }
+    if (!requirements.kv_offload) {
+        return "KVarN native attention requires KV offload";
+    }
+    if (!requirements.native_backend_supported) {
+        return "KVarN requires a backend with native KVarN FlashAttention support";
     }
     return nullptr;
 }
@@ -231,7 +237,7 @@ llama_kvarn_tile_layout llama_kvarn_make_layout(int head_dim, int group, int key
 }
 
 int llama_kvarn_head_slices(int head_dim) {
-    if (head_dim < 128 || head_dim > 512 || head_dim % 128 != 0) {
+    if (head_dim != 128 && head_dim != 256 && head_dim != 512) {
         return 0;
     }
 

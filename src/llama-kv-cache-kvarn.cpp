@@ -29,9 +29,11 @@ constexpr uint32_t KVAR_N_STATE_VERSION = 5;
 constexpr uint32_t KVAR_N_STATE_RECORDS_FULL = 0;
 constexpr uint32_t KVAR_N_STATE_STAGE_ONLY_PARTIAL = 1;
 
-bool kvarn_backend_supports_native_ops(ggml_backend_dev_t dev) {
+} // namespace
+
+bool llama_kvarn_backend_supports_native_ops(ggml_backend_dev_t dev) {
     if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
-        return true;
+        return false;
     }
 
     using ggml_backend_kvarn_native_ops_t = bool (*)(ggml_backend_dev_t dev);
@@ -40,6 +42,8 @@ bool kvarn_backend_supports_native_ops(ggml_backend_dev_t dev) {
             reg, "ggml_backend_kvarn_native_ops") : nullptr;
     return fn != nullptr && fn(dev);
 }
+
+namespace {
 
 size_t kvarn_record_bytes(int bits) {
     return llama_kvarn_packed_bytes(KVAR_N_GROUP * KVAR_N_GROUP, bits) +
@@ -514,7 +518,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         }
 
         auto * dev = offload ? model.dev_layer(il) : nullptr;
-        if (offload && !kvarn_backend_supports_native_ops(dev)) {
+        if (offload && !llama_kvarn_backend_supports_native_ops(dev)) {
             throw std::runtime_error(format(
                 "KVarN cache layer %u is assigned to backend %s, which has no native KVarN operations "
                 "or does not meet KVarN kernel limits; use a backend with native KVarN support, "

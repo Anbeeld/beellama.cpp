@@ -10,6 +10,8 @@
 struct llama_hparams;
 struct llama_model;
 
+bool llama_kvarn_backend_supports_native_ops(ggml_backend_dev_t dev);
+
 class llama_kv_cache_kvarn;
 
 class llama_kv_cache_kvarn_context : public llama_kv_cache_context {

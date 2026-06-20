@@ -235,6 +235,19 @@ static inline bool ggml_cuda_fattn_kvarn_valid_bits(const int bits) {
     return bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 8;
 }
 
+static inline const ggml_tensor * ggml_cuda_fattn_kvarn_view_base(const ggml_tensor * t) {
+    while (t != nullptr && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE)) {
+        t = t->src[0];
+    }
+    return t != nullptr && t->op == GGML_OP_KVARN_VIEW ? t : nullptr;
+}
+
+static inline bool ggml_cuda_fattn_kvarn_uses_views(const ggml_tensor * dst) {
+    return dst != nullptr &&
+        (ggml_cuda_fattn_kvarn_view_base(dst->src[1]) != nullptr ||
+         ggml_cuda_fattn_kvarn_view_base(dst->src[2]) != nullptr);
+}
+
 static inline bool ggml_cuda_fattn_kvarn_unwrap_view(
         const ggml_tensor * t,
         ggml_cuda_fattn_kvarn_plan_side & side) {

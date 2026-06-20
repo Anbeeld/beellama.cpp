@@ -2671,6 +2671,11 @@ static ggml_cuda_fattn_route_plan ggml_cuda_fattn_make_route_plan(const int devi
         return plan;
     }
 
+    if (ggml_cuda_fattn_kvarn_uses_views(dst)) {
+        plan.kernel = BEST_FATTN_KERNEL_NONE;
+        return plan;
+    }
+
     const bool turbo_kv =
         ggml_cuda_fattn_is_turbo_kv_type(K->type) ||
         ggml_cuda_fattn_is_turbo_kv_type(V->type);

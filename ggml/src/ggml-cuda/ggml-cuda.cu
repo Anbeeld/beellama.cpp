@@ -5374,6 +5374,9 @@ static bool ggml_backend_cuda_kvarn_native_ops(ggml_backend_dev_t dev) {
     if (device < 0 || device >= info.device_count) {
         return false;
     }
+    if (!turing_mma_available(info.devices[device].cc)) {
+        return false;
+    }
 
     const size_t high_shared = ggml_cuda_kvarn_required_shared_bytes();
     const size_t low_shared = ggml_cuda_kvarn_low_shared_bytes();

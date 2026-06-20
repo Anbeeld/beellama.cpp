@@ -2375,9 +2375,10 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * mctx_cur = inp->mctx;
     const auto * kvarn_ctx = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur);
-    const bool use_kvarn_native = kvarn_ctx != nullptr && q_cur->ne[0] % 128 == 0;
+    const bool use_kvarn_native = kvarn_ctx != nullptr;
 
     if (use_kvarn_native) {
+        GGML_ASSERT(llama_kvarn_head_dim_supported((int) q_cur->ne[0]));
         GGML_ASSERT(inp->self_k_rot == nullptr);
         GGML_ASSERT(inp->self_v_rot == nullptr);
         GGML_ASSERT(inp->self_kvarn_rot != nullptr);
@@ -2666,9 +2667,10 @@ ggml_tensor * llm_graph_context::build_attn(
     // KVarN native attention consumes raw records/stage directly. SWA layers carry
     // their own per-cell position index; the KQ mask still enforces the window.
     const auto * kvarn_ctx = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur);
-    const bool use_kvarn_native = kvarn_ctx != nullptr && q_cur->ne[0] % 128 == 0;
+    const bool use_kvarn_native = kvarn_ctx != nullptr;
 
     if (use_kvarn_native) {
+        GGML_ASSERT(llama_kvarn_head_dim_supported((int) q_cur->ne[0]));
         GGML_ASSERT(k_rot == nullptr);
         GGML_ASSERT(v_rot == nullptr);
         GGML_ASSERT(inp->self_kvarn_rot != nullptr);
