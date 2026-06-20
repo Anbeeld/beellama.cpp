@@ -3,6 +3,7 @@
 #include <vector>
 
 static constexpr int GGML_CUDA_FATTN_KVARN_DIM = 128;
+static constexpr int GGML_CUDA_FATTN_KVARN_NATIVE_MAX_Q = 8;
 static constexpr ggml_type GGML_CUDA_FATTN_KVARN_TYPE = GGML_TYPE_COUNT;
 
 enum {
@@ -308,7 +309,7 @@ static inline bool ggml_cuda_fattn_kvarn_unwrap_view(
     return side.stream_start >= 0 && side.stream_start + side.n_stream <= total_streams;
 }
 
-static inline bool ggml_cuda_fattn_kvarn_supported(
+static inline bool ggml_cuda_fattn_kvarn_view_supported(
         const int device,
         const ggml_tensor * dst,
         ggml_cuda_fattn_kvarn_plan * out = nullptr) {
@@ -371,6 +372,18 @@ static inline bool ggml_cuda_fattn_kvarn_supported(
         *out = plan;
     }
     return true;
+}
+
+static inline bool ggml_cuda_fattn_kvarn_supported(
+        const int device,
+        const ggml_tensor * dst,
+        ggml_cuda_fattn_kvarn_plan * out = nullptr) {
+    const ggml_tensor * Q = dst != nullptr ? dst->src[0] : nullptr;
+    if (Q == nullptr || !(Q->ne[1] <= GGML_CUDA_FATTN_KVARN_NATIVE_MAX_Q)) {
+        return false;
+    }
+
+    return ggml_cuda_fattn_kvarn_view_supported(device, dst, out);
 }
 
 #ifdef GGML_CUDA_FATTN_MMA_KVARN_DEFINE_CASE

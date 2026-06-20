@@ -455,6 +455,12 @@ int main(int argc, char ** argv) {
                  kv_cache_kvarn_cpp.find("llama_kv_cache_kvarn::materialize") == std::string::npos &&
                  kv_cache_kvarn_cpp.find("ggml_kvarn_materialize") == std::string::npos,
         "KVarN cache get_k/get_v must not retain a materialize graph path");
+    ok &= expect(kv_cache_kvarn_h.find("ceil((n_batch + n_ubatch) / KVAR_N_GROUP)") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("? n_ubatch : n_batch + n_ubatch") != std::string::npos &&
+                 contains_ws(model_cpp, "cparams.n_ctx_seq, cparams.n_seq_max, cparams.n_batch, cparams.n_ubatch") &&
+                 contains_ws(kv_cache_iswa_cpp, "size, n_seq_max, n_batch, n_ubatch") &&
+                 contains_ws(memory_hybrid_iswa, "kv_size, n_seq_max, n_batch, n_ubatch"),
+        "KVarN non-SWA stage depth must size from n_batch plus one n_ubatch and all construction paths must pass n_batch");
     ok &= expect(ggml_backend_cpp.find("pending_new_split_inputs") != std::string::npos &&
                  ggml_backend_cpp.find("split->n_inputs + pending_new_split_inputs > GGML_SCHED_MAX_SPLIT_INPUTS") != std::string::npos,
         "backend scheduler must pre-count all new cross-backend inputs for a node before deciding whether to start a new split");
@@ -468,6 +474,10 @@ int main(int argc, char ** argv) {
                  cuda_fattn_mma_kvarn.find("ggml_cuda_fattn_kvarn_unwrap_view") != std::string::npos &&
                  cuda_fattn_mma_kvarn.find("GGML_OP_KVARN_MATERIALIZE") == std::string::npos,
         "CUDA FlashAttention must recognize KVarN view inputs directly and avoid materialize ancestry in the native route");
+    ok &= expect(cuda_fattn_mma_kvarn.find("GGML_CUDA_FATTN_KVARN_NATIVE_MAX_Q = 8") != std::string::npos &&
+                 cuda_fattn_mma_kvarn.find("Q->ne[1] <= GGML_CUDA_FATTN_KVARN_NATIVE_MAX_Q") != std::string::npos &&
+                 cuda_fattn.find("materialize_kvarn_f16") != std::string::npos,
+        "KVarN native MMA must stay decode/small-batch scoped while large prefill uses an internal F16 materialize fallback");
     ok &= expect(cuda_fattn_mma_kvarn.find("ggml_cuda_flash_attn_ext_mma_kvarn_case") != std::string::npos &&
                  cuda_fattn_mma_kvarn.find("flash_attn_ext_f16") != std::string::npos &&
                  cuda_fattn_mma_kvarn.find("need_f16_K=false") != std::string::npos &&

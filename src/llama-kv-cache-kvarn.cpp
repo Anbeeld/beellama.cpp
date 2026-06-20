@@ -411,6 +411,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         bool unified,
         uint32_t kv_size,
         uint32_t n_seq_max,
+        uint32_t n_batch,
         uint32_t n_ubatch,
         uint32_t n_pad,
         uint32_t n_swa,
@@ -426,14 +427,16 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     // a slot collision and to keep (live_group - group) < groups_per_stream.
     n_groups_per_stream(((kv_size + KVAR_N_GROUP - 1) / KVAR_N_GROUP) +
         ((n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE) ? 2u : 0u)),
-    // Dynamic staging: size the lossless F16 ring from the configured physical
-    // ubatch. Non-SWA KVarN keeps at least four transient tail groups; Qwen KLD
-    // is sensitive to the compression boundary at common -ub 256 settings. SWA
-    // keeps the smaller ring because it has no permanent sink and stores a
-    // sliding window rather than a full-context cache.
+    // Dynamic staging: size the lossless F16 ring from the scheduler window.
+    // Non-SWA KVarN keeps at least four transient tail groups and covers the full
+    // logical batch plus one physical ubatch, so early queries in a large ubatch
+    // do not see nearby groups compressed relative to the ubatch's final live
+    // group, including at logical-batch boundaries. SWA keeps the smaller physical
+    // ubatch ring because it has no permanent sink and stores a sliding window
+    // rather than a full-context cache.
     tail_groups(std::max<uint32_t>(
         (n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE) ? 1u : 4u,
-        (n_ubatch + KVAR_N_GROUP - 1u) / KVAR_N_GROUP)),
+        (((n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE) ? n_ubatch : n_batch + n_ubatch) + KVAR_N_GROUP - 1u) / KVAR_N_GROUP)),
     stage_groups(tail_groups + 1u),
     swa(n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE),
     metadata(std::make_unique<llama_kv_cache>(
@@ -464,11 +467,11 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         GGML_ASSERT(n_groups_per_stream > (kv_size + KVAR_N_GROUP - 1) / KVAR_N_GROUP &&
             "SWA KVarN record ring is too small for the sliding window");
     }
-    // Dynamic staging keeps the F16/compressed mix independent of physical
-    // ubatch. Log the configured stage depth and its memory cost at cache
+    // Dynamic staging keeps the F16/compressed mix stable across physical ubatch
+    // splits. Log the configured stage depth and its memory cost at cache
     // creation so regressions in the propagation are visible at startup.
-    LLAMA_LOG_INFO("KVarN cache: stage_groups=%u tail_groups=%u n_ubatch=%u%s\n",
-            stage_groups, tail_groups, n_ubatch, swa ? " (SWA ring)" : "");
+    LLAMA_LOG_INFO("KVarN cache: stage_groups=%u tail_groups=%u n_batch=%u n_ubatch=%u%s\n",
+            stage_groups, tail_groups, n_batch, n_ubatch, swa ? " (SWA ring)" : "");
 
     struct buft_comparator {
         bool operator()(ggml_backend_buffer_type_t lhs, ggml_backend_buffer_type_t rhs) const {
@@ -502,9 +505,10 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     const size_t k_record_size = kvarn_record_bytes(params.key_bits);
     const size_t v_record_size = kvarn_record_bytes(params.value_bits);
     const int64_t n_record_groups = int64_t(n_groups_per_stream) * n_stream;
-    // Stage depth is now a cache property derived from the configured physical
-    // ubatch. Non-SWA caches keep at least four transient tail groups; SWA uses
-    // the raw ubatch-derived tail because its staging area is a sliding ring.
+    // Stage depth is now a cache property derived from the configured scheduler
+    // window. Non-SWA caches keep at least four transient tail groups and cover
+    // n_batch plus one n_ubatch boundary cushion; SWA uses the raw ubatch-derived
+    // tail because its staging area is a sliding ring.
     // Backends read stage_groups from op_params[7] instead of assuming 3.
     const int64_t n_stage_tokens = int64_t(KVAR_N_GROUP) * int64_t(stage_groups) * n_stream;
     size_t raw_bytes = 0;

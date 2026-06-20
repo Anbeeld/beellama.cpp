@@ -16,6 +16,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
                      bool   v_trans,
                      bool   swa_full,
                  uint32_t   kv_size,
+                 uint32_t   n_batch,
                  uint32_t   n_ubatch,
                  uint32_t   n_pad,
                             /* recurrent */
@@ -42,6 +43,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         unified,
         kv_size,
         n_seq_max,
+        n_batch,
         n_ubatch,
         n_pad,
         nullptr,

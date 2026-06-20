@@ -2375,9 +2375,10 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * mctx_cur = inp->mctx;
     const auto * kvarn_ctx = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur);
-    const bool use_kvarn_native = kvarn_ctx != nullptr;
+    const bool use_kvarn_rotated_domain = kvarn_ctx != nullptr;
+    const bool use_kvarn_native = use_kvarn_rotated_domain && q_cur->ne[1] <= 8;
 
-    if (use_kvarn_native) {
+    if (use_kvarn_rotated_domain) {
         GGML_ASSERT(llama_kvarn_head_dim_supported((int) q_cur->ne[0]));
         GGML_ASSERT(inp->self_k_rot == nullptr);
         GGML_ASSERT(inp->self_v_rot == nullptr);
@@ -2415,7 +2416,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = use_kvarn_native ? kvarn_ctx->get_k_native(ctx0, il) : mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = use_kvarn_native ? kvarn_ctx->get_v_native(ctx0, il) : mctx_cur->get_v(ctx0, il);
 
-    if (use_kvarn_native) {
+    if (use_kvarn_rotated_domain) {
         GGML_ASSERT(q->type == GGML_TYPE_F32);
         q = ggml_mul_mat_aux(ctx0, q, inp->self_kvarn_rot);
     }
@@ -2435,7 +2436,7 @@ ggml_tensor * llm_graph_context::build_attn(
     cb(cur, "kqv_out", il);
 
     // TurboQuant V un-rotation at graph level (CUDA graph compatible)
-    if (use_kvarn_native) {
+    if (use_kvarn_rotated_domain) {
         GGML_ASSERT(cur->type == GGML_TYPE_F32);
         cur = ggml_mul_mat_aux(ctx0, cur, inp->self_kvarn_rot);
     } else if (v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO4_TCQ || v->type == GGML_TYPE_TURBO3_TCQ || v->type == GGML_TYPE_TURBO2_TCQ) {
@@ -2667,9 +2668,10 @@ ggml_tensor * llm_graph_context::build_attn(
     // KVarN native attention consumes raw records/stage directly. SWA layers carry
     // their own per-cell position index; the KQ mask still enforces the window.
     const auto * kvarn_ctx = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur);
-    const bool use_kvarn_native = kvarn_ctx != nullptr;
+    const bool use_kvarn_rotated_domain = kvarn_ctx != nullptr;
+    const bool use_kvarn_native = use_kvarn_rotated_domain && q_cur->ne[1] <= 8;
 
-    if (use_kvarn_native) {
+    if (use_kvarn_rotated_domain) {
         GGML_ASSERT(llama_kvarn_head_dim_supported((int) q_cur->ne[0]));
         GGML_ASSERT(k_rot == nullptr);
         GGML_ASSERT(v_rot == nullptr);
@@ -2719,7 +2721,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = use_kvarn_native ? kvarn_ctx->get_k_native(ctx0, il) : mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = use_kvarn_native ? kvarn_ctx->get_v_native(ctx0, il) : mctx_cur->get_v(ctx0, il);
 
-    if (use_kvarn_native) {
+    if (use_kvarn_rotated_domain) {
         GGML_ASSERT(q->type == GGML_TYPE_F32);
         q = ggml_mul_mat_aux(ctx0, q, inp->self_kvarn_rot);
     }
@@ -2728,7 +2730,7 @@ ggml_tensor * llm_graph_context::build_attn(
     cb(cur, "kqv_out", il);
 
     // TurboQuant V un-rotation at graph level (CUDA graph compatible)
-    if (use_kvarn_native) {
+    if (use_kvarn_rotated_domain) {
         GGML_ASSERT(cur->type == GGML_TYPE_F32);
         cur = ggml_mul_mat_aux(ctx0, cur, inp->self_kvarn_rot);
     } else if (v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO4_TCQ || v->type == GGML_TYPE_TURBO3_TCQ || v->type == GGML_TYPE_TURBO2_TCQ) {

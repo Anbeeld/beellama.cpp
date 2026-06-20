@@ -94,6 +94,7 @@ public:
             bool unified,
             uint32_t kv_size,
             uint32_t n_seq_max,
+            uint32_t n_batch,
             uint32_t n_ubatch,
             uint32_t n_pad = 1,
             uint32_t n_swa = 0,
@@ -140,9 +141,9 @@ public:
     bool apply_pending_stream_copies(llama_context * lctx);
     bool is_swa() const { return swa; }
 
-    // Dynamic staging: the lossless F16 ring is sized from the configured physical
-    // ubatch, with a non-SWA precision floor for common small ubatches.
-    //   non-SWA tail_groups = max(4, ceil(n_ubatch / KVAR_N_GROUP))
+    // Dynamic staging: the lossless F16 ring is sized from the configured batch
+    // window, with a non-SWA precision floor for common small batches.
+    //   non-SWA tail_groups = max(4, ceil((n_batch + n_ubatch) / KVAR_N_GROUP))
     //   SWA tail_groups     = max(1, ceil(n_ubatch / KVAR_N_GROUP))
     //   stage_groups        = tail_groups + 1
     // The +1 is the permanent sink slot for non-SWA, or the extra ping-pong slot
@@ -196,7 +197,7 @@ private:
     const uint32_t n_groups_per_stream;
     // Declaration order matters: stage_groups depends on tail_groups, so
     // tail_groups must be declared first (C++ initializes members in order).
-    const uint32_t tail_groups;   // non-SWA max(4, ceil(n_ubatch / 128)); SWA max(1, ceil(...))
+    const uint32_t tail_groups;   // non-SWA max(4, ceil((n_batch + n_ubatch) / 128)); SWA max(1, ceil(n_ubatch / 128))
     const uint32_t stage_groups;   // F16 stage depth (tail_groups + 1)
     const bool swa;
 

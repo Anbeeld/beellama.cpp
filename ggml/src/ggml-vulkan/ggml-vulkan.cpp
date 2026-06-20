@@ -1199,7 +1199,7 @@ struct vk_op_kvarn_store_push_constants {
     uint32_t value;
     uint32_t swa; // SWA sliding-window ring store (absolute-position indices, no sink)
     uint32_t stage_groups; // dynamic stage depth (tail_groups + 1)
-    uint32_t tail_groups;  // ceil(n_ubatch / 128)
+    uint32_t tail_groups;  // stage_groups - 1
 };
 static_assert(sizeof(vk_op_kvarn_store_push_constants) <= 128, "sizeof(vk_op_kvarn_store_push_constants) must be <= 128");
 

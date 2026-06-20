@@ -930,10 +930,15 @@ static ggml_tensor * apply_hadamard_128(ggml_context * ctx, ggml_tensor * cur, g
 static std::vector<float> test_native_flash_attention_output(
         ggml_backend_t backend,
         bool           native_view,
+        bool           rotate_graph,
         int            head_dim,
         int            bits_k,
         int            bits_v,
-        int            n_q) {
+        int            n_q,
+        int            n_q_heads = 1,
+        int            n_kv_heads = 1,
+        int            n_kv = 512,
+        int            stage_groups = 3) {
     ggml_init_params params = {
         /*.mem_size   =*/ 32 * 1024 * 1024,
         /*.mem_buffer =*/ nullptr,
@@ -943,10 +948,6 @@ static std::vector<float> test_native_flash_attention_output(
     require(ctx != nullptr, "native FA: failed to initialize ggml context");
 
     constexpr int n_stream   = 1;
-    constexpr int n_q_heads  = 1;
-    constexpr int n_kv_heads = 1;
-    constexpr int n_kv       = 512;
-    constexpr int stage_groups = 3;
     const int slices = head_dim / 128;
     const int record_heads = n_kv_heads * slices;
     const int groups_per_stream = std::max(4, (n_kv + 127) / 128);
@@ -954,8 +955,8 @@ static std::vector<float> test_native_flash_attention_output(
     const int v_record_bytes = int(llama_kvarn_packed_bytes(128 * 128, bits_v) + 3 * 128 * sizeof(ggml_fp16_t));
 
     ggml_tensor * q_in = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_dim, n_q, n_q_heads, n_stream);
-    ggml_tensor * kvarn_rot = native_view ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 128) : nullptr;
-    ggml_tensor * q = native_view ? apply_hadamard_128(ctx, q_in, kvarn_rot) : q_in;
+    ggml_tensor * kvarn_rot = native_view && rotate_graph ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 128) : nullptr;
+    ggml_tensor * q = kvarn_rot ? apply_hadamard_128(ctx, q_in, kvarn_rot) : q_in;
     ggml_tensor * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_kv * n_stream);
     ggml_tensor * current_k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, record_heads, n_kv * n_stream);
     ggml_tensor * current_v = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, record_heads, n_kv * n_stream);
@@ -986,7 +987,7 @@ static std::vector<float> test_native_flash_attention_output(
     ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_q, 1, n_stream);
     ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, mask, 1.0f / std::sqrt(float(head_dim)), 0.0f, 0.0f);
     ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
-    if (native_view) {
+    if (kvarn_rot) {
         out = ggml_cont(ctx, out);
         out = apply_hadamard_128(ctx, out, kvarn_rot);
     }
@@ -1004,11 +1005,13 @@ static std::vector<float> test_native_flash_attention_output(
     require(buffer != nullptr, "native FA: failed to allocate tensors");
 
     std::vector<float> q_data((size_t) head_dim * n_q * n_q_heads * n_stream);
-    for (int iq = 0; iq < n_q; ++iq) {
-        for (int d = 0; d < head_dim; ++d) {
-            q_data[(size_t) iq * head_dim + d] =
-                0.09f * std::sin(float(d) * 0.017f + float(iq) * 0.13f) +
-                0.07f * std::cos(float(d) * 0.031f - float(iq) * 0.05f);
+    for (int qh = 0; qh < n_q_heads; ++qh) {
+        for (int iq = 0; iq < n_q; ++iq) {
+            for (int d = 0; d < head_dim; ++d) {
+                q_data[((size_t) qh * n_q + iq) * head_dim + d] =
+                    0.09f * std::sin(float(d) * 0.017f + float(iq) * 0.13f + float(qh) * 0.021f) +
+                    0.07f * std::cos(float(d) * 0.031f - float(iq) * 0.05f + float(qh) * 0.033f);
+            }
         }
     }
 
@@ -1183,11 +1186,32 @@ static void test_native_flash_attention_gpu() {
     ggml_backend_t cpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_CPU, true);
 
     for (int head_dim : { 128, 256, 512 }) {
-        const int n_q = head_dim == 512 ? 64 : 4;
-        const std::vector<float> expected = test_native_flash_attention_output(cpu_backend, false, head_dim, 4, 3, n_q);
-        const std::vector<float> actual   = test_native_flash_attention_output(gpu_backend, true,  head_dim, 4, 3, n_q);
-        require_close_f32_rmse(actual, expected, head_dim == 512 ? 2e-2f : 1e-2f,
+        constexpr int n_q_native = 4;
+        const std::vector<float> expected = test_native_flash_attention_output(cpu_backend, false, false, head_dim, 4, 3, n_q_native);
+        const std::vector<float> actual   = test_native_flash_attention_output(gpu_backend, true,  true,  head_dim, 4, 3, n_q_native);
+        require_close_f32_rmse(actual, expected, 1e-2f,
                 "native KVarN FlashAttention output differs from CPU reference decode");
+
+        constexpr int n_q_prefill = 64;
+        const std::vector<float> expected_prefill = test_native_flash_attention_output(cpu_backend, false, false, head_dim, 4, 3, n_q_prefill);
+        const std::vector<float> actual_prefill   = test_native_flash_attention_output(gpu_backend, true,  true,  head_dim, 4, 3, n_q_prefill);
+        require_close_f32_rmse(actual_prefill, expected_prefill, 1e-2f,
+                "large-prefill KVarN FlashAttention fallback differs from CPU reference decode");
+    }
+
+    {
+        constexpr int head_dim = 256;
+        constexpr int n_q_prefill = 512;
+        constexpr int n_q_heads = 6;
+        constexpr int n_kv_heads = 1;
+        constexpr int n_kv = 4096;
+        constexpr int stage_groups = 5;
+        const std::vector<float> expected_prefill = test_native_flash_attention_output(
+                cpu_backend, false, false, head_dim, 4, 4, n_q_prefill, n_q_heads, n_kv_heads, n_kv, stage_groups);
+        const std::vector<float> actual_prefill = test_native_flash_attention_output(
+                gpu_backend, true, true, head_dim, 4, 4, n_q_prefill, n_q_heads, n_kv_heads, n_kv, stage_groups);
+        require_close_f32_rmse(actual_prefill, expected_prefill, 1e-2f,
+                "large-prefill multi-head KVarN FlashAttention fallback differs from CPU reference decode");
     }
 
     ggml_backend_free(cpu_backend);
@@ -1338,7 +1362,7 @@ static void test_rotated_decode_transform_consistency(enum ggml_backend_dev_type
 
 // W2 dynamic-stage-depth test: verifies the store path honors
 // stage_groups carried in op_params[7] instead of the legacy three-slot stride.
-// Writes 768 tokens (6 groups) through a 5-deep stage (tail_groups=4, n_ubatch=512)
+// Writes 768 tokens (6 groups) through a 5-deep stage (tail_groups=4)
 // and checks reconstruction of sink, compressed, previous-tail, and live-tail
 // groups. Writing 6 groups with stage_groups=5 forces group 5 to reuse transient
 // slot 1, flushing the completed group 1 to records — exercising the dynamic
@@ -1360,7 +1384,7 @@ static void test_cache_ops_dynamic_stage(enum ggml_backend_dev_type device_type,
 
     constexpr int n_tokens = 768;     // 6 complete groups (0..5)
     constexpr int n_heads   = 1;
-    constexpr int stage_groups = 5;   // tail_groups = 4, n_ubatch = 512
+    constexpr int stage_groups = 5;   // tail_groups = 4
     constexpr int tail_groups  = stage_groups - 1;
     // 8 record groups per stream (kv_size = 1024) — enough to hold 6 groups with
     // room for the flush ring to grow without collision.
@@ -1617,7 +1641,7 @@ int main() {
         test_cache_ops(GGML_BACKEND_DEVICE_TYPE_CPU, true, bits);
         test_cache_ops(GGML_BACKEND_DEVICE_TYPE_GPU, false, bits);
     }
-    // W2 dynamic stage-depth coverage: stage_groups=5 (n_ubatch=512).
+    // W2 dynamic stage-depth coverage: stage_groups=5 (tail_groups=4).
     test_cache_ops_dynamic_stage(GGML_BACKEND_DEVICE_TYPE_CPU, true, 4);
     test_cache_ops_dynamic_stage(GGML_BACKEND_DEVICE_TYPE_GPU, false, 4);
     // W2 unaligned-start coverage: first persist a prefix, then run a second
