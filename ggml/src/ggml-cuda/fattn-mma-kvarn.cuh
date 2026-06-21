@@ -150,35 +150,6 @@ static __device__ __forceinline__ bool ggml_cuda_fattn_kvarn_mma_group_from_reco
     return !from_stage && group < live_group && group < desc.groups_per_stream;
 }
 
-static __device__ __forceinline__ half2 ggml_cuda_fattn_kvarn_load_rotated_mma_record_smem_h2(
-        const ggml_cuda_fattn_kvarn_desc & desc,
-        const uint8_t * record,
-        const int token,
-        const int dim) {
-    const int pos = token - (token / GGML_CUDA_FATTN_KVARN_DIM) * GGML_CUDA_FATTN_KVARN_DIM;
-    const int payload_bytes = ggml_cuda_fattn_kvarn_mma_record_payload_bytes(desc.bits);
-    const half * scale_axis = (const half *) (record + payload_bytes);
-    const half * zp_axis    = scale_axis + GGML_CUDA_FATTN_KVARN_DIM;
-    const half * other_axis = zp_axis + GGML_CUDA_FATTN_KVARN_DIM;
-
-    if (desc.value) {
-        const uint8_t q0 = ggml_cuda_fattn_kvarn_unpack_record(record, pos * GGML_CUDA_FATTN_KVARN_DIM + dim + 0, desc.bits);
-        const uint8_t q1 = ggml_cuda_fattn_kvarn_unpack_record(record, pos * GGML_CUDA_FATTN_KVARN_DIM + dim + 1, desc.bits);
-        const float scale = __half2float(scale_axis[pos]);
-        const float zp = __half2float(zp_axis[pos]);
-        const float x0 = (float(q0) * scale + zp) * __half2float(other_axis[dim + 0]);
-        const float x1 = (float(q1) * scale + zp) * __half2float(other_axis[dim + 1]);
-        return make_half2(x0, x1);
-    }
-
-    const uint8_t q0 = ggml_cuda_fattn_kvarn_unpack_record(record, (dim + 0) * GGML_CUDA_FATTN_KVARN_DIM + pos, desc.bits);
-    const uint8_t q1 = ggml_cuda_fattn_kvarn_unpack_record(record, (dim + 1) * GGML_CUDA_FATTN_KVARN_DIM + pos, desc.bits);
-    const float other = __half2float(other_axis[pos]);
-    const float x0 = (float(q0) * __half2float(scale_axis[dim + 0]) + __half2float(zp_axis[dim + 0])) * other;
-    const float x1 = (float(q1) * __half2float(scale_axis[dim + 1]) + __half2float(zp_axis[dim + 1])) * other;
-    return make_half2(x0, x1);
-}
-
 template<int D, int stride_tile, int nbatch_fa, int nthreads, bool oob_check>
 static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
         const char * __restrict__ desc_raw,
@@ -187,7 +158,7 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
         const int i_sup,
         const int dim2_start,
         const int dim2_count,
-        uint8_t   * __restrict__ record_cache) {
+        half      * __restrict__ scale_smem) {
     const ggml_cuda_fattn_kvarn_desc & desc = *(const ggml_cuda_fattn_kvarn_desc *) desc_raw;
     static_assert(D % GGML_CUDA_FATTN_KVARN_DIM == 0 && D <= 512, "KVarN native MMA supports 128-wide slices through D=512");
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
@@ -197,7 +168,7 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
     const int valid_count = oob_check ? min(i_sup, nbatch_fa) : nbatch_fa;
     const int group_first = valid_count > 0 ? k_start / GGML_CUDA_FATTN_KVARN_DIM : -1;
     const int group_last  = valid_count > 0 ? (k_start + valid_count - 1) / GGML_CUDA_FATTN_KVARN_DIM : -2;
-    const bool cache_record = record_cache != nullptr && !desc.swa && group_first == group_last &&
+    const bool stream_record = scale_smem != nullptr && !desc.swa && group_first == group_last &&
         ggml_cuda_fattn_kvarn_mma_group_from_record(desc, group_first);
     const int record_group = desc.stream * desc.groups_per_stream + group_first;
 
@@ -209,14 +180,24 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
             continue;
         }
 
-        if (cache_record) {
-            const uint8_t * src = desc.records + ((int64_t) record_group * desc.n_record_heads + desc.head_base + slice) * desc.record_bytes;
-            const int record_chunks = desc.record_bytes / (int) sizeof(uint4);
-            for (int i = tid; i < record_chunks; i += nthreads) {
-                ((uint4 *) record_cache)[i] = ((const uint4 *) src)[i];
-            }
-            for (int i = record_chunks * (int) sizeof(uint4) + tid; i < desc.record_bytes; i += nthreads) {
-                record_cache[i] = src[i];
+        const uint8_t * record = nullptr;
+        const half * scale_axis = nullptr;
+        const half * zp_axis = nullptr;
+        const half * other_axis = nullptr;
+
+        if (stream_record) {
+            record = desc.records + ((int64_t) record_group * desc.n_record_heads + desc.head_base + slice) * desc.record_bytes;
+            const int payload_bytes = ggml_cuda_fattn_kvarn_mma_record_payload_bytes(desc.bits);
+            scale_axis = (const half *) (record + payload_bytes);
+            zp_axis    = scale_axis + GGML_CUDA_FATTN_KVARN_DIM;
+            other_axis = zp_axis + GGML_CUDA_FATTN_KVARN_DIM;
+            for (int i = tid; i < GGML_CUDA_FATTN_KVARN_DIM; i += nthreads) {
+                if (desc.value) {
+                    scale_smem[i] = other_axis[i];
+                } else {
+                    scale_smem[i] = scale_axis[i];
+                    scale_smem[GGML_CUDA_FATTN_KVARN_DIM + i] = zp_axis[i];
+                }
             }
             __syncthreads();
         }
@@ -231,11 +212,28 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
             }
 
             const int token = k_start + row;
+            const int pos = token - group_first * GGML_CUDA_FATTN_KVARN_DIM;
+            const float token_scale = stream_record && desc.value ? __half2float(scale_axis[pos]) : 0.0f;
+            const float token_zp    = stream_record && desc.value ? __half2float(zp_axis[pos])    : 0.0f;
+            const float token_other = stream_record && !desc.value ? __half2float(other_axis[pos]) : 0.0f;
             for (int global_b = out_dim2_start; global_b < out_dim2_end; ++global_b) {
                 const int dim = 2 * (global_b - slice_dim2_start);
-                if (cache_record) {
-                    tile_KV[row * stride_tile + global_b - dim2_start] =
-                        ggml_cuda_fattn_kvarn_load_rotated_mma_record_smem_h2(desc, record_cache, token, dim);
+                if (stream_record) {
+                    if (desc.value) {
+                        const uint8_t q0 = ggml_cuda_fattn_kvarn_unpack_record(record, pos * GGML_CUDA_FATTN_KVARN_DIM + dim + 0, desc.bits);
+                        const uint8_t q1 = ggml_cuda_fattn_kvarn_unpack_record(record, pos * GGML_CUDA_FATTN_KVARN_DIM + dim + 1, desc.bits);
+                        const float x0 = (float(q0) * token_scale + token_zp) * __half2float(scale_smem[dim + 0]);
+                        const float x1 = (float(q1) * token_scale + token_zp) * __half2float(scale_smem[dim + 1]);
+                        tile_KV[row * stride_tile + global_b - dim2_start] = make_half2(x0, x1);
+                    } else {
+                        const uint8_t q0 = ggml_cuda_fattn_kvarn_unpack_record(record, (dim + 0) * GGML_CUDA_FATTN_KVARN_DIM + pos, desc.bits);
+                        const uint8_t q1 = ggml_cuda_fattn_kvarn_unpack_record(record, (dim + 1) * GGML_CUDA_FATTN_KVARN_DIM + pos, desc.bits);
+                        const float x0 = (float(q0) * __half2float(scale_smem[dim + 0]) +
+                                __half2float(scale_smem[GGML_CUDA_FATTN_KVARN_DIM + dim + 0])) * token_other;
+                        const float x1 = (float(q1) * __half2float(scale_smem[dim + 1]) +
+                                __half2float(scale_smem[GGML_CUDA_FATTN_KVARN_DIM + dim + 1])) * token_other;
+                        tile_KV[row * stride_tile + global_b - dim2_start] = make_half2(x0, x1);
+                    }
                 } else {
                     const float x0 = ggml_cuda_fattn_kvarn_load_rotated(desc, token, slice, dim + 0);
                     const float x1 = ggml_cuda_fattn_kvarn_load_rotated(desc, token, slice, dim + 1);
@@ -244,7 +242,7 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
             }
         }
 
-        if (cache_record) {
+        if (stream_record) {
             __syncthreads();
         }
     }
@@ -506,11 +504,11 @@ void ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, gg
     const size_t nbytes_shared_Q = ncols * (DKQ / 2 + 4) * sizeof(half2);
     const size_t nbytes_shared_mask = ncols1 * (nbatch_fa / 2 + 4) * sizeof(half2);
     const size_t nbytes_shared_combine = nwarps * cols_per_warp * (nbatch_combine + 4) * sizeof(half2);
-    const size_t nbytes_shared_record = (size_t) std::max(plan.k.records->ne[0], plan.v.records->ne[0]);
-    const size_t nbytes_shared_KV_mask_record = nbytes_shared_KV + nbytes_shared_mask + nbytes_shared_record;
+    const size_t nbytes_shared_kvarn_scales = 3 * GGML_CUDA_FATTN_KVARN_DIM * sizeof(half);
+    const size_t nbytes_shared_KV_mask_kvarn = nbytes_shared_KV + nbytes_shared_mask + nbytes_shared_kvarn_scales;
     const size_t nbytes_shared_total = std::max(nbytes_shared_combine, Q_in_reg ?
-        std::max(nbytes_shared_Q, nbytes_shared_KV_mask_record) :
-                 nbytes_shared_Q + nbytes_shared_KV_mask_record);
+        std::max(nbytes_shared_Q, nbytes_shared_KV_mask_kvarn) :
+                 nbytes_shared_Q + nbytes_shared_KV_mask_kvarn);
 
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t stream = ctx.stream();

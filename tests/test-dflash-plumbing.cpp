@@ -485,6 +485,10 @@ int main(int argc, char ** argv) {
                  cuda_fattn_mma_kvarn.find("GGML_KVARN_FORCE_MATERIALIZE") == std::string::npos &&
                  cuda_fattn_mma_kvarn.find("ggml_cuda_fattn_kvarn_force_materialize_enabled") == std::string::npos,
         "native KVarN FlashAttention must reuse the MMA F16 kernel template without F16 materialize buffers or materialize fallback env gates");
+    ok &= expect(cuda_fattn_mma_kvarn.find("record_cache") == std::string::npos &&
+                 cuda_fattn.find("nbytes_shared_record =") == std::string::npos &&
+                 cuda_fattn.find("nbytes_shared_KV_mask_record") == std::string::npos,
+        "native KVarN MMA must stream record payloads instead of copying full records into shared memory");
     ok &= expect(cuda_fattn.find("D=512: MMA/TILE templates don't support this head_dim, use VEC unconditionally") == std::string::npos &&
                  cuda_fattn.find("if (Q->ne[0] == 512) {\n        return BEST_FATTN_KERNEL_VEC;") == std::string::npos,
         "CUDA FlashAttention must not force all D=512 non-turbo attention onto the vector kernel; Gemma4 global layers need the MMA selector path");
@@ -2759,14 +2763,14 @@ int main(int argc, char ** argv) {
                  ggml_cuda_kvarn.find("GGML_KVARN_") == std::string::npos,
         "CUDA/HIP KVarN store must keep high/low-shared-memory paths without KVarN runtime env knobs");
     ok &= expect(cuda_fattn_kvarn.empty() &&
-                 cuda_fattn.find("fattn-kvarn.cuh") == std::string::npos &&
-                 cuda_fattn.find("ggml_cuda_flash_attn_ext_kvarn") == std::string::npos &&
-                 cuda_fattn_h.find("ggml_cuda_flash_attn_ext_kvarn") == std::string::npos &&
-                 cuda_cpp.find("ggml_cuda_try_fuse_kvarn_fattn") == std::string::npos &&
-                 cuda_cpp.find("ggml_cuda_flash_attn_ext_kvarn_supported") == std::string::npos &&
-                 cuda_cpp.find("GGML_KVARN_FUSED") == std::string::npos &&
-                 cuda_cpp.find("GGML_KVARN_NATIVE_FA") == std::string::npos,
-        "CUDA KVarN native/fused FlashAttention path and route envs must be removed");
+                  cuda_fattn.find("fattn-kvarn.cuh") == std::string::npos &&
+                  cuda_fattn.find("ggml_cuda_flash_attn_ext_kvarn(") == std::string::npos &&
+                  cuda_fattn_h.find("ggml_cuda_flash_attn_ext_kvarn") == std::string::npos &&
+                  cuda_cpp.find("ggml_cuda_try_fuse_kvarn_fattn") == std::string::npos &&
+                  cuda_cpp.find("ggml_cuda_flash_attn_ext_kvarn_supported") == std::string::npos &&
+                  cuda_cpp.find("GGML_KVARN_FUSED") == std::string::npos &&
+                  cuda_cpp.find("GGML_KVARN_NATIVE_FA") == std::string::npos,
+        "legacy CUDA KVarN fused FlashAttention path and route envs must stay removed");
     ok &= expect(graph_cpp.find("GGML_KVARN_FORCE_MATERIALIZE") == std::string::npos &&
                  graph_cpp.find("kvarn_force_materialize_enabled") == std::string::npos &&
                  graph_cpp.find("GGML_KVARN_ROTATED_FA") == std::string::npos &&

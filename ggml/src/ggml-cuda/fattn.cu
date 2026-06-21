@@ -93,11 +93,11 @@ void ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, gg
     const size_t nbytes_shared_Q = ncols * (DKQ/2 + 4) * sizeof(half2);
     const size_t nbytes_shared_mask = ncols1 * (nbatch_fa/2 + 4) * sizeof(half2);
     const size_t nbytes_shared_combine = nwarps * cols_per_warp * (nbatch_combine + 4) * sizeof(half2);
-    const size_t nbytes_shared_record = (size_t) std::max(plan.k.records->ne[0], plan.v.records->ne[0]);
-    const size_t nbytes_shared_KV_mask_record = nbytes_shared_KV + nbytes_shared_mask + nbytes_shared_record;
+    const size_t nbytes_shared_kvarn_scales = 3 * GGML_CUDA_FATTN_KVARN_DIM * sizeof(half);
+    const size_t nbytes_shared_KV_mask_kvarn = nbytes_shared_KV + nbytes_shared_mask + nbytes_shared_kvarn_scales;
     const size_t nbytes_shared_total = std::max(nbytes_shared_combine, Q_in_reg ?
-        std::max(nbytes_shared_Q, nbytes_shared_KV_mask_record) :
-                 nbytes_shared_Q + nbytes_shared_KV_mask_record);
+        std::max(nbytes_shared_Q, nbytes_shared_KV_mask_kvarn) :
+                 nbytes_shared_Q + nbytes_shared_KV_mask_kvarn);
 
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t stream = ctx.stream();
@@ -389,6 +389,7 @@ static constexpr int GGML_CUDA_FATTN_KVARN_DECODE_D          = 256;
 static constexpr int GGML_CUDA_FATTN_KVARN_DECODE_THREADS    = 256;
 static constexpr int GGML_CUDA_FATTN_KVARN_DECODE_MAX_GQA    = 8;
 static constexpr int GGML_CUDA_FATTN_KVARN_DECODE_SPLIT_TOKENS = 128;
+static constexpr int GGML_CUDA_FATTN_KVARN_DECODE_SPLIT_MIN_KV = 8192;
 
 static __host__ __device__ __forceinline__ int ggml_cuda_fattn_kvarn_record_payload_bytes(const int bits) {
     return GGML_CUDA_FATTN_KVARN_DIM * GGML_CUDA_FATTN_KVARN_DIM * bits / 8;
@@ -646,6 +647,9 @@ static bool ggml_cuda_flash_attn_ext_kvarn_decode_supported(
         return false;
     }
     if (plan.n_kv <= GGML_CUDA_FATTN_KVARN_DIM * std::max(plan.k.stage_groups, plan.v.stage_groups)) {
+        return false;
+    }
+    if (plan.n_kv < GGML_CUDA_FATTN_KVARN_DECODE_SPLIT_MIN_KV) {
         return false;
     }
     if (Q->ne[2] % plan.n_kv_heads != 0) {
@@ -3593,6 +3597,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     }
 
     if (plan.native_kvarn_mma) {
+        if (ggml_cuda_flash_attn_ext_kvarn_decode(ctx, dst, plan.kvarn_plan)) {
+            return;
+        }
+
         if (ggml_cuda_fattn_route_debug_enabled()) {
             fprintf(stderr,
                 "CUDA_FA_ROUTE_EXEC_DISPATCH kernel=MMA_KVARN need_f16_K=0 need_f16_V=0 "
