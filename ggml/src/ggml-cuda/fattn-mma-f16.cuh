@@ -687,6 +687,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         half2        * const __restrict__ tile_K,
         half2        * const __restrict__ tile_V,
         half         * const __restrict__ tile_mask,
+        uint8_t      * const __restrict__ record_cache,
         T_B_KQ       * const __restrict__ Q_B,
         T_C_VKQ      * const __restrict__ VKQ_C,
         float        * const __restrict__ KQ_max,
@@ -749,7 +750,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 if constexpr (type_K == GGML_CUDA_FATTN_KVARN_TYPE) {
                     constexpr int nthreads_kvarn = nwarps * ggml_cuda_get_physical_warp_size();
                     flash_attn_ext_kvarn_load_tile<DKQ, stride_tile_K, nbatch_fa, nthreads_kvarn, oob_check>
-                        ((const char *) K_h2, tile_K, k_VKQ_0, k_VKQ_sup, k0_start, k0_stop - k0_start);
+                        ((const char *) K_h2, tile_K, k_VKQ_0, k_VKQ_sup, k0_start, k0_stop - k0_start, record_cache);
                 } else {
                     const int k0_diff = k0_stop - k0_start;
                     constexpr bool use_cp_async = nstages == 1;
@@ -1126,7 +1127,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 if constexpr (type_V == GGML_CUDA_FATTN_KVARN_TYPE) {
                     constexpr int nthreads_kvarn = nwarps * ggml_cuda_get_physical_warp_size();
                     flash_attn_ext_kvarn_load_tile<DV, stride_tile_V, nbatch_fa, nthreads_kvarn, oob_check>
-                        ((const char *) V_h2, tile_V, k_VKQ_0, k_VKQ_sup, i0_start / 2, nbatch_V2);
+                        ((const char *) V_h2, tile_V, k_VKQ_0, k_VKQ_sup, i0_start / 2, nbatch_V2, record_cache);
                     __syncthreads();
                 } else {
                     if (!V_is_K_view || i0_stop > 2*nbatch_K2) {
@@ -1354,8 +1355,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols);
     constexpr int  nbatch_combine  = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols);
-    constexpr bool is_turbo_kv     = (type_K != GGML_TYPE_F16 || type_V != GGML_TYPE_F16);
-    constexpr int  nstages         = is_turbo_kv ? 0 : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2);
+    constexpr bool is_kvarn_kv     = (type_K == GGML_CUDA_FATTN_KVARN_TYPE || type_V == GGML_CUDA_FATTN_KVARN_TYPE);
+    constexpr bool is_turbo_kv     = !is_kvarn_kv && (type_K != GGML_TYPE_F16 || type_V != GGML_TYPE_F16);
+    constexpr int  nstages         = (is_turbo_kv || is_kvarn_kv) ? 0 : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2);
 
     if (cols_per_warp > ncols) {
         NO_DEVICE_CODE;
@@ -1374,6 +1376,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     half2 * tile_K    = Q_in_reg              ? tile_Q                             : tile_Q + ncols     * stride_tile_Q;
     half2 * tile_V    =           nstages > 1 ? tile_K + nbatch_fa * stride_tile_K : tile_K;
     half  * tile_mask = (half *) (nstages > 1 ? tile_V + nbatch_fa * stride_tile_V : tile_V + nbatch_fa * stride_tile_KV_max);
+    uint8_t * record_cache = (uint8_t *) (tile_mask + ncols1 * (nbatch_fa + 8));
 
     T_B_KQ    Q_B[(Q_in_reg ? DKQ/(2*T_B_KQ::J) : 1)];
 #if defined(TURING_MMA_AVAILABLE)
@@ -1476,7 +1479,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, last_iter, oob_check,
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ, type_K, type_V>
                 (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
-                 ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+                 ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, record_cache, Q_B, VKQ_C,
                  KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
         }
         constexpr bool last_iter = true;
@@ -1485,7 +1488,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, last_iter, oob_check,
               T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ, type_K, type_V>
             (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
-             ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+             ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, record_cache, Q_B, VKQ_C,
              KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
     } else {
         constexpr bool oob_check = false;
@@ -1496,7 +1499,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, last_iter, oob_check,
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ, type_K, type_V>
                 (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
-                 ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+                 ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, record_cache, Q_B, VKQ_C,
                  KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
         }
         constexpr bool last_iter = true;
@@ -1505,7 +1508,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, last_iter, oob_check,
              T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ, type_K, type_V>
             (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
-             ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+             ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, record_cache, Q_B, VKQ_C,
              KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
     }
 

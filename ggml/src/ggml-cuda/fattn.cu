@@ -93,9 +93,11 @@ void ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, gg
     const size_t nbytes_shared_Q = ncols * (DKQ/2 + 4) * sizeof(half2);
     const size_t nbytes_shared_mask = ncols1 * (nbatch_fa/2 + 4) * sizeof(half2);
     const size_t nbytes_shared_combine = nwarps * cols_per_warp * (nbatch_combine + 4) * sizeof(half2);
+    const size_t nbytes_shared_record = (size_t) std::max(plan.k.records->ne[0], plan.v.records->ne[0]);
+    const size_t nbytes_shared_KV_mask_record = nbytes_shared_KV + nbytes_shared_mask + nbytes_shared_record;
     const size_t nbytes_shared_total = std::max(nbytes_shared_combine, Q_in_reg ?
-        std::max(nbytes_shared_Q, nbytes_shared_KV + nbytes_shared_mask) :
-                 nbytes_shared_Q + nbytes_shared_KV + nbytes_shared_mask);
+        std::max(nbytes_shared_Q, nbytes_shared_KV_mask_record) :
+                 nbytes_shared_Q + nbytes_shared_KV_mask_record);
 
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t stream = ctx.stream();
@@ -161,10 +163,10 @@ void ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, gg
         fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view,
             GGML_CUDA_FATTN_KVARN_TYPE, GGML_CUDA_FATTN_KVARN_TYPE>;
 #if !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
-        static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
-        if (!shared_memory_limit_raised[id]) {
+        static size_t shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {0};
+        if (shared_memory_limit_raised[id] < nbytes_shared_total) {
             CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
-            shared_memory_limit_raised[id] = true;
+            shared_memory_limit_raised[id] = nbytes_shared_total;
         }
 #endif
     } else {
@@ -172,10 +174,10 @@ void ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, gg
         fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view,
             GGML_CUDA_FATTN_KVARN_TYPE, GGML_CUDA_FATTN_KVARN_TYPE>;
 #if !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
-        static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
-        if (!shared_memory_limit_raised[id]) {
+        static size_t shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {0};
+        if (shared_memory_limit_raised[id] < nbytes_shared_total) {
             CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
-            shared_memory_limit_raised[id] = true;
+            shared_memory_limit_raised[id] = nbytes_shared_total;
         }
 #endif
     }
@@ -3591,9 +3593,6 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     }
 
     if (plan.native_kvarn_mma) {
-        if (ggml_cuda_flash_attn_ext_kvarn_decode(ctx, dst, plan.kvarn_plan)) {
-            return;
-        }
         if (ggml_cuda_fattn_route_debug_enabled()) {
             fprintf(stderr,
                 "CUDA_FA_ROUTE_EXEC_DISPATCH kernel=MMA_KVARN need_f16_K=0 need_f16_V=0 "

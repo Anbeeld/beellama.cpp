@@ -137,6 +137,48 @@ static __device__ __forceinline__ float ggml_cuda_fattn_kvarn_load_rotated(
     return (float(q) * __half2float(scale_axis[row]) + __half2float(zp_axis[row])) * __half2float(other_axis[col]);
 }
 
+static __device__ __forceinline__ int ggml_cuda_fattn_kvarn_mma_record_payload_bytes(const int bits) {
+    return GGML_CUDA_FATTN_KVARN_DIM * GGML_CUDA_FATTN_KVARN_DIM * bits / 8;
+}
+
+static __device__ __forceinline__ bool ggml_cuda_fattn_kvarn_mma_group_from_record(
+        const ggml_cuda_fattn_kvarn_desc & desc,
+        const int group) {
+    const int live_group = desc.live_groups[desc.out_stream];
+    const bool from_stage = group == 0 ||
+        (group > 0 && group <= live_group && group + (desc.tail_groups - 1) >= live_group);
+    return !from_stage && group < live_group && group < desc.groups_per_stream;
+}
+
+static __device__ __forceinline__ half2 ggml_cuda_fattn_kvarn_load_rotated_mma_record_smem_h2(
+        const ggml_cuda_fattn_kvarn_desc & desc,
+        const uint8_t * record,
+        const int token,
+        const int dim) {
+    const int pos = token - (token / GGML_CUDA_FATTN_KVARN_DIM) * GGML_CUDA_FATTN_KVARN_DIM;
+    const int payload_bytes = ggml_cuda_fattn_kvarn_mma_record_payload_bytes(desc.bits);
+    const half * scale_axis = (const half *) (record + payload_bytes);
+    const half * zp_axis    = scale_axis + GGML_CUDA_FATTN_KVARN_DIM;
+    const half * other_axis = zp_axis + GGML_CUDA_FATTN_KVARN_DIM;
+
+    if (desc.value) {
+        const uint8_t q0 = ggml_cuda_fattn_kvarn_unpack_record(record, pos * GGML_CUDA_FATTN_KVARN_DIM + dim + 0, desc.bits);
+        const uint8_t q1 = ggml_cuda_fattn_kvarn_unpack_record(record, pos * GGML_CUDA_FATTN_KVARN_DIM + dim + 1, desc.bits);
+        const float scale = __half2float(scale_axis[pos]);
+        const float zp = __half2float(zp_axis[pos]);
+        const float x0 = (float(q0) * scale + zp) * __half2float(other_axis[dim + 0]);
+        const float x1 = (float(q1) * scale + zp) * __half2float(other_axis[dim + 1]);
+        return make_half2(x0, x1);
+    }
+
+    const uint8_t q0 = ggml_cuda_fattn_kvarn_unpack_record(record, (dim + 0) * GGML_CUDA_FATTN_KVARN_DIM + pos, desc.bits);
+    const uint8_t q1 = ggml_cuda_fattn_kvarn_unpack_record(record, (dim + 1) * GGML_CUDA_FATTN_KVARN_DIM + pos, desc.bits);
+    const float other = __half2float(other_axis[pos]);
+    const float x0 = (float(q0) * __half2float(scale_axis[dim + 0]) + __half2float(zp_axis[dim + 0])) * other;
+    const float x1 = (float(q1) * __half2float(scale_axis[dim + 1]) + __half2float(zp_axis[dim + 1])) * other;
+    return make_half2(x0, x1);
+}
+
 template<int D, int stride_tile, int nbatch_fa, int nthreads, bool oob_check>
 static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
         const char * __restrict__ desc_raw,
@@ -144,45 +186,65 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
         const int k_start,
         const int i_sup,
         const int dim2_start,
-        const int dim2_count) {
+        const int dim2_count,
+        uint8_t   * __restrict__ record_cache) {
     const ggml_cuda_fattn_kvarn_desc & desc = *(const ggml_cuda_fattn_kvarn_desc *) desc_raw;
-    constexpr int slices = D / GGML_CUDA_FATTN_KVARN_DIM;
     static_assert(D % GGML_CUDA_FATTN_KVARN_DIM == 0 && D <= 512, "KVarN native MMA supports 128-wide slices through D=512");
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int dim2_per_slice = GGML_CUDA_FATTN_KVARN_DIM / 2;
     const int tid = threadIdx.y * warp_size + threadIdx.x;
     const int dim2_end = dim2_start + dim2_count;
-    __shared__ float sh[GGML_CUDA_FATTN_KVARN_DIM];
+    const int valid_count = oob_check ? min(i_sup, nbatch_fa) : nbatch_fa;
+    const int group_first = valid_count > 0 ? k_start / GGML_CUDA_FATTN_KVARN_DIM : -1;
+    const int group_last  = valid_count > 0 ? (k_start + valid_count - 1) / GGML_CUDA_FATTN_KVARN_DIM : -2;
+    const bool cache_record = record_cache != nullptr && !desc.swa && group_first == group_last &&
+        ggml_cuda_fattn_kvarn_mma_group_from_record(desc, group_first);
+    const int record_group = desc.stream * desc.groups_per_stream + group_first;
 
-    for (int row = 0; row < nbatch_fa; ++row) {
-        const bool valid_row = !oob_check || row < i_sup;
-        if (!valid_row) {
-            for (int b = tid; b < dim2_count; b += nthreads) {
-                tile_KV[row * stride_tile + b] = make_half2(0.0f, 0.0f);
-            }
-            __syncthreads();
+    for (int slice = dim2_start / dim2_per_slice; slice < (dim2_end + dim2_per_slice - 1) / dim2_per_slice; ++slice) {
+        const int slice_dim2_start = slice * dim2_per_slice;
+        const int out_dim2_start = max(dim2_start, slice_dim2_start);
+        const int out_dim2_end = min(dim2_end, slice_dim2_start + dim2_per_slice);
+        if (out_dim2_start >= out_dim2_end) {
             continue;
         }
 
-        const int token = k_start + row;
-        for (int slice = 0; slice < slices; ++slice) {
-            const int slice_dim2_start = slice * (GGML_CUDA_FATTN_KVARN_DIM / 2);
-            const int slice_dim2_end   = slice_dim2_start + GGML_CUDA_FATTN_KVARN_DIM / 2;
-            const int out_dim2_start   = max(dim2_start, slice_dim2_start);
-            const int out_dim2_end     = min(dim2_end, slice_dim2_end);
-            if (out_dim2_start >= out_dim2_end) {
+        if (cache_record) {
+            const uint8_t * src = desc.records + ((int64_t) record_group * desc.n_record_heads + desc.head_base + slice) * desc.record_bytes;
+            const int record_chunks = desc.record_bytes / (int) sizeof(uint4);
+            for (int i = tid; i < record_chunks; i += nthreads) {
+                ((uint4 *) record_cache)[i] = ((const uint4 *) src)[i];
+            }
+            for (int i = record_chunks * (int) sizeof(uint4) + tid; i < desc.record_bytes; i += nthreads) {
+                record_cache[i] = src[i];
+            }
+            __syncthreads();
+        }
+
+        for (int row = tid; row < nbatch_fa; row += nthreads) {
+            const bool valid_row = !oob_check || row < i_sup;
+            if (!valid_row) {
+                for (int global_b = out_dim2_start; global_b < out_dim2_end; ++global_b) {
+                    tile_KV[row * stride_tile + global_b - dim2_start] = make_half2(0.0f, 0.0f);
+                }
                 continue;
             }
 
-            for (int dim = tid; dim < GGML_CUDA_FATTN_KVARN_DIM; dim += nthreads) {
-                sh[dim] = ggml_cuda_fattn_kvarn_load_rotated(desc, token, slice, dim);
+            const int token = k_start + row;
+            for (int global_b = out_dim2_start; global_b < out_dim2_end; ++global_b) {
+                const int dim = 2 * (global_b - slice_dim2_start);
+                if (cache_record) {
+                    tile_KV[row * stride_tile + global_b - dim2_start] =
+                        ggml_cuda_fattn_kvarn_load_rotated_mma_record_smem_h2(desc, record_cache, token, dim);
+                } else {
+                    const float x0 = ggml_cuda_fattn_kvarn_load_rotated(desc, token, slice, dim + 0);
+                    const float x1 = ggml_cuda_fattn_kvarn_load_rotated(desc, token, slice, dim + 1);
+                    tile_KV[row * stride_tile + global_b - dim2_start] = make_half2(x0, x1);
+                }
             }
-            __syncthreads();
+        }
 
-            for (int global_b = out_dim2_start + tid; global_b < out_dim2_end; global_b += nthreads) {
-                const int local_b = global_b - slice_dim2_start;
-                tile_KV[row * stride_tile + global_b - dim2_start] =
-                    make_half2(sh[2 * local_b], sh[2 * local_b + 1]);
-            }
+        if (cache_record) {
             __syncthreads();
         }
     }
@@ -444,9 +506,11 @@ void ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, gg
     const size_t nbytes_shared_Q = ncols * (DKQ / 2 + 4) * sizeof(half2);
     const size_t nbytes_shared_mask = ncols1 * (nbatch_fa / 2 + 4) * sizeof(half2);
     const size_t nbytes_shared_combine = nwarps * cols_per_warp * (nbatch_combine + 4) * sizeof(half2);
+    const size_t nbytes_shared_record = (size_t) std::max(plan.k.records->ne[0], plan.v.records->ne[0]);
+    const size_t nbytes_shared_KV_mask_record = nbytes_shared_KV + nbytes_shared_mask + nbytes_shared_record;
     const size_t nbytes_shared_total = std::max(nbytes_shared_combine, Q_in_reg ?
-        std::max(nbytes_shared_Q, nbytes_shared_KV + nbytes_shared_mask) :
-                 nbytes_shared_Q + nbytes_shared_KV + nbytes_shared_mask);
+        std::max(nbytes_shared_Q, nbytes_shared_KV_mask_record) :
+                 nbytes_shared_Q + nbytes_shared_KV_mask_record);
 
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t stream = ctx.stream();
@@ -512,10 +576,10 @@ void ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, gg
         fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view,
             GGML_CUDA_FATTN_KVARN_TYPE, GGML_CUDA_FATTN_KVARN_TYPE>;
 #if !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
-        static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
-        if (!shared_memory_limit_raised[id]) {
+        static size_t shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {0};
+        if (shared_memory_limit_raised[id] < nbytes_shared_total) {
             CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
-            shared_memory_limit_raised[id] = true;
+            shared_memory_limit_raised[id] = nbytes_shared_total;
         }
 #endif
     } else {
@@ -523,10 +587,10 @@ void ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, gg
         fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view,
             GGML_CUDA_FATTN_KVARN_TYPE, GGML_CUDA_FATTN_KVARN_TYPE>;
 #if !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
-        static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
-        if (!shared_memory_limit_raised[id]) {
+        static size_t shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {0};
+        if (shared_memory_limit_raised[id] < nbytes_shared_total) {
             CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
-            shared_memory_limit_raised[id] = true;
+            shared_memory_limit_raised[id] = nbytes_shared_total;
         }
 #endif
     }
