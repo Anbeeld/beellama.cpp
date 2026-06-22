@@ -178,6 +178,7 @@ int main(int argc, char ** argv) {
     const std::string cuda_fattn_vec = read_file(root + "/ggml/src/ggml-cuda/fattn-vec.cuh");
     const std::string cuda_fattn_kvarn = read_file_optional(root + "/ggml/src/ggml-cuda/fattn-kvarn.cuh");
     const std::string cuda_fattn_mma_kvarn = read_file_optional(root + "/ggml/src/ggml-cuda/fattn-mma-kvarn.cuh");
+    const std::string cuda_fattn_mma_kvarn_impl = read_file_optional(root + "/ggml/src/ggml-cuda/fattn-mma-kvarn-impl.cuh");
     const std::string cuda_turbo_quant = read_file(root + "/ggml/src/ggml-cuda/turbo-quant-cuda.cuh");
     const std::string cuda_cmake = read_file(root + "/ggml/src/ggml-cuda/CMakeLists.txt");
     const std::string cuda_fattn_h = read_file(root + "/ggml/src/ggml-cuda/fattn.cuh");
@@ -478,13 +479,14 @@ int main(int argc, char ** argv) {
                  cuda_fattn_mma_kvarn.find("Q->ne[1] <= GGML_CUDA_FATTN_KVARN_NATIVE_MAX_Q") != std::string::npos &&
                  cuda_fattn.find("materialize_kvarn_f16") != std::string::npos,
         "KVarN native MMA must stay decode/small-batch scoped while large prefill uses an internal F16 materialize fallback");
-    ok &= expect(cuda_fattn_mma_kvarn.find("ggml_cuda_flash_attn_ext_mma_kvarn_case") != std::string::npos &&
-                 cuda_fattn_mma_kvarn.find("flash_attn_ext_f16") != std::string::npos &&
-                 cuda_fattn_mma_kvarn.find("need_f16_K=false") != std::string::npos &&
-                 cuda_fattn_mma_kvarn.find("need_f16_V=false") != std::string::npos &&
+    ok &= expect(cuda_fattn.find("ggml_cuda_flash_attn_ext_mma_kvarn_case") != std::string::npos &&
+                 cuda_fattn.find("ggml_cuda_fattn_kvarn_decode_mma_d256_k4v4_kernel") != std::string::npos &&
+                 cuda_fattn.find("need_f16_K=false") != std::string::npos &&
+                 cuda_fattn.find("need_f16_V=false") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_impl.find("flash_attn_ext_kvarn_load_tile") != std::string::npos &&
                  cuda_fattn_mma_kvarn.find("GGML_KVARN_FORCE_MATERIALIZE") == std::string::npos &&
                  cuda_fattn_mma_kvarn.find("ggml_cuda_fattn_kvarn_force_materialize_enabled") == std::string::npos,
-        "native KVarN FlashAttention must reuse the MMA F16 kernel template without F16 materialize buffers or materialize fallback env gates");
+        "native KVarN FlashAttention must keep fused tensor-core decode plus generic native MMA fallback without K/V F16 materialize buffers or fallback env gates");
     ok &= expect(cuda_fattn_mma_kvarn.find("record_cache") == std::string::npos &&
                  cuda_fattn.find("nbytes_shared_record =") == std::string::npos &&
                  cuda_fattn.find("nbytes_shared_KV_mask_record") == std::string::npos,
@@ -2752,10 +2754,12 @@ int main(int argc, char ** argv) {
                  llama_bench.find("cparams.kvarn") != std::string::npos &&
                  llama_bench.find("bench_cache_type_name(type_k)") != std::string::npos,
         "llama-bench must accept cache-type KVarN pseudo names and pass KVarN params to llama_context_params");
-    ok &= expect(cuda_fattn_mma_kvarn.find("ggml_cuda_fattn_kvarn_live_groups_kernel") != std::string::npos &&
-                 cuda_fattn_mma_kvarn.find("ggml_cuda_pool_alloc<int> live_groups") != std::string::npos &&
-                 cuda_fattn_mma_kvarn.find("live_groups[out_stream]") != std::string::npos,
-        "CUDA native KVarN FlashAttention must precompute live groups once per stream instead of scanning indices inside every output block");
+    ok &= expect(cuda_fattn.find("ggml_cuda_fattn_kvarn_init_descs_kernel") != std::string::npos &&
+                 cuda_fattn.find("ggml_cuda_fattn_kvarn_live_group_for_thread") != std::string::npos &&
+                 cuda_fattn.find("k_desc.live_group = k_partial[0]") != std::string::npos &&
+                 cuda_fattn.find("v_desc.live_group = v_partial[0]") != std::string::npos &&
+                 cuda_fattn.find("cudaMemcpyAsync(k_desc") == std::string::npos,
+        "CUDA native KVarN FlashAttention must build graph-capture-safe descriptors and live groups once per stream on device");
     ok &= expect(ggml_cuda_kvarn_h.find("ggml_cuda_kvarn_required_shared_bytes") != std::string::npos &&
                  ggml_cuda_kvarn.find("KVAR_N_LOWSHMEM_BYTES") != std::string::npos &&
                  ggml_cuda_kvarn.find("kvarn_store_kernel_hishmem") != std::string::npos &&

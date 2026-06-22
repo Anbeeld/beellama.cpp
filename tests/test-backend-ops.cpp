@@ -1309,10 +1309,10 @@ struct test_case {
         }
     }
 
-    test_status_t eval(ggml_backend_t backend1,
-                       ggml_backend_t backend2,
-                       const char *   op_names_filter,
-                       printer *      output_printer) {
+    virtual test_status_t eval(ggml_backend_t backend1,
+                               ggml_backend_t backend2,
+                               const char *   op_names_filter,
+                               printer *      output_printer) {
         mode = MODE_TEST;
 
         ggml_init_params params = {
@@ -7299,6 +7299,502 @@ struct test_kvarn_store_only : public test_case {
     }
 };
 
+static uint8_t test_kvarn_unpack_bits_value(const uint8_t * src, int index, int bits) {
+    uint8_t value = 0;
+    const size_t bit_offset = size_t(index) * size_t(bits);
+    for (int bit = 0; bit < bits; ++bit) {
+        const size_t src_bit = bit_offset + size_t(bit);
+        value |= uint8_t(((src[src_bit / 8] >> (src_bit % 8)) & 1u) << bit);
+    }
+    return value;
+}
+
+static void test_kvarn_hadamard_128(float * values) {
+    for (int stride = 1; stride < 128; stride *= 2) {
+        for (int base = 0; base < 128; base += 2 * stride) {
+            for (int i = 0; i < stride; ++i) {
+                const float a = values[base + i];
+                const float b = values[base + stride + i];
+                values[base + i] = a + b;
+                values[base + stride + i] = a - b;
+            }
+        }
+    }
+
+    constexpr float inv_sqrt_128 = 0.08838834764831845f;
+    for (int i = 0; i < 128; ++i) {
+        values[i] *= inv_sqrt_128;
+    }
+}
+
+static void test_kvarn_fill_hadamard_matrix_128(std::vector<float> & data) {
+    constexpr int n = 128;
+    data.assign(n * n, 0.0f);
+    data[0] = 1.0f / std::sqrt(float(n));
+
+    for (int s = 1; s < n; s *= 2) {
+        for (int i = 0; i < s; ++i) {
+            for (int j = 0; j < s; ++j) {
+                const float val = data[i * n + j];
+                data[(i + s) * n + j]       =  val;
+                data[i * n + (j + s)]       =  val;
+                data[(i + s) * n + (j + s)] = -val;
+            }
+        }
+    }
+}
+
+static ggml_tensor * test_kvarn_apply_hadamard_128(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * rot) {
+    const int64_t n = rot->ne[0];
+    ggml_tensor * res = nullptr;
+    if (!ggml_is_contiguous(cur)) {
+        res = ggml_cont_2d(ctx, cur, n, ggml_nelements(cur) / n);
+    } else {
+        res = ggml_reshape_2d(ctx, cur, n, ggml_nelements(cur) / n);
+    }
+    res = ggml_mul_mat(ctx, rot, res);
+    ggml_mul_mat_set_hint(res, GGML_HINT_SRC0_IS_HADAMARD);
+    return ggml_reshape_4d(ctx, res, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
+}
+
+static void test_kvarn_rotate_128_chunks(std::vector<float> & data) {
+    GGML_ASSERT(data.size() % 128 == 0);
+    for (size_t off = 0; off < data.size(); off += 128) {
+        test_kvarn_hadamard_128(data.data() + off);
+    }
+}
+
+static float test_kvarn_record_value(const uint8_t * record, int bits, bool value, int token, int dim) {
+    const size_t payload_bytes = size_t(128 * 128 * bits) / 8;
+    const size_t scale_axis_off = payload_bytes;
+    const size_t zp_axis_off = scale_axis_off + 128 * sizeof(ggml_fp16_t);
+    const size_t other_axis_off = zp_axis_off + 128 * sizeof(ggml_fp16_t);
+    const int row = value ? token : dim;
+    const int col = value ? dim : token;
+    ggml_fp16_t scale_fp16;
+    ggml_fp16_t zp_fp16;
+    ggml_fp16_t other_fp16;
+    std::memcpy(&scale_fp16, record + scale_axis_off + row * sizeof(scale_fp16), sizeof(scale_fp16));
+    std::memcpy(&zp_fp16, record + zp_axis_off + row * sizeof(zp_fp16), sizeof(zp_fp16));
+    std::memcpy(&other_fp16, record + other_axis_off + col * sizeof(other_fp16), sizeof(other_fp16));
+    const float scale = ggml_fp16_to_fp32(scale_fp16);
+    const float zp = ggml_fp16_to_fp32(zp_fp16);
+    const float other = ggml_fp16_to_fp32(other_fp16);
+    const uint8_t q = test_kvarn_unpack_bits_value(record, row * 128 + col, bits);
+    return (float(q) * scale + zp) * other;
+}
+
+static std::vector<ggml_fp16_t> test_kvarn_reference_decode(
+        const ggml_tensor * records,
+        const ggml_tensor * stage,
+        const std::vector<int64_t> & indices,
+        int n_kv,
+        int stream_start,
+        int n_stream,
+        int bits,
+        bool value,
+        int stage_groups) {
+    GGML_ASSERT(records->type == GGML_TYPE_I8);
+    GGML_ASSERT(stage->type == GGML_TYPE_F16);
+    GGML_ASSERT(stage->ne[0] == 128);
+    GGML_ASSERT(stage_groups >= 2);
+    GGML_ASSERT(stage->ne[2] % (128 * stage_groups) == 0);
+    const int n_heads = (int) stage->ne[1];
+    const int total_streams = (int) (stage->ne[2] / (128 * stage_groups));
+    GGML_ASSERT(total_streams > 0);
+    GGML_ASSERT(records->ne[1] == n_heads);
+    GGML_ASSERT(records->ne[2] % total_streams == 0);
+    GGML_ASSERT(stream_start >= 0 && n_stream > 0 && stream_start + n_stream <= total_streams);
+
+    const int groups_per_stream = (int) (records->ne[2] / total_streams);
+    const int tail_groups = stage_groups - 1;
+    std::vector<ggml_fp16_t> stage_data(ggml_nelements(stage));
+    std::vector<uint8_t> record_data(ggml_nbytes(records));
+    ggml_backend_tensor_get(stage, stage_data.data(), 0, ggml_nbytes(stage));
+    ggml_backend_tensor_get(records, record_data.data(), 0, record_data.size());
+
+    std::vector<int64_t> live_groups(n_stream, 0);
+    for (int64_t idx : indices) {
+        const int64_t group_global = idx / 128;
+        const int64_t stream = group_global / groups_per_stream;
+        if (stream >= stream_start && stream < stream_start + n_stream) {
+            const int64_t group = group_global - stream * groups_per_stream;
+            live_groups[stream - stream_start] = std::max(live_groups[stream - stream_start], group);
+        }
+    }
+
+    std::vector<ggml_fp16_t> output((size_t) 128 * n_heads * n_kv * n_stream, ggml_fp32_to_fp16(0.0f));
+    for (int out_stream = 0; out_stream < n_stream; ++out_stream) {
+        const int stream = stream_start + out_stream;
+        const int64_t live_group = live_groups[out_stream];
+        const int64_t stage_base = (int64_t) stream * 128 * stage_groups;
+        for (int cell = 0; cell < n_kv; ++cell) {
+            const int64_t group = cell / 128;
+            const int64_t pos = cell % 128;
+            for (int h = 0; h < n_heads; ++h) {
+                std::array<float, 128> rotated = {};
+                const bool from_stage = group == 0 ||
+                    (group > 0 && group <= live_group && group + (tail_groups - 1) >= live_group);
+                const bool from_record = !from_stage && group < live_group;
+                const int64_t stage_pos = stage_base +
+                    (group == 0 ? pos : 128 + ((group - 1) % tail_groups) * 128 + pos);
+                const int64_t record_group = (int64_t) stream * groups_per_stream + group;
+
+                if (from_stage) {
+                    GGML_ASSERT(stage_pos >= 0 && stage_pos < stage->ne[2]);
+                    for (int d = 0; d < 128; ++d) {
+                        const size_t off = (size_t) d + (size_t) h * 128 + (size_t) stage_pos * 128 * n_heads;
+                        rotated[d] = ggml_fp16_to_fp32(stage_data[off]);
+                    }
+                } else if (from_record) {
+                    GGML_ASSERT(record_group >= 0 && record_group < records->ne[2]);
+                    const size_t record_off = ((size_t) record_group * n_heads + h) * (size_t) records->ne[0];
+                    const uint8_t * record = record_data.data() + record_off;
+                    for (int d = 0; d < 128; ++d) {
+                        rotated[d] = test_kvarn_record_value(record, bits, value, (int) pos, d);
+                    }
+                }
+
+                test_kvarn_hadamard_128(rotated.data());
+                for (int d = 0; d < 128; ++d) {
+                    const size_t out_off = (size_t) d + (size_t) h * 128 +
+                        (size_t) cell * 128 * n_heads + (size_t) out_stream * 128 * n_heads * n_kv;
+                    output[out_off] = ggml_fp32_to_fp16(rotated[d]);
+                }
+            }
+        }
+    }
+
+    return output;
+}
+
+struct test_kvarn_flash_attn_ext : public test_case {
+    const int64_t hsk;
+    const int64_t n_q;
+    const int64_t n_q_heads;
+    const int64_t n_kv_heads;
+    const int64_t n_kv;
+    const int bits_k;
+    const int bits_v;
+    const int stage_groups;
+    const int64_t n_stream;
+    const int stream_start;
+
+    test_kvarn_flash_attn_ext(
+            int64_t hsk = 256,
+            int64_t n_q = 1,
+            int64_t n_q_heads = 6,
+            int64_t n_kv_heads = 1,
+            int64_t n_kv = 1024,
+            int bits_k = 4,
+            int bits_v = 4,
+            int stage_groups = 5,
+            int64_t n_stream = 1,
+            int stream_start = 0)
+        : hsk(hsk), n_q(n_q), n_q_heads(n_q_heads), n_kv_heads(n_kv_heads), n_kv(n_kv),
+          bits_k(bits_k), bits_v(bits_v), stage_groups(stage_groups),
+          n_stream(n_stream), stream_start(stream_start) {}
+
+    std::string vars() override {
+        std::ostringstream oss;
+        oss << "hsk=" << hsk
+            << ",n_q=" << n_q
+            << ",n_q_heads=" << n_q_heads
+            << ",n_kv_heads=" << n_kv_heads
+            << ",n_kv=" << n_kv
+            << ",bits_k=" << bits_k
+            << ",bits_v=" << bits_v
+            << ",stage_groups=" << stage_groups
+            << ",n_stream=" << n_stream
+            << ",stream_start=" << stream_start;
+        return oss.str();
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * n_q_heads * n_q * (hsk + hsk) * n_kv;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph_impl(ctx, true);
+    }
+
+    ggml_tensor * build_graph_impl(ggml_context * ctx, bool native_view) {
+        GGML_ASSERT(hsk % 128 == 0);
+        const int slices = (int) (hsk / 128);
+        const int record_heads = (int) n_kv_heads * slices;
+        const int groups_per_stream = test_kvarn_groups_per_stream(0, (int) n_kv);
+        const int total_streams = stream_start + (int) n_stream;
+        const int k_record_bytes = (int) test_kvarn_record_bytes(bits_k);
+        const int v_record_bytes = (int) test_kvarn_record_bytes(bits_v);
+
+        ggml_tensor * q_in = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, n_q, n_q_heads, n_stream);
+        ggml_set_name(q_in, "q_in");
+        ggml_tensor * q = q_in;
+        if (native_view) {
+            ggml_tensor * kvarn_rot = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 128);
+            ggml_set_name(kvarn_rot, "kvarn_rot");
+            q = test_kvarn_apply_hadamard_128(ctx, q_in, kvarn_rot);
+            ggml_set_name(q, "q_rot");
+        }
+
+        ggml_tensor * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_kv * total_streams);
+        ggml_tensor * current_k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, record_heads, n_kv * total_streams);
+        ggml_tensor * current_v = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, record_heads, n_kv * total_streams);
+        ggml_tensor * k_stage = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, record_heads, 128 * stage_groups * total_streams);
+        ggml_tensor * v_stage = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, record_heads, 128 * stage_groups * total_streams);
+        ggml_tensor * k_records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, k_record_bytes, record_heads, groups_per_stream * total_streams);
+        ggml_tensor * v_records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, v_record_bytes, record_heads, groups_per_stream * total_streams);
+        ggml_set_name(indices, "indices");
+        ggml_set_name(current_k, "current_k");
+        ggml_set_name(current_v, "current_v");
+        ggml_set_name(k_stage, "k_stage");
+        ggml_set_name(v_stage, "v_stage");
+        ggml_set_name(k_records, "k_records");
+        ggml_set_name(v_records, "v_records");
+
+        ggml_tensor * stored_k = ggml_kvarn_store(ctx, current_k, indices, k_stage, k_records, bits_k, 16, false, stage_groups);
+        ggml_tensor * stored_v = ggml_kvarn_store(ctx, current_v, indices, v_stage, v_records, bits_v, 16, true,  stage_groups);
+        stored_k->op_params[3] = (int32_t) n_kv;
+        stored_v->op_params[3] = (int32_t) n_kv;
+        ggml_set_name(stored_k, "stored_k");
+        ggml_set_name(stored_v, "stored_v");
+
+        ggml_tensor * k = nullptr;
+        ggml_tensor * v = nullptr;
+        if (native_view) {
+            k = ggml_kvarn_view(ctx, k_records, stored_k, indices, (int) n_kv, stream_start, (int) n_stream, bits_k, false, stage_groups);
+            v = ggml_kvarn_view(ctx, v_records, stored_v, indices, (int) n_kv, stream_start, (int) n_stream, bits_v, true,  stage_groups);
+            if (slices > 1) {
+                k = ggml_reshape_4d(ctx, k, hsk, n_kv_heads, n_kv, n_stream);
+                v = ggml_reshape_4d(ctx, v, hsk, n_kv_heads, n_kv, n_stream);
+            }
+        } else {
+            k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hsk, n_kv_heads, n_kv, n_stream);
+            v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hsk, n_kv_heads, n_kv, n_stream);
+            ggml_set_name(k, "k_ref");
+            ggml_set_name(v, "v_ref");
+        }
+        k = ggml_permute(ctx, k, 0, 2, 1, 3);
+        v = ggml_permute(ctx, v, 0, 2, 1, 3);
+
+        ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_q, 1, n_stream);
+        ggml_set_name(mask, "mask");
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, mask, 1.0f / std::sqrt(float(hsk)), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    std::vector<int64_t> make_indices() const {
+        const int groups_per_stream = test_kvarn_groups_per_stream(0, (int) n_kv);
+        const int total_streams = stream_start + (int) n_stream;
+        std::vector<int64_t> data((size_t) n_kv * total_streams);
+        for (int s = 0; s < total_streams; ++s) {
+            for (int t = 0; t < n_kv; ++t) {
+                data[(size_t) s * n_kv + t] = (int64_t) s * groups_per_stream * 128 + t;
+            }
+        }
+        return data;
+    }
+
+    void initialize_common_tensors(ggml_context * ctx) const {
+        const int slices = (int) (hsk / 128);
+        const int record_heads = (int) n_kv_heads * slices;
+        const int total_streams = stream_start + (int) n_stream;
+
+        std::vector<float> q_data((size_t) hsk * n_q * n_q_heads * n_stream);
+        for (int s = 0; s < n_stream; ++s) {
+            for (int qh = 0; qh < n_q_heads; ++qh) {
+                for (int iq = 0; iq < n_q; ++iq) {
+                    for (int d = 0; d < hsk; ++d) {
+                        q_data[(((size_t) s * n_q_heads + qh) * n_q + iq) * hsk + d] =
+                            0.09f * std::sin(float(d) * 0.017f + float(iq) * 0.13f + float(qh) * 0.021f) +
+                            0.07f * std::cos(float(d) * 0.031f - float(iq) * 0.05f + float(qh) * 0.033f);
+                    }
+                }
+            }
+        }
+
+        std::vector<float> k_data((size_t) 128 * record_heads * n_kv * total_streams);
+        std::vector<float> v_data(k_data.size());
+        for (int s = 0; s < total_streams; ++s) {
+            for (int t = 0; t < n_kv; ++t) {
+                const int token = s * (int) n_kv + t;
+                for (int h = 0; h < n_kv_heads; ++h) {
+                    for (int slice = 0; slice < slices; ++slice) {
+                        const int record_head = h * slices + slice;
+                        for (int d = 0; d < 128; ++d) {
+                            const int full_d = slice * 128 + d;
+                            const size_t off = ((size_t) token * record_heads + record_head) * 128 + d;
+                            k_data[off] =
+                                0.80f * std::sin(float(full_d) * 0.011f + float(t) * 0.021f) +
+                                0.10f * std::cos(float(t) * 0.009f + float(h) * 0.17f);
+                            v_data[off] =
+                                0.75f * std::cos(float(full_d) * 0.013f - float(t) * 0.019f) +
+                                0.08f * std::sin(float(t) * 0.015f + float(h) * 0.23f);
+                        }
+                    }
+                }
+            }
+        }
+
+        const std::vector<int64_t> indices_data = make_indices();
+        std::vector<ggml_fp16_t> mask_data((size_t) n_kv * n_q * n_stream);
+        for (int s = 0; s < n_stream; ++s) {
+            for (int iq = 0; iq < n_q; ++iq) {
+                for (int ikv = 0; ikv < n_kv; ++ikv) {
+                    mask_data[((size_t) s * n_q + iq) * n_kv + ikv] =
+                        ggml_fp32_to_fp16(ikv <= iq + n_kv - n_q ? 0.0f : -INFINITY);
+                }
+            }
+        }
+
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "q_in"), q_data.data(), 0, q_data.size() * sizeof(float));
+        if (ggml_tensor * rot = ggml_get_tensor(ctx, "kvarn_rot")) {
+            std::vector<float> rot_data;
+            test_kvarn_fill_hadamard_matrix_128(rot_data);
+            ggml_backend_tensor_set(rot, rot_data.data(), 0, rot_data.size() * sizeof(float));
+        }
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "indices"), indices_data.data(), 0, indices_data.size() * sizeof(int64_t));
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "current_k"), k_data.data(), 0, k_data.size() * sizeof(float));
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "current_v"), v_data.data(), 0, v_data.size() * sizeof(float));
+        test_kvarn_zero_tensor(ggml_get_tensor(ctx, "k_stage"));
+        test_kvarn_zero_tensor(ggml_get_tensor(ctx, "v_stage"));
+        test_kvarn_zero_tensor(ggml_get_tensor(ctx, "k_records"));
+        test_kvarn_zero_tensor(ggml_get_tensor(ctx, "v_records"));
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "mask"), mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
+    }
+
+    test_status_t eval(
+            ggml_backend_t backend1,
+            ggml_backend_t backend2,
+            const char * op_names_filter,
+            printer * output_printer) override {
+        mode = MODE_TEST;
+
+        ggml_init_params params = {
+            /* .mem_size = */ ggml_tensor_overhead()*256 + ggml_graph_overhead_custom(1024, false),
+            /* .mem_base = */ NULL,
+            /* .no_alloc = */ true,
+        };
+
+        ggml_context_ptr ctx_native(ggml_init(params));
+        if (!ctx_native) {
+            return test_status_t::FAIL;
+        }
+        ggml_tensor * out_native = build_graph_impl(ctx_native.get(), true);
+        current_op_name = op_desc(out_native);
+        check_for_f16_tensor(ctx_native.get());
+        if (!matches_filter(out_native, op_names_filter)) {
+            return test_status_t::SKIPPED;
+        }
+
+        const auto print_result = [&](bool supported, bool passed, const std::string & error_message) {
+            test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", supported, passed, error_message);
+            print_test_result_locked(output_printer, result);
+        };
+
+        if (!ggml_backend_supports_op(backend1, out_native)) {
+            print_result(false, false, "not supported");
+            return test_status_t::NOT_SUPPORTED;
+        }
+
+        ggml_cgraph * graph_native = ggml_new_graph_custom(ctx_native.get(), 1024, false);
+        ggml_build_forward_expand(graph_native, out_native);
+        ggml_backend_buffer_ptr buf_native(ggml_backend_alloc_ctx_tensors(ctx_native.get(), backend1));
+        if (!buf_native) {
+            print_result(true, false, "native tensor allocation failed");
+            return test_status_t::FAIL;
+        }
+        initialize_common_tensors(ctx_native.get());
+
+        const ggml_status native_status = ggml_backend_graph_compute(backend1, graph_native);
+        if (native_status != GGML_STATUS_SUCCESS) {
+            print_result(true, false, std::string("native graph compute failed: ") + ggml_status_to_string(native_status));
+            return test_status_t::FAIL;
+        }
+        const std::vector<float> actual = tensor_to_float(out_native);
+
+        ggml_context_ptr ctx_ref(ggml_init(params));
+        if (!ctx_ref) {
+            print_result(true, false, "reference context allocation failed");
+            return test_status_t::FAIL;
+        }
+        ggml_tensor * out_ref = build_graph_impl(ctx_ref.get(), false);
+        ggml_tensor * stored_k = ggml_get_tensor(ctx_ref.get(), "stored_k");
+        ggml_tensor * stored_v = ggml_get_tensor(ctx_ref.get(), "stored_v");
+        ggml_tensor * k_records = ggml_get_tensor(ctx_ref.get(), "k_records");
+        ggml_tensor * v_records = ggml_get_tensor(ctx_ref.get(), "v_records");
+        ggml_tensor * k_ref = ggml_get_tensor(ctx_ref.get(), "k_ref");
+        ggml_tensor * v_ref = ggml_get_tensor(ctx_ref.get(), "v_ref");
+
+        ggml_cgraph * store_graph = ggml_new_graph_custom(ctx_ref.get(), 1024, false);
+        ggml_build_forward_expand(store_graph, stored_k);
+        ggml_build_forward_expand(store_graph, stored_v);
+        ggml_cgraph * graph_ref = ggml_new_graph_custom(ctx_ref.get(), 1024, false);
+        ggml_build_forward_expand(graph_ref, out_ref);
+
+        ggml_backend_buffer_ptr buf_ref(ggml_backend_alloc_ctx_tensors(ctx_ref.get(), backend2));
+        if (!buf_ref) {
+            print_result(true, false, "reference tensor allocation failed");
+            return test_status_t::FAIL;
+        }
+        initialize_common_tensors(ctx_ref.get());
+
+        const ggml_status store_status = ggml_backend_graph_compute(backend2, store_graph);
+        if (store_status != GGML_STATUS_SUCCESS) {
+            print_result(true, false, std::string("reference store graph compute failed: ") + ggml_status_to_string(store_status));
+            return test_status_t::FAIL;
+        }
+
+        const std::vector<int64_t> indices_data = make_indices();
+        const std::vector<ggml_fp16_t> k_ref_data = test_kvarn_reference_decode(
+                k_records, stored_k, indices_data, (int) n_kv, stream_start, (int) n_stream, bits_k, false, stage_groups);
+        const std::vector<ggml_fp16_t> v_ref_data = test_kvarn_reference_decode(
+                v_records, stored_v, indices_data, (int) n_kv, stream_start, (int) n_stream, bits_v, true,  stage_groups);
+        ggml_backend_tensor_set(k_ref, k_ref_data.data(), 0, k_ref_data.size() * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(v_ref, v_ref_data.data(), 0, v_ref_data.size() * sizeof(ggml_fp16_t));
+
+        const ggml_status ref_status = ggml_backend_graph_compute(backend2, graph_ref);
+        if (ref_status != GGML_STATUS_SUCCESS) {
+            print_result(true, false, std::string("reference graph compute failed: ") + ggml_status_to_string(ref_status));
+            return test_status_t::FAIL;
+        }
+        std::vector<float> expected = tensor_to_float(out_ref);
+        test_kvarn_rotate_128_chunks(expected);
+
+        if (actual.size() != expected.size()) {
+            print_result(true, false, "output size mismatch");
+            return test_status_t::FAIL;
+        }
+
+        double mse = 0.0;
+        double max_diff = 0.0;
+        for (size_t i = 0; i < actual.size(); ++i) {
+            if (!std::isfinite(actual[i]) || !std::isfinite(expected[i])) {
+                print_result(true, false, "non-finite output");
+                return test_status_t::FAIL;
+            }
+            const double diff = double(actual[i]) - double(expected[i]);
+            mse += diff * diff;
+            max_diff = std::max(max_diff, std::fabs(diff));
+        }
+
+        const double rmse = std::sqrt(mse / std::max<size_t>(actual.size(), 1));
+        constexpr double rmse_limit = 1e-2;
+        if (!std::isfinite(rmse) || rmse > rmse_limit) {
+            std::ostringstream oss;
+            oss << "rmse=" << rmse << " max_diff=" << max_diff << " limit=" << rmse_limit;
+            print_result(true, false, oss.str());
+            return test_status_t::FAIL;
+        }
+
+        print_result(true, true, "");
+        return test_status_t::OK;
+    }
+};
+
 enum llm_norm_type {
     LLM_NORM,
     LLM_NORM_RMS,
@@ -9226,6 +9722,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q1_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 1, 6, 1, 1024, 4, 4, 5));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 1, 6, 1, 1024, 4, 3, 5));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 1, 6, 1, 1024, 4, 2, 5));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 1, 6, 1, 1024, 2, 8, 5));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 1, 6, 1, 1024, 8, 2, 5));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 2, 6, 1, 1024, 4, 4, 5));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 4, 6, 1, 1024, 4, 4, 5));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 8, 6, 1, 1024, 4, 4, 5));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 1, 6, 1, 639, 4, 4, 5));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 1, 6, 1, 641, 4, 4, 5));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 1, 6, 1, 1024, 4, 4, 5, 2, 0));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 1, 6, 1, 1024, 4, 4, 5, 2, 1));
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));

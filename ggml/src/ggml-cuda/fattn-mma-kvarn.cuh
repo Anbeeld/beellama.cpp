@@ -1,7 +1,5 @@
 #pragma once
 
-#include <vector>
-
 static constexpr int GGML_CUDA_FATTN_KVARN_DIM = 128;
 static constexpr int GGML_CUDA_FATTN_KVARN_NATIVE_MAX_Q = 8;
 static constexpr ggml_type GGML_CUDA_FATTN_KVARN_TYPE = GGML_TYPE_COUNT;
@@ -19,9 +17,8 @@ struct ggml_cuda_fattn_kvarn_desc {
     const uint8_t * records;
     const half    * stage;
     const int64_t * indices;
-    const int     * live_groups;
     int n_record_heads;
-    int out_stream;
+    int live_group;
     int stream;
     int head_base;
     int groups_per_stream;
@@ -57,100 +54,11 @@ struct ggml_cuda_fattn_kvarn_plan {
     int slices     = 0;
 };
 
-static __device__ __forceinline__ uint8_t ggml_cuda_fattn_kvarn_unpack_record(
-        const uint8_t * record, const int index, const int bits) {
-    if (bits == 8) {
-        return record[index];
-    }
-    if (bits == 4) {
-        const uint8_t packed = record[index >> 1];
-        return (packed >> ((index & 1) << 2)) & 0x0fu;
-    }
-    if (bits == 2) {
-        const uint8_t packed = record[index >> 2];
-        return (packed >> ((index & 3) << 1)) & 0x03u;
-    }
-    const int bit_offset = index * bits;
-    const int byte_offset = bit_offset >> 3;
-    const int bit_in_byte = bit_offset & 7;
-    const uint16_t packed = (uint16_t) record[byte_offset] | ((uint16_t) record[byte_offset + 1] << 8);
-    return (packed >> bit_in_byte) & ((1u << bits) - 1u);
-}
-
-static __device__ __forceinline__ float ggml_cuda_fattn_kvarn_load_rotated(
-        const ggml_cuda_fattn_kvarn_desc & desc,
-        const int token,
-        const int slice,
-        const int dim) {
-    const int record_head = desc.head_base + slice;
-
-    int group;
-    int pos;
-    bool from_stage;
-    bool from_record;
-    int stage_pos;
-    int record_group;
-
-    if (desc.swa) {
-        const int64_t abs_pos = desc.indices[token];
-        if (abs_pos < 0) {
-            return 0.0f;
-        }
-        const int live_group = desc.live_groups[0];
-        group = (int) (abs_pos / GGML_CUDA_FATTN_KVARN_DIM);
-        pos   = (int) (abs_pos - (int64_t) group * GGML_CUDA_FATTN_KVARN_DIM);
-        const int stage_begin = live_group >= (desc.tail_groups - 1) ? live_group - (desc.tail_groups - 1) : 0;
-        from_stage  = group >= stage_begin && group <= live_group;
-        from_record = !from_stage && group >= 0 && group < stage_begin &&
-            (live_group - group) < desc.groups_per_stream;
-        stage_pos = (group % desc.stage_groups) * GGML_CUDA_FATTN_KVARN_DIM + pos;
-        record_group = group % desc.groups_per_stream;
-    } else {
-        const int live_group = desc.live_groups[desc.out_stream];
-        group = token / GGML_CUDA_FATTN_KVARN_DIM;
-        pos   = token - group * GGML_CUDA_FATTN_KVARN_DIM;
-        from_stage = group == 0 ||
-            (group > 0 && group <= live_group && group + (desc.tail_groups - 1) >= live_group);
-        from_record = !from_stage && group < live_group && group < desc.groups_per_stream;
-        const int stage_base = desc.stream * GGML_CUDA_FATTN_KVARN_DIM * desc.stage_groups;
-        stage_pos = stage_base + (group == 0 ? pos :
-            GGML_CUDA_FATTN_KVARN_DIM + ((group - 1) % desc.tail_groups) * GGML_CUDA_FATTN_KVARN_DIM + pos);
-        record_group = desc.stream * desc.groups_per_stream + group;
-    }
-
-    if (from_stage) {
-        return __half2float(desc.stage[((int64_t) stage_pos * desc.n_record_heads + record_head) * GGML_CUDA_FATTN_KVARN_DIM + dim]);
-    }
-
-    if (!from_record) {
-        return 0.0f;
-    }
-
-    const uint8_t * record = desc.records + ((int64_t) record_group * desc.n_record_heads + record_head) * desc.record_bytes;
-    const int payload_bytes = GGML_CUDA_FATTN_KVARN_DIM * GGML_CUDA_FATTN_KVARN_DIM * desc.bits / 8;
-    const half * scale_axis = (const half *) (record + payload_bytes);
-    const half * zp_axis    = scale_axis + GGML_CUDA_FATTN_KVARN_DIM;
-    const half * other_axis = zp_axis + GGML_CUDA_FATTN_KVARN_DIM;
-    const int row = desc.value ? pos : dim;
-    const int col = desc.value ? dim : pos;
-    const uint8_t q = ggml_cuda_fattn_kvarn_unpack_record(record, row * GGML_CUDA_FATTN_KVARN_DIM + col, desc.bits);
-    return (float(q) * __half2float(scale_axis[row]) + __half2float(zp_axis[row])) * __half2float(other_axis[col]);
-}
-
-static __device__ __forceinline__ int ggml_cuda_fattn_kvarn_mma_record_payload_bytes(const int bits) {
-    return GGML_CUDA_FATTN_KVARN_DIM * GGML_CUDA_FATTN_KVARN_DIM * bits / 8;
-}
-
-static __device__ __forceinline__ bool ggml_cuda_fattn_kvarn_mma_group_from_record(
-        const ggml_cuda_fattn_kvarn_desc & desc,
-        const int group) {
-    const int live_group = desc.live_groups[desc.out_stream];
-    const bool from_stage = group == 0 ||
-        (group > 0 && group <= live_group && group + (desc.tail_groups - 1) >= live_group);
-    return !from_stage && group < live_group && group < desc.groups_per_stream;
-}
-
-template<int D, int stride_tile, int nbatch_fa, int nthreads, bool oob_check>
+// Definition lives in fattn-mma-kvarn-impl.cuh (compiled only in fattn.cu). fattn-mma-f16.cuh
+// needs only this declaration: its call sites are in if-constexpr branches discarded for
+// non-KVarN types, and the KVarN kernel is instantiated solely in fattn.cu (which includes
+// the impl header). This keeps loader edits from recompiling every FA MMA instance.
+template<int D, int stride_tile, int nbatch_fa, int nthreads, bool oob_check, bool dim_major_K = false>
 static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
         const char * __restrict__ desc_raw,
         half2      * __restrict__ tile_KV,
@@ -158,95 +66,7 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
         const int i_sup,
         const int dim2_start,
         const int dim2_count,
-        half      * __restrict__ scale_smem) {
-    const ggml_cuda_fattn_kvarn_desc & desc = *(const ggml_cuda_fattn_kvarn_desc *) desc_raw;
-    static_assert(D % GGML_CUDA_FATTN_KVARN_DIM == 0 && D <= 512, "KVarN native MMA supports 128-wide slices through D=512");
-    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
-    constexpr int dim2_per_slice = GGML_CUDA_FATTN_KVARN_DIM / 2;
-    const int tid = threadIdx.y * warp_size + threadIdx.x;
-    const int dim2_end = dim2_start + dim2_count;
-    const int valid_count = oob_check ? min(i_sup, nbatch_fa) : nbatch_fa;
-    const int group_first = valid_count > 0 ? k_start / GGML_CUDA_FATTN_KVARN_DIM : -1;
-    const int group_last  = valid_count > 0 ? (k_start + valid_count - 1) / GGML_CUDA_FATTN_KVARN_DIM : -2;
-    const bool stream_record = scale_smem != nullptr && !desc.swa && group_first == group_last &&
-        ggml_cuda_fattn_kvarn_mma_group_from_record(desc, group_first);
-    const int record_group = desc.stream * desc.groups_per_stream + group_first;
-
-    for (int slice = dim2_start / dim2_per_slice; slice < (dim2_end + dim2_per_slice - 1) / dim2_per_slice; ++slice) {
-        const int slice_dim2_start = slice * dim2_per_slice;
-        const int out_dim2_start = max(dim2_start, slice_dim2_start);
-        const int out_dim2_end = min(dim2_end, slice_dim2_start + dim2_per_slice);
-        if (out_dim2_start >= out_dim2_end) {
-            continue;
-        }
-
-        const uint8_t * record = nullptr;
-        const half * scale_axis = nullptr;
-        const half * zp_axis = nullptr;
-        const half * other_axis = nullptr;
-
-        if (stream_record) {
-            record = desc.records + ((int64_t) record_group * desc.n_record_heads + desc.head_base + slice) * desc.record_bytes;
-            const int payload_bytes = ggml_cuda_fattn_kvarn_mma_record_payload_bytes(desc.bits);
-            scale_axis = (const half *) (record + payload_bytes);
-            zp_axis    = scale_axis + GGML_CUDA_FATTN_KVARN_DIM;
-            other_axis = zp_axis + GGML_CUDA_FATTN_KVARN_DIM;
-            for (int i = tid; i < GGML_CUDA_FATTN_KVARN_DIM; i += nthreads) {
-                if (desc.value) {
-                    scale_smem[i] = other_axis[i];
-                } else {
-                    scale_smem[i] = scale_axis[i];
-                    scale_smem[GGML_CUDA_FATTN_KVARN_DIM + i] = zp_axis[i];
-                }
-            }
-            __syncthreads();
-        }
-
-        for (int row = tid; row < nbatch_fa; row += nthreads) {
-            const bool valid_row = !oob_check || row < i_sup;
-            if (!valid_row) {
-                for (int global_b = out_dim2_start; global_b < out_dim2_end; ++global_b) {
-                    tile_KV[row * stride_tile + global_b - dim2_start] = make_half2(0.0f, 0.0f);
-                }
-                continue;
-            }
-
-            const int token = k_start + row;
-            const int pos = token - group_first * GGML_CUDA_FATTN_KVARN_DIM;
-            const float token_scale = stream_record && desc.value ? __half2float(scale_axis[pos]) : 0.0f;
-            const float token_zp    = stream_record && desc.value ? __half2float(zp_axis[pos])    : 0.0f;
-            const float token_other = stream_record && !desc.value ? __half2float(other_axis[pos]) : 0.0f;
-            for (int global_b = out_dim2_start; global_b < out_dim2_end; ++global_b) {
-                const int dim = 2 * (global_b - slice_dim2_start);
-                if (stream_record) {
-                    if (desc.value) {
-                        const uint8_t q0 = ggml_cuda_fattn_kvarn_unpack_record(record, pos * GGML_CUDA_FATTN_KVARN_DIM + dim + 0, desc.bits);
-                        const uint8_t q1 = ggml_cuda_fattn_kvarn_unpack_record(record, pos * GGML_CUDA_FATTN_KVARN_DIM + dim + 1, desc.bits);
-                        const float x0 = (float(q0) * token_scale + token_zp) * __half2float(scale_smem[dim + 0]);
-                        const float x1 = (float(q1) * token_scale + token_zp) * __half2float(scale_smem[dim + 1]);
-                        tile_KV[row * stride_tile + global_b - dim2_start] = make_half2(x0, x1);
-                    } else {
-                        const uint8_t q0 = ggml_cuda_fattn_kvarn_unpack_record(record, (dim + 0) * GGML_CUDA_FATTN_KVARN_DIM + pos, desc.bits);
-                        const uint8_t q1 = ggml_cuda_fattn_kvarn_unpack_record(record, (dim + 1) * GGML_CUDA_FATTN_KVARN_DIM + pos, desc.bits);
-                        const float x0 = (float(q0) * __half2float(scale_smem[dim + 0]) +
-                                __half2float(scale_smem[GGML_CUDA_FATTN_KVARN_DIM + dim + 0])) * token_other;
-                        const float x1 = (float(q1) * __half2float(scale_smem[dim + 1]) +
-                                __half2float(scale_smem[GGML_CUDA_FATTN_KVARN_DIM + dim + 1])) * token_other;
-                        tile_KV[row * stride_tile + global_b - dim2_start] = make_half2(x0, x1);
-                    }
-                } else {
-                    const float x0 = ggml_cuda_fattn_kvarn_load_rotated(desc, token, slice, dim + 0);
-                    const float x1 = ggml_cuda_fattn_kvarn_load_rotated(desc, token, slice, dim + 1);
-                    tile_KV[row * stride_tile + global_b - dim2_start] = make_half2(x0, x1);
-                }
-            }
-        }
-
-        if (stream_record) {
-            __syncthreads();
-        }
-    }
-}
+        half      * __restrict__ scale_smem);
 
 static __global__ void ggml_cuda_fattn_kvarn_live_groups_kernel(
         const int64_t * indices,
@@ -445,166 +265,3 @@ static inline bool ggml_cuda_fattn_kvarn_supported(
 
     return ggml_cuda_fattn_kvarn_view_supported(device, dst, out);
 }
-
-#ifdef GGML_CUDA_FATTN_MMA_KVARN_DEFINE_CASE
-#ifndef GGML_CUDA_FATTN_MMA_KVARN_CASE_DEFINED
-#define GGML_CUDA_FATTN_MMA_KVARN_CASE_DEFINED
-
-static inline void ggml_cuda_fattn_kvarn_fill_descs(
-        const ggml_cuda_fattn_kvarn_plan_side & side,
-        const ggml_cuda_fattn_kvarn_plan & plan,
-        const int * live_groups,
-        std::vector<ggml_cuda_fattn_kvarn_desc> & descs) {
-    descs.resize((size_t) plan.n_stream * plan.n_kv_heads);
-    for (int s = 0; s < plan.n_stream; ++s) {
-        for (int h = 0; h < plan.n_kv_heads; ++h) {
-            ggml_cuda_fattn_kvarn_desc & desc = descs[(size_t) s * plan.n_kv_heads + h];
-            desc.records = (const uint8_t *) side.records->data;
-            desc.stage = (const half *) side.stage->data;
-            desc.indices = (const int64_t *) side.indices->data;
-            desc.live_groups = live_groups;
-            desc.n_record_heads = (int) side.view->ne[1];
-            desc.out_stream = s;
-            desc.stream = side.stream_start + s;
-            desc.head_base = h * plan.slices;
-            desc.groups_per_stream = side.groups_per_stream;
-            desc.record_bytes = (int) side.records->ne[0];
-            desc.stage_groups = side.stage_groups;
-            desc.tail_groups = side.stage_groups - 1;
-            desc.bits = side.bits;
-            desc.value = side.value ? 1 : 0;
-            desc.swa = side.swa ? 1 : 0;
-        }
-    }
-}
-
-template <int DKQ, int DV, int ncols1, int ncols2>
-void ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    ggml_cuda_fattn_kvarn_plan plan;
-    GGML_ASSERT(ggml_cuda_fattn_kvarn_supported(ctx.device, dst, &plan));
-
-    const int id = ggml_cuda_get_device();
-    const int cc = ggml_cuda_info().devices[id].cc;
-    constexpr int ncols = ncols1 * ncols2;
-
-    const int  nthreads       = ggml_cuda_fattn_mma_get_nthreads      (DKQ, DV, ncols, cc);
-    const int  nbatch_fa      = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols, cc);
-    const int  nbatch_K2      = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols, cc);
-    const int  nbatch_V2      = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols, cc);
-    const int  nbatch_combine = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols, cc);
-    const bool Q_in_reg       = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols, cc);
-    constexpr int nstages = 0;
-
-    const int cols_per_warp = std::min(ncols, get_cols_per_warp(cc));
-    const int warp_size_host = ggml_cuda_info().devices[ctx.device].warp_size;
-    const int nwarps = nthreads / warp_size_host;
-    constexpr bool V_is_K_view = false;
-
-    const size_t nbytes_shared_KV = nbatch_fa * std::max(nbatch_K2 + 4, nbatch_V2 + 4) * sizeof(half2);
-    const size_t nbytes_shared_Q = ncols * (DKQ / 2 + 4) * sizeof(half2);
-    const size_t nbytes_shared_mask = ncols1 * (nbatch_fa / 2 + 4) * sizeof(half2);
-    const size_t nbytes_shared_combine = nwarps * cols_per_warp * (nbatch_combine + 4) * sizeof(half2);
-    const size_t nbytes_shared_kvarn_scales = 3 * GGML_CUDA_FATTN_KVARN_DIM * sizeof(half);
-    const size_t nbytes_shared_KV_mask_kvarn = nbytes_shared_KV + nbytes_shared_mask + nbytes_shared_kvarn_scales;
-    const size_t nbytes_shared_total = std::max(nbytes_shared_combine, Q_in_reg ?
-        std::max(nbytes_shared_Q, nbytes_shared_KV_mask_kvarn) :
-                 nbytes_shared_Q + nbytes_shared_KV_mask_kvarn);
-
-    ggml_cuda_pool & pool = ctx.pool();
-    cudaStream_t stream = ctx.stream();
-    ggml_cuda_pool_alloc<int> live_groups_k(pool, plan.n_stream);
-    ggml_cuda_pool_alloc<int> live_groups_v(pool, plan.n_stream);
-    ggml_cuda_fattn_kvarn_live_groups_kernel<<<plan.n_stream, GGML_CUDA_FATTN_KVARN_DIM, 0, stream>>>(
-        (const int64_t *) plan.k.indices->data,
-        (int) plan.k.indices->ne[0],
-        plan.k.stream_start,
-        plan.n_stream,
-        plan.k.groups_per_stream,
-        plan.k.swa,
-        live_groups_k.get());
-    ggml_cuda_fattn_kvarn_live_groups_kernel<<<plan.n_stream, GGML_CUDA_FATTN_KVARN_DIM, 0, stream>>>(
-        (const int64_t *) plan.v.indices->data,
-        (int) plan.v.indices->ne[0],
-        plan.v.stream_start,
-        plan.n_stream,
-        plan.v.groups_per_stream,
-        plan.v.swa,
-        live_groups_v.get());
-
-    std::vector<ggml_cuda_fattn_kvarn_desc> k_desc_host;
-    std::vector<ggml_cuda_fattn_kvarn_desc> v_desc_host;
-    ggml_cuda_fattn_kvarn_fill_descs(plan.k, plan, live_groups_k.get(), k_desc_host);
-    ggml_cuda_fattn_kvarn_fill_descs(plan.v, plan, live_groups_v.get(), v_desc_host);
-
-    ggml_cuda_pool_alloc<ggml_cuda_fattn_kvarn_desc> k_desc(pool, k_desc_host.size());
-    ggml_cuda_pool_alloc<ggml_cuda_fattn_kvarn_desc> v_desc(pool, v_desc_host.size());
-    CUDA_CHECK(cudaMemcpyAsync(k_desc.get(), k_desc_host.data(), k_desc_host.size() * sizeof(k_desc_host[0]), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(v_desc.get(), v_desc_host.data(), v_desc_host.size() * sizeof(v_desc_host[0]), cudaMemcpyHostToDevice, stream));
-
-    ggml_tensor K_desc = *dst->src[1];
-    ggml_tensor V_desc = *dst->src[2];
-    K_desc.data = k_desc.get();
-    V_desc.data = v_desc.get();
-    K_desc.type = GGML_TYPE_F16;
-    V_desc.type = GGML_TYPE_F16;
-    K_desc.view_src = nullptr;
-    V_desc.view_src = nullptr;
-    K_desc.view_offs = 0;
-    V_desc.view_offs = 0;
-    K_desc.nb[0] = sizeof(half);
-    V_desc.nb[0] = sizeof(half);
-    K_desc.nb[1] = 0;
-    V_desc.nb[1] = 0;
-    K_desc.nb[2] = sizeof(ggml_cuda_fattn_kvarn_desc);
-    V_desc.nb[2] = sizeof(ggml_cuda_fattn_kvarn_desc);
-    K_desc.nb[3] = sizeof(ggml_cuda_fattn_kvarn_desc) * plan.n_kv_heads;
-    V_desc.nb[3] = sizeof(ggml_cuda_fattn_kvarn_desc) * plan.n_kv_heads;
-
-    float logit_softcap;
-    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
-
-#if defined(GGML_USE_HIP)
-    using fattn_kernel_ptr_t = const void*;
-#else
-    using fattn_kernel_ptr_t = fattn_kernel_t;
-#endif
-    fattn_kernel_t fattn_kernel;
-    if (logit_softcap == 0.0f) {
-        constexpr bool use_logit_softcap = false;
-        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view,
-            GGML_CUDA_FATTN_KVARN_TYPE, GGML_CUDA_FATTN_KVARN_TYPE>;
-#if !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
-        static size_t shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {0};
-        if (shared_memory_limit_raised[id] < nbytes_shared_total) {
-            CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
-            shared_memory_limit_raised[id] = nbytes_shared_total;
-        }
-#endif
-    } else {
-        constexpr bool use_logit_softcap = true;
-        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view,
-            GGML_CUDA_FATTN_KVARN_TYPE, GGML_CUDA_FATTN_KVARN_TYPE>;
-#if !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
-        static size_t shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {0};
-        if (shared_memory_limit_raised[id] < nbytes_shared_total) {
-            CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
-            shared_memory_limit_raised[id] = nbytes_shared_total;
-        }
-#endif
-    }
-
-    ggml_tensor * orig_k = dst->src[1];
-    ggml_tensor * orig_v = dst->src[2];
-    dst->src[1] = &K_desc;
-    dst->src[2] = &V_desc;
-    // need_f16_K=false, need_f16_V=false: KVarN descriptors feed the MMA tile loader directly.
-    launch_fattn<DV, ncols1, ncols2>
-        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, false, false, true, warp_size_host);
-    dst->src[1] = orig_k;
-    dst->src[2] = orig_v;
-
-    GGML_UNUSED(nstages);
-}
-
-#endif
-#endif

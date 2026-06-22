@@ -3458,14 +3458,6 @@ static bool ggml_cuda_graph_check_compability(ggml_backend_cuda_context * cuda_c
             continue;
         }
 
-        if (node->op == GGML_OP_FLASH_ATTN_EXT && ggml_cuda_fattn_kvarn_uses_views(node)) {
-            use_cuda_graph = false;
-#ifndef NDEBUG
-            GGML_LOG_DEBUG("%s: disabling CUDA graphs due to KVarN FlashAttention view inputs\n", __func__);
-#endif
-            break;
-        }
-
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
             const ggml_tensor * src = node->src[j];
             if (!src || !src->buffer) {
