@@ -2765,8 +2765,9 @@ int main(int argc, char ** argv) {
     ok &= expect(kv_cache_iswa_cpp.find("KVarN enabled for all layers (non-SWA full-context and SWA sliding-window ring)") != std::string::npos &&
                  kv_cache_iswa_cpp.find("make_cache(size_base, 0, LLAMA_SWA_TYPE_NONE, filter_base, mem_other_base, use_kvarn)") != std::string::npos &&
                  kv_cache_iswa_cpp.find("make_cache(size_swa, hparams.n_swa, hparams.swa_type, filter_swa, mem_other_swa, use_kvarn)") != std::string::npos &&
-                 kv_cache_iswa_cpp.find("SWA KVarN ring requires a unified (single-stream) cache") != std::string::npos,
-        "ISWA with KVarN must keep KVarN on validated SWA ring layers and fall back only for unsupported multi-stream SWA");
+                 kv_cache_iswa_cpp.find("n_seq_max > 1 && !unified") != std::string::npos &&
+                 kv_cache_iswa_cpp.find("SWA KVarN ring requires a single stream") != std::string::npos,
+        "ISWA with KVarN must keep KVarN on single-stream SWA rings and fall back only when non-unified mode creates multiple streams");
     ok &= expect(context_cpp.find("is experimental; only kvarn_k4v2_g128 is reference-aligned") == std::string::npos,
         "KVarN presets must not emit experimental/reference-aligned startup warnings");
     ok &= expect(llama_bench.find("bench_cache_type_from_name") != std::string::npos &&

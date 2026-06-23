@@ -460,7 +460,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     GGML_ASSERT(swa || kv_size % KVAR_N_GROUP == 0);
     GGML_ASSERT(stage_groups >= 2 && "KVarN stage depth must be at least 2 (sink + one transient)");
     if (swa) {
-        GGML_ASSERT(n_stream == 1 && "SWA KVarN ring requires a unified (single-stream) cache");
+        GGML_ASSERT(n_stream == 1 && "SWA KVarN ring requires a single-stream cache");
         // Backstop for the ring-size invariant above: the record ring must have
         // strictly more slots than the metadata window's worst-case tile span so
         // the oldest in-window tile still decodes from records.

@@ -68,9 +68,11 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     }
 
     auto make_cache = [&](uint32_t size, uint32_t n_swa, llama_swa_type swa_type, const layer_filter_cb & layer_filter, llama_memory_t cache_mem_other, bool enable_kvarn) -> std::unique_ptr<llama_memory_i> {
-        // SWA KVarN ring requires a unified (single-stream) cache; fall back to the
-        // normal quantized KV cache for SWA layers when multi-stream is in use.
-        const bool kvarn_ok = enable_kvarn && !(n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE && !unified);
+        // SWA KVarN ring requires a single stream. Non-unified mode still has one
+        // stream when n_seq_max == 1, so only fall back when it actually creates
+        // multiple streams.
+        const bool kvarn_ok = enable_kvarn &&
+            !(n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE && n_seq_max > 1 && !unified);
         if (kvarn_ok) {
             // note: structured KVarN caches do not participate in cross-context sharing (mem_other/share)
             return std::make_unique<llama_kv_cache_kvarn>(

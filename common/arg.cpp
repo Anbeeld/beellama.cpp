@@ -467,9 +467,9 @@ static llama_kvarn_type kvarn_type_from_bits(int32_t key_bits, int32_t value_bit
     return llama_kvarn_type_from_name(string_format("kvarn_k%dv%d_g128", key_bits, value_bits).c_str());
 }
 
-// layers that cannot use structured KVarN records (e.g. iSWA SWA layers) fall back to a
-// normal KV cache with cache_type_k/v; match the requested KVarN bit width instead of
-// f16 so the fallback layers do not dominate memory use
+// layers that cannot use structured KVarN records (e.g. multi-stream iSWA SWA layers)
+// fall back to a normal KV cache with cache_type_k/v; match the requested KVarN bit
+// width instead of f16 so the fallback layers do not dominate memory use
 static ggml_type kvarn_fallback_cache_type(int32_t bits) {
     switch (bits) {
         case 2:  return GGML_TYPE_Q2_0;

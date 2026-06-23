@@ -211,7 +211,7 @@ On CUDA, KVarN reads are consumed through native view inputs in FlashAttention, 
 
 When KVarN runs with `--kv-unified`, it uses one physical structured stream and standard KV metadata for sequence isolation. Per-sequence prompt-cache state restore is used only when that shared stream is exclusive; otherwise the server keeps correctness by skipping the RAM state restore and processing the prompt normally.
 
-Layers that cannot use structured KVarN records (for example iSWA sliding-window layers, whose rolling eviction is incompatible with KVarN 128-token tile groups) fall back to a normal KV cache whose type matches the requested bit width: `kvarn2` → `q2_0`, `kvarn3` → `q3_0`, `kvarn4` → `q4_0`, `kvarn5` → `q5_0`, `kvarn6` → `q6_0`, `kvarn8` → `q8_0`. This keeps total KV memory at the requested bit level instead of silently storing the fallback layers in `f16`.
+Layers that cannot use structured KVarN records fall back to a normal KV cache whose type matches the requested bit width: `kvarn2` → `q2_0`, `kvarn3` → `q3_0`, `kvarn4` → `q4_0`, `kvarn5` → `q5_0`, `kvarn6` → `q6_0`, `kvarn8` → `q8_0`. iSWA sliding-window layers use a native KVarN ring when the cache has one stream; non-unified multi-sequence iSWA caches use the bit-width-matched fallback. This keeps total KV memory at the requested bit level instead of silently storing fallback layers in `f16`.
 
 ## Model Weight Quantization
 
