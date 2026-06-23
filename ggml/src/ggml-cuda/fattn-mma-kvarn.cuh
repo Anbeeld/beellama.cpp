@@ -54,10 +54,9 @@ struct ggml_cuda_fattn_kvarn_plan {
     int slices     = 0;
 };
 
-// Definition lives in fattn-mma-kvarn-impl.cuh (compiled only in fattn.cu). fattn-mma-f16.cuh
-// needs only this declaration: its call sites are in if-constexpr branches discarded for
-// non-KVarN types, and the KVarN kernel is instantiated solely in fattn.cu (which includes
-// the impl header). This keeps loader edits from recompiling every FA MMA instance.
+// Definition lives in fattn-mma-kvarn-impl.cuh. fattn-mma-f16.cuh needs only this declaration:
+// its call sites are in if-constexpr branches discarded for non-KVarN types, while fattn.cu
+// includes the implementation for the generic native-MMA fallback.
 template<int D, int stride_tile, int nbatch_fa, int nthreads, bool oob_check, bool dim_major_K = false>
 static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
         const char * __restrict__ desc_raw,

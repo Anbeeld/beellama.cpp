@@ -179,6 +179,11 @@ int main(int argc, char ** argv) {
     const std::string cuda_fattn_kvarn = read_file_optional(root + "/ggml/src/ggml-cuda/fattn-kvarn.cuh");
     const std::string cuda_fattn_mma_kvarn = read_file_optional(root + "/ggml/src/ggml-cuda/fattn-mma-kvarn.cuh");
     const std::string cuda_fattn_mma_kvarn_impl = read_file_optional(root + "/ggml/src/ggml-cuda/fattn-mma-kvarn-impl.cuh");
+    const std::string cuda_fattn_mma_kvarn_load = read_file(root + "/ggml/src/ggml-cuda/fattn-mma-kvarn-load.cuh");
+    const std::string cuda_fattn_mma_kvarn_decode_decl = read_file(root + "/ggml/src/ggml-cuda/fattn-mma-kvarn-decode-decl.cuh");
+    const std::string cuda_fattn_mma_kvarn_decode = read_file(root + "/ggml/src/ggml-cuda/fattn-mma-kvarn-decode.cuh");
+    const std::string cuda_fattn_mma_kvarn_decode_k4v3 =
+        read_file(root + "/ggml/src/ggml-cuda/template-instances/fattn-mma-kvarn-decode-instance-k4-v3.cu");
     const std::string cuda_turbo_quant = read_file(root + "/ggml/src/ggml-cuda/turbo-quant-cuda.cuh");
     const std::string cuda_cmake = read_file(root + "/ggml/src/ggml-cuda/CMakeLists.txt");
     const std::string cuda_fattn_h = read_file(root + "/ggml/src/ggml-cuda/fattn.cuh");
@@ -480,13 +485,30 @@ int main(int argc, char ** argv) {
                  cuda_fattn.find("materialize_kvarn_f16") != std::string::npos,
         "KVarN native MMA must stay decode/small-batch scoped while large prefill uses an internal F16 materialize fallback");
     ok &= expect(cuda_fattn.find("ggml_cuda_flash_attn_ext_mma_kvarn_case") != std::string::npos &&
-                 cuda_fattn.find("ggml_cuda_fattn_kvarn_decode_mma_d256_k4v4_kernel") != std::string::npos &&
+                 cuda_fattn.find("#include \"fattn-mma-kvarn-decode-decl.cuh\"") != std::string::npos &&
+                 cuda_fattn.find("ggml_cuda_fattn_kvarn_decode_mma_kernel") == std::string::npos &&
+                 cuda_fattn_mma_kvarn_decode.find(
+                     "template<int D, int MAX_GQA, int SPLIT_TOKENS, int NWARPS, int K_BITS, int V_BITS>") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_decode.find("ggml_cuda_fattn_kvarn_decode_mma_kernel") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_decode_decl.find(
+                     "template<int D, int K_BITS, int V_BITS>") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_decode.find("#include \"fattn-mma-kvarn-load.cuh\"") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_decode.find("#include \"fattn-mma-kvarn-impl.cuh\"") == std::string::npos &&
+                 cuda_fattn_mma_kvarn_load.find("ggml_cuda_fattn_kvarn_load_rotated") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_decode_k4v3.find(
+                     "DECL_FATTN_KVARN_DECODE_CASE(128, 4, 3);") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_decode_k4v3.find(
+                     "DECL_FATTN_KVARN_DECODE_CASE(256, 4, 3);") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_decode_k4v3.find(
+                     "DECL_FATTN_KVARN_DECODE_CASE(512, 4, 3);") != std::string::npos &&
+                 cuda_fattn.find("Q->ne[1] > GGML_CUDA_FATTN_KVARN_NATIVE_MAX_Q") != std::string::npos &&
+                 cuda_fattn.find("plan.k.swa || plan.v.swa") != std::string::npos &&
                  cuda_fattn.find("need_f16_K=false") != std::string::npos &&
                  cuda_fattn.find("need_f16_V=false") != std::string::npos &&
                  cuda_fattn_mma_kvarn_impl.find("flash_attn_ext_kvarn_load_tile") != std::string::npos &&
                  cuda_fattn_mma_kvarn.find("GGML_KVARN_FORCE_MATERIALIZE") == std::string::npos &&
                  cuda_fattn_mma_kvarn.find("ggml_cuda_fattn_kvarn_force_materialize_enabled") == std::string::npos,
-        "native KVarN FlashAttention must keep fused tensor-core decode plus generic native MMA fallback without K/V F16 materialize buffers or fallback env gates");
+        "native KVarN FlashAttention must keep the SWA-aware tensor-core decode in per-pair instance TUs plus generic shallow fallback without K/V F16 materialize buffers or fallback env gates");
     ok &= expect(cuda_fattn_mma_kvarn.find("record_cache") == std::string::npos &&
                  cuda_fattn.find("nbytes_shared_record =") == std::string::npos &&
                  cuda_fattn.find("nbytes_shared_KV_mask_record") == std::string::npos,

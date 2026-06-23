@@ -7393,7 +7393,8 @@ static std::vector<ggml_fp16_t> test_kvarn_reference_decode(
         int n_stream,
         int bits,
         bool value,
-        int stage_groups) {
+        int stage_groups,
+        bool swa) {
     GGML_ASSERT(records->type == GGML_TYPE_I8);
     GGML_ASSERT(stage->type == GGML_TYPE_F16);
     GGML_ASSERT(stage->ne[0] == 128);
@@ -7415,11 +7416,18 @@ static std::vector<ggml_fp16_t> test_kvarn_reference_decode(
 
     std::vector<int64_t> live_groups(n_stream, 0);
     for (int64_t idx : indices) {
+        if (idx < 0) {
+            continue;
+        }
         const int64_t group_global = idx / 128;
-        const int64_t stream = group_global / groups_per_stream;
-        if (stream >= stream_start && stream < stream_start + n_stream) {
-            const int64_t group = group_global - stream * groups_per_stream;
-            live_groups[stream - stream_start] = std::max(live_groups[stream - stream_start], group);
+        if (swa) {
+            live_groups[0] = std::max(live_groups[0], group_global);
+        } else {
+            const int64_t stream = group_global / groups_per_stream;
+            if (stream >= stream_start && stream < stream_start + n_stream) {
+                const int64_t group = group_global - stream * groups_per_stream;
+                live_groups[stream - stream_start] = std::max(live_groups[stream - stream_start], group);
+            }
         }
     }
 
@@ -7429,16 +7437,34 @@ static std::vector<ggml_fp16_t> test_kvarn_reference_decode(
         const int64_t live_group = live_groups[out_stream];
         const int64_t stage_base = (int64_t) stream * 128 * stage_groups;
         for (int cell = 0; cell < n_kv; ++cell) {
-            const int64_t group = cell / 128;
-            const int64_t pos = cell % 128;
+            const int64_t abs_pos = swa ? indices[cell] : (int64_t) stream * groups_per_stream * 128 + cell;
+            if (abs_pos < 0) {
+                continue;
+            }
+            const int64_t group_global = abs_pos / 128;
+            const int64_t group = swa ? group_global : group_global - (int64_t) stream * groups_per_stream;
+            const int64_t pos = abs_pos - group_global * 128;
             for (int h = 0; h < n_heads; ++h) {
                 std::array<float, 128> rotated = {};
-                const bool from_stage = group == 0 ||
-                    (group > 0 && group <= live_group && group + (tail_groups - 1) >= live_group);
-                const bool from_record = !from_stage && group < live_group;
-                const int64_t stage_pos = stage_base +
-                    (group == 0 ? pos : 128 + ((group - 1) % tail_groups) * 128 + pos);
-                const int64_t record_group = (int64_t) stream * groups_per_stream + group;
+                bool from_stage;
+                bool from_record;
+                int64_t stage_pos;
+                int64_t record_group;
+                if (swa) {
+                    const int64_t stage_begin = live_group >= (tail_groups - 1) ? live_group - (tail_groups - 1) : 0;
+                    from_stage = group_global >= stage_begin && group_global <= live_group;
+                    from_record = !from_stage && group_global >= 0 && group_global < stage_begin &&
+                        (live_group - group_global) < groups_per_stream;
+                    stage_pos = (group_global % stage_groups) * 128 + pos;
+                    record_group = group_global % groups_per_stream;
+                } else {
+                    from_stage = group == 0 ||
+                        (group > 0 && group <= live_group && group + (tail_groups - 1) >= live_group);
+                    from_record = !from_stage && group < live_group;
+                    stage_pos = stage_base +
+                        (group == 0 ? pos : 128 + ((group - 1) % tail_groups) * 128 + pos);
+                    record_group = (int64_t) stream * groups_per_stream + group;
+                }
 
                 if (from_stage) {
                     GGML_ASSERT(stage_pos >= 0 && stage_pos < stage->ne[2]);
@@ -7479,6 +7505,7 @@ struct test_kvarn_flash_attn_ext : public test_case {
     const int stage_groups;
     const int64_t n_stream;
     const int stream_start;
+    const bool swa;
 
     test_kvarn_flash_attn_ext(
             int64_t hsk = 256,
@@ -7490,10 +7517,11 @@ struct test_kvarn_flash_attn_ext : public test_case {
             int bits_v = 4,
             int stage_groups = 5,
             int64_t n_stream = 1,
-            int stream_start = 0)
+            int stream_start = 0,
+            bool swa = false)
         : hsk(hsk), n_q(n_q), n_q_heads(n_q_heads), n_kv_heads(n_kv_heads), n_kv(n_kv),
           bits_k(bits_k), bits_v(bits_v), stage_groups(stage_groups),
-          n_stream(n_stream), stream_start(stream_start) {}
+          n_stream(n_stream), stream_start(stream_start), swa(swa) {}
 
     std::string vars() override {
         std::ostringstream oss;
@@ -7506,7 +7534,8 @@ struct test_kvarn_flash_attn_ext : public test_case {
             << ",bits_v=" << bits_v
             << ",stage_groups=" << stage_groups
             << ",n_stream=" << n_stream
-            << ",stream_start=" << stream_start;
+            << ",stream_start=" << stream_start
+            << ",swa=" << (swa ? 1 : 0);
         return oss.str();
     }
 
@@ -7521,10 +7550,11 @@ struct test_kvarn_flash_attn_ext : public test_case {
 
     ggml_tensor * build_graph_impl(ggml_context * ctx, bool native_view) {
         GGML_ASSERT(hsk % 128 == 0);
+        GGML_ASSERT(!swa || (stream_start == 0 && n_stream == 1));
         const int slices = (int) (hsk / 128);
         const int record_heads = (int) n_kv_heads * slices;
         const int groups_per_stream = test_kvarn_groups_per_stream(0, (int) n_kv);
-        const int total_streams = stream_start + (int) n_stream;
+        const int total_streams = swa ? 1 : stream_start + (int) n_stream;
         const int k_record_bytes = (int) test_kvarn_record_bytes(bits_k);
         const int v_record_bytes = (int) test_kvarn_record_bytes(bits_v);
 
@@ -7557,6 +7587,8 @@ struct test_kvarn_flash_attn_ext : public test_case {
         ggml_tensor * stored_v = ggml_kvarn_store(ctx, current_v, indices, v_stage, v_records, bits_v, 16, true,  stage_groups);
         stored_k->op_params[3] = (int32_t) n_kv;
         stored_v->op_params[3] = (int32_t) n_kv;
+        stored_k->op_params[4] = swa ? 1 : 0;
+        stored_v->op_params[4] = swa ? 1 : 0;
         ggml_set_name(stored_k, "stored_k");
         ggml_set_name(stored_v, "stored_v");
 
@@ -7565,6 +7597,8 @@ struct test_kvarn_flash_attn_ext : public test_case {
         if (native_view) {
             k = ggml_kvarn_view(ctx, k_records, stored_k, indices, (int) n_kv, stream_start, (int) n_stream, bits_k, false, stage_groups);
             v = ggml_kvarn_view(ctx, v_records, stored_v, indices, (int) n_kv, stream_start, (int) n_stream, bits_v, true,  stage_groups);
+            k->op_params[6] = swa ? 1 : 0;
+            v->op_params[6] = swa ? 1 : 0;
             if (slices > 1) {
                 k = ggml_reshape_4d(ctx, k, hsk, n_kv_heads, n_kv, n_stream);
                 v = ggml_reshape_4d(ctx, v, hsk, n_kv_heads, n_kv, n_stream);
@@ -7588,11 +7622,18 @@ struct test_kvarn_flash_attn_ext : public test_case {
 
     std::vector<int64_t> make_indices() const {
         const int groups_per_stream = test_kvarn_groups_per_stream(0, (int) n_kv);
-        const int total_streams = stream_start + (int) n_stream;
+        const int total_streams = swa ? 1 : stream_start + (int) n_stream;
         std::vector<int64_t> data((size_t) n_kv * total_streams);
-        for (int s = 0; s < total_streams; ++s) {
+        if (swa) {
+            const int group_offset = groups_per_stream + 4;
             for (int t = 0; t < n_kv; ++t) {
-                data[(size_t) s * n_kv + t] = (int64_t) s * groups_per_stream * 128 + t;
+                data[(size_t) t] = (int64_t) group_offset * 128 + t;
+            }
+        } else {
+            for (int s = 0; s < total_streams; ++s) {
+                for (int t = 0; t < n_kv; ++t) {
+                    data[(size_t) s * n_kv + t] = (int64_t) s * groups_per_stream * 128 + t;
+                }
             }
         }
         return data;
@@ -7601,7 +7642,7 @@ struct test_kvarn_flash_attn_ext : public test_case {
     void initialize_common_tensors(ggml_context * ctx) const {
         const int slices = (int) (hsk / 128);
         const int record_heads = (int) n_kv_heads * slices;
-        const int total_streams = stream_start + (int) n_stream;
+        const int total_streams = swa ? 1 : stream_start + (int) n_stream;
 
         std::vector<float> q_data((size_t) hsk * n_q * n_q_heads * n_stream);
         for (int s = 0; s < n_stream; ++s) {
@@ -7750,9 +7791,9 @@ struct test_kvarn_flash_attn_ext : public test_case {
 
         const std::vector<int64_t> indices_data = make_indices();
         const std::vector<ggml_fp16_t> k_ref_data = test_kvarn_reference_decode(
-                k_records, stored_k, indices_data, (int) n_kv, stream_start, (int) n_stream, bits_k, false, stage_groups);
+                k_records, stored_k, indices_data, (int) n_kv, stream_start, (int) n_stream, bits_k, false, stage_groups, swa);
         const std::vector<ggml_fp16_t> v_ref_data = test_kvarn_reference_decode(
-                v_records, stored_v, indices_data, (int) n_kv, stream_start, (int) n_stream, bits_v, true,  stage_groups);
+                v_records, stored_v, indices_data, (int) n_kv, stream_start, (int) n_stream, bits_v, true,  stage_groups, swa);
         ggml_backend_tensor_set(k_ref, k_ref_data.data(), 0, k_ref_data.size() * sizeof(ggml_fp16_t));
         ggml_backend_tensor_set(v_ref, v_ref_data.data(), 0, v_ref_data.size() * sizeof(ggml_fp16_t));
 
@@ -7771,6 +7812,7 @@ struct test_kvarn_flash_attn_ext : public test_case {
 
         double mse = 0.0;
         double max_diff = 0.0;
+        size_t max_diff_index = 0;
         for (size_t i = 0; i < actual.size(); ++i) {
             if (!std::isfinite(actual[i]) || !std::isfinite(expected[i])) {
                 print_result(true, false, "non-finite output");
@@ -7778,14 +7820,34 @@ struct test_kvarn_flash_attn_ext : public test_case {
             }
             const double diff = double(actual[i]) - double(expected[i]);
             mse += diff * diff;
-            max_diff = std::max(max_diff, std::fabs(diff));
+            const double abs_diff = std::fabs(diff);
+            if (abs_diff > max_diff) {
+                max_diff = abs_diff;
+                max_diff_index = i;
+            }
         }
 
         const double rmse = std::sqrt(mse / std::max<size_t>(actual.size(), 1));
         constexpr double rmse_limit = 1e-2;
         if (!std::isfinite(rmse) || rmse > rmse_limit) {
+            const int64_t dim = (int64_t) (max_diff_index % (size_t) hsk);
+            const int64_t qh = (int64_t) ((max_diff_index / (size_t) hsk) % (size_t) n_q_heads);
+            const int64_t iq = (int64_t) ((max_diff_index / ((size_t) hsk * (size_t) n_q_heads)) % (size_t) n_q);
+            const int64_t stream = (int64_t) (max_diff_index / ((size_t) hsk * (size_t) n_q_heads * (size_t) n_q));
             std::ostringstream oss;
-            oss << "rmse=" << rmse << " max_diff=" << max_diff << " limit=" << rmse_limit;
+            oss << "rmse=" << rmse << " max_diff=" << max_diff << " limit=" << rmse_limit
+                << " max_at=[d=" << dim << ",iq=" << iq << ",qh=" << qh << ",stream=" << stream << "]"
+                << " actual=" << actual[max_diff_index] << " expected=" << expected[max_diff_index];
+            oss << " row_q=[";
+            for (int64_t row_iq = 0; row_iq < n_q; ++row_iq) {
+                const size_t row_index = (((size_t) stream * (size_t) n_q + (size_t) row_iq) *
+                        (size_t) n_q_heads + (size_t) qh) * (size_t) hsk + (size_t) dim;
+                if (row_iq != 0) {
+                    oss << ";";
+                }
+                oss << row_iq << ":" << actual[row_index] << "/" << expected[row_index];
+            }
+            oss << "]";
             print_result(true, false, oss.str());
             return test_status_t::FAIL;
         }
@@ -9722,18 +9784,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q1_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_F16));
-    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 1, 6, 1, 1024, 4, 4, 5));
-    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 1, 6, 1, 1024, 4, 3, 5));
-    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 1, 6, 1, 1024, 4, 2, 5));
-    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 1, 6, 1, 1024, 2, 8, 5));
-    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 1, 6, 1, 1024, 8, 2, 5));
-    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 2, 6, 1, 1024, 4, 4, 5));
-    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 4, 6, 1, 1024, 4, 4, 5));
-    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 8, 6, 1, 1024, 4, 4, 5));
+    constexpr int kvarn_bits[] = {2, 3, 4, 5, 6, 8};
+    constexpr int kvarn_dims[] = {128, 256, 512};
+    constexpr int kvarn_nq[] = {1, 2, 4, 8};
+    for (const int hsk : kvarn_dims) {
+        for (const int n_q : kvarn_nq) {
+            for (const int bits_k : kvarn_bits) {
+                for (const int bits_v : kvarn_bits) {
+                    test_cases.emplace_back(new test_kvarn_flash_attn_ext(
+                        hsk, n_q, 6, 1, 1024, bits_k, bits_v, 5));
+                }
+            }
+        }
+    }
     test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 1, 6, 1, 639, 4, 4, 5));
     test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 1, 6, 1, 641, 4, 4, 5));
     test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 1, 6, 1, 1024, 4, 4, 5, 2, 0));
     test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 1, 6, 1, 1024, 4, 4, 5, 2, 1));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(128, 8, 6, 1, 8192, 2, 8, 5));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 1, 16, 1, 1024, 4, 4, 5));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 2, 16, 1, 1024, 8, 4, 5));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 1, 8, 2, 1024, 4, 4, 5));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 1, 20, 2, 1024, 8, 6, 5));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 1, 6, 1, 768, 4, 4, 5, 1, 0, true));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 4, 6, 1, 768, 8, 6, 5, 1, 0, true));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 1, 16, 1, 768, 4, 4, 5, 1, 0, true));
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
