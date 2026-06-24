@@ -125,14 +125,28 @@ static __global__ void ggml_cuda_fattn_kvarn_vec_kernel(
     static_assert(MAX_GQA == 2, "KVarN vec shares one dequantized K/V value across a bounded D256 GQA group");
     static_assert(WARP_SIZE == 32, "KVarN vec requires CUDA warp size 32");
 
+    // Match the std fattn-vec block of 128 threads / 4 warps. The decode is latency-bound at ~6%
+    // occupancy because each split-block only ran 2 warps (one per 128-wide slice), so the strided
+    // per-element KVarN dequant loads had no sibling warps to hide behind. Splitting every slice
+    // across DIM_GROUPS warps doubles the resident warps (each walks half the dims), without changing
+    // the per-split math or the partial/combine layout. DIM_GROUPS==1 degenerates to the old kernel.
+    constexpr int DIM_GROUPS    = 4 / SLICES;
+    constexpr int DIM_PER_GROUP = GGML_CUDA_FATTN_KVARN_DIM / DIM_GROUPS;
+    static_assert(4 % SLICES == 0, "KVarN vec targets 4 warps per block");
+    static_assert(DIM_PER_GROUP >= WARP_SIZE && DIM_PER_GROUP % WARP_SIZE == 0,
+        "KVarN vec needs each dim group to be a warp-aligned slab");
+
     const int split = blockIdx.x;
     const int gqa_block = blockIdx.y % n_gqa_blocks;
     const int kv_head = blockIdx.y / n_gqa_blocks;
     const int stream = blockIdx.z;
     const int lane = threadIdx.x;
     const int slice = threadIdx.y;
-    const int tid = slice * WARP_SIZE + lane;
-    const int nthreads = SLICES * WARP_SIZE;
+    const int dim_group = threadIdx.z;
+    const int warp_id = dim_group * SLICES + slice;
+    const int tid = warp_id * WARP_SIZE + lane;
+    const int nthreads = SLICES * DIM_GROUPS * WARP_SIZE;
+    const int dim_base = dim_group * DIM_PER_GROUP;
     const int q_head0 = kv_head * gqa_ratio + gqa_block * MAX_GQA;
     const int gqa_head_count = min(MAX_GQA, gqa_ratio - gqa_block * MAX_GQA);
     const int token_begin = split * TOKENS_PER_SPLIT;
@@ -144,7 +158,7 @@ static __global__ void ggml_cuda_fattn_kvarn_vec_kernel(
     __shared__ __align__(16) half q_sh[MAX_GQA][D];
     __shared__ ggml_cuda_fattn_kvarn_vec_ref k_refs[TOKENS_PER_SPLIT];
     __shared__ ggml_cuda_fattn_kvarn_vec_ref v_refs[TOKENS_PER_SPLIT];
-    __shared__ float score_partial[SLICES][MAX_GQA][TOKENS_PER_SPLIT];
+    __shared__ float score_partial[SLICES][DIM_GROUPS][MAX_GQA][TOKENS_PER_SPLIT];
     __shared__ float weights[MAX_GQA][TOKENS_PER_SPLIT];
     __shared__ float max_score[MAX_GQA];
     __shared__ float denominator[MAX_GQA];
@@ -159,7 +173,7 @@ static __global__ void ggml_cuda_fattn_kvarn_vec_kernel(
         }
         q_sh[h][dim] = __float2half(value);
     }
-    if (slice == 0 && lane < TOKENS_PER_SPLIT) {
+    if (warp_id == 0 && lane < TOKENS_PER_SPLIT) {
         const int token = token_begin + lane;
         k_refs[lane] = ggml_cuda_fattn_kvarn_vec_resolve(k_desc, token, n_kv);
         v_refs[lane] = ggml_cuda_fattn_kvarn_vec_resolve(v_desc, token, n_kv);
@@ -173,7 +187,8 @@ static __global__ void ggml_cuda_fattn_kvarn_vec_kernel(
     if (token_begin + token_lane < token_end &&
             k_refs[token_lane].source != GGML_CUDA_FATTN_KVARN_VEC_INVALID) {
 #pragma unroll
-        for (int dim = dim_worker; dim < GGML_CUDA_FATTN_KVARN_DIM; dim += DIM_WORKERS) {
+        for (int d = dim_worker; d < DIM_PER_GROUP; d += DIM_WORKERS) {
+            const int dim = dim_base + d;
             const float k = ggml_cuda_fattn_kvarn_vec_load<K_BITS, false>(
                 k_desc, k_refs[token_lane], slice, dim);
 #pragma unroll
@@ -192,12 +207,12 @@ static __global__ void ggml_cuda_fattn_kvarn_vec_kernel(
 #pragma unroll
     for (int h = 0; h < MAX_GQA; ++h) {
         if (lane < TOKENS_PER_SPLIT) {
-            score_partial[slice][h][lane] = dot[h];
+            score_partial[slice][dim_group][h][lane] = dot[h];
         }
     }
     __syncthreads();
 
-    if (slice == 0) {
+    if (warp_id == 0) {
         const half * mask_h = mask != nullptr ?
             (const half *) (mask + nb33 * (stream % ne33)) : nullptr;
 #pragma unroll
@@ -209,7 +224,10 @@ static __global__ void ggml_cuda_fattn_kvarn_vec_kernel(
                 score = 0.0f;
 #pragma unroll
                 for (int s = 0; s < SLICES; ++s) {
-                    score += score_partial[s][h][lane];
+#pragma unroll
+                    for (int g = 0; g < DIM_GROUPS; ++g) {
+                        score += score_partial[s][g][h][lane];
+                    }
                 }
                 if (logit_softcap != 0.0f) {
                     score = logit_softcap * tanhf(score);
@@ -246,7 +264,8 @@ static __global__ void ggml_cuda_fattn_kvarn_vec_kernel(
     }
     __syncthreads();
 
-    for (int dim = lane; dim < GGML_CUDA_FATTN_KVARN_DIM; dim += WARP_SIZE) {
+    for (int d = lane; d < DIM_PER_GROUP; d += WARP_SIZE) {
+        const int dim = dim_base + d;
         float out[MAX_GQA] = {};
 #pragma unroll
         for (int t = 0; t < TOKENS_PER_SPLIT; ++t) {
@@ -274,7 +293,7 @@ static __global__ void ggml_cuda_fattn_kvarn_vec_kernel(
         }
     }
 
-    if (slice == 0 && lane < gqa_head_count && q_head0 + lane < n_q_heads) {
+    if (warp_id == 0 && lane < gqa_head_count && q_head0 + lane < n_q_heads) {
         const int q_head = q_head0 + lane;
         const size_t base = ((size_t) stream * n_q_heads + q_head) * n_splits + split;
         partial_meta[base] = make_float2(max_score[lane], denominator[lane]);
@@ -286,12 +305,13 @@ static void ggml_cuda_fattn_kvarn_vec_launch_tps(
         const ggml_cuda_fattn_kvarn_decode_args & args) {
     constexpr int max_gqa = ggml_cuda_fattn_kvarn_vec_max_gqa<D>();
     constexpr int slices = D / GGML_CUDA_FATTN_KVARN_DIM;
+    constexpr int dim_groups = 4 / slices; // 128 threads / 4 warps, matching std fattn-vec
     const dim3 blocks_split(
         (uint32_t) args.n_splits,
         (uint32_t) (args.n_kv_heads * args.n_gqa_blocks),
         (uint32_t) args.n_stream);
     ggml_cuda_fattn_kvarn_vec_kernel<D, TOKENS_PER_SPLIT, max_gqa, K_BITS, V_BITS>
-        <<<blocks_split, dim3(WARP_SIZE, slices, 1), 0, args.stream>>>(
+        <<<blocks_split, dim3(WARP_SIZE, slices, dim_groups), 0, args.stream>>>(
             args.Q, args.k_descs, args.v_descs, args.mask, args.partial, args.partial_meta,
             args.scale, args.logit_softcap, args.nb02, args.nb03,
             args.nb30, args.nb31, args.nb33, args.ne33, args.n_kv,
