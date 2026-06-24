@@ -1,7 +1,6 @@
 #pragma once
 
 static constexpr int GGML_CUDA_FATTN_KVARN_DIM = 128;
-static constexpr int GGML_CUDA_FATTN_KVARN_NATIVE_MAX_Q = 8;
 static constexpr ggml_type GGML_CUDA_FATTN_KVARN_TYPE = GGML_TYPE_COUNT;
 
 enum {
@@ -66,50 +65,6 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
         const int dim2_start,
         const int dim2_count,
         half      * __restrict__ scale_smem);
-
-static __global__ void ggml_cuda_fattn_kvarn_live_groups_kernel(
-        const int64_t * indices,
-        int n_indices,
-        int stream_start,
-        int n_stream,
-        int groups_per_stream,
-        bool swa,
-        int * live_groups) {
-    const int out_stream = blockIdx.x;
-    if (out_stream >= n_stream) {
-        return;
-    }
-
-    const int stream = stream_start + out_stream;
-    int live_group = 0;
-    for (int i = threadIdx.x; i < n_indices; i += blockDim.x) {
-        const int64_t idx = indices[i];
-        if (swa) {
-            if (idx >= 0) {
-                live_group = max(live_group, (int) (idx / GGML_CUDA_FATTN_KVARN_DIM));
-            }
-        } else {
-            const int group_global = (int) (idx / GGML_CUDA_FATTN_KVARN_DIM);
-            const int idx_stream = group_global / groups_per_stream;
-            if (idx_stream == stream) {
-                live_group = max(live_group, group_global - stream * groups_per_stream);
-            }
-        }
-    }
-
-    __shared__ int partial[GGML_CUDA_FATTN_KVARN_DIM];
-    partial[threadIdx.x] = live_group;
-    __syncthreads();
-    for (int stride = GGML_CUDA_FATTN_KVARN_DIM / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            partial[threadIdx.x] = max(partial[threadIdx.x], partial[threadIdx.x + stride]);
-        }
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) {
-        live_groups[out_stream] = partial[0];
-    }
-}
 
 static inline bool ggml_cuda_fattn_kvarn_valid_bits(const int bits) {
     return bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 8;
@@ -257,10 +212,5 @@ static inline bool ggml_cuda_fattn_kvarn_supported(
         const int device,
         const ggml_tensor * dst,
         ggml_cuda_fattn_kvarn_plan * out = nullptr) {
-    const ggml_tensor * Q = dst != nullptr ? dst->src[0] : nullptr;
-    if (Q == nullptr || !(Q->ne[1] <= GGML_CUDA_FATTN_KVARN_NATIVE_MAX_Q)) {
-        return false;
-    }
-
     return ggml_cuda_fattn_kvarn_view_supported(device, dst, out);
 }

@@ -7506,6 +7506,8 @@ struct test_kvarn_flash_attn_ext : public test_case {
     const int64_t n_stream;
     const int stream_start;
     const bool swa;
+    const int swa_base_pos; // SWA window in-group start offset (group misalignment)
+    const bool swa_wrap;    // SWA: inject one ring-wrap discontinuity in cell order
 
     test_kvarn_flash_attn_ext(
             int64_t hsk = 256,
@@ -7518,10 +7520,13 @@ struct test_kvarn_flash_attn_ext : public test_case {
             int stage_groups = 5,
             int64_t n_stream = 1,
             int stream_start = 0,
-            bool swa = false)
+            bool swa = false,
+            int swa_base_pos = 0,
+            bool swa_wrap = false)
         : hsk(hsk), n_q(n_q), n_q_heads(n_q_heads), n_kv_heads(n_kv_heads), n_kv(n_kv),
           bits_k(bits_k), bits_v(bits_v), stage_groups(stage_groups),
-          n_stream(n_stream), stream_start(stream_start), swa(swa) {}
+          n_stream(n_stream), stream_start(stream_start), swa(swa),
+          swa_base_pos(swa_base_pos), swa_wrap(swa_wrap) {}
 
     std::string vars() override {
         std::ostringstream oss;
@@ -7536,6 +7541,10 @@ struct test_kvarn_flash_attn_ext : public test_case {
             << ",n_stream=" << n_stream
             << ",stream_start=" << stream_start
             << ",swa=" << (swa ? 1 : 0);
+        if (swa) {
+            oss << ",swa_base_pos=" << swa_base_pos
+                << ",swa_wrap=" << (swa_wrap ? 1 : 0);
+        }
         return oss.str();
     }
 
@@ -7626,8 +7635,22 @@ struct test_kvarn_flash_attn_ext : public test_case {
         std::vector<int64_t> data((size_t) n_kv * total_streams);
         if (swa) {
             const int group_offset = groups_per_stream + 4;
-            for (int t = 0; t < n_kv; ++t) {
-                data[(size_t) t] = (int64_t) group_offset * 128 + t;
+            const int64_t base = (int64_t) group_offset * 128 + swa_base_pos;
+            if (swa_wrap) {
+                // Emulate one ring-wrap discontinuity in cell order: the first run holds the newest
+                // contiguous positions, then at the seam cell order jumps down to an older,
+                // group-disjoint contiguous run (no shared (group,pos) -> no store collision). Tiles
+                // spanning the seam are non-contiguous and must fall back to the per-cell loader; the
+                // older run still lands on the fast record path.
+                const int seam = (int) (n_kv / 2) + 13; // neither split- nor group-aligned
+                const int64_t base_lo = (int64_t) (group_offset - 4) * 128 + swa_base_pos;
+                for (int t = 0; t < n_kv; ++t) {
+                    data[(size_t) t] = (t < seam) ? base + (int64_t) t : base_lo + (int64_t) (t - seam);
+                }
+            } else {
+                for (int t = 0; t < n_kv; ++t) {
+                    data[(size_t) t] = base + (int64_t) t;
+                }
             }
         } else {
             for (int s = 0; s < total_streams; ++s) {
@@ -9809,6 +9832,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 1, 6, 1, 768, 4, 4, 5, 1, 0, true));
     test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 4, 6, 1, 768, 8, 6, 5, 1, 0, true));
     test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 1, 16, 1, 768, 4, 4, 5, 1, 0, true));
+    // D512 non-SWA global-decode (n_q=1) is the Gemma-4 global-layer shape routed to the
+    // lightweight vec kernel (bounded GQA=8 sharing). Cover varied n_kv (incl. non-128
+    // multiples), GQA below/at/above the share width, multi-head, and multi-stream.
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 1, 16, 1, 639, 4, 4, 5));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 1, 16, 1, 641, 4, 4, 5));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 1, 8, 1, 1024, 4, 4, 5));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 1, 4, 1, 1024, 4, 4, 5));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 1, 16, 2, 1024, 4, 4, 5));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 1, 16, 1, 1024, 4, 4, 5, 2, 0));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 1, 16, 1, 1024, 4, 4, 5, 2, 1));
+    // DFlash verifier widths beyond the split-decode specialization must remain on direct
+    // descriptor-native KVarN attention rather than materializing the cache to F16.
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 9, 8, 2, 1024, 4, 4, 2, 1, 0, true, 56, false));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 16, 8, 2, 1024, 5, 4, 2, 1, 0, true, 56, false));
+    // SWA misaligned window: base_pos != {0,64} forces 64-token tiles to straddle a 128-group
+    // boundary, exercising the cooperative record fast path for group0 plus the per-cell fallback
+    // for the group1 tail. base_pos 40 (<64) and 88 (>64) cover both split parities.
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 1, 6, 1, 768, 4, 4, 5, 1, 0, true, 40, false));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 1, 6, 1, 768, 4, 4, 5, 1, 0, true, 88, false));
+    // Production Gemma 4 SWA config: stage_groups=2 (tail_groups=1) with a misaligned window,
+    // including D=256/GQA=4/n_q=4 (DFlash-verify shape) and mixed K/V bits.
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 1, 6, 1, 768, 4, 4, 2, 1, 0, true, 40, false));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 1, 16, 8, 1024, 4, 4, 2, 1, 0, true, 56, false));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 4, 8, 2, 1024, 5, 4, 2, 1, 0, true, 56, false));
+    // SWA ring-wrap discontinuity: a 64-token tile spanning the seam is non-contiguous and must
+    // fall back per cell; the older run still lands on the fast record path.
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 1, 6, 1, 768, 4, 4, 5, 1, 0, true, 0, true));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 1, 6, 1, 768, 4, 4, 2, 1, 0, true, 0, true));
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));

@@ -182,8 +182,12 @@ int main(int argc, char ** argv) {
     const std::string cuda_fattn_mma_kvarn_load = read_file(root + "/ggml/src/ggml-cuda/fattn-mma-kvarn-load.cuh");
     const std::string cuda_fattn_mma_kvarn_decode_decl = read_file(root + "/ggml/src/ggml-cuda/fattn-mma-kvarn-decode-decl.cuh");
     const std::string cuda_fattn_mma_kvarn_decode = read_file(root + "/ggml/src/ggml-cuda/fattn-mma-kvarn-decode.cuh");
+    const std::string cuda_fattn_kvarn_vec_decl = read_file_optional(root + "/ggml/src/ggml-cuda/fattn-kvarn-vec-decl.cuh");
+    const std::string cuda_fattn_kvarn_vec = read_file_optional(root + "/ggml/src/ggml-cuda/fattn-kvarn-vec.cuh");
     const std::string cuda_fattn_mma_kvarn_decode_k4v3 =
         read_file(root + "/ggml/src/ggml-cuda/template-instances/fattn-mma-kvarn-decode-instance-k4-v3.cu");
+    const std::string cuda_fattn_mma_kvarn_decode_k4v4 =
+        read_file(root + "/ggml/src/ggml-cuda/template-instances/fattn-mma-kvarn-decode-instance-k4-v4.cu");
     const std::string cuda_turbo_quant = read_file(root + "/ggml/src/ggml-cuda/turbo-quant-cuda.cuh");
     const std::string cuda_cmake = read_file(root + "/ggml/src/ggml-cuda/CMakeLists.txt");
     const std::string cuda_fattn_h = read_file(root + "/ggml/src/ggml-cuda/fattn.cuh");
@@ -480,10 +484,12 @@ int main(int argc, char ** argv) {
                  cuda_fattn_mma_kvarn.find("ggml_cuda_fattn_kvarn_unwrap_view") != std::string::npos &&
                  cuda_fattn_mma_kvarn.find("GGML_OP_KVARN_MATERIALIZE") == std::string::npos,
         "CUDA FlashAttention must recognize KVarN view inputs directly and avoid materialize ancestry in the native route");
-    ok &= expect(cuda_fattn_mma_kvarn.find("GGML_CUDA_FATTN_KVARN_NATIVE_MAX_Q = 8") != std::string::npos &&
-                 cuda_fattn_mma_kvarn.find("Q->ne[1] <= GGML_CUDA_FATTN_KVARN_NATIVE_MAX_Q") != std::string::npos &&
-                 cuda_fattn.find("materialize_kvarn_f16") != std::string::npos,
-        "KVarN native MMA must stay decode/small-batch scoped while large prefill uses an internal F16 materialize fallback");
+    ok &= expect(cuda_fattn_mma_kvarn.find("GGML_CUDA_FATTN_KVARN_NATIVE_MAX_Q") == std::string::npos &&
+                 cuda_fattn_mma_kvarn.find("return ggml_cuda_fattn_kvarn_view_supported(device, dst, out);") != std::string::npos &&
+                 cuda_fattn.find("GGML_CUDA_FATTN_KVARN_DECODE_MAX_Q") == std::string::npos &&
+                 cuda_fattn.find("Q->ne[1] > GGML_CUDA_FATTN_KVARN_DECODE_MAX_Q") == std::string::npos &&
+                 cuda_fattn.find("materialize_kvarn_f16") == std::string::npos,
+        "KVarN descriptors must stay native for DFlash/prefill query widths without a static split-decode row cap or F16 materialize fallback");
     ok &= expect(cuda_fattn.find("ggml_cuda_flash_attn_ext_mma_kvarn_case") != std::string::npos &&
                  cuda_fattn.find("#include \"fattn-mma-kvarn-decode-decl.cuh\"") != std::string::npos &&
                  cuda_fattn.find("ggml_cuda_fattn_kvarn_decode_mma_kernel") == std::string::npos &&
@@ -501,8 +507,7 @@ int main(int argc, char ** argv) {
                      "DECL_FATTN_KVARN_DECODE_CASE(256, 4, 3);") != std::string::npos &&
                  cuda_fattn_mma_kvarn_decode_k4v3.find(
                      "DECL_FATTN_KVARN_DECODE_CASE(512, 4, 3);") != std::string::npos &&
-                 cuda_fattn.find("Q->ne[1] > GGML_CUDA_FATTN_KVARN_NATIVE_MAX_Q") != std::string::npos &&
-                 cuda_fattn.find("plan.k.swa || plan.v.swa") != std::string::npos &&
+                 cuda_fattn.find("Q->ne[1] > GGML_CUDA_FATTN_KVARN_DECODE_MAX_Q") == std::string::npos &&
                  cuda_fattn.find("need_f16_K=false") != std::string::npos &&
                  cuda_fattn.find("need_f16_V=false") != std::string::npos &&
                  cuda_fattn_mma_kvarn_impl.find("flash_attn_ext_kvarn_load_tile") != std::string::npos &&
@@ -513,6 +518,29 @@ int main(int argc, char ** argv) {
                  cuda_fattn.find("nbytes_shared_record =") == std::string::npos &&
                  cuda_fattn.find("nbytes_shared_KV_mask_record") == std::string::npos,
         "native KVarN MMA must stream record payloads instead of copying full records into shared memory");
+    ok &= expect(cuda_fattn.find("ggml_cuda_fattn_kvarn_decode_select") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_decode_decl.find("ggml_cuda_fattn_kvarn_decode_geometry") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_decode_decl.find("ggml_cuda_fattn_kvarn_decode_select") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_decode.find("cudaOccupancyMaxActiveBlocksPerMultiprocessor") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_decode.find("ggml_cuda_fattn_kvarn_decode_consider") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_decode.find("ggml_cuda_fattn_kvarn_decode_split_tokens") == std::string::npos &&
+                 cuda_fattn_mma_kvarn_decode.find("constexpr int WARPS_PER_CHUNK = D / GGML_CUDA_FATTN_KVARN_DIM;") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_decode.find("constexpr int CHUNKS_PER_PASS = NWARPS / WARPS_PER_CHUNK;") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_decode.find("score_partial_sh") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_decode.find("args.split_tokens") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_decode.find("args.nwarps") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_decode.find("args.gqa_per_block") != std::string::npos,
+        "native KVarN split decode must select compiled geometries from occupancy/wave evidence instead of hardcoded D-specific split tokens");
+    ok &= expect(cuda_fattn_kvarn_vec.find("ggml_cuda_fattn_kvarn_vec_kernel") != std::string::npos &&
+                 cuda_fattn_kvarn_vec.find("template<int D, int TOKENS_PER_SPLIT, int MAX_GQA, int K_BITS, int V_BITS>") != std::string::npos &&
+                 cuda_fattn_kvarn_vec_decl.find("DECL_FATTN_KVARN_VEC_CASE") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_decode_k4v4.find("DECL_FATTN_KVARN_VEC_CASE(256, 4, 4);") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_decode_k4v4.find("DECL_FATTN_KVARN_VEC_CASE(512, 4, 4);") == std::string::npos &&
+                 cuda_template_generator.find("head_size == 256") != std::string::npos &&
+                 cuda_fattn.find("ggml_cuda_flash_attn_ext_kvarn_vec_supported") != std::string::npos &&
+                 cuda_fattn.find("GGML_KVARN_VEC_D512") == std::string::npos &&
+                 cuda_fattn.find("CUDA_FA_ROUTE_EXEC_DISPATCH kernel=KVARN_DECODE_VEC") != std::string::npos,
+        "KVarN low-parallelism decode must keep only proven vec production instances and route them by geometry, not a dead D512 env path");
     ok &= expect(cuda_fattn.find("D=512: MMA/TILE templates don't support this head_dim, use VEC unconditionally") == std::string::npos &&
                  cuda_fattn.find("if (Q->ne[0] == 512) {\n        return BEST_FATTN_KERNEL_VEC;") == std::string::npos,
         "CUDA FlashAttention must not force all D=512 non-turbo attention onto the vector kernel; Gemma4 global layers need the MMA selector path");

@@ -22,6 +22,64 @@ static __device__ __forceinline__ bool ggml_cuda_fattn_kvarn_decode_group_from_r
     return !from_stage && group < live_group && group < desc.groups_per_stream;
 }
 
+// True when an absolute SWA group sits in the record store (not the live/stage tail and
+// still inside the ring window). Mirrors the SWA branch of ggml_cuda_fattn_kvarn_load_rotated.
+static __device__ __forceinline__ bool ggml_cuda_fattn_kvarn_decode_swa_record_backed(
+        const ggml_cuda_fattn_kvarn_desc & desc,
+        const int group_global) {
+    if (group_global < 0) {
+        return false;
+    }
+    const int live_group = desc.live_group;
+    const int stage_begin = live_group >= (desc.tail_groups - 1) ? live_group - (desc.tail_groups - 1) : 0;
+    const bool from_stage = group_global >= stage_begin && group_global <= live_group;
+    return !from_stage && group_global < stage_begin && (live_group - group_global) < desc.groups_per_stream;
+}
+
+// Per-split tile plan: whether the cooperative direct-record fast path is usable, the in-group
+// position of the first tile token, and the ring record-group index for that first group.
+//
+// Non-SWA: token == in-stream position, so a 64-token split always lands inside one record group
+// (pos_begin is 0 or 64) — identical to the original linear mapping.
+//
+// SWA: the ring presents window cells in piecewise-contiguous absolute-position order (one wrap
+// discontinuity per decode). We take the fast path when the split's valid tokens are contiguous in
+// absolute position (endpoint check) and the first absolute group is record-backed. Group-straddle,
+// stage (live group), ring-wrap, and non-contiguous tiles fall back per element to load_rotated,
+// which independently resolves group/pos for any cell. Empty/out-of-window cells carry idx < 0 and
+// are -inf-masked downstream, so reads for them are harmless.
+struct ggml_cuda_fattn_kvarn_decode_tile {
+    bool fast;
+    int  pos_begin;
+    int  record_group;
+};
+
+static __device__ __forceinline__ ggml_cuda_fattn_kvarn_decode_tile
+ggml_cuda_fattn_kvarn_decode_plan_tile(
+        const ggml_cuda_fattn_kvarn_desc & desc,
+        const int token_begin,
+        const int token_end,
+        const int group,
+        const int group_pos_begin) {
+    ggml_cuda_fattn_kvarn_decode_tile tile;
+    if (desc.swa) {
+        const int64_t a0 = desc.indices[token_begin];
+        const int64_t a1 = desc.indices[token_end - 1];
+        const int span = (token_end - 1) - token_begin;
+        const int g0 = a0 >= 0 ? (int) (a0 / GGML_CUDA_FATTN_KVARN_DIM) : -1;
+        const bool contiguous = a0 >= 0 && a1 >= 0 && (int) (a1 - a0) == span;
+        const bool rec0 = ggml_cuda_fattn_kvarn_decode_swa_record_backed(desc, g0);
+        tile.fast = contiguous && rec0;
+        tile.pos_begin = tile.fast ? (int) (a0 % GGML_CUDA_FATTN_KVARN_DIM) : 0;
+        tile.record_group = tile.fast ? (g0 % desc.groups_per_stream) : 0;
+    } else {
+        tile.fast = ggml_cuda_fattn_kvarn_decode_group_from_record(desc, group);
+        tile.pos_begin = group_pos_begin;
+        tile.record_group = desc.stream * desc.groups_per_stream + group;
+    }
+    return tile;
+}
+
 template<int BITS>
 static __device__ __forceinline__ int ggml_cuda_fattn_kvarn_decode_unpack(
         const uint8_t * raw,
@@ -98,15 +156,21 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
     constexpr int SLICES = D / GGML_CUDA_FATTN_KVARN_DIM;
     constexpr int TOKENS_PER_CHUNK = GGML_CUDA_FATTN_KVARN_DECODE_CHUNK;
     constexpr int TOKEN_CHUNKS = SPLIT_TOKENS / TOKENS_PER_CHUNK;
+    constexpr int WARPS_PER_CHUNK = D / GGML_CUDA_FATTN_KVARN_DIM;
+    constexpr int CHUNKS_PER_PASS = NWARPS / WARPS_PER_CHUNK;
     constexpr int Q_STRIDE2 = D / 2 + 4;
     constexpr int P_STRIDE2 = SPLIT_TOKENS / 2 + 4;
 
+    using T_A = tile<16, 8, half2>;
+    using T_B = tile<8, 8, half2>;
+    using T_C = tile<16, 8, float>;
+
     static_assert(D == 128 || D == 256 || D == 512, "KVarN decode MMA supports 128/256/512-wide heads");
     static_assert(MAX_GQA > 0 && MAX_GQA <= 8, "KVarN decode MMA expects at most eight GQA heads");
-    static_assert(SPLIT_TOKENS == 32 || SPLIT_TOKENS == 64 || SPLIT_TOKENS == 128,
-        "KVarN decode MMA supports 32-, 64-, or 128-token splits");
-    static_assert(NWARPS >= (MAX_GQA + 1) / 2 && NWARPS <= 4,
-        "KVarN decode MMA needs one half-warp per GQA head");
+    static_assert(SPLIT_TOKENS == 64, "KVarN decode MMA production splits use 64 KV tokens");
+    static_assert(NWARPS % WARPS_PER_CHUNK == 0 && NWARPS >= WARPS_PER_CHUNK &&
+        NWARPS <= TOKEN_CHUNKS * WARPS_PER_CHUNK && NWARPS <= 16,
+        "KVarN decode MMA needs whole 128-dim slice groups and at most sixteen warps");
     static_assert(K_BITS == 2 || K_BITS == 3 || K_BITS == 4 ||
         K_BITS == 5 || K_BITS == 6 || K_BITS == 8, "invalid compile-time KVarN K bits");
     static_assert(V_BITS == 2 || V_BITS == 3 || V_BITS == 4 ||
@@ -114,6 +178,7 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
     static_assert(WARP_SIZE == 32, "KVarN decode MMA currently targets CUDA warp size 32");
 
     __shared__ __align__(16) half2 q_sh[MAX_GQA][Q_STRIDE2];
+    __shared__ __align__(16) float score_partial_sh[NWARPS][MAX_GQA * TOKENS_PER_CHUNK];
     __shared__ __align__(16) float score_sh[MAX_GQA][SPLIT_TOKENS];
     __shared__ __align__(16) half2 p_sh[MAX_GQA][P_STRIDE2];
     __shared__ float scale_axis_sh[SLICES][GGML_CUDA_FATTN_KVARN_DIM];
@@ -130,14 +195,18 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
     const int token_end = min(n_kv, token_begin + SPLIT_TOKENS);
     const int group = token_begin / GGML_CUDA_FATTN_KVARN_DIM;
     const int group_pos_begin = token_begin - group * GGML_CUDA_FATTN_KVARN_DIM;
-    const bool k_from_record = ggml_cuda_fattn_kvarn_decode_group_from_record(k_desc, group);
-    const bool v_from_record = ggml_cuda_fattn_kvarn_decode_group_from_record(v_desc, group);
+    const ggml_cuda_fattn_kvarn_decode_tile k_tile =
+        ggml_cuda_fattn_kvarn_decode_plan_tile(k_desc, token_begin, token_end, group, group_pos_begin);
+    const ggml_cuda_fattn_kvarn_decode_tile v_tile =
+        ggml_cuda_fattn_kvarn_decode_plan_tile(v_desc, token_begin, token_end, group, group_pos_begin);
+    const bool k_from_record = k_tile.fast;
+    const bool v_from_record = v_tile.fast;
     const int k_payload_bytes = GGML_CUDA_FATTN_KVARN_DIM * GGML_CUDA_FATTN_KVARN_DIM * K_BITS / 8;
     const int v_payload_bytes = GGML_CUDA_FATTN_KVARN_DIM * GGML_CUDA_FATTN_KVARN_DIM * V_BITS / 8;
     const int k_row_bytes = GGML_CUDA_FATTN_KVARN_DIM * K_BITS / 8;
     const int v_row_bytes = GGML_CUDA_FATTN_KVARN_DIM * V_BITS / 8;
-    const int record_group_k = k_desc.stream * k_desc.groups_per_stream + group;
-    const int record_group_v = v_desc.stream * v_desc.groups_per_stream + group;
+    const int record_group_k = k_tile.record_group;
+    const int record_group_v = v_tile.record_group;
 
     const uint8_t * k_records[SLICES];
     const uint8_t * v_records[SLICES];
@@ -175,77 +244,110 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
     }
     __syncthreads();
 
-    using T_A = tile<16, 8, half2>;
-    using T_B = tile<8, 8, half2>;
-    using T_C = tile<16, 8, float>;
+    const int local_chunk = warp / WARPS_PER_CHUNK;
+    const int warp_in_chunk = warp % WARPS_PER_CHUNK;
+    const half * mask_h = mask != nullptr ? (const half *) (mask + nb33 * (stream % ne33)) : nullptr;
 
-#pragma unroll
-    for (int chunk = warp; chunk < TOKEN_CHUNKS; chunk += NWARPS) {
+#pragma unroll 1
+    for (int chunk_base = 0; chunk_base < TOKEN_CHUNKS; chunk_base += CHUNKS_PER_PASS) {
+        const int chunk = chunk_base + local_chunk;
+        const bool chunk_active = chunk < TOKEN_CHUNKS;
         const int token0 = token_begin + chunk * TOKENS_PER_CHUNK;
         T_C scores;
 #pragma unroll
         for (int l = 0; l < T_C::ne; ++l) {
             scores.x[l] = 0.0f;
         }
+
+        if (chunk_active) {
 #pragma unroll 1
-        for (int dim0 = 0; dim0 < D; dim0 += 2 * T_A::J) {
-            T_A k_a;
-            T_B q_b;
+            for (int dim0 = warp_in_chunk * GGML_CUDA_FATTN_KVARN_DIM;
+                    dim0 < (warp_in_chunk + 1) * GGML_CUDA_FATTN_KVARN_DIM;
+                    dim0 += 2 * T_A::J) {
+                T_A k_a;
+                T_B q_b;
 #pragma unroll
-            for (int l = 0; l < T_A::ne; ++l) {
-                const int token_local = T_A::get_i(l);
-                const int dim = dim0 + 2 * T_A::get_j(l);
-                const int slice = dim / GGML_CUDA_FATTN_KVARN_DIM;
-                const int local_dim = dim % GGML_CUDA_FATTN_KVARN_DIM;
-                float x0;
-                float x1;
-                if (k_from_record) {
-                    const int pos = group_pos_begin + chunk * TOKENS_PER_CHUNK + token_local;
-                    const uint8_t * row0 = k_records[slice] + (local_dim + 0) * k_row_bytes;
-                    const uint8_t * row1 = k_records[slice] + (local_dim + 1) * k_row_bytes;
-                    const int q0 = ggml_cuda_fattn_kvarn_decode_unpack<K_BITS>(row0, pos, K_BITS);
-                    const int q1 = ggml_cuda_fattn_kvarn_decode_unpack<K_BITS>(row1, pos, K_BITS);
-                    const float other = other_axis_sh[slice][pos];
-                    x0 = (float(q0) * scale_axis_sh[slice][local_dim + 0] +
-                            zp_axis_sh[slice][local_dim + 0]) * other;
-                    x1 = (float(q1) * scale_axis_sh[slice][local_dim + 1] +
-                            zp_axis_sh[slice][local_dim + 1]) * other;
-                } else {
-                    const int token = token0 + token_local;
-                    x0 = token < token_end ?
-                        ggml_cuda_fattn_kvarn_load_rotated(k_desc, token, slice, local_dim + 0) : 0.0f;
-                    x1 = token < token_end ?
-                        ggml_cuda_fattn_kvarn_load_rotated(k_desc, token, slice, local_dim + 1) : 0.0f;
+                for (int l = 0; l < T_A::ne; ++l) {
+                    const int token_local = T_A::get_i(l);
+                    const int dim = dim0 + 2 * T_A::get_j(l);
+                    const int slice = dim / GGML_CUDA_FATTN_KVARN_DIM;
+                    const int local_dim = dim % GGML_CUDA_FATTN_KVARN_DIM;
+                    float x0;
+                    float x1;
+                    const int pos = k_tile.pos_begin + chunk * TOKENS_PER_CHUNK + token_local;
+                    if (k_from_record && pos < GGML_CUDA_FATTN_KVARN_DIM) {
+                        const uint8_t * row0 = k_records[slice] + (local_dim + 0) * k_row_bytes;
+                        const uint8_t * row1 = k_records[slice] + (local_dim + 1) * k_row_bytes;
+                        const int q0 = ggml_cuda_fattn_kvarn_decode_unpack<K_BITS>(row0, pos, K_BITS);
+                        const int q1 = ggml_cuda_fattn_kvarn_decode_unpack<K_BITS>(row1, pos, K_BITS);
+                        const float other = other_axis_sh[slice][pos];
+                        x0 = (float(q0) * scale_axis_sh[slice][local_dim + 0] +
+                                zp_axis_sh[slice][local_dim + 0]) * other;
+                        x1 = (float(q1) * scale_axis_sh[slice][local_dim + 1] +
+                                zp_axis_sh[slice][local_dim + 1]) * other;
+                    } else {
+                        const int token = token0 + token_local;
+                        x0 = token < token_end ?
+                            ggml_cuda_fattn_kvarn_load_rotated(k_desc, token, slice, local_dim + 0) : 0.0f;
+                        x1 = token < token_end ?
+                            ggml_cuda_fattn_kvarn_load_rotated(k_desc, token, slice, local_dim + 1) : 0.0f;
+                    }
+                    k_a.x[l] = make_half2(x0, x1);
                 }
-                k_a.x[l] = make_half2(x0, x1);
+                load_ldmatrix(q_b, q_sh[0] + dim0 / 2, Q_STRIDE2);
+                mma(scores, k_a, q_b);
             }
-            load_ldmatrix(q_b, q_sh[0] + dim0 / 2, Q_STRIDE2);
-            mma(scores, k_a, q_b);
+
+#pragma unroll
+            for (int l = 0; l < T_C::ne; ++l) {
+                const int j = T_C::get_i(l);
+                const int h = T_C::get_j(l);
+                if (h < MAX_GQA) {
+                    score_partial_sh[warp][h * TOKENS_PER_CHUNK + j] = scores.x[l];
+                }
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int stride = WARPS_PER_CHUNK / 2; stride > 0; stride >>= 1) {
+            if (chunk_active && warp_in_chunk < stride) {
+#pragma unroll
+                for (int l = 0; l < T_C::ne; ++l) {
+                    const int j = T_C::get_i(l);
+                    const int h = T_C::get_j(l);
+                    if (h < MAX_GQA) {
+                        score_partial_sh[warp][h * TOKENS_PER_CHUNK + j] +=
+                            score_partial_sh[warp + stride][h * TOKENS_PER_CHUNK + j];
+                    }
+                }
+            }
+            __syncthreads();
         }
 
-        const half * mask_h = mask != nullptr ? (const half *) (mask + nb33 * (stream % ne33)) : nullptr;
+        if (chunk_active && warp_in_chunk == 0) {
 #pragma unroll
-        for (int l = 0; l < T_C::ne; ++l) {
-            const int j = T_C::get_i(l);
-            const int h = T_C::get_j(l);
-            const int token = token0 + j;
-            float score = -FLT_MAX / 2.0f;
-            if (h < gqa_head_count && q_head0 + h < n_q_heads && token < token_end) {
-                score = scores.x[l];
-                if (logit_softcap != 0.0f) {
-                    score = logit_softcap * tanhf(score);
+            for (int l = 0; l < T_C::ne; ++l) {
+                const int j = T_C::get_i(l);
+                const int h = T_C::get_j(l);
+                const int token = token0 + j;
+                float score = -FLT_MAX / 2.0f;
+                if (h < gqa_head_count && q_head0 + h < n_q_heads && token < token_end) {
+                    score = score_partial_sh[warp][h * TOKENS_PER_CHUNK + j];
+                    if (logit_softcap != 0.0f) {
+                        score = logit_softcap * tanhf(score);
+                    }
+                    if (mask_h != nullptr) {
+                        score += __half2float(*(const half *) ((const char *) mask_h + nb30 * token + nb31 * q_index));
+                    }
                 }
-                if (mask_h != nullptr) {
-                    score += __half2float(*(const half *) ((const char *) mask_h + nb30 * token + nb31 * q_index));
+                if (h < MAX_GQA) {
+                    score_sh[h][chunk * TOKENS_PER_CHUNK + j] = score;
                 }
-            }
-            if (h < MAX_GQA) {
-                score_sh[h][chunk * TOKENS_PER_CHUNK + j] = score;
             }
         }
-        __syncwarp();
+        __syncthreads();
     }
-    __syncthreads();
 
     const int h = tid / 16;
     const int lane_h = tid % 16;
@@ -315,9 +417,9 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
                 const int token_local = 2 * T_A::get_j(l);
                 float x0;
                 float x1;
-                if (v_from_record) {
-                    const int pos0 = group_pos_begin + chunk * TOKENS_PER_CHUNK + token_local + 0;
-                    const int pos1 = group_pos_begin + chunk * TOKENS_PER_CHUNK + token_local + 1;
+                const int pos0 = v_tile.pos_begin + chunk * TOKENS_PER_CHUNK + token_local + 0;
+                const int pos1 = v_tile.pos_begin + chunk * TOKENS_PER_CHUNK + token_local + 1;
+                if (v_from_record && pos1 < GGML_CUDA_FATTN_KVARN_DIM) {
                     const uint8_t * row0 = v_records[slice] + pos0 * v_row_bytes;
                     const uint8_t * row1 = v_records[slice] + pos1 * v_row_bytes;
                     const int q0 = ggml_cuda_fattn_kvarn_decode_unpack<V_BITS>(row0, local_dim0 + local_dim, V_BITS);
@@ -427,28 +529,206 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_combine_kernel(
     }
 }
 
+static inline int ggml_cuda_fattn_kvarn_decode_div_up_i64(const int64_t x, const int y) {
+    return (int) ((x + y - 1) / y);
+}
+
+static inline int ggml_cuda_fattn_kvarn_decode_wave_efficiency_percent(
+        const int64_t blocks_total,
+        const int blocks_per_wave,
+        int * n_waves) {
+    if (blocks_total <= 0 || blocks_per_wave <= 0) {
+        *n_waves = 0;
+        return 0;
+    }
+    *n_waves = ggml_cuda_fattn_kvarn_decode_div_up_i64(blocks_total, blocks_per_wave);
+    return (int) (100 * blocks_total / ((int64_t) *n_waves * blocks_per_wave));
+}
+
+template<int D, int MAX_GQA, int SPLIT_TOKENS, int NWARPS, int K_BITS, int V_BITS>
+static int ggml_cuda_fattn_kvarn_decode_active_blocks_per_sm() {
+    // Occupancy depends only on the compiled kernel and the device arch, not the workload,
+    // so cache it per device: the selector queries several candidates on every decode op.
+    static int cache[GGML_CUDA_MAX_DEVICES] = {};
+    const int device = ggml_cuda_get_device();
+    if (device >= 0 && device < GGML_CUDA_MAX_DEVICES && cache[device] > 0) {
+        return cache[device];
+    }
+    const dim3 block_dim(WARP_SIZE, NWARPS, 1);
+    int max_blocks_per_sm = 0;
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &max_blocks_per_sm,
+        ggml_cuda_fattn_kvarn_decode_mma_kernel<D, MAX_GQA, SPLIT_TOKENS, NWARPS, K_BITS, V_BITS>,
+        block_dim.x * block_dim.y * block_dim.z,
+        0));
+    if (device >= 0 && device < GGML_CUDA_MAX_DEVICES) {
+        cache[device] = max_blocks_per_sm;
+    }
+    return max_blocks_per_sm;
+}
+
+template<int D, int MAX_GQA, int SPLIT_TOKENS, int NWARPS, int K_BITS, int V_BITS>
+static void ggml_cuda_fattn_kvarn_decode_consider(
+        ggml_cuda_fattn_kvarn_decode_geometry & best,
+        int64_t & best_score,
+        const int nsm,
+        const int n_kv,
+        const int n_q,
+        const int n_q_heads,
+        const int n_kv_heads,
+        const int n_stream) {
+    const int gqa_ratio = n_q_heads / n_kv_heads;
+    const int n_splits = ggml_cuda_fattn_kvarn_decode_div_up_i64(n_kv, SPLIT_TOKENS);
+    const int n_gqa_blocks = ggml_cuda_fattn_kvarn_decode_div_up_i64(gqa_ratio, MAX_GQA);
+    const int max_blocks_per_sm =
+        ggml_cuda_fattn_kvarn_decode_active_blocks_per_sm<D, MAX_GQA, SPLIT_TOKENS, NWARPS, K_BITS, V_BITS>();
+    if (max_blocks_per_sm <= 0 || n_splits <= 0 || n_gqa_blocks <= 0) {
+        return;
+    }
+
+    const int blocks_per_wave = nsm * max_blocks_per_sm;
+    const int64_t blocks_total =
+        (int64_t) n_splits * n_kv_heads * n_gqa_blocks * n_q * n_stream;
+    int n_waves = 0;
+    const int wave_efficiency_percent =
+        ggml_cuda_fattn_kvarn_decode_wave_efficiency_percent(blocks_total, blocks_per_wave, &n_waves);
+
+    // Upstream queries actual occupancy, then scores wave efficiency inside one kernel family.
+    // KVarN is choosing between different CTA shapes; when split/combine work is equal, the
+    // occupancy result is the architectural signal, and wave efficiency is secondary.
+    const int64_t score =
+        (int64_t) max_blocks_per_sm * 1000000 +
+        (int64_t) wave_efficiency_percent * 10000 -
+        (int64_t) n_gqa_blocks * 1000 -
+        (int64_t) n_splits;
+
+    if (score > best_score) {
+        best_score = score;
+        best.use_split = true;
+        best.split_tokens = SPLIT_TOKENS;
+        best.nwarps = NWARPS;
+        best.gqa_per_block = MAX_GQA;
+        best.n_splits = n_splits;
+        best.n_gqa_blocks = n_gqa_blocks;
+        best.max_blocks_per_sm = max_blocks_per_sm;
+        best.wave_efficiency_percent = wave_efficiency_percent;
+        best.n_waves = n_waves;
+    }
+}
+
+template<int D, int K_BITS, int V_BITS>
+ggml_cuda_fattn_kvarn_decode_geometry ggml_cuda_fattn_kvarn_decode_select(
+        int device,
+        int n_kv,
+        int n_q,
+        int n_q_heads,
+        int n_kv_heads,
+        int n_stream) {
+    ggml_cuda_fattn_kvarn_decode_geometry best = {};
+    if (n_kv <= 0 || n_q <= 0 || n_q_heads <= 0 || n_kv_heads <= 0 ||
+            n_stream <= 0 || n_q_heads % n_kv_heads != 0) {
+        return best;
+    }
+
+    const int nsm = ggml_cuda_info().devices[device].nsm;
+    int64_t best_score = INT64_MIN;
+    if constexpr (D == 512) {
+        ggml_cuda_fattn_kvarn_decode_consider<D, 6, 64,  8, K_BITS, V_BITS>(
+            best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
+        ggml_cuda_fattn_kvarn_decode_consider<D, 8, 64,  8, K_BITS, V_BITS>(
+            best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
+        ggml_cuda_fattn_kvarn_decode_consider<D, 6, 64, 16, K_BITS, V_BITS>(
+            best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
+        ggml_cuda_fattn_kvarn_decode_consider<D, 8, 64, 16, K_BITS, V_BITS>(
+            best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
+    } else if constexpr (D == 256) {
+        ggml_cuda_fattn_kvarn_decode_consider<D, 6, 64, 8, K_BITS, V_BITS>(
+            best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
+        ggml_cuda_fattn_kvarn_decode_consider<D, 8, 64, 8, K_BITS, V_BITS>(
+            best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
+    } else if constexpr (D == 128) {
+        ggml_cuda_fattn_kvarn_decode_consider<D, 6, 64, 4, K_BITS, V_BITS>(
+            best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
+        ggml_cuda_fattn_kvarn_decode_consider<D, 8, 64, 4, K_BITS, V_BITS>(
+            best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
+    }
+
+    if (!best.use_split || best.n_splits <= 1) {
+        best.use_split = false;
+        return best;
+    }
+
+    const int direct_blocks_per_wave = nsm * best.max_blocks_per_sm;
+    const int64_t direct_blocks =
+        (int64_t) n_kv_heads * best.n_gqa_blocks * n_q * n_stream;
+    int direct_waves = 0;
+    const int direct_efficiency_percent =
+        ggml_cuda_fattn_kvarn_decode_wave_efficiency_percent(
+            direct_blocks, direct_blocks_per_wave, &direct_waves);
+
+    // Mirror upstream's "don't add parallel work when the base grid is already efficient"
+    // idea. Once the unsplit decode would occupy at least two efficient waves, the split
+    // combine pass is usually worse than falling through to the generic native MMA path.
+    if (direct_waves >= 2 && direct_efficiency_percent >= 75) {
+        best.use_split = false;
+    }
+    return best;
+}
+
+template<int D, int MAX_GQA, int SPLIT_TOKENS, int NWARPS, int K_BITS, int V_BITS>
+static void ggml_cuda_fattn_kvarn_decode_launch_geometry(
+        const ggml_cuda_fattn_kvarn_decode_args & args,
+        const dim3 blocks_split) {
+    ggml_cuda_fattn_kvarn_decode_mma_kernel<D, MAX_GQA, SPLIT_TOKENS, NWARPS, K_BITS, V_BITS>
+        <<<blocks_split, dim3(WARP_SIZE, NWARPS, 1), 0, args.stream>>>(
+            args.Q, args.k_descs, args.v_descs, args.mask, args.partial, args.partial_meta,
+            args.scale, args.logit_softcap, args.nb01, args.nb02, args.nb03,
+            args.nb30, args.nb31, args.nb33, args.ne33, args.n_kv, args.n_q,
+            args.n_q_heads, args.n_kv_heads, args.gqa_ratio, args.n_gqa_blocks, args.n_splits);
+}
+
+template<int D, int MAX_GQA, int K_BITS, int V_BITS>
+static void ggml_cuda_fattn_kvarn_decode_launch_gqa(
+        const ggml_cuda_fattn_kvarn_decode_args & args,
+        const dim3 blocks_split) {
+    if constexpr (D == 512) {
+        if (args.split_tokens == 64 && args.nwarps == 8) {
+            ggml_cuda_fattn_kvarn_decode_launch_geometry<D, MAX_GQA, 64, 8, K_BITS, V_BITS>(args, blocks_split);
+            return;
+        }
+        if (args.split_tokens == 64 && args.nwarps == 16) {
+            ggml_cuda_fattn_kvarn_decode_launch_geometry<D, MAX_GQA, 64, 16, K_BITS, V_BITS>(args, blocks_split);
+            return;
+        }
+    } else if constexpr (D == 256) {
+        if (args.split_tokens == 64 && args.nwarps == 8) {
+            ggml_cuda_fattn_kvarn_decode_launch_geometry<D, MAX_GQA, 64, 8, K_BITS, V_BITS>(args, blocks_split);
+            return;
+        }
+    } else if constexpr (D == 128) {
+        if (args.split_tokens == 64 && args.nwarps == 4) {
+            ggml_cuda_fattn_kvarn_decode_launch_geometry<D, MAX_GQA, 64, 4, K_BITS, V_BITS>(args, blocks_split);
+            return;
+        }
+    }
+    GGML_ABORT("unsupported KVarN decode geometry D=%d split=%d nwarps=%d max_gqa=%d",
+        D, args.split_tokens, args.nwarps, MAX_GQA);
+}
+
 template<int D, int K_BITS, int V_BITS>
 void ggml_cuda_fattn_kvarn_decode_launch(const ggml_cuda_fattn_kvarn_decode_args & args) {
-    constexpr int split_tokens = 64;
     const dim3 blocks_split(
         (uint32_t) args.n_splits,
         (uint32_t) (args.n_kv_heads * args.n_gqa_blocks * args.n_q),
         (uint32_t) args.n_stream);
 
-#define GGML_CUDA_FATTN_KVARN_LAUNCH(MAX_GQA) \
-    ggml_cuda_fattn_kvarn_decode_mma_kernel<D, MAX_GQA, split_tokens, 4, K_BITS, V_BITS> \
-        <<<blocks_split, dim3(WARP_SIZE, 4, 1), 0, args.stream>>>( \
-            args.Q, args.k_descs, args.v_descs, args.mask, args.partial, args.partial_meta, \
-            args.scale, args.logit_softcap, args.nb01, args.nb02, args.nb03, \
-            args.nb30, args.nb31, args.nb33, args.ne33, args.n_kv, args.n_q, \
-            args.n_q_heads, args.n_kv_heads, args.gqa_ratio, args.n_gqa_blocks, args.n_splits)
-
-    if (args.gqa_ratio == 6) {
-        GGML_CUDA_FATTN_KVARN_LAUNCH(6);
+    if (args.gqa_per_block == 6) {
+        ggml_cuda_fattn_kvarn_decode_launch_gqa<D, 6, K_BITS, V_BITS>(args, blocks_split);
+    } else if (args.gqa_per_block == 8) {
+        ggml_cuda_fattn_kvarn_decode_launch_gqa<D, 8, K_BITS, V_BITS>(args, blocks_split);
     } else {
-        GGML_CUDA_FATTN_KVARN_LAUNCH(GGML_CUDA_FATTN_KVARN_DECODE_MAX_GQA);
+        GGML_ABORT("unsupported KVarN decode GQA block size %d", args.gqa_per_block);
     }
-#undef GGML_CUDA_FATTN_KVARN_LAUNCH
     CUDA_CHECK(cudaGetLastError());
 
     const dim3 blocks_combine((uint32_t) args.n_q_heads, (uint32_t) args.n_q, (uint32_t) args.n_stream);
