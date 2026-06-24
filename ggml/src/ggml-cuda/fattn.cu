@@ -314,15 +314,15 @@ static bool ggml_cuda_flash_attn_ext_kvarn_vec_supported(
             Q->ne[1] != 1 || Q->ne[3] != plan.n_stream || plan.n_stream <= 0) {
         return false;
     }
-    if (plan.k.bits != 4 || plan.v.bits != 4 || sinks != nullptr || max_bias != 0.0f) {
+    if (sinks != nullptr || max_bias != 0.0f) {
         return false;
     }
     if (Q->ne[2] % plan.n_kv_heads != 0) {
         return false;
     }
     const int gqa_ratio = (int) (Q->ne[2] / plan.n_kv_heads);
-    // D256 SWA/GQA2 is the only vec geometry with positive evidence. D512 vec regressed
-    // deep-context global layers and is intentionally not a production route.
+    // D256 SWA/GQA2 is the proven vec geometry (benchmarked at k4v4); every KVarN bit pair
+    // is wired through it. D512 vec regressed deep-context global layers and stays excluded.
     return plan.k.swa && plan.v.swa && gqa_ratio == 2;
 }
 
@@ -401,7 +401,39 @@ static bool ggml_cuda_flash_attn_ext_kvarn_vec_d(
     args.nwarps = 0;
     args.stream = stream;
 
-    ggml_cuda_fattn_kvarn_vec_launch<D, 4, 4>(args);
+#define GGML_CUDA_FATTN_KVARN_VEC_LAUNCH(K_BITS, V_BITS) \
+    ggml_cuda_fattn_kvarn_vec_launch<D, K_BITS, V_BITS>(args)
+
+#define GGML_CUDA_FATTN_KVARN_VEC_DISPATCH_V(K_BITS) \
+    do { \
+        switch (plan.v.bits) { \
+            case 2: GGML_CUDA_FATTN_KVARN_VEC_LAUNCH(K_BITS, 2); break; \
+            case 3: GGML_CUDA_FATTN_KVARN_VEC_LAUNCH(K_BITS, 3); break; \
+            case 4: GGML_CUDA_FATTN_KVARN_VEC_LAUNCH(K_BITS, 4); break; \
+            case 5: GGML_CUDA_FATTN_KVARN_VEC_LAUNCH(K_BITS, 5); break; \
+            case 6: GGML_CUDA_FATTN_KVARN_VEC_LAUNCH(K_BITS, 6); break; \
+            case 8: GGML_CUDA_FATTN_KVARN_VEC_LAUNCH(K_BITS, 8); break; \
+            default: GGML_ABORT("unsupported native KVarN V bits %d", plan.v.bits); \
+        } \
+    } while (0)
+
+#define GGML_CUDA_FATTN_KVARN_VEC_DISPATCH_K() \
+    do { \
+        switch (plan.k.bits) { \
+            case 2: GGML_CUDA_FATTN_KVARN_VEC_DISPATCH_V(2); break; \
+            case 3: GGML_CUDA_FATTN_KVARN_VEC_DISPATCH_V(3); break; \
+            case 4: GGML_CUDA_FATTN_KVARN_VEC_DISPATCH_V(4); break; \
+            case 5: GGML_CUDA_FATTN_KVARN_VEC_DISPATCH_V(5); break; \
+            case 6: GGML_CUDA_FATTN_KVARN_VEC_DISPATCH_V(6); break; \
+            case 8: GGML_CUDA_FATTN_KVARN_VEC_DISPATCH_V(8); break; \
+            default: GGML_ABORT("unsupported native KVarN K bits %d", plan.k.bits); \
+        } \
+    } while (0)
+
+    GGML_CUDA_FATTN_KVARN_VEC_DISPATCH_K();
+#undef GGML_CUDA_FATTN_KVARN_VEC_DISPATCH_K
+#undef GGML_CUDA_FATTN_KVARN_VEC_DISPATCH_V
+#undef GGML_CUDA_FATTN_KVARN_VEC_LAUNCH
     return true;
 }
 

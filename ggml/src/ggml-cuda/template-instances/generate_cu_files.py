@@ -161,11 +161,12 @@ for bits_k in KVARN_DECODE_BITS:
         cases = "\n".join(
             f"DECL_FATTN_KVARN_DECODE_CASE({head_size}, {bits_k}, {bits_v});"
             for head_size in KVARN_DECODE_HEAD_SIZES)
-        vec_include = '\n#include "../fattn-kvarn-vec.cuh"' if bits_k == 4 and bits_v == 4 else ""
-        vec_cases = ("\n" + "\n".join(
+        # Every KVarN bit pair gets the D256 low-parallelism vec instance; D512 vec is
+        # intentionally excluded (it regressed deep-context global layers).
+        vec_include = '\n#include "../fattn-kvarn-vec.cuh"'
+        vec_cases = "\n" + "\n".join(
             f"DECL_FATTN_KVARN_VEC_CASE({head_size}, {bits_k}, {bits_v});"
-            for head_size in KVARN_DECODE_HEAD_SIZES if head_size == 256
-        )) if bits_k == 4 and bits_v == 4 else ""
+            for head_size in KVARN_DECODE_HEAD_SIZES if head_size == 256)
         with open(f"fattn-mma-kvarn-decode-instance-k{bits_k}-v{bits_v}.cu", "w") as f:
             f.write(SOURCE_FATTN_MMA_KVARN_DECODE.format(
                 cases=cases, vec_include=vec_include, vec_cases=vec_cases))

@@ -205,8 +205,7 @@ static __global__ void ggml_cuda_fattn_kvarn_vec_kernel(
             const int token = token_begin + lane;
             float score = -FLT_MAX / 2.0f;
             if (lane < TOKENS_PER_SPLIT && token < token_end &&
-                    h < gqa_head_count && q_head0 + h < n_q_heads &&
-                    k_refs[lane].source != GGML_CUDA_FATTN_KVARN_VEC_INVALID) {
+                    h < gqa_head_count && q_head0 + h < n_q_heads) {
                 score = 0.0f;
 #pragma unroll
                 for (int s = 0; s < SLICES; ++s) {

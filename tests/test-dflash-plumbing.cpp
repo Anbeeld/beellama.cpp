@@ -536,11 +536,16 @@ int main(int argc, char ** argv) {
                  cuda_fattn_kvarn_vec_decl.find("DECL_FATTN_KVARN_VEC_CASE") != std::string::npos &&
                  cuda_fattn_mma_kvarn_decode_k4v4.find("DECL_FATTN_KVARN_VEC_CASE(256, 4, 4);") != std::string::npos &&
                  cuda_fattn_mma_kvarn_decode_k4v4.find("DECL_FATTN_KVARN_VEC_CASE(512, 4, 4);") == std::string::npos &&
+                 cuda_fattn_mma_kvarn_decode_k4v3.find("DECL_FATTN_KVARN_VEC_CASE(256, 4, 3);") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_decode_k4v3.find("DECL_FATTN_KVARN_VEC_CASE(512, 4, 3);") == std::string::npos &&
                  cuda_template_generator.find("head_size == 256") != std::string::npos &&
                  cuda_fattn.find("ggml_cuda_flash_attn_ext_kvarn_vec_supported") != std::string::npos &&
+                 cuda_fattn.find("ggml_cuda_fattn_kvarn_vec_launch<D, 4, 4>") == std::string::npos &&
+                 cuda_fattn.find("plan.k.bits != 4 || plan.v.bits != 4") == std::string::npos &&
+                 cuda_fattn.find("GGML_CUDA_FATTN_KVARN_VEC_DISPATCH_K") != std::string::npos &&
                  cuda_fattn.find("GGML_KVARN_VEC_D512") == std::string::npos &&
                  cuda_fattn.find("CUDA_FA_ROUTE_EXEC_DISPATCH kernel=KVARN_DECODE_VEC") != std::string::npos,
-        "KVarN low-parallelism decode must keep only proven vec production instances and route them by geometry, not a dead D512 env path");
+        "KVarN low-parallelism vec decode must cover every KVarN bit pair at D256 via a bit-generic dispatch (not a k4v4 hardcode) and never compile a D512 vec instance");
     ok &= expect(cuda_fattn.find("D=512: MMA/TILE templates don't support this head_dim, use VEC unconditionally") == std::string::npos &&
                  cuda_fattn.find("if (Q->ne[0] == 512) {\n        return BEST_FATTN_KERNEL_VEC;") == std::string::npos,
         "CUDA FlashAttention must not force all D=512 non-turbo attention onto the vector kernel; Gemma4 global layers need the MMA selector path");

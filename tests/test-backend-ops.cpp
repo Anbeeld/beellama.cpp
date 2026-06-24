@@ -9860,6 +9860,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // fall back per cell; the older run still lands on the fast record path.
     test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 1, 6, 1, 768, 4, 4, 5, 1, 0, true, 0, true));
     test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 1, 6, 1, 768, 4, 4, 2, 1, 0, true, 0, true));
+    // D256 SWA / GQA=2 / n_q=1 is the low-parallelism vec decode regime (the only route the vec
+    // kernel serves). The vec kernel is bit-generic, so cover every KVarN K/V bit pair through it
+    // against the CPU oracle; previously only k4v4 was instantiated. gqa=2 via 2 q-heads/1 kv-head.
+    for (const int bits_k : kvarn_bits) {
+        for (const int bits_v : kvarn_bits) {
+            test_cases.emplace_back(new test_kvarn_flash_attn_ext(
+                256, 1, 2, 1, 1024, bits_k, bits_v, 5, 1, 0, true));
+        }
+    }
+    // Vec-regime edge coverage at k4v4: non-128-multiple n_kv (all-stage vs spill-to-records),
+    // misaligned and ring-wrapped SWA windows, and gqa=2 spread across multiple kv-heads.
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 1, 2, 1, 639, 4, 4, 5, 1, 0, true));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 1, 2, 1, 641, 4, 4, 5, 1, 0, true));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 1, 2, 1, 1024, 4, 4, 5, 1, 0, true, 56, false));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 1, 2, 1, 1024, 4, 4, 5, 1, 0, true, 0, true));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 1, 4, 2, 1024, 4, 4, 5, 1, 0, true));
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
