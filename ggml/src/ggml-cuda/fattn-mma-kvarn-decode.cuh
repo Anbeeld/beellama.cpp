@@ -184,6 +184,7 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
     __shared__ float scale_axis_sh[SLICES][GGML_CUDA_FATTN_KVARN_DIM];
     __shared__ float zp_axis_sh[SLICES][GGML_CUDA_FATTN_KVARN_DIM];
     __shared__ float other_axis_sh[SLICES][GGML_CUDA_FATTN_KVARN_DIM];
+    __shared__ float zq_sh[SLICES][MAX_GQA];
     __shared__ float m_sh[MAX_GQA];
     __shared__ float denom_sh[MAX_GQA];
 
@@ -208,6 +209,9 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
     const int record_group_k = k_tile.record_group;
     const int record_group_v = v_tile.record_group;
 
+    const bool k_split_in_group =
+        k_from_record && (k_tile.pos_begin + SPLIT_TOKENS) <= GGML_CUDA_FATTN_KVARN_DIM;
+
     const uint8_t * k_records[SLICES];
     const uint8_t * v_records[SLICES];
 #pragma unroll
@@ -230,7 +234,7 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
         q_h[h * (2 * Q_STRIDE2) + dim] = __float2half(value);
     }
 
-    if (k_from_record) {
+    if (k_split_in_group) {
         for (int i = tid; i < SLICES * GGML_CUDA_FATTN_KVARN_DIM; i += NWARPS * WARP_SIZE) {
             const int slice = i / GGML_CUDA_FATTN_KVARN_DIM;
             const int axis = i % GGML_CUDA_FATTN_KVARN_DIM;
@@ -240,6 +244,25 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
             scale_axis_sh[slice][axis] = __half2float(scale_axis[axis]);
             zp_axis_sh[slice][axis] = __half2float(zp_axis[axis]);
             other_axis_sh[slice][axis] = __half2float(other_axis[axis]);
+        }
+    }
+    __syncthreads();
+
+    if (k_split_in_group) {
+        const int n_targets = SLICES * gqa_head_count;
+        for (int target = tid; target < n_targets; target += NWARPS * WARP_SIZE) {
+            const int slice = target / gqa_head_count;
+            const int h = target % gqa_head_count;
+            const half * q_row = (const half *) q_sh + h * (2 * Q_STRIDE2) + slice * GGML_CUDA_FATTN_KVARN_DIM;
+            float zq = 0.0f;
+            for (int dim = 0; dim < GGML_CUDA_FATTN_KVARN_DIM; ++dim) {
+                const float q_val = __half2float(q_row[dim]);
+                zq += zp_axis_sh[slice][dim] * q_val;
+                const float q_prime = scale_axis_sh[slice][dim] * q_val;
+                ((half *) q_sh)[h * (2 * Q_STRIDE2) + slice * GGML_CUDA_FATTN_KVARN_DIM + dim] =
+                    __float2half(q_prime);
+            }
+            zq_sh[slice][h] = zq;
         }
     }
     __syncthreads();
@@ -275,16 +298,11 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
                     float x0;
                     float x1;
                     const int pos = k_tile.pos_begin + chunk * TOKENS_PER_CHUNK + token_local;
-                    if (k_from_record && pos < GGML_CUDA_FATTN_KVARN_DIM) {
+                    if (k_split_in_group) {
                         const uint8_t * row0 = k_records[slice] + (local_dim + 0) * k_row_bytes;
                         const uint8_t * row1 = k_records[slice] + (local_dim + 1) * k_row_bytes;
-                        const int q0 = ggml_cuda_fattn_kvarn_decode_unpack<K_BITS>(row0, pos, K_BITS);
-                        const int q1 = ggml_cuda_fattn_kvarn_decode_unpack<K_BITS>(row1, pos, K_BITS);
-                        const float other = other_axis_sh[slice][pos];
-                        x0 = (float(q0) * scale_axis_sh[slice][local_dim + 0] +
-                                zp_axis_sh[slice][local_dim + 0]) * other;
-                        x1 = (float(q1) * scale_axis_sh[slice][local_dim + 1] +
-                                zp_axis_sh[slice][local_dim + 1]) * other;
+                        x0 = (float) ggml_cuda_fattn_kvarn_decode_unpack<K_BITS>(row0, pos, K_BITS);
+                        x1 = (float) ggml_cuda_fattn_kvarn_decode_unpack<K_BITS>(row1, pos, K_BITS);
                     } else {
                         const int token = token0 + token_local;
                         x0 = token < token_end ?
@@ -303,7 +321,12 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
                 const int j = T_C::get_i(l);
                 const int h = T_C::get_j(l);
                 if (h < MAX_GQA) {
-                    score_partial_sh[warp][h * TOKENS_PER_CHUNK + j] = scores.x[l];
+                    float v = scores.x[l];
+                    if (k_split_in_group && h < gqa_head_count) {
+                        const int pos = k_tile.pos_begin + chunk * TOKENS_PER_CHUNK + j;
+                        v = other_axis_sh[warp_in_chunk][pos] * (v + zq_sh[warp_in_chunk][h]);
+                    }
+                    score_partial_sh[warp][h * TOKENS_PER_CHUNK + j] = v;
                 }
             }
         }
