@@ -22,6 +22,25 @@ static __device__ __forceinline__ uint8_t ggml_cuda_fattn_kvarn_unpack_record(
     return (packed >> bit_in_byte) & ((1u << bits) - 1u);
 }
 
+static __device__ __forceinline__ float ggml_cuda_fattn_kvarn_wht_sign(const int out, const int in) {
+    return (__popc((unsigned) (out & in)) & 1) ? -1.0f : 1.0f;
+}
+
+static __device__ __forceinline__ float ggml_cuda_fattn_kvarn_load_stage_rotated(
+        const ggml_cuda_fattn_kvarn_desc & desc,
+        const int stage_pos,
+        const int record_head,
+        const int dim) {
+    float acc = 0.0f;
+    const int64_t base = ((int64_t) stage_pos * desc.n_record_heads + record_head) *
+        GGML_CUDA_FATTN_KVARN_DIM;
+    for (int i = 0; i < GGML_CUDA_FATTN_KVARN_DIM; ++i) {
+        acc += ggml_cuda_fattn_kvarn_wht_sign(dim, i) *
+            __half2float(desc.stage[base + i]);
+    }
+    return acc * 0.08838834764831845f;
+}
+
 static __device__ __forceinline__ float ggml_cuda_fattn_kvarn_load_rotated(
         const ggml_cuda_fattn_kvarn_desc & desc,
         const int token,
@@ -64,8 +83,7 @@ static __device__ __forceinline__ float ggml_cuda_fattn_kvarn_load_rotated(
     }
 
     if (from_stage) {
-        return __half2float(desc.stage[((int64_t) stage_pos * desc.n_record_heads + record_head) *
-            GGML_CUDA_FATTN_KVARN_DIM + dim]);
+        return ggml_cuda_fattn_kvarn_load_stage_rotated(desc, stage_pos, record_head, dim);
     }
 
     if (!from_record) {

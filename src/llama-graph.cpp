@@ -24,6 +24,46 @@
 
 // dedup helpers
 
+static enum ggml_flash_attn_ext_kvarn_domain llm_kvarn_attn_domain(
+        const llama_cparams & cparams,
+        const ggml_tensor   * q,
+        bool is_swa) {
+    const int64_t n_q = q->ne[1];
+
+    // True decode has one query row per stream. SWA decode is still decode and
+    // should keep the low-parallelism rotated KVarN fast paths available.
+    if (n_q == 1) {
+        return GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED;
+    }
+
+    if (!is_swa && cparams.dflash_verify_logits && n_q <= LLAMA_DFLASH_MAX_VERIFY_TOKENS) {
+        return GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED;
+    }
+
+    // Small multi-row prompt/MTP batches need original hidden-domain output.
+    // Prompt prefill rotates Q and reads K in rotated-domain, but reconstructs V
+    // in original-domain so the attention output already matches hidden space.
+    return GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V;
+}
+
+static void llm_flash_attn_ext_set_kvarn_domain(
+        ggml_tensor * cur,
+        enum ggml_flash_attn_ext_kvarn_domain domain) {
+    while (cur != nullptr &&
+            (cur->op == GGML_OP_RESHAPE ||
+             cur->op == GGML_OP_PERMUTE ||
+             cur->op == GGML_OP_TRANSPOSE ||
+             cur->op == GGML_OP_VIEW ||
+             cur->op == GGML_OP_CONT) &&
+            cur->src[0] != nullptr) {
+        cur = cur->src[0];
+    }
+
+    if (cur != nullptr && cur->op == GGML_OP_FLASH_ATTN_EXT) {
+        cur->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN] = (int32_t) domain;
+    }
+}
+
 static ggml_tensor * build_attn_inp_kq_mask(
         ggml_context * ctx,
         const llama_kv_cache_context * mctx,
@@ -520,7 +560,7 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         mctx->set_input_v_rot(self_v_rot);
     }
 
-    if (self_kvarn_rot) {
+    if (self_kvarn_rot && self_kvarn_rot->buffer) {
         const auto * kvarn = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx);
         GGML_ASSERT(kvarn != nullptr);
         kvarn->set_input_kvarn_rot(self_kvarn_rot);
@@ -621,7 +661,7 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
         mctx->get_base()->set_input_v_rot(self_v_rot);
     }
 
-    if (self_kvarn_rot) {
+    if (self_kvarn_rot && self_kvarn_rot->buffer) {
         const auto * kvarn_base = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx->get_base());
         const auto * kvarn_swa  = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx->get_swa());
         GGML_ASSERT(kvarn_base != nullptr || kvarn_swa != nullptr);
@@ -631,7 +671,7 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     if (self_kvarn_mat_idxs_swa && self_kvarn_mat_idxs_swa->buffer) {
         const auto * kvarn_swa = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx->get_swa());
         GGML_ASSERT(kvarn_swa != nullptr);
-        kvarn_swa->set_input_kvarn_mat_idxs(self_kvarn_mat_idxs_swa);
+        kvarn_swa->set_input_kvarn_mat_idxs(self_kvarn_mat_idxs_swa, ubatch);
     }
 
     if (self_k_rot_swa) {
@@ -2375,14 +2415,22 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * mctx_cur = inp->mctx;
     const auto * kvarn_ctx = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur);
-    const bool use_kvarn_rotated_domain = kvarn_ctx != nullptr;
-    const bool use_kvarn_native = use_kvarn_rotated_domain && q_cur->ne[1] <= 8;
+    const bool use_kvarn = kvarn_ctx != nullptr;
+    const auto kvarn_domain = use_kvarn ? llm_kvarn_attn_domain(cparams, q_cur, false) :
+        GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO;
+    const bool use_kvarn_rotated_domain = use_kvarn &&
+        kvarn_domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED;
+    const bool use_kvarn_mixed_domain = use_kvarn &&
+        kvarn_domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V;
+    const bool use_kvarn_native = use_kvarn;
+    const bool use_kvarn_q_rot = use_kvarn_rotated_domain || use_kvarn_mixed_domain;
+    const bool use_kvarn_output_rot = use_kvarn_rotated_domain;
 
-    if (use_kvarn_rotated_domain) {
+    if (use_kvarn) {
         GGML_ASSERT(llama_kvarn_head_dim_supported((int) q_cur->ne[0]));
         GGML_ASSERT(inp->self_k_rot == nullptr);
         GGML_ASSERT(inp->self_v_rot == nullptr);
-        GGML_ASSERT(inp->self_kvarn_rot != nullptr);
+        GGML_ASSERT(!use_kvarn_q_rot || inp->self_kvarn_rot != nullptr);
     }
 
     if (inp->self_k_rot) {
@@ -2416,7 +2464,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = use_kvarn_native ? kvarn_ctx->get_k_native(ctx0, il) : mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = use_kvarn_native ? kvarn_ctx->get_v_native(ctx0, il) : mctx_cur->get_v(ctx0, il);
 
-    if (use_kvarn_rotated_domain) {
+    if (use_kvarn_q_rot) {
         GGML_ASSERT(q->type == GGML_TYPE_F32);
         q = ggml_mul_mat_aux(ctx0, q, inp->self_kvarn_rot);
     }
@@ -2433,10 +2481,15 @@ ggml_tensor * llm_graph_context::build_attn(
     }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    if (use_kvarn) {
+        llm_flash_attn_ext_set_kvarn_domain(cur, kvarn_domain);
+    }
     cb(cur, "kqv_out", il);
 
-    // TurboQuant V un-rotation at graph level (CUDA graph compatible)
-    if (use_kvarn_rotated_domain) {
+    // KVarN rotated-domain decode/verifier routes return rotated V output.
+    // Broad prefill reads rotated K but reconstructs original-domain V in the
+    // native tile loader, so no output inverse is needed.
+    if (use_kvarn_output_rot) {
         GGML_ASSERT(cur->type == GGML_TYPE_F32);
         cur = ggml_mul_mat_aux(ctx0, cur, inp->self_kvarn_rot);
     } else if (v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO4_TCQ || v->type == GGML_TYPE_TURBO3_TCQ || v->type == GGML_TYPE_TURBO2_TCQ) {
@@ -2668,14 +2721,22 @@ ggml_tensor * llm_graph_context::build_attn(
     // KVarN native attention consumes raw records/stage directly. SWA layers carry
     // their own per-cell position index; the KQ mask still enforces the window.
     const auto * kvarn_ctx = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur);
-    const bool use_kvarn_rotated_domain = kvarn_ctx != nullptr;
-    const bool use_kvarn_native = use_kvarn_rotated_domain && q_cur->ne[1] <= 8;
+    const bool use_kvarn = kvarn_ctx != nullptr;
+    const auto kvarn_domain = use_kvarn ? llm_kvarn_attn_domain(cparams, q_cur, is_swa) :
+        GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO;
+    const bool use_kvarn_rotated_domain = use_kvarn &&
+        kvarn_domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED;
+    const bool use_kvarn_mixed_domain = use_kvarn &&
+        kvarn_domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V;
+    const bool use_kvarn_native = use_kvarn;
+    const bool use_kvarn_q_rot = use_kvarn_rotated_domain || use_kvarn_mixed_domain;
+    const bool use_kvarn_output_rot = use_kvarn_rotated_domain;
 
-    if (use_kvarn_rotated_domain) {
+    if (use_kvarn) {
         GGML_ASSERT(llama_kvarn_head_dim_supported((int) q_cur->ne[0]));
         GGML_ASSERT(k_rot == nullptr);
         GGML_ASSERT(v_rot == nullptr);
-        GGML_ASSERT(inp->self_kvarn_rot != nullptr);
+        GGML_ASSERT(!use_kvarn_q_rot || inp->self_kvarn_rot != nullptr);
     }
 
     if (k_rot) {
@@ -2721,16 +2782,21 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = use_kvarn_native ? kvarn_ctx->get_k_native(ctx0, il) : mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = use_kvarn_native ? kvarn_ctx->get_v_native(ctx0, il) : mctx_cur->get_v(ctx0, il);
 
-    if (use_kvarn_rotated_domain) {
+    if (use_kvarn_q_rot) {
         GGML_ASSERT(q->type == GGML_TYPE_F32);
         q = ggml_mul_mat_aux(ctx0, q, inp->self_kvarn_rot);
     }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    if (use_kvarn) {
+        llm_flash_attn_ext_set_kvarn_domain(cur, kvarn_domain);
+    }
     cb(cur, "kqv_out", il);
 
-    // TurboQuant V un-rotation at graph level (CUDA graph compatible)
-    if (use_kvarn_rotated_domain) {
+    // KVarN rotated-domain decode/verifier routes return rotated V output.
+    // Broad prefill reads rotated K but reconstructs original-domain V in the
+    // native tile loader, so no output inverse is needed.
+    if (use_kvarn_output_rot) {
         GGML_ASSERT(cur->type == GGML_TYPE_F32);
         cur = ggml_mul_mat_aux(ctx0, cur, inp->self_kvarn_rot);
     } else if (v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO4_TCQ || v->type == GGML_TYPE_TURBO3_TCQ || v->type == GGML_TYPE_TURBO2_TCQ) {

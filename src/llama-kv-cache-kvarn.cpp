@@ -20,12 +20,11 @@ namespace {
 constexpr uint32_t KVAR_N_GROUP = 128;
 constexpr uint32_t KVAR_N_STAGE_GROUPS = 3; // legacy default; production caches carry stage_groups in op_params[7]
 constexpr uint32_t KVAR_N_STATE_MAGIC = 0x4e52564b; // "KVRN"
-// Version 5: adds stage_groups to the state header so restore can validate the
-// saved stage layout against the current cache. The initial W2 gate rejects any
-// stage_groups mismatch (including version-4 states restored into a cache whose
-// configured ubatch is not 256) rather than silently corrupting the stage. Stage-
-// slot remap for differing save/restore ubatch settings is future work.
-constexpr uint32_t KVAR_N_STATE_VERSION = 5;
+// Version 6: KVarN stage tensors store original-domain fp16 rows while compressed
+// records remain rotated-domain. Older states are rejected because their staged
+// rows would otherwise be restored in the wrong domain. Version 5 added
+// stage_groups validation.
+constexpr uint32_t KVAR_N_STATE_VERSION = 6;
 constexpr uint32_t KVAR_N_STATE_RECORDS_FULL = 0;
 constexpr uint32_t KVAR_N_STATE_STAGE_ONLY_PARTIAL = 1;
 
@@ -140,6 +139,15 @@ const std::vector<float> & kvarn_hadamard_128() {
     }();
 
     return data;
+}
+
+uint32_t kvarn_stage_tail_groups(uint32_t kv_size, uint32_t n_batch, uint32_t n_ubatch, uint32_t n_swa, bool is_swa) {
+    const uint32_t swa_stage_cells = std::min(kv_size, n_swa + n_ubatch);
+    const uint32_t stage_span_groups = is_swa ?
+        ((swa_stage_cells + KVAR_N_GROUP - 1u) / KVAR_N_GROUP) + 1u :
+        ((n_batch + n_ubatch + KVAR_N_GROUP - 1u) / KVAR_N_GROUP);
+
+    return std::max<uint32_t>(is_swa ? 2u : 4u, stage_span_groups);
 }
 
 } // namespace
@@ -292,7 +300,7 @@ ggml_tensor * llama_kv_cache_kvarn_context::build_input_kvarn_mat_idxs(ggml_cont
     return res;
 }
 
-void llama_kv_cache_kvarn_context::set_input_kvarn_mat_idxs(ggml_tensor * dst) const {
+void llama_kv_cache_kvarn_context::set_input_kvarn_mat_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     GGML_ASSERT(dst->type == GGML_TYPE_I64);
 
@@ -307,6 +315,25 @@ void llama_kv_cache_kvarn_context::set_input_kvarn_mat_idxs(ggml_tensor * dst) c
             data[cell] = -1; // empty window cell
         } else {
             data[cell] = (int64_t) cells.pos_get(cell);
+        }
+    }
+
+    // During graph compute the metadata cells still hold the previous committed
+    // state; the current ubatch is committed only after compute. Mirror the
+    // pending SWA ring slot mapping here so native KVarN views use the same
+    // absolute positions as the K/V store and mask inputs for this graph.
+    if (ubatch != nullptr) {
+        const auto & sinfo = current_sinfo();
+        if (!sinfo.empty()) {
+            GGML_ASSERT(sinfo.n_stream() == 1);
+            GGML_ASSERT(ubatch->n_tokens == sinfo.size()*sinfo.n_stream());
+
+            for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+                for (uint32_t i = 0; i < sinfo.size(); ++i) {
+                    GGML_ASSERT(sinfo.idxs[s][i] < n_kv);
+                    data[sinfo.idxs[s][i]] = (int64_t) ubatch->pos[s*sinfo.size() + i];
+                }
+            }
         }
     }
 }
@@ -431,12 +458,12 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     // Non-SWA KVarN keeps at least four transient tail groups and covers the full
     // logical batch plus one physical ubatch, so early queries in a large ubatch
     // do not see nearby groups compressed relative to the ubatch's final live
-    // group, including at logical-batch boundaries. SWA keeps the smaller physical
-    // ubatch ring because it has no permanent sink and stores a sliding window
-    // rather than a full-context cache.
-    tail_groups(std::max<uint32_t>(
-        (n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE) ? 1u : 4u,
-        (((n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE) ? n_ubatch : n_batch + n_ubatch) + KVAR_N_GROUP - 1u) / KVAR_N_GROUP)),
+    // group, including at logical-batch boundaries. SWA covers the active sliding
+    // window plus the current ubatch, bounded by the SWA ring size, because those
+    // visible local-attention keys are much more sensitive to compressed record
+    // reads during prompt prefill than global full-context layers.
+    tail_groups(kvarn_stage_tail_groups(
+        kv_size, n_batch, n_ubatch, n_swa, n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE)),
     stage_groups(tail_groups + 1u),
     swa(n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE),
     metadata(std::make_unique<llama_kv_cache>(
@@ -507,8 +534,8 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     const int64_t n_record_groups = int64_t(n_groups_per_stream) * n_stream;
     // Stage depth is now a cache property derived from the configured scheduler
     // window. Non-SWA caches keep at least four transient tail groups and cover
-    // n_batch plus one n_ubatch boundary cushion; SWA uses the raw ubatch-derived
-    // tail because its staging area is a sliding ring.
+    // n_batch plus one n_ubatch boundary cushion; SWA keeps the active sliding
+    // window exact in the F16 stage ring.
     // Backends read stage_groups from op_params[7] instead of assuming 3.
     const int64_t n_stage_tokens = int64_t(KVAR_N_GROUP) * int64_t(stage_groups) * n_stream;
     size_t raw_bytes = 0;
@@ -899,9 +926,9 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
     }
     const uint32_t state_kind = partial_state ? KVAR_N_STATE_STAGE_ONLY_PARTIAL : KVAR_N_STATE_RECORDS_FULL;
     io.write(&state_kind, sizeof(state_kind));
-    // Version 5: record the stage depth so the reader can validate that the saved
-    // stage tensor layout matches the current cache. The W2 gate rejects any
-    // mismatch; remap for differing save/restore ubatch is future work.
+    // Version 5+: record the stage depth so the reader can validate that the
+    // saved stage tensor layout matches the current cache. The W2 gate rejects
+    // any mismatch; remap for differing save/restore ubatch is future work.
     io.write(&stage_groups, sizeof(stage_groups));
 
     // n_groups_used is single-valued across all saved streams. This is correct
@@ -957,20 +984,9 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
         type != params.type || n_layers != layers.size()) {
         throw std::runtime_error("incompatible KVarN cache state");
     }
-
-    if (version == 1) {
-        for (const auto & layer : layers) {
-            uint32_t il;
-            io.read(&il, sizeof(il));
-            if (il != layer.il) {
-                throw std::runtime_error("mismatched KVarN cache layer");
-            }
-
-            for (auto * tensor : { layer.k_records, layer.v_records, layer.k_stage, layer.v_stage }) {
-                read_kvarn_tensor(io, tensor);
-            }
-        }
-        return;
+    if (version < 6) {
+        throw std::runtime_error(
+            "incompatible KVarN cache state: re-save prompt cache with this build");
     }
 
     uint32_t n_saved_streams;
@@ -987,27 +1003,21 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
         }
     }
 
-    uint32_t state_kind = KVAR_N_STATE_RECORDS_FULL;
-    if (version >= 4) {
-        io.read(&state_kind, sizeof(state_kind));
-        if (state_kind != KVAR_N_STATE_RECORDS_FULL && state_kind != KVAR_N_STATE_STAGE_ONLY_PARTIAL) {
-            throw std::runtime_error("invalid KVarN cache state kind");
-        }
+    uint32_t state_kind;
+    io.read(&state_kind, sizeof(state_kind));
+    if (state_kind != KVAR_N_STATE_RECORDS_FULL && state_kind != KVAR_N_STATE_STAGE_ONLY_PARTIAL) {
+        throw std::runtime_error("invalid KVarN cache state kind");
     }
 
-    // Version 5 carries stage_groups. Version 4 states were written with the
-    // legacy three-slot stage layout. The initial W2 gate does not implement
+    // Version 6 rejects older stage-domain states. The reader still does not implement
     // stage-slot remap on restore (the plan's full save/restore matrix allows
     // remapping logical live groups into differently-sized stages). For now,
-    // any stage_groups mismatch — including version-4 states restored into a
-    // cache whose configured ubatch is not 256 — is rejected explicitly so the
-    // stage is never silently corrupted. Remap support is a follow-up.
-    uint32_t saved_stage_groups = KVAR_N_STAGE_GROUPS;
-    if (version >= 5) {
-        io.read(&saved_stage_groups, sizeof(saved_stage_groups));
-        if (saved_stage_groups < 2) {
-            throw std::runtime_error("invalid KVarN cache stage depth");
-        }
+    // any stage_groups mismatch is rejected explicitly so the stage is never
+    // silently corrupted. Remap support is a follow-up.
+    uint32_t saved_stage_groups;
+    io.read(&saved_stage_groups, sizeof(saved_stage_groups));
+    if (saved_stage_groups < 2) {
+        throw std::runtime_error("invalid KVarN cache stage depth");
     }
     if (saved_stage_groups != stage_groups) {
         throw std::runtime_error(format(
@@ -1016,12 +1026,10 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
             saved_stage_groups, stage_groups));
     }
 
-    uint32_t n_groups_used = n_groups_per_stream;
-    if (version >= 3) {
-        io.read(&n_groups_used, sizeof(n_groups_used));
-        if (n_groups_used == 0 || n_groups_used > n_groups_per_stream) {
-            throw std::runtime_error("invalid KVarN cache group count");
-        }
+    uint32_t n_groups_used;
+    io.read(&n_groups_used, sizeof(n_groups_used));
+    if (n_groups_used == 0 || n_groups_used > n_groups_per_stream) {
+        throw std::runtime_error("invalid KVarN cache group count");
     }
 
     const uint32_t seq_stream = seq_id == -1 ? 0 : metadata->get_stream_for_seq(seq_id);
@@ -1050,32 +1058,21 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
 
             const uint32_t stream_dst = seq_id == -1 ? stream : seq_stream;
 
-            if (version >= 3) {
-                const size_t k_records_used = n_groups_used * layer.k_records_stream[stream_dst]->nb[2];
-                const size_t v_records_used = n_groups_used * layer.v_records_stream[stream_dst]->nb[2];
-                const size_t k_records_total = n_groups_per_stream * layer.k_records_stream[stream_dst]->nb[2];
-                const size_t v_records_total = n_groups_per_stream * layer.v_records_stream[stream_dst]->nb[2];
+            const size_t k_records_used = n_groups_used * layer.k_records_stream[stream_dst]->nb[2];
+            const size_t v_records_used = n_groups_used * layer.v_records_stream[stream_dst]->nb[2];
+            const size_t k_records_total = n_groups_per_stream * layer.k_records_stream[stream_dst]->nb[2];
+            const size_t v_records_total = n_groups_per_stream * layer.v_records_stream[stream_dst]->nb[2];
 
-                if (state_kind == KVAR_N_STATE_RECORDS_FULL) {
-                    read_kvarn_tensor_slice(io, layer.k_records_stream[stream_dst], 0, k_records_used);
-                    zero_kvarn_tensor_range(layer.k_records_stream[stream_dst], k_records_used, k_records_total - k_records_used);
+            if (state_kind == KVAR_N_STATE_RECORDS_FULL) {
+                read_kvarn_tensor_slice(io, layer.k_records_stream[stream_dst], 0, k_records_used);
+                zero_kvarn_tensor_range(layer.k_records_stream[stream_dst], k_records_used, k_records_total - k_records_used);
 
-                    read_kvarn_tensor_slice(io, layer.v_records_stream[stream_dst], 0, v_records_used);
-                    zero_kvarn_tensor_range(layer.v_records_stream[stream_dst], v_records_used, v_records_total - v_records_used);
-                }
-
-                read_kvarn_tensor(io, layer.k_stage_stream[stream_dst]);
-                read_kvarn_tensor(io, layer.v_stage_stream[stream_dst]);
-            } else {
-                for (auto * tensor : {
-                        layer.k_records_stream[stream_dst],
-                        layer.v_records_stream[stream_dst],
-                        layer.k_stage_stream[stream_dst],
-                        layer.v_stage_stream[stream_dst],
-                    }) {
-                    read_kvarn_tensor(io, tensor);
-                }
+                read_kvarn_tensor_slice(io, layer.v_records_stream[stream_dst], 0, v_records_used);
+                zero_kvarn_tensor_range(layer.v_records_stream[stream_dst], v_records_used, v_records_total - v_records_used);
             }
+
+            read_kvarn_tensor(io, layer.k_stage_stream[stream_dst]);
+            read_kvarn_tensor(io, layer.v_stage_stream[stream_dst]);
         }
     }
 }

@@ -2,6 +2,11 @@
 
 static constexpr int GGML_CUDA_FATTN_KVARN_DIM = 128;
 static constexpr ggml_type GGML_CUDA_FATTN_KVARN_TYPE = GGML_TYPE_COUNT;
+static constexpr ggml_type GGML_CUDA_FATTN_KVARN_ORIGINAL_TYPE = (ggml_type) (GGML_TYPE_COUNT + 1);
+
+static constexpr __host__ __device__ bool ggml_cuda_fattn_kvarn_template_type(ggml_type type) {
+    return type == GGML_CUDA_FATTN_KVARN_TYPE || type == GGML_CUDA_FATTN_KVARN_ORIGINAL_TYPE;
+}
 
 enum {
     GGML_CUDA_FATTN_KVARN_OP_PARAM_BITS              = 0,
@@ -27,6 +32,9 @@ struct ggml_cuda_fattn_kvarn_desc {
     int bits;
     int value;
     int swa;
+    // Large prefill can reconstruct one side in the original domain in the MMA tile loader.
+    // Decode-width paths keep rotated-domain K/V and rotate Q/output in the graph.
+    int original_domain;
 };
 
 struct ggml_cuda_fattn_kvarn_plan_side {
@@ -56,7 +64,7 @@ struct ggml_cuda_fattn_kvarn_plan {
 // Definition lives in fattn-mma-kvarn-impl.cuh. fattn-mma-f16.cuh needs only this declaration:
 // its call sites are in if-constexpr branches discarded for non-KVarN types, while fattn.cu
 // includes the implementation for the generic native-MMA fallback.
-template<int D, int stride_tile, int nbatch_fa, int nthreads, bool oob_check, bool dim_major_K = false>
+template<int D, int stride_tile, int nbatch_fa, int nthreads, bool oob_check, bool original_domain = false, bool dim_major_K = false>
 static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
         const char * __restrict__ desc_raw,
         half2      * __restrict__ tile_KV,

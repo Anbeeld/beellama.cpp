@@ -94,7 +94,9 @@ static __global__ void ggml_cuda_fattn_kvarn_init_descs_kernel(
         bool v_swa,
         int n_stream,
         int n_kv_heads,
-        int slices) {
+        int slices,
+        int k_original_domain,
+        int v_original_domain) {
     const int out_stream = blockIdx.x;
     if (out_stream >= n_stream) {
         return;
@@ -138,6 +140,7 @@ static __global__ void ggml_cuda_fattn_kvarn_init_descs_kernel(
         k_desc.bits = k_bits;
         k_desc.value = 0;
         k_desc.swa = k_swa ? 1 : 0;
+        k_desc.original_domain = k_original_domain;
 
         ggml_cuda_fattn_kvarn_desc & v_desc = v_descs[(size_t) out_stream * n_kv_heads + h];
         v_desc.records = v_records;
@@ -154,6 +157,7 @@ static __global__ void ggml_cuda_fattn_kvarn_init_descs_kernel(
         v_desc.bits = v_bits;
         v_desc.value = 1;
         v_desc.swa = v_swa ? 1 : 0;
+        v_desc.original_domain = v_original_domain;
     }
 }
 
@@ -161,6 +165,8 @@ static inline void ggml_cuda_fattn_kvarn_init_descs(
         const ggml_cuda_fattn_kvarn_plan & plan,
         ggml_cuda_fattn_kvarn_desc * k_desc,
         ggml_cuda_fattn_kvarn_desc * v_desc,
+        int k_original_domain,
+        int v_original_domain,
         cudaStream_t stream) {
     ggml_cuda_fattn_kvarn_init_descs_kernel<<<plan.n_stream, GGML_CUDA_FATTN_KVARN_DIM, 0, stream>>>(
         (const uint8_t *) plan.k.records->data,
@@ -189,8 +195,97 @@ static inline void ggml_cuda_fattn_kvarn_init_descs(
         plan.v.swa,
         plan.n_stream,
         plan.n_kv_heads,
-        plan.slices);
+        plan.slices,
+        k_original_domain,
+        v_original_domain);
     CUDA_CHECK(cudaGetLastError());
+}
+
+static inline enum ggml_flash_attn_ext_kvarn_domain ggml_cuda_fattn_kvarn_domain(const ggml_tensor * dst) {
+    return (enum ggml_flash_attn_ext_kvarn_domain) ggml_get_op_params_i32(
+            dst, GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN);
+}
+
+static inline bool ggml_cuda_fattn_kvarn_k_original_domain(const ggml_tensor * dst) {
+    switch (ggml_cuda_fattn_kvarn_domain(dst)) {
+        case GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ORIGINAL:
+            return true;
+        case GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED:
+        case GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V:
+            return false;
+        case GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO:
+            return dst->src[0]->ne[1] > 1;
+    }
+
+    return dst->src[0]->ne[1] > 1;
+}
+
+static inline bool ggml_cuda_fattn_kvarn_v_original_domain(const ggml_tensor * dst) {
+    switch (ggml_cuda_fattn_kvarn_domain(dst)) {
+        case GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ORIGINAL:
+        case GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V:
+            return true;
+        case GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED:
+            return false;
+        case GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO:
+            return dst->src[0]->ne[1] > 1;
+    }
+
+    return dst->src[0]->ne[1] > 1;
+}
+
+static inline bool ggml_cuda_fattn_kvarn_rotated_decode_domain(const ggml_tensor * dst) {
+    switch (ggml_cuda_fattn_kvarn_domain(dst)) {
+        case GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ORIGINAL:
+        case GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V:
+            return false;
+        case GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED:
+            return true;
+        case GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO:
+            return dst->src[0]->ne[1] == 1;
+    }
+
+    return dst->src[0]->ne[1] == 1;
+}
+
+static inline const char * ggml_cuda_fattn_kvarn_domain_name(const ggml_tensor * dst) {
+    switch (ggml_cuda_fattn_kvarn_domain(dst)) {
+        case GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ORIGINAL:
+            return "original_prefill";
+        case GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED:
+            return "rotated";
+        case GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V:
+            return "rotated_k_original_v";
+        case GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO:
+            return "auto";
+    }
+
+    return "unknown";
+}
+
+template <int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap>
+static inline fattn_kernel_t ggml_cuda_flash_attn_ext_mma_kvarn_select_kernel(
+        bool k_original_domain,
+        bool v_original_domain) {
+    constexpr bool V_is_K_view = false;
+
+    if (k_original_domain) {
+        if (v_original_domain) {
+            return flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view,
+                GGML_CUDA_FATTN_KVARN_ORIGINAL_TYPE, GGML_CUDA_FATTN_KVARN_ORIGINAL_TYPE>;
+        }
+
+        return flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view,
+            GGML_CUDA_FATTN_KVARN_ORIGINAL_TYPE, GGML_CUDA_FATTN_KVARN_TYPE>;
+    }
+
+    if (v_original_domain) {
+        return flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view,
+            GGML_CUDA_FATTN_KVARN_TYPE, GGML_CUDA_FATTN_KVARN_ORIGINAL_TYPE>;
+    }
+
+    return flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view,
+        GGML_CUDA_FATTN_KVARN_TYPE, GGML_CUDA_FATTN_KVARN_TYPE>;
 }
 
 template <int DKQ, int DV, int ncols1, int ncols2>
@@ -212,14 +307,22 @@ void ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, gg
     const int cols_per_warp = std::min(ncols, get_cols_per_warp(cc));
     const int warp_size_host = ggml_cuda_info().devices[ctx.device].warp_size;
     const int nwarps = nthreads / warp_size_host;
-    constexpr bool V_is_K_view = false;
+    const bool k_original_domain = ggml_cuda_fattn_kvarn_k_original_domain(dst);
+    const bool v_original_domain = ggml_cuda_fattn_kvarn_v_original_domain(dst);
+    const bool has_original_domain = k_original_domain || v_original_domain;
 
     const size_t nbytes_shared_KV = nbatch_fa * std::max(nbatch_K2 + 4, nbatch_V2 + 4) * sizeof(half2);
     const size_t nbytes_shared_Q = ncols * (DKQ/2 + 4) * sizeof(half2);
     const size_t nbytes_shared_mask = ncols1 * (nbatch_fa/2 + 4) * sizeof(half2);
     const size_t nbytes_shared_combine = nwarps * cols_per_warp * (nbatch_combine + 4) * sizeof(half2);
-    const size_t nbytes_shared_kvarn_scales = 2 * GGML_CUDA_FATTN_KVARN_DIM * sizeof(half);
-    const size_t nbytes_shared_KV_mask_kvarn = nbytes_shared_KV + nbytes_shared_mask + nbytes_shared_kvarn_scales;
+    const size_t nbytes_shared_kvarn_rotated =
+        2 * GGML_CUDA_FATTN_KVARN_DIM * sizeof(half);
+    const size_t nbytes_shared_kvarn_original =
+        3 * GGML_CUDA_FATTN_KVARN_DIM * sizeof(half) +
+        2 * nwarps * GGML_CUDA_FATTN_KVARN_DIM * sizeof(float);
+    const size_t nbytes_shared_kvarn = has_original_domain ?
+        nbytes_shared_kvarn_original : nbytes_shared_kvarn_rotated;
+    const size_t nbytes_shared_KV_mask_kvarn = nbytes_shared_KV + nbytes_shared_mask + nbytes_shared_kvarn;
     const size_t nbytes_shared_total = std::max(nbytes_shared_combine, Q_in_reg ?
         std::max(nbytes_shared_Q, nbytes_shared_KV_mask_kvarn) :
                  nbytes_shared_Q + nbytes_shared_KV_mask_kvarn);
@@ -229,7 +332,8 @@ void ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, gg
     const size_t n_desc = (size_t) plan.n_stream * plan.n_kv_heads;
     ggml_cuda_pool_alloc<ggml_cuda_fattn_kvarn_desc> k_desc(pool, n_desc);
     ggml_cuda_pool_alloc<ggml_cuda_fattn_kvarn_desc> v_desc(pool, n_desc);
-    ggml_cuda_fattn_kvarn_init_descs(plan, k_desc.get(), v_desc.get(), stream);
+    ggml_cuda_fattn_kvarn_init_descs(plan, k_desc.get(), v_desc.get(),
+            k_original_domain ? 1 : 0, v_original_domain ? 1 : 0, stream);
 
     ggml_tensor K_desc = *dst->src[1];
     ggml_tensor V_desc = *dst->src[2];
@@ -261,25 +365,17 @@ void ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, gg
     fattn_kernel_t fattn_kernel;
     if (logit_softcap == 0.0f) {
         constexpr bool use_logit_softcap = false;
-        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view,
-            GGML_CUDA_FATTN_KVARN_TYPE, GGML_CUDA_FATTN_KVARN_TYPE>;
+        fattn_kernel = ggml_cuda_flash_attn_ext_mma_kvarn_select_kernel<DKQ, DV, ncols1, ncols2, use_logit_softcap>(
+                k_original_domain, v_original_domain);
 #if !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
-        static size_t shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {0};
-        if (shared_memory_limit_raised[id] < nbytes_shared_total) {
-            CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
-            shared_memory_limit_raised[id] = nbytes_shared_total;
-        }
+        CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
 #endif
     } else {
         constexpr bool use_logit_softcap = true;
-        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view,
-            GGML_CUDA_FATTN_KVARN_TYPE, GGML_CUDA_FATTN_KVARN_TYPE>;
+        fattn_kernel = ggml_cuda_flash_attn_ext_mma_kvarn_select_kernel<DKQ, DV, ncols1, ncols2, use_logit_softcap>(
+                k_original_domain, v_original_domain);
 #if !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
-        static size_t shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {0};
-        if (shared_memory_limit_raised[id] < nbytes_shared_total) {
-            CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
-            shared_memory_limit_raised[id] = nbytes_shared_total;
-        }
+        CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
 #endif
     }
 
@@ -312,6 +408,9 @@ static bool ggml_cuda_flash_attn_ext_kvarn_vec_supported(
     const int head_dim = (int) Q->ne[0];
     if (head_dim != 256 || K->ne[0] != head_dim || V->ne[0] != head_dim ||
             Q->ne[1] != 1 || Q->ne[3] != plan.n_stream || plan.n_stream <= 0) {
+        return false;
+    }
+    if (!ggml_cuda_fattn_kvarn_rotated_decode_domain(dst)) {
         return false;
     }
     if (sinks != nullptr || max_bias != 0.0f) {
@@ -352,7 +451,7 @@ static bool ggml_cuda_flash_attn_ext_kvarn_vec_d(
     const size_t n_desc = (size_t) plan.n_stream * plan.n_kv_heads;
     ggml_cuda_pool_alloc<ggml_cuda_fattn_kvarn_desc> k_desc(pool, n_desc);
     ggml_cuda_pool_alloc<ggml_cuda_fattn_kvarn_desc> v_desc(pool, n_desc);
-    ggml_cuda_fattn_kvarn_init_descs(plan, k_desc.get(), v_desc.get(), stream);
+    ggml_cuda_fattn_kvarn_init_descs(plan, k_desc.get(), v_desc.get(), 0, 0, stream);
 
     const size_t partial_count = (size_t) plan.n_stream * n_q_heads * n_splits * D;
     const size_t meta_count = (size_t) plan.n_stream * n_q_heads * n_splits;
@@ -465,6 +564,12 @@ static bool ggml_cuda_flash_attn_ext_kvarn_decode_supported(
     if (Q->ne[1] <= 0 || Q->ne[3] != plan.n_stream || plan.n_stream <= 0) {
         return false;
     }
+    if (!ggml_cuda_fattn_kvarn_rotated_decode_domain(dst)) {
+        return false;
+    }
+    if (Q->ne[1] > 8) {
+        return false;
+    }
     if (sinks != nullptr || max_bias != 0.0f) {
         return false;
     }
@@ -543,7 +648,7 @@ static bool ggml_cuda_flash_attn_ext_kvarn_decode_d(
     const size_t n_desc = (size_t) plan.n_stream * plan.n_kv_heads;
     ggml_cuda_pool_alloc<ggml_cuda_fattn_kvarn_desc> k_desc(pool, n_desc);
     ggml_cuda_pool_alloc<ggml_cuda_fattn_kvarn_desc> v_desc(pool, n_desc);
-    ggml_cuda_fattn_kvarn_init_descs(plan, k_desc.get(), v_desc.get(), stream);
+    ggml_cuda_fattn_kvarn_init_descs(plan, k_desc.get(), v_desc.get(), 0, 0, stream);
 
     const size_t partial_count = (size_t) plan.n_stream * n_q_heads * n_q * n_splits * D;
     const size_t meta_count = (size_t) plan.n_stream * n_q_heads * n_q * n_splits;
@@ -645,6 +750,9 @@ static bool ggml_cuda_flash_attn_ext_kvarn_decode(
         default:  return false;
     }
 }
+
+static inline bool ggml_cuda_fattn_route_debug_enabled();
+static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void turbo_q_calibrate_init() {
     const char * env = getenv("TURBO_Q_CALIBRATE");
@@ -3353,10 +3461,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     }
 
     if (plan.native_kvarn_mma) {
-        // KVarN is always served natively from descriptors: low-parallelism vec, then the
-        // geometry-selected split decode, then the generic descriptor MMA as the catch-all
-        // for every view_supported shape (all query widths/prefill). There is intentionally
-        // no F16 materialize fallback; an unsupported shape is a bug to fix, not to mask.
+        // KVarN stays descriptor-native. Decode/verifier widths keep rotated-domain
+        // K/V, while broad prompt-prefill reads rotated-domain K and reconstructs V inside
+        // the MMA tile loader without full-context F16 scratch.
         if (ggml_cuda_flash_attn_ext_kvarn_vec(ctx, dst, plan.kvarn_plan)) {
             return;
         }
@@ -3366,8 +3473,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
         if (ggml_cuda_fattn_route_debug_enabled()) {
             fprintf(stderr,
-                "CUDA_FA_ROUTE_EXEC_DISPATCH kernel=MMA_KVARN need_f16_K=0 need_f16_V=0 "
+                "CUDA_FA_ROUTE_EXEC_DISPATCH kernel=MMA_KVARN domain=%s need_f16_K=0 need_f16_V=0 "
                 "Q=[%lld,%lld,%lld,%lld] K=[%lld,%lld,%lld,%lld] V=[%lld,%lld,%lld,%lld]\n",
+                ggml_cuda_fattn_kvarn_domain_name(dst),
                 (long long) Q->ne[0], (long long) Q->ne[1], (long long) Q->ne[2], (long long) Q->ne[3],
                 (long long) K->ne[0], (long long) K->ne[1], (long long) K->ne[2], (long long) K->ne[3],
                 (long long) V->ne[0], (long long) V->ne[1], (long long) V->ne[2], (long long) V->ne[3]);

@@ -452,6 +452,18 @@ extern "C" {
         GGML_PREC_F32     = 10,
     };
 
+    enum ggml_flash_attn_ext_op_param {
+        GGML_FLASH_ATTN_EXT_OP_PARAM_PREC         = 3,
+        GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN = 4,
+    };
+
+    enum ggml_flash_attn_ext_kvarn_domain {
+        GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO                 = 0,
+        GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED              = 1,
+        GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ORIGINAL             = 2,
+        GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V = 3,
+    };
+
     // op hint
     enum ggml_op_hint {
         GGML_HINT_NONE             = 0,

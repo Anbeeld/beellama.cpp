@@ -44,7 +44,7 @@ public:
     ggml_tensor * build_input_kvarn_rot(ggml_context * ctx) const;
     void set_input_kvarn_rot(ggml_tensor * dst) const;
     ggml_tensor * build_input_kvarn_mat_idxs(ggml_context * ctx) const;
-    void set_input_kvarn_mat_idxs(ggml_tensor * dst) const;
+    void set_input_kvarn_mat_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_mat_idxs(ggml_tensor * idxs) const { mat_idxs = idxs; }
 
     ggml_tensor * get_turbo_rotation() const override;
@@ -144,7 +144,7 @@ public:
     // Dynamic staging: the lossless F16 ring is sized from the configured batch
     // window, with a non-SWA precision floor for common small batches.
     //   non-SWA tail_groups = max(4, ceil((n_batch + n_ubatch) / KVAR_N_GROUP))
-    //   SWA tail_groups     = max(1, ceil(n_ubatch / KVAR_N_GROUP))
+    //   SWA tail_groups     = max(2, ceil(min(kv_size, n_swa + n_ubatch) / KVAR_N_GROUP) + 1)
     //   stage_groups        = tail_groups + 1
     // The +1 is the permanent sink slot for non-SWA, or the extra ping-pong slot
     // for SWA. KVarN cache state is versioned to carry stage_groups so restore can
@@ -197,7 +197,7 @@ private:
     const uint32_t n_groups_per_stream;
     // Declaration order matters: stage_groups depends on tail_groups, so
     // tail_groups must be declared first (C++ initializes members in order).
-    const uint32_t tail_groups;   // non-SWA max(4, ceil((n_batch + n_ubatch) / 128)); SWA max(1, ceil(n_ubatch / 128))
+    const uint32_t tail_groups;   // non-SWA max(4, ceil((n_batch + n_ubatch) / 128)); SWA max(2, ceil(active window / 128) + 1)
     const uint32_t stage_groups;   // F16 stage depth (tail_groups + 1)
     const bool swa;
 

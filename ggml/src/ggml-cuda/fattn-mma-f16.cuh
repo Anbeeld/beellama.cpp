@@ -705,7 +705,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr int  nbatch_K2       = ggml_cuda_fattn_mma_get_nbatch_K2(DKQ, DV, ncols);
     constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg (DKQ, DV, ncols);
-    constexpr bool is_kvarn_kv     = (type_K == GGML_CUDA_FATTN_KVARN_TYPE || type_V == GGML_CUDA_FATTN_KVARN_TYPE);
+    constexpr bool is_kvarn_kv     = ggml_cuda_fattn_kvarn_template_type(type_K) || ggml_cuda_fattn_kvarn_template_type(type_V);
     constexpr bool is_turbo_kv     = !is_kvarn_kv && (type_K != GGML_TYPE_F16 || type_V != GGML_TYPE_F16);
     constexpr int  nstages         = (is_turbo_kv || is_kvarn_kv) ? 0 : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2);
 
@@ -747,9 +747,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
         if constexpr (nstages <= 1) {
             if constexpr (!is_turbo_kv) {
-                if constexpr (type_K == GGML_CUDA_FATTN_KVARN_TYPE) {
+                if constexpr (ggml_cuda_fattn_kvarn_template_type(type_K)) {
+                    constexpr bool kvarn_original_domain = type_K == GGML_CUDA_FATTN_KVARN_ORIGINAL_TYPE;
                     constexpr int nthreads_kvarn = nwarps * ggml_cuda_get_physical_warp_size();
-                    flash_attn_ext_kvarn_load_tile<DKQ, stride_tile_K, nbatch_fa, nthreads_kvarn, oob_check>
+                    flash_attn_ext_kvarn_load_tile<DKQ, stride_tile_K, nbatch_fa, nthreads_kvarn, oob_check, kvarn_original_domain>
                         ((const char *) K_h2, tile_K, k_VKQ_0, k_VKQ_sup, k0_start, k0_stop - k0_start, kvarn_smem);
                 } else {
                     const int k0_diff = k0_stop - k0_start;
@@ -1124,9 +1125,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
         if constexpr (nstages <= 1) {
             if constexpr (!is_turbo_kv) {
-                if constexpr (type_V == GGML_CUDA_FATTN_KVARN_TYPE) {
+                if constexpr (ggml_cuda_fattn_kvarn_template_type(type_V)) {
+                    constexpr bool kvarn_original_domain = type_V == GGML_CUDA_FATTN_KVARN_ORIGINAL_TYPE;
                     constexpr int nthreads_kvarn = nwarps * ggml_cuda_get_physical_warp_size();
-                    flash_attn_ext_kvarn_load_tile<DV, stride_tile_V, nbatch_fa, nthreads_kvarn, oob_check>
+                    flash_attn_ext_kvarn_load_tile<DV, stride_tile_V, nbatch_fa, nthreads_kvarn, oob_check, kvarn_original_domain>
                         ((const char *) V_h2, tile_V, k_VKQ_0, k_VKQ_sup, i0_start / 2, nbatch_V2, kvarn_smem);
                     __syncthreads();
                 } else {
@@ -1355,7 +1357,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols);
     constexpr int  nbatch_combine  = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols);
-    constexpr bool is_kvarn_kv     = (type_K == GGML_CUDA_FATTN_KVARN_TYPE || type_V == GGML_CUDA_FATTN_KVARN_TYPE);
+    constexpr bool is_kvarn_kv     = ggml_cuda_fattn_kvarn_template_type(type_K) || ggml_cuda_fattn_kvarn_template_type(type_V);
     constexpr bool is_turbo_kv     = !is_kvarn_kv && (type_K != GGML_TYPE_F16 || type_V != GGML_TYPE_F16);
     constexpr int  nstages         = (is_turbo_kv || is_kvarn_kv) ? 0 : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2);
 
@@ -1981,7 +1983,7 @@ static __global__ void flash_attn_ext_f16(
 
     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
 
-    constexpr bool is_kvarn_kv = (type_K == GGML_CUDA_FATTN_KVARN_TYPE || type_V == GGML_CUDA_FATTN_KVARN_TYPE);
+    constexpr bool is_kvarn_kv = ggml_cuda_fattn_kvarn_template_type(type_K) || ggml_cuda_fattn_kvarn_template_type(type_V);
     constexpr bool is_turbo_kv = !is_kvarn_kv && (type_K != GGML_TYPE_F16 || type_V != GGML_TYPE_F16);
 
     const int stride_Q1   = nb01 / sizeof(float2);
