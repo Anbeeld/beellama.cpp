@@ -239,9 +239,11 @@ static void test_tile_quantization(llama_kvarn_type type) {
 // Proof that KVarN rotated-domain attention is algebraically equivalent to the
 // original-domain decode path, using only the CPU reference quant/dequant. Let R = the
 // normalized WHT-128 (symmetric involution: R^2 = I, verified separately by
-// test_hadamard_roundtrip). KVarN stores K_rot = R*K, V_rot = R*V; reference decode
-// reconstructs X_orig = R*dequant(record). Rotated-domain attention skips that
-// inverse-WHT and instead rotates the query / inverse-rotates the output:
+// test_hadamard_roundtrip). KVarN compressed records store K_rot = R*K and
+// V_rot = R*V, while live fp16 stage rows are kept original-domain. Reference
+// decode reconstructs X_orig = R*dequant(record) for records. Rotated-domain
+// attention skips that inverse-WHT and instead rotates the query / inverse-rotates
+// the output:
 //   K:  Q . K_orig[:,c]        == (R Q) . K_rot[:,c]
 //   V:  sum_t w[t] V_orig[t,:] == R ( sum_t w[t] V_rot[t,:] )
 static void test_rotated_domain_equivalence() {
@@ -424,7 +426,8 @@ static std::vector<ggml_fp16_t> test_kvarn_reference_decode(
             const int64_t group = abs_pos / 128;
             const int64_t pos = abs_pos % 128;
             for (int h = 0; h < n_heads; ++h) {
-                std::array<float, 128> rotated = {};
+                std::array<float, 128> values = {};
+                bool values_original = false;
                 bool from_stage;
                 bool from_record;
                 int64_t stage_pos = 0;
@@ -447,23 +450,24 @@ static std::vector<ggml_fp16_t> test_kvarn_reference_decode(
                     require(stage_pos >= 0 && stage_pos < stage->ne[2], "reference decode stage offset out of range");
                     for (int d = 0; d < 128; ++d) {
                         const size_t off = (size_t) d + (size_t) h * 128 + (size_t) stage_pos * 128 * n_heads;
-                        rotated[d] = ggml_fp16_to_fp32(stage_data[off]);
+                        values[d] = ggml_fp16_to_fp32(stage_data[off]);
                     }
+                    values_original = true;
                 } else if (from_record) {
                     require(record_group >= 0 && record_group < records->ne[2], "reference decode record offset out of range");
                     const size_t record_off = ((size_t) record_group * n_heads + h) * (size_t) records->ne[0];
                     const uint8_t * record = record_data.data() + record_off;
                     for (int d = 0; d < 128; ++d) {
-                        rotated[d] = test_kvarn_record_value(record, bits, value, (int) pos, d);
+                        values[d] = test_kvarn_record_value(record, bits, value, (int) pos, d);
                     }
                 }
-                if (!emit_rotated) {
-                    llama_kvarn_hadamard_128(rotated.data());
+                if (emit_rotated == values_original) {
+                    llama_kvarn_hadamard_128(values.data());
                 }
                 for (int d = 0; d < 128; ++d) {
                     const size_t out_off = (size_t) d + (size_t) h * 128 +
                         (size_t) cell * 128 * n_heads + (size_t) out_stream * 128 * n_heads * n_kv;
-                    output[out_off] = ggml_fp32_to_fp16(rotated[d]);
+                    output[out_off] = ggml_fp32_to_fp16(values[d]);
                 }
             }
         }
@@ -955,7 +959,9 @@ static std::vector<float> test_native_flash_attention_output(
     const int v_record_bytes = int(llama_kvarn_packed_bytes(128 * 128, bits_v) + 3 * 128 * sizeof(ggml_fp16_t));
 
     ggml_tensor * q_in = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_dim, n_q, n_q_heads, n_stream);
-    ggml_tensor * kvarn_rot = native_view && rotate_graph ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 128) : nullptr;
+    const bool use_q_rot = native_view && rotate_graph;
+    const bool use_output_rot = use_q_rot;
+    ggml_tensor * kvarn_rot = use_q_rot ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 128) : nullptr;
     ggml_tensor * q = kvarn_rot ? apply_hadamard_128(ctx, q_in, kvarn_rot) : q_in;
     ggml_tensor * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_kv * n_stream);
     ggml_tensor * current_k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, record_heads, n_kv * n_stream);
@@ -986,8 +992,13 @@ static std::vector<float> test_native_flash_attention_output(
 
     ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_q, 1, n_stream);
     ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, mask, 1.0f / std::sqrt(float(head_dim)), 0.0f, 0.0f);
+    if (native_view) {
+        out->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN] = rotate_graph ?
+            GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED :
+            GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ORIGINAL;
+    }
     ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
-    if (kvarn_rot) {
+    if (use_output_rot) {
         out = ggml_cont(ctx, out);
         out = apply_hadamard_128(ctx, out, kvarn_rot);
     }
@@ -1089,6 +1100,238 @@ static std::vector<float> test_native_flash_attention_output(
     return output;
 }
 
+static std::vector<float> test_native_flash_attention_segmented_output(
+        ggml_backend_t backend,
+        bool           native_view,
+        int            head_dim,
+        int            bits_k,
+        int            bits_v,
+        int            n_q,
+        int            n_q_heads,
+        int            n_kv_heads,
+        int            n_segments,
+        int            segment_tokens,
+        int            stage_groups,
+        bool           swa = false,
+        int            n_kv_override = 0,
+        bool           ring_view = false,
+        int            sliding_window = 0,
+        float          attn_scale = 0.0f,
+        bool           scramble_view = false) {
+    ggml_init_params params = {
+        /*.mem_size   =*/ 64 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr, "segmented native FA: failed to initialize ggml context");
+
+    constexpr int n_stream = 1;
+    const int n_total_tokens = n_segments * segment_tokens;
+    const int n_kv = n_kv_override > 0 ? n_kv_override : n_total_tokens;
+    require(n_kv <= n_total_tokens, "segmented native FA: view cannot exceed stored tokens");
+    require(n_q <= segment_tokens, "segmented native FA: q width must fit in final segment");
+    require(segment_tokens > 0 && (segment_tokens % 128) == 0, "segmented native FA: segment size must be tile aligned");
+    const int slices = head_dim / 128;
+    const int record_heads = n_kv_heads * slices;
+    const int groups_per_stream = std::max(4, (n_kv + 127) / 128 + (swa ? 2 : 0));
+    const int k_record_bytes = int(llama_kvarn_packed_bytes(128 * 128, bits_k) + 3 * 128 * sizeof(ggml_fp16_t));
+    const int v_record_bytes = int(llama_kvarn_packed_bytes(128 * 128, bits_v) + 3 * 128 * sizeof(ggml_fp16_t));
+
+    ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_dim, n_q, n_q_heads, n_stream);
+    ggml_tensor * k_stage = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, record_heads, 128 * stage_groups * n_stream);
+    ggml_tensor * v_stage = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, record_heads, 128 * stage_groups * n_stream);
+    ggml_tensor * k_records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, k_record_bytes, record_heads, groups_per_stream * n_stream);
+    ggml_tensor * v_records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, v_record_bytes, record_heads, groups_per_stream * n_stream);
+    ggml_tensor * view_indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_kv * n_stream);
+
+    std::vector<ggml_tensor *> current_k_segments;
+    std::vector<ggml_tensor *> current_v_segments;
+    std::vector<ggml_tensor *> indices_segments;
+    current_k_segments.reserve(n_segments);
+    current_v_segments.reserve(n_segments);
+    indices_segments.reserve(n_segments);
+
+    ggml_tensor * stored_k = k_stage;
+    ggml_tensor * stored_v = v_stage;
+    for (int segment = 0; segment < n_segments; ++segment) {
+        ggml_tensor * current_k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, record_heads, segment_tokens * n_stream);
+        ggml_tensor * current_v = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, record_heads, segment_tokens * n_stream);
+        ggml_tensor * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, segment_tokens * n_stream);
+        current_k_segments.push_back(current_k);
+        current_v_segments.push_back(current_v);
+        indices_segments.push_back(indices);
+
+        stored_k = ggml_kvarn_store(ctx, current_k, indices, stored_k, k_records, bits_k, 16, false, stage_groups);
+        stored_v = ggml_kvarn_store(ctx, current_v, indices, stored_v, v_records, bits_v, 16, true,  stage_groups);
+        stored_k->op_params[3] = segment_tokens;
+        stored_v->op_params[3] = segment_tokens;
+        if (swa) {
+            stored_k->op_params[4] = 1;
+            stored_v->op_params[4] = 1;
+        }
+    }
+
+    ggml_tensor * k_ref = native_view ? nullptr : ggml_new_tensor_4d(ctx, GGML_TYPE_F16, head_dim, n_kv_heads, n_kv, n_stream);
+    ggml_tensor * v_ref = native_view ? nullptr : ggml_new_tensor_4d(ctx, GGML_TYPE_F16, head_dim, n_kv_heads, n_kv, n_stream);
+    ggml_tensor * k = native_view ?
+        ggml_kvarn_view(ctx, k_records, stored_k, view_indices, n_kv, 0, n_stream, bits_k, false, stage_groups) : k_ref;
+    ggml_tensor * v = native_view ?
+        ggml_kvarn_view(ctx, v_records, stored_v, view_indices, n_kv, 0, n_stream, bits_v, true,  stage_groups) : v_ref;
+    if (native_view && swa) {
+        k->op_params[6] = 1;
+        v->op_params[6] = 1;
+    }
+
+    if (native_view && slices > 1) {
+        k = ggml_reshape_4d(ctx, k, head_dim, n_kv_heads, n_kv, n_stream);
+        v = ggml_reshape_4d(ctx, v, head_dim, n_kv_heads, n_kv, n_stream);
+    }
+    k = ggml_permute(ctx, k, 0, 2, 1, 3);
+    v = ggml_permute(ctx, v, 0, 2, 1, 3);
+
+    ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_q, 1, n_stream);
+    const float scale = attn_scale > 0.0f ? attn_scale : 1.0f / std::sqrt(float(head_dim));
+    ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, mask, scale, 0.0f, 0.0f);
+    if (native_view) {
+        out->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN] = GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ORIGINAL;
+    }
+    ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+
+    ggml_cgraph * store_graph = nullptr;
+    if (!native_view) {
+        store_graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(store_graph, stored_k);
+        ggml_build_forward_expand(store_graph, stored_v);
+    }
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, out);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    require(buffer != nullptr, "segmented native FA: failed to allocate tensors");
+
+    std::vector<float> q_data((size_t) head_dim * n_q * n_q_heads * n_stream);
+    for (int qh = 0; qh < n_q_heads; ++qh) {
+        for (int iq = 0; iq < n_q; ++iq) {
+            const int abs_q = n_total_tokens - n_q + iq;
+            for (int d = 0; d < head_dim; ++d) {
+                q_data[((size_t) qh * n_q + iq) * head_dim + d] =
+                    0.08f * std::sin(float(d) * 0.019f + float(abs_q) * 0.037f + float(qh) * 0.023f) +
+                    0.06f * std::cos(float(d) * 0.041f - float(abs_q) * 0.029f + float(qh) * 0.017f);
+            }
+        }
+    }
+
+    std::vector<std::vector<float>> k_segment_data;
+    std::vector<std::vector<float>> v_segment_data;
+    std::vector<std::vector<int64_t>> idx_segment_data;
+    k_segment_data.reserve(n_segments);
+    v_segment_data.reserve(n_segments);
+    idx_segment_data.reserve(n_segments);
+
+    for (int segment = 0; segment < n_segments; ++segment) {
+        const int base_token = segment * segment_tokens;
+        std::vector<float> k_data((size_t) 128 * record_heads * segment_tokens * n_stream);
+        std::vector<float> v_data(k_data.size());
+        std::vector<int64_t> idx(segment_tokens * n_stream);
+
+        for (int t = 0; t < segment_tokens; ++t) {
+            const int abs_t = base_token + t;
+            idx[t] = int64_t(abs_t);
+            for (int h = 0; h < n_kv_heads; ++h) {
+                for (int slice = 0; slice < slices; ++slice) {
+                    const int record_head = h * slices + slice;
+                    for (int d = 0; d < 128; ++d) {
+                        const int full_d = slice * 128 + d;
+                        const size_t off = ((size_t) t * record_heads + record_head) * 128 + d;
+                        k_data[off] =
+                            0.82f * std::sin(float(full_d) * 0.010f + float(abs_t) * 0.023f) +
+                            0.09f * std::cos(float(abs_t) * 0.007f + float(h) * 0.19f);
+                        v_data[off] =
+                            0.73f * std::cos(float(full_d) * 0.012f - float(abs_t) * 0.017f) +
+                            0.10f * std::sin(float(abs_t) * 0.013f + float(h) * 0.29f);
+                    }
+                }
+            }
+        }
+
+        k_segment_data.push_back(std::move(k_data));
+        v_segment_data.push_back(std::move(v_data));
+        idx_segment_data.push_back(std::move(idx));
+    }
+
+    std::vector<int64_t> view_idx(n_kv * n_stream);
+    const int view_base = n_total_tokens - n_kv;
+    if (ring_view) {
+        const int last = n_total_tokens - 1;
+        for (int i = 0; i < n_kv * n_stream; ++i) {
+            int abs_pos = last - ((last - i) % n_kv + n_kv) % n_kv;
+            if (abs_pos < view_base) {
+                abs_pos -= n_kv;
+            }
+            view_idx[i] = abs_pos >= view_base ? int64_t(abs_pos) : int64_t(-1);
+        }
+    } else {
+        for (int i = 0; i < n_kv * n_stream; ++i) {
+            view_idx[i] = int64_t(view_base + i);
+        }
+    }
+    if (scramble_view && n_kv >= 128) {
+        std::swap(view_idx[1], view_idx[2]);
+        std::swap(view_idx[65], view_idx[66]);
+    }
+
+    std::vector<ggml_fp16_t> mask_data((size_t) n_kv * n_q * n_stream);
+    for (int iq = 0; iq < n_q; ++iq) {
+        const int abs_q = n_total_tokens - n_q + iq;
+        for (int ikv = 0; ikv < n_kv; ++ikv) {
+            const bool visible = view_idx[ikv] <= abs_q &&
+                (sliding_window <= 0 || abs_q - view_idx[ikv] < sliding_window);
+            mask_data[(size_t) iq * n_kv + ikv] = ggml_fp32_to_fp16(visible ? 0.0f : -INFINITY);
+        }
+    }
+
+    std::vector<uint8_t> k_stage_zeros(ggml_nbytes(k_stage), 0);
+    std::vector<uint8_t> v_stage_zeros(ggml_nbytes(v_stage), 0);
+    std::vector<uint8_t> k_record_zeros(ggml_nbytes(k_records), 0);
+    std::vector<uint8_t> v_record_zeros(ggml_nbytes(v_records), 0);
+
+    ggml_backend_tensor_set(q, q_data.data(), 0, ggml_nbytes(q));
+    ggml_backend_tensor_set(k_stage, k_stage_zeros.data(), 0, k_stage_zeros.size());
+    ggml_backend_tensor_set(v_stage, v_stage_zeros.data(), 0, v_stage_zeros.size());
+    ggml_backend_tensor_set(k_records, k_record_zeros.data(), 0, k_record_zeros.size());
+    ggml_backend_tensor_set(v_records, v_record_zeros.data(), 0, v_record_zeros.size());
+    ggml_backend_tensor_set(view_indices, view_idx.data(), 0, ggml_nbytes(view_indices));
+    ggml_backend_tensor_set(mask, mask_data.data(), 0, ggml_nbytes(mask));
+
+    for (int segment = 0; segment < n_segments; ++segment) {
+        ggml_backend_tensor_set(current_k_segments[segment], k_segment_data[segment].data(), 0, ggml_nbytes(current_k_segments[segment]));
+        ggml_backend_tensor_set(current_v_segments[segment], v_segment_data[segment].data(), 0, ggml_nbytes(current_v_segments[segment]));
+        ggml_backend_tensor_set(indices_segments[segment], idx_segment_data[segment].data(), 0, ggml_nbytes(indices_segments[segment]));
+    }
+
+    if (!native_view) {
+        require(ggml_backend_graph_compute(backend, store_graph) == GGML_STATUS_SUCCESS,
+                "segmented native FA: reference store graph compute failed");
+        const std::vector<ggml_fp16_t> k_ref_data = test_kvarn_reference_decode(
+                k_records, stored_k, view_idx, n_kv, 0, n_stream, bits_k, false, stage_groups, false, swa);
+        const std::vector<ggml_fp16_t> v_ref_data = test_kvarn_reference_decode(
+                v_records, stored_v, view_idx, n_kv, 0, n_stream, bits_v, true, stage_groups, false, swa);
+        ggml_backend_tensor_set(k_ref, k_ref_data.data(), 0, ggml_nbytes(k_ref));
+        ggml_backend_tensor_set(v_ref, v_ref_data.data(), 0, ggml_nbytes(v_ref));
+    }
+
+    require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
+            native_view ? "segmented native FA: native-view graph compute failed" : "segmented native FA: reference graph compute failed");
+
+    std::vector<float> output(ggml_nelements(out));
+    ggml_backend_tensor_get(out, output.data(), 0, ggml_nbytes(out));
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    return output;
+}
+
 static void require_close_f32_rmse(
         const std::vector<float> & actual,
         const std::vector<float> & expected,
@@ -1111,6 +1354,167 @@ static void require_close_f32_rmse(
                 rmse, max_diff, double(rmse_limit));
         require(false, message);
     }
+}
+
+static void require_segmented_raw_roundtrip(
+        ggml_backend_t backend,
+        int            head_dim,
+        int            bits,
+        bool           value,
+        int            n_heads,
+        int            n_segments,
+        int            segment_tokens,
+        int            stage_groups,
+        float          rmse_limit,
+        const char *   message,
+        bool           swa = false,
+        int            n_kv_override = 0,
+        bool           ring_view = false) {
+    ggml_init_params params = {
+        /*.mem_size   =*/ 32 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr, "segmented raw roundtrip: failed to initialize ggml context");
+
+    const int n_tokens = n_segments * segment_tokens;
+    const int n_kv = n_kv_override > 0 ? n_kv_override : n_tokens;
+    require(n_kv <= n_tokens, "segmented raw roundtrip: view cannot exceed stored tokens");
+    const int slices = head_dim / 128;
+    const int record_heads = n_heads * slices;
+    const int groups_per_stream = std::max(4, (swa ? (n_kv + 127) / 128 + 2 : (n_tokens + 127) / 128));
+    const int record_bytes = int(llama_kvarn_packed_bytes(128 * 128, bits) + 3 * 128 * sizeof(ggml_fp16_t));
+
+    ggml_tensor * stage = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, record_heads, 128 * stage_groups);
+    ggml_tensor * records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, record_bytes, record_heads, groups_per_stream);
+
+    std::vector<ggml_tensor *> currents;
+    std::vector<ggml_tensor *> indices_tensors;
+    currents.reserve(n_segments);
+    indices_tensors.reserve(n_segments);
+
+    ggml_tensor * stored = stage;
+    for (int segment = 0; segment < n_segments; ++segment) {
+        ggml_tensor * current = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, record_heads, segment_tokens);
+        ggml_tensor * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, segment_tokens);
+        currents.push_back(current);
+        indices_tensors.push_back(indices);
+
+        stored = ggml_kvarn_store(ctx, current, indices, stored, records, bits, 16, value, stage_groups);
+        stored->op_params[3] = segment_tokens;
+        if (swa) {
+            stored->op_params[4] = 1;
+        }
+    }
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, stored);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    require(buffer != nullptr, "segmented raw roundtrip: failed to allocate tensors");
+
+    std::vector<float> expected((size_t) n_tokens * n_heads * head_dim);
+    std::vector<std::vector<float>> segment_data;
+    std::vector<std::vector<int64_t>> idx_data;
+    segment_data.reserve(n_segments);
+    idx_data.reserve(n_segments);
+
+    for (int segment = 0; segment < n_segments; ++segment) {
+        const int base_token = segment * segment_tokens;
+        std::vector<float> data((size_t) 128 * record_heads * segment_tokens);
+        std::vector<int64_t> idx(segment_tokens);
+        for (int t = 0; t < segment_tokens; ++t) {
+            const int abs_t = base_token + t;
+            idx[t] = int64_t(abs_t);
+            for (int h = 0; h < n_heads; ++h) {
+                for (int slice = 0; slice < slices; ++slice) {
+                    const int record_head = h * slices + slice;
+                    for (int d = 0; d < 128; ++d) {
+                        const int full_d = slice * 128 + d;
+                        const float x =
+                            0.67f * std::sin(float(full_d) * 0.013f + float(abs_t) * 0.017f + float(h) * 0.07f) +
+                            0.21f * std::cos(float(full_d) * 0.037f - float(abs_t) * 0.011f + float(h) * 0.13f);
+                        data[((size_t) t * record_heads + record_head) * 128 + d] = x;
+                        expected[((size_t) abs_t * n_heads + h) * head_dim + full_d] = x;
+                    }
+                }
+            }
+        }
+        segment_data.push_back(std::move(data));
+        idx_data.push_back(std::move(idx));
+    }
+
+    std::vector<uint8_t> stage_zeros(ggml_nbytes(stage), 0);
+    std::vector<uint8_t> record_zeros(ggml_nbytes(records), 0);
+    ggml_backend_tensor_set(stage, stage_zeros.data(), 0, stage_zeros.size());
+    ggml_backend_tensor_set(records, record_zeros.data(), 0, record_zeros.size());
+    for (int segment = 0; segment < n_segments; ++segment) {
+        ggml_backend_tensor_set(currents[segment], segment_data[segment].data(), 0, ggml_nbytes(currents[segment]));
+        ggml_backend_tensor_set(indices_tensors[segment], idx_data[segment].data(), 0, ggml_nbytes(indices_tensors[segment]));
+    }
+
+    require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
+            "segmented raw roundtrip: store graph compute failed");
+
+    std::vector<int64_t> view_idx;
+    if (swa) {
+        view_idx.resize(n_kv);
+        const int view_base = n_tokens - n_kv;
+        if (ring_view) {
+            const int last = n_tokens - 1;
+            for (int i = 0; i < n_kv; ++i) {
+                int abs_pos = last - ((last - i) % n_kv + n_kv) % n_kv;
+                if (abs_pos < view_base) {
+                    abs_pos -= n_kv;
+                }
+                view_idx[i] = abs_pos >= view_base ? int64_t(abs_pos) : int64_t(-1);
+            }
+        } else {
+            for (int i = 0; i < n_kv; ++i) {
+                view_idx[i] = int64_t(view_base + i);
+            }
+        }
+    }
+
+    const std::vector<ggml_fp16_t> decoded = test_kvarn_reference_decode(
+            records, stored, swa ? view_idx : idx_data.back(), n_kv, 0, 1, bits, value, stage_groups, false, swa);
+    double mse = 0.0;
+    double max_diff = 0.0;
+    size_t n_checked = 0;
+    for (int t = 0; t < n_kv; ++t) {
+        const int expected_token = swa ? int(view_idx[t]) : t;
+        if (expected_token < 0) {
+            continue;
+        }
+        for (int h = 0; h < n_heads; ++h) {
+            for (int slice = 0; slice < slices; ++slice) {
+                const int record_head = h * slices + slice;
+                for (int d = 0; d < 128; ++d) {
+                    const int full_d = slice * 128 + d;
+                    const size_t decoded_off = (size_t) d + (size_t) record_head * 128 +
+                        (size_t) t * 128 * record_heads;
+                    const size_t expected_off = ((size_t) expected_token * n_heads + h) * head_dim + full_d;
+                    const double diff = double(ggml_fp16_to_fp32(decoded[decoded_off])) - double(expected[expected_off]);
+                    mse += diff * diff;
+                    ++n_checked;
+                    max_diff = std::max(max_diff, std::fabs(diff));
+                }
+            }
+        }
+    }
+    require(n_checked > 0, "segmented raw roundtrip: no cells checked");
+
+    const double rmse = std::sqrt(mse / double(n_checked));
+    if (!std::isfinite(rmse) || rmse > rmse_limit) {
+        std::fprintf(stderr,
+                "segmented raw KVarN roundtrip mismatch: rmse=%g max_diff=%g limit=%g\n",
+                rmse, max_diff, double(rmse_limit));
+        require(false, message);
+    }
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
 }
 
 static bool backend_supports_kvarn_flash_attention_shape(ggml_backend_t backend, int head_dim) {
@@ -1194,9 +1598,9 @@ static void test_native_flash_attention_gpu() {
 
         constexpr int n_q_prefill = 64;
         const std::vector<float> expected_prefill = test_native_flash_attention_output(cpu_backend, false, false, head_dim, 4, 3, n_q_prefill);
-        const std::vector<float> actual_prefill   = test_native_flash_attention_output(gpu_backend, true,  true,  head_dim, 4, 3, n_q_prefill);
+        const std::vector<float> actual_prefill   = test_native_flash_attention_output(gpu_backend, true,  false, head_dim, 4, 3, n_q_prefill);
         require_close_f32_rmse(actual_prefill, expected_prefill, 1e-2f,
-                "large-prefill KVarN FlashAttention fallback differs from CPU reference decode");
+                "large-prefill original-domain KVarN FlashAttention differs from CPU reference");
     }
 
     {
@@ -1209,9 +1613,146 @@ static void test_native_flash_attention_gpu() {
         const std::vector<float> expected_prefill = test_native_flash_attention_output(
                 cpu_backend, false, false, head_dim, 4, 4, n_q_prefill, n_q_heads, n_kv_heads, n_kv, stage_groups);
         const std::vector<float> actual_prefill = test_native_flash_attention_output(
-                gpu_backend, true, true, head_dim, 4, 4, n_q_prefill, n_q_heads, n_kv_heads, n_kv, stage_groups);
+                gpu_backend, true, false, head_dim, 4, 4, n_q_prefill, n_q_heads, n_kv_heads, n_kv, stage_groups);
         require_close_f32_rmse(actual_prefill, expected_prefill, 1e-2f,
-                "large-prefill multi-head KVarN FlashAttention fallback differs from CPU reference decode");
+                "large-prefill multi-head original-domain KVarN FlashAttention differs from CPU reference");
+    }
+
+    {
+        constexpr int head_dim = 512;
+        constexpr int n_q_prefill = 256;
+        constexpr int n_q_heads = 32;
+        constexpr int n_kv_heads = 4;
+        constexpr int n_segments = 16;
+        constexpr int segment_tokens = 256;
+        constexpr int stage_groups = 19;
+        require_segmented_raw_roundtrip(gpu_backend, head_dim, 8, false, n_kv_heads,
+                n_segments, segment_tokens, stage_groups, 3e-2f,
+                "segmented D512 KVarN8 K roundtrip differs from original-domain input");
+        require_segmented_raw_roundtrip(gpu_backend, head_dim, 8, true, n_kv_heads,
+                n_segments, segment_tokens, stage_groups, 3e-2f,
+                "segmented D512 KVarN8 V roundtrip differs from original-domain input");
+        const std::vector<float> expected_prefill = test_native_flash_attention_segmented_output(
+                gpu_backend, false, head_dim, 4, 4, n_q_prefill, n_q_heads, n_kv_heads,
+                n_segments, segment_tokens, stage_groups);
+        const std::vector<float> actual_prefill = test_native_flash_attention_segmented_output(
+                gpu_backend, true, head_dim, 4, 4, n_q_prefill, n_q_heads, n_kv_heads,
+                n_segments, segment_tokens, stage_groups);
+        require_close_f32_rmse(actual_prefill, expected_prefill, 1e-2f,
+                "segmented Gemma-style original-domain KVarN FlashAttention differs from materialized reference");
+    }
+
+    {
+        constexpr int head_dim = 512;
+        constexpr int n_q_prefill = 256;
+        constexpr int n_q_heads = 8;
+        constexpr int n_kv_heads = 1;
+        constexpr int n_segments = 64;
+        constexpr int segment_tokens = 256;
+        constexpr int stage_groups = 19;
+        constexpr float gemma_attn_scale = 1.0f;
+        const std::vector<float> expected_prefill = test_native_flash_attention_segmented_output(
+                gpu_backend, false, head_dim, 8, 8, n_q_prefill, n_q_heads, n_kv_heads,
+                n_segments, segment_tokens, stage_groups, false, 0, false, 0, gemma_attn_scale);
+        const std::vector<float> actual_prefill = test_native_flash_attention_segmented_output(
+                gpu_backend, true, head_dim, 8, 8, n_q_prefill, n_q_heads, n_kv_heads,
+                n_segments, segment_tokens, stage_groups, false, 0, false, 0, gemma_attn_scale);
+        require_close_f32_rmse(actual_prefill, expected_prefill, 1e-2f,
+                "deep D512 original-domain KVarN8 FlashAttention differs from materialized reference");
+    }
+
+    {
+        constexpr int head_dim = 256;
+        constexpr int n_q_prefill = 256;
+        constexpr int n_q_heads = 32;
+        constexpr int n_kv_heads = 16;
+        constexpr int n_segments = 8;
+        constexpr int segment_tokens = 256;
+        constexpr int n_swa_window = 1280;
+        constexpr int stage_groups = 3;
+        const std::vector<float> expected_prefill = test_native_flash_attention_segmented_output(
+                gpu_backend, false, head_dim, 8, 8, n_q_prefill, n_q_heads, n_kv_heads,
+                n_segments, segment_tokens, stage_groups, true, n_swa_window);
+        const std::vector<float> actual_prefill = test_native_flash_attention_segmented_output(
+                gpu_backend, true, head_dim, 8, 8, n_q_prefill, n_q_heads, n_kv_heads,
+                n_segments, segment_tokens, stage_groups, true, n_swa_window);
+        require_close_f32_rmse(actual_prefill, expected_prefill, 1e-2f,
+                "segmented Gemma-style SWA original-domain KVarN FlashAttention differs from materialized reference");
+    }
+
+    {
+        constexpr int head_dim = 256;
+        constexpr int n_kv_heads = 16;
+        constexpr int n_segments = 64;
+        constexpr int segment_tokens = 256;
+        constexpr int n_swa_window = 1280;
+        constexpr int stage_groups = 3;
+        require_segmented_raw_roundtrip(gpu_backend, head_dim, 8, false, n_kv_heads,
+                n_segments, segment_tokens, stage_groups, 3e-2f,
+                "wrapped SWA D256 KVarN8 K roundtrip differs from original-domain input",
+                true, n_swa_window, true);
+        require_segmented_raw_roundtrip(gpu_backend, head_dim, 8, true, n_kv_heads,
+                n_segments, segment_tokens, stage_groups, 3e-2f,
+                "wrapped SWA D256 KVarN8 V roundtrip differs from original-domain input",
+                true, n_swa_window, true);
+    }
+
+    {
+        constexpr int head_dim = 512;
+        constexpr int n_kv_heads = 1;
+        constexpr int n_segments = 64;
+        constexpr int segment_tokens = 256;
+        constexpr int n_swa_window = 1280;
+        constexpr int stage_groups = 3;
+        require_segmented_raw_roundtrip(gpu_backend, head_dim, 8, false, n_kv_heads,
+                n_segments, segment_tokens, stage_groups, 3e-2f,
+                "wrapped SWA D512 KVarN8 K roundtrip differs from original-domain input",
+                true, n_swa_window, true);
+        require_segmented_raw_roundtrip(gpu_backend, head_dim, 8, true, n_kv_heads,
+                n_segments, segment_tokens, stage_groups, 3e-2f,
+                "wrapped SWA D512 KVarN8 V roundtrip differs from original-domain input",
+                true, n_swa_window, true);
+    }
+
+    {
+        constexpr int head_dim = 256;
+        constexpr int n_q_prefill = 256;
+        constexpr int n_q_heads = 32;
+        constexpr int n_kv_heads = 16;
+        constexpr int n_segments = 64;
+        constexpr int segment_tokens = 256;
+        constexpr int n_swa_window = 1280;
+        constexpr int n_swa_visible = 1024;
+        constexpr int stage_groups = 3;
+        constexpr float gemma_attn_scale = 1.0f;
+        const std::vector<float> expected_prefill = test_native_flash_attention_segmented_output(
+                gpu_backend, false, head_dim, 8, 8, n_q_prefill, n_q_heads, n_kv_heads,
+                n_segments, segment_tokens, stage_groups, true, n_swa_window, true, n_swa_visible, gemma_attn_scale);
+        const std::vector<float> actual_prefill = test_native_flash_attention_segmented_output(
+                gpu_backend, true, head_dim, 8, 8, n_q_prefill, n_q_heads, n_kv_heads,
+                n_segments, segment_tokens, stage_groups, true, n_swa_window, true, n_swa_visible, gemma_attn_scale);
+        require_close_f32_rmse(actual_prefill, expected_prefill, 1e-2f,
+                "wrapped Gemma-style SWA original-domain KVarN FlashAttention differs from materialized reference");
+    }
+
+    {
+        constexpr int head_dim = 512;
+        constexpr int n_q_prefill = 128;
+        constexpr int n_q_heads = 4;
+        constexpr int n_kv_heads = 1;
+        constexpr int n_segments = 8;
+        constexpr int segment_tokens = 256;
+        constexpr int n_swa_window = 768;
+        constexpr int stage_groups = 3;
+        constexpr float gemma_attn_scale = 1.0f;
+        const std::vector<float> expected_prefill = test_native_flash_attention_segmented_output(
+                gpu_backend, false, head_dim, 8, 8, n_q_prefill, n_q_heads, n_kv_heads,
+                n_segments, segment_tokens, stage_groups, true, n_swa_window, false, 0, gemma_attn_scale, true);
+        const std::vector<float> actual_prefill = test_native_flash_attention_segmented_output(
+                gpu_backend, true, head_dim, 8, 8, n_q_prefill, n_q_heads, n_kv_heads,
+                n_segments, segment_tokens, stage_groups, true, n_swa_window, false, 0, gemma_attn_scale, true);
+        require_close_f32_rmse(actual_prefill, expected_prefill, 1e-2f,
+                "scrambled SWA D512 original-domain KVarN FlashAttention differs from materialized reference");
     }
 
     {

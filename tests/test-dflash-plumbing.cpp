@@ -466,11 +466,27 @@ int main(int argc, char ** argv) {
                  kv_cache_kvarn_cpp.find("ggml_kvarn_materialize") == std::string::npos,
         "KVarN cache get_k/get_v must not retain a materialize graph path");
     ok &= expect(kv_cache_kvarn_h.find("ceil((n_batch + n_ubatch) / KVAR_N_GROUP)") != std::string::npos &&
-                 kv_cache_kvarn_cpp.find("? n_ubatch : n_batch + n_ubatch") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("((n_batch + n_ubatch + KVAR_N_GROUP - 1u) / KVAR_N_GROUP)") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("kvarn_stage_tail_groups(") != std::string::npos &&
                  contains_ws(model_cpp, "cparams.n_ctx_seq, cparams.n_seq_max, cparams.n_batch, cparams.n_ubatch") &&
                  contains_ws(kv_cache_iswa_cpp, "size, n_seq_max, n_batch, n_ubatch") &&
                  contains_ws(memory_hybrid_iswa, "kv_size, n_seq_max, n_batch, n_ubatch"),
         "KVarN non-SWA stage depth must size from n_batch plus one n_ubatch and all construction paths must pass n_batch");
+    ok &= expect(kv_cache_kvarn_h.find("SWA tail_groups     = max(2, ceil(min(kv_size, n_swa + n_ubatch) / KVAR_N_GROUP) + 1)") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("const uint32_t swa_stage_cells = std::min(kv_size, n_swa + n_ubatch);") != std::string::npos &&
+                 contains_ws(kv_cache_kvarn_cpp, "is_swa ? ((swa_stage_cells + KVAR_N_GROUP - 1u) / KVAR_N_GROUP) + 1u") &&
+                 kv_cache_kvarn_cpp.find("is_swa ? 2u : 4u") != std::string::npos,
+        "KVarN SWA stage depth must cover the full sliding-window tile span, not only the physical ubatch tail");
+    ok &= expect(contains_ws(graph_cpp, "static enum ggml_flash_attn_ext_kvarn_domain llm_kvarn_attn_domain( const llama_cparams & cparams, const ggml_tensor * q, bool is_swa)") &&
+                 graph_cpp.find("if (n_q == 1)") != std::string::npos &&
+                 graph_cpp.find("GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V") != std::string::npos &&
+                 graph_cpp.find("const bool use_kvarn_mixed_domain") != std::string::npos &&
+                 ggml_cuda_kvarn.find("Live stage rows are original-domain; compressed records stay rotated-domain.") != std::string::npos &&
+                 ggml_cuda_kvarn.find("kvarn_wht_stage_tile(tile, value);") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_impl.find("const bool stage_original = loaded_from_stage;") != std::string::npos &&
+                 vulkan_kvarn_store.find("Live stage rows stay original-domain.") != std::string::npos &&
+                 vulkan_kvarn_store.find("return acc * KVAR_N_WHT_SCALE;") != std::string::npos,
+        "KVarN prefill must use mixed K-rotated/V-original attention while keeping the active F16 stage in original domain");
     ok &= expect(ggml_backend_cpp.find("pending_new_split_inputs") != std::string::npos &&
                  ggml_backend_cpp.find("split->n_inputs + pending_new_split_inputs > GGML_SCHED_MAX_SPLIT_INPUTS") != std::string::npos,
         "backend scheduler must pre-count all new cross-backend inputs for a node before deciding whether to start a new split");
@@ -2740,7 +2756,9 @@ int main(int argc, char ** argv) {
     ok &= expect(kv_cache_kvarn_cpp.find("GGML_ABORT(\"KVarN does not support position shifts\")") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("GGML_ABORT(\"KVarN does not support position division\")") != std::string::npos,
         "KVarN seq_add/seq_div must fail fast instead of logging and continuing");
-    ok &= expect(kv_cache_kvarn_cpp.find("constexpr uint32_t KVAR_N_STATE_VERSION = 5") != std::string::npos &&
+    ok &= expect(kv_cache_kvarn_cpp.find("constexpr uint32_t KVAR_N_STATE_VERSION = 6") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("if (version < 6)") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("if (version == 1)") == std::string::npos &&
                  kv_cache_kvarn_cpp.find("KVAR_N_STATE_RECORDS_FULL") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("KVAR_N_STATE_STAGE_ONLY_PARTIAL") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("const uint32_t state_kind = partial_state ? KVAR_N_STATE_STAGE_ONLY_PARTIAL : KVAR_N_STATE_RECORDS_FULL;") != std::string::npos &&
@@ -2801,6 +2819,11 @@ int main(int argc, char ** argv) {
                  kv_cache_iswa_cpp.find("n_seq_max > 1 && !unified") != std::string::npos &&
                  kv_cache_iswa_cpp.find("SWA KVarN ring requires a single stream") != std::string::npos,
         "ISWA with KVarN must keep KVarN on single-stream SWA rings and fall back only when non-unified mode creates multiple streams");
+    ok &= expect(kv_cache_kvarn_h.find("void set_input_kvarn_mat_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;") != std::string::npos &&
+                 graph_cpp.find("kvarn_swa->set_input_kvarn_mat_idxs(self_kvarn_mat_idxs_swa, ubatch);") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("const auto & sinfo = current_sinfo();") != std::string::npos &&
+                 contains_ws(kv_cache_kvarn_cpp, "data[sinfo.idxs[s][i]] = (int64_t) ubatch->pos[s*sinfo.size() + i];"),
+        "SWA KVarN native mat indexes must include the pending ubatch overlay before KV metadata is committed");
     ok &= expect(context_cpp.find("is experimental; only kvarn_k4v2_g128 is reference-aligned") == std::string::npos,
         "KVarN presets must not emit experimental/reference-aligned startup warnings");
     ok &= expect(llama_bench.find("bench_cache_type_from_name") != std::string::npos &&

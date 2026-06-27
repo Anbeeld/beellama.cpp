@@ -7445,7 +7445,8 @@ static std::vector<ggml_fp16_t> test_kvarn_reference_decode(
             const int64_t group = swa ? group_global : group_global - (int64_t) stream * groups_per_stream;
             const int64_t pos = abs_pos - group_global * 128;
             for (int h = 0; h < n_heads; ++h) {
-                std::array<float, 128> rotated = {};
+                std::array<float, 128> values = {};
+                bool values_original = false;
                 bool from_stage;
                 bool from_record;
                 int64_t stage_pos;
@@ -7470,22 +7471,25 @@ static std::vector<ggml_fp16_t> test_kvarn_reference_decode(
                     GGML_ASSERT(stage_pos >= 0 && stage_pos < stage->ne[2]);
                     for (int d = 0; d < 128; ++d) {
                         const size_t off = (size_t) d + (size_t) h * 128 + (size_t) stage_pos * 128 * n_heads;
-                        rotated[d] = ggml_fp16_to_fp32(stage_data[off]);
+                        values[d] = ggml_fp16_to_fp32(stage_data[off]);
                     }
+                    values_original = true;
                 } else if (from_record) {
                     GGML_ASSERT(record_group >= 0 && record_group < records->ne[2]);
                     const size_t record_off = ((size_t) record_group * n_heads + h) * (size_t) records->ne[0];
                     const uint8_t * record = record_data.data() + record_off;
                     for (int d = 0; d < 128; ++d) {
-                        rotated[d] = test_kvarn_record_value(record, bits, value, (int) pos, d);
+                        values[d] = test_kvarn_record_value(record, bits, value, (int) pos, d);
                     }
                 }
 
-                test_kvarn_hadamard_128(rotated.data());
+                if (!values_original) {
+                    test_kvarn_hadamard_128(values.data());
+                }
                 for (int d = 0; d < 128; ++d) {
                     const size_t out_off = (size_t) d + (size_t) h * 128 +
                         (size_t) cell * 128 * n_heads + (size_t) out_stream * 128 * n_heads * n_kv;
-                    output[out_off] = ggml_fp32_to_fp16(rotated[d]);
+                    output[out_off] = ggml_fp32_to_fp16(values[d]);
                 }
             }
         }
@@ -7495,6 +7499,12 @@ static std::vector<ggml_fp16_t> test_kvarn_reference_decode(
 }
 
 struct test_kvarn_flash_attn_ext : public test_case {
+    enum class route_domain {
+        rotated_decode,
+        original_prefill,
+        mixed_prefill,
+    };
+
     const int64_t hsk;
     const int64_t n_q;
     const int64_t n_q_heads;
@@ -7508,6 +7518,7 @@ struct test_kvarn_flash_attn_ext : public test_case {
     const bool swa;
     const int swa_base_pos; // SWA window in-group start offset (group misalignment)
     const bool swa_wrap;    // SWA: inject one ring-wrap discontinuity in cell order
+    const route_domain domain;
 
     test_kvarn_flash_attn_ext(
             int64_t hsk = 256,
@@ -7522,11 +7533,13 @@ struct test_kvarn_flash_attn_ext : public test_case {
             int stream_start = 0,
             bool swa = false,
             int swa_base_pos = 0,
-            bool swa_wrap = false)
+            bool swa_wrap = false,
+            route_domain domain = route_domain::rotated_decode)
         : hsk(hsk), n_q(n_q), n_q_heads(n_q_heads), n_kv_heads(n_kv_heads), n_kv(n_kv),
           bits_k(bits_k), bits_v(bits_v), stage_groups(stage_groups),
           n_stream(n_stream), stream_start(stream_start), swa(swa),
-          swa_base_pos(swa_base_pos), swa_wrap(swa_wrap) {}
+          swa_base_pos(swa_base_pos), swa_wrap(swa_wrap),
+          domain(swa && n_q > 1 && domain == route_domain::rotated_decode ? route_domain::mixed_prefill : domain) {}
 
     std::string vars() override {
         std::ostringstream oss;
@@ -7544,6 +7557,18 @@ struct test_kvarn_flash_attn_ext : public test_case {
         if (swa) {
             oss << ",swa_base_pos=" << swa_base_pos
                 << ",swa_wrap=" << (swa_wrap ? 1 : 0);
+        }
+        oss << ",domain=";
+        switch (domain) {
+            case route_domain::rotated_decode:
+                oss << "rotated_decode";
+                break;
+            case route_domain::original_prefill:
+                oss << "original_prefill";
+                break;
+            case route_domain::mixed_prefill:
+                oss << "mixed_prefill";
+                break;
         }
         return oss.str();
     }
@@ -7570,7 +7595,9 @@ struct test_kvarn_flash_attn_ext : public test_case {
         ggml_tensor * q_in = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, n_q, n_q_heads, n_stream);
         ggml_set_name(q_in, "q_in");
         ggml_tensor * q = q_in;
-        if (native_view) {
+        const bool use_rotated_domain = native_view &&
+            (domain == route_domain::rotated_decode || domain == route_domain::mixed_prefill);
+        if (use_rotated_domain) {
             ggml_tensor * kvarn_rot = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 128);
             ggml_set_name(kvarn_rot, "kvarn_rot");
             q = test_kvarn_apply_hadamard_128(ctx, q_in, kvarn_rot);
@@ -7624,6 +7651,20 @@ struct test_kvarn_flash_attn_ext : public test_case {
         ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_q, 1, n_stream);
         ggml_set_name(mask, "mask");
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, mask, 1.0f / std::sqrt(float(hsk)), 0.0f, 0.0f);
+        switch (domain) {
+            case route_domain::rotated_decode:
+                out->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN] =
+                    GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED;
+                break;
+            case route_domain::original_prefill:
+                out->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN] =
+                    GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ORIGINAL;
+                break;
+            case route_domain::mixed_prefill:
+                out->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN] =
+                    GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V;
+                break;
+        }
         ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
         ggml_set_name(out, "out");
         return out;
@@ -7826,7 +7867,9 @@ struct test_kvarn_flash_attn_ext : public test_case {
             return test_status_t::FAIL;
         }
         std::vector<float> expected = tensor_to_float(out_ref);
-        test_kvarn_rotate_128_chunks(expected);
+        if (domain == route_domain::rotated_decode) {
+            test_kvarn_rotate_128_chunks(expected);
+        }
 
         if (actual.size() != expected.size()) {
             print_result(true, false, "output size mismatch");
@@ -9860,9 +9903,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // fall back per cell; the older run still lands on the fast record path.
     test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 1, 6, 1, 768, 4, 4, 5, 1, 0, true, 0, true));
     test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 1, 6, 1, 768, 4, 4, 2, 1, 0, true, 0, true));
-    // D256 SWA / GQA=2 / n_q=1 is the low-parallelism vec decode regime (the only route the vec
-    // kernel serves). The vec kernel is bit-generic, so cover every KVarN K/V bit pair through it
-    // against the CPU oracle; previously only k4v4 was instantiated. gqa=2 via 2 q-heads/1 kv-head.
+    // Small multi-query prompt/MTP batches are prefill, not decode. They must not take
+    // the rotated-domain split-decode route even though their query width is narrow.
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 2, 32, 16, 256, 4, 4, 3, 1, 0, true,  0, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 2, 32,  4, 256, 4, 4, 3, 1, 0, true,  0, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 2, 32,  4, 512, 4, 4, 3, 1, 0, false, 0, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
+    // Deep Gemma-like prompt routes: global layers keep a large non-SWA transient
+    // stage ring, while SWA layers use the sliding ring and real GQA head counts.
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 128, 32,  4, 4096, 4, 4, 19, 1, 0, false, 0, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 128, 32, 16, 4096, 4, 4,  3, 1, 0, true,  0, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
+    // D512 + SWA at prefill query widths through the generic native MMA loader. This is the
+    // Gemma-4 SWA-layer shape that regressed when large prefill used rotated-domain F16 MMA.
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(512,  64, 4, 1, 768, 4, 4, 2, 1, 0, true,  0, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 128, 4, 1, 768, 4, 4, 2, 1, 0, true,  0, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 256, 4, 1, 768, 4, 4, 2, 1, 0, true,  0, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(512,  64, 8, 2, 768, 4, 4, 2, 1, 0, true, 40, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 128, 8, 2, 768, 4, 4, 2, 1, 0, true, 40, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 256, 8, 2, 768, 4, 4, 2, 1, 0, true, 40, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(512,  64, 4, 1, 768, 4, 4, 2, 1, 0, true,  0, true,  test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 128, 4, 1, 768, 5, 4, 2, 1, 0, true,  0, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 128, 4, 1, 768, 4, 5, 2, 1, 0, true,  0, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(512,  64, 4, 1, 1024, 4, 4, 5, 1, 0, false, 0, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 128, 4, 1, 1024, 4, 4, 5, 1, 0, false, 0, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 256, 4, 1, 1024, 4, 4, 5, 1, 0, false, 0, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
+    // D256 SWA / GQA=2 / n_q=1 is true low-parallelism decode. Keep it on the
+    // rotated decode domain so the vec/split decode fast paths stay covered.
     for (const int bits_k : kvarn_bits) {
         for (const int bits_v : kvarn_bits) {
             test_cases.emplace_back(new test_kvarn_flash_attn_ext(
