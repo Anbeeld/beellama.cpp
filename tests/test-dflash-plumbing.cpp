@@ -178,6 +178,9 @@ int main(int argc, char ** argv) {
     const std::string cuda_fattn_vec = read_file(root + "/ggml/src/ggml-cuda/fattn-vec.cuh");
     const std::string cuda_fattn_kvarn = read_file_optional(root + "/ggml/src/ggml-cuda/fattn-kvarn.cuh");
     const std::string cuda_fattn_mma_kvarn = read_file_optional(root + "/ggml/src/ggml-cuda/fattn-mma-kvarn.cuh");
+    const std::string cuda_fattn_mma_kvarn_case = read_file(root + "/ggml/src/ggml-cuda/fattn-mma-kvarn-case.cuh");
+    const std::string cuda_fattn_mma_kvarn_case_decl = read_file(root + "/ggml/src/ggml-cuda/fattn-mma-kvarn-case-decl.cuh");
+    const std::string cuda_fattn_mma_f16 = read_file(root + "/ggml/src/ggml-cuda/fattn-mma-f16.cuh");
     const std::string cuda_fattn_mma_kvarn_impl = read_file_optional(root + "/ggml/src/ggml-cuda/fattn-mma-kvarn-impl.cuh");
     const std::string cuda_fattn_mma_kvarn_load = read_file(root + "/ggml/src/ggml-cuda/fattn-mma-kvarn-load.cuh");
     const std::string cuda_fattn_mma_kvarn_decode_decl = read_file(root + "/ggml/src/ggml-cuda/fattn-mma-kvarn-decode-decl.cuh");
@@ -188,6 +191,8 @@ int main(int argc, char ** argv) {
         read_file(root + "/ggml/src/ggml-cuda/template-instances/fattn-mma-kvarn-decode-instance-k4-v3.cu");
     const std::string cuda_fattn_mma_kvarn_decode_k4v4 =
         read_file(root + "/ggml/src/ggml-cuda/template-instances/fattn-mma-kvarn-decode-instance-k4-v4.cu");
+    const std::string cuda_fattn_mma_kvarn_generic_d512 =
+        read_file(root + "/ggml/src/ggml-cuda/template-instances/fattn-mma-kvarn-instance-ncols1_16-ncols2_4.cu");
     const std::string cuda_turbo_quant = read_file(root + "/ggml/src/ggml-cuda/turbo-quant-cuda.cuh");
     const std::string cuda_cmake = read_file(root + "/ggml/src/ggml-cuda/CMakeLists.txt");
     const std::string cuda_fattn_h = read_file(root + "/ggml/src/ggml-cuda/fattn.cuh");
@@ -480,13 +485,22 @@ int main(int argc, char ** argv) {
     ok &= expect(contains_ws(graph_cpp, "static enum ggml_flash_attn_ext_kvarn_domain llm_kvarn_attn_domain( const llama_cparams & cparams, const ggml_tensor * q, bool is_swa)") &&
                  graph_cpp.find("if (n_q == 1)") != std::string::npos &&
                  graph_cpp.find("GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V") != std::string::npos &&
+                 graph_cpp.find("GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_KV_OUTPUT_ORIGINAL") == std::string::npos &&
                  graph_cpp.find("const bool use_kvarn_mixed_domain") != std::string::npos &&
-                 ggml_cuda_kvarn.find("Live stage rows are original-domain; compressed records stay rotated-domain.") != std::string::npos &&
+                 graph_cpp.find("const bool use_kvarn_rotated_output_original_domain") == std::string::npos &&
+                 ggml_cuda_kvarn.find("K stage is already rotated-domain; V stage is original-domain.") != std::string::npos &&
+                 ggml_cuda_kvarn.find("if (value)") != std::string::npos &&
                  ggml_cuda_kvarn.find("kvarn_wht_stage_tile(tile, value);") != std::string::npos &&
-                 cuda_fattn_mma_kvarn_impl.find("const bool stage_original = loaded_from_stage;") != std::string::npos &&
-                 vulkan_kvarn_store.find("Live stage rows stay original-domain.") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_impl.find("bool stage;") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_impl.find("const bool fast_stage_direct") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_impl.find("tile.stage_pos_begin") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_impl.find("const bool stage_original = loaded_from_stage && desc.value;") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_case_decl.find("ggml_cuda_fattn_kvarn_output_original_domain") == std::string::npos &&
+                 cuda_fattn_mma_kvarn_case.find("nbytes_shared_kvarn_output") == std::string::npos &&
+                 cuda_fattn_mma_f16.find("flash_attn_ext_kvarn_inverse_wht_output_tile") == std::string::npos &&
+                 vulkan_kvarn_store.find("K stage is stored rotated-domain") != std::string::npos &&
                  vulkan_kvarn_store.find("return acc * KVAR_N_WHT_SCALE;") != std::string::npos,
-        "KVarN prefill must use mixed K-rotated/V-original attention while keeping the active F16 stage in original domain");
+        "KVarN prefill must use mixed K-rotated/V-original attention with per-side live-stage domains and no failed output-WHT route");
     ok &= expect(ggml_backend_cpp.find("pending_new_split_inputs") != std::string::npos &&
                  ggml_backend_cpp.find("split->n_inputs + pending_new_split_inputs > GGML_SCHED_MAX_SPLIT_INPUTS") != std::string::npos,
         "backend scheduler must pre-count all new cross-backend inputs for a node before deciding whether to start a new split");
@@ -495,11 +509,15 @@ int main(int argc, char ** argv) {
                  ggml_backend_cpp.find("src_index == 1 || src_index == 2") != std::string::npos,
         "backend scheduler must not copy bufferless KVarN native K/V proxy sources as split inputs");
     ok &= expect(cuda_fattn.find("#include \"fattn-mma-kvarn.cuh\"") != std::string::npos &&
+                 cuda_fattn.find("#include \"fattn-mma-kvarn-case-decl.cuh\"") != std::string::npos &&
+                 cuda_fattn.find("#include \"fattn-mma-f16.cuh\"") == std::string::npos &&
+                 cuda_fattn_mma_kvarn_case.find("#include \"fattn-mma-f16.cuh\"") != std::string::npos &&
                  cuda_fattn.find("ggml_cuda_flash_attn_ext_mma_kvarn_case") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_generic_d512.find("DECL_FATTN_MMA_KVARN_CASE(512, 512, 16, 4);") != std::string::npos &&
                  cuda_fattn.find("ggml_cuda_fattn_kvarn_supported") != std::string::npos &&
                  cuda_fattn_mma_kvarn.find("ggml_cuda_fattn_kvarn_unwrap_view") != std::string::npos &&
                  cuda_fattn_mma_kvarn.find("GGML_OP_KVARN_MATERIALIZE") == std::string::npos,
-        "CUDA FlashAttention must recognize KVarN view inputs directly and avoid materialize ancestry in the native route");
+        "CUDA FlashAttention must recognize KVarN view inputs directly, keep heavy KVarN MMA instantiations sharded, and avoid materialize ancestry in the native route");
     ok &= expect(cuda_fattn_mma_kvarn.find("GGML_CUDA_FATTN_KVARN_NATIVE_MAX_Q") == std::string::npos &&
                  cuda_fattn_mma_kvarn.find("return ggml_cuda_fattn_kvarn_view_supported(device, dst, out);") != std::string::npos &&
                  cuda_fattn.find("GGML_CUDA_FATTN_KVARN_DECODE_MAX_Q") == std::string::npos &&
@@ -524,8 +542,8 @@ int main(int argc, char ** argv) {
                  cuda_fattn_mma_kvarn_decode_k4v3.find(
                      "DECL_FATTN_KVARN_DECODE_CASE(512, 4, 3);") != std::string::npos &&
                  cuda_fattn.find("Q->ne[1] > GGML_CUDA_FATTN_KVARN_DECODE_MAX_Q") == std::string::npos &&
-                 cuda_fattn.find("need_f16_K=false") != std::string::npos &&
-                 cuda_fattn.find("need_f16_V=false") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_case.find("need_f16_K=false") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_case.find("need_f16_V=false") != std::string::npos &&
                  cuda_fattn_mma_kvarn_impl.find("flash_attn_ext_kvarn_load_tile") != std::string::npos &&
                  cuda_fattn_mma_kvarn.find("GGML_KVARN_FORCE_MATERIALIZE") == std::string::npos &&
                  cuda_fattn_mma_kvarn.find("ggml_cuda_fattn_kvarn_force_materialize_enabled") == std::string::npos,
@@ -534,6 +552,10 @@ int main(int argc, char ** argv) {
                  cuda_fattn.find("nbytes_shared_record =") == std::string::npos &&
                  cuda_fattn.find("nbytes_shared_KV_mask_record") == std::string::npos,
         "native KVarN MMA must stream record payloads instead of copying full records into shared memory");
+    ok &= expect(cuda_fattn_mma_kvarn_impl.find("const bool stream_record = fast_record;") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_impl.find("tile.pos_begin + row") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_impl.find("fast_record && !desc.swa") == std::string::npos,
+        "native KVarN MMA must use the batched record loader for SWA tiles and derive record positions from the SWA-aware tile plan");
     ok &= expect(cuda_fattn.find("ggml_cuda_fattn_kvarn_decode_select") != std::string::npos &&
                  cuda_fattn_mma_kvarn_decode_decl.find("ggml_cuda_fattn_kvarn_decode_geometry") != std::string::npos &&
                  cuda_fattn_mma_kvarn_decode_decl.find("ggml_cuda_fattn_kvarn_decode_select") != std::string::npos &&
@@ -2756,8 +2778,8 @@ int main(int argc, char ** argv) {
     ok &= expect(kv_cache_kvarn_cpp.find("GGML_ABORT(\"KVarN does not support position shifts\")") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("GGML_ABORT(\"KVarN does not support position division\")") != std::string::npos,
         "KVarN seq_add/seq_div must fail fast instead of logging and continuing");
-    ok &= expect(kv_cache_kvarn_cpp.find("constexpr uint32_t KVAR_N_STATE_VERSION = 6") != std::string::npos &&
-                 kv_cache_kvarn_cpp.find("if (version < 6)") != std::string::npos &&
+    ok &= expect(kv_cache_kvarn_cpp.find("constexpr uint32_t KVAR_N_STATE_VERSION = 7") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("if (version < 7)") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("if (version == 1)") == std::string::npos &&
                  kv_cache_kvarn_cpp.find("KVAR_N_STATE_RECORDS_FULL") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("KVAR_N_STATE_STAGE_ONLY_PARTIAL") != std::string::npos &&
@@ -2861,6 +2883,9 @@ int main(int argc, char ** argv) {
                  graph_cpp.find("get_v_rotated") == std::string::npos &&
                  graph_cpp.find("ggml_mul_mat_aux(ctx0, q, inp->self_kvarn_rot)") != std::string::npos &&
                  graph_cpp.find("ggml_mul_mat_aux(ctx0, cur, inp->self_kvarn_rot)") != std::string::npos &&
+                 graph_cpp.find("GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_KV_OUTPUT_ORIGINAL") == std::string::npos &&
+                 cuda_fattn_mma_f16.find("kvarn_output_original_domain") == std::string::npos &&
+                 cuda_fattn_mma_f16.find("flash_attn_ext_kvarn_inverse_wht_output_tile") == std::string::npos &&
                  kv_cache_kvarn_h.find("get_k_native") != std::string::npos &&
                  kv_cache_kvarn_h.find("get_v_native") != std::string::npos &&
                  kv_cache_kvarn_h.find("get_k_rotated") == std::string::npos &&
