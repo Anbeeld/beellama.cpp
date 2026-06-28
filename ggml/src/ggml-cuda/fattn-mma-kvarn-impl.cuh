@@ -20,8 +20,10 @@ static __device__ __forceinline__ bool ggml_cuda_fattn_kvarn_mma_group_from_reco
 
 struct ggml_cuda_fattn_kvarn_mma_tile {
     bool fast;
+    bool stage;
     int pos_begin;
     int record_group;
+    int stage_pos_begin;
 };
 
 static __device__ __forceinline__ ggml_cuda_fattn_kvarn_mma_tile ggml_cuda_fattn_kvarn_mma_plan_tile(
@@ -30,7 +32,7 @@ static __device__ __forceinline__ ggml_cuda_fattn_kvarn_mma_tile ggml_cuda_fattn
         const int valid_count,
         const int group_first,
         const int group_last) {
-    ggml_cuda_fattn_kvarn_mma_tile tile = { false, 0, 0 };
+    ggml_cuda_fattn_kvarn_mma_tile tile = { false, false, 0, 0, 0 };
     if (valid_count <= 0) {
         return tile;
     }
@@ -51,20 +53,42 @@ static __device__ __forceinline__ ggml_cuda_fattn_kvarn_mma_tile ggml_cuda_fattn
         const bool from_stage = group0 >= stage_begin && group0 <= live_group;
         const bool from_record = !from_stage && group0 >= 0 && group0 < stage_begin &&
             (live_group - group0) < desc.groups_per_stream;
+        tile.pos_begin = (int) (first_idx - (int64_t) group0 * GGML_CUDA_FATTN_KVARN_DIM);
+        if (from_stage) {
+            tile.stage = true;
+            tile.stage_pos_begin = (group0 % desc.stage_groups) * GGML_CUDA_FATTN_KVARN_DIM + tile.pos_begin;
+            return tile;
+        }
         if (!from_record) {
             return tile;
         }
         tile.fast = true;
-        tile.pos_begin = (int) (first_idx - (int64_t) group0 * GGML_CUDA_FATTN_KVARN_DIM);
         tile.record_group = group0 % desc.groups_per_stream;
         return tile;
     }
 
-    if (group_first != group_last || !ggml_cuda_fattn_kvarn_mma_group_from_record(desc, group_first)) {
+    if (group_first != group_last) {
+        return tile;
+    }
+
+    tile.pos_begin = k_start - group_first * GGML_CUDA_FATTN_KVARN_DIM;
+    const int live_group = desc.live_group;
+    const bool from_stage = group_first == 0 ||
+        (group_first > 0 && group_first <= live_group &&
+         group_first + (desc.tail_groups - 1) >= live_group);
+    if (from_stage) {
+        const int stage_base = desc.stream * GGML_CUDA_FATTN_KVARN_DIM * desc.stage_groups;
+        tile.stage = true;
+        tile.stage_pos_begin = stage_base + (group_first == 0 ? tile.pos_begin :
+            GGML_CUDA_FATTN_KVARN_DIM +
+            ((group_first - 1) % desc.tail_groups) * GGML_CUDA_FATTN_KVARN_DIM + tile.pos_begin);
+        return tile;
+    }
+
+    if (!ggml_cuda_fattn_kvarn_mma_group_from_record(desc, group_first)) {
         return tile;
     }
     tile.fast = true;
-    tile.pos_begin = k_start - group_first * GGML_CUDA_FATTN_KVARN_DIM;
     tile.record_group = desc.stream * desc.groups_per_stream + group_first;
     return tile;
 }
@@ -219,8 +243,9 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
     const int group_last  = valid_count > 0 ? (k_start + valid_count - 1) / GGML_CUDA_FATTN_KVARN_DIM : -2;
     const ggml_cuda_fattn_kvarn_mma_tile tile =
         ggml_cuda_fattn_kvarn_mma_plan_tile(desc, k_start, valid_count, group_first, group_last);
-    const bool fast_record = scale_smem != nullptr && tile.fast;
-    const bool stream_record = fast_record && !desc.swa;
+    const bool fast_record = scale_smem != nullptr && tile.fast && !tile.stage;
+    const bool fast_stage = tile.stage;
+    const bool stream_record = fast_record;
     const int record_group = tile.record_group;
 
     for (int slice = dim2_start / dim2_per_slice; slice < (dim2_end + dim2_per_slice - 1) / dim2_per_slice; ++slice) {
@@ -228,6 +253,75 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
         const int out_dim2_start = max(dim2_start, slice_dim2_start);
         const int out_dim2_end = min(dim2_end, slice_dim2_start + dim2_per_slice);
         if (out_dim2_start >= out_dim2_end) {
+            continue;
+        }
+
+        const bool fast_stage_direct = fast_stage &&
+            ((original_domain && desc.value) || (!original_domain && !desc.value));
+        if (fast_stage_direct) {
+            const int dim2_count_local = out_dim2_end - out_dim2_start;
+            constexpr int h2_per_chunk = 16 / sizeof(half2);
+            const int dst_h2_begin = out_dim2_start - dim2_start;
+            const int src_h2_begin = out_dim2_start - slice_dim2_start;
+            const bool chunk_aligned = (dst_h2_begin % h2_per_chunk) == 0 &&
+                (src_h2_begin % h2_per_chunk) == 0;
+            const int record_head = desc.head_base + slice;
+
+            if constexpr (stride_tile % h2_per_chunk == 0) {
+                if (chunk_aligned) {
+                    const half2 zero[4] = {{0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}};
+                    const int chunks_per_row = dim2_count_local / h2_per_chunk;
+                    for (int idx = tid; idx < nbatch_fa * chunks_per_row; idx += nthreads) {
+                        const int row = idx / chunks_per_row;
+                        const int chunk = idx - row * chunks_per_row;
+                        const int dst_h2 = dst_h2_begin + chunk * h2_per_chunk;
+                        const int src_h2 = src_h2_begin + chunk * h2_per_chunk;
+                        const int stage_pos = tile.stage_pos_begin + row;
+                        const int64_t base = ((int64_t) stage_pos * desc.n_record_heads + record_head) *
+                            GGML_CUDA_FATTN_KVARN_DIM;
+                        const half2 * src = row < valid_count ?
+                            (const half2 *) (desc.stage + base + 2 * src_h2) : zero;
+                        ggml_cuda_memcpy_1<16>(tile_KV + row * stride_tile + dst_h2, src);
+                    }
+
+                    const int copied_h2 = chunks_per_row * h2_per_chunk;
+                    const int tail_h2 = dim2_count_local - copied_h2;
+                    if (tail_h2 > 0) {
+                        for (int idx = tid; idx < nbatch_fa * tail_h2; idx += nthreads) {
+                            const int row = idx / tail_h2;
+                            const int dim2_tail = copied_h2 + idx - row * tail_h2;
+                            const int dst_h2 = dst_h2_begin + dim2_tail;
+                            const int src_h2 = src_h2_begin + dim2_tail;
+                            if (row >= valid_count) {
+                                tile_KV[row * stride_tile + dst_h2] = make_half2(0.0f, 0.0f);
+                                continue;
+                            }
+                            const int stage_pos = tile.stage_pos_begin + row;
+                            const int64_t base = ((int64_t) stage_pos * desc.n_record_heads + record_head) *
+                                GGML_CUDA_FATTN_KVARN_DIM;
+                            tile_KV[row * stride_tile + dst_h2] =
+                                ((const half2 *) (desc.stage + base))[src_h2];
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            for (int idx = tid; idx < nbatch_fa * dim2_count_local; idx += nthreads) {
+                const int row = idx / dim2_count_local;
+                const int dim2_local = idx - row * dim2_count_local;
+                const int dst_h2 = dst_h2_begin + dim2_local;
+                const int src_h2 = src_h2_begin + dim2_local;
+                if (row >= valid_count) {
+                    tile_KV[row * stride_tile + dst_h2] = make_half2(0.0f, 0.0f);
+                    continue;
+                }
+                const int stage_pos = tile.stage_pos_begin + row;
+                const int64_t base = ((int64_t) stage_pos * desc.n_record_heads + record_head) *
+                    GGML_CUDA_FATTN_KVARN_DIM;
+                tile_KV[row * stride_tile + dst_h2] =
+                    ((const half2 *) (desc.stage + base))[src_h2];
+            }
             continue;
         }
 
@@ -266,8 +360,8 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
                 } else {
                     loaded_from_stage = ggml_cuda_fattn_kvarn_load_rotated_slice_warp(desc, k_start + row, slice, valid_row, row0, lane);
                 }
-                // Stage rows are already original-domain; record rows need the inverse WHT.
-                const bool stage_original = loaded_from_stage;
+                // K stage is stored rotated-domain; V stage is stored original-domain.
+                const bool stage_original = loaded_from_stage && desc.value;
                 float * orig = stage_original ? row0 : ggml_cuda_fattn_kvarn_inverse_wht_128_warp(row0, row1, lane);
                 for (int global_b = out_dim2_start + lane; global_b < out_dim2_end; global_b += warp_size) {
                     const int dim = 2 * (global_b - slice_dim2_start);
@@ -319,8 +413,8 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
                     const int row1 = 2 * tok2 + 1;
                     const bool valid0 = !oob_check || row0 < i_sup;
                     const bool valid1 = !oob_check || row1 < i_sup;
-                    const int pos0 = k_start + row0 - group_first * GGML_CUDA_FATTN_KVARN_DIM;
-                    const int pos1 = k_start + row1 - group_first * GGML_CUDA_FATTN_KVARN_DIM;
+                    const int pos0 = tile.pos_begin + row0;
+                    const int pos1 = tile.pos_begin + row1;
                     const float other0 = stream_record && valid0 ? __half2float(other_axis[pos0]) : 0.0f;
                     const float other1 = stream_record && valid1 ? __half2float(other_axis[pos1]) : 0.0f;
                     for (int dim = dim_begin + dim_lane; dim < dim_end; dim += dim_workers) {
@@ -363,7 +457,8 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
                 }
 
                 const int token = k_start + row;
-                const int pos = token - group_first * GGML_CUDA_FATTN_KVARN_DIM;
+                const int pos = stream_record ? tile.pos_begin + row :
+                    token - group_first * GGML_CUDA_FATTN_KVARN_DIM;
                 const float token_scale = stream_record && desc.value ? __half2float(scale_axis[pos]) : 0.0f;
                 const float token_zp    = stream_record && desc.value ? __half2float(zp_axis[pos])    : 0.0f;
                 const float token_other = stream_record && !desc.value ? __half2float(other_axis[pos]) : 0.0f;

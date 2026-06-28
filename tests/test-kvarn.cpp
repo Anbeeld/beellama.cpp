@@ -240,10 +240,10 @@ static void test_tile_quantization(llama_kvarn_type type) {
 // original-domain decode path, using only the CPU reference quant/dequant. Let R = the
 // normalized WHT-128 (symmetric involution: R^2 = I, verified separately by
 // test_hadamard_roundtrip). KVarN compressed records store K_rot = R*K and
-// V_rot = R*V, while live fp16 stage rows are kept original-domain. Reference
-// decode reconstructs X_orig = R*dequant(record) for records. Rotated-domain
-// attention skips that inverse-WHT and instead rotates the query / inverse-rotates
-// the output:
+// V_rot = R*V. Live fp16 K stage rows are rotated-domain so mixed prefill can
+// read K directly; live V stage rows are kept original-domain. Reference decode
+// reconstructs X_orig = R*dequant(record) for records. Rotated-domain attention
+// skips that inverse-WHT and instead rotates the query / inverse-rotates the output:
 //   K:  Q . K_orig[:,c]        == (R Q) . K_rot[:,c]
 //   V:  sum_t w[t] V_orig[t,:] == R ( sum_t w[t] V_rot[t,:] )
 static void test_rotated_domain_equivalence() {
@@ -452,7 +452,7 @@ static std::vector<ggml_fp16_t> test_kvarn_reference_decode(
                         const size_t off = (size_t) d + (size_t) h * 128 + (size_t) stage_pos * 128 * n_heads;
                         values[d] = ggml_fp16_to_fp32(stage_data[off]);
                     }
-                    values_original = true;
+                    values_original = value;
                 } else if (from_record) {
                     require(record_group >= 0 && record_group < records->ne[2], "reference decode record offset out of range");
                     const size_t record_off = ((size_t) record_group * n_heads + h) * (size_t) records->ne[0];

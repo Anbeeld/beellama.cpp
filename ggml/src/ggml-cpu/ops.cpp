@@ -11411,7 +11411,9 @@ static void kvarn_cpu_quantize_stage(
             tile[value ? t * 128 + d : d * 128 + t] = x;
         }
     }
-    kvarn_cpu_rotate_stage_tile(tile, value);
+    if (value) {
+        kvarn_cpu_rotate_stage_tile(tile, value);
+    }
 
     std::vector<float> balanced;
     std::array<float, 128> s_col;
@@ -11503,11 +11505,17 @@ void ggml_compute_forward_kvarn_store(const ggml_compute_params * params, ggml_t
         const int64_t stage_slot = swa ? group % stage_groups : (group == 0 ? 0 : 1 + ((group - 1) % tail_groups));
         const int64_t stage_pos = stage_base + stage_slot * 128 + pos;
         for (int64_t h = 0; h < n_heads; ++h) {
+            std::array<float, 128> row;
             for (int d = 0; d < 128; ++d) {
                 const char * src = (const char *) current->data + d * current->nb[0] + h * current->nb[1] + t * current->nb[2];
-                const float x = *(const float *) src;
+                row[d] = *(const float *) src;
+            }
+            if (!value) {
+                kvarn_cpu_hadamard(row.data());
+            }
+            for (int d = 0; d < 128; ++d) {
                 char * out = (char *) stage->data + d * stage->nb[0] + h * stage->nb[1] + stage_pos * stage->nb[2];
-                *(ggml_fp16_t *) out = ggml_fp32_to_fp16(x);
+                *(ggml_fp16_t *) out = ggml_fp32_to_fp16(row[d]);
             }
         }
     }

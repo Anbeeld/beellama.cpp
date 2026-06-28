@@ -31,9 +31,13 @@ static __device__ __forceinline__ float ggml_cuda_fattn_kvarn_load_stage_rotated
         const int stage_pos,
         const int record_head,
         const int dim) {
-    float acc = 0.0f;
     const int64_t base = ((int64_t) stage_pos * desc.n_record_heads + record_head) *
         GGML_CUDA_FATTN_KVARN_DIM;
+    if (!desc.value) {
+        return __half2float(desc.stage[base + dim]);
+    }
+
+    float acc = 0.0f;
     for (int i = 0; i < GGML_CUDA_FATTN_KVARN_DIM; ++i) {
         acc += ggml_cuda_fattn_kvarn_wht_sign(dim, i) *
             __half2float(desc.stage[base + i]);

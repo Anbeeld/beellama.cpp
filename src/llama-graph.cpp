@@ -40,9 +40,9 @@ static enum ggml_flash_attn_ext_kvarn_domain llm_kvarn_attn_domain(
         return GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED;
     }
 
-    // Small multi-row prompt/MTP batches need original hidden-domain output.
-    // Prompt prefill rotates Q and reads K in rotated-domain, but reconstructs V
-    // in original-domain so the attention output already matches hidden space.
+    // Multi-row prompt/MTP batches need original hidden-domain output. Prompt
+    // prefill rotates Q and reads K in rotated-domain, but reconstructs V in
+    // original-domain so the attention output already matches hidden space.
     return GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V;
 }
 
@@ -2487,7 +2487,7 @@ ggml_tensor * llm_graph_context::build_attn(
     cb(cur, "kqv_out", il);
 
     // KVarN rotated-domain decode/verifier routes return rotated V output.
-    // Broad prefill reads rotated K but reconstructs original-domain V in the
+    // Prompt prefill reads rotated K but reconstructs original-domain V in the
     // native tile loader, so no output inverse is needed.
     if (use_kvarn_output_rot) {
         GGML_ASSERT(cur->type == GGML_TYPE_F32);
@@ -2794,7 +2794,7 @@ ggml_tensor * llm_graph_context::build_attn(
     cb(cur, "kqv_out", il);
 
     // KVarN rotated-domain decode/verifier routes return rotated V output.
-    // Broad prefill reads rotated K but reconstructs original-domain V in the
+    // Prompt prefill reads rotated K but reconstructs original-domain V in the
     // native tile loader, so no output inverse is needed.
     if (use_kvarn_output_rot) {
         GGML_ASSERT(cur->type == GGML_TYPE_F32);

@@ -384,6 +384,24 @@ static __device__ void kvarn_wht_128(float * values) {
     __syncthreads();
 }
 
+static __device__ void kvarn_wht_128_lane(float * values, int lane_dim) {
+    __syncthreads();
+    for (int stride = 1; stride < KVAR_N_DIM; stride *= 2) {
+        if (lane_dim < 64) {
+            const int j = (lane_dim / stride) * (2 * stride) + (lane_dim % stride);
+            const float a = values[j];
+            const float b = values[j + stride];
+            values[j] = a + b;
+            values[j + stride] = a - b;
+        }
+        __syncthreads();
+    }
+    if (lane_dim < KVAR_N_DIM) {
+        values[lane_dim] *= 0.08838834764831845f;
+    }
+    __syncthreads();
+}
+
 static __device__ void kvarn_wht_stage_tile(float * tile, bool value) {
     if (value) {
         for (int token = 0; token < KVAR_N_DIM; ++token) {
@@ -601,8 +619,11 @@ static __device__ void kvarn_quantize_stage(
         tile[i] = __half2float(stage[(stage_pos * n_heads + head) * KVAR_N_DIM + dim]);
     }
     __syncthreads();
-    // Live stage rows are original-domain; compressed records stay rotated-domain.
-    kvarn_wht_stage_tile(tile, value);
+    // K stage is already rotated-domain; V stage is original-domain. Records
+    // remain rotated-domain for both sides.
+    if (value) {
+        kvarn_wht_stage_tile(tile, value);
+    }
     kvarn_quantize_tile(record, bits, iterations, shared);
 }
 
@@ -621,23 +642,20 @@ static __device__ float kvarn_stage_rotated_value(
         int row,
         int col) {
     const int stage_slot = KVAR_N_DIM + ((stage_group - 1) % tail_groups) * KVAR_N_DIM;
-    float acc = 0.0f;
     if (value) {
+        float acc = 0.0f;
         const int token = row;
         const int stage_pos = stage_base + stage_slot + token;
         for (int dim = 0; dim < KVAR_N_DIM; ++dim) {
             acc += kvarn_wht_sign(col, dim) *
                 __half2float(stage[(stage_pos * n_heads + head) * KVAR_N_DIM + dim]);
         }
+        return acc * 0.08838834764831845f;
     } else {
         const int token = col;
         const int stage_pos = stage_base + stage_slot + token;
-        for (int dim = 0; dim < KVAR_N_DIM; ++dim) {
-            acc += kvarn_wht_sign(row, dim) *
-                __half2float(stage[(stage_pos * n_heads + head) * KVAR_N_DIM + dim]);
-        }
+        return __half2float(stage[(stage_pos * n_heads + head) * KVAR_N_DIM + row]);
     }
-    return acc * 0.08838834764831845f;
 }
 
 static __device__ float kvarn_std_col_lowshmem(
@@ -889,6 +907,9 @@ static __global__ void kvarn_store_kernel_hishmem(
         }
 
         shared[threadIdx.x] = current[(token * n_heads + head) * KVAR_N_DIM + threadIdx.x];
+        if (!value) {
+            kvarn_wht_128(shared);
+        }
         const int stage_slot = swa ? (group % stage_groups) : (group == 0 ? 0 : 1 + ((group - 1) % tail_groups));
         const int stage_pos = stage_base + stage_slot * KVAR_N_DIM + pos;
         stage[(stage_pos * n_heads + head) * KVAR_N_DIM + threadIdx.x] =
@@ -933,6 +954,9 @@ static __global__ void kvarn_store_kernel_lowshmem(
         }
 
         shared[threadIdx.x] = current[(token * n_heads + head) * KVAR_N_DIM + threadIdx.x];
+        if (!value) {
+            kvarn_wht_128(shared);
+        }
         const int stage_pos = stage_base + (group == 0 ? pos : KVAR_N_DIM + ((group - 1) % tail_groups) * KVAR_N_DIM + pos);
         stage[(stage_pos * n_heads + head) * KVAR_N_DIM + threadIdx.x] =
             __float2half_rn(shared[threadIdx.x]);
@@ -986,29 +1010,41 @@ static __global__ void kvarn_store_direct_stage_kernel(
         int n_stream,
         int groups_per_stream,
         int stage_groups,
-        int tail_groups) {
+        int tail_groups,
+        bool value) {
     const int head = blockIdx.x;
     const int chunk = blockIdx.y;
     const int lane = threadIdx.x / KVAR_N_DIM;
     const int dim = threadIdx.x - lane * KVAR_N_DIM;
     const int token = chunk * KVAR_N_STAGE_CHUNK + lane;
-    if (head >= n_heads || lane >= KVAR_N_STAGE_CHUNK || token >= n_tokens) {
+    if (head >= n_heads || lane >= KVAR_N_STAGE_CHUNK) {
         return;
     }
 
-    const int64_t idx = indices[token];
-    const int group_global = (int) (idx / KVAR_N_DIM);
-    const int stream = group_global / groups_per_stream;
-    const int group = group_global - stream * groups_per_stream;
-    const int pos = (int) (idx % KVAR_N_DIM);
-    if (stream < 0 || stream >= n_stream || group < 0 || group >= groups_per_stream) {
-        return;
+    bool valid = token < n_tokens;
+    int stream = 0;
+    int group = 0;
+    int pos = 0;
+    if (valid) {
+        const int64_t idx = indices[token];
+        const int group_global = (int) (idx / KVAR_N_DIM);
+        stream = group_global / groups_per_stream;
+        group = group_global - stream * groups_per_stream;
+        pos = (int) (idx % KVAR_N_DIM);
+        valid = stream >= 0 && stream < n_stream && group >= 0 && group < groups_per_stream;
     }
 
     __shared__ float shared[KVAR_N_STAGE_CHUNK * KVAR_N_DIM];
     float * values = shared + lane * KVAR_N_DIM;
-    values[dim] = current[((int64_t) token * n_heads + head) * KVAR_N_DIM + dim];
-    __syncthreads();
+    values[dim] = valid ? current[((int64_t) token * n_heads + head) * KVAR_N_DIM + dim] : 0.0f;
+    if (!value) {
+        kvarn_wht_128_lane(values, dim);
+    } else {
+        __syncthreads();
+    }
+    if (!valid) {
+        return;
+    }
 
     const int stage_base = stream * KVAR_N_DIM * stage_groups;
     const int stage_pos = stage_base + (group == 0 ? pos : KVAR_N_DIM + ((group - 1) % tail_groups) * KVAR_N_DIM + pos);
@@ -1020,7 +1056,8 @@ static __global__ void kvarn_store_workspace_stage_kernel(
         const float * current,
         half * workspace,
         int n_heads,
-        int n_tokens) {
+        int n_tokens,
+        bool value) {
     const int head = blockIdx.x;
     const int chunk = blockIdx.y;
     const int lane = threadIdx.x / KVAR_N_DIM;
@@ -1032,8 +1069,14 @@ static __global__ void kvarn_store_workspace_stage_kernel(
 
     __shared__ float shared[KVAR_N_STAGE_CHUNK * KVAR_N_DIM];
     float * values = shared + lane * KVAR_N_DIM;
+    values[dim] = token < n_tokens ?
+        current[((int64_t) token * n_heads + head) * KVAR_N_DIM + dim] : 0.0f;
+    if (!value) {
+        kvarn_wht_128_lane(values, dim);
+    } else {
+        __syncthreads();
+    }
     if (token < n_tokens) {
-        values[dim] = current[((int64_t) token * n_heads + head) * KVAR_N_DIM + dim];
         workspace[((int64_t) token * n_heads + head) * KVAR_N_DIM + dim] =
             __float2half_rn(values[dim]);
     }
@@ -1170,7 +1213,9 @@ static __global__ void kvarn_store_workspace_flush_kernel(
     }
     __syncthreads();
 
-    kvarn_wht_stage_tile(tile, value);
+    if (value) {
+        kvarn_wht_stage_tile(tile, value);
+    }
     const int flush_record_group = stream * groups_per_stream + flush_group;
     uint8_t * record = records + ((int64_t) flush_record_group * n_heads + head) * record_bytes;
     kvarn_quantize_tile(record, bits, iterations, shared);
@@ -1344,7 +1389,8 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             (const float *) current->data,
             workspace.get(),
             n_heads,
-            n_tokens);
+            n_tokens,
+            value);
         dim3 blocks_flush(n_heads, active_streams * flush_candidates, 1);
         kvarn_store_workspace_flush_kernel<<<blocks_flush, KVAR_N_DIM, KVAR_N_SHARED_BYTES, stream>>>(
             (const int64_t *) indices->data,
@@ -1436,7 +1482,8 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             n_stream,
             groups_per_stream,
             stage_groups,
-            tail_groups);
+            tail_groups,
+            value);
         kvarn_prof_end(prof, stream);
         return;
     }

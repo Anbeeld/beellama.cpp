@@ -20,11 +20,11 @@ namespace {
 constexpr uint32_t KVAR_N_GROUP = 128;
 constexpr uint32_t KVAR_N_STAGE_GROUPS = 3; // legacy default; production caches carry stage_groups in op_params[7]
 constexpr uint32_t KVAR_N_STATE_MAGIC = 0x4e52564b; // "KVRN"
-// Version 6: KVarN stage tensors store original-domain fp16 rows while compressed
-// records remain rotated-domain. Older states are rejected because their staged
-// rows would otherwise be restored in the wrong domain. Version 5 added
-// stage_groups validation.
-constexpr uint32_t KVAR_N_STATE_VERSION = 6;
+// Version 7: KVarN K stage rows are rotated-domain, V stage rows are
+// original-domain, and compressed records remain rotated-domain. Older states
+// are rejected because their staged rows would otherwise be restored in the
+// wrong domain. Version 5 added stage_groups validation.
+constexpr uint32_t KVAR_N_STATE_VERSION = 7;
 constexpr uint32_t KVAR_N_STATE_RECORDS_FULL = 0;
 constexpr uint32_t KVAR_N_STATE_STAGE_ONLY_PARTIAL = 1;
 
@@ -984,7 +984,7 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
         type != params.type || n_layers != layers.size()) {
         throw std::runtime_error("incompatible KVarN cache state");
     }
-    if (version < 6) {
+    if (version < 7) {
         throw std::runtime_error(
             "incompatible KVarN cache state: re-save prompt cache with this build");
     }
@@ -1009,7 +1009,7 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
         throw std::runtime_error("invalid KVarN cache state kind");
     }
 
-    // Version 6 rejects older stage-domain states. The reader still does not implement
+    // Version 7 rejects older stage-domain states. The reader still does not implement
     // stage-slot remap on restore (the plan's full save/restore matrix allows
     // remapping logical live groups into differently-sized stages). For now,
     // any stage_groups mismatch is rejected explicitly so the stage is never

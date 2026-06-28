@@ -7473,7 +7473,7 @@ static std::vector<ggml_fp16_t> test_kvarn_reference_decode(
                         const size_t off = (size_t) d + (size_t) h * 128 + (size_t) stage_pos * 128 * n_heads;
                         values[d] = ggml_fp16_to_fp32(stage_data[off]);
                     }
-                    values_original = true;
+                    values_original = value;
                 } else if (from_record) {
                     GGML_ASSERT(record_group >= 0 && record_group < records->ne[2]);
                     const size_t record_off = ((size_t) record_group * n_heads + h) * (size_t) records->ne[0];

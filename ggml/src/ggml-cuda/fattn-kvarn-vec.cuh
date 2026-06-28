@@ -73,9 +73,7 @@ static __device__ __forceinline__ float ggml_cuda_fattn_kvarn_vec_load(
         const int dim) {
     const int record_head = desc.head_base + slice;
     if (ref.source == GGML_CUDA_FATTN_KVARN_VEC_STAGE) {
-        return __half2float(desc.stage[
-            ((int64_t) ref.stage_pos * desc.n_record_heads + record_head) *
-                GGML_CUDA_FATTN_KVARN_DIM + dim]);
+        return ggml_cuda_fattn_kvarn_load_stage_rotated(desc, ref.stage_pos, record_head, dim);
     }
     if (ref.source != GGML_CUDA_FATTN_KVARN_VEC_RECORD) {
         return 0.0f;
