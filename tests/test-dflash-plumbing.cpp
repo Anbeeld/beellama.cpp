@@ -547,7 +547,7 @@ int main(int argc, char ** argv) {
                  cuda_fattn_mma_kvarn_impl.find("flash_attn_ext_kvarn_load_tile") != std::string::npos &&
                  cuda_fattn_mma_kvarn.find("GGML_KVARN_FORCE_MATERIALIZE") == std::string::npos &&
                  cuda_fattn_mma_kvarn.find("ggml_cuda_fattn_kvarn_force_materialize_enabled") == std::string::npos,
-        "native KVarN FlashAttention must keep the SWA-aware tensor-core decode in per-pair instance TUs plus generic shallow fallback without K/V F16 materialize buffers or fallback env gates");
+        "native KVarN FlashAttention must keep the SWA-aware tensor-core decode in per-pair instance TUs plus generic shallow fallback without full-cache K/V F16 materialize fallbacks or env gates");
     ok &= expect(cuda_fattn_mma_kvarn.find("record_cache") == std::string::npos &&
                  cuda_fattn.find("nbytes_shared_record =") == std::string::npos &&
                  cuda_fattn.find("nbytes_shared_KV_mask_record") == std::string::npos,

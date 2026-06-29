@@ -1698,6 +1698,24 @@ static void test_native_flash_attention_gpu() {
     }
 
     {
+        // stage_groups=4 gives tail_groups=3, which is the direct SWA safety guard.
+        constexpr int head_dim = 256;
+        constexpr int n_kv_heads = 4;
+        constexpr int n_segments = 8;
+        constexpr int segment_tokens = 256;
+        constexpr int n_swa_window = 768;
+        constexpr int stage_groups = 4;
+        require_segmented_raw_roundtrip(gpu_backend, head_dim, 4, false, n_kv_heads,
+                n_segments, segment_tokens, stage_groups, 3e-1f,
+                "direct SWA D256 KVarN4 K roundtrip differs from original-domain input",
+                true, n_swa_window, true);
+        require_segmented_raw_roundtrip(gpu_backend, head_dim, 4, true, n_kv_heads,
+                n_segments, segment_tokens, stage_groups, 3e-1f,
+                "direct SWA D256 KVarN4 V roundtrip differs from original-domain input",
+                true, n_swa_window, true);
+    }
+
+    {
         constexpr int head_dim = 512;
         constexpr int n_kv_heads = 1;
         constexpr int n_segments = 64;
