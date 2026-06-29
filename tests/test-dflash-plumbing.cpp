@@ -544,6 +544,8 @@ int main(int argc, char ** argv) {
                  cuda_fattn.find("Q->ne[1] > GGML_CUDA_FATTN_KVARN_DECODE_MAX_Q") == std::string::npos &&
                  cuda_fattn_mma_kvarn_case.find("need_f16_K=false") != std::string::npos &&
                  cuda_fattn_mma_kvarn_case.find("need_f16_V=false") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_case.find("materialize_v_original") == std::string::npos &&
+                 cuda_fattn_mma_kvarn_case.find("plan.n_kv * DV") == std::string::npos &&
                  cuda_fattn_mma_kvarn_impl.find("flash_attn_ext_kvarn_load_tile") != std::string::npos &&
                  cuda_fattn_mma_kvarn.find("GGML_KVARN_FORCE_MATERIALIZE") == std::string::npos &&
                  cuda_fattn_mma_kvarn.find("ggml_cuda_fattn_kvarn_force_materialize_enabled") == std::string::npos,
