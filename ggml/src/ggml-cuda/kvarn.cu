@@ -10,9 +10,10 @@
 static constexpr int KVAR_N_DIM = 128;
 // Dynamic stage depth: stage_groups is carried explicitly in op_params[7].
 static constexpr int KVAR_N_TILE_VALUES = KVAR_N_DIM * KVAR_N_DIM;
-static constexpr int KVAR_N_SHARED_FLOATS = KVAR_N_TILE_VALUES + 8 * KVAR_N_DIM + 2;
+static constexpr int KVAR_N_REDUCE_FLOATS = 4 * 4;
+static constexpr int KVAR_N_SHARED_FLOATS = KVAR_N_TILE_VALUES + 8 * KVAR_N_DIM + 2 + KVAR_N_REDUCE_FLOATS;
 static constexpr int KVAR_N_SHARED_BYTES = KVAR_N_SHARED_FLOATS * sizeof(float);
-static constexpr int KVAR_N_LOWSHMEM_FLOATS = 6 * KVAR_N_DIM + 2;
+static constexpr int KVAR_N_LOWSHMEM_FLOATS = 6 * KVAR_N_DIM + 2 + KVAR_N_REDUCE_FLOATS;
 static constexpr int KVAR_N_LOWSHMEM_BYTES = KVAR_N_LOWSHMEM_FLOATS * sizeof(float);
 static constexpr int KVAR_N_STAGE_CHUNK = 4;
 static constexpr int KVAR_N_OP_PARAM_BITS = 0;
@@ -404,19 +405,45 @@ static __device__ void kvarn_wht_128_lane(float * values, int lane_dim) {
 
 static __device__ void kvarn_wht_stage_tile(float * tile, bool value) {
     if (value) {
-        for (int token = 0; token < KVAR_N_DIM; ++token) {
-            kvarn_wht_128(tile + token * KVAR_N_DIM);
+        __syncthreads();
+        const int token = threadIdx.x;
+        float * row = tile + token * KVAR_N_DIM;
+        for (int stride = 1; stride < KVAR_N_DIM; stride *= 2) {
+            for (int base = 0; base < KVAR_N_DIM; base += 2 * stride) {
+                for (int i = 0; i < stride; ++i) {
+                    const int j = base + i;
+                    const float a = row[j];
+                    const float b = row[j + stride];
+                    row[j] = a + b;
+                    row[j + stride] = a - b;
+                }
+            }
         }
+        for (int dim = 0; dim < KVAR_N_DIM; ++dim) {
+            row[dim] *= 0.08838834764831845f;
+        }
+        __syncthreads();
         return;
     }
 
-    float * tmp = tile + KVAR_N_TILE_VALUES;
-    for (int token = 0; token < KVAR_N_DIM; ++token) {
-        tmp[threadIdx.x] = tile[threadIdx.x * KVAR_N_DIM + token];
-        kvarn_wht_128(tmp);
-        tile[threadIdx.x * KVAR_N_DIM + token] = tmp[threadIdx.x];
-        __syncthreads();
+    __syncthreads();
+    const int col = threadIdx.x;
+    for (int stride = 1; stride < KVAR_N_DIM; stride *= 2) {
+        for (int base = 0; base < KVAR_N_DIM; base += 2 * stride) {
+            for (int i = 0; i < stride; ++i) {
+                const int r0 = base + i;
+                const int r1 = r0 + stride;
+                const float a = tile[r0 * KVAR_N_DIM + col];
+                const float b = tile[r1 * KVAR_N_DIM + col];
+                tile[r0 * KVAR_N_DIM + col] = a + b;
+                tile[r1 * KVAR_N_DIM + col] = a - b;
+            }
+        }
     }
+    for (int row = 0; row < KVAR_N_DIM; ++row) {
+        tile[row * KVAR_N_DIM + col] *= 0.08838834764831845f;
+    }
+    __syncthreads();
 }
 
 static __device__ float kvarn_std_col(
@@ -453,32 +480,70 @@ static __device__ float kvarn_std_row(
     return sqrtf(fmaxf((sum_sq - KVAR_N_DIM * mean * mean) / (KVAR_N_DIM - 1), 0.0f));
 }
 
-static __device__ void kvarn_update_best(
-        const float * tile,
-        const float * s_col,
-        const float * s_row,
+static __device__ __forceinline__ float kvarn_warp_min(float value) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value = fminf(value, __shfl_down_sync(0xffffffffu, value, offset));
+    }
+    return value;
+}
+
+static __device__ __forceinline__ float kvarn_warp_max(float value) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, offset));
+    }
+    return value;
+}
+
+static __device__ void kvarn_reduce_std_ranges(
+        const float * col_std,
+        const float * row_std,
+        float * reduce) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    float col_min = kvarn_warp_min(col_std[threadIdx.x]);
+    float col_max = kvarn_warp_max(col_std[threadIdx.x]);
+    float row_min = kvarn_warp_min(row_std[threadIdx.x]);
+    float row_max = kvarn_warp_max(row_std[threadIdx.x]);
+
+    if (lane == 0) {
+        reduce[warp * 4 + 0] = col_min;
+        reduce[warp * 4 + 1] = col_max;
+        reduce[warp * 4 + 2] = row_min;
+        reduce[warp * 4 + 3] = row_max;
+    }
+    __syncthreads();
+
+    if (threadIdx.x < 4) {
+        const int metric = threadIdx.x;
+        float value = reduce[metric];
+        for (int w = 1; w < 4; ++w) {
+            const float next = reduce[w * 4 + metric];
+            value = (metric == 0 || metric == 2) ? fminf(value, next) : fmaxf(value, next);
+        }
+        reduce[metric] = value;
+    }
+    __syncthreads();
+}
+
+static __device__ void kvarn_update_best_from_std(
+        const float * candidate_col,
+        const float * candidate_row,
+        bool candidate_is_log,
         float * best_col,
         float * best_row,
         float * col_std,
         float * row_std,
         float * best_imbalance,
-        float * better) {
+        float * better,
+        float * reduce) {
     const int i = threadIdx.x;
-    col_std[i] = kvarn_std_col(tile, s_col, s_row, i);
-    row_std[i] = kvarn_std_row(tile, s_col, s_row, i);
-    __syncthreads();
+    kvarn_reduce_std_ranges(col_std, row_std, reduce);
 
     if (i == 0) {
-        float col_min = col_std[0];
-        float col_max = col_std[0];
-        float row_min = row_std[0];
-        float row_max = row_std[0];
-        for (int j = 1; j < KVAR_N_DIM; ++j) {
-            col_min = fminf(col_min, col_std[j]);
-            col_max = fmaxf(col_max, col_std[j]);
-            row_min = fminf(row_min, row_std[j]);
-            row_max = fmaxf(row_max, row_std[j]);
-        }
+        const float col_min = reduce[0];
+        const float col_max = reduce[1];
+        const float row_min = reduce[2];
+        const float row_max = reduce[3];
         const float imbalance =
             col_max / fmaxf(col_min, 1e-8f) +
             row_max / fmaxf(row_min, 1e-8f);
@@ -490,8 +555,8 @@ static __device__ void kvarn_update_best(
     __syncthreads();
 
     if (*better != 0.0f) {
-        best_col[i] = s_col[i];
-        best_row[i] = s_row[i];
+        best_col[i] = candidate_is_log ? expf(candidate_col[i]) : candidate_col[i];
+        best_row[i] = candidate_is_log ? expf(candidate_row[i]) : candidate_row[i];
     }
     __syncthreads();
 }
@@ -512,6 +577,7 @@ static __device__ void kvarn_quantize_tile(
     float * row_std = col_std + KVAR_N_DIM;
     float * best_imbalance = row_std + KVAR_N_DIM;
     float * better = best_imbalance + 1;
+    float * reduce = better + 1;
 
     log_s_col[threadIdx.x] = 0.0f;
     log_s_row[threadIdx.x] = 0.0f;
@@ -525,34 +591,37 @@ static __device__ void kvarn_quantize_tile(
     row_std[threadIdx.x] = kvarn_std_row(tile, s_col, s_row, threadIdx.x);
     __syncthreads();
     if (threadIdx.x == 0) {
-        float col_min = col_std[0];
-        float col_max = col_std[0];
-        float row_min = row_std[0];
-        float row_max = row_std[0];
-        for (int i = 1; i < KVAR_N_DIM; ++i) {
-            col_min = fminf(col_min, col_std[i]);
-            col_max = fmaxf(col_max, col_std[i]);
-            row_min = fminf(row_min, row_std[i]);
-            row_max = fmaxf(row_max, row_std[i]);
-        }
-        *best_imbalance =
-            col_max / fmaxf(col_min, 1e-8f) +
-            row_max / fmaxf(row_min, 1e-8f);
+        *best_imbalance = 3.402823466e+38F;
     }
     __syncthreads();
+    kvarn_update_best_from_std(
+            s_col, s_row, false,
+            best_col, best_row, col_std, row_std,
+            best_imbalance, better, reduce);
 
     for (int iter = 0; iter < iterations; ++iter) {
-        const float col = fminf(fmaxf(kvarn_std_col(tile, s_col, s_row, threadIdx.x), 1e-3f), 1e3f);
+        const float col = fminf(fmaxf(col_std[threadIdx.x], 1e-3f), 1e3f);
         log_s_col[threadIdx.x] = fminf(fmaxf(log_s_col[threadIdx.x] + logf(col), -0.3f), 10.0f);
         s_col[threadIdx.x] = expf(log_s_col[threadIdx.x]);
         __syncthreads();
 
-        const float row = fminf(fmaxf(kvarn_std_row(tile, s_col, s_row, threadIdx.x), 1e-3f), 1e3f);
-        log_s_row[threadIdx.x] = fminf(fmaxf(log_s_row[threadIdx.x] + logf(row), -0.3f), 10.0f);
-        s_row[threadIdx.x] = expf(log_s_row[threadIdx.x]);
+        row_std[threadIdx.x] = kvarn_std_row(tile, s_col, s_row, threadIdx.x);
         __syncthreads();
 
-        kvarn_update_best(tile, s_col, s_row, best_col, best_row, col_std, row_std, best_imbalance, better);
+        const float row = fminf(fmaxf(row_std[threadIdx.x], 1e-3f), 1e3f);
+        const float log_s_row_new = fminf(fmaxf(log_s_row[threadIdx.x] + logf(row), -0.3f), 10.0f);
+        log_s_row[threadIdx.x] = log_s_row_new;
+        s_row[threadIdx.x] = expf(log_s_row_new);
+        __syncthreads();
+
+        row_std[threadIdx.x] = kvarn_std_row(tile, s_col, s_row, threadIdx.x);
+        col_std[threadIdx.x] = kvarn_std_col(tile, s_col, s_row, threadIdx.x);
+        __syncthreads();
+
+        kvarn_update_best_from_std(
+                s_col, s_row, false,
+                best_col, best_row, col_std, row_std,
+                best_imbalance, better, reduce);
     }
 
     const int row = threadIdx.x;
@@ -706,55 +775,6 @@ static __device__ float kvarn_std_row_lowshmem(
     return sqrtf(fmaxf((sum_sq - KVAR_N_DIM * mean * mean) / (KVAR_N_DIM - 1), 0.0f));
 }
 
-static __device__ void kvarn_update_best_lowshmem(
-        const half * stage,
-        int n_heads,
-        int head,
-        int stage_base,
-        int stage_group,
-        bool value,
-        int tail_groups,
-        const float * log_s_col,
-        const float * log_s_row,
-        float * best_col,
-        float * best_row,
-        float * col_std,
-        float * row_std,
-        float * best_imbalance,
-        float * better) {
-    const int i = threadIdx.x;
-    col_std[i] = kvarn_std_col_lowshmem(stage, n_heads, head, stage_base, stage_group, log_s_col, log_s_row, value, tail_groups, i);
-    row_std[i] = kvarn_std_row_lowshmem(stage, n_heads, head, stage_base, stage_group, log_s_col, log_s_row, value, tail_groups, i);
-    __syncthreads();
-
-    if (i == 0) {
-        float col_min = col_std[0];
-        float col_max = col_std[0];
-        float row_min = row_std[0];
-        float row_max = row_std[0];
-        for (int j = 1; j < KVAR_N_DIM; ++j) {
-            col_min = fminf(col_min, col_std[j]);
-            col_max = fmaxf(col_max, col_std[j]);
-            row_min = fminf(row_min, row_std[j]);
-            row_max = fmaxf(row_max, row_std[j]);
-        }
-        const float imbalance =
-            col_max / fmaxf(col_min, 1e-8f) +
-            row_max / fmaxf(row_min, 1e-8f);
-        *better = imbalance <= *best_imbalance ? 1.0f : 0.0f;
-        if (*better != 0.0f) {
-            *best_imbalance = imbalance;
-        }
-    }
-    __syncthreads();
-
-    if (*better != 0.0f) {
-        best_col[i] = expf(log_s_col[i]);
-        best_row[i] = expf(log_s_row[i]);
-    }
-    __syncthreads();
-}
-
 static __device__ void kvarn_quantize_stage_lowshmem(
         const half * stage,
         uint8_t * record,
@@ -775,6 +795,7 @@ static __device__ void kvarn_quantize_stage_lowshmem(
     float * row_std = col_std + KVAR_N_DIM;
     float * best_imbalance = row_std + KVAR_N_DIM;
     float * better = best_imbalance + 1;
+    float * reduce = better + 1;
 
     log_s_col[threadIdx.x] = 0.0f;
     log_s_row[threadIdx.x] = 0.0f;
@@ -789,39 +810,41 @@ static __device__ void kvarn_quantize_stage_lowshmem(
     __syncthreads();
 
     if (threadIdx.x == 0) {
-        float col_min = col_std[0];
-        float col_max = col_std[0];
-        float row_min = row_std[0];
-        float row_max = row_std[0];
-        for (int i = 1; i < KVAR_N_DIM; ++i) {
-            col_min = fminf(col_min, col_std[i]);
-            col_max = fmaxf(col_max, col_std[i]);
-            row_min = fminf(row_min, row_std[i]);
-            row_max = fmaxf(row_max, row_std[i]);
-        }
-        *best_imbalance =
-            col_max / fmaxf(col_min, 1e-8f) +
-            row_max / fmaxf(row_min, 1e-8f);
+        *best_imbalance = 3.402823466e+38F;
     }
     __syncthreads();
+    kvarn_update_best_from_std(
+            log_s_col, log_s_row, true,
+            best_col, best_row, col_std, row_std,
+            best_imbalance, better, reduce);
 
     for (int iter = 0; iter < iterations; ++iter) {
-        const float col = fminf(fmaxf(kvarn_std_col_lowshmem(
-                        stage, n_heads, head, stage_base, stage_group,
-                        log_s_col, log_s_row, value, tail_groups, threadIdx.x), 1e-3f), 1e3f);
+        const float col = fminf(fmaxf(col_std[threadIdx.x], 1e-3f), 1e3f);
         log_s_col[threadIdx.x] = fminf(fmaxf(log_s_col[threadIdx.x] + logf(col), -0.3f), 10.0f);
         __syncthreads();
 
-        const float row = fminf(fmaxf(kvarn_std_row_lowshmem(
-                        stage, n_heads, head, stage_base, stage_group,
-                        log_s_col, log_s_row, value, tail_groups, threadIdx.x), 1e-3f), 1e3f);
-        log_s_row[threadIdx.x] = fminf(fmaxf(log_s_row[threadIdx.x] + logf(row), -0.3f), 10.0f);
+        row_std[threadIdx.x] = kvarn_std_row_lowshmem(
+                stage, n_heads, head, stage_base, stage_group,
+                log_s_col, log_s_row, value, tail_groups, threadIdx.x);
         __syncthreads();
 
-        kvarn_update_best_lowshmem(
-                stage, n_heads, head, stage_base, stage_group, value, tail_groups,
-                log_s_col, log_s_row, best_col, best_row, col_std, row_std,
-                best_imbalance, better);
+        const float row = fminf(fmaxf(row_std[threadIdx.x], 1e-3f), 1e3f);
+        const float log_s_row_new = fminf(fmaxf(log_s_row[threadIdx.x] + logf(row), -0.3f), 10.0f);
+        log_s_row[threadIdx.x] = log_s_row_new;
+        __syncthreads();
+
+        row_std[threadIdx.x] = kvarn_std_row_lowshmem(
+                stage, n_heads, head, stage_base, stage_group,
+                log_s_col, log_s_row, value, tail_groups, threadIdx.x);
+        col_std[threadIdx.x] = kvarn_std_col_lowshmem(
+                stage, n_heads, head, stage_base, stage_group,
+                log_s_col, log_s_row, value, tail_groups, threadIdx.x);
+        __syncthreads();
+
+        kvarn_update_best_from_std(
+                log_s_col, log_s_row, true,
+                best_col, best_row, col_std, row_std,
+                best_imbalance, better, reduce);
     }
 
     const int row = threadIdx.x;
