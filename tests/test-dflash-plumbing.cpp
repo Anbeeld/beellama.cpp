@@ -535,6 +535,10 @@ int main(int argc, char ** argv) {
                  cuda_fattn_mma_kvarn_decode.find("#include \"fattn-mma-kvarn-load.cuh\"") != std::string::npos &&
                  cuda_fattn_mma_kvarn_decode.find("#include \"fattn-mma-kvarn-impl.cuh\"") == std::string::npos &&
                  cuda_fattn_mma_kvarn_load.find("ggml_cuda_fattn_kvarn_load_rotated") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_case.find("GGML_CUDA_FATTN_KVARN_WINDOW_CHUNK") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_case.find("GGML_KVARN_WINDOW") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_case.find("GGML_KVARN_WINDOW_CHUNK") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_case.find("ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case") != std::string::npos &&
                  cuda_fattn_mma_kvarn_decode_k4v3.find(
                      "DECL_FATTN_KVARN_DECODE_CASE(128, 4, 3);") != std::string::npos &&
                  cuda_fattn_mma_kvarn_decode_k4v3.find(

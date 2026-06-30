@@ -40,8 +40,15 @@ static enum ggml_flash_attn_ext_kvarn_domain llm_kvarn_attn_domain(
         return GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED;
     }
 
-    // Multi-row prompt/MTP batches need original hidden-domain output. Prompt
-    // prefill rotates Q and reads K in rotated-domain, but reconstructs V in
+    // D128 prefill can run the all-original windowed KVarN path. D256 Qwen
+    // keeps the mixed K-rotated/V-original contract because real-model KLD is
+    // sensitive to inverse-WHT reconstruction of K at deep context.
+    if (!is_swa && q->ne[0] == 128) {
+        return GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ORIGINAL;
+    }
+
+    // Multi-row prompt/MTP batches need original hidden-domain output. The
+    // mixed route rotates Q and reads K in rotated-domain, but reconstructs V in
     // original-domain so the attention output already matches hidden space.
     return GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V;
 }
