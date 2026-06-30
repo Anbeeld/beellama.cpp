@@ -9908,10 +9908,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 2, 32, 16, 256, 4, 4, 3, 1, 0, true,  0, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
     test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 2, 32,  4, 256, 4, 4, 3, 1, 0, true,  0, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
     test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 2, 32,  4, 512, 4, 4, 3, 1, 0, false, 0, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
-    // Windowed split-KV targets: D128 covers all-original prefill, while
-    // Qwen-like D256 covers the precision-sensitive mixed K-rotated/V-original route.
-    test_cases.emplace_back(new test_kvarn_flash_attn_ext(128, 128, 32,  8, 4096, 4, 4, 3, 1, 0, false, 0, false, test_kvarn_flash_attn_ext::route_domain::original_prefill));
-    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 128, 32,  8, 4096, 4, 4, 3, 1, 0, false, 0, false, test_kvarn_flash_attn_ext::route_domain::original_prefill));
+    // Windowed split-KV targets use the production mixed K-rotated/V-original route.
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(128, 128, 32,  8, 4096, 4, 4, 3, 1, 0, false, 0, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
     test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 128, 32,  8, 4096, 4, 4, 3, 1, 0, false, 0, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
     test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 256, 24,  4, 4096, 4, 4, 3, 1, 0, false, 0, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
     test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 128, 32,  8, 8192, 4, 4, 3, 3, 1, false, 0, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));

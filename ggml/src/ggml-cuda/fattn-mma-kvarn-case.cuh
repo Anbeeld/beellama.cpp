@@ -61,7 +61,7 @@ static __global__ void ggml_cuda_fattn_kvarn_window_dequant_kernel(
         int chunk_begin,
         int chunk_len,
         int n_kv_heads) {
-    static_assert(D == 128 || D == 256, "windowed KVarN prefill currently supports D128/D256");
+    static_assert(D == 128 || D == 256 || D == 512, "windowed KVarN prefill supports 128-wide slices through D512");
     constexpr int slices = D / GGML_CUDA_FATTN_KVARN_DIM;
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
@@ -264,7 +264,7 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
         ggml_tensor * dst,
         const ggml_cuda_fattn_kvarn_plan & plan,
         size_t nbytes_shared_total) {
-    if constexpr (DKQ != DV || (DKQ != 128 && DKQ != 256)) {
+    if constexpr (DKQ != DV || (DKQ != 128 && DKQ != 256 && DKQ != 512)) {
         GGML_UNUSED_VARS(ctx, dst, plan, nbytes_shared_total);
         return false;
     }
@@ -274,9 +274,8 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
     const ggml_tensor * sinks = dst->src[4];
     const enum ggml_flash_attn_ext_kvarn_domain domain = ggml_cuda_fattn_kvarn_domain(dst);
     if (!ggml_cuda_fattn_kvarn_window_enabled() ||
-            Q->ne[1] <= 1 || sinks != nullptr || plan.k.swa || plan.v.swa ||
-            (domain != GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ORIGINAL &&
-             domain != GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V)) {
+            Q->ne[1] <= 1 || sinks != nullptr ||
+            domain != GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V) {
         return false;
     }
 
@@ -402,7 +401,7 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case(
         const ggml_cuda_fattn_kvarn_plan & plan,
         size_t nbytes_shared_total,
         bool use_logit_softcap) {
-    if constexpr (DKQ != DV || (DKQ != 128 && DKQ != 256)) {
+    if constexpr (DKQ != DV || (DKQ != 128 && DKQ != 256 && DKQ != 512)) {
         GGML_UNUSED_VARS(ctx, dst, plan, nbytes_shared_total, use_logit_softcap);
         return false;
     } else {
