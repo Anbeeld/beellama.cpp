@@ -28,7 +28,9 @@ static enum ggml_flash_attn_ext_kvarn_domain llm_kvarn_attn_domain(
         const llama_cparams & cparams,
         const ggml_tensor   * q,
         bool is_swa) {
-    const int64_t n_q = q->ne[1];
+    // At this point Q is still in graph-builder layout [head_dim, n_head, n_tokens].
+    // build_attn_mha() later permutes it to the FLASH_ATTN_EXT layout.
+    const int64_t n_q = q->ne[2];
 
     // True decode has one query row per stream. SWA decode is still decode and
     // should keep the low-parallelism rotated KVarN fast paths available.

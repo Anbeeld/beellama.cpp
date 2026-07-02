@@ -11368,31 +11368,6 @@ static void kvarn_cpu_pack(const std::vector<uint8_t> & values, int bits, uint8_
     }
 }
 
-static void kvarn_cpu_rotate_stage_tile(std::vector<float> & tile, bool value) {
-    std::array<float, KVAR_N_GROUP> tmp;
-    if (value) {
-        for (int r = 0; r < KVAR_N_GROUP; ++r) {
-            for (int c = 0; c < KVAR_N_GROUP; ++c) {
-                tmp[c] = tile[r * KVAR_N_GROUP + c];
-            }
-            kvarn_cpu_hadamard(tmp.data());
-            for (int c = 0; c < KVAR_N_GROUP; ++c) {
-                tile[r * KVAR_N_GROUP + c] = tmp[c];
-            }
-        }
-    } else {
-        for (int c = 0; c < KVAR_N_GROUP; ++c) {
-            for (int r = 0; r < KVAR_N_GROUP; ++r) {
-                tmp[r] = tile[r * KVAR_N_GROUP + c];
-            }
-            kvarn_cpu_hadamard(tmp.data());
-            for (int r = 0; r < KVAR_N_GROUP; ++r) {
-                tile[r * KVAR_N_GROUP + c] = tmp[r];
-            }
-        }
-    }
-}
-
 static void kvarn_cpu_quantize_stage(
         const ggml_tensor * stage,
         int64_t head,
@@ -11411,10 +11386,6 @@ static void kvarn_cpu_quantize_stage(
             tile[value ? t * 128 + d : d * 128 + t] = x;
         }
     }
-    if (value) {
-        kvarn_cpu_rotate_stage_tile(tile, value);
-    }
-
     std::vector<float> balanced;
     std::array<float, 128> s_col;
     std::array<float, 128> s_row;
@@ -11510,9 +11481,7 @@ void ggml_compute_forward_kvarn_store(const ggml_compute_params * params, ggml_t
                 const char * src = (const char *) current->data + d * current->nb[0] + h * current->nb[1] + t * current->nb[2];
                 row[d] = *(const float *) src;
             }
-            if (!value) {
-                kvarn_cpu_hadamard(row.data());
-            }
+            kvarn_cpu_hadamard(row.data());
             for (int d = 0; d < 128; ++d) {
                 char * out = (char *) stage->data + d * stage->nb[0] + h * stage->nb[1] + stage_pos * stage->nb[2];
                 *(ggml_fp16_t *) out = ggml_fp32_to_fp16(row[d]);

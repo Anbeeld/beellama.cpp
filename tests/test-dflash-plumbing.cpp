@@ -483,24 +483,23 @@ int main(int argc, char ** argv) {
                  kv_cache_kvarn_cpp.find("is_swa ? 2u : 4u") != std::string::npos,
         "KVarN SWA stage depth must cover the full sliding-window tile span, not only the physical ubatch tail");
     ok &= expect(contains_ws(graph_cpp, "static enum ggml_flash_attn_ext_kvarn_domain llm_kvarn_attn_domain( const llama_cparams & cparams, const ggml_tensor * q, bool is_swa)") &&
+                 graph_cpp.find("const int64_t n_q = q->ne[2];") != std::string::npos &&
                  graph_cpp.find("if (n_q == 1)") != std::string::npos &&
                  graph_cpp.find("GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V") != std::string::npos &&
                  graph_cpp.find("GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_KV_OUTPUT_ORIGINAL") == std::string::npos &&
                  graph_cpp.find("const bool use_kvarn_mixed_domain") != std::string::npos &&
                  graph_cpp.find("const bool use_kvarn_rotated_output_original_domain") == std::string::npos &&
-                 ggml_cuda_kvarn.find("K stage is already rotated-domain; V stage is original-domain.") != std::string::npos &&
-                 ggml_cuda_kvarn.find("if (value)") != std::string::npos &&
-                 ggml_cuda_kvarn.find("kvarn_wht_stage_tile(tile, value);") != std::string::npos &&
+                 ggml_cuda_kvarn.find("Stage and records are rotated-domain for both K and V.") != std::string::npos &&
+                 ggml_cuda_kvarn.find("kvarn_wht_stage_tile") == std::string::npos &&
                  cuda_fattn_mma_kvarn_impl.find("bool stage;") != std::string::npos &&
                  cuda_fattn_mma_kvarn_impl.find("const bool fast_stage_direct") != std::string::npos &&
                  cuda_fattn_mma_kvarn_impl.find("tile.stage_pos_begin") != std::string::npos &&
-                 cuda_fattn_mma_kvarn_impl.find("const bool stage_original = loaded_from_stage && desc.value;") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_impl.find("const bool stage_original") == std::string::npos &&
                  cuda_fattn_mma_kvarn_case_decl.find("ggml_cuda_fattn_kvarn_output_original_domain") == std::string::npos &&
                  cuda_fattn_mma_kvarn_case.find("nbytes_shared_kvarn_output") == std::string::npos &&
                  cuda_fattn_mma_f16.find("flash_attn_ext_kvarn_inverse_wht_output_tile") == std::string::npos &&
-                 vulkan_kvarn_store.find("K stage is stored rotated-domain") != std::string::npos &&
-                 vulkan_kvarn_store.find("return acc * KVAR_N_WHT_SCALE;") != std::string::npos,
-        "KVarN prefill must use mixed K-rotated/V-original attention with per-side live-stage domains and no failed output-WHT route");
+                 vulkan_kvarn_store.find("Stage and records are rotated-domain for both K and V.") != std::string::npos,
+        "KVarN prefill/decode must use mixed prompt attention plus all-rotated live stage rows without the failed output-WHT route");
     ok &= expect(ggml_backend_cpp.find("pending_new_split_inputs") != std::string::npos &&
                  ggml_backend_cpp.find("split->n_inputs + pending_new_split_inputs > GGML_SCHED_MAX_SPLIT_INPUTS") != std::string::npos,
         "backend scheduler must pre-count all new cross-backend inputs for a node before deciding whether to start a new split");
@@ -2784,8 +2783,8 @@ int main(int argc, char ** argv) {
     ok &= expect(kv_cache_kvarn_cpp.find("GGML_ABORT(\"KVarN does not support position shifts\")") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("GGML_ABORT(\"KVarN does not support position division\")") != std::string::npos,
         "KVarN seq_add/seq_div must fail fast instead of logging and continuing");
-    ok &= expect(kv_cache_kvarn_cpp.find("constexpr uint32_t KVAR_N_STATE_VERSION = 7") != std::string::npos &&
-                 kv_cache_kvarn_cpp.find("if (version < 7)") != std::string::npos &&
+    ok &= expect(kv_cache_kvarn_cpp.find("constexpr uint32_t KVAR_N_STATE_VERSION = 8") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("if (version < 8)") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("if (version == 1)") == std::string::npos &&
                  kv_cache_kvarn_cpp.find("KVAR_N_STATE_RECORDS_FULL") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("KVAR_N_STATE_STAGE_ONLY_PARTIAL") != std::string::npos &&

@@ -85,11 +85,10 @@ static __global__ void ggml_cuda_fattn_kvarn_window_dequant_kernel(
     float * row0 = row_scratch[side][slice][0];
     float * row1 = row_scratch[side][slice][1];
 
-    const bool loaded_from_stage = ggml_cuda_fattn_kvarn_load_rotated_slice_warp(
+    ggml_cuda_fattn_kvarn_load_rotated_slice_warp(
             desc, chunk_begin + token, slice, true, row0, lane);
-    const bool stage_original = loaded_from_stage && desc.value;
     const bool needs_original = desc.original_domain != 0;
-    float * out = !needs_original || stage_original ?
+    float * out = !needs_original ?
         row0 : ggml_cuda_fattn_kvarn_inverse_wht_128_warp(row0, row1, lane);
 
     half * dst = (side == 0 ? k_f16 : v_f16) +

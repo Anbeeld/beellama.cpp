@@ -256,8 +256,7 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
             continue;
         }
 
-        const bool fast_stage_direct = fast_stage &&
-            ((original_domain && desc.value) || (!original_domain && !desc.value));
+        const bool fast_stage_direct = fast_stage && !original_domain;
         if (fast_stage_direct) {
             const int dim2_count_local = out_dim2_end - out_dim2_start;
             constexpr int h2_per_chunk = 16 / sizeof(half2);
@@ -353,16 +352,13 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
                 const bool valid_row = !oob_check || row < i_sup;
                 float * row0 = scratch0 + warp * GGML_CUDA_FATTN_KVARN_DIM;
                 float * row1 = scratch1 + warp * GGML_CUDA_FATTN_KVARN_DIM;
-                bool loaded_from_stage = false;
                 if (fast_record && valid_row) {
                     ggml_cuda_fattn_kvarn_load_rotated_slice_record_warp(
                         desc, record, tile.pos_begin + row, row0, scale_smem, lane);
                 } else {
-                    loaded_from_stage = ggml_cuda_fattn_kvarn_load_rotated_slice_warp(desc, k_start + row, slice, valid_row, row0, lane);
+                    ggml_cuda_fattn_kvarn_load_rotated_slice_warp(desc, k_start + row, slice, valid_row, row0, lane);
                 }
-                // K stage is stored rotated-domain; V stage is stored original-domain.
-                const bool stage_original = loaded_from_stage && desc.value;
-                float * orig = stage_original ? row0 : ggml_cuda_fattn_kvarn_inverse_wht_128_warp(row0, row1, lane);
+                float * orig = ggml_cuda_fattn_kvarn_inverse_wht_128_warp(row0, row1, lane);
                 for (int global_b = out_dim2_start + lane; global_b < out_dim2_end; global_b += warp_size) {
                     const int dim = 2 * (global_b - slice_dim2_start);
                     tile_KV[row * stride_tile + global_b - dim2_start] = make_half2(orig[dim], orig[dim + 1]);

@@ -56,10 +56,6 @@ void store_stage_pair(uint stage_pos, uint head, uint lane) {
     }
 }
 
-float wht_sign(uint out_dim, uint in_dim) {
-    return (bitCount(out_dim & in_dim) & 1) == 0 ? 1.0 : -1.0;
-}
-
 void wht_stage_row(uint lane) {
     barrier();
     for (uint stride = 1; stride < KVAR_N_DIM; stride *= 2) {
@@ -83,15 +79,7 @@ float stage_matrix_value(uint head, uint stage_base, uint stage_group, uint row,
     // and tail_groups transient slots. tail_groups = stage_groups - 1.
     const uint stage_slot = p.swa != 0u ? (stage_group % p.stage_groups) : (1u + ((stage_group - 1u) % p.tail_groups));
     const uint stage_pos = stage_base + stage_slot * KVAR_N_DIM + token;
-    if (p.value == 0u) {
-        return load_stage_value(stage_pos, head, out_dim);
-    }
-
-    float acc = 0.0;
-    for (uint in_dim = 0; in_dim < KVAR_N_DIM; ++in_dim) {
-        acc += wht_sign(out_dim, in_dim) * load_stage_value(stage_pos, head, in_dim);
-    }
-    return acc * KVAR_N_WHT_SCALE;
+    return load_stage_value(stage_pos, head, out_dim);
 }
 
 float std_col(uint head, uint stage_base, uint stage_group, uint col) {
@@ -277,13 +265,9 @@ void main() {
             quantize_stage(head, stage_base, flush_group, record_base, lane);
         }
 
-        // K stage is stored rotated-domain for mixed prefill; V stage stays
-        // original-domain. Quantization reads rotated K directly and rotates V
-        // through stage_matrix_value(), so records stay rotated-domain for both.
+        // Stage and records are rotated-domain for both K and V.
         sh_wht[lane] = data_current[(token * p.n_heads + head) * KVAR_N_DIM + lane];
-        if (p.value == 0u) {
-            wht_stage_row(lane);
-        }
+        wht_stage_row(lane);
         barrier();
         const uint stage_slot = p.swa != 0u ? (group % p.stage_groups) : (group == 0u ? 0u : 1u + ((group - 1u) % p.tail_groups));
         const uint stage_pos = stage_base + stage_slot * KVAR_N_DIM + pos;
