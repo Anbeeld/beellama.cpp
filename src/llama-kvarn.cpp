@@ -65,6 +65,15 @@ static bool llama_kvarn_valid_bits(int bits) {
     return bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 8;
 }
 
+static bool llama_kvarn_valid_bit_pair(int key_bits, int value_bits) {
+    for (const auto & desc : KVAR_N_TYPES) {
+        if (desc.key_bits == key_bits && desc.value_bits == value_bits && desc.group == 128) {
+            return desc.type != LLAMA_KVARN_TYPE_DISABLED && desc.type != LLAMA_KVARN_TYPE_INVALID;
+        }
+    }
+    return false;
+}
+
 static size_t llama_kvarn_align_up(size_t value, size_t alignment) {
     return (value + alignment - 1) / alignment * alignment;
 }
@@ -84,6 +93,8 @@ llama_kvarn_params llama_kvarn_default_params() {
         /*.type                =*/ LLAMA_KVARN_TYPE_DISABLED,
         /*.key_bits            =*/ 0,
         /*.value_bits          =*/ 0,
+        /*.swa_key_bits        =*/ 0,
+        /*.swa_value_bits      =*/ 0,
         /*.group               =*/ 128,
         /*.sinkhorn_iters      =*/ 16,
         /*.sink_tokens         =*/ 128,
@@ -133,30 +144,6 @@ const llama_kvarn_type_desc * llama_kvarn_type_desc_from_type(llama_kvarn_type t
     return nullptr;
 }
 
-llama_kvarn_params llama_kvarn_params_with_min_bits(llama_kvarn_params params, int min_bits) {
-    if (params.type == LLAMA_KVARN_TYPE_DISABLED) {
-        return params;
-    }
-
-    const int key_bits   = std::max(params.key_bits,   min_bits);
-    const int value_bits = std::max(params.value_bits, min_bits);
-    if (key_bits == params.key_bits && value_bits == params.value_bits) {
-        return params;
-    }
-
-    for (const auto & desc : KVAR_N_TYPES) {
-        if (desc.key_bits == key_bits && desc.value_bits == value_bits && desc.group == params.group) {
-            params.type       = desc.type;
-            params.key_bits   = key_bits;
-            params.value_bits = value_bits;
-            return params;
-        }
-    }
-
-    assert(false && "invalid KVarN minimum-bit floor");
-    return params;
-}
-
 const char * llama_kvarn_validate_runtime(
         const llama_kvarn_params & params,
         const llama_kvarn_runtime_requirements & requirements) {
@@ -173,6 +160,16 @@ const char * llama_kvarn_validate_runtime(
     }
     if (!llama_kvarn_valid_bits(params.key_bits) || !llama_kvarn_valid_bits(params.value_bits)) {
         return "KVarN supports only 2-, 3-, 4-, 5-, 6-, and 8-bit cache payloads";
+    }
+    if ((params.swa_key_bits != 0 && !llama_kvarn_valid_bits(params.swa_key_bits)) ||
+            (params.swa_value_bits != 0 && !llama_kvarn_valid_bits(params.swa_value_bits))) {
+        return "KVarN SWA overrides support only 2-, 3-, 4-, 5-, 6-, and 8-bit cache payloads";
+    }
+    if ((params.swa_key_bits == 0) != (params.swa_value_bits == 0)) {
+        return "KVarN SWA override must specify both K and V bits";
+    }
+    if (params.swa_key_bits != 0 && !llama_kvarn_valid_bit_pair(params.swa_key_bits, params.swa_value_bits)) {
+        return "invalid KVarN SWA override bit combination";
     }
     if (params.group != 128) {
         return "KVarN currently requires a group size of 128 tokens";

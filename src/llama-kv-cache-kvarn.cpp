@@ -21,7 +21,6 @@ constexpr uint32_t KVAR_N_GROUP = 128;
 constexpr uint32_t KVAR_N_STAGE_GROUPS = 3; // legacy default; production caches carry stage_groups in op_params[7]
 constexpr uint32_t KVAR_N_MIN_TAIL_GROUPS = 4;
 constexpr uint32_t KVAR_N_SWA_TAIL_GROUPS = 4;
-constexpr uint32_t KVAR_N_SWA_MIN_RECORD_BITS = 4;
 constexpr uint32_t KVAR_N_STATE_MAGIC = 0x4e52564b; // "KVRN"
 // Version 11: tail_groups is explicit and SWA stages no longer allocate a
 // non-existent sink slot. Version 9: D256/D512 records use the full logical-head Hadamard instead of
@@ -52,14 +51,6 @@ namespace {
 size_t kvarn_record_bytes(int bits) {
     return llama_kvarn_packed_bytes(KVAR_N_GROUP * KVAR_N_GROUP, bits) +
         3 * KVAR_N_GROUP * sizeof(ggml_fp16_t);
-}
-
-llama_kvarn_params kvarn_effective_params(llama_kvarn_params params, uint32_t n_swa, llama_swa_type swa_type) {
-    if (n_swa == 0 || swa_type == LLAMA_SWA_TYPE_NONE || params.type == LLAMA_KVARN_TYPE_DISABLED) {
-        return params;
-    }
-
-    return llama_kvarn_params_with_min_bits(params, KVAR_N_SWA_MIN_RECORD_BITS);
 }
 
 void write_kvarn_tensor(llama_io_write_i & io, ggml_tensor * tensor) {
@@ -497,7 +488,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         const layer_filter_cb & filter,
         const layer_reuse_cb & reuse) :
     hparams(hparams),
-    params(kvarn_effective_params(params, n_swa, swa_type)),
+    params(params),
     n_stream(unified ? 1u : n_seq_max),
     // Dynamic staging: size the lossless F16 ring from position semantics.
     // Non-SWA keeps a permanent sink slot plus enough tail groups for the active
@@ -546,10 +537,6 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     // Dynamic staging keeps the F16/compressed mix stable across physical ubatch
     // splits. Log the configured stage depth and its memory cost at cache
     // creation so regressions in the propagation are visible at startup.
-    if (swa && (this->params.key_bits != params.key_bits || this->params.value_bits != params.value_bits)) {
-        LLAMA_LOG_INFO("KVarN cache: SWA record precision floor k%d/v%d -> k%d/v%d bits\n",
-                params.key_bits, params.value_bits, this->params.key_bits, this->params.value_bits);
-    }
     LLAMA_LOG_INFO("KVarN cache: stage_groups=%u tail_groups=%u n_batch=%u n_ubatch=%u%s\n",
             stage_groups, tail_groups, n_batch, n_ubatch, swa ? " (SWA ring)" : "");
 

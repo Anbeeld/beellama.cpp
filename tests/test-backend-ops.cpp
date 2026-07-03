@@ -7434,6 +7434,7 @@ static std::vector<ggml_fp16_t> test_kvarn_reference_decode(
         int bits,
         bool value,
         int stage_groups,
+        int tail_groups,
         int head_slices,
         bool swa) {
     GGML_ASSERT(records->type == GGML_TYPE_I8);
@@ -7451,7 +7452,7 @@ static std::vector<ggml_fp16_t> test_kvarn_reference_decode(
     GGML_ASSERT(stream_start >= 0 && n_stream > 0 && stream_start + n_stream <= total_streams);
 
     const int groups_per_stream = (int) (records->ne[2] / total_streams);
-    const int tail_groups = stage_groups - 1;
+    GGML_ASSERT(tail_groups >= 1 && tail_groups <= stage_groups);
     std::vector<ggml_fp16_t> stage_data(ggml_nelements(stage));
     std::vector<uint8_t> record_data(ggml_nbytes(records));
     ggml_backend_tensor_get(stage, stage_data.data(), 0, ggml_nbytes(stage));
@@ -7559,6 +7560,7 @@ struct test_kvarn_flash_attn_ext : public test_case {
     const int bits_k;
     const int bits_v;
     const int stage_groups;
+    const int tail_groups;
     const int64_t n_stream;
     const int stream_start;
     const bool swa;
@@ -7580,9 +7582,11 @@ struct test_kvarn_flash_attn_ext : public test_case {
             bool swa = false,
             int swa_base_pos = 0,
             bool swa_wrap = false,
-            route_domain domain = route_domain::rotated_decode)
+            route_domain domain = route_domain::rotated_decode,
+            int tail_groups_override = -1)
         : hsk(hsk), n_q(n_q), n_q_heads(n_q_heads), n_kv_heads(n_kv_heads), n_kv(n_kv),
           bits_k(bits_k), bits_v(bits_v), stage_groups(stage_groups),
+          tail_groups(tail_groups_override > 0 ? tail_groups_override : stage_groups - 1),
           n_stream(n_stream), stream_start(stream_start), swa(swa),
           swa_base_pos(swa_base_pos), swa_wrap(swa_wrap),
           domain(swa && n_q > 1 && domain == route_domain::rotated_decode ? route_domain::mixed_prefill : domain) {}
@@ -7597,6 +7601,7 @@ struct test_kvarn_flash_attn_ext : public test_case {
             << ",bits_k=" << bits_k
             << ",bits_v=" << bits_v
             << ",stage_groups=" << stage_groups
+            << ",tail_groups=" << tail_groups
             << ",n_stream=" << n_stream
             << ",stream_start=" << stream_start
             << ",swa=" << (swa ? 1 : 0);
@@ -7671,6 +7676,8 @@ struct test_kvarn_flash_attn_ext : public test_case {
         stored_v->op_params[4] = swa ? 1 : 0;
         stored_k->op_params[5] = slices;
         stored_v->op_params[5] = slices;
+        stored_k->op_params[8] = tail_groups;
+        stored_v->op_params[8] = tail_groups;
         ggml_set_name(stored_k, "stored_k");
         ggml_set_name(stored_v, "stored_v");
 
@@ -7681,6 +7688,8 @@ struct test_kvarn_flash_attn_ext : public test_case {
             v = ggml_kvarn_view(ctx, v_records, stored_v, indices, (int) n_kv, stream_start, (int) n_stream, bits_v, true,  stage_groups);
             k->op_params[6] = swa ? 1 : 0;
             v->op_params[6] = swa ? 1 : 0;
+            k->op_params[8] = tail_groups;
+            v->op_params[8] = tail_groups;
             if (slices > 1) {
                 k = ggml_reshape_4d(ctx, k, hsk, n_kv_heads, n_kv, n_stream);
                 v = ggml_reshape_4d(ctx, v, hsk, n_kv_heads, n_kv, n_stream);
@@ -7896,9 +7905,9 @@ struct test_kvarn_flash_attn_ext : public test_case {
 
         const std::vector<int64_t> indices_data = make_indices();
         const std::vector<ggml_fp16_t> k_ref_data = test_kvarn_reference_decode(
-                k_records, stored_k, indices_data, (int) n_kv, stream_start, (int) n_stream, bits_k, false, stage_groups, (int) (hsk / 128), swa);
+                k_records, stored_k, indices_data, (int) n_kv, stream_start, (int) n_stream, bits_k, false, stage_groups, tail_groups, (int) (hsk / 128), swa);
         const std::vector<ggml_fp16_t> v_ref_data = test_kvarn_reference_decode(
-                v_records, stored_v, indices_data, (int) n_kv, stream_start, (int) n_stream, bits_v, true,  stage_groups, (int) (hsk / 128), swa);
+                v_records, stored_v, indices_data, (int) n_kv, stream_start, (int) n_stream, bits_v, true,  stage_groups, tail_groups, (int) (hsk / 128), swa);
         ggml_backend_tensor_set(k_ref, k_ref_data.data(), 0, k_ref_data.size() * sizeof(ggml_fp16_t));
         ggml_backend_tensor_set(v_ref, v_ref_data.data(), 0, v_ref_data.size() * sizeof(ggml_fp16_t));
 
@@ -9969,6 +9978,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 256, 8, 2, 768, 4, 4, 2, 1, 0, true, 40, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
     test_cases.emplace_back(new test_kvarn_flash_attn_ext(512,  64, 4, 1, 768, 4, 4, 2, 1, 0, true,  0, true,  test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
     test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 128, 4, 1, 768, 5, 4, 2, 1, 0, true,  0, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
+    // Current Gemma 4 production SWA ring: no sink slot, stage_groups == tail_groups == 4,
+    // six record slots, D512 prefill, and record-backed older window groups.
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 128, 4, 1, 768, 4, 4, 4, 1, 0, true, 40, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill, 4));
     test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 128, 4, 1, 768, 4, 5, 2, 1, 0, true,  0, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
     test_cases.emplace_back(new test_kvarn_flash_attn_ext(512,  64, 4, 1, 1024, 4, 4, 5, 1, 0, false, 0, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
     test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 128, 4, 1, 1024, 4, 4, 5, 1, 0, false, 0, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));

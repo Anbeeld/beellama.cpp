@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <string>
 
 //
 // llama_kv_cache_iswa
@@ -55,6 +56,19 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     uint32_t size_swa = GGML_PAD(std::min(size_base, hparams.n_swa*(unified ? n_seq_max : 1) + n_ubatch), 256);
 
     const bool use_kvarn = kvarn.type != LLAMA_KVARN_TYPE_DISABLED;
+    llama_kvarn_params kvarn_swa = kvarn;
+    if (use_kvarn && kvarn.swa_key_bits != 0) {
+        const std::string swa_type_name =
+            "kvarn_k" + std::to_string(kvarn.swa_key_bits) +
+            "v" + std::to_string(kvarn.swa_value_bits) + "_g128";
+        const llama_kvarn_type swa_type = llama_kvarn_type_from_name(swa_type_name.c_str());
+        GGML_ASSERT(swa_type != LLAMA_KVARN_TYPE_INVALID);
+
+        kvarn_swa = llama_kvarn_params_for_type(swa_type);
+        kvarn_swa.sinkhorn_iters      = kvarn.sinkhorn_iters;
+        kvarn_swa.sink_tokens         = kvarn.sink_tokens;
+        kvarn_swa.fail_if_unsupported = kvarn.fail_if_unsupported;
+    }
 
     // when using full-size SWA cache, we set the SWA cache size to be equal to the base cache size
     if (swa_full) {
@@ -64,21 +78,22 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         size_swa = size_base;
     }
     if (use_kvarn) {
-        LLAMA_LOG_INFO("%s: KVarN enabled for all layers (non-SWA full-context and SWA sliding-window ring)\n", __func__);
+        LLAMA_LOG_INFO("%s: KVarN enabled for all layers (non-SWA %s, SWA %s sliding-window ring)\n",
+                __func__, llama_kvarn_type_name(kvarn.type), llama_kvarn_type_name(kvarn_swa.type));
     }
 
-    auto make_cache = [&](uint32_t size, uint32_t n_swa, llama_swa_type swa_type, const layer_filter_cb & layer_filter, llama_memory_t cache_mem_other, bool enable_kvarn) -> std::unique_ptr<llama_memory_i> {
+    auto make_cache = [&](uint32_t size, uint32_t n_swa, llama_swa_type swa_type, const layer_filter_cb & layer_filter, llama_memory_t cache_mem_other, const llama_kvarn_params & cache_kvarn) -> std::unique_ptr<llama_memory_i> {
         // SWA KVarN ring requires a single stream. Non-unified mode still has one
         // stream when n_seq_max == 1, so only fall back when it actually creates
         // multiple streams.
-        const bool kvarn_ok = enable_kvarn &&
+        const bool kvarn_ok = cache_kvarn.type != LLAMA_KVARN_TYPE_DISABLED &&
             !(n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE && n_seq_max > 1 && !unified);
         if (kvarn_ok) {
             // note: structured KVarN caches do not participate in cross-context sharing (mem_other/share)
             return std::make_unique<llama_kv_cache_kvarn>(
                     model,
                     hparams,
-                    kvarn,
+                    cache_kvarn,
                     offload,
                     unified,
                     size,
@@ -110,11 +125,11 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         mem_other_swa = static_cast<llama_kv_cache_iswa *>(mem_other)->get_swa();
     }
 
-    kv_base = make_cache(size_base, 0, LLAMA_SWA_TYPE_NONE, filter_base, mem_other_base, use_kvarn);
+    kv_base = make_cache(size_base, 0, LLAMA_SWA_TYPE_NONE, filter_base, mem_other_base, kvarn);
 
     LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
 
-    kv_swa = make_cache(size_swa, hparams.n_swa, hparams.swa_type, filter_swa, mem_other_swa, use_kvarn);
+    kv_swa = make_cache(size_swa, hparams.n_swa, hparams.swa_type, filter_swa, mem_other_swa, kvarn_swa);
 }
 
 void llama_kv_cache_iswa::clear(bool data) {

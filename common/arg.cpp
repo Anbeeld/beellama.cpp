@@ -504,6 +504,19 @@ static void parse_target_cache_type(common_params & params, bool key, const std:
     }
 }
 
+static void parse_target_kvarn_swa_cache_type(common_params & params, bool key, const std::string & value) {
+    const int32_t kvarn_bits = kvarn_bits_from_cache_type(value);
+    if (kvarn_bits == 0) {
+        throw std::runtime_error("SWA KVarN cache overrides require a KVarN pseudo type: " + value);
+    }
+
+    if (key) {
+        params.cache_kvarn_swa_bits_k = kvarn_bits;
+    } else {
+        params.cache_kvarn_swa_bits_v = kvarn_bits;
+    }
+}
+
 static bool parse_bool_value(const std::string & value) {
     if (is_truthy(value)) {
         return true;
@@ -1041,8 +1054,13 @@ bool common_params_to_map(int argc, char ** argv, llama_example ex, std::map<com
 static void common_params_kvarn_normalize(common_params & params) {
     int32_t key_bits   = params.cache_kvarn_bits_k;
     int32_t value_bits = params.cache_kvarn_bits_v;
+    const int32_t swa_key_bits   = params.cache_kvarn_swa_bits_k;
+    const int32_t swa_value_bits = params.cache_kvarn_swa_bits_v;
 
     if (key_bits == 0 && value_bits == 0) {
+        if (swa_key_bits != 0 || swa_value_bits != 0) {
+            throw std::invalid_argument("KVarN SWA cache overrides require KVarN --cache-type-k and --cache-type-v");
+        }
         return;
     }
 
@@ -1068,6 +1086,20 @@ static void common_params_kvarn_normalize(common_params & params) {
     params.cache_kvarn_bits_v = value_bits;
     params.cache_type_k       = kvarn_fallback_cache_type(key_bits);
     params.cache_type_v       = kvarn_fallback_cache_type(value_bits);
+
+    if ((swa_key_bits == 0) != (swa_value_bits == 0)) {
+        throw std::invalid_argument("KVarN SWA cache overrides require both --cache-type-k-swa and --cache-type-v-swa");
+    }
+
+    if (swa_key_bits != 0) {
+        const llama_kvarn_type swa_type = kvarn_type_from_bits(swa_key_bits, swa_value_bits);
+        if (swa_type == LLAMA_KVARN_TYPE_INVALID) {
+            throw std::invalid_argument(string_format(
+                "invalid KVarN SWA cache type combination: kvarn%d/kvarn%d", swa_key_bits, swa_value_bits));
+        }
+        params.kvarn.swa_key_bits   = swa_key_bits;
+        params.kvarn.swa_value_bits = swa_value_bits;
+    }
 
     if (params.grp_attn_n != 1) {
         throw std::invalid_argument("KVarN does not support Self-Extend/group attention; use --grp-attn-n 1");
@@ -2327,6 +2359,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             parse_target_cache_type(params, /*key =*/ false, value);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
+    add_opt(common_arg(
+        {"--cache-type-k-swa"}, "TYPE",
+        string_format(
+            "SWA-layer KVarN cache type override for K\n"
+            "allowed values: kvarn2, kvarn3, kvarn4, kvarn5, kvarn6, kvarn8\n"
+            "(default: same as --cache-type-k)"
+        ),
+        [](common_params & params, const std::string & value) {
+            parse_target_kvarn_swa_cache_type(params, /*key =*/ true, value);
+        }
+    ).set_env("LLAMA_ARG_CACHE_TYPE_K_SWA"));
+    add_opt(common_arg(
+        {"--cache-type-v-swa"}, "TYPE",
+        string_format(
+            "SWA-layer KVarN cache type override for V\n"
+            "allowed values: kvarn2, kvarn3, kvarn4, kvarn5, kvarn6, kvarn8\n"
+            "(default: same as --cache-type-v)"
+        ),
+        [](common_params & params, const std::string & value) {
+            parse_target_kvarn_swa_cache_type(params, /*key =*/ false, value);
+        }
+    ).set_env("LLAMA_ARG_CACHE_TYPE_V_SWA"));
     add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",

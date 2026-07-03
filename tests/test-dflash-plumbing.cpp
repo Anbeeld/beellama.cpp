@@ -487,14 +487,14 @@ int main(int argc, char ** argv) {
                  contains_ws(kv_cache_kvarn_cpp, "if (is_swa) { return KVAR_N_SWA_TAIL_GROUPS; }") &&
                  kv_cache_kvarn_cpp.find("const uint32_t in_flight_groups = std::max<uint32_t>(1u, (n_ubatch + KVAR_N_GROUP - 1u) / KVAR_N_GROUP);") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("visible_groups - tail_groups + in_flight_groups - 1u") != std::string::npos &&
-                 kv_cache_kvarn_cpp.find("kvarn_effective_params(params, n_swa, swa_type)") != std::string::npos &&
-                 kv_cache_kvarn_cpp.find("KVAR_N_SWA_MIN_RECORD_BITS = 4") != std::string::npos &&
-                 llama_kvarn_h.find("llama_kvarn_params_with_min_bits") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("KVAR_N_SWA_MIN_RECORD_BITS") == std::string::npos &&
+                 kv_cache_kvarn_cpp.find("SWA record precision floor") == std::string::npos &&
+                 llama_kvarn_h.find("llama_kvarn_params_with_min_bits") == std::string::npos &&
                  kv_cache_kvarn_cpp.find("kvarn_record_bytes(this->params.key_bits)") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("kvarn_record_bytes(this->params.value_bits)") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("kvarn_record_groups_per_stream") != std::string::npos &&
                  cuda_fattn_mma_kvarn.find("ggml_cuda_fattn_kvarn_swa_group_from_record") != std::string::npos,
-        "KVarN SWA record ring must cover the active ubatch span without raising the requested KVarN4 precision");
+        "KVarN SWA record ring must cover the active ubatch span without silently raising requested K/V bits");
     ok &= expect(contains_ws(graph_cpp, "static enum ggml_flash_attn_ext_kvarn_domain llm_kvarn_attn_domain( const llama_cparams & cparams, const ggml_tensor * q, bool is_swa)") &&
                  graph_cpp.find("const int64_t n_q = q->ne[2];") != std::string::npos &&
                  graph_cpp.find("if (n_q == 1)") != std::string::npos &&
@@ -2856,11 +2856,14 @@ int main(int argc, char ** argv) {
         "Vulkan KVarN shaders must not generate a materialize shader");
     ok &= expect(llama_kvarn_h.find("LLAMA_API") == std::string::npos,
         "internal C++ KVarN helper declarations must not be exported from the public DLL ABI");
-    ok &= expect(kv_cache_iswa_cpp.find("KVarN enabled for all layers (non-SWA full-context and SWA sliding-window ring)") != std::string::npos &&
+    ok &= expect(kv_cache_iswa_cpp.find("KVarN enabled for all layers (non-SWA %s, SWA %s sliding-window ring)") != std::string::npos &&
+                 kv_cache_iswa_cpp.find("llama_kvarn_params kvarn_swa = kvarn") != std::string::npos &&
+                 kv_cache_iswa_cpp.find("llama_kvarn_params_for_type(swa_type)") != std::string::npos &&
                  kv_cache_iswa_cpp.find("kvarn_swa_fallback_cache_type") == std::string::npos &&
                  kv_cache_iswa_cpp.find("return GGML_TYPE_Q5_0;") == std::string::npos &&
-                 kv_cache_iswa_cpp.find("make_cache(size_base, 0, LLAMA_SWA_TYPE_NONE, filter_base, mem_other_base, use_kvarn)") != std::string::npos &&
-                 kv_cache_iswa_cpp.find("make_cache(size_swa, hparams.n_swa, hparams.swa_type, filter_swa, mem_other_swa, use_kvarn)") != std::string::npos &&
+                 kv_cache_iswa_cpp.find("cache_kvarn.type != LLAMA_KVARN_TYPE_DISABLED") != std::string::npos &&
+                 kv_cache_iswa_cpp.find("make_cache(size_base, 0, LLAMA_SWA_TYPE_NONE, filter_base, mem_other_base, kvarn)") != std::string::npos &&
+                 kv_cache_iswa_cpp.find("make_cache(size_swa, hparams.n_swa, hparams.swa_type, filter_swa, mem_other_swa, kvarn_swa)") != std::string::npos &&
                  kv_cache_iswa_cpp.find("n_seq_max > 1 && !unified") != std::string::npos &&
                  kv_cache_iswa_cpp.find("SWA KVarN ring requires a single stream") != std::string::npos,
         "ISWA with KVarN must keep KVarN on single-stream SWA rings and fall back only when non-unified mode creates multiple streams");

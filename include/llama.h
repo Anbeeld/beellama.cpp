@@ -250,6 +250,8 @@ extern "C" {
 
         int32_t key_bits;
         int32_t value_bits;
+        int32_t swa_key_bits;   // optional SWA-layer KVarN key bits override (0 = use key_bits)
+        int32_t swa_value_bits; // optional SWA-layer KVarN value bits override (0 = use value_bits)
         int32_t group;
         int32_t sinkhorn_iters;
         int32_t sink_tokens;

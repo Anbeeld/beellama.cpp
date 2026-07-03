@@ -56,6 +56,8 @@ struct llama_cparams {
         /*.type                =*/ LLAMA_KVARN_TYPE_DISABLED,
         /*.key_bits            =*/ 0,
         /*.value_bits          =*/ 0,
+        /*.swa_key_bits        =*/ 0,
+        /*.swa_value_bits      =*/ 0,
         /*.group               =*/ 128,
         /*.sinkhorn_iters      =*/ 16,
         /*.sink_tokens         =*/ 128,

@@ -42,8 +42,6 @@ size_t llama_kvarn_type_count();
 const llama_kvarn_type_desc * llama_kvarn_type_desc_from_name(const char * name);
 const llama_kvarn_type_desc * llama_kvarn_type_desc_from_type(llama_kvarn_type type);
 
-llama_kvarn_params llama_kvarn_params_with_min_bits(llama_kvarn_params params, int min_bits);
-
 llama_kvarn_tile_layout llama_kvarn_make_layout(int head_dim, int group, int key_bits, int value_bits);
 
 int  llama_kvarn_head_slices(int head_dim);

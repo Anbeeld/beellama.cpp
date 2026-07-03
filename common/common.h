@@ -730,11 +730,15 @@ struct common_params {
 
     int32_t cache_kvarn_bits_k = 0; // KVarN pseudo cache type bits from --cache-type-k (0 = disabled)
     int32_t cache_kvarn_bits_v = 0; // KVarN pseudo cache type bits from --cache-type-v (0 = disabled)
+    int32_t cache_kvarn_swa_bits_k = 0; // KVarN pseudo SWA-layer K bits from --cache-type-k-swa (0 = base K bits)
+    int32_t cache_kvarn_swa_bits_v = 0; // KVarN pseudo SWA-layer V bits from --cache-type-v-swa (0 = base V bits)
 
     llama_kvarn_params kvarn = {
         /*.type                =*/ LLAMA_KVARN_TYPE_DISABLED,
         /*.key_bits            =*/ 0,
         /*.value_bits          =*/ 0,
+        /*.swa_key_bits        =*/ 0,
+        /*.swa_value_bits      =*/ 0,
         /*.group               =*/ 128,
         /*.sinkhorn_iters      =*/ 16,
         /*.sink_tokens         =*/ 128,
