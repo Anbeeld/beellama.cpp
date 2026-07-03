@@ -33,7 +33,7 @@ static __device__ __forceinline__ bool ggml_cuda_fattn_kvarn_decode_swa_record_b
     const int live_group = desc.live_group;
     const int stage_begin = live_group >= (desc.tail_groups - 1) ? live_group - (desc.tail_groups - 1) : 0;
     const bool from_stage = group_global >= stage_begin && group_global <= live_group;
-    return !from_stage && group_global < stage_begin && (live_group - group_global) < desc.groups_per_stream;
+    return !from_stage && ggml_cuda_fattn_kvarn_swa_group_from_record(desc, group_global, stage_begin);
 }
 
 // Per-split tile plan: whether the cooperative direct-record fast path is usable, the in-group

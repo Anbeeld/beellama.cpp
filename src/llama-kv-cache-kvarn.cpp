@@ -19,12 +19,17 @@ namespace {
 
 constexpr uint32_t KVAR_N_GROUP = 128;
 constexpr uint32_t KVAR_N_STAGE_GROUPS = 3; // legacy default; production caches carry stage_groups in op_params[7]
+constexpr uint32_t KVAR_N_MIN_TAIL_GROUPS = 4;
+constexpr uint32_t KVAR_N_SWA_TAIL_GROUPS = 4;
+constexpr uint32_t KVAR_N_SWA_MIN_RECORD_BITS = 4;
 constexpr uint32_t KVAR_N_STATE_MAGIC = 0x4e52564b; // "KVRN"
-// Version 8: KVarN K/V stage rows and compressed records are all
+// Version 11: tail_groups is explicit and SWA stages no longer allocate a
+// non-existent sink slot. Version 9: D256/D512 records use the full logical-head Hadamard instead of
+// independent 128-wide slice rotations. Version 8: KVarN K/V stage rows and compressed records are all
 // rotated-domain. Older states are rejected because their staged V rows may
 // otherwise be restored in the wrong domain. Version 5 added stage_groups
-// validation.
-constexpr uint32_t KVAR_N_STATE_VERSION = 8;
+// validation. Version 10 rejects states with the pre-dedup SWA record-ring layout.
+constexpr uint32_t KVAR_N_STATE_VERSION = 11;
 constexpr uint32_t KVAR_N_STATE_RECORDS_FULL = 0;
 constexpr uint32_t KVAR_N_STATE_STAGE_ONLY_PARTIAL = 1;
 
@@ -47,6 +52,14 @@ namespace {
 size_t kvarn_record_bytes(int bits) {
     return llama_kvarn_packed_bytes(KVAR_N_GROUP * KVAR_N_GROUP, bits) +
         3 * KVAR_N_GROUP * sizeof(ggml_fp16_t);
+}
+
+llama_kvarn_params kvarn_effective_params(llama_kvarn_params params, uint32_t n_swa, llama_swa_type swa_type) {
+    if (n_swa == 0 || swa_type == LLAMA_SWA_TYPE_NONE || params.type == LLAMA_KVARN_TYPE_DISABLED) {
+        return params;
+    }
+
+    return llama_kvarn_params_with_min_bits(params, KVAR_N_SWA_MIN_RECORD_BITS);
 }
 
 void write_kvarn_tensor(llama_io_write_i & io, ggml_tensor * tensor) {
@@ -113,8 +126,8 @@ int32_t kvarn_contiguous_tokens_per_stream_hint(const llama_kv_cache::slot_info 
     return (int32_t) n_tokens;
 }
 
-void kvarn_gen_hadamard_128(std::vector<float> & data) {
-    constexpr int n = 128;
+void kvarn_gen_hadamard(std::vector<float> & data, int n) {
+    GGML_ASSERT(n == 128 || n == 256 || n == 512);
     data.assign(n * n, 0.0f);
     data[0] = 1.0f / std::sqrt(float(n));
 
@@ -131,23 +144,59 @@ void kvarn_gen_hadamard_128(std::vector<float> & data) {
     }
 }
 
-const std::vector<float> & kvarn_hadamard_128() {
-    static const std::vector<float> data = [] {
+const std::vector<float> & kvarn_hadamard(int n) {
+    static const std::vector<float> h128 = [] {
         std::vector<float> result;
-        kvarn_gen_hadamard_128(result);
+        kvarn_gen_hadamard(result, 128);
+        return result;
+    }();
+    static const std::vector<float> h256 = [] {
+        std::vector<float> result;
+        kvarn_gen_hadamard(result, 256);
+        return result;
+    }();
+    static const std::vector<float> h512 = [] {
+        std::vector<float> result;
+        kvarn_gen_hadamard(result, 512);
         return result;
     }();
 
-    return data;
+    switch (n) {
+        case 128: return h128;
+        case 256: return h256;
+        case 512: return h512;
+        default:  GGML_ABORT("unsupported KVarN Hadamard width");
+    }
 }
 
 uint32_t kvarn_stage_tail_groups(uint32_t kv_size, uint32_t n_batch, uint32_t n_ubatch, uint32_t n_swa, bool is_swa) {
-    const uint32_t swa_stage_cells = std::min(kv_size, n_swa + n_ubatch);
-    const uint32_t stage_span_groups = is_swa ?
-        ((swa_stage_cells + KVAR_N_GROUP - 1u) / KVAR_N_GROUP) + 1u :
-        ((n_batch + n_ubatch + KVAR_N_GROUP - 1u) / KVAR_N_GROUP);
+    GGML_UNUSED(n_batch);
+    GGML_UNUSED(n_swa);
 
-    return std::max<uint32_t>(is_swa ? 2u : 4u, stage_span_groups);
+    if (is_swa) {
+        return KVAR_N_SWA_TAIL_GROUPS;
+    }
+
+    const uint32_t in_flight_groups = std::max<uint32_t>(1u, (n_ubatch + KVAR_N_GROUP - 1u) / KVAR_N_GROUP);
+    const uint32_t min_tail_groups = KVAR_N_MIN_TAIL_GROUPS + (kv_size >= 65536u ? 2u : 0u);
+    return min_tail_groups + in_flight_groups;
+}
+
+uint32_t kvarn_swa_visible_groups(uint32_t kv_size, uint32_t n_swa) {
+    const uint32_t window_cells = n_swa > 0 ? std::min(kv_size, n_swa) : kv_size;
+    return ((window_cells + KVAR_N_GROUP - 1u) / KVAR_N_GROUP) + 1u;
+}
+
+uint32_t kvarn_record_groups_per_stream(uint32_t kv_size, uint32_t n_ubatch, uint32_t n_swa, bool is_swa, uint32_t tail_groups) {
+    if (!is_swa) {
+        return (kv_size + KVAR_N_GROUP - 1u) / KVAR_N_GROUP;
+    }
+
+    const uint32_t visible_groups = kvarn_swa_visible_groups(kv_size, n_swa);
+    const uint32_t in_flight_groups = std::max<uint32_t>(1u, (n_ubatch + KVAR_N_GROUP - 1u) / KVAR_N_GROUP);
+    const uint32_t record_groups = visible_groups > tail_groups ?
+        visible_groups - tail_groups + in_flight_groups - 1u : in_flight_groups;
+    return std::max<uint32_t>(1u, record_groups);
 }
 
 } // namespace
@@ -246,8 +295,9 @@ ggml_tensor * llama_kv_cache_kvarn_context::get_turbo_rot_inverse() const {
     return nullptr;
 }
 
-ggml_tensor * llama_kv_cache_kvarn_context::build_input_kvarn_rot(ggml_context * ctx) const {
-    ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, KVAR_N_GROUP, KVAR_N_GROUP);
+ggml_tensor * llama_kv_cache_kvarn_context::build_input_kvarn_rot(ggml_context * ctx, int n_rot) const {
+    GGML_ASSERT(n_rot == 128 || n_rot == 256 || n_rot == 512);
+    ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_rot, n_rot);
     ggml_set_input(res);
     ggml_set_name(res, "attn_inp_kvarn_rot");
     return res;
@@ -424,9 +474,10 @@ void llama_kv_cache_kvarn_context::set_input_v_rot_backend(ggml_tensor * dst) co
 
 void llama_kv_cache_kvarn_context::set_input_kvarn_rot(ggml_tensor * dst) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
-    GGML_ASSERT(dst->type == GGML_TYPE_F32 && dst->ne[0] == KVAR_N_GROUP && dst->ne[1] == KVAR_N_GROUP);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT((dst->ne[0] == 128 || dst->ne[0] == 256 || dst->ne[0] == 512) && dst->ne[1] == dst->ne[0]);
 
-    const auto & data = kvarn_hadamard_128();
+    const auto & data = kvarn_hadamard((int) dst->ne[0]);
     memcpy(dst->data, data.data(), ggml_nbytes(dst));
 }
 
@@ -446,26 +497,20 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         const layer_filter_cb & filter,
         const layer_reuse_cb & reuse) :
     hparams(hparams),
-    params(params),
+    params(kvarn_effective_params(params, n_swa, swa_type)),
     n_stream(unified ? 1u : n_seq_max),
-    // SWA: the metadata window of up to kv_size cells spans kv_size/128 + 1 tiles
-    // (a sliding window is rarely tile-aligned), so the record ring needs 2 extra
-    // slots over the non-SWA count to represent the oldest in-window tile without
-    // a slot collision and to keep (live_group - group) < groups_per_stream.
-    n_groups_per_stream(((kv_size + KVAR_N_GROUP - 1) / KVAR_N_GROUP) +
-        ((n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE) ? 2u : 0u)),
-    // Dynamic staging: size the lossless F16 ring from the scheduler window.
-    // Non-SWA KVarN keeps at least four transient tail groups and covers the full
-    // logical batch plus one physical ubatch, so early queries in a large ubatch
-    // do not see nearby groups compressed relative to the ubatch's final live
-    // group, including at logical-batch boundaries. SWA covers the active sliding
-    // window plus the current ubatch, bounded by the SWA ring size, because those
-    // visible local-attention keys are much more sensitive to compressed record
-    // reads during prompt prefill than global full-context layers.
+    // Dynamic staging: size the lossless F16 ring from position semantics.
+    // Non-SWA keeps a permanent sink slot plus enough tail groups for the active
+    // ubatch. SWA has no sink, so every stage slot is part of the local tail.
     tail_groups(kvarn_stage_tail_groups(
         kv_size, n_batch, n_ubatch, n_swa, n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE)),
-    stage_groups(tail_groups + 1u),
+    stage_groups((n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE) ? tail_groups : tail_groups + 1u),
     swa(n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE),
+    // SWA: the metadata window may span one more 128-token tile than its nominal
+    // size, and a batched prefill needs the union of every row's sliding window.
+    // The record ring stores only tiles older than the F16 tail; loaders account
+    // for the tail offset when deciding whether a ring slot is live.
+    n_groups_per_stream(kvarn_record_groups_per_stream(kv_size, n_ubatch, n_swa, swa, tail_groups)),
     metadata(std::make_unique<llama_kv_cache>(
         model,
         hparams,
@@ -485,18 +530,26 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         nullptr)) {
     GGML_ASSERT(n_stream > 0);
     GGML_ASSERT(swa || kv_size % KVAR_N_GROUP == 0);
-    GGML_ASSERT(stage_groups >= 2 && "KVarN stage depth must be at least 2 (sink + one transient)");
+    GGML_ASSERT(stage_groups >= 2 && "KVarN stage depth must be at least 2");
+    GGML_ASSERT(tail_groups >= 1 && tail_groups <= stage_groups &&
+        "KVarN tail depth must fit within the F16 stage");
     if (swa) {
         GGML_ASSERT(n_stream == 1 && "SWA KVarN ring requires a single-stream cache");
+        const uint32_t in_flight_groups = std::max<uint32_t>(1u, (n_ubatch + KVAR_N_GROUP - 1u) / KVAR_N_GROUP);
         // Backstop for the ring-size invariant above: the record ring must have
-        // strictly more slots than the metadata window's worst-case tile span so
-        // the oldest in-window tile still decodes from records.
-        GGML_ASSERT(n_groups_per_stream > (kv_size + KVAR_N_GROUP - 1) / KVAR_N_GROUP &&
-            "SWA KVarN record ring is too small for the sliding window");
+        // enough slots for the compressed portion of the worst-case visible tile
+        // span after subtracting the F16 tail and adding the active ubatch span.
+        GGML_ASSERT(n_groups_per_stream + tail_groups >=
+                kvarn_swa_visible_groups(kv_size, n_swa) + in_flight_groups - 1u &&
+            "SWA KVarN record ring is too small for the deduplicated sliding window");
     }
     // Dynamic staging keeps the F16/compressed mix stable across physical ubatch
     // splits. Log the configured stage depth and its memory cost at cache
     // creation so regressions in the propagation are visible at startup.
+    if (swa && (this->params.key_bits != params.key_bits || this->params.value_bits != params.value_bits)) {
+        LLAMA_LOG_INFO("KVarN cache: SWA record precision floor k%d/v%d -> k%d/v%d bits\n",
+                params.key_bits, params.value_bits, this->params.key_bits, this->params.value_bits);
+    }
     LLAMA_LOG_INFO("KVarN cache: stage_groups=%u tail_groups=%u n_batch=%u n_ubatch=%u%s\n",
             stage_groups, tail_groups, n_batch, n_ubatch, swa ? " (SWA ring)" : "");
 
@@ -529,13 +582,12 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         return result;
     };
 
-    const size_t k_record_size = kvarn_record_bytes(params.key_bits);
-    const size_t v_record_size = kvarn_record_bytes(params.value_bits);
+    const size_t k_record_size = kvarn_record_bytes(this->params.key_bits);
+    const size_t v_record_size = kvarn_record_bytes(this->params.value_bits);
     const int64_t n_record_groups = int64_t(n_groups_per_stream) * n_stream;
-    // Stage depth is now a cache property derived from the configured scheduler
-    // window. Non-SWA caches keep at least four transient tail groups and cover
-    // n_batch plus one n_ubatch boundary cushion; SWA keeps the active sliding
-    // window exact in the F16 stage ring.
+    // Stage depth is a cache property derived from position semantics. Non-SWA
+    // caches keep a bounded current-ubatch/recent-token span; SWA keeps only the
+    // live tail while older visible tiles live in the compressed record ring.
     // Backends read stage_groups from op_params[7] instead of assuming 3.
     const int64_t n_stage_tokens = int64_t(KVAR_N_GROUP) * int64_t(stage_groups) * n_stream;
     size_t raw_bytes = 0;
@@ -699,7 +751,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     }
 
     LLAMA_LOG_INFO("%s: type = %s, layers = %zu, groups/stream = %u, streams = %u, KVarN = %.2f MiB, equivalent F16 = %.2f MiB\n",
-            __func__, llama_kvarn_type_name(params.type), layers.size(), n_groups_per_stream, n_stream,
+            __func__, llama_kvarn_type_name(this->params.type), layers.size(), n_groups_per_stream, n_stream,
             total_bytes / 1024.0 / 1024.0, raw_bytes / 1024.0 / 1024.0);
 }
 
@@ -926,10 +978,10 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
     }
     const uint32_t state_kind = partial_state ? KVAR_N_STATE_STAGE_ONLY_PARTIAL : KVAR_N_STATE_RECORDS_FULL;
     io.write(&state_kind, sizeof(state_kind));
-    // Version 5+: record the stage depth so the reader can validate that the
-    // saved stage tensor layout matches the current cache. The W2 gate rejects
-    // any mismatch; remap for differing save/restore ubatch is future work.
+    // Version 11+: record both stage and tail depth so SWA no-sink stages and
+    // non-SWA sink stages cannot be restored into each other's layout.
     io.write(&stage_groups, sizeof(stage_groups));
+    io.write(&tail_groups, sizeof(tail_groups));
 
     // n_groups_used is single-valued across all saved streams. This is correct
     // because when seq_id >= 0, saved_streams has exactly 1 entry (the stream
@@ -984,7 +1036,7 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
         type != params.type || n_layers != layers.size()) {
         throw std::runtime_error("incompatible KVarN cache state");
     }
-    if (version < 8) {
+    if (version < 11) {
         throw std::runtime_error(
             "incompatible KVarN cache state: re-save prompt cache with this build");
     }
@@ -1009,7 +1061,10 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
         throw std::runtime_error("invalid KVarN cache state kind");
     }
 
-    // Version 8 rejects older stage-domain states. The reader still does not implement
+    // Version 8 rejects older stage-domain states; version 9 rejects D>128
+    // independent-slice records; version 10 rejects the old full-overlap SWA
+    // record ring; version 11 carries explicit tail depth for SWA no-sink
+    // stages. The reader still does not implement
     // stage-slot remap on restore (the plan's full save/restore matrix allows
     // remapping logical live groups into differently-sized stages). For now,
     // any stage_groups mismatch is rejected explicitly so the stage is never
@@ -1024,6 +1079,14 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
             "KVarN cache stage depth mismatch: state has %u stage groups, cache has %u; "
             "re-save the prompt cache with the current --ubatch setting",
             saved_stage_groups, stage_groups));
+    }
+    uint32_t saved_tail_groups;
+    io.read(&saved_tail_groups, sizeof(saved_tail_groups));
+    if (saved_tail_groups != tail_groups) {
+        throw std::runtime_error(format(
+            "KVarN cache tail depth mismatch: state has %u tail groups, cache has %u; "
+            "re-save the prompt cache with this build",
+            saved_tail_groups, tail_groups));
     }
 
     uint32_t n_groups_used;
@@ -1121,6 +1184,8 @@ ggml_tensor * llama_kv_cache_kvarn::store(
         int32_t(stage_groups));
     result->op_params[3] = kvarn_contiguous_tokens_per_stream_hint(sinfo);
     result->op_params[4] = swa ? 1 : 0; // SWA sliding-window ring store
+    result->op_params[5] = (int32_t) slices; // KVarN head-wide Hadamard slice count
+    result->op_params[8] = int32_t(tail_groups);
     return result;
 }
 
@@ -1149,6 +1214,7 @@ ggml_tensor * llama_kv_cache_kvarn::view(
         value,
         int32_t(stage_groups));
     result->op_params[6] = swa ? 1 : 0;
+    result->op_params[8] = int32_t(tail_groups);
     const uint32_t slices = value ? layer.v_slices : layer.k_slices;
     if (slices > 1) {
         result = ggml_reshape_4d(

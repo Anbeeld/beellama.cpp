@@ -2183,6 +2183,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_turbo_wht(params, tensor);
             } break;
+        case GGML_OP_KVARN_WHT:
+            {
+                ggml_compute_forward_kvarn_wht(params, tensor);
+            } break;
         case GGML_OP_KVARN_STORE:
             {
                 ggml_compute_forward_kvarn_store(params, tensor);
@@ -2373,6 +2377,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_GATED_DELTA_NET:
         case GGML_OP_GATED_DELTA_NET_TREE:
         case GGML_OP_TURBO_WHT:
+        case GGML_OP_KVARN_WHT:
             {
                 n_tasks = n_threads;
             } break;
@@ -3106,6 +3111,7 @@ struct ggml_cplan ggml_graph_plan(
                         cur = S_v * sizeof(float) * n_tasks;
                     } break;
                 case GGML_OP_TURBO_WHT:
+                case GGML_OP_KVARN_WHT:
                 case GGML_OP_KVARN_STORE:
                 case GGML_OP_KVARN_VIEW:
                     {

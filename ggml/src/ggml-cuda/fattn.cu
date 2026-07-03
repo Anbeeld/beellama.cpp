@@ -78,6 +78,7 @@ static __global__ void ggml_cuda_fattn_kvarn_init_descs_kernel(
         int k_groups_per_stream,
         int k_record_bytes,
         int k_stage_groups,
+        int k_tail_groups,
         int k_bits,
         bool k_swa,
         const uint8_t * v_records,
@@ -90,11 +91,14 @@ static __global__ void ggml_cuda_fattn_kvarn_init_descs_kernel(
         int v_groups_per_stream,
         int v_record_bytes,
         int v_stage_groups,
+        int v_tail_groups,
         int v_bits,
         bool v_swa,
         int n_stream,
         int n_kv_heads,
         int slices,
+        int k_head_slices,
+        int v_head_slices,
         int k_original_domain,
         int v_original_domain) {
     const int out_stream = blockIdx.x;
@@ -136,10 +140,11 @@ static __global__ void ggml_cuda_fattn_kvarn_init_descs_kernel(
         k_desc.groups_per_stream = k_groups_per_stream;
         k_desc.record_bytes = k_record_bytes;
         k_desc.stage_groups = k_stage_groups;
-        k_desc.tail_groups = k_stage_groups - 1;
+        k_desc.tail_groups = k_tail_groups;
         k_desc.bits = k_bits;
         k_desc.value = 0;
         k_desc.swa = k_swa ? 1 : 0;
+        k_desc.head_slices = k_head_slices;
         k_desc.original_domain = k_original_domain;
 
         ggml_cuda_fattn_kvarn_desc & v_desc = v_descs[(size_t) out_stream * n_kv_heads + h];
@@ -153,10 +158,11 @@ static __global__ void ggml_cuda_fattn_kvarn_init_descs_kernel(
         v_desc.groups_per_stream = v_groups_per_stream;
         v_desc.record_bytes = v_record_bytes;
         v_desc.stage_groups = v_stage_groups;
-        v_desc.tail_groups = v_stage_groups - 1;
+        v_desc.tail_groups = v_tail_groups;
         v_desc.bits = v_bits;
         v_desc.value = 1;
         v_desc.swa = v_swa ? 1 : 0;
+        v_desc.head_slices = v_head_slices;
         v_desc.original_domain = v_original_domain;
     }
 }
@@ -179,6 +185,7 @@ void ggml_cuda_fattn_kvarn_init_descs(
         plan.k.groups_per_stream,
         (int) plan.k.records->ne[0],
         plan.k.stage_groups,
+        plan.k.tail_groups,
         plan.k.bits,
         plan.k.swa,
         (const uint8_t *) plan.v.records->data,
@@ -191,11 +198,14 @@ void ggml_cuda_fattn_kvarn_init_descs(
         plan.v.groups_per_stream,
         (int) plan.v.records->ne[0],
         plan.v.stage_groups,
+        plan.v.tail_groups,
         plan.v.bits,
         plan.v.swa,
         plan.n_stream,
         plan.n_kv_heads,
         plan.slices,
+        plan.k.head_slices,
+        plan.v.head_slices,
         k_original_domain,
         v_original_domain);
     CUDA_CHECK(cudaGetLastError());

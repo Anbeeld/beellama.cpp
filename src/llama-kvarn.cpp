@@ -133,6 +133,30 @@ const llama_kvarn_type_desc * llama_kvarn_type_desc_from_type(llama_kvarn_type t
     return nullptr;
 }
 
+llama_kvarn_params llama_kvarn_params_with_min_bits(llama_kvarn_params params, int min_bits) {
+    if (params.type == LLAMA_KVARN_TYPE_DISABLED) {
+        return params;
+    }
+
+    const int key_bits   = std::max(params.key_bits,   min_bits);
+    const int value_bits = std::max(params.value_bits, min_bits);
+    if (key_bits == params.key_bits && value_bits == params.value_bits) {
+        return params;
+    }
+
+    for (const auto & desc : KVAR_N_TYPES) {
+        if (desc.key_bits == key_bits && desc.value_bits == value_bits && desc.group == params.group) {
+            params.type       = desc.type;
+            params.key_bits   = key_bits;
+            params.value_bits = value_bits;
+            return params;
+        }
+    }
+
+    assert(false && "invalid KVarN minimum-bit floor");
+    return params;
+}
+
 const char * llama_kvarn_validate_runtime(
         const llama_kvarn_params & params,
         const llama_kvarn_runtime_requirements & requirements) {

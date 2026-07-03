@@ -13,8 +13,10 @@ enum {
     GGML_CUDA_FATTN_KVARN_OP_PARAM_VIEW_VALUE        = 1,
     GGML_CUDA_FATTN_KVARN_OP_PARAM_VIEW_STREAM_START = 2,
     GGML_CUDA_FATTN_KVARN_OP_PARAM_VIEW_N_STREAM     = 3,
+    GGML_CUDA_FATTN_KVARN_OP_PARAM_HEAD_SLICES       = 5,
     GGML_CUDA_FATTN_KVARN_OP_PARAM_VIEW_SWA          = 6,
     GGML_CUDA_FATTN_KVARN_OP_PARAM_STAGE_GROUPS      = 7,
+    GGML_CUDA_FATTN_KVARN_OP_PARAM_TAIL_GROUPS       = 8,
 };
 
 struct ggml_cuda_fattn_kvarn_desc {
@@ -32,10 +34,22 @@ struct ggml_cuda_fattn_kvarn_desc {
     int bits;
     int value;
     int swa;
+    int head_slices;
     // Large prefill can reconstruct one side in the original domain in the MMA tile loader.
     // Decode-width paths keep rotated-domain K/V and rotate Q/output in the graph.
     int original_domain;
 };
+
+static __device__ __forceinline__ bool ggml_cuda_fattn_kvarn_swa_group_from_record(
+        const ggml_cuda_fattn_kvarn_desc & desc,
+        const int group,
+        const int stage_begin) {
+    if (group < 0 || group >= stage_begin) {
+        return false;
+    }
+    const int distance = desc.live_group - group;
+    return distance >= desc.tail_groups && distance < desc.groups_per_stream + desc.tail_groups;
+}
 
 struct ggml_cuda_fattn_kvarn_plan_side {
     const ggml_tensor * view        = nullptr;
@@ -46,7 +60,9 @@ struct ggml_cuda_fattn_kvarn_plan_side {
     int stream_start  = 0;
     int n_stream      = 0;
     int stage_groups  = 0;
+    int tail_groups   = 0;
     int groups_per_stream = 0;
+    int head_slices   = 1;
     bool value        = false;
     bool swa          = false;
 };
@@ -76,6 +92,12 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
 
 static inline bool ggml_cuda_fattn_kvarn_valid_bits(const int bits) {
     return bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 8;
+}
+
+static __device__ __forceinline__ float ggml_cuda_fattn_kvarn_hslice_sign(
+        const int row,
+        const int col) {
+    return (__popc((unsigned) (row & col)) & 1) ? -1.0f : 1.0f;
 }
 
 static inline const ggml_tensor * ggml_cuda_fattn_kvarn_view_base(const ggml_tensor * t) {
@@ -132,9 +154,15 @@ static inline bool ggml_cuda_fattn_kvarn_unwrap_view(
     side.stream_start = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_VIEW_STREAM_START);
     side.n_stream = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_VIEW_N_STREAM);
     side.swa = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_VIEW_SWA) != 0;
+    const int head_slices_param = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_HEAD_SLICES);
+    side.head_slices = head_slices_param > 0 ? head_slices_param : 1;
     side.stage_groups = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_STAGE_GROUPS);
+    const int tail_groups_param = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_TAIL_GROUPS);
+    side.tail_groups = tail_groups_param > 0 ? tail_groups_param : side.stage_groups - 1;
 
-    if (!ggml_cuda_fattn_kvarn_valid_bits(side.bits) || side.n_stream <= 0 || side.stage_groups < 2) {
+    if (!ggml_cuda_fattn_kvarn_valid_bits(side.bits) || side.n_stream <= 0 || side.stage_groups < 2 ||
+            side.tail_groups <= 0 || side.tail_groups > side.stage_groups ||
+            !(side.head_slices == 1 || side.head_slices == 2 || side.head_slices == 4)) {
         return false;
     }
     if (side.records->type != GGML_TYPE_I8 || side.stage->type != GGML_TYPE_F16 || side.indices->type != GGML_TYPE_I64) {
@@ -148,6 +176,9 @@ static inline bool ggml_cuda_fattn_kvarn_unwrap_view(
         return false;
     }
     side.groups_per_stream = (int) (side.records->ne[2] / total_streams);
+    if (side.groups_per_stream <= 0) {
+        return false;
+    }
     return side.stream_start >= 0 && side.stream_start + side.n_stream <= total_streams;
 }
 
@@ -200,6 +231,10 @@ static inline bool ggml_cuda_fattn_kvarn_view_supported(
     plan.n_kv_heads = (int) K->ne[2];
     plan.n_stream = (int) K->ne[3];
     plan.slices = plan.head_dim / GGML_CUDA_FATTN_KVARN_DIM;
+    if (plan.k.head_slices != plan.v.head_slices ||
+            (plan.k.head_slices != 1 && plan.k.head_slices != plan.slices)) {
+        return false;
+    }
     if (plan.n_stream != plan.k.n_stream || plan.n_stream != plan.v.n_stream) {
         return false;
     }

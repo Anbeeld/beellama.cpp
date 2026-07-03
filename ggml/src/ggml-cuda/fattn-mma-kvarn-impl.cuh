@@ -51,8 +51,7 @@ static __device__ __forceinline__ ggml_cuda_fattn_kvarn_mma_tile ggml_cuda_fattn
         const int live_group = desc.live_group;
         const int stage_begin = live_group >= (desc.tail_groups - 1) ? live_group - (desc.tail_groups - 1) : 0;
         const bool from_stage = group0 >= stage_begin && group0 <= live_group;
-        const bool from_record = !from_stage && group0 >= 0 && group0 < stage_begin &&
-            (live_group - group0) < desc.groups_per_stream;
+        const bool from_record = !from_stage && ggml_cuda_fattn_kvarn_swa_group_from_record(desc, group0, stage_begin);
         tile.pos_begin = (int) (first_idx - (int64_t) group0 * GGML_CUDA_FATTN_KVARN_DIM);
         if (from_stage) {
             tile.stage = true;
@@ -147,8 +146,7 @@ static __device__ __forceinline__ bool ggml_cuda_fattn_kvarn_load_rotated_slice_
                 pos = (int) (abs_pos - (int64_t) group * GGML_CUDA_FATTN_KVARN_DIM);
                 const int stage_begin = live_group >= (desc.tail_groups - 1) ? live_group - (desc.tail_groups - 1) : 0;
                 from_stage  = group >= stage_begin && group <= live_group;
-                from_record = !from_stage && group >= 0 && group < stage_begin &&
-                    (live_group - group) < desc.groups_per_stream;
+                from_record = !from_stage && ggml_cuda_fattn_kvarn_swa_group_from_record(desc, group, stage_begin);
                 stage_pos = (group % desc.stage_groups) * GGML_CUDA_FATTN_KVARN_DIM + pos;
                 record_group = group % desc.groups_per_stream;
             }
@@ -330,6 +328,47 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
             static_assert(warps_per_block > 0, "bad KVarN original-domain warp count");
             const int warp = tid / warp_size;
             const int lane = tid - warp * warp_size;
+            float * scratch0 = (float *) (scale_smem + 3 * GGML_CUDA_FATTN_KVARN_DIM);
+            float * scratch1 = scratch0 + warps_per_block * GGML_CUDA_FATTN_KVARN_DIM;
+
+            if (desc.head_slices > 1) {
+                const float inv_sqrt_slices = desc.head_slices == 2 ? 0.7071067811865475f : 0.5f;
+
+                for (int row = warp; row < nbatch_fa; row += warps_per_block) {
+                    const bool valid_row = !oob_check || row < i_sup;
+                    float * row0 = scratch0 + warp * GGML_CUDA_FATTN_KVARN_DIM;
+                    float * row1 = scratch1 + warp * GGML_CUDA_FATTN_KVARN_DIM;
+                    for (int d = lane; d < GGML_CUDA_FATTN_KVARN_DIM; d += warp_size) {
+                        row0[d] = 0.0f;
+                    }
+                    __syncwarp();
+
+                    for (int src_slice = 0; src_slice < desc.head_slices; ++src_slice) {
+                        ggml_cuda_fattn_kvarn_load_rotated_slice_warp(
+                                desc, k_start + row, src_slice, valid_row, row1, lane);
+                        __syncwarp();
+                        const float sign = ggml_cuda_fattn_kvarn_hslice_sign(slice, src_slice);
+                        for (int d = lane; d < GGML_CUDA_FATTN_KVARN_DIM; d += warp_size) {
+                            row0[d] += sign * row1[d];
+                        }
+                        __syncwarp();
+                    }
+
+                    for (int d = lane; d < GGML_CUDA_FATTN_KVARN_DIM; d += warp_size) {
+                        row0[d] *= inv_sqrt_slices;
+                    }
+                    __syncwarp();
+
+                    float * orig = ggml_cuda_fattn_kvarn_inverse_wht_128_warp(row0, row1, lane);
+                    for (int global_b = out_dim2_start + lane; global_b < out_dim2_end; global_b += warp_size) {
+                        const int dim = 2 * (global_b - slice_dim2_start);
+                        tile_KV[row * stride_tile + global_b - dim2_start] = make_half2(orig[dim], orig[dim + 1]);
+                    }
+                    __syncwarp();
+                }
+                continue;
+            }
+
             const uint8_t * record = nullptr;
             if (fast_record) {
                 record = desc.records + ((int64_t) record_group * desc.n_record_heads + desc.head_base + slice) * desc.record_bytes;
@@ -344,9 +383,6 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
                 }
                 __syncthreads();
             }
-
-            float * scratch0 = (float *) (scale_smem + 3 * GGML_CUDA_FATTN_KVARN_DIM);
-            float * scratch1 = scratch0 + warps_per_block * GGML_CUDA_FATTN_KVARN_DIM;
 
             for (int row = warp; row < nbatch_fa; row += warps_per_block) {
                 const bool valid_row = !oob_check || row < i_sup;

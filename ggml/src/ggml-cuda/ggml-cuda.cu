@@ -3176,6 +3176,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_TURBO_WHT:
             ggml_cuda_op_turbo_wht(ctx, dst);
             break;
+        case GGML_OP_KVARN_WHT:
+            ggml_cuda_op_kvarn_wht(ctx, dst);
+            break;
         case GGML_OP_KVARN_STORE:
             ggml_cuda_op_kvarn_store(ctx, dst);
             break;
@@ -5823,6 +5826,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_DIAG:
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_TURBO_WHT:
+        case GGML_OP_KVARN_WHT:
         case GGML_OP_KVARN_STORE:
             return ggml_backend_cuda_kvarn_native_ops(dev);
 

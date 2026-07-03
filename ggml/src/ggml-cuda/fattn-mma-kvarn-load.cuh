@@ -56,8 +56,7 @@ static __device__ __forceinline__ float ggml_cuda_fattn_kvarn_load_rotated(
         pos   = (int) (abs_pos - (int64_t) group * GGML_CUDA_FATTN_KVARN_DIM);
         const int stage_begin = live_group >= (desc.tail_groups - 1) ? live_group - (desc.tail_groups - 1) : 0;
         from_stage  = group >= stage_begin && group <= live_group;
-        from_record = !from_stage && group >= 0 && group < stage_begin &&
-            (live_group - group) < desc.groups_per_stream;
+        from_record = !from_stage && ggml_cuda_fattn_kvarn_swa_group_from_record(desc, group, stage_begin);
         stage_pos = (group % desc.stage_groups) * GGML_CUDA_FATTN_KVARN_DIM + pos;
         record_group = group % desc.groups_per_stream;
     } else {

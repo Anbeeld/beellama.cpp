@@ -8637,7 +8637,7 @@ llama_context * llama_init_from_model(
                     LLAMA_LOG_WARN("%s: KVarN requires Flash Attention; enabling it\n", __func__);
                     params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
                 }
-                LLAMA_LOG_INFO("%s: KVarN layers use structured records (full-context and SWA sliding-window ring); non-KVarN layers use type_k = %s, type_v = %s\n",
+                LLAMA_LOG_INFO("%s: KVarN will use structured records where supported; non-KVarN cache paths start from type_k = %s, type_v = %s\n",
                         __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
                 LLAMA_LOG_INFO("%s: enabling structured KVarN cache type %s\n",
                         __func__, llama_kvarn_type_name(params.kvarn.type));

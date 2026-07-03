@@ -12,8 +12,8 @@ layout(push_constant) uniform parameter {
     uint iterations;
     uint value;
     uint swa; // SWA sliding-window ring store (absolute-position indices, no group-0 sink)
-    uint stage_groups; // dynamic stage depth (tail_groups + 1)
-    uint tail_groups;  // stage_groups - 1
+    uint stage_groups; // dynamic F16 stage depth
+    uint tail_groups;  // lossless tail groups within the stage
 } p;
 
 layout(binding = 0, std430) readonly buffer Current { float data_current[]; };
@@ -75,8 +75,8 @@ void wht_stage_row(uint lane) {
 float stage_matrix_value(uint head, uint stage_base, uint stage_group, uint row, uint col) {
     const uint token = p.value != 0 ? row : col;
     const uint out_dim = p.value != 0 ? col : row;
-    // SWA: stage_groups-deep ping-pong over absolute tiles; non-SWA: tile 0 sink
-    // and tail_groups transient slots. tail_groups = stage_groups - 1.
+    // SWA: tail-only ping-pong over absolute tiles; non-SWA: tile 0 sink and
+    // tail_groups transient slots.
     const uint stage_slot = p.swa != 0u ? (stage_group % p.stage_groups) : (1u + ((stage_group - 1u) % p.tail_groups));
     const uint stage_pos = stage_base + stage_slot * KVAR_N_DIM + token;
     return load_stage_value(stage_pos, head, out_dim);

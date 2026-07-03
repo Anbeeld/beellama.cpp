@@ -7327,6 +7327,39 @@ static void test_kvarn_hadamard_128(float * values) {
     }
 }
 
+static void test_kvarn_hadamard_head(float * values, int head_width) {
+    GGML_ASSERT(head_width == 128 || head_width == 256 || head_width == 512);
+    const int slices = head_width / 128;
+
+    for (int slice = 0; slice < slices; ++slice) {
+        test_kvarn_hadamard_128(values + slice * 128);
+    }
+    if (slices == 1) {
+        return;
+    }
+
+    const float scale = slices == 2 ? 0.7071067811865475f : 0.5f;
+    for (int d = 0; d < 128; ++d) {
+        float x[4] = {};
+        for (int slice = 0; slice < slices; ++slice) {
+            x[slice] = values[slice * 128 + d];
+        }
+        for (int stride = 1; stride < slices; stride <<= 1) {
+            for (int base = 0; base < slices; base += 2 * stride) {
+                for (int i = 0; i < stride; ++i) {
+                    const float a = x[base + i];
+                    const float b = x[base + stride + i];
+                    x[base + i] = a + b;
+                    x[base + stride + i] = a - b;
+                }
+            }
+        }
+        for (int slice = 0; slice < slices; ++slice) {
+            values[slice * 128 + d] = x[slice] * scale;
+        }
+    }
+}
+
 static void test_kvarn_fill_hadamard_matrix_128(std::vector<float> & data) {
     constexpr int n = 128;
     data.assign(n * n, 0.0f);
@@ -7364,6 +7397,13 @@ static void test_kvarn_rotate_128_chunks(std::vector<float> & data) {
     }
 }
 
+static void test_kvarn_rotate_heads(std::vector<float> & data, int head_width) {
+    GGML_ASSERT(data.size() % (size_t) head_width == 0);
+    for (size_t off = 0; off < data.size(); off += (size_t) head_width) {
+        test_kvarn_hadamard_head(data.data() + off, head_width);
+    }
+}
+
 static float test_kvarn_record_value(const uint8_t * record, int bits, bool value, int token, int dim) {
     const size_t payload_bytes = size_t(128 * 128 * bits) / 8;
     const size_t scale_axis_off = payload_bytes;
@@ -7394,13 +7434,16 @@ static std::vector<ggml_fp16_t> test_kvarn_reference_decode(
         int bits,
         bool value,
         int stage_groups,
+        int head_slices,
         bool swa) {
     GGML_ASSERT(records->type == GGML_TYPE_I8);
     GGML_ASSERT(stage->type == GGML_TYPE_F16);
     GGML_ASSERT(stage->ne[0] == 128);
     GGML_ASSERT(stage_groups >= 2);
+    GGML_ASSERT(head_slices == 1 || head_slices == 2 || head_slices == 4);
     GGML_ASSERT(stage->ne[2] % (128 * stage_groups) == 0);
     const int n_heads = (int) stage->ne[1];
+    GGML_ASSERT(n_heads % head_slices == 0);
     const int total_streams = (int) (stage->ne[2] / (128 * stage_groups));
     GGML_ASSERT(total_streams > 0);
     GGML_ASSERT(records->ne[1] == n_heads);
@@ -7444,52 +7487,55 @@ static std::vector<ggml_fp16_t> test_kvarn_reference_decode(
             const int64_t group_global = abs_pos / 128;
             const int64_t group = swa ? group_global : group_global - (int64_t) stream * groups_per_stream;
             const int64_t pos = abs_pos - group_global * 128;
-            for (int h = 0; h < n_heads; ++h) {
-                std::array<float, 128> values = {};
-                bool values_original = false;
-                bool from_stage;
-                bool from_record;
-                int64_t stage_pos;
-                int64_t record_group;
-                if (swa) {
-                    const int64_t stage_begin = live_group >= (tail_groups - 1) ? live_group - (tail_groups - 1) : 0;
-                    from_stage = group_global >= stage_begin && group_global <= live_group;
-                    from_record = !from_stage && group_global >= 0 && group_global < stage_begin &&
-                        (live_group - group_global) < groups_per_stream;
-                    stage_pos = (group_global % stage_groups) * 128 + pos;
-                    record_group = group_global % groups_per_stream;
-                } else {
-                    from_stage = group == 0 ||
-                        (group > 0 && group <= live_group && group + (tail_groups - 1) >= live_group);
-                    from_record = !from_stage && group < live_group;
-                    stage_pos = stage_base +
-                        (group == 0 ? pos : 128 + ((group - 1) % tail_groups) * 128 + pos);
-                    record_group = (int64_t) stream * groups_per_stream + group;
+            for (int logical_head = 0; logical_head < n_heads / head_slices; ++logical_head) {
+                std::array<float, 512> head_values = {};
+                for (int slice = 0; slice < head_slices; ++slice) {
+                    const int h = logical_head * head_slices + slice;
+                    bool from_stage;
+                    bool from_record;
+                    int64_t stage_pos;
+                    int64_t record_group;
+                    if (swa) {
+                        const int64_t stage_begin = live_group >= (tail_groups - 1) ? live_group - (tail_groups - 1) : 0;
+                        from_stage = group_global >= stage_begin && group_global <= live_group;
+                        from_record = !from_stage && group_global >= 0 && group_global < stage_begin &&
+                            (live_group - group_global) < groups_per_stream + tail_groups;
+                        stage_pos = (group_global % stage_groups) * 128 + pos;
+                        record_group = group_global % groups_per_stream;
+                    } else {
+                        from_stage = group == 0 ||
+                            (group > 0 && group <= live_group && group + (tail_groups - 1) >= live_group);
+                        from_record = !from_stage && group < live_group;
+                        stage_pos = stage_base +
+                            (group == 0 ? pos : 128 + ((group - 1) % tail_groups) * 128 + pos);
+                        record_group = (int64_t) stream * groups_per_stream + group;
+                    }
+
+                    float * values = head_values.data() + slice * 128;
+                    if (from_stage) {
+                        GGML_ASSERT(stage_pos >= 0 && stage_pos < stage->ne[2]);
+                        for (int d = 0; d < 128; ++d) {
+                            const size_t off = (size_t) d + (size_t) h * 128 + (size_t) stage_pos * 128 * n_heads;
+                            values[d] = ggml_fp16_to_fp32(stage_data[off]);
+                        }
+                    } else if (from_record) {
+                        GGML_ASSERT(record_group >= 0 && record_group < records->ne[2]);
+                        const size_t record_off = ((size_t) record_group * n_heads + h) * (size_t) records->ne[0];
+                        const uint8_t * record = record_data.data() + record_off;
+                        for (int d = 0; d < 128; ++d) {
+                            values[d] = test_kvarn_record_value(record, bits, value, (int) pos, d);
+                        }
+                    }
                 }
 
-                if (from_stage) {
-                    GGML_ASSERT(stage_pos >= 0 && stage_pos < stage->ne[2]);
+                test_kvarn_hadamard_head(head_values.data(), head_slices * 128);
+                for (int slice = 0; slice < head_slices; ++slice) {
+                    const int h = logical_head * head_slices + slice;
                     for (int d = 0; d < 128; ++d) {
-                        const size_t off = (size_t) d + (size_t) h * 128 + (size_t) stage_pos * 128 * n_heads;
-                        values[d] = ggml_fp16_to_fp32(stage_data[off]);
+                        const size_t out_off = (size_t) d + (size_t) h * 128 +
+                            (size_t) cell * 128 * n_heads + (size_t) out_stream * 128 * n_heads * n_kv;
+                        output[out_off] = ggml_fp32_to_fp16(head_values[(size_t) slice * 128 + d]);
                     }
-                    values_original = false;
-                } else if (from_record) {
-                    GGML_ASSERT(record_group >= 0 && record_group < records->ne[2]);
-                    const size_t record_off = ((size_t) record_group * n_heads + h) * (size_t) records->ne[0];
-                    const uint8_t * record = record_data.data() + record_off;
-                    for (int d = 0; d < 128; ++d) {
-                        values[d] = test_kvarn_record_value(record, bits, value, (int) pos, d);
-                    }
-                }
-
-                if (!values_original) {
-                    test_kvarn_hadamard_128(values.data());
-                }
-                for (int d = 0; d < 128; ++d) {
-                    const size_t out_off = (size_t) d + (size_t) h * 128 +
-                        (size_t) cell * 128 * n_heads + (size_t) out_stream * 128 * n_heads * n_kv;
-                    output[out_off] = ggml_fp32_to_fp16(values[d]);
                 }
             }
         }
@@ -7598,9 +7644,7 @@ struct test_kvarn_flash_attn_ext : public test_case {
         const bool use_rotated_domain = native_view &&
             (domain == route_domain::rotated_decode || domain == route_domain::mixed_prefill);
         if (use_rotated_domain) {
-            ggml_tensor * kvarn_rot = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 128);
-            ggml_set_name(kvarn_rot, "kvarn_rot");
-            q = test_kvarn_apply_hadamard_128(ctx, q_in, kvarn_rot);
+            q = ggml_kvarn_wht(ctx, q_in, (int) hsk);
             ggml_set_name(q, "q_rot");
         }
 
@@ -7625,6 +7669,8 @@ struct test_kvarn_flash_attn_ext : public test_case {
         stored_v->op_params[3] = (int32_t) n_kv;
         stored_k->op_params[4] = swa ? 1 : 0;
         stored_v->op_params[4] = swa ? 1 : 0;
+        stored_k->op_params[5] = slices;
+        stored_v->op_params[5] = slices;
         ggml_set_name(stored_k, "stored_k");
         ggml_set_name(stored_v, "stored_v");
 
@@ -7756,11 +7802,6 @@ struct test_kvarn_flash_attn_ext : public test_case {
         }
 
         ggml_backend_tensor_set(ggml_get_tensor(ctx, "q_in"), q_data.data(), 0, q_data.size() * sizeof(float));
-        if (ggml_tensor * rot = ggml_get_tensor(ctx, "kvarn_rot")) {
-            std::vector<float> rot_data;
-            test_kvarn_fill_hadamard_matrix_128(rot_data);
-            ggml_backend_tensor_set(rot, rot_data.data(), 0, rot_data.size() * sizeof(float));
-        }
         ggml_backend_tensor_set(ggml_get_tensor(ctx, "indices"), indices_data.data(), 0, indices_data.size() * sizeof(int64_t));
         ggml_backend_tensor_set(ggml_get_tensor(ctx, "current_k"), k_data.data(), 0, k_data.size() * sizeof(float));
         ggml_backend_tensor_set(ggml_get_tensor(ctx, "current_v"), v_data.data(), 0, v_data.size() * sizeof(float));
@@ -7855,9 +7896,9 @@ struct test_kvarn_flash_attn_ext : public test_case {
 
         const std::vector<int64_t> indices_data = make_indices();
         const std::vector<ggml_fp16_t> k_ref_data = test_kvarn_reference_decode(
-                k_records, stored_k, indices_data, (int) n_kv, stream_start, (int) n_stream, bits_k, false, stage_groups, swa);
+                k_records, stored_k, indices_data, (int) n_kv, stream_start, (int) n_stream, bits_k, false, stage_groups, (int) (hsk / 128), swa);
         const std::vector<ggml_fp16_t> v_ref_data = test_kvarn_reference_decode(
-                v_records, stored_v, indices_data, (int) n_kv, stream_start, (int) n_stream, bits_v, true,  stage_groups, swa);
+                v_records, stored_v, indices_data, (int) n_kv, stream_start, (int) n_stream, bits_v, true,  stage_groups, (int) (hsk / 128), swa);
         ggml_backend_tensor_set(k_ref, k_ref_data.data(), 0, k_ref_data.size() * sizeof(ggml_fp16_t));
         ggml_backend_tensor_set(v_ref, v_ref_data.data(), 0, v_ref_data.size() * sizeof(ggml_fp16_t));
 
@@ -7868,7 +7909,7 @@ struct test_kvarn_flash_attn_ext : public test_case {
         }
         std::vector<float> expected = tensor_to_float(out_ref);
         if (domain == route_domain::rotated_decode) {
-            test_kvarn_rotate_128_chunks(expected);
+            test_kvarn_rotate_heads(expected, (int) hsk);
         }
 
         if (actual.size() != expected.size()) {
@@ -9912,6 +9953,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_kvarn_flash_attn_ext(128, 128, 32,  8, 4096, 4, 4, 3, 1, 0, false, 0, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
     test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 128, 32,  8, 4096, 4, 4, 3, 1, 0, false, 0, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
     test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 256, 24,  4, 4096, 4, 4, 3, 1, 0, false, 0, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 512, 32,  8, 8192, 4, 4, 7, 1, 0, false, 0, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
     test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 128, 32,  8, 8192, 4, 4, 3, 3, 1, false, 0, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
     // Deep Gemma-like prompt routes: global layers keep a large non-SWA transient
     // stage ring, while SWA layers use the sliding ring and real GQA head counts.

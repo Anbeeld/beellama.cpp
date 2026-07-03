@@ -8,7 +8,7 @@
 #include <vector>
 
 static constexpr int KVAR_N_DIM = 128;
-// Dynamic stage depth: stage_groups is carried explicitly in op_params[7].
+// Dynamic stage/tail depth is carried explicitly in op_params[7]/[8].
 static constexpr int KVAR_N_TILE_VALUES = KVAR_N_DIM * KVAR_N_DIM;
 static constexpr int KVAR_N_REDUCE_FLOATS = 4 * 4;
 static constexpr int KVAR_N_SHARED_FLOATS = KVAR_N_TILE_VALUES + 8 * KVAR_N_DIM + 2 + KVAR_N_REDUCE_FLOATS;
@@ -21,12 +21,19 @@ static constexpr int KVAR_N_OP_PARAM_ITERS = 1;
 static constexpr int KVAR_N_OP_PARAM_STORE_VALUE = 2;
 static constexpr int KVAR_N_OP_PARAM_TOKENS_PER_STREAM = 3;
 static constexpr int KVAR_N_OP_PARAM_STORE_SWA = 4;     // store: SWA sliding-window ring mode
-static constexpr int KVAR_N_OP_PARAM_STAGE_GROUPS = 7;  // dynamic stage depth (tail_groups + 1)
+static constexpr int KVAR_N_OP_PARAM_HEAD_SLICES = 5;   // 1/2/4 slices per logical K/V head
+static constexpr int KVAR_N_OP_PARAM_STAGE_GROUPS = 7;  // dynamic F16 stage depth
+static constexpr int KVAR_N_OP_PARAM_TAIL_GROUPS = 8;   // lossless tail groups within the stage
 
 // Resolve stage_groups from op_params[7]. Constructors set this explicitly;
 // backends assert it before deriving stream counts.
 static int kvarn_resolve_stage_groups(const ggml_tensor * dst) {
     return ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_STAGE_GROUPS);
+}
+
+static int kvarn_resolve_tail_groups(const ggml_tensor * dst, int stage_groups) {
+    const int tail_groups = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_TAIL_GROUPS);
+    return tail_groups > 0 ? tail_groups : stage_groups - 1;
 }
 enum class kvarn_prof_kind : uint8_t {
     STORE_HI = 0,
@@ -401,6 +408,41 @@ static __device__ void kvarn_wht_128_lane(float * values, int lane_dim) {
         values[lane_dim] *= 0.08838834764831845f;
     }
     __syncthreads();
+}
+
+static __device__ void kvarn_wht_cross_slices(float values[4], int head_slices) {
+    if (head_slices == 1) {
+        return;
+    }
+
+    for (int stride = 1; stride < head_slices; stride <<= 1) {
+#pragma unroll
+        for (int base = 0; base < 4; base += 2 * stride) {
+            if (base + stride >= head_slices) {
+                continue;
+            }
+#pragma unroll
+            for (int i = 0; i < stride; ++i) {
+                const int a_idx = base + i;
+                const int b_idx = base + stride + i;
+                if (b_idx >= head_slices) {
+                    continue;
+                }
+                const float a = values[a_idx];
+                const float b = values[b_idx];
+                values[a_idx] = a + b;
+                values[b_idx] = a - b;
+            }
+        }
+    }
+
+    const float scale = head_slices == 2 ? 0.7071067811865475f : 0.5f;
+#pragma unroll
+    for (int slice = 0; slice < 4; ++slice) {
+        if (slice < head_slices) {
+            values[slice] *= scale;
+        }
+    }
 }
 
 static __device__ float kvarn_std_col(
@@ -877,6 +919,78 @@ static __global__ void kvarn_store_kernel_hishmem(
         __syncthreads();
     }
 }
+
+static __global__ void kvarn_store_kernel_headwide(
+        const float * current,
+        const int64_t * indices,
+        half * stage,
+        uint8_t * records,
+        int n_heads,
+        int n_tokens,
+        int n_stream,
+        int groups_per_stream,
+        int record_bytes,
+        int bits,
+        int iterations,
+        bool value,
+        bool swa,
+        int stage_groups,
+        int tail_groups,
+        int head_slices,
+        const int * skip_if_workspace_valid) {
+    extern __shared__ float shared[];
+    const int head0 = blockIdx.x * head_slices;
+    if (head0 + head_slices > n_heads) {
+        return;
+    }
+    if (skip_if_workspace_valid != nullptr && skip_if_workspace_valid[0] != 0) {
+        return;
+    }
+    const int dim = threadIdx.x;
+
+    for (int token = 0; token < n_tokens; ++token) {
+        const int64_t idx = indices[token];
+        const int group_global = (int) (idx / KVAR_N_DIM);
+        const int pos = (int) (idx % KVAR_N_DIM);
+        const int stream = swa ? 0 : group_global / groups_per_stream;
+        const int group = swa ? group_global : group_global - stream * groups_per_stream;
+        if (stream < 0 || stream >= n_stream || group < 0 || (!swa && group >= groups_per_stream)) {
+            return;
+        }
+
+        const int stage_base = stream * KVAR_N_DIM * stage_groups;
+        if (pos == 0 && (swa ? group >= tail_groups : group > tail_groups)) {
+            const int flush_group = group - tail_groups;
+            const int flush_ring = swa ? flush_group % groups_per_stream : flush_group;
+            const int flush_record_group = stream * groups_per_stream + flush_ring;
+            for (int slice = 0; slice < head_slices; ++slice) {
+                const int head = head0 + slice;
+                uint8_t * record = records + ((int64_t) flush_record_group * n_heads + head) * record_bytes;
+                kvarn_quantize_stage(stage, record, n_heads, head, stage_base, flush_group, bits, iterations, value, swa, stage_groups, tail_groups, shared);
+            }
+        }
+
+        float values[4] = {};
+        for (int slice = 0; slice < head_slices; ++slice) {
+            const int head = head0 + slice;
+            shared[dim] = current[((int64_t) token * n_heads + head) * KVAR_N_DIM + dim];
+            kvarn_wht_128(shared);
+            values[slice] = shared[dim];
+        }
+
+        kvarn_wht_cross_slices(values, head_slices);
+
+        const int stage_slot = swa ? (group % stage_groups) : (group == 0 ? 0 : 1 + ((group - 1) % tail_groups));
+        const int stage_pos = stage_base + stage_slot * KVAR_N_DIM + pos;
+        for (int slice = 0; slice < head_slices; ++slice) {
+            const int head = head0 + slice;
+            stage[((int64_t) stage_pos * n_heads + head) * KVAR_N_DIM + dim] =
+                __float2half_rn(values[slice]);
+        }
+        __syncthreads();
+    }
+}
+
 static __global__ void kvarn_store_kernel_lowshmem(
         const float * current,
         const int64_t * indices,
@@ -1037,6 +1151,49 @@ static __global__ void kvarn_store_workspace_stage_kernel(
     if (token < n_tokens) {
         workspace[((int64_t) token * n_heads + head) * KVAR_N_DIM + dim] =
             __float2half_rn(values[dim]);
+    }
+}
+
+template<int HEAD_SLICES>
+static __global__ void kvarn_store_workspace_stage_headwide_kernel(
+        const float * current,
+        half * workspace,
+        int n_heads,
+        int n_tokens,
+        bool value) {
+    GGML_UNUSED(value);
+
+    const int head0 = blockIdx.x * HEAD_SLICES;
+    const int chunk = blockIdx.y;
+    const int lane = threadIdx.x / KVAR_N_DIM;
+    const int dim = threadIdx.x - lane * KVAR_N_DIM;
+    const int token = chunk * KVAR_N_STAGE_CHUNK + lane;
+    if (head0 + HEAD_SLICES > n_heads || lane >= KVAR_N_STAGE_CHUNK) {
+        return;
+    }
+
+    __shared__ float shared[KVAR_N_STAGE_CHUNK * HEAD_SLICES * KVAR_N_DIM];
+    for (int slice = 0; slice < HEAD_SLICES; ++slice) {
+        float * values = shared + (lane * HEAD_SLICES + slice) * KVAR_N_DIM;
+        const int head = head0 + slice;
+        values[dim] = token < n_tokens ? current[((int64_t) token * n_heads + head) * KVAR_N_DIM + dim] : 0.0f;
+        kvarn_wht_128_lane(values, dim);
+    }
+
+    if (token >= n_tokens) {
+        return;
+    }
+
+    float values[4] = {};
+    for (int slice = 0; slice < HEAD_SLICES; ++slice) {
+        values[slice] = shared[(lane * HEAD_SLICES + slice) * KVAR_N_DIM + dim];
+    }
+    kvarn_wht_cross_slices(values, HEAD_SLICES);
+
+    for (int slice = 0; slice < HEAD_SLICES; ++slice) {
+        const int head = head0 + slice;
+        workspace[((int64_t) token * n_heads + head) * KVAR_N_DIM + dim] =
+            __float2half_rn(values[slice]);
     }
 }
 
@@ -1265,12 +1422,16 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const bool value = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_STORE_VALUE) != 0;
     const int tokens_per_stream_hint = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_TOKENS_PER_STREAM);
     const bool swa = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_STORE_SWA) != 0;
+    const int head_slices_param = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_HEAD_SLICES);
+    const int head_slices = head_slices_param > 0 ? head_slices_param : 1;
     const int stage_groups = kvarn_resolve_stage_groups(dst);
-    const int tail_groups = stage_groups - 1;
+    const int tail_groups = kvarn_resolve_tail_groups(dst, stage_groups);
     GGML_ASSERT(ggml_cuda_kvarn_valid_bits(bits));
+    GGML_ASSERT(head_slices == 1 || head_slices == 2 || head_slices == 4);
     GGML_ASSERT((KVAR_N_TILE_VALUES * bits) % 8 == 0);
     GGML_ASSERT((KVAR_N_DIM * bits) % 8 == 0);
     GGML_ASSERT(stage_groups >= 2);
+    GGML_ASSERT(tail_groups >= 1 && tail_groups <= stage_groups);
     GGML_ASSERT(stage->ne[2] % (KVAR_N_DIM * stage_groups) == 0);
     const int n_stream = (int) (stage->ne[2] / (KVAR_N_DIM * stage_groups));
     GGML_ASSERT(n_stream > 0);
@@ -1282,6 +1443,7 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const size_t smpbo = ggml_cuda_info().devices[ctx.device].smpbo;
     cudaStream_t stream = ctx.stream();
     const int n_heads = (int) current->ne[1];
+    GGML_ASSERT(n_heads % head_slices == 0);
     const int n_tokens = (int) current->ne[2];
     const size_t staged_bytes = (size_t) current->ne[0] * (size_t) current->ne[1] * (size_t) current->ne[2] * sizeof(half);
 
@@ -1309,10 +1471,150 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         grid_fits;
     const bool use_direct =
         smpbo >= KVAR_N_SHARED_BYTES &&
+        head_slices == 1 &&
         direct_hint &&
         active_streams > 0 &&
         active_streams <= n_stream &&
         n_tokens <= 65535;
+    if (head_slices > 1 && use_workspace) {
+#if defined(GGML_USE_HIP)
+        CUDA_CHECK(hipFuncSetAttribute(
+            reinterpret_cast<const void *>(&kvarn_store_workspace_flush_kernel),
+            hipFuncAttributeMaxDynamicSharedMemorySize,
+            KVAR_N_SHARED_BYTES));
+        CUDA_CHECK(hipFuncSetAttribute(
+            reinterpret_cast<const void *>(&kvarn_store_kernel_headwide),
+            hipFuncAttributeMaxDynamicSharedMemorySize,
+            KVAR_N_SHARED_BYTES));
+#elif !defined(GGML_USE_MUSA)
+        CUDA_CHECK(cudaFuncSetAttribute(
+            kvarn_store_workspace_flush_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            KVAR_N_SHARED_BYTES));
+        CUDA_CHECK(cudaFuncSetAttribute(
+            kvarn_store_kernel_headwide,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            KVAR_N_SHARED_BYTES));
+#endif
+        ggml_cuda_pool_alloc<half> workspace(ctx.pool(), (size_t) n_tokens * (size_t) n_heads * KVAR_N_DIM);
+        ggml_cuda_pool_alloc<int> workspace_valid(ctx.pool(), 1);
+        auto prof = kvarn_prof_begin(ctx, stream, kvarn_prof_kind::STORE_HI, value, bits, n_tokens, staged_bytes);
+        kvarn_store_workspace_validate_kernel<<<1, 256, 0, stream>>>(
+            (const int64_t *) indices->data,
+            n_tokens,
+            n_stream,
+            groups_per_stream,
+            tokens_per_stream_hint,
+            active_streams,
+            workspace_valid.get());
+        dim3 blocks_stage(n_heads / head_slices, (n_tokens + KVAR_N_STAGE_CHUNK - 1) / KVAR_N_STAGE_CHUNK, 1);
+        switch (head_slices) {
+            case 2:
+                kvarn_store_workspace_stage_headwide_kernel<2><<<blocks_stage, KVAR_N_DIM * KVAR_N_STAGE_CHUNK, 0, stream>>>(
+                    (const float *) current->data,
+                    workspace.get(),
+                    n_heads,
+                    n_tokens,
+                    value);
+                break;
+            case 4:
+                kvarn_store_workspace_stage_headwide_kernel<4><<<blocks_stage, KVAR_N_DIM * KVAR_N_STAGE_CHUNK, 0, stream>>>(
+                    (const float *) current->data,
+                    workspace.get(),
+                    n_heads,
+                    n_tokens,
+                    value);
+                break;
+            default:
+                GGML_ABORT("unsupported KVarN head_slices");
+        }
+        dim3 blocks_flush(n_heads, active_streams * flush_candidates, 1);
+        kvarn_store_workspace_flush_kernel<<<blocks_flush, KVAR_N_DIM, KVAR_N_SHARED_BYTES, stream>>>(
+            (const int64_t *) indices->data,
+            (const half *) stage->data,
+            workspace.get(),
+            (uint8_t *) records->data,
+            workspace_valid.get(),
+            n_heads,
+            n_tokens,
+            n_stream,
+            groups_per_stream,
+            (int) records->ne[0],
+            tokens_per_stream_hint,
+            flush_candidates,
+            bits,
+            iterations,
+            value,
+            stage_groups,
+            tail_groups);
+        dim3 blocks_commit(n_heads, active_streams * KVAR_N_DIM * stage_groups, 1);
+        kvarn_store_workspace_commit_kernel<<<blocks_commit, KVAR_N_DIM, 0, stream>>>(
+            (const int64_t *) indices->data,
+            workspace.get(),
+            (half *) stage->data,
+            workspace_valid.get(),
+            n_heads,
+            n_tokens,
+            n_stream,
+            groups_per_stream,
+            tokens_per_stream_hint,
+            stage_groups,
+            tail_groups);
+        kvarn_store_kernel_headwide<<<n_heads / head_slices, KVAR_N_DIM, KVAR_N_SHARED_BYTES, stream>>>(
+            (const float *) current->data,
+            (const int64_t *) indices->data,
+            (half *) stage->data,
+            (uint8_t *) records->data,
+            n_heads,
+            n_tokens,
+            n_stream,
+            groups_per_stream,
+            (int) records->ne[0],
+            bits,
+            iterations,
+            value,
+            /*swa=*/false,
+            stage_groups,
+            tail_groups,
+            head_slices,
+            workspace_valid.get());
+        kvarn_prof_end(prof, stream);
+        return;
+    }
+    if (head_slices > 1) {
+#if defined(GGML_USE_HIP)
+        CUDA_CHECK(hipFuncSetAttribute(
+            reinterpret_cast<const void *>(&kvarn_store_kernel_headwide),
+            hipFuncAttributeMaxDynamicSharedMemorySize,
+            KVAR_N_SHARED_BYTES));
+#elif !defined(GGML_USE_MUSA)
+        CUDA_CHECK(cudaFuncSetAttribute(
+            kvarn_store_kernel_headwide,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            KVAR_N_SHARED_BYTES));
+#endif
+        auto prof = kvarn_prof_begin(ctx, stream, kvarn_prof_kind::STORE_HI, value, bits, (int) current->ne[2], staged_bytes);
+        kvarn_store_kernel_headwide<<<n_heads / head_slices, KVAR_N_DIM, KVAR_N_SHARED_BYTES, stream>>>(
+            (const float *) current->data,
+            (const int64_t *) indices->data,
+            (half *) stage->data,
+            (uint8_t *) records->data,
+            n_heads,
+            n_tokens,
+            n_stream,
+            groups_per_stream,
+            (int) records->ne[0],
+            bits,
+            iterations,
+            value,
+            swa,
+            stage_groups,
+            tail_groups,
+            head_slices,
+            nullptr);
+        kvarn_prof_end(prof, stream);
+        return;
+    }
 
     if (use_workspace) {
 #if defined(GGML_USE_HIP)

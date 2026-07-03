@@ -126,6 +126,47 @@ static ggml_tensor * ggml_mul_mat_aux(
     return res;
 }
 
+static ggml_tensor * ggml_kvarn_wht_aux(
+        ggml_context * ctx,
+        ggml_tensor * cur,
+        int64_t       head_width) {
+    GGML_ASSERT(head_width == 128 || head_width == 256 || head_width == 512);
+    if (!ggml_is_contiguous(cur)) {
+        cur = ggml_cont(ctx, cur);
+    }
+    return ggml_kvarn_wht(ctx, cur, (int) head_width);
+}
+
+static ggml_tensor * llm_kvarn_rot_for_dim(
+        ggml_tensor * rot_128,
+        ggml_tensor * rot_256,
+        ggml_tensor * rot_512,
+        int64_t       head_dim) {
+    switch (head_dim) {
+        case 128: return rot_128;
+        case 256: return rot_256;
+        case 512: return rot_512;
+        default:  return nullptr;
+    }
+}
+
+static void llm_kvarn_set_rot_inputs(
+        const llama_kv_cache_kvarn_context * kvarn,
+        ggml_tensor * rot_128,
+        ggml_tensor * rot_256,
+        ggml_tensor * rot_512) {
+    GGML_ASSERT(kvarn != nullptr);
+    if (rot_128 && rot_128->buffer) {
+        kvarn->set_input_kvarn_rot(rot_128);
+    }
+    if (rot_256 && rot_256->buffer) {
+        kvarn->set_input_kvarn_rot(rot_256);
+    }
+    if (rot_512 && rot_512->buffer) {
+        kvarn->set_input_kvarn_rot(rot_512);
+    }
+}
+
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -562,10 +603,12 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         mctx->set_input_v_rot(self_v_rot);
     }
 
-    if (self_kvarn_rot && self_kvarn_rot->buffer) {
+    if ((self_kvarn_rot_128 && self_kvarn_rot_128->buffer) ||
+            (self_kvarn_rot_256 && self_kvarn_rot_256->buffer) ||
+            (self_kvarn_rot_512 && self_kvarn_rot_512->buffer)) {
         const auto * kvarn = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx);
         GGML_ASSERT(kvarn != nullptr);
-        kvarn->set_input_kvarn_rot(self_kvarn_rot);
+        llm_kvarn_set_rot_inputs(kvarn, self_kvarn_rot_128, self_kvarn_rot_256, self_kvarn_rot_512);
     }
 
 }
@@ -663,11 +706,14 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
         mctx->get_base()->set_input_v_rot(self_v_rot);
     }
 
-    if (self_kvarn_rot && self_kvarn_rot->buffer) {
+    if ((self_kvarn_rot_128 && self_kvarn_rot_128->buffer) ||
+            (self_kvarn_rot_256 && self_kvarn_rot_256->buffer) ||
+            (self_kvarn_rot_512 && self_kvarn_rot_512->buffer)) {
         const auto * kvarn_base = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx->get_base());
         const auto * kvarn_swa  = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx->get_swa());
         GGML_ASSERT(kvarn_base != nullptr || kvarn_swa != nullptr);
-        (kvarn_base ? kvarn_base : kvarn_swa)->set_input_kvarn_rot(self_kvarn_rot);
+        llm_kvarn_set_rot_inputs(kvarn_base ? kvarn_base : kvarn_swa,
+                self_kvarn_rot_128, self_kvarn_rot_256, self_kvarn_rot_512);
     }
 
     if (self_kvarn_mat_idxs_swa && self_kvarn_mat_idxs_swa->buffer) {
@@ -2386,7 +2432,9 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
     if (const auto * kvarn = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur)) {
-        inp->self_kvarn_rot = kvarn->build_input_kvarn_rot(ctx0);
+        inp->self_kvarn_rot_128 = kvarn->build_input_kvarn_rot(ctx0, 128);
+        inp->self_kvarn_rot_256 = kvarn->build_input_kvarn_rot(ctx0, 256);
+        inp->self_kvarn_rot_512 = kvarn->build_input_kvarn_rot(ctx0, 512);
     }
 
     return inp;
@@ -2432,7 +2480,8 @@ ggml_tensor * llm_graph_context::build_attn(
         GGML_ASSERT(llama_kvarn_head_dim_supported((int) q_cur->ne[0]));
         GGML_ASSERT(inp->self_k_rot == nullptr);
         GGML_ASSERT(inp->self_v_rot == nullptr);
-        GGML_ASSERT(!use_kvarn_q_rot || inp->self_kvarn_rot != nullptr);
+        GGML_ASSERT(!use_kvarn_q_rot || llm_kvarn_rot_for_dim(
+                inp->self_kvarn_rot_128, inp->self_kvarn_rot_256, inp->self_kvarn_rot_512, q_cur->ne[0]) != nullptr);
     }
 
     if (inp->self_k_rot) {
@@ -2465,10 +2514,13 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * q = q_cur;
     ggml_tensor * k = use_kvarn_native ? kvarn_ctx->get_k_native(ctx0, il) : mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = use_kvarn_native ? kvarn_ctx->get_v_native(ctx0, il) : mctx_cur->get_v(ctx0, il);
+    ggml_tensor * kvarn_rot = use_kvarn ? llm_kvarn_rot_for_dim(
+            inp->self_kvarn_rot_128, inp->self_kvarn_rot_256, inp->self_kvarn_rot_512, q->ne[0]) : nullptr;
 
     if (use_kvarn_q_rot) {
         GGML_ASSERT(q->type == GGML_TYPE_F32);
-        q = ggml_mul_mat_aux(ctx0, q, inp->self_kvarn_rot);
+        GGML_ASSERT(kvarn_rot != nullptr);
+        q = ggml_kvarn_wht_aux(ctx0, q, kvarn_rot->ne[0]);
     }
 
     // TurboQuant Q pre-rotation is handled inline in CUDA FA kernels:
@@ -2493,7 +2545,8 @@ ggml_tensor * llm_graph_context::build_attn(
     // native tile loader, so no output inverse is needed.
     if (use_kvarn_output_rot) {
         GGML_ASSERT(cur->type == GGML_TYPE_F32);
-        cur = ggml_mul_mat_aux(ctx0, cur, inp->self_kvarn_rot);
+        GGML_ASSERT(kvarn_rot != nullptr);
+        cur = ggml_kvarn_wht_aux(ctx0, cur, kvarn_rot->ne[0]);
     } else if (v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO4_TCQ || v->type == GGML_TYPE_TURBO3_TCQ || v->type == GGML_TYPE_TURBO2_TCQ) {
         if (cur->ne[0] % 128 == 0) {
             cur = ggml_cont(ctx0, cur);  // force copy to break potential aliasing
@@ -2738,7 +2791,8 @@ ggml_tensor * llm_graph_context::build_attn(
         GGML_ASSERT(llama_kvarn_head_dim_supported((int) q_cur->ne[0]));
         GGML_ASSERT(k_rot == nullptr);
         GGML_ASSERT(v_rot == nullptr);
-        GGML_ASSERT(!use_kvarn_q_rot || inp->self_kvarn_rot != nullptr);
+        GGML_ASSERT(!use_kvarn_q_rot || llm_kvarn_rot_for_dim(
+                inp->self_kvarn_rot_128, inp->self_kvarn_rot_256, inp->self_kvarn_rot_512, q_cur->ne[0]) != nullptr);
     }
 
     if (k_rot) {
@@ -2783,10 +2837,13 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * q = q_cur;
     ggml_tensor * k = use_kvarn_native ? kvarn_ctx->get_k_native(ctx0, il) : mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = use_kvarn_native ? kvarn_ctx->get_v_native(ctx0, il) : mctx_cur->get_v(ctx0, il);
+    ggml_tensor * kvarn_rot = use_kvarn ? llm_kvarn_rot_for_dim(
+            inp->self_kvarn_rot_128, inp->self_kvarn_rot_256, inp->self_kvarn_rot_512, q->ne[0]) : nullptr;
 
     if (use_kvarn_q_rot) {
         GGML_ASSERT(q->type == GGML_TYPE_F32);
-        q = ggml_mul_mat_aux(ctx0, q, inp->self_kvarn_rot);
+        GGML_ASSERT(kvarn_rot != nullptr);
+        q = ggml_kvarn_wht_aux(ctx0, q, kvarn_rot->ne[0]);
     }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
@@ -2800,7 +2857,8 @@ ggml_tensor * llm_graph_context::build_attn(
     // native tile loader, so no output inverse is needed.
     if (use_kvarn_output_rot) {
         GGML_ASSERT(cur->type == GGML_TYPE_F32);
-        cur = ggml_mul_mat_aux(ctx0, cur, inp->self_kvarn_rot);
+        GGML_ASSERT(kvarn_rot != nullptr);
+        cur = ggml_kvarn_wht_aux(ctx0, cur, kvarn_rot->ne[0]);
     } else if (v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO4_TCQ || v->type == GGML_TYPE_TURBO3_TCQ || v->type == GGML_TYPE_TURBO2_TCQ) {
         if (cur->ne[0] % 128 == 0) {
             cur = ggml_cont(ctx0, cur);
@@ -2941,15 +2999,19 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
     inp->self_k_rot = mctx_cur->get_base()->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->get_base()->build_input_v_rot(ctx0);
     if (const auto * kvarn_base = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur->get_base())) {
-        inp->self_kvarn_rot = kvarn_base->build_input_kvarn_rot(ctx0);
+        inp->self_kvarn_rot_128 = kvarn_base->build_input_kvarn_rot(ctx0, 128);
+        inp->self_kvarn_rot_256 = kvarn_base->build_input_kvarn_rot(ctx0, 256);
+        inp->self_kvarn_rot_512 = kvarn_base->build_input_kvarn_rot(ctx0, 512);
     }
 
     inp->self_k_rot_swa = mctx_cur->get_swa()->build_input_k_rot(ctx0);
     inp->self_v_rot_swa = mctx_cur->get_swa()->build_input_v_rot(ctx0);
     // SWA KVarN native attention needs one absolute token position per cache cell.
     if (const auto * kvarn_swa = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur->get_swa())) {
-        if (inp->self_kvarn_rot == nullptr) {
-            inp->self_kvarn_rot = kvarn_swa->build_input_kvarn_rot(ctx0);
+        if (inp->self_kvarn_rot_128 == nullptr) {
+            inp->self_kvarn_rot_128 = kvarn_swa->build_input_kvarn_rot(ctx0, 128);
+            inp->self_kvarn_rot_256 = kvarn_swa->build_input_kvarn_rot(ctx0, 256);
+            inp->self_kvarn_rot_512 = kvarn_swa->build_input_kvarn_rot(ctx0, 512);
         }
         inp->self_kvarn_mat_idxs_swa = kvarn_swa->build_input_kvarn_mat_idxs(ctx0);
         // make the SWA indices available to the context at graph build time

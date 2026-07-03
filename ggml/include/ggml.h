@@ -597,6 +597,7 @@ extern "C" {
         GGML_OP_GATED_DELTA_NET_TREE,
         GGML_OP_SSM_CONV_TREE,
         GGML_OP_TURBO_WHT,
+        GGML_OP_KVARN_WHT,
         GGML_OP_KVARN_STORE,
         GGML_OP_KVARN_VIEW,
 
@@ -2645,6 +2646,13 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             int                   direction);
+
+    // KVarN normalized Sylvester Walsh-Hadamard transform for 128/256/512-wide heads.
+    // The transform matches KVarN store/view math and is self-inverse.
+    GGML_API struct ggml_tensor * ggml_kvarn_wht(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   head_width);
 
     // KVarN structured KV-cache operations. These are fork-specific and intentionally
     // separate from ggml_type because KVarN records span complete 128-token tiles.

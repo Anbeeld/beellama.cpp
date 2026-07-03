@@ -797,6 +797,24 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return ret;
     };
 
+    auto handle_kvarn_wht = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        ggml_backend_meta_split_state ret = handle_generic(src_ss, /*scalar_only =*/ false);
+        if (ret.axis == GGML_BACKEND_SPLIT_AXIS_0) {
+            int head_width;
+            memcpy(&head_width, tensor->op_params, sizeof(int));
+            GGML_ASSERT(head_width == 128 || head_width == 256 || head_width == 512);
+
+            const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
+            for (size_t s = 0; s < ret.n_segments; ++s) {
+                for (size_t j = 0; j < n_bufs; ++j) {
+                    const int64_t kvarn_wht_split_axis_ne = ret.ne[s*n_bufs + j];
+                    GGML_ASSERT(kvarn_wht_split_axis_ne % head_width == 0);
+                }
+            }
+        }
+        return ret;
+    };
+
     auto calculate_split_state = [&]() -> ggml_backend_meta_split_state {
         if (ggml_nelements(tensor) == 0) {
             return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
@@ -1019,6 +1037,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             } break;
             case GGML_OP_TURBO_WHT: {
                 split_state = handle_turbo_wht(src_ss);
+            } break;
+            case GGML_OP_KVARN_WHT: {
+                split_state = handle_kvarn_wht(src_ss);
             } break;
             default: {
                 GGML_ABORT("ggml op not implemented: %s", ggml_op_name(tensor->op));

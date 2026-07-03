@@ -1198,8 +1198,8 @@ struct vk_op_kvarn_store_push_constants {
     uint32_t iterations;
     uint32_t value;
     uint32_t swa; // SWA sliding-window ring store (absolute-position indices, no sink)
-    uint32_t stage_groups; // dynamic stage depth (tail_groups + 1)
-    uint32_t tail_groups;  // stage_groups - 1
+    uint32_t stage_groups; // dynamic F16 stage depth
+    uint32_t tail_groups;  // lossless tail groups within the stage
 };
 static_assert(sizeof(vk_op_kvarn_store_push_constants) <= 128, "sizeof(vk_op_kvarn_store_push_constants) must be <= 128");
 
@@ -3621,6 +3621,7 @@ static constexpr int KVAR_N_OP_PARAM_STORE_ITERS = 1;
 static constexpr int KVAR_N_OP_PARAM_STORE_VALUE = 2;
 static constexpr int KVAR_N_OP_PARAM_STORE_SWA = 4;
 static constexpr int KVAR_N_OP_PARAM_STAGE_GROUPS = 7;
+static constexpr int KVAR_N_OP_PARAM_TAIL_GROUPS = 8;
 
 static bool ggml_vk_kvarn_stage_shape_valid(const ggml_tensor * stage, const ggml_tensor * records, int stage_groups) {
     if (stage_groups < 2 || stage->ne[2] % (KVAR_N_GROUP * stage_groups) != 0) {
@@ -9162,9 +9163,11 @@ static void ggml_vk_kvarn_store(ggml_backend_vk_context * ctx, vk_context& subct
     const bool value = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_STORE_VALUE) != 0;
     const bool swa = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_STORE_SWA) != 0;
     const int stage_groups = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_STAGE_GROUPS);
-    const int tail_groups = stage_groups - 1;
+    const int tail_groups_param = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_TAIL_GROUPS);
+    const int tail_groups = tail_groups_param > 0 ? tail_groups_param : stage_groups - 1;
     GGML_ASSERT(ggml_vk_kvarn_valid_bits(bits));
     GGML_ASSERT(stage_groups >= 2);
+    GGML_ASSERT(tail_groups >= 1 && tail_groups <= stage_groups);
     GGML_ASSERT(stage->ne[2] % (KVAR_N_GROUP * stage_groups) == 0);
     const int n_stream = (int) (stage->ne[2] / (KVAR_N_GROUP * stage_groups));
     GGML_ASSERT(n_stream > 0);

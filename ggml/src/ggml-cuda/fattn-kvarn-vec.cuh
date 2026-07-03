@@ -39,8 +39,7 @@ ggml_cuda_fattn_kvarn_vec_resolve(
         if (group >= stage_begin && group <= desc.live_group) {
             ref.source = GGML_CUDA_FATTN_KVARN_VEC_STAGE;
             ref.stage_pos = (group % desc.stage_groups) * GGML_CUDA_FATTN_KVARN_DIM + ref.pos;
-        } else if (group >= 0 && group < stage_begin &&
-                (desc.live_group - group) < desc.groups_per_stream) {
+        } else if (ggml_cuda_fattn_kvarn_swa_group_from_record(desc, group, stage_begin)) {
             ref.source = GGML_CUDA_FATTN_KVARN_VEC_RECORD;
             ref.record_group = group % desc.groups_per_stream;
         }

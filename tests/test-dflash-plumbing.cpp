@@ -470,18 +470,31 @@ int main(int argc, char ** argv) {
                  kv_cache_kvarn_cpp.find("llama_kv_cache_kvarn::materialize") == std::string::npos &&
                  kv_cache_kvarn_cpp.find("ggml_kvarn_materialize") == std::string::npos,
         "KVarN cache get_k/get_v must not retain a materialize graph path");
-    ok &= expect(kv_cache_kvarn_h.find("ceil((n_batch + n_ubatch) / KVAR_N_GROUP)") != std::string::npos &&
-                 kv_cache_kvarn_cpp.find("((n_batch + n_ubatch + KVAR_N_GROUP - 1u) / KVAR_N_GROUP)") != std::string::npos &&
+    ok &= expect(kv_cache_kvarn_h.find("non-SWA tail_groups = 4 + long_ctx_min + ceil(n_ubatch / KVAR_N_GROUP)") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("constexpr uint32_t KVAR_N_MIN_TAIL_GROUPS = 4;") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("const uint32_t in_flight_groups = std::max<uint32_t>(1u, (n_ubatch + KVAR_N_GROUP - 1u) / KVAR_N_GROUP);") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("const uint32_t min_tail_groups = KVAR_N_MIN_TAIL_GROUPS + (kv_size >= 65536u ? 2u : 0u);") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("return min_tail_groups + in_flight_groups;") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("kvarn_stage_tail_groups(") != std::string::npos &&
                  contains_ws(model_cpp, "cparams.n_ctx_seq, cparams.n_seq_max, cparams.n_batch, cparams.n_ubatch") &&
                  contains_ws(kv_cache_iswa_cpp, "size, n_seq_max, n_batch, n_ubatch") &&
                  contains_ws(memory_hybrid_iswa, "kv_size, n_seq_max, n_batch, n_ubatch"),
-        "KVarN non-SWA stage depth must size from n_batch plus one n_ubatch and all construction paths must pass n_batch");
-    ok &= expect(kv_cache_kvarn_h.find("SWA tail_groups     = max(2, ceil(min(kv_size, n_swa + n_ubatch) / KVAR_N_GROUP) + 1)") != std::string::npos &&
-                 kv_cache_kvarn_cpp.find("const uint32_t swa_stage_cells = std::min(kv_size, n_swa + n_ubatch);") != std::string::npos &&
-                 contains_ws(kv_cache_kvarn_cpp, "is_swa ? ((swa_stage_cells + KVAR_N_GROUP - 1u) / KVAR_N_GROUP) + 1u") &&
-                 kv_cache_kvarn_cpp.find("is_swa ? 2u : 4u") != std::string::npos,
-        "KVarN SWA stage depth must cover the full sliding-window tile span, not only the physical ubatch tail");
+        "KVarN non-SWA stage depth must cover the target tail plus the in-flight ubatch span");
+    ok &= expect(kv_cache_kvarn_h.find("SWA tail_groups     = KVAR_N_SWA_TAIL_GROUPS") != std::string::npos &&
+                 kv_cache_kvarn_h.find("stage_groups        = tail_groups + 1 for non-SWA, tail_groups for SWA") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("constexpr uint32_t KVAR_N_SWA_TAIL_GROUPS = 4;") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("stage_groups((n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE) ? tail_groups : tail_groups + 1u)") != std::string::npos &&
+                 contains_ws(kv_cache_kvarn_cpp, "if (is_swa) { return KVAR_N_SWA_TAIL_GROUPS; }") &&
+                 kv_cache_kvarn_cpp.find("const uint32_t in_flight_groups = std::max<uint32_t>(1u, (n_ubatch + KVAR_N_GROUP - 1u) / KVAR_N_GROUP);") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("visible_groups - tail_groups + in_flight_groups - 1u") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("kvarn_effective_params(params, n_swa, swa_type)") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("KVAR_N_SWA_MIN_RECORD_BITS = 4") != std::string::npos &&
+                 llama_kvarn_h.find("llama_kvarn_params_with_min_bits") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("kvarn_record_bytes(this->params.key_bits)") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("kvarn_record_bytes(this->params.value_bits)") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("kvarn_record_groups_per_stream") != std::string::npos &&
+                 cuda_fattn_mma_kvarn.find("ggml_cuda_fattn_kvarn_swa_group_from_record") != std::string::npos,
+        "KVarN SWA record ring must cover the active ubatch span without raising the requested KVarN4 precision");
     ok &= expect(contains_ws(graph_cpp, "static enum ggml_flash_attn_ext_kvarn_domain llm_kvarn_attn_domain( const llama_cparams & cparams, const ggml_tensor * q, bool is_swa)") &&
                  graph_cpp.find("const int64_t n_q = q->ne[2];") != std::string::npos &&
                  graph_cpp.find("if (n_q == 1)") != std::string::npos &&
@@ -534,7 +547,7 @@ int main(int argc, char ** argv) {
                  cuda_fattn_mma_kvarn_decode.find("#include \"fattn-mma-kvarn-load.cuh\"") != std::string::npos &&
                  cuda_fattn_mma_kvarn_decode.find("#include \"fattn-mma-kvarn-impl.cuh\"") == std::string::npos &&
                  cuda_fattn_mma_kvarn_load.find("ggml_cuda_fattn_kvarn_load_rotated") != std::string::npos &&
-                 cuda_fattn_mma_kvarn_case.find("GGML_CUDA_FATTN_KVARN_WINDOW_CHUNK") != std::string::npos &&
+                 cuda_fattn_mma_kvarn_case.find("STOPGAP: keep windowed prefill single-chunk by default") != std::string::npos &&
                  cuda_fattn_mma_kvarn_case.find("GGML_KVARN_WINDOW") != std::string::npos &&
                  cuda_fattn_mma_kvarn_case.find("GGML_KVARN_WINDOW_CHUNK") != std::string::npos &&
                  cuda_fattn_mma_kvarn_case.find("ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case") != std::string::npos &&
@@ -546,12 +559,13 @@ int main(int argc, char ** argv) {
                      "DECL_FATTN_KVARN_DECODE_CASE(512, 4, 3);") != std::string::npos &&
                  cuda_fattn.find("Q->ne[1] > GGML_CUDA_FATTN_KVARN_DECODE_MAX_Q") == std::string::npos &&
                  cuda_fattn_mma_kvarn_case.find("need_f16_K=false") != std::string::npos &&
-                 cuda_fattn_mma_kvarn_case.find("need_f16_V=false") != std::string::npos &&
-                 cuda_fattn_mma_kvarn_case.find("materialize_v_original") == std::string::npos &&
-                 cuda_fattn_mma_kvarn_case.find("plan.n_kv * DV") == std::string::npos &&
-                 cuda_fattn_mma_kvarn_impl.find("flash_attn_ext_kvarn_load_tile") != std::string::npos &&
-                 cuda_fattn_mma_kvarn.find("GGML_KVARN_FORCE_MATERIALIZE") == std::string::npos &&
-                 cuda_fattn_mma_kvarn.find("ggml_cuda_fattn_kvarn_force_materialize_enabled") == std::string::npos,
+                  cuda_fattn_mma_kvarn_case.find("need_f16_V=false") != std::string::npos &&
+                  cuda_fattn_mma_kvarn_case.find("materialize_v_original") == std::string::npos &&
+                  cuda_fattn_mma_kvarn_case.find("bounded by window_chunk") != std::string::npos &&
+                  cuda_fattn_mma_kvarn_case.find("not a graph-level KVarN materialize fallback") != std::string::npos &&
+                  cuda_fattn_mma_kvarn_impl.find("flash_attn_ext_kvarn_load_tile") != std::string::npos &&
+                  cuda_fattn_mma_kvarn.find("GGML_KVARN_FORCE_MATERIALIZE") == std::string::npos &&
+                  cuda_fattn_mma_kvarn.find("ggml_cuda_fattn_kvarn_force_materialize_enabled") == std::string::npos,
         "native KVarN FlashAttention must keep the SWA-aware tensor-core decode in per-pair instance TUs plus generic shallow fallback without full-cache K/V F16 materialize fallbacks or env gates");
     ok &= expect(cuda_fattn_mma_kvarn.find("record_cache") == std::string::npos &&
                  cuda_fattn.find("nbytes_shared_record =") == std::string::npos &&
@@ -2783,8 +2797,8 @@ int main(int argc, char ** argv) {
     ok &= expect(kv_cache_kvarn_cpp.find("GGML_ABORT(\"KVarN does not support position shifts\")") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("GGML_ABORT(\"KVarN does not support position division\")") != std::string::npos,
         "KVarN seq_add/seq_div must fail fast instead of logging and continuing");
-    ok &= expect(kv_cache_kvarn_cpp.find("constexpr uint32_t KVAR_N_STATE_VERSION = 8") != std::string::npos &&
-                 kv_cache_kvarn_cpp.find("if (version < 8)") != std::string::npos &&
+    ok &= expect(kv_cache_kvarn_cpp.find("constexpr uint32_t KVAR_N_STATE_VERSION = 11") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("if (version < 11)") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("if (version == 1)") == std::string::npos &&
                  kv_cache_kvarn_cpp.find("KVAR_N_STATE_RECORDS_FULL") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("KVAR_N_STATE_STAGE_ONLY_PARTIAL") != std::string::npos &&
@@ -2801,7 +2815,9 @@ int main(int argc, char ** argv) {
                  kv_cache_kvarn_cpp.find("ggml_backend_tensor_memset") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("const uint64_t size64 = size") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("io.write(&stage_groups, sizeof(stage_groups))") != std::string::npos &&
-                 kv_cache_kvarn_cpp.find("io.read(&saved_stage_groups, sizeof(saved_stage_groups))") != std::string::npos,
+                 kv_cache_kvarn_cpp.find("io.read(&saved_stage_groups, sizeof(saved_stage_groups))") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("io.write(&tail_groups, sizeof(tail_groups))") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("io.read(&saved_tail_groups, sizeof(saved_tail_groups))") != std::string::npos,
         "KVarN sequence state must serialize full records compactly and partial checkpoints as stage-only overlays");
     ok &= expect(kv_cache_kvarn_cpp.find("pending_stream_copies") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("llama_synchronize(lctx)") != std::string::npos &&
@@ -2841,6 +2857,8 @@ int main(int argc, char ** argv) {
     ok &= expect(llama_kvarn_h.find("LLAMA_API") == std::string::npos,
         "internal C++ KVarN helper declarations must not be exported from the public DLL ABI");
     ok &= expect(kv_cache_iswa_cpp.find("KVarN enabled for all layers (non-SWA full-context and SWA sliding-window ring)") != std::string::npos &&
+                 kv_cache_iswa_cpp.find("kvarn_swa_fallback_cache_type") == std::string::npos &&
+                 kv_cache_iswa_cpp.find("return GGML_TYPE_Q5_0;") == std::string::npos &&
                  kv_cache_iswa_cpp.find("make_cache(size_base, 0, LLAMA_SWA_TYPE_NONE, filter_base, mem_other_base, use_kvarn)") != std::string::npos &&
                  kv_cache_iswa_cpp.find("make_cache(size_swa, hparams.n_swa, hparams.swa_type, filter_swa, mem_other_swa, use_kvarn)") != std::string::npos &&
                  kv_cache_iswa_cpp.find("n_seq_max > 1 && !unified") != std::string::npos &&
@@ -2886,8 +2904,11 @@ int main(int argc, char ** argv) {
                  graph_cpp.find("GGML_KVARN_ROTATED_FA") == std::string::npos &&
                  graph_cpp.find("get_k_rotated") == std::string::npos &&
                  graph_cpp.find("get_v_rotated") == std::string::npos &&
-                 graph_cpp.find("ggml_mul_mat_aux(ctx0, q, inp->self_kvarn_rot)") != std::string::npos &&
-                 graph_cpp.find("ggml_mul_mat_aux(ctx0, cur, inp->self_kvarn_rot)") != std::string::npos &&
+                 graph_cpp.find("llm_kvarn_rot_for_dim(") != std::string::npos &&
+                 graph_cpp.find("ggml_kvarn_wht_aux(ctx0, q, kvarn_rot->ne[0])") != std::string::npos &&
+                 graph_cpp.find("ggml_kvarn_wht_aux(ctx0, cur, kvarn_rot->ne[0])") != std::string::npos &&
+                 ggml_c.find("GGML_OP_KVARN_WHT") != std::string::npos &&
+                 cuda_cpp.find("ggml_cuda_op_kvarn_wht") != std::string::npos &&
                  graph_cpp.find("GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_KV_OUTPUT_ORIGINAL") == std::string::npos &&
                  cuda_fattn_mma_f16.find("kvarn_output_original_domain") == std::string::npos &&
                  cuda_fattn_mma_f16.find("flash_attn_ext_kvarn_inverse_wht_output_tile") == std::string::npos &&
@@ -2897,6 +2918,12 @@ int main(int argc, char ** argv) {
                  kv_cache_kvarn_h.find("get_v_rotated") == std::string::npos &&
                  kv_cache_kvarn_h.find("build_input_kvarn_rot") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("ggml_kvarn_view") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("result->op_params[5] = (int32_t) slices") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("result->op_params[8] = int32_t(tail_groups)") != std::string::npos &&
+                 ggml_c.find("ggml_get_op_params_i32(stage_after_store, GGML_KVARN_OP_PARAM_HEAD_SLICES)") != std::string::npos &&
+                 ggml_c.find("GGML_KVARN_OP_PARAM_TAIL_GROUPS") != std::string::npos &&
+                 cuda_fattn_mma_kvarn.find("head_slices") != std::string::npos &&
+                 cuda_fattn_mma_kvarn.find("tail_groups_param") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("result->op_params[5] = emit_rotated ? 1 : 0") == std::string::npos &&
                  cuda_fattn_mma_kvarn.find("for (int stride = 1; stride < GGML_CUDA_FATTN_KVARN_DIM; stride <<= 1)") == std::string::npos,
         "KVarN attention graph must keep native K/V views, rotate only Q/output once, and avoid per-tile inverse-WHT in native FA");

@@ -1175,6 +1175,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     [GGML_OP_GATED_DELTA_NET_TREE]  = "GATED_DELTA_NET_TREE",
     [GGML_OP_SSM_CONV_TREE]         = "SSM_CONV_TREE",
     [GGML_OP_TURBO_WHT]             = "TURBO_WHT",
+    [GGML_OP_KVARN_WHT]             = "KVARN_WHT",
     [GGML_OP_KVARN_STORE]           = "KVARN_STORE",
     [GGML_OP_KVARN_VIEW]            = "KVARN_VIEW",
     [GGML_OP_UNARY]                  = "UNARY",
@@ -1189,7 +1190,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     [GGML_OP_GLU]                     = "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     [GGML_OP_NONE]                  = "none",
@@ -1282,6 +1283,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     [GGML_OP_GATED_DELTA_NET_TREE]  = "gated_delta_net_tree(q, k, v, g, beta, s, parents, inter)",
     [GGML_OP_SSM_CONV_TREE]         = "ssm_conv_tree(x, c, parents)",
     [GGML_OP_TURBO_WHT]             = "turbo_wht(a)",
+    [GGML_OP_KVARN_WHT]             = "kvarn_wht(a)",
     [GGML_OP_KVARN_STORE]           = "kvarn_store(cur, idx, stage, records)",
     [GGML_OP_KVARN_VIEW]            = "kvarn_view(records, stage, idx)",
     [GGML_OP_UNARY]                  = "unary(x)",
@@ -1296,7 +1298,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     [GGML_OP_GLU]                     = "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6561,6 +6563,27 @@ struct ggml_tensor * ggml_turbo_wht(
     return result;
 }
 
+// ggml_kvarn_wht
+
+struct ggml_tensor * ggml_kvarn_wht(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   head_width) {
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(head_width == 128 || head_width == 256 || head_width == 512);
+    GGML_ASSERT(ggml_nelements(a) % head_width == 0);
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, a->ne);
+
+    result->op = GGML_OP_KVARN_WHT;
+    result->src[0] = a;
+
+    memcpy(result->op_params, &head_width, sizeof(int));
+
+    return result;
+}
+
 // ggml_kvarn_store
 
 static bool ggml_kvarn_valid_bits(int bits) {
@@ -6573,7 +6596,9 @@ enum {
     GGML_KVARN_OP_PARAM_VIEW_VALUE        = 1,
     GGML_KVARN_OP_PARAM_STORE_VALUE       = 2,
     GGML_KVARN_OP_PARAM_STORE_SWA         = 4,
+    GGML_KVARN_OP_PARAM_HEAD_SLICES       = 5,
     GGML_KVARN_OP_PARAM_STAGE_GROUPS      = 7,
+    GGML_KVARN_OP_PARAM_TAIL_GROUPS       = 8,
 };
 
 struct ggml_tensor * ggml_kvarn_store(
@@ -6610,9 +6635,12 @@ struct ggml_tensor * ggml_kvarn_store(
     ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_ITERS, sinkhorn_iters);
     ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_STORE_VALUE, value ? 1 : 0);
     // op_params[3..6] are reserved for the cache to set at graph construction
-    // (tokens_per_stream_hint, swa flag, and native-view live/swa markers).
+    // (tokens_per_stream_hint, swa flag, head_slices, and native-view live/swa markers).
     // op_params[7] carries the explicit dynamic stage_groups depth.
+    // op_params[8] carries tail_groups; default keeps legacy stage-1 behavior.
+    ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_HEAD_SLICES, 1);
     ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_STAGE_GROUPS, stage_groups);
+    ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_TAIL_GROUPS, stage_groups - 1);
     return result;
 }
 
@@ -6650,7 +6678,15 @@ struct ggml_tensor * ggml_kvarn_view(
     ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_VIEW_VALUE, value ? 1 : 0);
     ggml_set_op_params_i32(result, 2, stream_start);
     ggml_set_op_params_i32(result, 3, n_stream);
+    ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_HEAD_SLICES,
+            ggml_get_op_params_i32(stage_after_store, GGML_KVARN_OP_PARAM_HEAD_SLICES) > 0 ?
+            ggml_get_op_params_i32(stage_after_store, GGML_KVARN_OP_PARAM_HEAD_SLICES) : 1);
     ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_STAGE_GROUPS, stage_groups);
+    int tail_groups = ggml_get_op_params_i32(stage_after_store, GGML_KVARN_OP_PARAM_TAIL_GROUPS);
+    if (tail_groups <= 0) {
+        tail_groups = stage_groups - 1;
+    }
+    ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_TAIL_GROUPS, tail_groups);
     return result;
 }
 

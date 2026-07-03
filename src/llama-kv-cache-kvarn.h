@@ -41,7 +41,7 @@ public:
 
     // SWA sliding-window ring: per-cell absolute positions for native KVarN views.
     // Built as a graph input sized [n_kv]; set on the host from cells.pos_get(cell).
-    ggml_tensor * build_input_kvarn_rot(ggml_context * ctx) const;
+    ggml_tensor * build_input_kvarn_rot(ggml_context * ctx, int n_rot) const;
     void set_input_kvarn_rot(ggml_tensor * dst) const;
     ggml_tensor * build_input_kvarn_mat_idxs(ggml_context * ctx) const;
     void set_input_kvarn_mat_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
@@ -141,15 +141,19 @@ public:
     bool apply_pending_stream_copies(llama_context * lctx);
     bool is_swa() const { return swa; }
 
-    // Dynamic staging: the lossless F16 ring is sized from the configured batch
-    // window, with a non-SWA precision floor for common small batches.
-    //   non-SWA tail_groups = max(4, ceil((n_batch + n_ubatch) / KVAR_N_GROUP))
-    //   SWA tail_groups     = max(2, ceil(min(kv_size, n_swa + n_ubatch) / KVAR_N_GROUP) + 1)
-    //   stage_groups        = tail_groups + 1
-    // The +1 is the permanent sink slot for non-SWA, or the extra ping-pong slot
-    // for SWA. KVarN cache state is versioned to carry stage_groups so restore can
-    // validate the saved layout against the current cache. The W2 gate rejects
-    // any stage_groups mismatch; remap for differing save/restore ubatch is future.
+    // Dynamic staging: the lossless F16 ring is position-oriented, not sized to
+    // the full scheduler batch/window.
+    //   non-SWA tail_groups = 4 + long_ctx_min + ceil(n_ubatch / KVAR_N_GROUP)
+    //   SWA tail_groups     = KVAR_N_SWA_TAIL_GROUPS
+    //   stage_groups        = tail_groups + 1 for non-SWA, tail_groups for SWA
+    // The +1 is only the permanent sink slot for non-SWA. SWA has no sink slot,
+    // so all F16 stage groups are live local tail groups. Its record ring also
+    // carries the active ubatch span because early query rows can still attend
+    // older window groups after later rows have flushed newer groups into the
+    // ring. KVarN cache state is versioned to carry stage_groups/tail_groups so
+    // restore can validate the saved layout against the current cache. The W2
+    // gate rejects any layout mismatch; remap for differing save/restore ubatch
+    // is future.
     uint32_t get_stage_groups() const { return stage_groups; }
     uint32_t get_tail_groups()  const { return tail_groups; }
 
@@ -194,12 +198,12 @@ private:
     const llama_hparams & hparams;
     const llama_kvarn_params params;
     const uint32_t n_stream;
-    const uint32_t n_groups_per_stream;
     // Declaration order matters: stage_groups depends on tail_groups, so
     // tail_groups must be declared first (C++ initializes members in order).
-    const uint32_t tail_groups;   // non-SWA max(4, ceil((n_batch + n_ubatch) / 128)); SWA max(2, ceil(active window / 128) + 1)
-    const uint32_t stage_groups;   // F16 stage depth (tail_groups + 1)
+    const uint32_t tail_groups;   // non-SWA bounded current-ubatch tail; SWA fixed local tail
+    const uint32_t stage_groups;   // F16 stage depth (non-SWA sink + tail; SWA tail only)
     const bool swa;
+    const uint32_t n_groups_per_stream;
 
     std::unique_ptr<llama_kv_cache> metadata;
     std::vector<layer> layers;
