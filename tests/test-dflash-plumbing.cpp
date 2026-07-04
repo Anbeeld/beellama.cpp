@@ -482,7 +482,7 @@ int main(int argc, char ** argv) {
         "KVarN non-SWA stage depth must cover the target tail plus the in-flight ubatch span");
     ok &= expect(kv_cache_kvarn_h.find("SWA tail_groups     = KVAR_N_SWA_TAIL_GROUPS") != std::string::npos &&
                  kv_cache_kvarn_h.find("stage_groups        = tail_groups + 1 for non-SWA, tail_groups for SWA") != std::string::npos &&
-                 kv_cache_kvarn_cpp.find("constexpr uint32_t KVAR_N_SWA_TAIL_GROUPS = 4;") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("constexpr uint32_t KVAR_N_SWA_TAIL_GROUPS = 2;") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("stage_groups((n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE) ? tail_groups : tail_groups + 1u)") != std::string::npos &&
                  contains_ws(kv_cache_kvarn_cpp, "if (is_swa) { return KVAR_N_SWA_TAIL_GROUPS; }") &&
                  kv_cache_kvarn_cpp.find("const uint32_t in_flight_groups = std::max<uint32_t>(1u, (n_ubatch + KVAR_N_GROUP - 1u) / KVAR_N_GROUP);") != std::string::npos &&

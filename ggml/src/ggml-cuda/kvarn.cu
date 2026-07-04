@@ -1204,6 +1204,7 @@ static __global__ void kvarn_store_workspace_validate_kernel(
         int groups_per_stream,
         int tokens_per_stream,
         int active_streams,
+        bool swa,
         int * workspace_valid) {
     if (blockIdx.x != 0) {
         return;
@@ -1235,15 +1236,15 @@ static __global__ void kvarn_store_workspace_validate_kernel(
 
         if (threadIdx.x == 0 && valid != 0) {
             const int first_group_global = (int) (first_idx / KVAR_N_DIM);
-            const int stream = first_group_global / groups_per_stream;
-            const int first_group = first_group_global - stream * groups_per_stream;
+            const int stream = swa ? 0 : first_group_global / groups_per_stream;
+            const int first_group = swa ? first_group_global : first_group_global - stream * groups_per_stream;
             const int first_pos = (int) (first_idx % KVAR_N_DIM);
             const int start_local = first_group * KVAR_N_DIM + first_pos;
             const int end_local = start_local + tokens_per_stream;
             if (stream < 0 || stream >= n_stream ||
-                    first_group < 0 || first_group >= groups_per_stream ||
+                    first_group < 0 || (!swa && first_group >= groups_per_stream) ||
                     first_pos < 0 || first_pos >= KVAR_N_DIM ||
-                    end_local > groups_per_stream * KVAR_N_DIM) {
+                    (!swa && end_local > groups_per_stream * KVAR_N_DIM)) {
                 valid = 0;
             }
         }
@@ -1272,7 +1273,8 @@ static __global__ void kvarn_store_workspace_flush_kernel(
         int iterations,
         bool value,
         int stage_groups,
-        int tail_groups) {
+        int tail_groups,
+        bool swa) {
     extern __shared__ float shared[];
     const int head = blockIdx.x;
     const int active_stream = blockIdx.y / flush_candidates;
@@ -1289,23 +1291,29 @@ static __global__ void kvarn_store_workspace_flush_kernel(
     }
 
     const int first_group_global = (int) (first_idx / KVAR_N_DIM);
-    const int stream = first_group_global / groups_per_stream;
-    const int first_group = first_group_global - stream * groups_per_stream;
+    const int stream = swa ? 0 : first_group_global / groups_per_stream;
+    const int first_group = swa ? first_group_global : first_group_global - stream * groups_per_stream;
     const int first_pos = (int) (first_idx % KVAR_N_DIM);
-    if (stream < 0 || stream >= n_stream || first_group < 0 || first_group >= groups_per_stream || first_pos < 0) {
+    if (stream < 0 || stream >= n_stream || first_group < 0 || (!swa && first_group >= groups_per_stream) || first_pos < 0) {
         return;
     }
 
     const int start_local = first_group * KVAR_N_DIM + first_pos;
     const int end_local = start_local + tokens_per_stream;
     const int boundary_group = (start_local + KVAR_N_DIM - 1) / KVAR_N_DIM + candidate;
-    if (boundary_group * KVAR_N_DIM >= end_local || boundary_group <= tail_groups) {
+    if (boundary_group * KVAR_N_DIM >= end_local || (swa ? boundary_group < tail_groups : boundary_group <= tail_groups)) {
         return;
     }
 
     const int flush_group = boundary_group - tail_groups;
-    if (flush_group < 1 || flush_group >= groups_per_stream) {
+    if (swa ? flush_group < 0 : (flush_group < 1 || flush_group >= groups_per_stream)) {
         return;
+    }
+    if (swa) {
+        const int next_same_record_boundary_group = flush_group + groups_per_stream + tail_groups;
+        if (next_same_record_boundary_group * KVAR_N_DIM < end_local) {
+            return;
+        }
     }
 
     const int flush_start = flush_group * KVAR_N_DIM;
@@ -1321,14 +1329,14 @@ static __global__ void kvarn_store_workspace_flush_kernel(
             const int src_token = token_base + local_pos - start_local;
             tile[i] = __half2float(workspace[((int64_t) src_token * n_heads + head) * KVAR_N_DIM + dim]);
         } else {
-            const int stage_slot = 1 + ((flush_group - 1) % tail_groups);
+            const int stage_slot = swa ? (flush_group % stage_groups) : 1 + ((flush_group - 1) % tail_groups);
             const int stage_pos = stage_base + stage_slot * KVAR_N_DIM + token;
             tile[i] = __half2float(stage[(stage_pos * n_heads + head) * KVAR_N_DIM + dim]);
         }
     }
     __syncthreads();
 
-    const int flush_record_group = stream * groups_per_stream + flush_group;
+    const int flush_record_group = stream * groups_per_stream + (swa ? flush_group % groups_per_stream : flush_group);
     uint8_t * record = records + ((int64_t) flush_record_group * n_heads + head) * record_bytes;
     kvarn_quantize_tile(record, bits, iterations, shared);
 }
@@ -1344,7 +1352,8 @@ static __global__ void kvarn_store_workspace_commit_kernel(
         int groups_per_stream,
         int tokens_per_stream,
         int stage_groups,
-        int tail_groups) {
+        int tail_groups,
+        bool swa) {
     const int head = blockIdx.x;
     const int active_stream = blockIdx.y / (KVAR_N_DIM * stage_groups);
     const int stage_local = blockIdx.y - active_stream * (KVAR_N_DIM * stage_groups);
@@ -1360,10 +1369,10 @@ static __global__ void kvarn_store_workspace_commit_kernel(
     }
 
     const int first_group_global = (int) (first_idx / KVAR_N_DIM);
-    const int stream = first_group_global / groups_per_stream;
-    const int first_group = first_group_global - stream * groups_per_stream;
+    const int stream = swa ? 0 : first_group_global / groups_per_stream;
+    const int first_group = swa ? first_group_global : first_group_global - stream * groups_per_stream;
     const int first_pos = (int) (first_idx % KVAR_N_DIM);
-    if (stream < 0 || stream >= n_stream || first_group < 0 || first_group >= groups_per_stream || first_pos < 0) {
+    if (stream < 0 || stream >= n_stream || first_group < 0 || (!swa && first_group >= groups_per_stream) || first_pos < 0) {
         return;
     }
 
@@ -1371,26 +1380,26 @@ static __global__ void kvarn_store_workspace_commit_kernel(
     const int end_local = start_local + tokens_per_stream;
     const int pos = stage_local % KVAR_N_DIM;
     int group = 0;
-    if (stage_local < KVAR_N_DIM) {
+    if (!swa && stage_local < KVAR_N_DIM) {
         const int local_pos = pos;
         if (local_pos < start_local || local_pos >= end_local) {
             return;
         }
     } else {
-        const int slot = (stage_local - KVAR_N_DIM) / KVAR_N_DIM;
+        const int slot = swa ? stage_local / KVAR_N_DIM : (stage_local - KVAR_N_DIM) / KVAR_N_DIM;
         int max_group = (end_local - 1 - pos) / KVAR_N_DIM;
-        if (max_group < 1) {
+        if (max_group < (swa ? 0 : 1)) {
             return;
         }
-        while (max_group >= 1 && ((max_group - 1) % tail_groups) != slot) {
+        while (max_group >= (swa ? 0 : 1) && (swa ? (max_group % stage_groups) != slot : ((max_group - 1) % tail_groups) != slot)) {
             --max_group;
         }
-        if (max_group < 1) {
+        if (max_group < (swa ? 0 : 1)) {
             return;
         }
         group = max_group;
         const int local_pos = group * KVAR_N_DIM + pos;
-        if (group >= groups_per_stream || local_pos < start_local || local_pos >= end_local) {
+        if ((!swa && group >= groups_per_stream) || local_pos < start_local || local_pos >= end_local) {
             return;
         }
     }
@@ -1452,7 +1461,10 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         tokens_per_stream_hint <= n_tokens &&
         n_tokens % tokens_per_stream_hint == 0;
     const int active_streams = hint_well_formed ? n_tokens / tokens_per_stream_hint : 0;
-    const bool workspace_hint = !swa && hint_well_formed && tokens_per_stream_hint >= 3 * KVAR_N_DIM;
+    const bool workspace_hint =
+        hint_well_formed &&
+        tokens_per_stream_hint >= 3 * KVAR_N_DIM &&
+        (!swa || (n_stream == 1 && tokens_per_stream_hint <= groups_per_stream * KVAR_N_DIM));
     // The direct split is safe for the common ubatch=256 two-group case only
     // when there are at least three transient tail groups. With fewer tail
     // groups, an unaligned 256-token write can span far enough that the
@@ -1506,6 +1518,7 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             groups_per_stream,
             tokens_per_stream_hint,
             active_streams,
+            swa,
             workspace_valid.get());
         dim3 blocks_stage(n_heads / head_slices, (n_tokens + KVAR_N_STAGE_CHUNK - 1) / KVAR_N_STAGE_CHUNK, 1);
         switch (head_slices) {
@@ -1546,7 +1559,8 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             iterations,
             value,
             stage_groups,
-            tail_groups);
+            tail_groups,
+            swa);
         dim3 blocks_commit(n_heads, active_streams * KVAR_N_DIM * stage_groups, 1);
         kvarn_store_workspace_commit_kernel<<<blocks_commit, KVAR_N_DIM, 0, stream>>>(
             (const int64_t *) indices->data,
@@ -1559,7 +1573,8 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             groups_per_stream,
             tokens_per_stream_hint,
             stage_groups,
-            tail_groups);
+            tail_groups,
+            swa);
         kvarn_store_kernel_headwide<<<n_heads / head_slices, KVAR_N_DIM, KVAR_N_SHARED_BYTES, stream>>>(
             (const float *) current->data,
             (const int64_t *) indices->data,
@@ -1573,7 +1588,7 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             bits,
             iterations,
             value,
-            /*swa=*/false,
+            swa,
             stage_groups,
             tail_groups,
             head_slices,
@@ -1646,6 +1661,7 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             groups_per_stream,
             tokens_per_stream_hint,
             active_streams,
+            swa,
             workspace_valid.get());
         dim3 blocks_stage(n_heads, (n_tokens + KVAR_N_STAGE_CHUNK - 1) / KVAR_N_STAGE_CHUNK, 1);
         kvarn_store_workspace_stage_kernel<<<blocks_stage, KVAR_N_DIM * KVAR_N_STAGE_CHUNK, 0, stream>>>(
@@ -1672,7 +1688,8 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             iterations,
             value,
             stage_groups,
-            tail_groups);
+            tail_groups,
+            swa);
         dim3 blocks_commit(n_heads, active_streams * KVAR_N_DIM * stage_groups, 1);
         kvarn_store_workspace_commit_kernel<<<blocks_commit, KVAR_N_DIM, 0, stream>>>(
             (const int64_t *) indices->data,
@@ -1685,7 +1702,8 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             groups_per_stream,
             tokens_per_stream_hint,
             stage_groups,
-            tail_groups);
+            tail_groups,
+            swa);
         kvarn_store_kernel_hishmem<<<n_heads, KVAR_N_DIM, KVAR_N_SHARED_BYTES, stream>>>(
             (const float *) current->data,
             (const int64_t *) indices->data,
@@ -1699,7 +1717,7 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             bits,
             iterations,
             value,
-            /*swa=*/false,
+            swa,
             stage_groups,
             tail_groups,
             workspace_valid.get());

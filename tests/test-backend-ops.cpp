@@ -9978,9 +9978,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 256, 8, 2, 768, 4, 4, 2, 1, 0, true, 40, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
     test_cases.emplace_back(new test_kvarn_flash_attn_ext(512,  64, 4, 1, 768, 4, 4, 2, 1, 0, true,  0, true,  test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
     test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 128, 4, 1, 768, 5, 4, 2, 1, 0, true,  0, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
-    // Current Gemma 4 production SWA ring: no sink slot, stage_groups == tail_groups == 4,
+    // Current Gemma 4 production SWA ring: no sink slot, stage_groups == tail_groups == 2,
     // six record slots, D512 prefill, and record-backed older window groups.
-    test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 128, 4, 1, 768, 4, 4, 4, 1, 0, true, 40, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill, 4));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 128, 4, 1, 768, 4, 4, 2, 1, 0, true, 40, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill, 2));
     test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 128, 4, 1, 768, 4, 5, 2, 1, 0, true,  0, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
     test_cases.emplace_back(new test_kvarn_flash_attn_ext(512,  64, 4, 1, 1024, 4, 4, 5, 1, 0, false, 0, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
     test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 128, 4, 1, 1024, 4, 4, 5, 1, 0, false, 0, false, test_kvarn_flash_attn_ext::route_domain::mixed_prefill));
