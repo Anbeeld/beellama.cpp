@@ -18,7 +18,6 @@
 namespace {
 
 constexpr uint32_t KVAR_N_GROUP = 128;
-constexpr uint32_t KVAR_N_STAGE_GROUPS = 3; // legacy default; production caches carry stage_groups in op_params[7]
 constexpr uint32_t KVAR_N_MIN_TAIL_GROUPS = 4;
 // SWA keeps only local tail groups in F16; older window groups are served from
 // records. Keep this low enough that KVarN remains a KV-memory win over q5_0.
