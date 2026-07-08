@@ -1085,18 +1085,25 @@ llm_build_dflash_draft::llm_build_dflash_draft(
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
-    // GPU top-K or argmax — avoids 15.9MB logits transfer + CPU scan for DFlash draft
-    const float sample_temp = cparams.dflash_sample_temp;
-    static std::atomic<uint64_t> gumbel_counter{1};
-    const uint64_t seed = (sample_temp > 0.0f) ? gumbel_counter.fetch_add(1) : 0;
-    const int topk = cparams.dflash_topk;
-    if (topk > 1) {
-        res->t_logits_argmax = ggml_topk_ext(ctx0, cur, topk, sample_temp, seed);
-    } else {
-        res->t_logits_argmax = ggml_argmax_ext(ctx0, cur, sample_temp, seed);
-    }
+    // GPU top-K or argmax — avoids 15.9MB logits transfer + CPU scan for DFlash draft.
+    // Only built when the output device backend implements the extended argmax
+    // semantics (CUDA); otherwise leave t_logits_argmax unset so the drafter
+    // falls back to scanning the full logits on the CPU.
+    if (cparams.dflash_graph_argmax) {
+        const float sample_temp = cparams.dflash_sample_temp;
+        static std::atomic<uint64_t> gumbel_counter{1};
+        const uint64_t seed = (sample_temp > 0.0f) ? gumbel_counter.fetch_add(1) : 0;
+        const int topk = cparams.dflash_topk;
+        if (topk > 1) {
+            res->t_logits_argmax = ggml_topk_ext(ctx0, cur, topk, sample_temp, seed);
+        } else {
+            res->t_logits_argmax = ggml_argmax_ext(ctx0, cur, sample_temp, seed);
+        }
 
-    ggml_build_forward_expand(gf, res->t_logits_argmax);
+        ggml_build_forward_expand(gf, res->t_logits_argmax);
+    } else {
+        ggml_build_forward_expand(gf, cur);
+    }
 }
 
 llm_build_dflash_kv_update::llm_build_dflash_kv_update(

@@ -68,6 +68,12 @@ struct llama_cparams {
     int  dflash_verify_topk = 1;
     bool dflash_reduced_consumer_active = false;
 
+    // DFlash: whether graph-embedded argmax/topk (ggml_argmax_ext/ggml_topk_ext)
+    // produces valid results on the model's output device. Only the CUDA backend
+    // implements the extended semantics; other backends run the stock argmax
+    // kernel and leave the rest of the compact ids/probs tensor uninitialized.
+    bool dflash_graph_argmax = false;
+
     // DFlash: cross-attention window in tokens (how many target hidden states the drafter sees)
     int dflash_cross_ctx = 512;
 

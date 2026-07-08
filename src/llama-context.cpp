@@ -22,6 +22,7 @@
 #include "ggml-alloc.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
 #include <cstdlib>
@@ -273,6 +274,16 @@ llama_context::llama_context(
     cparams.dflash_n_slots = std::clamp(params.dflash_n_slots <= 0 ? 1 : params.dflash_n_slots,
                                         1, (int) LLAMA_DFLASH_MAX_SLOTS);
     cparams.dflash_cross_ctx = params.dflash_cross_ctx > 0 ? params.dflash_cross_ctx : 512;
+
+    // DFlash graph argmax/topk is only implemented by the CUDA backend; the stock
+    // GGML_OP_ARGMAX kernels on other backends ignore the extended op_params and
+    // leave most of the compact ids/probs tensor uninitialized.
+    {
+        ggml_backend_dev_t output_dev = model.dev_output();
+        ggml_backend_reg_t output_reg = output_dev ? ggml_backend_dev_backend_reg(output_dev) : nullptr;
+        const char * output_reg_name = output_reg ? ggml_backend_reg_name(output_reg) : nullptr;
+        cparams.dflash_graph_argmax = output_reg_name != nullptr && strcmp(output_reg_name, "CUDA") == 0;
+    }
 
     // Initialize backend samplers here so they are part of the sampling graph
     // before the reserve passes run later in this function. This avoids a later
@@ -1741,6 +1752,14 @@ void llama_context::set_dflash_topk(int k) {
 
 void llama_context::set_dflash_verify_logits(bool enabled, int top_k) {
     const int clamped_top_k = std::max(1, std::min(top_k, 64));
+    if (enabled && !cparams.dflash_graph_argmax) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            LLAMA_LOG_WARN("%s: DFlash reduced verify logits requested, but graph argmax/topk is only implemented "
+                    "on the CUDA backend; falling back to full-logits verification\n", __func__);
+        }
+        enabled = false;
+    }
     if (cparams.dflash_verify_logits == enabled && cparams.dflash_verify_topk == clamped_top_k) {
         return;
     }
