@@ -211,6 +211,106 @@ void ggml_cuda_fattn_kvarn_init_descs(
     CUDA_CHECK(cudaGetLastError());
 }
 
+static inline bool ggml_cuda_fattn_kvarn_fast_decode_pair_enabled(int k_bits, int v_bits) {
+#if defined(GGML_CUDA_FA_ALL_QUANTS)
+    return ggml_cuda_fattn_kvarn_valid_bits(k_bits) && ggml_cuda_fattn_kvarn_valid_bits(v_bits);
+#elif defined(GGML_CUDA_FA_HALF_QUANTS)
+    return ggml_cuda_fattn_kvarn_valid_bits(k_bits) &&
+           ggml_cuda_fattn_kvarn_valid_bits(v_bits) &&
+           k_bits >= v_bits;
+#else
+    switch (k_bits) {
+        case 8: return v_bits == 8 || v_bits == 6 || v_bits == 5;
+        case 6: return v_bits == 6 || v_bits == 5 || v_bits == 4;
+        case 5: return v_bits == 5 || v_bits == 4 || v_bits == 3;
+        case 4: return v_bits == 4 || v_bits == 3 || v_bits == 2;
+        case 3: return v_bits == 3 || v_bits == 2;
+        case 2: return v_bits == 2;
+        default: return false;
+    }
+#endif
+}
+
+// Keep template references in sync with the decoder sources selected by CMake.
+#if defined(GGML_CUDA_FA_ALL_QUANTS)
+#define GGML_CUDA_FATTN_KVARN_FAST_DECODE_DISPATCH_K(DISPATCH_PAIR) \
+    do { \
+        switch (plan.k.bits) { \
+            case 8: switch (plan.v.bits) { \
+                case 8: DISPATCH_PAIR(8, 8); break; case 6: DISPATCH_PAIR(8, 6); break; \
+                case 5: DISPATCH_PAIR(8, 5); break; case 4: DISPATCH_PAIR(8, 4); break; \
+                case 3: DISPATCH_PAIR(8, 3); break; case 2: DISPATCH_PAIR(8, 2); break; default: return false; } break; \
+            case 6: switch (plan.v.bits) { \
+                case 8: DISPATCH_PAIR(6, 8); break; case 6: DISPATCH_PAIR(6, 6); break; \
+                case 5: DISPATCH_PAIR(6, 5); break; case 4: DISPATCH_PAIR(6, 4); break; \
+                case 3: DISPATCH_PAIR(6, 3); break; case 2: DISPATCH_PAIR(6, 2); break; default: return false; } break; \
+            case 5: switch (plan.v.bits) { \
+                case 8: DISPATCH_PAIR(5, 8); break; case 6: DISPATCH_PAIR(5, 6); break; \
+                case 5: DISPATCH_PAIR(5, 5); break; case 4: DISPATCH_PAIR(5, 4); break; \
+                case 3: DISPATCH_PAIR(5, 3); break; case 2: DISPATCH_PAIR(5, 2); break; default: return false; } break; \
+            case 4: switch (plan.v.bits) { \
+                case 8: DISPATCH_PAIR(4, 8); break; case 6: DISPATCH_PAIR(4, 6); break; \
+                case 5: DISPATCH_PAIR(4, 5); break; case 4: DISPATCH_PAIR(4, 4); break; \
+                case 3: DISPATCH_PAIR(4, 3); break; case 2: DISPATCH_PAIR(4, 2); break; default: return false; } break; \
+            case 3: switch (plan.v.bits) { \
+                case 8: DISPATCH_PAIR(3, 8); break; case 6: DISPATCH_PAIR(3, 6); break; \
+                case 5: DISPATCH_PAIR(3, 5); break; case 4: DISPATCH_PAIR(3, 4); break; \
+                case 3: DISPATCH_PAIR(3, 3); break; case 2: DISPATCH_PAIR(3, 2); break; default: return false; } break; \
+            case 2: switch (plan.v.bits) { \
+                case 8: DISPATCH_PAIR(2, 8); break; case 6: DISPATCH_PAIR(2, 6); break; \
+                case 5: DISPATCH_PAIR(2, 5); break; case 4: DISPATCH_PAIR(2, 4); break; \
+                case 3: DISPATCH_PAIR(2, 3); break; case 2: DISPATCH_PAIR(2, 2); break; default: return false; } break; \
+            default: return false; \
+        } \
+    } while (0)
+#elif defined(GGML_CUDA_FA_HALF_QUANTS)
+#define GGML_CUDA_FATTN_KVARN_FAST_DECODE_DISPATCH_K(DISPATCH_PAIR) \
+    do { \
+        switch (plan.k.bits) { \
+            case 8: switch (plan.v.bits) { \
+                case 8: DISPATCH_PAIR(8, 8); break; case 6: DISPATCH_PAIR(8, 6); break; \
+                case 5: DISPATCH_PAIR(8, 5); break; case 4: DISPATCH_PAIR(8, 4); break; \
+                case 3: DISPATCH_PAIR(8, 3); break; case 2: DISPATCH_PAIR(8, 2); break; default: return false; } break; \
+            case 6: switch (plan.v.bits) { \
+                case 6: DISPATCH_PAIR(6, 6); break; case 5: DISPATCH_PAIR(6, 5); break; \
+                case 4: DISPATCH_PAIR(6, 4); break; case 3: DISPATCH_PAIR(6, 3); break; \
+                case 2: DISPATCH_PAIR(6, 2); break; default: return false; } break; \
+            case 5: switch (plan.v.bits) { \
+                case 5: DISPATCH_PAIR(5, 5); break; case 4: DISPATCH_PAIR(5, 4); break; \
+                case 3: DISPATCH_PAIR(5, 3); break; case 2: DISPATCH_PAIR(5, 2); break; default: return false; } break; \
+            case 4: switch (plan.v.bits) { \
+                case 4: DISPATCH_PAIR(4, 4); break; case 3: DISPATCH_PAIR(4, 3); break; \
+                case 2: DISPATCH_PAIR(4, 2); break; default: return false; } break; \
+            case 3: switch (plan.v.bits) { \
+                case 3: DISPATCH_PAIR(3, 3); break; case 2: DISPATCH_PAIR(3, 2); break; default: return false; } break; \
+            case 2: if (plan.v.bits == 2) { DISPATCH_PAIR(2, 2); } else { return false; } break; \
+            default: return false; \
+        } \
+    } while (0)
+#else
+#define GGML_CUDA_FATTN_KVARN_FAST_DECODE_DISPATCH_K(DISPATCH_PAIR) \
+    do { \
+        switch (plan.k.bits) { \
+            case 8: switch (plan.v.bits) { \
+                case 8: DISPATCH_PAIR(8, 8); break; case 6: DISPATCH_PAIR(8, 6); break; \
+                case 5: DISPATCH_PAIR(8, 5); break; default: return false; } break; \
+            case 6: switch (plan.v.bits) { \
+                case 6: DISPATCH_PAIR(6, 6); break; case 5: DISPATCH_PAIR(6, 5); break; \
+                case 4: DISPATCH_PAIR(6, 4); break; default: return false; } break; \
+            case 5: switch (plan.v.bits) { \
+                case 5: DISPATCH_PAIR(5, 5); break; case 4: DISPATCH_PAIR(5, 4); break; \
+                case 3: DISPATCH_PAIR(5, 3); break; default: return false; } break; \
+            case 4: switch (plan.v.bits) { \
+                case 4: DISPATCH_PAIR(4, 4); break; case 3: DISPATCH_PAIR(4, 3); break; \
+                case 2: DISPATCH_PAIR(4, 2); break; default: return false; } break; \
+            case 3: switch (plan.v.bits) { \
+                case 3: DISPATCH_PAIR(3, 3); break; case 2: DISPATCH_PAIR(3, 2); break; default: return false; } break; \
+            case 2: if (plan.v.bits == 2) { DISPATCH_PAIR(2, 2); } else { return false; } break; \
+            default: return false; \
+        } \
+    } while (0)
+#endif
+
 static bool ggml_cuda_flash_attn_ext_kvarn_vec_supported(
         const ggml_cuda_fattn_kvarn_plan & plan,
         const ggml_tensor * dst) {
@@ -243,7 +343,8 @@ static bool ggml_cuda_flash_attn_ext_kvarn_vec_supported(
     const int gqa_ratio = (int) (Q->ne[2] / plan.n_kv_heads);
     // D256 SWA/GQA2 is the proven vec geometry (benchmarked at k4v4); every KVarN bit pair
     // is wired through it. D512 vec regressed deep-context global layers and stays excluded.
-    return plan.k.swa && plan.v.swa && gqa_ratio == 2;
+    return plan.k.swa && plan.v.swa && gqa_ratio == 2 &&
+        ggml_cuda_fattn_kvarn_fast_decode_pair_enabled(plan.k.bits, plan.v.bits);
 }
 
 template<int D>
@@ -324,35 +425,7 @@ static bool ggml_cuda_flash_attn_ext_kvarn_vec_d(
 #define GGML_CUDA_FATTN_KVARN_VEC_LAUNCH(K_BITS, V_BITS) \
     ggml_cuda_fattn_kvarn_vec_launch<D, K_BITS, V_BITS>(args)
 
-#define GGML_CUDA_FATTN_KVARN_VEC_DISPATCH_V(K_BITS) \
-    do { \
-        switch (plan.v.bits) { \
-            case 2: GGML_CUDA_FATTN_KVARN_VEC_LAUNCH(K_BITS, 2); break; \
-            case 3: GGML_CUDA_FATTN_KVARN_VEC_LAUNCH(K_BITS, 3); break; \
-            case 4: GGML_CUDA_FATTN_KVARN_VEC_LAUNCH(K_BITS, 4); break; \
-            case 5: GGML_CUDA_FATTN_KVARN_VEC_LAUNCH(K_BITS, 5); break; \
-            case 6: GGML_CUDA_FATTN_KVARN_VEC_LAUNCH(K_BITS, 6); break; \
-            case 8: GGML_CUDA_FATTN_KVARN_VEC_LAUNCH(K_BITS, 8); break; \
-            default: GGML_ABORT("unsupported native KVarN V bits %d", plan.v.bits); \
-        } \
-    } while (0)
-
-#define GGML_CUDA_FATTN_KVARN_VEC_DISPATCH_K() \
-    do { \
-        switch (plan.k.bits) { \
-            case 2: GGML_CUDA_FATTN_KVARN_VEC_DISPATCH_V(2); break; \
-            case 3: GGML_CUDA_FATTN_KVARN_VEC_DISPATCH_V(3); break; \
-            case 4: GGML_CUDA_FATTN_KVARN_VEC_DISPATCH_V(4); break; \
-            case 5: GGML_CUDA_FATTN_KVARN_VEC_DISPATCH_V(5); break; \
-            case 6: GGML_CUDA_FATTN_KVARN_VEC_DISPATCH_V(6); break; \
-            case 8: GGML_CUDA_FATTN_KVARN_VEC_DISPATCH_V(8); break; \
-            default: GGML_ABORT("unsupported native KVarN K bits %d", plan.k.bits); \
-        } \
-    } while (0)
-
-    GGML_CUDA_FATTN_KVARN_VEC_DISPATCH_K();
-#undef GGML_CUDA_FATTN_KVARN_VEC_DISPATCH_K
-#undef GGML_CUDA_FATTN_KVARN_VEC_DISPATCH_V
+    GGML_CUDA_FATTN_KVARN_FAST_DECODE_DISPATCH_K(GGML_CUDA_FATTN_KVARN_VEC_LAUNCH);
 #undef GGML_CUDA_FATTN_KVARN_VEC_LAUNCH
     return true;
 }
@@ -398,7 +471,7 @@ static bool ggml_cuda_flash_attn_ext_kvarn_decode_supported(
         return false;
     }
     const int gqa_ratio = (int) (Q->ne[2] / plan.n_kv_heads);
-    return gqa_ratio > 0;
+    return gqa_ratio > 0 && ggml_cuda_fattn_kvarn_fast_decode_pair_enabled(plan.k.bits, plan.v.bits);
 }
 
 template<int D>
@@ -417,35 +490,7 @@ static bool ggml_cuda_flash_attn_ext_kvarn_decode_d(
     geometry = ggml_cuda_fattn_kvarn_decode_select<D, K_BITS, V_BITS>( \
         ctx.device, plan.n_kv, n_q, n_q_heads, plan.n_kv_heads, plan.n_stream)
 
-#define GGML_CUDA_FATTN_KVARN_SELECT_V(K_BITS) \
-    do { \
-        switch (plan.v.bits) { \
-            case 2: GGML_CUDA_FATTN_KVARN_SELECT(K_BITS, 2); break; \
-            case 3: GGML_CUDA_FATTN_KVARN_SELECT(K_BITS, 3); break; \
-            case 4: GGML_CUDA_FATTN_KVARN_SELECT(K_BITS, 4); break; \
-            case 5: GGML_CUDA_FATTN_KVARN_SELECT(K_BITS, 5); break; \
-            case 6: GGML_CUDA_FATTN_KVARN_SELECT(K_BITS, 6); break; \
-            case 8: GGML_CUDA_FATTN_KVARN_SELECT(K_BITS, 8); break; \
-            default: GGML_ABORT("unsupported native KVarN V bits %d", plan.v.bits); \
-        } \
-    } while (0)
-
-#define GGML_CUDA_FATTN_KVARN_SELECT_K() \
-    do { \
-        switch (plan.k.bits) { \
-            case 2: GGML_CUDA_FATTN_KVARN_SELECT_V(2); break; \
-            case 3: GGML_CUDA_FATTN_KVARN_SELECT_V(3); break; \
-            case 4: GGML_CUDA_FATTN_KVARN_SELECT_V(4); break; \
-            case 5: GGML_CUDA_FATTN_KVARN_SELECT_V(5); break; \
-            case 6: GGML_CUDA_FATTN_KVARN_SELECT_V(6); break; \
-            case 8: GGML_CUDA_FATTN_KVARN_SELECT_V(8); break; \
-            default: GGML_ABORT("unsupported native KVarN K bits %d", plan.k.bits); \
-        } \
-    } while (0)
-
-    GGML_CUDA_FATTN_KVARN_SELECT_K();
-#undef GGML_CUDA_FATTN_KVARN_SELECT_K
-#undef GGML_CUDA_FATTN_KVARN_SELECT_V
+    GGML_CUDA_FATTN_KVARN_FAST_DECODE_DISPATCH_K(GGML_CUDA_FATTN_KVARN_SELECT);
 #undef GGML_CUDA_FATTN_KVARN_SELECT
 
     if (!geometry.use_split) {
@@ -522,35 +567,7 @@ static bool ggml_cuda_flash_attn_ext_kvarn_decode_d(
 #define GGML_CUDA_FATTN_KVARN_LAUNCH(K_BITS, V_BITS) \
     ggml_cuda_fattn_kvarn_decode_launch<D, K_BITS, V_BITS>(args)
 
-#define GGML_CUDA_FATTN_KVARN_DISPATCH_V(K_BITS) \
-    do { \
-        switch (plan.v.bits) { \
-            case 2: GGML_CUDA_FATTN_KVARN_LAUNCH(K_BITS, 2); break; \
-            case 3: GGML_CUDA_FATTN_KVARN_LAUNCH(K_BITS, 3); break; \
-            case 4: GGML_CUDA_FATTN_KVARN_LAUNCH(K_BITS, 4); break; \
-            case 5: GGML_CUDA_FATTN_KVARN_LAUNCH(K_BITS, 5); break; \
-            case 6: GGML_CUDA_FATTN_KVARN_LAUNCH(K_BITS, 6); break; \
-            case 8: GGML_CUDA_FATTN_KVARN_LAUNCH(K_BITS, 8); break; \
-            default: GGML_ABORT("unsupported native KVarN V bits %d", plan.v.bits); \
-        } \
-    } while (0)
-
-#define GGML_CUDA_FATTN_KVARN_DISPATCH_K() \
-    do { \
-        switch (plan.k.bits) { \
-            case 2: GGML_CUDA_FATTN_KVARN_DISPATCH_V(2); break; \
-            case 3: GGML_CUDA_FATTN_KVARN_DISPATCH_V(3); break; \
-            case 4: GGML_CUDA_FATTN_KVARN_DISPATCH_V(4); break; \
-            case 5: GGML_CUDA_FATTN_KVARN_DISPATCH_V(5); break; \
-            case 6: GGML_CUDA_FATTN_KVARN_DISPATCH_V(6); break; \
-            case 8: GGML_CUDA_FATTN_KVARN_DISPATCH_V(8); break; \
-            default: GGML_ABORT("unsupported native KVarN K bits %d", plan.k.bits); \
-        } \
-    } while (0)
-
-    GGML_CUDA_FATTN_KVARN_DISPATCH_K();
-#undef GGML_CUDA_FATTN_KVARN_DISPATCH_K
-#undef GGML_CUDA_FATTN_KVARN_DISPATCH_V
+    GGML_CUDA_FATTN_KVARN_FAST_DECODE_DISPATCH_K(GGML_CUDA_FATTN_KVARN_LAUNCH);
 #undef GGML_CUDA_FATTN_KVARN_LAUNCH
     return true;
 }

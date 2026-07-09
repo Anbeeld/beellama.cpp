@@ -213,6 +213,84 @@ set   (GGML_CUDA_COMPRESSION_MODE "size" CACHE STRING
                                             "ggml: cuda link binary compression mode; requires cuda 12.8+")
 set_property(CACHE GGML_CUDA_COMPRESSION_MODE PROPERTY STRINGS "none;speed;balance;size")
 
+set(GGML_CUDA_KVARN_FAST_DECODE_DEFAULT_PAIRS
+    k8-v8
+    k8-v6
+    k8-v5
+    k6-v6
+    k6-v5
+    k6-v4
+    k5-v5
+    k5-v4
+    k5-v3
+    k4-v4
+    k4-v3
+    k4-v2
+    k3-v3
+    k3-v2
+    k2-v2
+)
+
+list(LENGTH GGML_CUDA_KVARN_FAST_DECODE_DEFAULT_PAIRS GGML_CUDA_KVARN_FAST_DECODE_DEFAULT_PAIR_COUNT)
+if (NOT GGML_CUDA_KVARN_FAST_DECODE_DEFAULT_PAIR_COUNT EQUAL 15)
+    message(FATAL_ERROR "Default KVarN fast decode policy expected 15 pairs, got ${GGML_CUDA_KVARN_FAST_DECODE_DEFAULT_PAIR_COUNT}")
+endif()
+
+set(GGML_CUDA_KVARN_FAST_DECODE_HALF_PAIRS
+    k8-v8
+    k8-v6
+    k8-v5
+    k8-v4
+    k8-v3
+    k8-v2
+    k6-v6
+    k6-v5
+    k6-v4
+    k6-v3
+    k6-v2
+    k5-v5
+    k5-v4
+    k5-v3
+    k5-v2
+    k4-v4
+    k4-v3
+    k4-v2
+    k3-v3
+    k3-v2
+    k2-v2
+)
+
+list(LENGTH GGML_CUDA_KVARN_FAST_DECODE_HALF_PAIRS GGML_CUDA_KVARN_FAST_DECODE_HALF_PAIR_COUNT)
+if (NOT GGML_CUDA_KVARN_FAST_DECODE_HALF_PAIR_COUNT EQUAL 21)
+    message(FATAL_ERROR "HALF KVarN fast decode policy expected 21 pairs, got ${GGML_CUDA_KVARN_FAST_DECODE_HALF_PAIR_COUNT}")
+endif()
+
+function(ggml_cuda_select_kvarn_fast_decode_sources OUT_VAR PREFIX)
+    set(_sources ${ARGN})
+
+    if (GGML_CUDA_FA_ALL_QUANTS)
+        set(${OUT_VAR} ${_sources} PARENT_SCOPE)
+        return()
+    elseif (GGML_CUDA_FA_HALF_QUANTS)
+        set(_pairs ${GGML_CUDA_KVARN_FAST_DECODE_HALF_PAIRS})
+    else()
+        set(_pairs ${GGML_CUDA_KVARN_FAST_DECODE_DEFAULT_PAIRS})
+    endif()
+
+    set(_selected_sources)
+    foreach(SRC ${_sources})
+        if (NOT SRC MATCHES "fattn-mma-kvarn-decode-instance-")
+            list(APPEND _selected_sources "${SRC}")
+        endif()
+    endforeach()
+
+    foreach(PAIR ${_pairs})
+        list(APPEND _selected_sources "${PREFIX}/fattn-mma-kvarn-decode-instance-${PAIR}.cu")
+    endforeach()
+
+    set(${OUT_VAR} ${_selected_sources} PARENT_SCOPE)
+endfunction()
+
 option(GGML_HIP                             "ggml: use HIP"                                   OFF)
 option(GGML_HIP_GRAPHS                      "ggml: use HIP graph"                              ON)
 option(GGML_HIP_RCCL                        "ggml: use ROCm Collective Comm. Library"         OFF)

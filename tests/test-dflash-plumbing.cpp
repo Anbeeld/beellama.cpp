@@ -102,6 +102,7 @@ int main(int argc, char ** argv) {
     const std::string root = argv[1];
     const std::string context_h = read_file(root + "/src/llama-context.h");
     const std::string cmake_root = read_file(root + "/CMakeLists.txt");
+    const std::string ggml_cmake = read_file(root + "/ggml/CMakeLists.txt");
     const std::string context_cpp = read_file(root + "/src/llama-context.cpp");
     const std::string kv_cache_h = read_file(root + "/src/llama-kv-cache.h");
     const std::string kv_cache_cpp = read_file(root + "/src/llama-kv-cache.cpp");
@@ -599,10 +600,12 @@ int main(int argc, char ** argv) {
                  cuda_fattn.find("ggml_cuda_flash_attn_ext_kvarn_vec_supported") != std::string::npos &&
                  cuda_fattn.find("ggml_cuda_fattn_kvarn_vec_launch<D, 4, 4>") == std::string::npos &&
                  cuda_fattn.find("plan.k.bits != 4 || plan.v.bits != 4") == std::string::npos &&
-                 cuda_fattn.find("GGML_CUDA_FATTN_KVARN_VEC_DISPATCH_K") != std::string::npos &&
+                 cuda_fattn.find("GGML_CUDA_FATTN_KVARN_FAST_DECODE_DISPATCH_K") != std::string::npos &&
+                 cuda_fattn.find("GGML_CUDA_FA_ALL_QUANTS") != std::string::npos &&
+                 cuda_fattn.find("GGML_CUDA_FA_HALF_QUANTS") != std::string::npos &&
                  cuda_fattn.find("GGML_KVARN_VEC_D512") == std::string::npos &&
                  cuda_fattn.find("CUDA_FA_ROUTE_EXEC_DISPATCH kernel=KVARN_DECODE_VEC") != std::string::npos,
-        "KVarN low-parallelism vec decode must cover every KVarN bit pair at D256 via a bit-generic dispatch (not a k4v4 hardcode) and never compile a D512 vec instance");
+        "KVarN low-parallelism vec decode must use the shared fast-decode pair policy (not a k4v4 hardcode) and never compile a D512 vec instance");
     ok &= expect(cuda_fattn.find("D=512: MMA/TILE templates don't support this head_dim, use VEC unconditionally") == std::string::npos &&
                  cuda_fattn.find("if (Q->ne[0] == 512) {\n        return BEST_FATTN_KERNEL_VEC;") == std::string::npos,
         "CUDA FlashAttention must not force all D=512 non-turbo attention onto the vector kernel; Gemma4 global layers need the MMA selector path");
@@ -932,6 +935,73 @@ int main(int argc, char ** argv) {
                      user_docs.find("GGML_CUDA_FA_HALF_QUANTS=ON") != std::string::npos &&
                      user_docs.find("GGML_CUDA_FA_ALL_QUANTS=ON") != std::string::npos,
             "User-facing docs must recommend default CUDA FA q/KVarN compilation while documenting HALF/ALL escape hatches");
+    }
+    {
+        const std::string cuda_cmake_kvarn_fast_decode_pairs = slice_between(
+            ggml_cmake,
+            "set(GGML_CUDA_KVARN_FAST_DECODE_DEFAULT_PAIRS",
+            "set(GGML_CUDA_KVARN_FAST_DECODE_HALF_PAIRS");
+        const std::string cuda_cmake_kvarn_fast_decode_half_pairs = slice_between(
+            ggml_cmake,
+            "set(GGML_CUDA_KVARN_FAST_DECODE_HALF_PAIRS",
+            "function(ggml_cuda_select_kvarn_fast_decode_sources");
+        const auto cmake_has_kvarn_fast_decode_pair = [&](const char * pair) {
+            return cuda_cmake_kvarn_fast_decode_pairs.find(pair) != std::string::npos;
+        };
+        const auto cmake_has_kvarn_fast_decode_half_pair = [&](const char * pair) {
+            return cuda_cmake_kvarn_fast_decode_half_pairs.find(pair) != std::string::npos;
+        };
+
+        ok &= expect(ggml_cmake.find("option(GGML_CUDA_KVARN_FAST_DECODE_ALL") == std::string::npos &&
+                     ggml_cmake.find("GGML_CUDA_KVARN_FAST_DECODE_DEFAULT_PAIR_COUNT EQUAL 15") != std::string::npos &&
+                     ggml_cmake.find("GGML_CUDA_KVARN_FAST_DECODE_HALF_PAIR_COUNT EQUAL 21") != std::string::npos &&
+                     ggml_cmake.find("if (GGML_CUDA_FA_ALL_QUANTS)") != std::string::npos &&
+                     ggml_cmake.find("elseif (GGML_CUDA_FA_HALF_QUANTS)") != std::string::npos,
+            "CUDA KVarN fast decode must use the existing CUDA FA default, HALF, and ALL build policies");
+        ok &= expect(cmake_has_kvarn_fast_decode_pair("k8-v8") &&
+                     cmake_has_kvarn_fast_decode_pair("k8-v6") &&
+                     cmake_has_kvarn_fast_decode_pair("k8-v5") &&
+                     cmake_has_kvarn_fast_decode_pair("k6-v6") &&
+                     cmake_has_kvarn_fast_decode_pair("k6-v5") &&
+                     cmake_has_kvarn_fast_decode_pair("k6-v4") &&
+                     cmake_has_kvarn_fast_decode_pair("k5-v5") &&
+                     cmake_has_kvarn_fast_decode_pair("k5-v4") &&
+                     cmake_has_kvarn_fast_decode_pair("k5-v3") &&
+                     cmake_has_kvarn_fast_decode_pair("k4-v4") &&
+                     cmake_has_kvarn_fast_decode_pair("k4-v3") &&
+                     cmake_has_kvarn_fast_decode_pair("k4-v2") &&
+                     cmake_has_kvarn_fast_decode_pair("k3-v3") &&
+                     cmake_has_kvarn_fast_decode_pair("k3-v2") &&
+                     cmake_has_kvarn_fast_decode_pair("k2-v2") &&
+                     !cmake_has_kvarn_fast_decode_pair("k2-v3") &&
+                     !cmake_has_kvarn_fast_decode_pair("k8-v4"),
+            "CUDA KVarN fast decode default must require K>=V and cap the precision gap at two tiers");
+        ok &= expect(cmake_has_kvarn_fast_decode_half_pair("k8-v2") &&
+                     cmake_has_kvarn_fast_decode_half_pair("k6-v2") &&
+                     cmake_has_kvarn_fast_decode_half_pair("k5-v2") &&
+                     cmake_has_kvarn_fast_decode_half_pair("k4-v2") &&
+                     cmake_has_kvarn_fast_decode_half_pair("k3-v2") &&
+                     cmake_has_kvarn_fast_decode_half_pair("k2-v2") &&
+                     !cmake_has_kvarn_fast_decode_half_pair("k2-v3"),
+            "CUDA KVarN HALF fast decode must include every K>=V pair and exclude K<V pairs");
+        ok &= expect(cuda_fattn.find("#if defined(GGML_CUDA_FA_ALL_QUANTS)") != std::string::npos &&
+                     cuda_fattn.find("#elif defined(GGML_CUDA_FA_HALF_QUANTS)") != std::string::npos &&
+                     cuda_fattn.find("k_bits >= v_bits") != std::string::npos &&
+                     cuda_fattn.find("GGML_CUDA_FATTN_KVARN_FAST_DECODE_DISPATCH_K") != std::string::npos,
+            "CUDA KVarN dispatch must align with the existing CUDA FA build policies");
+        const size_t kvarn_vec_route = cuda_fattn.find("ggml_cuda_flash_attn_ext_kvarn_vec(ctx, dst, plan.kvarn_plan)");
+        const size_t kvarn_decode_route = cuda_fattn.find("ggml_cuda_flash_attn_ext_kvarn_decode(ctx, dst, plan.kvarn_plan)");
+        const size_t kvarn_mma_fallback = cuda_fattn.find("ggml_cuda_flash_attn_ext_mma_kvarn(ctx, dst)");
+        ok &= expect(kvarn_vec_route != std::string::npos &&
+                     kvarn_decode_route != std::string::npos &&
+                     kvarn_mma_fallback != std::string::npos &&
+                     kvarn_vec_route < kvarn_decode_route &&
+                     kvarn_decode_route < kvarn_mma_fallback,
+            "CUDA KVarN pairs outside the fast decode matrix must retain the native MMA fallback");
+        ok &= expect(docs_build_md.find("GGML_CUDA_KVARN_FAST_DECODE_ALL") == std::string::npos &&
+                     docs_build_md.find("all 21 K>=V pairs with `GGML_CUDA_FA_HALF_QUANTS=ON`") != std::string::npos &&
+                     docs_build_md.find("all 36 ordered pairs with `GGML_CUDA_FA_ALL_QUANTS=ON`") != std::string::npos,
+            "CUDA KVarN fast decode documentation must use the existing CUDA FA build policies");
     }
     ok &= expect(arch_cpp.find("{ LLM_ARCH_DFLASH,") != std::string::npos,
         "upstream dflash architecture must be registered separately");
