@@ -202,60 +202,6 @@ typedef pthread_t ggml_thread_t;
 #define GGML_THREADPOOL_N_THREADS_MASK (0xffffU)
 #define GGML_THREADPOOL_N_THREADS_BITS (16)
 
-static void ggml_vec_dot_tq3_1s_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
-        const void * GGML_RESTRICT vx, size_t bx,
-        const void * GGML_RESTRICT vy, size_t by, int nrc) {
-    GGML_ASSERT(nrc == 1);
-    GGML_UNUSED(bs);
-    GGML_UNUSED(bx);
-    GGML_UNUSED(by);
-    GGML_UNUSED(nrc);
-
-    float * tmp_x = (float *) malloc((size_t) n * sizeof(float));
-    float * tmp_y = (float *) malloc((size_t) n * sizeof(float));
-    GGML_ASSERT(tmp_x != NULL);
-    GGML_ASSERT(tmp_y != NULL);
-
-    ggml_get_type_traits(GGML_TYPE_TQ3_1S)->to_float(vx, tmp_x, n);
-    ggml_get_type_traits(GGML_TYPE_Q8_0)->to_float(vy, tmp_y, n);
-
-    float sum = 0.0f;
-    for (int i = 0; i < n; i++) {
-        sum += tmp_x[i] * tmp_y[i];
-    }
-
-    free(tmp_x);
-    free(tmp_y);
-    *s = sum;
-}
-
-static void ggml_vec_dot_tq4_1s_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
-        const void * GGML_RESTRICT vx, size_t bx,
-        const void * GGML_RESTRICT vy, size_t by, int nrc) {
-    GGML_ASSERT(nrc == 1);
-    GGML_UNUSED(bs);
-    GGML_UNUSED(bx);
-    GGML_UNUSED(by);
-    GGML_UNUSED(nrc);
-
-    float * tmp_x = (float *) malloc((size_t) n * sizeof(float));
-    float * tmp_y = (float *) malloc((size_t) n * sizeof(float));
-    GGML_ASSERT(tmp_x != NULL);
-    GGML_ASSERT(tmp_y != NULL);
-
-    ggml_get_type_traits(GGML_TYPE_TQ4_1S)->to_float(vx, tmp_x, n);
-    ggml_get_type_traits(GGML_TYPE_Q8_0)->to_float(vy, tmp_y, n);
-
-    float sum = 0.0f;
-    for (int i = 0; i < n; i++) {
-        sum += tmp_x[i] * tmp_y[i];
-    }
-
-    free(tmp_x);
-    free(tmp_y);
-    *s = sum;
-}
-
 #if defined(__APPLE__)
 #include <unistd.h>
 #include <mach/mach.h>
@@ -488,36 +434,6 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = quantize_row_tq2_0,
         .vec_dot                  = ggml_vec_dot_tq2_0_q8_K,
         .vec_dot_type             = GGML_TYPE_Q8_K,
-        .nrows                    = 1,
-    },
-    [GGML_TYPE_TURBO2_0] = {
-        .from_float               = (ggml_from_float_t) quantize_row_turbo2_0_ref,
-        .vec_dot                  = NULL,
-        .vec_dot_type             = GGML_TYPE_F32,
-        .nrows                    = 1,
-    },
-    [GGML_TYPE_TURBO3_0] = {
-        .from_float               = (ggml_from_float_t) quantize_row_turbo3_0_ref,
-        .vec_dot                  = NULL,
-        .vec_dot_type             = GGML_TYPE_F32,
-        .nrows                    = 1,
-    },
-    [GGML_TYPE_TURBO4_0] = {
-        .from_float               = (ggml_from_float_t) quantize_row_turbo4_0_ref,
-        .vec_dot                  = NULL,
-        .vec_dot_type             = GGML_TYPE_F32,
-        .nrows                    = 1,
-    },
-    [GGML_TYPE_TQ3_1S] = {
-        .from_float               = (ggml_from_float_t) quantize_row_tq3_1s_ref,
-        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_tq3_1s_q8_0,
-        .vec_dot_type             = GGML_TYPE_Q8_0,
-        .nrows                    = 1,
-    },
-    [GGML_TYPE_TQ4_1S] = {
-        .from_float               = (ggml_from_float_t) quantize_row_tq4_1s_ref,
-        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_tq4_1s_q8_0,
-        .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
     [GGML_TYPE_I32] = {
@@ -2179,10 +2095,6 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_gated_delta_net_tree(params, tensor);
             } break;
-        case GGML_OP_TURBO_WHT:
-            {
-                ggml_compute_forward_turbo_wht(params, tensor);
-            } break;
         case GGML_OP_KVARN_WHT:
             {
                 ggml_compute_forward_kvarn_wht(params, tensor);
@@ -2376,7 +2288,6 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_GATED_DELTA_NET:
         case GGML_OP_GATED_DELTA_NET_TREE:
-        case GGML_OP_TURBO_WHT:
         case GGML_OP_KVARN_WHT:
             {
                 n_tasks = n_threads;
@@ -3110,7 +3021,6 @@ struct ggml_cplan ggml_graph_plan(
                         const int64_t S_v = node->src[2]->ne[0];
                         cur = S_v * sizeof(float) * n_tasks;
                     } break;
-                case GGML_OP_TURBO_WHT:
                 case GGML_OP_KVARN_WHT:
                 case GGML_OP_KVARN_STORE:
                 case GGML_OP_KVARN_VIEW:

@@ -47,11 +47,6 @@ public:
     void set_input_kvarn_mat_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_mat_idxs(ggml_tensor * idxs) const { mat_idxs = idxs; }
 
-    ggml_tensor * get_turbo_rotation() const override;
-    ggml_tensor * get_turbo_rotation_inv() const override;
-    ggml_tensor * get_turbo_rot_forward() const override;
-    ggml_tensor * get_turbo_rot_inverse() const override;
-
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const override;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const override;
 

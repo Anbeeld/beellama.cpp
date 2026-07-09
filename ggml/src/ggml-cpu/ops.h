@@ -107,7 +107,6 @@ void ggml_compute_forward_solve_tri(const struct ggml_compute_params * params, s
 void ggml_compute_forward_gla(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_gated_delta_net(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_gated_delta_net_tree(const struct ggml_compute_params * params, struct ggml_tensor * dst);
-void ggml_compute_forward_turbo_wht(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_kvarn_wht(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_kvarn_store(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_fwht(const struct ggml_compute_params * params, struct ggml_tensor * dst);

@@ -429,21 +429,13 @@ extern "C" {
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
-        GGML_TYPE_TURBO3_0 = 42, // TurboQuant 3-bit KV cache: 2-bit PolarQuant + 1-bit QJL
-        GGML_TYPE_TURBO4_0 = 43, // TurboQuant 4-bit KV cache: 3-bit PolarQuant + 1-bit QJL
-        GGML_TYPE_TURBO2_0 = 44, // TurboQuant 2-bit KV cache: 2-bit PolarQuant, no QJL
-        GGML_TYPE_TURBO3_TCQ = 45, // TurboQuant 3-bit KV cache: TCQ (Trellis-Coded Quantization)
-        GGML_TYPE_TURBO2_TCQ = 46, // TurboQuant 2-bit KV cache: TCQ (k=2, L=8, 256 states)
-        GGML_TYPE_TQ3_1S  = 47, // TurboQuant 3-bit weight: WHT-rotated 8-level Lloyd-Max, block_size=32
-        GGML_TYPE_TQ4_1S  = 48, // TurboQuant 4-bit weight: WHT-rotated 16-level Lloyd-Max, block_size=32
         GGML_TYPE_Q6_0    = 49,
         GGML_TYPE_Q6_1    = 50,
         GGML_TYPE_Q3_0    = 51,
         GGML_TYPE_Q3_1    = 52,
         GGML_TYPE_Q2_0    = 53,
         GGML_TYPE_Q2_1    = 54,
-        GGML_TYPE_TURBO4_TCQ = 55, // TurboQuant 4-bit KV cache: TCQ (k=4, L=10, 1024 states)
-        GGML_TYPE_COUNT   = 56,
+        GGML_TYPE_COUNT   = 55,
     };
 
     // precision
@@ -596,7 +588,6 @@ extern "C" {
         GGML_OP_GATED_DELTA_NET,
         GGML_OP_GATED_DELTA_NET_TREE,
         GGML_OP_SSM_CONV_TREE,
-        GGML_OP_TURBO_WHT,
         GGML_OP_KVARN_WHT,
         GGML_OP_KVARN_STORE,
         GGML_OP_KVARN_VIEW,
@@ -2638,14 +2629,6 @@ extern "C" {
             struct ggml_tensor  * conv_input,
             struct ggml_tensor  * conv_weight,
             struct ggml_tensor  * parent_ids);
-
-    // TurboQuant Walsh-Hadamard Transform (O(d log d) rotation for KV cache compression)
-    // Applies WHT rotation to 128-element groups along ne[0]: sign1 → butterfly → sign2 → normalize
-    // direction: 0 = forward (signs1 → WHT → signs2), 1 = inverse (signs2 → WHT → signs1)
-    GGML_API struct ggml_tensor * ggml_turbo_wht(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * a,
-            int                   direction);
 
     // KVarN normalized Sylvester Walsh-Hadamard transform for 128/256/512-wide heads.
     // The transform matches KVarN store/view math and is self-inverse.

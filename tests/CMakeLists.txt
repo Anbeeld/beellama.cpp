@@ -119,15 +119,20 @@ endfunction()
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if (Python3_Interpreter_FOUND)
     add_test(
-        NAME test-turbo-mma-fused-static
-        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-turbo-mma-fused-static.py)
-    set_property(TEST test-turbo-mma-fused-static PROPERTY LABELS cuda)
-    add_test(
         NAME test-issue41-regressions-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-issue41-regressions-static.py)
     set_property(TEST test-issue41-regressions-static PROPERTY LABELS cuda)
+    add_test(
+        NAME test-cache-type-redirects-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-cache-type-redirects-static.py)
+    set_property(TEST test-cache-type-redirects-static PROPERTY LABELS main)
+    add_test(
+        NAME test-removed-cache-types-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-removed-cache-types-static.py)
+    set_property(TEST test-removed-cache-types-static PROPERTY LABELS main)
     add_test(
         NAME test-hip-shuffle-compat-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
@@ -286,7 +291,6 @@ target_include_directories(test-server-context PRIVATE ${PROJECT_SOURCE_DIR}/too
 target_link_libraries(test-server-context PRIVATE server-context)
 llama_build_and_test(test-dflash-ring.cpp)
 llama_build_and_test(test-cpu-out-prod.cpp)
-llama_build_and_test(test-cpu-fattn-support.cpp)
 llama_build_and_test(test-dflash-plumbing.cpp ARGS ${PROJECT_SOURCE_DIR})
 target_include_directories(test-dflash-plumbing PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build_and_test(test-mtmd-plumbing.cpp ARGS ${PROJECT_SOURCE_DIR})
@@ -322,7 +326,6 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-barrier.cpp)
     llama_build_and_test(test-quantize-fns.cpp)
     llama_build_and_test(test-quantize-perf.cpp)
-    llama_build_and_test(test-turbo-quant.c)
     llama_build_and_test(test-rope.cpp)
     llama_build_and_test(test-col2im-1d.cpp)
 endif()

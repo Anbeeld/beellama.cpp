@@ -74,15 +74,6 @@ static ggml_backend_reg_t dflash_gpu_backend_reg() {
     return reg;
 }
 
-static bool llama_cache_type_is_turbo(ggml_type type) {
-    return type == GGML_TYPE_TURBO2_0 ||
-           type == GGML_TYPE_TURBO3_0 ||
-           type == GGML_TYPE_TURBO4_0 ||
-           type == GGML_TYPE_TURBO2_TCQ ||
-           type == GGML_TYPE_TURBO3_TCQ ||
-           type == GGML_TYPE_TURBO4_TCQ;
-}
-
 struct llama_cuda_fa_pair_diag {
     bool available = false;
     bool pair_compiled = true;
@@ -641,8 +632,6 @@ llama_context::llama_context(
     cparams.flash_attn_required =
         params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_ENABLED ||
         ggml_is_quantized(params.type_v) ||
-        llama_cache_type_is_turbo(params.type_k) ||
-        llama_cache_type_is_turbo(params.type_v) ||
         params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED;
 
     cparams.fused_gdn_ar = !params.no_fused_gdn;
@@ -843,24 +832,6 @@ llama_context::llama_context(
 
         if (cparams.pipeline_parallel) {
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
-        }
-
-        // turbo3/turbo4 KV cache stores data in FWHT-rotated space.
-        // Q pre-rotation and V inverse rotation are only implemented in the Flash Attention path.
-        // Without FA, attention computes dot(Q_unrotated, K_rotated) = garbage.
-        // Must enable FA BEFORE sched_reserve() so the scheduler knows FA is required
-        // and builds the graph plan with FA ops on GPU from the start.
-        {
-            const bool turbo_k = llama_cache_type_is_turbo(params.type_k);
-            const bool turbo_v = llama_cache_type_is_turbo(params.type_v);
-            if (turbo_k || turbo_v) {
-                if (!cparams.flash_attn) {
-                    LLAMA_LOG_WARN("%s: turbo KV cache requires Flash Attention — enabling automatically\n", __func__);
-                    cparams.flash_attn = true;
-                }
-                cparams.flash_attn_required = true;
-                cparams.auto_fa = false;  // turbo requires FA — don't let sched_reserve override
-            }
         }
 
         sched_reserve();
@@ -8680,16 +8651,6 @@ llama_context * llama_init_from_model(
                     __func__, ggml_type_name(params.type_v), blck_size, model->hparams.n_embd_head_v(il));
                 return nullptr;
             }
-        }
-    }
-
-    // Auto-enable flash attention for turbo KV cache types
-    {
-        const bool turbo_k = llama_cache_type_is_turbo(params.type_k);
-        const bool turbo_v = llama_cache_type_is_turbo(params.type_v);
-        if ((turbo_k || turbo_v) && params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
-            LLAMA_LOG_WARN("%s: turbo KV cache requires flash attention — enabling automatically\n", __func__);
-            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
         }
     }
 

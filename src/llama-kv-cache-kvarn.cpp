@@ -271,22 +271,6 @@ ggml_tensor * llama_kv_cache_kvarn_context::get_v_native(ggml_context * ctx, int
     return cache->view(ctx, it->second, il, get_n_kv(), current_sinfo(), true, mat_idxs);
 }
 
-ggml_tensor * llama_kv_cache_kvarn_context::get_turbo_rotation() const {
-    return nullptr;
-}
-
-ggml_tensor * llama_kv_cache_kvarn_context::get_turbo_rotation_inv() const {
-    return nullptr;
-}
-
-ggml_tensor * llama_kv_cache_kvarn_context::get_turbo_rot_forward() const {
-    return nullptr;
-}
-
-ggml_tensor * llama_kv_cache_kvarn_context::get_turbo_rot_inverse() const {
-    return nullptr;
-}
-
 ggml_tensor * llama_kv_cache_kvarn_context::build_input_kvarn_rot(ggml_context * ctx, int n_rot) const {
     GGML_ASSERT(n_rot == 128 || n_rot == 256 || n_rot == 512);
     ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_rot, n_rot);

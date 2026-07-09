@@ -306,11 +306,23 @@ int main(void) {
     assert(params.cache_type_k == GGML_TYPE_Q8_0);
     assert(params.cache_type_v == GGML_TYPE_Q8_0);
 
+    // Removed Turbo cache spellings redirect to the equivalent target KVarN types.
     params = common_params();
-    argv = {"binary_name", "-m", "model_file.gguf", "--cache-type-k", "q6_1", "--cache-type-v", "turbo4_tcq"};
+    argv = {"binary_name", "-m", "model_file.gguf", "--cache-type-k", "turbo3", "--cache-type-v", "turbo4_tcq"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
-    assert(params.cache_type_k == GGML_TYPE_Q6_1);
-    assert(params.cache_type_v == GGML_TYPE_TURBO4_TCQ);
+    assert(params.kvarn.key_bits == 3);
+    assert(params.kvarn.value_bits == 4);
+    assert(params.cache_kvarn_bits_k == 3);
+    assert(params.cache_kvarn_bits_v == 4);
+    assert(params.cache_type_k == GGML_TYPE_Q3_0);
+    assert(params.cache_type_v == GGML_TYPE_Q4_0);
+
+    // Draft contexts cannot use KVarN records, so the same aliases use matching q fallbacks.
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-type-k", "turbo2_tcq", "--spec-draft-type-v", "turbo4"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(params.speculative.draft.cache_type_k == GGML_TYPE_Q2_0);
+    assert(params.speculative.draft.cache_type_v == GGML_TYPE_Q4_0);
 
     params = common_params();
     argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-type-k", "q2_1", "--spec-draft-type-v", "q3_0"};

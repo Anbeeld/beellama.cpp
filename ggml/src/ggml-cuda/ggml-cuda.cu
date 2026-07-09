@@ -5970,10 +5970,6 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
         features.push_back({ "FA_ALL_QUANTS", "1" });
     #endif
 
-    #ifdef GGML_CUDA_FA_HALF_QUANTS
-        features.push_back({ "FA_HALF_QUANTS", "1" });
-    #endif
-
     {
         const auto & info = ggml_cuda_info();
         for (int id = 0; id < info.device_count; ++id) {

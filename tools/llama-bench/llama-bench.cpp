@@ -545,25 +545,6 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     if (s == "iq4_nl") {
         return GGML_TYPE_IQ4_NL;
     }
-    if (s == "turbo2") {
-        return GGML_TYPE_TURBO2_0;
-    }
-    if (s == "turbo3") {
-        return GGML_TYPE_TURBO3_0;
-    }
-    if (s == "turbo4") {
-        return GGML_TYPE_TURBO4_0;
-    }
-    if (s == "turbo4_tcq") {
-        return GGML_TYPE_TURBO4_TCQ;
-    }
-    if (s == "turbo3_tcq") {
-        return GGML_TYPE_TURBO3_TCQ;
-    }
-    if (s == "turbo2_tcq") {
-        return GGML_TYPE_TURBO2_TCQ;
-    }
-
     return GGML_TYPE_COUNT;
 }
 
@@ -608,12 +589,37 @@ static ggml_type kvarn_fallback_cache_type(int32_t bits) {
     }
 }
 
-static bench_cache_type bench_cache_type_from_name(const std::string & name) {
-    if (const int32_t kvarn_bits = kvarn_bits_from_cache_type(name)) {
+static bench_cache_type bench_cache_type_from_name(const std::string & s) {
+    if (s == "turbo2") {
+        fprintf(stderr, "cache type 'turbo2' was removed in v0.4.0; redirecting to 'kvarn2'\n");
+        return { kvarn_fallback_cache_type(2), 2 };
+    }
+    if (s == "turbo2_tcq") {
+        fprintf(stderr, "cache type 'turbo2_tcq' was removed in v0.4.0; redirecting to 'kvarn2'\n");
+        return { kvarn_fallback_cache_type(2), 2 };
+    }
+    if (s == "turbo3") {
+        fprintf(stderr, "cache type 'turbo3' was removed in v0.4.0; redirecting to 'kvarn3'\n");
+        return { kvarn_fallback_cache_type(3), 3 };
+    }
+    if (s == "turbo3_tcq") {
+        fprintf(stderr, "cache type 'turbo3_tcq' was removed in v0.4.0; redirecting to 'kvarn3'\n");
+        return { kvarn_fallback_cache_type(3), 3 };
+    }
+    if (s == "turbo4") {
+        fprintf(stderr, "cache type 'turbo4' was removed in v0.4.0; redirecting to 'kvarn4'\n");
+        return { kvarn_fallback_cache_type(4), 4 };
+    }
+    if (s == "turbo4_tcq") {
+        fprintf(stderr, "cache type 'turbo4_tcq' was removed in v0.4.0; redirecting to 'kvarn4'\n");
+        return { kvarn_fallback_cache_type(4), 4 };
+    }
+
+    if (const int32_t kvarn_bits = kvarn_bits_from_cache_type(s)) {
         return { kvarn_fallback_cache_type(kvarn_bits), kvarn_bits };
     }
 
-    return { ggml_type_from_name(name), 0 };
+    return { ggml_type_from_name(s), 0 };
 }
 
 static void normalize_kvarn_cache_pair(bench_cache_type & key, bench_cache_type & value) {

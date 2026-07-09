@@ -52,58 +52,12 @@ if (MUSAToolkit_FOUND)
         list(APPEND ${OUT_VAR} "${_FILE}")
     endmacro()
 
-    if (GGML_CUDA_FA_ALL_QUANTS AND GGML_CUDA_FA_HALF_QUANTS)
-        message(FATAL_ERROR
-            "GGML_CUDA_FA_ALL_QUANTS and GGML_CUDA_FA_HALF_QUANTS are mutually exclusive. "
-            "Use GGML_CUDA_FA_ALL_QUANTS for the full K/V pair matrix, or GGML_CUDA_FA_HALF_QUANTS for only K>=V pairs.")
-    endif()
-
     set(FA_VEC_PREFIX "../ggml-cuda/template-instances")
 
     if (GGML_CUDA_FA_ALL_QUANTS)
         file(GLOB   SRCS "${FA_VEC_PREFIX}/fattn-vec-instance-*.cu")
         list(APPEND GGML_SOURCES_MUSA ${SRCS})
         add_compile_definitions(GGML_CUDA_FA_ALL_QUANTS)
-    elseif (GGML_CUDA_FA_HALF_QUANTS)
-        set(GGML_CUDA_FA_KV_TYPES_ORDERED
-            f16
-            bf16
-            q8_0
-            q6_0
-            q5_1
-            q5_0
-            turbo4_0
-            q4_1
-            q4_0
-            turbo3_tcq
-            turbo3_0
-            turbo2_tcq
-            turbo2_0
-        )
-
-        list(LENGTH GGML_CUDA_FA_KV_TYPES_ORDERED GGML_CUDA_FA_KV_TYPES_LEN)
-        math(EXPR GGML_CUDA_FA_KV_TYPES_LAST "${GGML_CUDA_FA_KV_TYPES_LEN} - 1")
-
-    set(GGML_CUDA_FA_HALF_PAIR_COUNT 0)
-
-        foreach(KI RANGE 0 ${GGML_CUDA_FA_KV_TYPES_LAST})
-            list(GET GGML_CUDA_FA_KV_TYPES_ORDERED ${KI} K_TYPE)
-
-            foreach(VI RANGE 0 ${GGML_CUDA_FA_KV_TYPES_LAST})
-                list(GET GGML_CUDA_FA_KV_TYPES_ORDERED ${VI} V_TYPE)
-
-                if (KI LESS_EQUAL VI OR K_TYPE STREQUAL "f16" OR V_TYPE STREQUAL "f16")
-                    ggml_add_fattn_vec_pair_musa(GGML_SOURCES_MUSA "${FA_VEC_PREFIX}" "${K_TYPE}" "${V_TYPE}")
-                    math(EXPR GGML_CUDA_FA_HALF_PAIR_COUNT "${GGML_CUDA_FA_HALF_PAIR_COUNT} + 1")
-                endif()
-            endforeach()
-        endforeach()
-
-        if (NOT GGML_CUDA_FA_HALF_PAIR_COUNT EQUAL 103)
-            message(FATAL_ERROR "GGML_CUDA_FA_HALF_QUANTS expected 103 FA vec pairs, got ${GGML_CUDA_FA_HALF_PAIR_COUNT}")
-        endif()
-
-        add_compile_definitions(GGML_CUDA_FA_HALF_QUANTS)
     else()
         set(GGML_CUDA_FA_DEFAULT_KV_PAIRS
             f16:f16

@@ -397,6 +397,31 @@ static handle_model_result common_params_handle_model(struct common_params_model
     return result;
 }
 
+static int32_t kvarn_bits_from_legacy_cache_type(const std::string & value) {
+    if (value == "turbo2" || value == "turbo2_tcq") {
+        return 2;
+    }
+    if (value == "turbo3" || value == "turbo3_tcq") {
+        return 3;
+    }
+    if (value == "turbo4" || value == "turbo4_tcq") {
+        return 4;
+    }
+    return 0;
+}
+
+static ggml_type kvarn_fallback_cache_type(int32_t bits) {
+    switch (bits) {
+        case 2:  return GGML_TYPE_Q2_0;
+        case 3:  return GGML_TYPE_Q3_0;
+        case 4:  return GGML_TYPE_Q4_0;
+        case 5:  return GGML_TYPE_Q5_0;
+        case 6:  return GGML_TYPE_Q6_0;
+        case 8:  return GGML_TYPE_Q8_0;
+        default: return GGML_TYPE_F16;
+    }
+}
+
 const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_F32,
     GGML_TYPE_F16,
@@ -413,15 +438,17 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_Q3_1,
     GGML_TYPE_Q2_0,
     GGML_TYPE_Q2_1,
-    GGML_TYPE_TURBO2_0,
-    GGML_TYPE_TURBO3_0,
-    GGML_TYPE_TURBO4_0,
-    GGML_TYPE_TURBO4_TCQ,
-    GGML_TYPE_TURBO3_TCQ,
-    GGML_TYPE_TURBO2_TCQ,
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
+    const int32_t kvarn_bits = kvarn_bits_from_legacy_cache_type(s);
+    if (kvarn_bits != 0) {
+        const std::string replacement = string_format("q%d_0", kvarn_bits);
+        LOG_WRN("cache type '%s' was removed in v0.4.0; redirecting to '%s' for a draft context\n",
+                s.c_str(), replacement.c_str());
+        return kvarn_fallback_cache_type(kvarn_bits);
+    }
+
     for (const auto & type : kv_cache_types) {
         if (ggml_type_name(type) == s) {
             return type;
@@ -467,23 +494,18 @@ static llama_kvarn_type kvarn_type_from_bits(int32_t key_bits, int32_t value_bit
     return llama_kvarn_type_from_name(string_format("kvarn_k%dv%d_g128", key_bits, value_bits).c_str());
 }
 
-// layers that cannot use structured KVarN records (e.g. multi-stream iSWA SWA layers)
-// fall back to a normal KV cache with cache_type_k/v; match the requested KVarN bit
-// width instead of f16 so the fallback layers do not dominate memory use
-static ggml_type kvarn_fallback_cache_type(int32_t bits) {
-    switch (bits) {
-        case 2:  return GGML_TYPE_Q2_0;
-        case 3:  return GGML_TYPE_Q3_0;
-        case 4:  return GGML_TYPE_Q4_0;
-        case 5:  return GGML_TYPE_Q5_0;
-        case 6:  return GGML_TYPE_Q6_0;
-        case 8:  return GGML_TYPE_Q8_0;
-        default: return GGML_TYPE_F16;
-    }
-}
-
 static void parse_target_cache_type(common_params & params, bool key, const std::string & value) {
-    const int32_t kvarn_bits = kvarn_bits_from_cache_type(value);
+    const int32_t redirected_kvarn_bits = kvarn_bits_from_legacy_cache_type(value);
+    const std::string cache_type = redirected_kvarn_bits != 0
+        ? string_format("kvarn%d", redirected_kvarn_bits)
+        : value;
+
+    if (redirected_kvarn_bits != 0) {
+        LOG_WRN("cache type '%s' was removed in v0.4.0; redirecting to '%s'\n",
+                value.c_str(), cache_type.c_str());
+    }
+
+    const int32_t kvarn_bits = kvarn_bits_from_cache_type(cache_type);
     if (kvarn_bits != 0) {
         if (key) {
             params.cache_kvarn_bits_k = kvarn_bits;
@@ -497,10 +519,10 @@ static void parse_target_cache_type(common_params & params, bool key, const std:
 
     if (key) {
         params.cache_kvarn_bits_k = 0;
-        params.cache_type_k       = kv_cache_type_from_str(value);
+        params.cache_type_k       = kv_cache_type_from_str(cache_type);
     } else {
         params.cache_kvarn_bits_v = 0;
-        params.cache_type_v       = kv_cache_type_from_str(value);
+        params.cache_type_v       = kv_cache_type_from_str(cache_type);
     }
 }
 

@@ -682,8 +682,6 @@ void ggml_compute_forward_add(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
-        case GGML_TYPE_TQ3_1S:
-        case GGML_TYPE_TQ4_1S:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -1135,8 +1133,6 @@ void ggml_compute_forward_add1(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
-        case GGML_TYPE_TQ3_1S:
-        case GGML_TYPE_TQ4_1S:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -1267,8 +1263,6 @@ void ggml_compute_forward_acc(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
-        case GGML_TYPE_TQ3_1S:
-        case GGML_TYPE_TQ4_1S:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -5747,8 +5741,6 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
-        case GGML_TYPE_TQ3_1S:
-        case GGML_TYPE_TQ4_1S:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -5767,15 +5759,6 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_COUNT:
             {
                 GGML_ABORT("fatal error");
-            }
-        case GGML_TYPE_TURBO2_0:
-        case GGML_TYPE_TURBO3_0:
-        case GGML_TYPE_TURBO4_0:
-        case GGML_TYPE_TURBO3_TCQ:
-        case GGML_TYPE_TURBO2_TCQ:
-        case GGML_TYPE_TURBO4_TCQ:
-            {
-                // no-op
             }
     }
 }
@@ -11181,70 +11164,6 @@ void ggml_compute_forward_gated_delta_net_tree(
             {
                 GGML_ABORT("fatal error");
             }
-    }
-}
-
-// ggml_compute_forward_turbo_wht
-
-// WHT sign arrays (must match Metal shader turbo_wht_signs1/2)
-static const float turbo_wht_s1[128] = {-1,1,1,-1,-1,1,-1,1,-1,-1,1,1,1,1,1,1,1,-1,1,-1,1,-1,-1,1,1,1,-1,1,1,-1,-1,-1,-1,1,1,-1,1,1,-1,1,-1,1,1,-1,-1,1,-1,1,1,1,1,-1,-1,-1,-1,-1,1,-1,1,1,1,1,-1,1,-1,-1,1,-1,-1,-1,1,-1,-1,-1,1,-1,-1,-1,1,1,1,-1,-1,1,1,1,-1,-1,1,1,-1,1,1,-1,1,-1,-1,1,1,-1,1,-1,1,-1,1,1,1,1,-1,1,-1,1,1,-1,1,1,-1,-1,-1,-1,-1,1,1,-1,1,1,-1,1};
-static const float turbo_wht_s2[128] = {1,1,1,1,-1,1,1,-1,1,-1,-1,-1,1,-1,-1,-1,1,1,-1,-1,1,-1,1,-1,1,-1,-1,1,-1,1,1,1,1,1,-1,-1,-1,1,-1,-1,-1,-1,-1,-1,1,1,1,-1,1,-1,1,1,1,-1,-1,1,-1,-1,-1,-1,-1,-1,1,1,1,-1,1,-1,-1,-1,-1,1,-1,1,-1,1,-1,-1,1,1,-1,1,-1,1,1,-1,1,-1,-1,-1,-1,1,-1,-1,1,-1,1,-1,1,1,1,-1,-1,1,-1,1,-1,1,1,-1,-1,1,-1,1,-1,1,1,-1,1,-1,1,-1,-1,-1,-1,-1,1,-1};
-
-static void ggml_compute_forward_turbo_wht_f32(
-        const ggml_compute_params * params,
-        ggml_tensor * dst) {
-    const ggml_tensor * src = dst->src[0];
-    const float * src_data = (const float *) src->data;
-    float * dst_data = (float *) dst->data;
-
-    int direction;
-    memcpy(&direction, dst->op_params, sizeof(int));
-
-    const float * s_first = (direction == 0) ? turbo_wht_s1 : turbo_wht_s2;
-    const float * s_second = (direction == 0) ? turbo_wht_s2 : turbo_wht_s1;
-
-    const int64_t n_total = ggml_nelements(src);
-    const int64_t n_groups = n_total / 128;
-
-    // Parallel over groups
-    const int64_t ith = params->ith;
-    const int64_t nth = params->nth;
-    const int64_t grp_start = (n_groups * ith) / nth;
-    const int64_t grp_end = (n_groups * (ith + 1)) / nth;
-
-    for (int64_t g = grp_start; g < grp_end; g++) {
-        float x[128];
-        const float * in = src_data + g * 128;
-
-        // Apply first signs
-        for (int i = 0; i < 128; i++) x[i] = in[i] * s_first[i];
-
-        // WHT butterfly (7 stages)
-        for (int h = 1; h < 128; h *= 2) {
-            for (int i = 0; i < 128; i += h * 2) {
-                for (int j = i; j < i + h; j++) {
-                    float a = x[j], b = x[j + h];
-                    x[j] = a + b;
-                    x[j + h] = a - b;
-                }
-            }
-        }
-
-        // Normalize + second signs
-        const float inv_sqrt_128 = 0.08838834764831845f;
-        float * out = dst_data + g * 128;
-        for (int i = 0; i < 128; i++) {
-            out[i] = x[i] * inv_sqrt_128 * s_second[i];
-        }
-    }
-}
-
-void ggml_compute_forward_turbo_wht(
-        const ggml_compute_params * params,
-        ggml_tensor * dst) {
-    switch (dst->src[0]->type) {
-        case GGML_TYPE_F32: ggml_compute_forward_turbo_wht_f32(params, dst); break;
-        default: GGML_ABORT("fatal error");
     }
 }
 
