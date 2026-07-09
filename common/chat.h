@@ -143,15 +143,75 @@ struct common_chat_msg_diff {
     }
 };
 
+enum common_chat_role {
+    COMMON_CHAT_ROLE_UNKNOWN,
+    COMMON_CHAT_ROLE_SYSTEM,
+    COMMON_CHAT_ROLE_ASSISTANT,
+    COMMON_CHAT_ROLE_USER,
+    COMMON_CHAT_ROLE_TOOL
+};
+
+common_chat_role common_chat_role_from_string(const std::string & role);
+const char *     common_chat_role_to_string(common_chat_role role);
+
 struct common_chat_msg_span {
-    std::string role;
+    common_chat_role role = COMMON_CHAT_ROLE_UNKNOWN;
     std::size_t pos = 0;
     std::size_t len = 0;
+
+    bool valid() const {
+        return role != COMMON_CHAT_ROLE_UNKNOWN;
+    }
+};
+
+struct common_chat_msg_spans {
+    std::vector<common_chat_msg_span> spans;
+
+    void add(common_chat_role role, size_t pos, size_t len) {
+        spans.push_back({ role, pos, len });
+    }
+
+    bool is_user_start(int32_t pos) const {
+        for (auto it = spans.begin(); it != spans.end(); ++it) {
+            if (it->role == COMMON_CHAT_ROLE_USER && pos == (int32_t) it->pos) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    int32_t last_user_message_pos() const {
+        for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
+            if (it->role == COMMON_CHAT_ROLE_USER) {
+                return (int32_t) it->pos;
+            }
+        }
+        return -1;
+    }
 };
 
 struct common_chat_msg_delimiter {
-    std::string role;
-    std::string delimiter;
+    common_chat_role role = COMMON_CHAT_ROLE_UNKNOWN;
+    std::string      delimiter;
+    llama_tokens     tokens = {};
+};
+
+struct common_chat_msg_delimiters {
+    std::vector<common_chat_msg_delimiter> delimiters;
+
+    common_chat_msg_delimiters() = default;
+    common_chat_msg_delimiters(std::initializer_list<common_chat_msg_delimiter> delims) : delimiters(delims) {}
+
+    void add(common_chat_role role, const std::string & delimiter) {
+        delimiters.push_back({ role, delimiter });
+    }
+
+    void tokenize(const llama_vocab * vocab);
+
+    // split tokens into message spans. skips maps a start index to a length of a region to jump over without matching
+    common_chat_msg_spans split(const llama_tokens & tokens, const std::map<size_t, size_t> & skips = {}) const;
+
+    nlohmann::ordered_json to_json() const;
 };
 
 struct common_chat_tool {
@@ -219,7 +279,7 @@ struct common_chat_params {
     std::vector<std::string>            preserved_tokens;
     std::vector<std::string>            additional_stops;
     std::string                         parser;
-    std::vector<common_chat_msg_span>   message_spans;
+    common_chat_msg_delimiters          message_delimiters;
 };
 
 // per-message parsing syntax
@@ -230,8 +290,6 @@ struct common_chat_parser_params {
     // Whether reasoning_content should be inlined in the content (e.g. for reasoning_format=deepseek in stream mode)
     bool                    reasoning_in_content = false;
     std::string             generation_prompt;
-    std::string             thinking_start_tag;
-    std::string             thinking_end_tag;
     bool                    parse_tool_calls     = true;
     bool                    is_continuation      = false;
     bool                    echo                 = false;  // Include assistant prefilled msg in output
@@ -241,8 +299,6 @@ struct common_chat_parser_params {
     common_chat_parser_params(const common_chat_params & chat_params) {
         format  = chat_params.format;
         generation_prompt = chat_params.generation_prompt;
-        thinking_start_tag = chat_params.thinking_start_tag;
-        thinking_end_tag = chat_params.thinking_end_tag;
     }
 };
 
@@ -329,4 +385,4 @@ struct common_chat_prompt_preset {
 
 common_chat_prompt_preset common_chat_get_asr_prompt(const common_chat_templates * chat_templates);
 
-std::vector<common_chat_msg_span> common_chat_split_by_role(const std::string & prompt, const std::vector<common_chat_msg_delimiter> & delims);
+common_chat_msg_delimiters common_chat_msg_delimiters_parse(const nlohmann::ordered_json & delimiters);

@@ -18,12 +18,13 @@ struct ggml_tensor;
 
 struct llama_cparams;
 struct llama_layer;
-struct llama_tree_mask;
 
 struct llama_memory_context_i;
 
 class llama_kv_cache_context;
 class llama_kv_cache_dsa_context;
+class llama_kv_cache_dsv4_raw_context;
+class llama_kv_cache_dsv4_context;
 class llama_kv_cache_iswa_context;
 class llama_memory_recurrent_context;
 class llama_memory_hybrid_context;
@@ -35,20 +36,12 @@ enum llm_graph_type {
     LLM_GRAPH_TYPE_ENCODER,
     LLM_GRAPH_TYPE_DECODER,
     LLM_GRAPH_TYPE_DECODER_MTP,
-    LLM_GRAPH_TYPE_DFLASH_KV_UPDATE,
 };
 
-struct llama_dflash_kv_cache_view {
-    int n_layers = 0;
-    int64_t n_embd_head = 0;
-    int64_t n_head_kv = 0;
-    int64_t ctx_len = 0;
-    int64_t n_filled = 0;
-    int64_t ring_size = 0;
-    int64_t write_pos = 0;
-
-    std::vector<ggml_tensor *> k_ring;
-    std::vector<ggml_tensor *> v_ring;
+enum llm_fused_op {
+    LLM_FUSED_OP_FLASH_ATTN,
+    LLM_FUSED_OP_GDN_AR,
+    LLM_FUSED_OP_GDN_CH,
 };
 
 enum llm_ffn_op_type : int {
@@ -81,45 +74,11 @@ struct llama_cross {
     //       ref: https://github.com/ggml-org/llama.cpp/pull/11213#discussion_r1969892524
     //ggml_tensor * t_embd = nullptr;
 
-    int64_t n_embd    = 0;
-    int64_t n_enc     = 0;  // may be padded to bucket for graph stability
-    int64_t n_enc_real = 0; // actual data length (unpadded)
+    int64_t n_embd = 0;
+    int64_t n_enc  = 0;
 
     // embeddings data copied to host memory (tmp)
-    // Single-slot / encoder-decoder path: graph builders read from here directly.
     std::vector<float> v_embd;
-
-    // GPU D2D path: device pointer to interleaved cross data (set by GPU ring interleave)
-    const void * v_embd_gpu = nullptr;
-    int64_t v_embd_gpu_n_enc_real = 0;
-    void (*fn_set_tensor_d2d)(void * d_dst, const void * d_src, size_t offset, size_t size) = nullptr;
-
-    // Temporary DFlash K/V-update input. This lets the drafter-side projection
-    // cache read newly committed hidden states without mutating the main cross
-    // window shape, which would otherwise force a scheduler reserve before each
-    // draft decode.
-    const void * dflash_kv_update_gpu = nullptr;
-    int64_t dflash_kv_update_n_embd = 0;
-    int64_t dflash_kv_update_n_enc_real = 0;
-    void (*dflash_kv_update_fn_set_tensor_d2d)(void * d_dst, const void * d_src, size_t offset, size_t size) = nullptr;
-
-    // Per-seq cross buffers for DFlash multi-slot.
-    // When non-empty, graph builders should pack these into target_hidden per slot
-    // instead of reading v_embd. Empty ⇒ fall through to the legacy v_embd path.
-    struct seq_cross {
-        int64_t n_enc      = 0;  // padded length (graph stability)
-        int64_t n_enc_real = 0;  // actual data length
-        std::vector<float> v_embd;
-        const void * v_embd_gpu = nullptr;
-        int64_t v_embd_gpu_n_enc_real = 0;
-    };
-    std::map<llama_seq_id, seq_cross> v_embd_per_seq;
-
-    // DFlash drafter-side cache of projected cross-attention K/V. When this is
-    // present and filled for the current window, the drafter graph consumes the
-    // staged K/V tensors directly instead of recomputing wk/wv over the whole
-    // cross window every speculative cycle.
-    llama_dflash_kv_cache_view * dflash_kv_cache = nullptr;
 
     // needed to construct the cross-attention mask in the decoder
     std::vector<std::set<llama_seq_id>> seq_ids_enc;
@@ -356,12 +315,10 @@ public:
     llm_graph_input_attn_kv(
             const llama_hparams & hparams,
             const llama_cparams & cparams,
-            const llama_kv_cache_context * mctx,
-            const llama_tree_mask * tree_mask = nullptr) :
+            const llama_kv_cache_context * mctx) :
         hparams(hparams),
         cparams(cparams),
-        mctx(mctx),
-        tree_mask(tree_mask) {
+        mctx(mctx) {
     }
     ~llm_graph_input_attn_kv() = default;
 
@@ -383,9 +340,6 @@ public:
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
-    ggml_tensor * self_kvarn_rot_128 = nullptr;
-    ggml_tensor * self_kvarn_rot_256 = nullptr;
-    ggml_tensor * self_kvarn_rot_512 = nullptr;
 
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
@@ -394,7 +348,6 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_context * mctx;
-    const llama_tree_mask * tree_mask;
 };
 
 // V-less input for the KV cache
@@ -504,10 +457,6 @@ public:
 
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
-    ggml_tensor * self_kvarn_rot_128 = nullptr;
-    ggml_tensor * self_kvarn_rot_256 = nullptr;
-    ggml_tensor * self_kvarn_rot_512 = nullptr;
-    ggml_tensor * self_kvarn_mat_idxs_swa = nullptr; // I64 [n_kv] SWA ring per-cell absolute positions
 
     ggml_tensor * self_k_rot_swa = nullptr;
     ggml_tensor * self_v_rot_swa = nullptr;
@@ -516,6 +465,79 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_iswa_context * mctx;
+};
+
+// DSV4 raw graph inputs are SWA-only, but their mask may be stream-shaped
+// so raw K can be concatenated with DSV4 compressed K in one attention op.
+class llm_graph_input_dsv4_raw {
+public:
+    llm_graph_input_dsv4_raw(
+            const llama_cparams & cparams,
+            const llama_kv_cache_dsv4_raw_context * mctx) :
+        cparams(cparams),
+        mctx(mctx) {
+    }
+
+    void set_input(const llama_ubatch * ubatch);
+
+    ggml_tensor * get_k_idxs() const { return self_k_idxs; }
+    ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
+
+    ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
+
+    ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+
+    ggml_tensor * self_k_rot = nullptr;
+
+    const llama_cparams cparams;
+
+    const llama_kv_cache_dsv4_raw_context * mctx;
+};
+
+class llm_graph_input_dsv4 : public llm_graph_input_i {
+public:
+    struct comp_input {
+        ggml_tensor * state_pos        = nullptr; // I32 [n_state]
+        ggml_tensor * state_persist_src_idxs = nullptr; // I32 [n_state_persist]
+        ggml_tensor * state_persist_dst_idxs = nullptr; // I32 [n_state_persist]
+        ggml_tensor * state_read_idxs  = nullptr; // I32 [ratio*n_state_write]
+        ggml_tensor * state_write_idxs = nullptr; // I64 [n_state_write]
+        ggml_tensor * state_write_pos  = nullptr; // I32 [n_state_write]
+
+        ggml_tensor * kq_mask    = nullptr; // F32 [n_kv, n_batch/n_stream, 1, n_stream]
+
+        ggml_tensor * k_rot      = nullptr;
+    };
+
+    llm_graph_input_dsv4(
+            const llama_cparams & cparams,
+            std::unique_ptr<llm_graph_input_dsv4_raw> inp_raw,
+            const llama_kv_cache_dsv4_context * mctx) :
+        inp_raw(std::move(inp_raw)),
+        cparams(cparams),
+        mctx(mctx) {
+    }
+    ~llm_graph_input_dsv4() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    llm_graph_input_dsv4_raw * get_raw() const { return inp_raw.get(); }
+    const comp_input & get_csa() const { return inp_csa; }
+    const comp_input & get_hca() const { return inp_hca; }
+    const comp_input & get_lid() const { return inp_lid; }
+
+    std::unique_ptr<llm_graph_input_dsv4_raw> inp_raw;
+
+    comp_input inp_csa;
+    comp_input inp_hca;
+    comp_input inp_lid;
+
+    const llama_cparams cparams;
+
+    const llama_kv_cache_dsv4_context * mctx;
 };
 
 class llm_graph_input_attn_cross : public llm_graph_input_i {
@@ -661,12 +683,6 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
-    const llama_tree_mask        * tree_mask = nullptr;
-
-    // DDTree: tree-mode SSM buffers (parent_ids + persistent intermediates)
-    ggml_tensor * tree_parent_ids = nullptr;
-    const std::vector<ggml_tensor *> * tree_ssm_intermediates = nullptr;
-    int tree_n_recurrent_layers = 0;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -747,43 +763,28 @@ struct llm_graph_params {
             }
         }
 
-        for (size_t i = 0; i < sizeof(cparams.dflash_prefill_src_offsets)/sizeof(cparams.dflash_prefill_src_offsets[0]); ++i) {
-            if (cparams.dflash_prefill_src_offsets[i] != other.cparams.dflash_prefill_src_offsets[i] ||
-                cparams.dflash_prefill_dst_offsets[i] != other.cparams.dflash_prefill_dst_offsets[i] ||
-                cparams.dflash_prefill_n_tokens_seqs[i] != other.cparams.dflash_prefill_n_tokens_seqs[i]) {
-                return false;
-            }
-        }
-
-        for (size_t i = 0; i < sizeof(cparams.hidden_gpu_seqs)/sizeof(cparams.hidden_gpu_seqs[0]); ++i) {
-            if (cparams.hidden_gpu_seqs[i] != other.cparams.hidden_gpu_seqs[i] ||
-                cparams.prefill_gpu_seqs[i] != other.cparams.prefill_gpu_seqs[i] ||
-                cparams.tape_gpu_seqs[i] != other.cparams.tape_gpu_seqs[i]) {
-                return false;
-            }
+        // TODO: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448035248
+        if (cparams.nextn_layer_offset != other.cparams.nextn_layer_offset) {
+            return false;
         }
 
         return
-            cparams.embeddings  == other.cparams.embeddings  &&
-            cparams.causal_attn == other.cparams.causal_attn &&
-            cparams.dflash_verify_logits == other.cparams.dflash_verify_logits &&
-            cparams.dflash_verify_topk   == other.cparams.dflash_verify_topk &&
-            cparams.dflash_reduced_consumer_active == other.cparams.dflash_reduced_consumer_active &&
-            cparams.hidden_gpu_n_seqs    == other.cparams.hidden_gpu_n_seqs &&
-            cparams.prefill_gpu_n_seqs   == other.cparams.prefill_gpu_n_seqs &&
-            cparams.tape_gpu             == other.cparams.tape_gpu &&
-            cparams.tape_gpu_n_seqs      == other.cparams.tape_gpu_n_seqs &&
-            cparams.dflash_prefill_capture_active == other.cparams.dflash_prefill_capture_active &&
-            cparams.dflash_prefill_src_offset     == other.cparams.dflash_prefill_src_offset &&
-            cparams.dflash_prefill_dst_offset     == other.cparams.dflash_prefill_dst_offset &&
-            cparams.dflash_prefill_n_tokens       == other.cparams.dflash_prefill_n_tokens &&
+            cparams.embeddings              == other.cparams.embeddings              &&
+            cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
+            cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
+            cparams.causal_attn             == other.cparams.causal_attn             &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
-            cross == other.cross &&
-            (tree_parent_ids != nullptr) == (other.tree_parent_ids != nullptr);
+            cross == other.cross;
     }
+};
+
+struct llm_graph_fused_node {
+    llm_fused_op op;
+    ggml_tensor * tensor;
+    int il;
 };
 
 class llm_graph_result {
@@ -798,6 +799,8 @@ public:
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
 
+    ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
+
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
 
@@ -806,7 +809,7 @@ public:
     void reset();
 
     void set_inputs(const llama_ubatch * ubatch);
-    void set_outputs();
+    void set_outputs(const llm_graph_params & params);
 
     // try to update the existing graph result using the new graph parameters in order to reuse it
     // this can only be done if we determine that the resulting graph using the new graph parameters
@@ -817,29 +820,29 @@ public:
 
     llm_graph_input_i * add_input(llm_graph_input_ptr input);
 
+    void add_fused_node(llm_graph_fused_node result);
+
+    const std::vector<llm_graph_fused_node> & get_fused_nodes() const { return fused_nodes; }
+
     void set_params(const llm_graph_params & params);
 
     // important graph nodes
     ggml_tensor * t_inp_tokens  = nullptr;
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
     ggml_tensor * t_logits      = nullptr;
-    ggml_tensor * t_logits_argmax = nullptr; // [n_tokens] int32, GPU argmax of logits
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
 
-    std::vector<ggml_tensor *> dflash_k_update;
-    std::vector<ggml_tensor *> dflash_v_update;
+    std::vector<ggml_tensor *> t_layer_inp;
 
-    std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
-    std::map<llama_seq_id, ggml_tensor*> t_candidates;
-    std::map<llama_seq_id, ggml_tensor*> t_sampled;
-    std::map<llama_seq_id, ggml_tensor*> t_sampled_probs;
-
-    // DFlash: captured per-layer hidden states (set by target model graph builder)
-    // DFlash hidden state capture moved to eval callback (dflash_eval_callback)
+    std::map<llama_seq_id, ggml_tensor *> t_sampled_logits;
+    std::map<llama_seq_id, ggml_tensor *> t_candidates;
+    std::map<llama_seq_id, ggml_tensor *> t_sampled;
+    std::map<llama_seq_id, ggml_tensor *> t_sampled_probs;
 
     std::vector<llm_graph_input_ptr> inputs;
+    std::vector<llm_graph_fused_node> fused_nodes;
 
     ggml_context_ptr ctx_compute;
 
@@ -920,12 +923,6 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
-    const llama_tree_mask        * tree_mask;
-
-    // DDTree: tree-mode SSM buffers
-    ggml_tensor * tree_parent_ids = nullptr;
-    const std::vector<ggml_tensor *> * tree_ssm_intermediates = nullptr;
-    int tree_n_recurrent_layers = 0;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -955,11 +952,12 @@ struct llm_graph_context {
               ggml_tensor * cur,
               ggml_tensor * w_s = nullptr) const;
 
-    // do mat_mul_id, while optionally apply lora
+    // do mat_mul_id, while optionally apply lora and per-expert scale
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b
-              ggml_tensor * ids) const;
+              ggml_tensor * ids,
+              ggml_tensor * w_s = nullptr) const;
 
     ggml_tensor * build_norm(
              ggml_tensor * cur,
@@ -1014,7 +1012,8 @@ struct llm_graph_context {
              ggml_tensor * gate_up_exps = nullptr,
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
-             ggml_tensor * down_exps_s = nullptr) const;
+             ggml_tensor * down_exps_s = nullptr,
+             ggml_tensor * selected_experts_in = nullptr) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -1039,7 +1038,8 @@ struct llm_graph_context {
              ggml_tensor * gate_up_exps_b = nullptr,
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
-             ggml_tensor * down_exps_s = nullptr) const;
+             ggml_tensor * down_exps_s = nullptr,
+             ggml_tensor * selected_experts_in = nullptr) const;
 
     //
     // inputs
@@ -1138,6 +1138,8 @@ struct llm_graph_context {
                     int   il) const;
 
     llm_graph_input_attn_kv_iswa * build_attn_inp_kv_iswa() const;
+
+    llm_graph_input_dsv4 * build_inp_dsv4() const;
 
     // note: if k_cur or v_cur are not provided, they will not be stored in the memory
     ggml_tensor * build_attn(

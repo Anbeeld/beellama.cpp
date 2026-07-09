@@ -9,9 +9,9 @@
 #include "llama-model-loader.h"
 
 #include "llama-kv-cache.h"
-#include "llama-kv-cache-kvarn.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-dsa.h"
+#include "llama-kv-cache-dsv4.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
@@ -158,6 +158,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_command_r(params);
         case LLM_ARCH_COHERE2:
             return new llama_model_cohere2(params);
+        case LLM_ARCH_COHERE2MOE:
+            return new llama_model_cohere2moe(params);
         case LLM_ARCH_DBRX:
             return new llama_model_dbrx(params);
         case LLM_ARCH_OLMO:
@@ -180,6 +182,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_deepseek2ocr(params);
         case LLM_ARCH_DEEPSEEK32:
             return new llama_model_deepseek32(params);
+        case LLM_ARCH_DEEPSEEK4:
+            return new llama_model_deepseek4(params);
         case LLM_ARCH_GLM_DSA:
             return new llama_model_glm_dsa(params);
         case LLM_ARCH_MISTRAL4:
@@ -288,15 +292,16 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_qwen35moe(params);
         case LLM_ARCH_MISTRAL3:
             return new llama_model_mistral3(params);
+        case LLM_ARCH_EAGLE3:
+            return new llama_model_eagle3(params);
+        case LLM_ARCH_DFLASH:
+            return new llama_model_dflash(params);
         case LLM_ARCH_MIMO2:
             return new llama_model_mimo2(params);
         case LLM_ARCH_KIMI_LINEAR:
             return new llama_model_kimi_linear(params);
         case LLM_ARCH_STEP35:
             return new llama_model_step35(params);
-        case LLM_ARCH_DFLASH:
-        case LLM_ARCH_DFLASH_DRAFT:
-            return new llama_model_dflash_draft(params);
         default:
             throw std::runtime_error(std::string("unsupported model architecture: '") + llm_arch_name(arch) + "'");
     }
@@ -700,6 +705,7 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_160M:          return "160M";
         case LLM_TYPE_190M:          return "190M";
         case LLM_TYPE_220M:          return "220M";
+        case LLM_TYPE_230M:          return "230M";
         case LLM_TYPE_250M:          return "250M";
         case LLM_TYPE_256M:          return "256M";
         case LLM_TYPE_270M:          return "270M";
@@ -814,6 +820,7 @@ static const char * llama_expert_gating_func_name(llama_expert_gating_func_type 
     switch (type) {
         case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX: return "softmax";
         case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID: return "sigmoid";
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS: return "sqrtsoftplus";
         default:                                    return "unknown";
     }
 }
@@ -946,6 +953,8 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
             if (buft != nullptr) {
                 buft_list.emplace_back(dev, buft);
             }
+        } else {
+            throw std::runtime_error(format("device %s does not support split buffers", ggml_backend_dev_name(dev)));
         }
     }
 
@@ -980,6 +989,8 @@ struct llama_model::impl {
 
     std::string desc_str;
 
+    llama_ftype ftype = LLAMA_FTYPE_ALL_F32;
+
     // model memory mapped files
     llama_mmaps mappings;
 
@@ -1003,9 +1014,17 @@ struct llama_model::impl {
     std::vector<layer_dev> dev_layer;
 
     bool has_tensor_overrides;
+
+    std::vector<float> tensor_split_owned;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
+    if (params.tensor_split != nullptr) {
+        // llama_model_params stores tensor_split as a borrowed pointer, but the model
+        // may need it later for tensor-parallel KV-cache split metadata.
+        pimpl->tensor_split_owned.assign(params.tensor_split, params.tensor_split + llama_max_devices());
+        this->params.tensor_split = pimpl->tensor_split_owned.data();
+    }
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
 }
 
@@ -1092,11 +1111,8 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     std::fill(hparams.n_ff_arr.begin(),      hparams.n_ff_arr.end(),      0);
 
     std::fill(hparams.rope_sections.begin(), hparams.rope_sections.end(), 0);
-    std::fill(hparams.is_swa_impl.begin(), hparams.is_swa_impl.end(), 0);
-    std::fill(
-            hparams.is_recr_impl.begin(),
-            hparams.is_recr_impl.end(),
-            llm_arch_is_recurrent(ml.get_arch()));
+    std::fill(hparams.is_swa_impl.begin(),   hparams.is_swa_impl.end(), 0);
+    std::fill(hparams.is_recr_impl.begin(),  hparams.is_recr_impl.end(),  llm_arch_is_recurrent(ml.get_arch()) ? 1 : 0);
 
     std::fill(hparams.xielu_alpha_n.begin(), hparams.xielu_alpha_n.end(), 0.0f);
     std::fill(hparams.xielu_alpha_p.begin(), hparams.xielu_alpha_p.end(), 0.0f);
@@ -1196,6 +1212,8 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
 
     pimpl->desc_str = arch_name() + " " + type_name() + " " + ml.ftype_name();
 
+    pimpl->ftype = ml.ftype;
+
     if (hparams.f_max_alibi_bias > 0.0f) {
         hparams.use_alibi = true;
     }
@@ -1285,22 +1303,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         return {dev, &pimpl->gpu_buft_list.at(dev)};
     };
 
-    auto get_output_buft_list = [&](ggml_backend_dev_t dev) -> llama_model::impl::layer_dev {
-        if (dev == cpu_dev) {
-            LLAMA_LOG_DEBUG("%s: output tensor assigned to device %s by override\n", __func__, ggml_backend_dev_name(cpu_dev));
-            return {cpu_dev, &pimpl->cpu_buft_list};
-        }
-
-        auto it = pimpl->gpu_buft_list.find(dev);
-        if (it == pimpl->gpu_buft_list.end()) {
-            throw std::runtime_error(format("%s: output_device %s is not available to this model",
-                        __func__, dev ? ggml_backend_dev_name(dev) : "(null)"));
-        }
-
-        LLAMA_LOG_DEBUG("%s: output tensor assigned to device %s by override\n", __func__, ggml_backend_dev_name(dev));
-        return {dev, &it->second};
-    };
-
     // assign the input layer
     // there is very little benefit to offloading the input layer, so always keep it on the CPU
     pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
@@ -1312,7 +1314,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     // assign the output layer
-    pimpl->dev_output = params.output_device ? get_output_buft_list(params.output_device) : get_layer_buft_list(n_layer_all);
+    pimpl->dev_output = get_layer_buft_list(n_layer_all);
 
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
@@ -1488,9 +1490,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
     ml.done_getting_tensors();
 
+    // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.
+    // If sidecar scales exist, the output weight must be an actual output tensor.
     GGML_ASSERT(!(output && tok_embd &&
             strcmp(output->name, tok_embd->name) == 0 &&
-            output->type == GGML_TYPE_NVFP4));
+            output->type == GGML_TYPE_NVFP4 &&
+            (output_s || output_in_s)));
     // populate tensors_by_name
     for (auto & [_, ctx_ptr] : ml.ctx_map) {
         for (auto * cur = ggml_get_first_tensor(ctx_ptr.get()); cur != NULL; cur = ggml_get_next_tensor(ctx_ptr.get(), cur)) {
@@ -1653,6 +1658,10 @@ std::string llama_model::type_name() const {
 
 std::string llama_model::desc() const {
     return pimpl->desc_str;
+}
+
+llama_ftype llama_model::ftype() const {
+    return pimpl->ftype;
 }
 
 size_t llama_model::size() const {
@@ -1865,6 +1874,7 @@ void llama_model::print_info() const {
         }
 
         if (arch == LLM_ARCH_MELLUM ||
+                arch == LLM_ARCH_COHERE2MOE ||
                 arch == LLM_ARCH_QWEN3MOE ||
                 arch == LLM_ARCH_OPENAI_MOE ||
                 arch == LLM_ARCH_QWEN3VLMOE ||
@@ -2035,7 +2045,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         case LLM_ARCH_LLADA:
         case LLM_ARCH_LLADA_MOE:
         case LLM_ARCH_RND1:
-        case LLM_ARCH_DFLASH:
             {
                 res = nullptr;
             } break;
@@ -2109,7 +2118,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_v_trans      */ !cparams.flash_attn,
                             /* attn_swa_full     */ params.swa_full,
                             /* attn_kv_size      */ cparams.n_ctx_seq,
-                            /* attn_n_batch      */ cparams.n_batch,
                             /* attn_n_ubatch     */ cparams.n_ubatch,
                             /* attn_n_pad        */ 1,
                             /* recurrent_type_r  */ GGML_TYPE_F32,
@@ -2120,55 +2128,26 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr),
-                            /* kvarn             */ params.kvarn);
+                            /* filter_recr       */ std::move(filter_recr));
                     } else {
-                        if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
-                            auto mem_attn = std::make_unique<llama_kv_cache_kvarn>(
-                                    *this,
-                                    hparams,
-                                    params.kvarn,
-                                    cparams.offload_kqv,
-                                    cparams.kv_unified,
-                                    cparams.n_ctx_seq,
-                                    cparams.n_seq_max,
-                                    cparams.n_batch,
-                                    cparams.n_ubatch,
-                                    1,
-                                    hparams.n_swa,
-                                    hparams.swa_type,
-                                    filter_attn,
-                                    nullptr);
-                            auto mem_recr = std::make_unique<llama_memory_recurrent>(
-                                    *this,
-                                    GGML_TYPE_F32,
-                                    GGML_TYPE_F32,
-                                    cparams.offload_kqv,
-                                    std::max((uint32_t) 1, cparams.n_seq_max),
-                                    cparams.n_seq_max,
-                                    cparams.n_rs_seq,
-                                    filter_recr);
-                            res = new llama_memory_hybrid(*this, std::move(mem_attn), std::move(mem_recr));
-                        } else {
-                            res = new llama_memory_hybrid(
-                                /* model             */ *this,
-                                /* attn_type_k       */ params.type_k,
-                                /* attn_type_v       */ params.type_v,
-                                /* attn_v_trans      */ !cparams.flash_attn,
-                                /* attn_kv_size      */ cparams.n_ctx_seq,
-                                /* attn_n_pad        */ 1,
-                                /* attn_n_swa        */ hparams.n_swa,
-                                /* attn_swa_type     */ hparams.swa_type,
-                                /* recurrent_type_k  */ GGML_TYPE_F32,
-                                /* recurrent_type_v  */ GGML_TYPE_F32,
-                                /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
-                                /* n_seq_max         */ cparams.n_seq_max,
-                                /* n_rs_seq          */ cparams.n_rs_seq,
-                                /* offload           */ cparams.offload_kqv,
-                                /* unified           */ cparams.kv_unified,
-                                /* filter_attn       */ std::move(filter_attn),
-                                /* filter_recr       */ std::move(filter_recr));
-                        }
+                        res = new llama_memory_hybrid(
+                            /* model             */ *this,
+                            /* attn_type_k       */ params.type_k,
+                            /* attn_type_v       */ params.type_v,
+                            /* attn_v_trans      */ !cparams.flash_attn,
+                            /* attn_kv_size      */ cparams.n_ctx_seq,
+                            /* attn_n_pad        */ 1,
+                            /* attn_n_swa        */ hparams.n_swa,
+                            /* attn_swa_type     */ hparams.swa_type,
+                            /* recurrent_type_k  */ GGML_TYPE_F32,
+                            /* recurrent_type_v  */ GGML_TYPE_F32,
+                            /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                            /* n_seq_max         */ cparams.n_seq_max,
+                            /* n_rs_seq          */ cparams.n_rs_seq,
+                            /* offload           */ cparams.offload_kqv,
+                            /* unified           */ cparams.kv_unified,
+                            /* filter_attn       */ std::move(filter_attn),
+                            /* filter_recr       */ std::move(filter_recr));
                     }
                 } else {
                     llama_kv_cache::layer_filter_cb filter = nullptr;
@@ -2199,7 +2178,24 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         }
                     }
 
-                    if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+                    if (arch == LLM_ARCH_DEEPSEEK4) {
+                        GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
+
+                        res = new llama_kv_cache_dsv4(
+                                *this,
+                                params.type_k,
+                                params.type_v,
+                                !cparams.flash_attn,
+                                cparams.offload_kqv,
+                                params.swa_full,
+                                cparams.kv_unified,
+                                cparams.n_ctx_seq,
+                                cparams.n_seq_max,
+                                cparams.n_ubatch,
+                                1,
+                                filter,
+                                reuse);
+                    } else if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         GGML_ASSERT(hparams.is_swa_any());
 
                         if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
@@ -2225,14 +2221,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     cparams.kv_unified,
                                     cparams.n_ctx_seq,
                                     cparams.n_seq_max,
-                                    cparams.n_batch,
                                     cparams.n_ubatch,
                                     1,
                                     mem_other,
                                     filter,
                                     reuse,
-                                    share,
-                                    params.kvarn);
+                                    share);
                         } else {
                             res = new llama_kv_cache_iswa(
                                     *this,
@@ -2244,53 +2238,33 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     cparams.kv_unified,
                                     cparams.n_ctx_seq,
                                     cparams.n_seq_max,
-                                    cparams.n_batch,
                                     cparams.n_ubatch,
                                     1,
                                     nullptr,
                                     filter,
                                     reuse,
-                                    share,
-                                    params.kvarn);
+                                    share);
                         }
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
-                        if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
-                            res = new llama_kv_cache_kvarn(
-                                    *this,
-                                    hparams,
-                                    params.kvarn,
-                                    cparams.offload_kqv,
-                                    cparams.kv_unified,
-                                    cparams.n_ctx_seq,
-                                    cparams.n_seq_max,
-                                    cparams.n_batch,
-                                    cparams.n_ubatch,
-                                    1,
-                                    hparams.n_swa,
-                                    hparams.swa_type,
-                                    filter,
-                                    reuse);
-                        } else {
-                            res = new llama_kv_cache(
-                                    *this,
-                                    hparams,
-                                    params.type_k,
-                                    params.type_v,
-                                    !cparams.flash_attn,
-                                    cparams.offload_kqv,
-                                    cparams.kv_unified,
-                                    cparams.n_ctx_seq,
-                                    cparams.n_seq_max,
-                                    1,
-                                    hparams.n_swa,
-                                    hparams.swa_type,
-                                    nullptr,
-                                    filter,
-                                    nullptr,
-                                    nullptr);
-                        }
+                        res = new llama_kv_cache(
+                                *this,
+                                hparams,
+                                params.type_k,
+                                params.type_v,
+                                !cparams.flash_attn,
+                                cparams.offload_kqv,
+                                cparams.kv_unified,
+                                cparams.n_ctx_seq,
+                                cparams.n_seq_max,
+                                1,
+                                hparams.n_swa,
+                                hparams.swa_type,
+                                nullptr,
+                                filter,
+                                nullptr,
+                                nullptr);
                     }
                 }
             }
@@ -2314,7 +2288,7 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     // TODO: move reranking logic here and generalize
     llm->build_dense_out(dense_2_out_layers, dense_2_out_layers_b, dense_3_out_layers);
 
-    llm->res->set_outputs();
+    llm->res->set_outputs(params);
 
     return llm->res->get_gf();
 }
@@ -2331,7 +2305,6 @@ llama_model_params llama_model_default_params() {
         /*.n_gpu_layers                =*/ -1,
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.main_gpu                    =*/ 0,
-        /*.output_device                =*/ nullptr,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
@@ -2381,6 +2354,10 @@ int32_t llama_model_n_layer(const llama_model * model) {
     return model->hparams.n_layer();
 }
 
+int32_t llama_model_n_layer_nextn(const llama_model * model) {
+    return model->hparams.n_layer_nextn;
+}
+
 int32_t llama_model_n_head(const llama_model * model) {
     return model->hparams.n_head();
 }
@@ -2390,19 +2367,12 @@ int32_t llama_model_n_head_kv(const llama_model * model) {
 }
 
 int32_t llama_model_n_swa(const llama_model * model) {
-    return model->hparams.n_swa;
-}
-
-const char * llama_model_arch_name(const llama_model * model) {
-    return model ? llm_arch_name(model->arch) : "unknown";
-}
-
-int32_t llama_model_is_swa_layer(const llama_model * model, int32_t il) {
-    if (!model || il < 0 || il >= (int32_t) model->hparams.n_layer_all) {
-        return -1;
+    // dsv4 kv-cache has SWA but it cannot be used as a rollback because of
+    // other compression ratios, so we return 0 here
+    if (model->arch == LLM_ARCH_DEEPSEEK4) {
+        return 0;
     }
-
-    return model->hparams.is_swa((uint32_t) il) ? 1 : 0;
+    return model->hparams.n_swa;
 }
 
 
@@ -2476,12 +2446,14 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_XVERSE:
         case LLM_ARCH_COMMAND_R:
         case LLM_ARCH_COHERE2:
+        case LLM_ARCH_COHERE2MOE:
         case LLM_ARCH_OLMO:
         case LLM_ARCH_ARCTIC:
         case LLM_ARCH_DEEPSEEK:
         case LLM_ARCH_DEEPSEEK2:
         case LLM_ARCH_DEEPSEEK2OCR:
         case LLM_ARCH_DEEPSEEK32:
+        case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_PLM:
         case LLM_ARCH_CHATGLM:
         case LLM_ARCH_GRANITE:
@@ -2495,6 +2467,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_ERNIE4_5:
         case LLM_ARCH_ERNIE4_5_MOE:
         case LLM_ARCH_MISTRAL3:
+        case LLM_ARCH_EAGLE3:
         case LLM_ARCH_MISTRAL4:
         case LLM_ARCH_LLAMA_EMBED:
         case LLM_ARCH_MAINCODER:
@@ -2569,7 +2542,6 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_TALKIE:
         case LLM_ARCH_MELLUM:
         case LLM_ARCH_DFLASH:
-        case LLM_ARCH_DFLASH_DRAFT:
             return LLAMA_ROPE_TYPE_NEOX;
 
         case LLM_ARCH_QWEN2VL:
@@ -2599,63 +2571,6 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
 
 float llama_model_rope_freq_scale_train(const llama_model * model) {
     return model->hparams.rope_freq_scale_train;
-}
-
-float llama_model_rope_freq_base_train(const llama_model * model) {
-    return model->hparams.rope_freq_base_train;
-}
-
-float llama_model_rope_freq_base_train_swa(const llama_model * model) {
-    return model->hparams.rope_freq_base_train_swa;
-}
-
-float llama_model_rope_freq_scale_train_swa(const llama_model * model) {
-    return model->hparams.rope_freq_scale_train_swa;
-}
-
-void llama_model_share_tensors(llama_model * dst, const llama_model * src) {
-    dst->tok_embd = src->tok_embd;
-    dst->output   = src->output;
-}
-
-int32_t llama_model_dflash_block_size(const llama_model * model) {
-    if (!model || !llm_arch_is_dflash_drafter(model->arch)) {
-        return 0;
-    }
-    return (int32_t) model->hparams.dflash_block_size;
-}
-
-int32_t llama_model_dflash_mask_token_id(const llama_model * model) {
-    if (!model || !llm_arch_is_dflash_drafter(model->arch)) {
-        return LLAMA_TOKEN_NULL;
-    }
-    return (int32_t) model->hparams.dflash_mask_token_id;
-}
-
-int32_t llama_model_dflash_n_target_layers(const llama_model * model) {
-    if (!model || !llm_arch_is_dflash_drafter(model->arch)) {
-        return 0;
-    }
-    return (int32_t) model->hparams.dflash_n_target_layers;
-}
-
-int32_t llama_model_dflash_n_target_features(const llama_model * model) {
-    if (!model || !llm_arch_is_dflash_drafter(model->arch)) {
-        return 0;
-    }
-    return (int32_t) model->hparams.dflash_n_target_features;
-}
-
-int32_t llama_model_dflash_target_layer_ids(const llama_model * model, int32_t * layer_ids, int32_t capacity) {
-    if (!model || !llm_arch_is_dflash_drafter(model->arch)) {
-        return 0;
-    }
-    int32_t n = (int32_t) model->hparams.dflash_n_target_layers;
-    if (n > capacity) n = capacity;
-    for (int32_t i = 0; i < n; ++i) {
-        layer_ids[i] = (int32_t) model->hparams.dflash_target_layer_ids[i];
-    }
-    return n;
 }
 
 int32_t llama_model_meta_val_str(const llama_model * model, const char * key, char * buf, size_t buf_size) {
@@ -2719,6 +2634,10 @@ int32_t llama_model_desc(const llama_model * model, char * buf, size_t buf_size)
     return snprintf(buf, buf_size, "%s", model->desc().c_str());
 }
 
+llama_ftype llama_model_ftype(const llama_model * model) {
+    return model->ftype();
+}
+
 uint64_t llama_model_size(const llama_model * model) {
     return model->size();
 }
@@ -2748,8 +2667,10 @@ uint64_t llama_model_n_params(const llama_model * model) {
 
 bool llama_model_has_encoder(const llama_model * model) {
     switch (model->arch) {
-        case LLM_ARCH_T5:        return true;
-        case LLM_ARCH_T5ENCODER: return true;
+        case LLM_ARCH_T5:
+        case LLM_ARCH_T5ENCODER:
+        case LLM_ARCH_EAGLE3:
+        case LLM_ARCH_DFLASH:    return true;
         default:                 return false;
     }
 }
@@ -2796,10 +2717,6 @@ ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int 
     return model->devices[i].dev;
 }
 
-ggml_backend_dev_t llama_model_dev_output(const struct llama_model * model) {
-    return model ? model->dev_output() : nullptr;
-}
-
 //
 // llama_model_base
 //
@@ -2838,4 +2755,13 @@ void llama_model_base::create_tensor_qkv(llama_layer & layer, int bid,
         layer.wk_b = create_tensor(tn(LLM_TENSOR_ATTN_K, "bias", bid), {n_embd_k_}, TENSOR_NOT_REQUIRED);
         layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V, "bias", bid), {n_embd_v_}, TENSOR_NOT_REQUIRED);
     }
+}
+
+const int32_t * llama_model_target_layer_ids(const struct llama_model * model) {
+    const auto & v = model->target_layer_ids;
+    return v.empty() ? nullptr : v.data();
+}
+
+uint32_t llama_model_target_layer_ids_n(const struct llama_model * model) {
+    return (uint32_t) model->target_layer_ids.size();
 }

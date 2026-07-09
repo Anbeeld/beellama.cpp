@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1.7
-
 ARG UBUNTU_VERSION=24.04
 
 # This needs to generally match the container host's environment.
@@ -7,7 +5,25 @@ ARG ROCM_VERSION=7.2.1
 ARG AMDGPU_VERSION=7.2.1
 
 # Target the ROCm build image
-ARG BASE_ROCM_DEV_CONTAINER=rocm/dev-ubuntu-${UBUNTU_VERSION}:${ROCM_VERSION}-complete
+ARG BASE_ROCM_DEV_CONTAINER=docker.io/rocm/dev-ubuntu-${UBUNTU_VERSION}:${ROCM_VERSION}-complete
+
+ARG BUILD_DATE=N/A
+ARG APP_VERSION=N/A
+ARG APP_REVISION=N/A
+
+ARG NODE_VERSION=24
+
+FROM docker.io/node:$NODE_VERSION AS web
+
+ARG APP_VERSION
+
+WORKDIR /app/tools/ui
+
+COPY tools/ui/package.json tools/ui/package-lock.json ./
+RUN npm ci
+
+COPY tools/ui/ ./
+RUN LLAMA_BUILD_NUMBER="$APP_VERSION" npm run build
 
 ### Build image
 FROM ${BASE_ROCM_DEV_CONTAINER} AS build
@@ -23,37 +39,29 @@ ARG ROCM_DOCKER_ARCH='gfx908;gfx90a;gfx942;gfx1030;gfx1100;gfx1101;gfx1102;gfx11
 # Set ROCm architectures
 ENV AMDGPU_TARGETS=${ROCM_DOCKER_ARCH}
 
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
-    apt-get update \
+RUN apt-get update \
     && apt-get install -y \
     build-essential \
     cmake \
-    ccache \
     git \
     libssl-dev \
     curl \
     libgomp1
 
-ENV CCACHE_SLOPPINESS=time_macros CCACHE_MAXSIZE=5G
-
 WORKDIR /app
 
 COPY . .
 
-RUN --mount=type=cache,target=/root/.ccache \
-    HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -R)" \
+COPY --from=web /app/tools/ui/dist tools/ui/dist
+
+RUN HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -R)" \
     cmake -S . -B build \
         -DGGML_HIP=ON \
         -DGGML_HIP_ROCWMMA_FATTN=ON \
         -DAMDGPU_TARGETS="$ROCM_DOCKER_ARCH" \
         -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON \
-        -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-        -DCMAKE_HIP_COMPILER_LAUNCHER=ccache \
         -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TESTS=OFF \
-    && cmake --build build --config Release -j$(nproc) \
-    && ccache --show-stats
+    && cmake --build build --config Release -j$(nproc)
 
 RUN mkdir -p /app/lib \
     && find build -name "*.so*" -exec cp -P {} /app/lib \;
@@ -70,26 +78,28 @@ RUN mkdir -p /app/full \
 ## Base image
 FROM ${BASE_ROCM_DEV_CONTAINER} AS base
 
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
-    apt-get update \
-    && apt-get install -y --no-install-recommends libgomp1 curl \
-    && rm -rf /tmp/* /var/tmp/*
-
-COPY --from=build /app/lib/ /app
-
 ARG BUILD_DATE=N/A
 ARG APP_VERSION=N/A
 ARG APP_REVISION=N/A
-ARG IMAGE_URL=https://github.com/Anbeeld/beellama.cpp
-ARG IMAGE_SOURCE=https://github.com/Anbeeld/beellama.cpp
+ARG IMAGE_URL=https://github.com/ggml-org/llama.cpp
+ARG IMAGE_SOURCE=https://github.com/ggml-org/llama.cpp
 LABEL org.opencontainers.image.created=$BUILD_DATE \
       org.opencontainers.image.version=$APP_VERSION \
       org.opencontainers.image.revision=$APP_REVISION \
-      org.opencontainers.image.title="BeeLlama.cpp" \
-      org.opencontainers.image.description="BeeLlama.cpp GGUF inference with DFlash, TurboQuant, and TCQ cache types" \
+      org.opencontainers.image.title="llama.cpp" \
+      org.opencontainers.image.description="LLM inference in C/C++" \
       org.opencontainers.image.url=$IMAGE_URL \
       org.opencontainers.image.source=$IMAGE_SOURCE
+
+RUN apt-get update \
+    && apt-get install -y libgomp1 curl ffmpeg \
+    && apt autoremove -y \
+    && apt clean -y \
+    && rm -rf /tmp/* /var/tmp/* \
+    && find /var/cache/apt/archives /var/lib/apt/lists -not -name lock -type f -delete \
+    && find /var/cache -type f -delete
+
+COPY --from=build /app/lib/ /app
 
 ### Full
 FROM base AS full
@@ -117,7 +127,7 @@ ENTRYPOINT ["/app/tools.sh"]
 ### Light, CLI only
 FROM base AS light
 
-COPY --from=build /app/full/llama-cli /app/full/llama-completion /app
+COPY --from=build /app/full/llama /app/full/llama-cli /app/full/llama-completion /app
 
 WORKDIR /app
 
@@ -128,11 +138,9 @@ FROM base AS server
 
 ENV LLAMA_ARG_HOST=0.0.0.0
 
-COPY --from=build /app/full/llama-server /app
+COPY --from=build /app/full/llama /app/full/llama-server /app
 
 WORKDIR /app
-
-RUN /app/llama-server --version
 
 HEALTHCHECK CMD [ "curl", "-f", "http://localhost:8080/health" ]
 

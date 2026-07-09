@@ -429,31 +429,14 @@ extern "C" {
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
-        GGML_TYPE_Q6_0    = 49,
-        GGML_TYPE_Q6_1    = 50,
-        GGML_TYPE_Q3_0    = 51,
-        GGML_TYPE_Q3_1    = 52,
-        GGML_TYPE_Q2_0    = 53,
-        GGML_TYPE_Q2_1    = 54,
-        GGML_TYPE_COUNT   = 55,
+        GGML_TYPE_Q2_0    = 42,
+        GGML_TYPE_COUNT   = 43,
     };
 
     // precision
     enum ggml_prec {
         GGML_PREC_DEFAULT =  0, // stored as ggml_tensor.op_params, 0 by default
         GGML_PREC_F32     = 10,
-    };
-
-    enum ggml_flash_attn_ext_op_param {
-        GGML_FLASH_ATTN_EXT_OP_PARAM_PREC         = 3,
-        GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN = 4,
-    };
-
-    enum ggml_flash_attn_ext_kvarn_domain {
-        GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO                 = 0,
-        GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED              = 1,
-        GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ORIGINAL             = 2,
-        GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V = 3,
     };
 
     // op hint
@@ -491,6 +474,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_MXFP4   = 25, // except 1d tensors
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
     };
 
     // available tensor operations:
@@ -586,11 +570,6 @@ extern "C" {
         GGML_OP_RWKV_WKV7,
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
-        GGML_OP_GATED_DELTA_NET_TREE,
-        GGML_OP_SSM_CONV_TREE,
-        GGML_OP_KVARN_WHT,
-        GGML_OP_KVARN_STORE,
-        GGML_OP_KVARN_VIEW,
 
         GGML_OP_UNARY,
 
@@ -1074,26 +1053,6 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_argmax(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
-
-    // argmax with temperature scaling and Gumbel noise (sampling via Gumbel-max trick)
-    // when temp > 0 and seed != 0: samples from softmax(a/temp) distribution
-    // when temp == 0 or seed == 0: equivalent to regular argmax
-    GGML_API struct ggml_tensor * ggml_argmax_ext(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * a,
-            float                 temp,
-            uint64_t              seed);
-
-    // top-K with temperature scaling and Gumbel noise
-    // output: [2*K*nrows] I32 — first K*nrows = token IDs (sorted by score desc),
-    //         second K*nrows = log-probs as float bits
-    // K candidates per row, row-major: row0_tok0, row0_tok1, ..., row0_tokK-1, row1_tok0, ...
-    GGML_API struct ggml_tensor * ggml_topk_ext(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * a,
-            int                   k,
-            float                 temp,
-            uint64_t              seed);
 
     // count number of equal elements in a and b
     GGML_API struct ggml_tensor * ggml_count_equal(
@@ -2596,11 +2555,16 @@ extern "C" {
     // TODO: add ggml_gated_delta_net_set_bcast() to be able to configure Q, K broadcast type: tiled vs interleaved [TAG_GGML_GDN_BCAST]
     // ref: https://github.com/ggml-org/llama.cpp/pull/19468#discussion_r2786394306
     //
-    // state is a 3D tensor of shape (S_v*S_v*H, K, n_seqs):
-    //   K == 1: output carries the final state only.
-    //   K  > 1: output carries K snapshot slots; the kernel writes the last min(n_tokens, K)
-    //   per-token snapshots into the trailing slots
-    // The K == 1 path also accepts the old 4D recurrent-state layout (S_v, S_v, H, n_seqs).
+    // tensor shapes (S_k == S_v, H_v % H_k == 0):
+    //   q, k  : [S_k, H_k, n_tokens, n_seqs]
+    //   v     : [S_v, H_v, n_tokens, n_seqs]
+    //   g     : [1, H_v, n_tokens, n_seqs] (scalar gate) or [S_v, H_v, n_tokens, n_seqs] (KDA)
+    //   beta  : [1, H_v, n_tokens, n_seqs]
+    //   state : [S_v, S_v, H_v, n_seqs] -- initial recurrent state s0
+    //
+    // the output packs the attention scores [S_v, H_v, n_tokens, n_seqs] followed by K state
+    // snapshots, most-recent first (slot 0 = final state, slot s = state s tokens back). K == 1
+    // keeps only the final state; when n_tokens < K only slots 0..n_tokens-1 are written.
     GGML_API struct ggml_tensor * ggml_gated_delta_net(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -2608,59 +2572,8 @@ extern "C" {
             struct ggml_tensor  * v,
             struct ggml_tensor  * g,
             struct ggml_tensor  * beta,
-            struct ggml_tensor  * state);
-
-    // Tree-mode gated delta net: processes tokens with tree structure via parent_ids
-    // persist_inter: [S_v, S_v, H, n_tokens, n_seqs] f16 buffer for intermediate states
-    GGML_API struct ggml_tensor * ggml_gated_delta_net_tree(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * q,
-            struct ggml_tensor  * k,
-            struct ggml_tensor  * v,
-            struct ggml_tensor  * g,
-            struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
-            struct ggml_tensor  * parent_ids,
-            struct ggml_tensor  * persist_inter);
-
-    // Tree-mode SSM conv: follows parent pointers for convolution window
-    GGML_API struct ggml_tensor * ggml_ssm_conv_tree(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * conv_input,
-            struct ggml_tensor  * conv_weight,
-            struct ggml_tensor  * parent_ids);
-
-    // KVarN normalized Sylvester Walsh-Hadamard transform for 128/256/512-wide heads.
-    // The transform matches KVarN store/view math and is self-inverse.
-    GGML_API struct ggml_tensor * ggml_kvarn_wht(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * a,
-            int                   head_width);
-
-    // KVarN structured KV-cache operations. These are fork-specific and intentionally
-    // separate from ggml_type because KVarN records span complete 128-token tiles.
-    GGML_API struct ggml_tensor * ggml_kvarn_store(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * current,
-            struct ggml_tensor  * indices,
-            struct ggml_tensor  * stage,
-            struct ggml_tensor  * records,
-            int                   bits,
-            int                   sinkhorn_iters,
-            bool                  value,
-            int                   stage_groups);
-
-    GGML_API struct ggml_tensor * ggml_kvarn_view(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * records,
-            struct ggml_tensor  * stage_after_store,
-            struct ggml_tensor  * indices,
-            int                   n_kv,
-            int                   stream_start,
-            int                   n_stream,
-            int                   bits,
-            bool                  value,
-            int                   stage_groups);
+            int64_t               K);
 
     // custom operators
 

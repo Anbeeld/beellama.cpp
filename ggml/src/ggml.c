@@ -525,7 +525,11 @@ const char * ggml_commit(void) {
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 static int64_t timer_freq, timer_start;
-void ggml_time_init(void) {
+static BOOL CALLBACK ggml_time_init_once(PINIT_ONCE once, PVOID param, PVOID *ctx) {
+    UNUSED(once);
+    UNUSED(param);
+    UNUSED(ctx);
+
     LARGE_INTEGER t;
     QueryPerformanceFrequency(&t);
     timer_freq = t.QuadPart;
@@ -535,6 +539,12 @@ void ggml_time_init(void) {
     // We subtract the program start time to reduce the likelihood of that happening.
     QueryPerformanceCounter(&t);
     timer_start = t.QuadPart;
+
+    return TRUE;
+}
+void ggml_time_init(void) {
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    InitOnceExecuteOnce(&once, ggml_time_init_once, NULL, NULL);
 }
 int64_t ggml_time_ms(void) {
     LARGE_INTEGER t;
@@ -600,18 +610,15 @@ FILE * ggml_fopen(const char * fname, const char * mode) {
     // convert fname (UTF-8)
     wchar_t * wfname = ggml_mbstowcs(fname);
     if (wfname) {
-        // convert mode (ANSI)
-        wchar_t * wmode = GGML_MALLOC((strlen(mode) + 1) * sizeof(wchar_t));
-        wchar_t * wmode_p = wmode;
-        do {
-            *wmode_p++ = (wchar_t)*mode;
-        } while (*mode++);
-
-        // open file
-        file = _wfopen(wfname, wmode);
+        // convert mode (UTF-8)
+        wchar_t * wmode = ggml_mbstowcs(mode);
+        if (wmode) {
+            // open file
+            file = _wfopen(wfname, wmode);
+            GGML_FREE(wmode);
+        }
 
         GGML_FREE(wfname);
-        GGML_FREE(wmode);
     }
 
     return file;
@@ -674,6 +681,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_q1_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_q1_0_ref,
     },
+    [GGML_TYPE_Q2_0] = {
+        .type_name                = "q2_0",
+        .blck_size                = QK2_0,
+        .type_size                = sizeof(block_q2_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q2_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_q2_0_ref,
+    },
     [GGML_TYPE_Q4_0] = {
         .type_name                = "q4_0",
         .blck_size                = QK4_0,
@@ -717,54 +732,6 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .is_quantized             = true,
         .to_float                 = (ggml_to_float_t) dequantize_row_q5_1,
         .from_float_ref           = (ggml_from_float_t) quantize_row_q5_1_ref,
-    },
-    [GGML_TYPE_Q6_0] = {
-        .type_name                = "q6_0",
-        .blck_size                = QK6_0,
-        .type_size                = sizeof(block_q6_0),
-        .is_quantized             = true,
-        .to_float                 = (ggml_to_float_t) dequantize_row_q6_0,
-        .from_float_ref           = (ggml_from_float_t) quantize_row_q6_0_ref,
-    },
-    [GGML_TYPE_Q6_1] = {
-        .type_name                = "q6_1",
-        .blck_size                = QK6_1,
-        .type_size                = sizeof(block_q6_1),
-        .is_quantized             = true,
-        .to_float                 = (ggml_to_float_t) dequantize_row_q6_1,
-        .from_float_ref           = (ggml_from_float_t) quantize_row_q6_1_ref,
-    },
-    [GGML_TYPE_Q3_0] = {
-        .type_name                = "q3_0",
-        .blck_size                = QK3_0,
-        .type_size                = sizeof(block_q3_0),
-        .is_quantized             = true,
-        .to_float                 = (ggml_to_float_t) dequantize_row_q3_0,
-        .from_float_ref           = (ggml_from_float_t) quantize_row_q3_0_ref,
-    },
-    [GGML_TYPE_Q3_1] = {
-        .type_name                = "q3_1",
-        .blck_size                = QK3_1,
-        .type_size                = sizeof(block_q3_1),
-        .is_quantized             = true,
-        .to_float                 = (ggml_to_float_t) dequantize_row_q3_1,
-        .from_float_ref           = (ggml_from_float_t) quantize_row_q3_1_ref,
-    },
-    [GGML_TYPE_Q2_0] = {
-        .type_name                = "q2_0",
-        .blck_size                = QK2_0,
-        .type_size                = sizeof(block_q2_0),
-        .is_quantized             = true,
-        .to_float                 = (ggml_to_float_t) dequantize_row_q2_0,
-        .from_float_ref           = (ggml_from_float_t) quantize_row_q2_0_ref,
-    },
-    [GGML_TYPE_Q2_1] = {
-        .type_name                = "q2_1",
-        .blck_size                = QK2_1,
-        .type_size                = sizeof(block_q2_1),
-        .is_quantized             = true,
-        .to_float                 = (ggml_to_float_t) dequantize_row_q2_1,
-        .from_float_ref           = (ggml_from_float_t) quantize_row_q2_1_ref,
     },
     [GGML_TYPE_Q8_0] = {
         .type_name                = "q8_0",
@@ -1021,218 +988,226 @@ struct ggml_context {
 //
 
 static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
-    [GGML_OP_NONE]                  = "NONE",
-    [GGML_OP_DUP]                   = "DUP",
-    [GGML_OP_ADD]                   = "ADD",
-    [GGML_OP_ADD_ID]                = "ADD_ID",
-    [GGML_OP_ADD1]                  = "ADD1",
-    [GGML_OP_ACC]                   = "ACC",
-    [GGML_OP_SUB]                   = "SUB",
-    [GGML_OP_MUL]                   = "MUL",
-    [GGML_OP_DIV]                   = "DIV",
-    [GGML_OP_SQR]                   = "SQR",
-    [GGML_OP_SQRT]                  = "SQRT",
-    [GGML_OP_LOG]                   = "LOG",
-    [GGML_OP_SIN]                   = "SIN",
-    [GGML_OP_COS]                   = "COS",
-    [GGML_OP_SUM]                   = "SUM",
-    [GGML_OP_SUM_ROWS]              = "SUM_ROWS",
-    [GGML_OP_CUMSUM]                = "CUMSUM",
-    [GGML_OP_MEAN]                  = "MEAN",
-    [GGML_OP_ARGMAX]                = "ARGMAX",
-    [GGML_OP_COUNT_EQUAL]           = "COUNT_EQUAL",
-    [GGML_OP_REPEAT]                = "REPEAT",
-    [GGML_OP_REPEAT_BACK]           = "REPEAT_BACK",
-    [GGML_OP_CONCAT]                = "CONCAT",
-    [GGML_OP_SILU_BACK]             = "SILU_BACK",
-    [GGML_OP_NORM]                  = "NORM",
-    [GGML_OP_RMS_NORM]              = "RMS_NORM",
-    [GGML_OP_RMS_NORM_BACK]         = "RMS_NORM_BACK",
-    [GGML_OP_GROUP_NORM]            = "GROUP_NORM",
-    [GGML_OP_L2_NORM]               = "L2_NORM",
-    [GGML_OP_MUL_MAT]               = "MUL_MAT",
-    [GGML_OP_MUL_MAT_ID]            = "MUL_MAT_ID",
-    [GGML_OP_OUT_PROD]              = "OUT_PROD",
-    [GGML_OP_SCALE]                 = "SCALE",
-    [GGML_OP_SET]                   = "SET",
-    [GGML_OP_CPY]                   = "CPY",
-    [GGML_OP_CONT]                  = "CONT",
-    [GGML_OP_RESHAPE]              = "RESHAPE",
-    [GGML_OP_VIEW]                  = "VIEW",
-    [GGML_OP_PERMUTE]              = "PERMUTE",
-    [GGML_OP_TRANSPOSE]             = "TRANSPOSE",
-    [GGML_OP_GET_ROWS]              = "GET_ROWS",
-    [GGML_OP_GET_ROWS_BACK]         = "GET_ROWS_BACK",
-    [GGML_OP_SET_ROWS]              = "SET_ROWS",
-    [GGML_OP_DIAG]                  = "DIAG",
-    [GGML_OP_DIAG_MASK_INF]         = "DIAG_MASK_INF",
-    [GGML_OP_DIAG_MASK_ZERO]        = "DIAG_MASK_ZERO",
-    [GGML_OP_SOFT_MAX]              = "SOFT_MAX",
-    [GGML_OP_SOFT_MAX_BACK]         = "SOFT_MAX_BACK",
-    [GGML_OP_ROPE]                  = "ROPE",
-    [GGML_OP_ROPE_BACK]             = "ROPE_BACK",
-    [GGML_OP_CLAMP]                 = "CLAMP",
-    [GGML_OP_CONV_TRANSPOSE_1D]     = "CONV_TRANSPOSE_1D",
-    [GGML_OP_IM2COL]                = "IM2COL",
-    [GGML_OP_IM2COL_BACK]           = "IM2COL_BACK",
-    [GGML_OP_IM2COL_3D]             = "IM2COL_3D",
-    [GGML_OP_COL2IM_1D]             = "COL2IM_1D",
-    [GGML_OP_CONV_2D]               = "CONV_2D",
-    [GGML_OP_CONV_3D]               = "CONV_3D",
-    [GGML_OP_CONV_2D_DW]            = "CONV_2D_DW",
-    [GGML_OP_CONV_TRANSPOSE_2D]     = "CONV_TRANSPOSE_2D",
-    [GGML_OP_POOL_1D]               = "POOL_1D",
-    [GGML_OP_POOL_2D]               = "POOL_2D",
-    [GGML_OP_POOL_2D_BACK]          = "POOL_2D_BACK",
-    [GGML_OP_UPSCALE]               = "UPSCALE",
-    [GGML_OP_PAD]                   = "PAD",
-    [GGML_OP_PAD_REFLECT_1D]        = "PAD_REFLECT_1D",
-    [GGML_OP_ROLL]                  = "ROLL",
-    [GGML_OP_ARANGE]                = "ARANGE",
-    [GGML_OP_TIMESTEP_EMBEDDING]    = "TIMESTEP_EMBEDDING",
-    [GGML_OP_ARGSORT]               = "ARGSORT",
-    [GGML_OP_TOP_K]                 = "TOP_K",
-    [GGML_OP_LEAKY_RELU]            = "LEAKY_RELU",
-    [GGML_OP_TRI]                   = "TRI",
-    [GGML_OP_FILL]                  = "FILL",
-    [GGML_OP_FLASH_ATTN_EXT]        = "FLASH_ATTN_EXT",
-    [GGML_OP_FLASH_ATTN_BACK]       = "FLASH_ATTN_BACK",
-    [GGML_OP_SSM_CONV]              = "SSM_CONV",
-    [GGML_OP_SSM_SCAN]              = "SSM_SCAN",
-    [GGML_OP_WIN_PART]              = "WIN_PART",
-    [GGML_OP_WIN_UNPART]            = "WIN_UNPART",
-    [GGML_OP_GET_REL_POS]           = "GET_REL_POS",
-    [GGML_OP_ADD_REL_POS]           = "ADD_REL_POS",
-    [GGML_OP_RWKV_WKV6]             = "RWKV_WKV6",
-    [GGML_OP_GATED_LINEAR_ATTN]     = "GATED_LINEAR_ATTN",
-    [GGML_OP_RWKV_WKV7]             = "RWKV_WKV7",
-    [GGML_OP_SOLVE_TRI]             = "SOLVE_TRI",
-    [GGML_OP_GATED_DELTA_NET]       = "GATED_DELTA_NET",
-    [GGML_OP_GATED_DELTA_NET_TREE]  = "GATED_DELTA_NET_TREE",
-    [GGML_OP_SSM_CONV_TREE]         = "SSM_CONV_TREE",
-    [GGML_OP_KVARN_WHT]             = "KVARN_WHT",
-    [GGML_OP_KVARN_STORE]           = "KVARN_STORE",
-    [GGML_OP_KVARN_VIEW]            = "KVARN_VIEW",
-    [GGML_OP_UNARY]                  = "UNARY",
-    [GGML_OP_MAP_CUSTOM1]            = "MAP_CUSTOM1",
-    [GGML_OP_MAP_CUSTOM2]            = "MAP_CUSTOM2",
-    [GGML_OP_MAP_CUSTOM3]            = "MAP_CUSTOM3",
-    [GGML_OP_CUSTOM]                  = "CUSTOM",
-    [GGML_OP_CROSS_ENTROPY_LOSS]      = "CROSS_ENTROPY_LOSS",
-    [GGML_OP_CROSS_ENTROPY_LOSS_BACK] = "CROSS_ENTROPY_LOSS_BACK",
-    [GGML_OP_OPT_STEP_ADAMW]          = "OPT_STEP_ADAMW",
-    [GGML_OP_OPT_STEP_SGD]            = "OPT_STEP_SGD",
-    [GGML_OP_GLU]                     = "GLU",
+    "NONE",
+
+    "DUP",
+    "ADD",
+    "ADD_ID",
+    "ADD1",
+    "ACC",
+    "SUB",
+    "MUL",
+    "DIV",
+    "SQR",
+    "SQRT",
+    "LOG",
+    "SIN",
+    "COS",
+    "SUM",
+    "SUM_ROWS",
+    "CUMSUM",
+    "MEAN",
+    "ARGMAX",
+    "COUNT_EQUAL",
+    "REPEAT",
+    "REPEAT_BACK",
+    "CONCAT",
+    "SILU_BACK",
+    "NORM",
+    "RMS_NORM",
+    "RMS_NORM_BACK",
+    "GROUP_NORM",
+    "L2_NORM",
+
+    "MUL_MAT",
+    "MUL_MAT_ID",
+    "OUT_PROD",
+
+    "SCALE",
+    "SET",
+    "CPY",
+    "CONT",
+    "RESHAPE",
+    "VIEW",
+    "PERMUTE",
+    "TRANSPOSE",
+    "GET_ROWS",
+    "GET_ROWS_BACK",
+    "SET_ROWS",
+    "DIAG",
+    "DIAG_MASK_INF",
+    "DIAG_MASK_ZERO",
+    "SOFT_MAX",
+    "SOFT_MAX_BACK",
+    "ROPE",
+    "ROPE_BACK",
+    "CLAMP",
+    "CONV_TRANSPOSE_1D",
+    "IM2COL",
+    "IM2COL_BACK",
+    "IM2COL_3D",
+    "COL2IM_1D",
+    "CONV_2D",
+    "CONV_3D",
+    "CONV_2D_DW",
+    "CONV_TRANSPOSE_2D",
+    "POOL_1D",
+    "POOL_2D",
+    "POOL_2D_BACK",
+    "UPSCALE",
+    "PAD",
+    "PAD_REFLECT_1D",
+    "ROLL",
+    "ARANGE",
+    "TIMESTEP_EMBEDDING",
+    "ARGSORT",
+    "TOP_K",
+    "LEAKY_RELU",
+    "TRI",
+    "FILL",
+
+    "FLASH_ATTN_EXT",
+    "FLASH_ATTN_BACK",
+    "SSM_CONV",
+    "SSM_SCAN",
+    "WIN_PART",
+    "WIN_UNPART",
+    "GET_REL_POS",
+    "ADD_REL_POS",
+    "RWKV_WKV6",
+    "GATED_LINEAR_ATTN",
+    "RWKV_WKV7",
+    "SOLVE_TRI",
+    "GATED_DELTA_NET",
+
+    "UNARY",
+
+    "MAP_CUSTOM1",
+    "MAP_CUSTOM2",
+    "MAP_CUSTOM3",
+
+    "CUSTOM",
+
+    "CROSS_ENTROPY_LOSS",
+    "CROSS_ENTROPY_LOSS_BACK",
+    "OPT_STEP_ADAMW",
+    "OPT_STEP_SGD",
+
+    "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
-    [GGML_OP_NONE]                  = "none",
-    [GGML_OP_DUP]                   = "x",
-    [GGML_OP_ADD]                   = "x+y",
-    [GGML_OP_ADD_ID]                = "x[i]+y",
-    [GGML_OP_ADD1]                  = "x+y",
-    [GGML_OP_ACC]                   = "view(x,nb,offset)+=y->x",
-    [GGML_OP_SUB]                   = "x-y",
-    [GGML_OP_MUL]                   = "x*y",
-    [GGML_OP_DIV]                   = "x/y",
-    [GGML_OP_SQR]                   = "x^2",
-    [GGML_OP_SQRT]                  = "√x",
-    [GGML_OP_LOG]                   = "log(x)",
-    [GGML_OP_SIN]                   = "sin(x)",
-    [GGML_OP_COS]                   = "cos(x)",
-    [GGML_OP_SUM]                   = "Σx",
-    [GGML_OP_SUM_ROWS]              = "Σx_k",
-    [GGML_OP_CUMSUM]                = "cumsum(x)",
-    [GGML_OP_MEAN]                  = "Σx/n",
-    [GGML_OP_ARGMAX]                = "argmax(x)",
-    [GGML_OP_COUNT_EQUAL]           = "count_equal(x)",
-    [GGML_OP_REPEAT]                = "repeat(x)",
-    [GGML_OP_REPEAT_BACK]           = "repeat_back(x)",
-    [GGML_OP_CONCAT]                = "concat(x, y)",
-    [GGML_OP_SILU_BACK]            = "silu_back(x)",
-    [GGML_OP_NORM]                  = "norm(x)",
-    [GGML_OP_RMS_NORM]              = "rms_norm(x)",
-    [GGML_OP_RMS_NORM_BACK]         = "rms_norm_back(x)",
-    [GGML_OP_GROUP_NORM]            = "group_norm(x)",
-    [GGML_OP_L2_NORM]               = "l2_norm(x)",
-    [GGML_OP_MUL_MAT]               = "X*Y",
-    [GGML_OP_MUL_MAT_ID]            = "X[i]*Y",
-    [GGML_OP_OUT_PROD]              = "X*Y",
-    [GGML_OP_SCALE]                 = "x*v",
-    [GGML_OP_SET]                   = "y-\\>view(x)",
-    [GGML_OP_CPY]                   = "x-\\>y",
-    [GGML_OP_CONT]                  = "cont(x)",
-    [GGML_OP_RESHAPE]              = "reshape(x)",
-    [GGML_OP_VIEW]                  = "view(x)",
-    [GGML_OP_PERMUTE]              = "permute(x)",
-    [GGML_OP_TRANSPOSE]             = "transpose(x)",
-    [GGML_OP_GET_ROWS]              = "get_rows(x)",
-    [GGML_OP_GET_ROWS_BACK]         = "get_rows_back(x)",
-    [GGML_OP_SET_ROWS]              = "set_rows(x)",
-    [GGML_OP_DIAG]                  = "diag(x)",
-    [GGML_OP_DIAG_MASK_INF]         = "diag_mask_inf(x)",
-    [GGML_OP_DIAG_MASK_ZERO]        = "diag_mask_zero(x)",
-    [GGML_OP_SOFT_MAX]              = "soft_max(x)",
-    [GGML_OP_SOFT_MAX_BACK]         = "soft_max_back(x)",
-    [GGML_OP_ROPE]                  = "rope(x)",
-    [GGML_OP_ROPE_BACK]             = "rope_back(x)",
-    [GGML_OP_CLAMP]                 = "clamp(x)",
-    [GGML_OP_CONV_TRANSPOSE_1D]     = "conv_transpose_1d(x)",
-    [GGML_OP_IM2COL]                = "im2col(x)",
-    [GGML_OP_IM2COL_BACK]           = "im2col_back(x)",
-    [GGML_OP_IM2COL_3D]             = "im2col_3d(x)",
-    [GGML_OP_COL2IM_1D]             = "col2im_1d(x)",
-    [GGML_OP_CONV_2D]               = "conv_2d(x)",
-    [GGML_OP_CONV_3D]               = "conv_3d(x)",
-    [GGML_OP_CONV_2D_DW]            = "conv_2d_dw(x)",
-    [GGML_OP_CONV_TRANSPOSE_2D]     = "conv_transpose_2d(x)",
-    [GGML_OP_POOL_1D]               = "pool_1d(x)",
-    [GGML_OP_POOL_2D]               = "pool_2d(x)",
-    [GGML_OP_POOL_2D_BACK]          = "pool_2d_back(x)",
-    [GGML_OP_UPSCALE]               = "upscale(x)",
-    [GGML_OP_PAD]                   = "pad(x)",
-    [GGML_OP_PAD_REFLECT_1D]        = "pad_reflect_1d(x)",
-    [GGML_OP_ROLL]                  = "roll(x)",
-    [GGML_OP_ARANGE]                = "arange(start, stop, step)",
-    [GGML_OP_TIMESTEP_EMBEDDING]    = "timestep_embedding(timesteps, dim, max_period)",
-    [GGML_OP_ARGSORT]               = "argsort(x)",
-    [GGML_OP_TOP_K]                 = "top_k(x)",
-    [GGML_OP_LEAKY_RELU]            = "leaky_relu(x)",
-    [GGML_OP_TRI]                   = "tri(x)",
-    [GGML_OP_FILL]                  = "fill(x, c)",
-    [GGML_OP_FLASH_ATTN_EXT]        = "flash_attn_ext(x)",
-    [GGML_OP_FLASH_ATTN_BACK]       = "flash_attn_back(x)",
-    [GGML_OP_SSM_CONV]              = "ssm_conv(x)",
-    [GGML_OP_SSM_SCAN]              = "ssm_scan(x)",
-    [GGML_OP_WIN_PART]              = "win_part(x)",
-    [GGML_OP_WIN_UNPART]            = "win_unpart(x)",
-    [GGML_OP_GET_REL_POS]           = "get_rel_pos(x)",
-    [GGML_OP_ADD_REL_POS]           = "add_rel_pos(x)",
-    [GGML_OP_RWKV_WKV6]             = "rwkv_wkv6(k, v, r, tf, td, s)",
-    [GGML_OP_GATED_LINEAR_ATTN]     = "gated_linear_attn(k, v, q, gate, s)",
-    [GGML_OP_RWKV_WKV7]             = "rwkv_wkv7(r, w, k, v, a, b, s)",
-    [GGML_OP_SOLVE_TRI]             = "A X = B, A triangular, solve X",
-    [GGML_OP_GATED_DELTA_NET]       = "gated_delta_net(q, k, v, g, beta, s)",
-    [GGML_OP_GATED_DELTA_NET_TREE]  = "gated_delta_net_tree(q, k, v, g, beta, s, parents, inter)",
-    [GGML_OP_SSM_CONV_TREE]         = "ssm_conv_tree(x, c, parents)",
-    [GGML_OP_KVARN_WHT]             = "kvarn_wht(a)",
-    [GGML_OP_KVARN_STORE]           = "kvarn_store(cur, idx, stage, records)",
-    [GGML_OP_KVARN_VIEW]            = "kvarn_view(records, stage, idx)",
-    [GGML_OP_UNARY]                  = "unary(x)",
-    [GGML_OP_MAP_CUSTOM1]            = "map_custom(x)",
-    [GGML_OP_MAP_CUSTOM2]            = "map_custom(x,y)",
-    [GGML_OP_MAP_CUSTOM3]            = "map_custom(x,y,z)",
-    [GGML_OP_CUSTOM]                  = "custom(x)",
-    [GGML_OP_CROSS_ENTROPY_LOSS]      = "cross_entropy_loss(x,y)",
-    [GGML_OP_CROSS_ENTROPY_LOSS_BACK] = "cross_entropy_loss_back(x,y)",
-    [GGML_OP_OPT_STEP_ADAMW]          = "adamw(x)",
-    [GGML_OP_OPT_STEP_SGD]            = "sgd(x)",
-    [GGML_OP_GLU]                     = "glu(x)",
+    "none",
+
+    "x",
+    "x+y",
+    "x[i]+y",
+    "x+y",
+    "view(x,nb,offset)+=y->x",
+    "x-y",
+    "x*y",
+    "x/y",
+    "x^2",
+    "√x",
+    "log(x)",
+    "sin(x)",
+    "cos(x)",
+    "Σx",
+    "Σx_k",
+    "cumsum(x)",
+    "Σx/n",
+    "argmax(x)",
+    "count_equal(x)",
+    "repeat(x)",
+    "repeat_back(x)",
+    "concat(x, y)",
+    "silu_back(x)",
+    "norm(x)",
+    "rms_norm(x)",
+    "rms_norm_back(x)",
+    "group_norm(x)",
+    "l2_norm(x)",
+
+    "X*Y",
+    "X[i]*Y",
+    "X*Y",
+
+    "x*v",
+    "y-\\>view(x)",
+    "x-\\>y",
+    "cont(x)",
+    "reshape(x)",
+    "view(x)",
+    "permute(x)",
+    "transpose(x)",
+    "get_rows(x)",
+    "get_rows_back(x)",
+    "set_rows(x)",
+    "diag(x)",
+    "diag_mask_inf(x)",
+    "diag_mask_zero(x)",
+    "soft_max(x)",
+    "soft_max_back(x)",
+    "rope(x)",
+    "rope_back(x)",
+    "clamp(x)",
+    "conv_transpose_1d(x)",
+    "im2col(x)",
+    "im2col_back(x)",
+    "im2col_3d(x)",
+    "col2im_1d(x)",
+    "conv_2d(x)",
+    "conv_3d(x)",
+    "conv_2d_dw(x)",
+    "conv_transpose_2d(x)",
+    "pool_1d(x)",
+    "pool_2d(x)",
+    "pool_2d_back(x)",
+    "upscale(x)",
+    "pad(x)",
+    "pad_reflect_1d(x)",
+    "roll(x)",
+    "arange(start, stop, step)",
+    "timestep_embedding(timesteps, dim, max_period)",
+    "argsort(x)",
+    "top_k(x)",
+    "leaky_relu(x)",
+    "tri(x)",
+    "fill(x, c)",
+
+    "flash_attn_ext(x)",
+    "flash_attn_back(x)",
+    "ssm_conv(x)",
+    "ssm_scan(x)",
+    "win_part(x)",
+    "win_unpart(x)",
+    "get_rel_pos(x)",
+    "add_rel_pos(x)",
+    "rwkv_wkv6(k, v, r, tf, td, s)",
+    "gated_linear_attn(k, v, q, gate, s)",
+    "rwkv_wkv7(r, w, k, v, a, b, s)",
+    "A X = B, A triangular, solve X",
+    "gated_delta_net(q, k, v, g, beta, s)",
+
+    "unary(x)",
+
+    "map_custom(x)",
+    "map_custom(x,y)",
+    "map_custom(x,y,z)",
+
+    "custom(x)",
+
+    "cross_entropy_loss(x,y)",
+    "cross_entropy_loss_back(x,y)",
+    "adamw(x)",
+    "sgd(x)",
+
+    "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -1378,14 +1353,10 @@ bool ggml_is_quantized(enum ggml_type type) {
 }
 
 const char * ggml_op_name(enum ggml_op op) {
-    GGML_ASSERT(op >= 0 && op < GGML_OP_COUNT);
-    GGML_ASSERT(GGML_OP_NAME[op] != NULL);
     return GGML_OP_NAME[op];
 }
 
 const char * ggml_op_symbol(enum ggml_op op) {
-    GGML_ASSERT(op >= 0 && op < GGML_OP_COUNT);
-    GGML_ASSERT(GGML_OP_SYMBOL[op] != NULL);
     return GGML_OP_SYMBOL[op];
 }
 
@@ -1454,6 +1425,7 @@ enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype) {
         case GGML_FTYPE_MOSTLY_Q4_0:          wtype = GGML_TYPE_Q4_0;  break;
         case GGML_FTYPE_MOSTLY_Q4_1:          wtype = GGML_TYPE_Q4_1;  break;
         case GGML_FTYPE_MOSTLY_Q1_0:          wtype = GGML_TYPE_Q1_0;  break;
+        case GGML_FTYPE_MOSTLY_Q2_0:          wtype = GGML_TYPE_Q2_0;  break;
         case GGML_FTYPE_MOSTLY_Q5_0:          wtype = GGML_TYPE_Q5_0;  break;
         case GGML_FTYPE_MOSTLY_Q5_1:          wtype = GGML_TYPE_Q5_1;  break;
         case GGML_FTYPE_MOSTLY_Q8_0:          wtype = GGML_TYPE_Q8_0;  break;
@@ -2551,56 +2523,6 @@ struct ggml_tensor * ggml_argmax(
 
     result->op     = GGML_OP_ARGMAX;
     result->src[0] = a;
-
-    return result;
-}
-
-struct ggml_tensor * ggml_argmax_ext(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * a,
-        float                 temp,
-        uint64_t              seed) {
-    GGML_ASSERT(ggml_is_matrix(a));
-    GGML_ASSERT(a->ne[0] <= INT32_MAX);
-
-    // always output [2*nrows] I32: first nrows = token IDs, second nrows = log-probs as float bits
-    // (extra 128 bytes is negligible; ensures graph reservation is consistent regardless of temp)
-    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2 * a->ne[1]);
-
-    result->op     = GGML_OP_ARGMAX;
-    result->src[0] = a;
-
-    // op_params[0] = temp (float), op_params[1..2] = seed (uint64)
-    ggml_set_op_params_f32(result, 0, temp);
-    ggml_set_op_params_i32(result, 1, (int32_t)(seed & 0xFFFFFFFF));
-    ggml_set_op_params_i32(result, 2, (int32_t)(seed >> 32));
-
-    return result;
-}
-
-// ggml_topk_ext
-
-struct ggml_tensor * ggml_topk_ext(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * a,
-        int                   k,
-        float                 temp,
-        uint64_t              seed) {
-    GGML_ASSERT(ggml_is_matrix(a));
-    GGML_ASSERT(a->ne[0] <= INT32_MAX);
-    GGML_ASSERT(k >= 1 && k <= 64);
-
-    // output [2*K*nrows] I32: first K*nrows = token IDs, second K*nrows = log-probs as float bits
-    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2 * k * a->ne[1]);
-
-    result->op     = GGML_OP_ARGMAX;
-    result->src[0] = a;
-
-    // op_params[0] = temp, op_params[1..2] = seed, op_params[3] = K
-    ggml_set_op_params_f32(result, 0, temp);
-    ggml_set_op_params_i32(result, 1, (int32_t)(seed & 0xFFFFFFFF));
-    ggml_set_op_params_i32(result, 2, (int32_t)(seed >> 32));
-    ggml_set_op_params_i32(result, 3, (int32_t)k);
 
     return result;
 }
@@ -4004,7 +3926,7 @@ struct ggml_tensor * ggml_set_rows(
     GGML_ASSERT(b->ne[2] % c->ne[1] == 0);
     GGML_ASSERT(b->ne[3] % c->ne[2] == 0);
     GGML_ASSERT(c->ne[3] == 1);
-    GGML_ASSERT(b->type == GGML_TYPE_F32);
+    GGML_ASSERT(b->type == GGML_TYPE_F32 || b->type == GGML_TYPE_F16);
     GGML_ASSERT(c->type == GGML_TYPE_I64 || c->type == GGML_TYPE_I32);
 
     GGML_ASSERT(ggml_is_contiguous_rows(a));
@@ -5457,29 +5379,6 @@ struct ggml_tensor * ggml_arange(
 
 // ggml_flash_attn_ext
 
-static struct ggml_tensor * ggml_kvarn_view_base(struct ggml_tensor * t) {
-    while (t != NULL && (t->op == GGML_OP_PERMUTE || t->op == GGML_OP_RESHAPE)) {
-        t = t->src[0];
-    }
-    return t != NULL && t->op == GGML_OP_KVARN_VIEW ? t : NULL;
-}
-
-static void ggml_flash_attn_ext_add_kvarn_deps(
-        struct ggml_tensor * result,
-        struct ggml_tensor * k,
-        struct ggml_tensor * v) {
-    struct ggml_tensor * k_view = ggml_kvarn_view_base(k);
-    struct ggml_tensor * v_view = ggml_kvarn_view_base(v);
-    if (k_view == NULL && v_view == NULL) {
-        return;
-    }
-    GGML_ASSERT(k_view != NULL && v_view != NULL);
-    result->src[5] = k_view->src[1];
-    result->src[6] = k_view->src[2];
-    result->src[7] = v_view->src[1];
-    result->src[8] = v_view->src[2];
-}
-
 struct ggml_tensor * ggml_flash_attn_ext(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
@@ -5520,7 +5419,6 @@ struct ggml_tensor * ggml_flash_attn_ext(
     result->src[1] = k;
     result->src[2] = v;
     result->src[3] = mask;
-    ggml_flash_attn_ext_add_kvarn_deps(result, k, v);
 
     return result;
 }
@@ -5532,14 +5430,14 @@ void ggml_flash_attn_ext_set_prec(
 
     const int32_t prec_i32 = (int32_t) prec;
 
-    ggml_set_op_params_i32(a, GGML_FLASH_ATTN_EXT_OP_PARAM_PREC, prec_i32);
+    ggml_set_op_params_i32(a, 3, prec_i32); // scale is on first pos, max_bias on second
 }
 
 enum ggml_prec ggml_flash_attn_ext_get_prec(
         const struct ggml_tensor * a) {
     GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
 
-    const int32_t prec_i32 = ggml_get_op_params_i32(a, GGML_FLASH_ATTN_EXT_OP_PARAM_PREC);
+    const int32_t prec_i32 = ggml_get_op_params_i32(a, 3);
 
     return (enum ggml_prec) prec_i32;
 }
@@ -6341,7 +6239,8 @@ struct ggml_tensor * ggml_gated_delta_net(
         struct ggml_tensor  * v,
         struct ggml_tensor  * g,
         struct ggml_tensor  * beta,
-        struct ggml_tensor  * state) {
+        struct ggml_tensor  * state,
+        int64_t               K) {
     GGML_ASSERT(ggml_is_contiguous_rows(q));
     GGML_ASSERT(ggml_is_contiguous_rows(k));
     GGML_ASSERT(ggml_is_contiguous_rows(v));
@@ -6365,17 +6264,17 @@ struct ggml_tensor * ggml_gated_delta_net(
     GGML_ASSERT(g->ne[0] == 1 || g->ne[0] == S_v);
     GGML_ASSERT(beta->ne[0] == 1);
 
-    const bool state_is_3d = state->ne[0] == S_v * S_v * H && state->ne[2] == n_seqs && state->ne[3] == 1;
-    const bool state_is_4d = state->ne[0] == S_v && state->ne[1] == S_v && state->ne[2] == H && state->ne[3] == n_seqs;
-    GGML_ASSERT(state_is_3d || state_is_4d);
-
-    // 3D state: (S_v*S_v*H, K, n_seqs), where K is the snapshot slot count.
-    // 4D state: old K=1 recurrent cache layout (S_v, S_v, H, n_seqs).
-    const int64_t K = state_is_4d ? 1 : state->ne[1];
+    // state holds the initial state s0 only: [S_v, S_v, H, n_seqs]. K (snapshot slot count) is an op param.
+    GGML_ASSERT(state->ne[0] == S_v);
+    GGML_ASSERT(state->ne[1] == S_v);
+    GGML_ASSERT(state->ne[2] == H);
+    GGML_ASSERT(state->ne[3] == n_seqs);
     GGML_ASSERT(K >= 1);
     const int64_t state_rows = K * S_v * n_seqs;
     const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + state_rows, 1, 1 };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) K);
 
     result->op     = GGML_OP_GATED_DELTA_NET;
     result->src[0] = q;
@@ -6385,220 +6284,6 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[4] = beta;
     result->src[5] = state;
 
-    return result;
-}
-
-// ggml_gated_delta_net_tree
-
-struct ggml_tensor * ggml_gated_delta_net_tree(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * q,
-        struct ggml_tensor  * k,
-        struct ggml_tensor  * v,
-        struct ggml_tensor  * g,
-        struct ggml_tensor  * beta,
-        struct ggml_tensor  * state,
-        struct ggml_tensor  * parent_ids,
-        struct ggml_tensor  * persist_inter) {
-    GGML_ASSERT(ggml_is_contiguous_rows(q));
-    GGML_ASSERT(ggml_is_contiguous_rows(k));
-    GGML_ASSERT(ggml_is_contiguous_rows(v));
-    GGML_ASSERT(ggml_is_contiguous(g));
-    GGML_ASSERT(ggml_is_contiguous(beta));
-    GGML_ASSERT(ggml_is_contiguous(state));
-
-    GGML_ASSERT(q->type == GGML_TYPE_F32);
-    GGML_ASSERT(k->type == GGML_TYPE_F32);
-    GGML_ASSERT(v->type == GGML_TYPE_F32);
-    GGML_ASSERT(g->type == GGML_TYPE_F32);
-    GGML_ASSERT(beta->type == GGML_TYPE_F32);
-    GGML_ASSERT(state->type == GGML_TYPE_F32);
-    GGML_ASSERT(parent_ids->type == GGML_TYPE_I32);
-    GGML_ASSERT(persist_inter->type == GGML_TYPE_F16);
-
-    const int64_t S_v      = v->ne[0];
-    const int64_t H        = v->ne[1];
-    const int64_t n_tokens = v->ne[2];
-    const int64_t n_seqs   = v->ne[3];
-
-    GGML_ASSERT(g->ne[0] == 1 || g->ne[0] == S_v);
-    GGML_ASSERT(beta->ne[0] == 1);
-    GGML_ASSERT(ggml_nelements(state) == S_v * S_v * H * n_seqs);
-    GGML_ASSERT(ggml_nelements(parent_ids) >= n_tokens);
-    GGML_ASSERT(ggml_nelements(persist_inter) >= S_v * S_v * H * n_tokens * n_seqs);
-
-    // output layout same as non-tree: [S_v*H, (n_tokens + S_v)*n_seqs]
-    const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + S_v * n_seqs, 1, 1 };
-    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
-
-    result->op     = GGML_OP_GATED_DELTA_NET_TREE;
-    result->src[0] = q;
-    result->src[1] = k;
-    result->src[2] = v;
-    result->src[3] = g;
-    result->src[4] = beta;
-    result->src[5] = state;
-    result->src[6] = parent_ids;
-    result->src[7] = persist_inter;
-
-    return result;
-}
-
-// ggml_ssm_conv_tree
-
-struct ggml_tensor * ggml_ssm_conv_tree(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * sx,
-        struct ggml_tensor  * c,
-        struct ggml_tensor  * parent_ids) {
-    GGML_ASSERT(ggml_is_3d(sx));
-    GGML_ASSERT(ggml_is_matrix(c));
-    GGML_ASSERT(parent_ids->type == GGML_TYPE_I32);
-
-    const int64_t d_conv  = c->ne[0];
-    const int64_t d_inner = c->ne[1];
-    const int64_t n_t     = sx->ne[0] - d_conv + 1;
-    const int64_t n_s     = sx->ne[2];
-
-    GGML_ASSERT(sx->ne[0] == d_conv - 1 + n_t);
-    GGML_ASSERT(sx->ne[1] == d_inner);
-    GGML_ASSERT(n_t >= 0);
-    GGML_ASSERT(ggml_nelements(parent_ids) >= n_t);
-
-    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_inner, n_t, n_s);
-
-    result->op     = GGML_OP_SSM_CONV_TREE;
-    result->src[0] = sx;
-    result->src[1] = c;
-    result->src[2] = parent_ids;
-
-    return result;
-}
-
-// ggml_kvarn_wht
-
-struct ggml_tensor * ggml_kvarn_wht(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * a,
-        int                   head_width) {
-    GGML_ASSERT(ggml_is_contiguous(a));
-    GGML_ASSERT(a->type == GGML_TYPE_F32);
-    GGML_ASSERT(head_width == 128 || head_width == 256 || head_width == 512);
-    GGML_ASSERT(ggml_nelements(a) % head_width == 0);
-
-    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, a->ne);
-
-    result->op = GGML_OP_KVARN_WHT;
-    result->src[0] = a;
-
-    memcpy(result->op_params, &head_width, sizeof(int));
-
-    return result;
-}
-
-// ggml_kvarn_store
-
-static bool ggml_kvarn_valid_bits(int bits) {
-    return bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 8;
-}
-
-enum {
-    GGML_KVARN_OP_PARAM_BITS              = 0,
-    GGML_KVARN_OP_PARAM_ITERS             = 1,
-    GGML_KVARN_OP_PARAM_VIEW_VALUE        = 1,
-    GGML_KVARN_OP_PARAM_STORE_VALUE       = 2,
-    GGML_KVARN_OP_PARAM_STORE_SWA         = 4,
-    GGML_KVARN_OP_PARAM_HEAD_SLICES       = 5,
-    GGML_KVARN_OP_PARAM_STAGE_GROUPS      = 7,
-    GGML_KVARN_OP_PARAM_TAIL_GROUPS       = 8,
-};
-
-struct ggml_tensor * ggml_kvarn_store(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * current,
-        struct ggml_tensor  * indices,
-        struct ggml_tensor  * stage,
-        struct ggml_tensor  * records,
-        int                   bits,
-        int                   sinkhorn_iters,
-        bool                  value,
-        int                   stage_groups) {
-    GGML_ASSERT(current->type == GGML_TYPE_F32);
-    GGML_ASSERT(indices->type == GGML_TYPE_I64);
-    GGML_ASSERT(stage->type == GGML_TYPE_F16);
-    GGML_ASSERT(records->type == GGML_TYPE_I8);
-    GGML_ASSERT(current->ne[0] == 128);
-    // Dynamic stage depth: the stage's third dimension is 128 * stage_groups * n_stream.
-    GGML_ASSERT(stage_groups >= 2);
-    GGML_ASSERT(stage->ne[0] == 128 && stage->ne[2] % (128 * stage_groups) == 0);
-    GGML_ASSERT(current->ne[1] == stage->ne[1] && stage->ne[1] == records->ne[1]);
-    GGML_ASSERT(current->ne[2] == indices->ne[0]);
-    GGML_ASSERT(ggml_kvarn_valid_bits(bits) && sinkhorn_iters > 0);
-    const int64_t n_stream = stage->ne[2] / (128 * stage_groups);
-    GGML_ASSERT(n_stream > 0 && records->ne[2] > 0 && records->ne[2] % n_stream == 0);
-
-    struct ggml_tensor * result = ggml_view_tensor(ctx, stage);
-    result->op = GGML_OP_KVARN_STORE;
-    result->src[0] = current;
-    result->src[1] = indices;
-    result->src[2] = stage;
-    result->src[3] = records;
-    ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_BITS, bits);
-    ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_ITERS, sinkhorn_iters);
-    ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_STORE_VALUE, value ? 1 : 0);
-    // op_params[3..6] are reserved for the cache to set at graph construction
-    // (tokens_per_stream_hint, swa flag, head_slices, and native-view live/swa markers).
-    // op_params[7] carries the explicit dynamic stage_groups depth.
-    // op_params[8] carries tail_groups; default keeps legacy stage-1 behavior.
-    ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_HEAD_SLICES, 1);
-    ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_STAGE_GROUPS, stage_groups);
-    ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_TAIL_GROUPS, stage_groups - 1);
-    return result;
-}
-
-// ggml_kvarn_view
-
-struct ggml_tensor * ggml_kvarn_view(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * records,
-        struct ggml_tensor  * stage_after_store,
-        struct ggml_tensor  * indices,
-        int                   n_kv,
-        int                   stream_start,
-        int                   n_stream,
-        int                   bits,
-        bool                  value,
-        int                   stage_groups) {
-    GGML_ASSERT(records->type == GGML_TYPE_I8);
-    GGML_ASSERT(stage_after_store->type == GGML_TYPE_F16);
-    GGML_ASSERT(indices->type == GGML_TYPE_I64);
-    GGML_ASSERT(stage_groups >= 2);
-    GGML_ASSERT(stage_after_store->ne[0] == 128 && stage_after_store->ne[2] % (128 * stage_groups) == 0);
-    GGML_ASSERT(stage_after_store->ne[1] == records->ne[1]);
-    GGML_ASSERT(n_kv > 0 && ggml_kvarn_valid_bits(bits));
-    const int64_t n_total_stream = stage_after_store->ne[2] / (128 * stage_groups);
-    GGML_ASSERT(n_total_stream > 0 && records->ne[2] > 0 && records->ne[2] % n_total_stream == 0);
-    GGML_ASSERT(stream_start >= 0 && n_stream > 0);
-    GGML_ASSERT((int64_t) stream_start + n_stream <= n_total_stream);
-
-    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 128, stage_after_store->ne[1], n_kv, n_stream);
-    result->op = GGML_OP_KVARN_VIEW;
-    result->src[0] = records;
-    result->src[1] = stage_after_store;
-    result->src[2] = indices;
-    ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_BITS, bits);
-    ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_VIEW_VALUE, value ? 1 : 0);
-    ggml_set_op_params_i32(result, 2, stream_start);
-    ggml_set_op_params_i32(result, 3, n_stream);
-    ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_HEAD_SLICES,
-            ggml_get_op_params_i32(stage_after_store, GGML_KVARN_OP_PARAM_HEAD_SLICES) > 0 ?
-            ggml_get_op_params_i32(stage_after_store, GGML_KVARN_OP_PARAM_HEAD_SLICES) : 1);
-    ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_STAGE_GROUPS, stage_groups);
-    int tail_groups = ggml_get_op_params_i32(stage_after_store, GGML_KVARN_OP_PARAM_TAIL_GROUPS);
-    if (tail_groups <= 0) {
-        tail_groups = stage_groups - 1;
-    }
-    ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_TAIL_GROUPS, tail_groups);
     return result;
 }
 
@@ -7406,8 +7091,7 @@ void ggml_build_backward_expand(
 
         // inplace operations are currently not supported
         GGML_ASSERT(!node->view_src || node->op == GGML_OP_CPY || node->op == GGML_OP_VIEW ||
-            node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE ||
-            node->op == GGML_OP_KVARN_VIEW);
+            node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE);
 
         const size_t ihash = ggml_hash_find(&cgraph->visited_hash_set, node);
         GGML_ASSERT(ihash != GGML_HASHSET_FULL);
@@ -7744,6 +7428,10 @@ static int ggml_node_list_find_tensor(const struct ggml_cgraph * cgraph,
     return -1;
 }
 
+static bool ggml_is_constant(const struct ggml_tensor * tensor) {
+    return tensor->buffer != NULL && ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS && (tensor->flags & GGML_TENSOR_FLAG_PARAM) == 0;
+}
+
 bool ggml_can_fuse_subgraph_ext(const struct ggml_cgraph * cgraph,
                                 const int *                node_idxs,
                                 int                        count,
@@ -7789,10 +7477,11 @@ bool ggml_can_fuse_subgraph_ext(const struct ggml_cgraph * cgraph,
             return false;
         }
 
-        // if node is a view, check if the view_src and all it's parent view_srcs are within the subgraph
+        // if node is a view, check if the view_src and all its parent view_srcs are within the subgraph.
+        // external view sources are allowed only for weight tensors, which are constant for this graph execution.
         struct ggml_tensor * view_src = node->view_src;
         while (view_src) {
-            if (ggml_node_list_find_tensor(cgraph, node_idxs, count, view_src) == -1) {
+            if (ggml_node_list_find_tensor(cgraph, node_idxs, count, view_src) == -1 && !ggml_is_constant(view_src)) {
                 return false;
             }
             view_src = view_src->view_src;
@@ -8064,16 +7753,11 @@ size_t ggml_quantize_chunk(
 
     switch (type) {
         case GGML_TYPE_Q1_0:    result = quantize_q1_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_Q2_0:    result = quantize_q2_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_0:    result = quantize_q4_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_1:    result = quantize_q4_1   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q5_0:    result = quantize_q5_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q5_1:    result = quantize_q5_1   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
-        case GGML_TYPE_Q6_0:    result = quantize_q6_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
-        case GGML_TYPE_Q6_1:    result = quantize_q6_1   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
-        case GGML_TYPE_Q3_0:    result = quantize_q3_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
-        case GGML_TYPE_Q3_1:    result = quantize_q3_1   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
-        case GGML_TYPE_Q2_0:    result = quantize_q2_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
-        case GGML_TYPE_Q2_1:    result = quantize_q2_1   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q8_0:    result = quantize_q8_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_MXFP4:   result = quantize_mxfp4  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_NVFP4:   result = quantize_nvfp4  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;

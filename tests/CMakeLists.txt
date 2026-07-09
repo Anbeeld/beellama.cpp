@@ -116,30 +116,6 @@ function(llama_build_and_test source)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS ${LLAMA_TEST_LABEL})
 endfunction()
 
-find_package(Python3 COMPONENTS Interpreter QUIET)
-if (Python3_Interpreter_FOUND)
-    add_test(
-        NAME test-issue41-regressions-static
-        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-issue41-regressions-static.py)
-    set_property(TEST test-issue41-regressions-static PROPERTY LABELS cuda)
-    add_test(
-        NAME test-cache-type-redirects-static
-        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-cache-type-redirects-static.py)
-    set_property(TEST test-cache-type-redirects-static PROPERTY LABELS main)
-    add_test(
-        NAME test-removed-cache-types-static
-        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-removed-cache-types-static.py)
-    set_property(TEST test-removed-cache-types-static PROPERTY LABELS main)
-    add_test(
-        NAME test-hip-shuffle-compat-static
-        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-hip-shuffle-compat-static.py)
-    set_property(TEST test-hip-shuffle-compat-static PROPERTY LABELS hip)
-endif()
-
 # build test-tokenizer-0 target once and add many tests
 llama_build(test-tokenizer-0.cpp)
 
@@ -175,18 +151,13 @@ endif ()
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-sampling.cpp)
-    llama_build_and_test(test-sampling-grammar.cpp ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-qwen2.gguf)
-    llama_build_and_test(test-cuda-zero-dim-gemm.cpp ARGS ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda/ggml-cuda.cu)
     llama_build_and_test(test-reasoning-budget.cpp)
     llama_build_and_test(test-grammar-parser.cpp)
     llama_build_and_test(test-grammar-integration.cpp)
     llama_build_and_test(test-llama-grammar.cpp)
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
-    target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)
+    target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-chat PRIVATE server-context)
-    llama_build_and_test(test-server-loop-guard.cpp)
-    target_include_directories(test-server-loop-guard PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
-    target_link_libraries(test-server-loop-guard PRIVATE server-context)
     # TODO: disabled on loongarch64 because the ggml-ci node lacks Python 3.8
     if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "loongarch64")
         llama_build_and_test(test-json-schema-to-grammar.cpp   WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
@@ -223,21 +194,11 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-llama-archs.cpp)
 endif()
 
-if (WIN32 AND BUILD_SHARED_LIBS)
-    llama_build_and_test(test-sampling-grammar.cpp ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-qwen2.gguf)
-    llama_build_and_test(test-cuda-zero-dim-gemm.cpp ARGS ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda/ggml-cuda.cu)
-    llama_build_and_test(test-reasoning-budget.cpp)
-    llama_build_and_test(test-server-loop-guard.cpp)
-    target_include_directories(test-server-loop-guard PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
-    target_link_libraries(test-server-loop-guard PRIVATE server-context)
-endif()
-
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
 llama_build_and_test(test-jinja.cpp)
 llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)
 llama_build_and_test(test-chat-auto-parser.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-chat-template.cpp)
-llama_build_and_test(test-json-partial.cpp)
 llama_build_and_test(test-log.cpp)
 llama_build_and_test(
     test-peg-parser.cpp
@@ -250,7 +211,6 @@ llama_build_and_test(
     peg-parser/test-unicode.cpp
     peg-parser/tests.h
 )
-llama_build_and_test(test-regex-partial.cpp)
 
 if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "s390x")
     set(MODEL_NAME "tinyllamas/stories15M-q4_0.gguf")
@@ -273,30 +233,6 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp)
-add_executable(test-kvarn test-kvarn.cpp ../src/llama-kvarn.cpp)
-target_include_directories(test-kvarn PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include)
-target_compile_features(test-kvarn PRIVATE cxx_std_17)
-target_link_libraries(test-kvarn PRIVATE ggml)
-if (LLAMA_TESTS_INSTALL)
-    install(TARGETS test-kvarn RUNTIME)
-endif()
-add_test(NAME test-kvarn WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-kvarn>)
-set_property(TEST test-kvarn PROPERTY LABELS main)
-llama_build_and_test(test-adaptive-dm.cpp)
-llama_build_and_test(test-server-prompt-checkpoint.cpp)
-target_include_directories(test-server-prompt-checkpoint PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)
-target_link_libraries(test-server-prompt-checkpoint PRIVATE server-context)
-llama_build_and_test(test-server-context.cpp)
-target_include_directories(test-server-context PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)
-target_link_libraries(test-server-context PRIVATE server-context)
-llama_build_and_test(test-dflash-ring.cpp)
-llama_build_and_test(test-cpu-out-prod.cpp)
-llama_build_and_test(test-dflash-plumbing.cpp ARGS ${PROJECT_SOURCE_DIR})
-target_include_directories(test-dflash-plumbing PRIVATE ${PROJECT_SOURCE_DIR}/src)
-llama_build_and_test(test-mtmd-plumbing.cpp ARGS ${PROJECT_SOURCE_DIR})
-llama_build_and_test(test-perplexity-plumbing.cpp ARGS ${PROJECT_SOURCE_DIR})
-llama_build_and_test(test-cuda-fattn-route-policy.cpp ARGS ${PROJECT_SOURCE_DIR})
-llama_build_and_test(test-cuda-fattn-vec-policy.cpp ARGS ${PROJECT_SOURCE_DIR})
 
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
@@ -365,15 +301,9 @@ target_link_libraries(${TEST_TARGET} PRIVATE llama)
 llama_build_and_test(test-alloc.cpp)
 target_include_directories(test-alloc PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 
-# op coverage test: catches enum/name/symbol table drift before release
-add_executable(test-ggml-op-coverage test-ggml-op-coverage.cpp)
-target_include_directories(test-ggml-op-coverage PRIVATE ${PROJECT_SOURCE_DIR}/ggml/include)
-target_link_libraries(test-ggml-op-coverage PRIVATE ggml)
-add_test(NAME test-ggml-op-coverage COMMAND test-ggml-op-coverage)
-
-llama_build(export-graph-ops.cpp)
-target_include_directories(export-graph-ops PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+llama_build(test-export-graph-ops.cpp)
+target_include_directories(test-export-graph-ops PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 if (TARGET gguf-model-data)
-    target_link_libraries(export-graph-ops PRIVATE gguf-model-data)
-    target_compile_definitions(export-graph-ops PRIVATE LLAMA_HF_FETCH)
+    target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
+    target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()

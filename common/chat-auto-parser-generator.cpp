@@ -13,10 +13,6 @@
 
 using json = nlohmann::ordered_json;
 
-static bool is_structural_tool_marker(const std::string & marker) {
-    return !marker.empty() && (marker[0] == '<' || marker[0] == '[');
-}
-
 // Helper to iterate over tools/functions
 static void foreach_function(const json & tools, const std::function<void(const json &)> & fn) {
     for (const auto & tool : tools) {
@@ -102,29 +98,14 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &  
             parser.build_grammar(builder, data.grammar_lazy);
         });
 
-        // Set grammar triggers based on tool section markers (fall back to per-call markers).
-        // Some tag-style models occasionally skip the outer per-call wrapper and start
-        // directly at the function marker; trigger there too if it is a structural marker.
+        // Set grammar triggers based on tool section markers (fall back to per-call markers)
         if (data.grammar_lazy) {
-            std::vector<std::string> trigger_markers = {
-                autoparser.tools.format.section_start,
-                autoparser.tools.format.per_call_start,
+            data.grammar_triggers = {
+                { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, trigger_marker }
             };
-            if (is_structural_tool_marker(autoparser.tools.function.name_prefix)) {
-                trigger_markers.push_back(autoparser.tools.function.name_prefix);
-            }
-
-            for (const std::string & marker : trigger_markers) {
-                if (marker.empty()) {
-                    continue;
-                }
-                bool exists = false;
-                for (const auto & trigger : data.grammar_triggers) {
-                    exists = exists || trigger.value == marker;
-                }
-                if (!exists) {
-                    data.grammar_triggers.push_back({ COMMON_GRAMMAR_TRIGGER_TYPE_WORD, marker });
-                }
+            if (autoparser.tools.format.openai_wrapper_trigger) {
+                // model emits the OpenAI function wrapper, trigger on it
+                data.grammar_triggers.push_back({ COMMON_GRAMMAR_TRIGGER_TYPE_WORD, "{\"type\": \"function\"," });
             }
         }
     }
@@ -157,7 +138,7 @@ common_peg_arena autoparser::build_parser(const generation_params & inputs, cons
             auto response_format = p.rule("response-format", p.content(p.schema(p.json(), "response-format-schema", inputs.json_schema)));
             parser = ctx.reasoning_parser + p.space() + p.choice({
                 p.literal("```json") + p.space() + response_format + p.space() + p.literal("```"),
-                response_format
+                p.space() + response_format  + p.space()
             }) + p.end();
             pure_content = false;
         } else if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE && jinja_caps.supports_tool_calls) {
@@ -247,13 +228,13 @@ common_peg_parser analyze_tools::build_tool_parser_json_native(parser_build_cont
         auto single_tool_parser = p.standard_json_tools(
             format.per_call_start, format.per_call_end, inputs.tools, inputs.parallel_tool_calls,
             inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED, name_field, args_field, format.tools_array_wrapped,
-            format.fun_name_is_key, format.id_field, format.gen_id_field, format.parameter_order);
+            format.fun_name_is_key, format.id_field, format.gen_id_field, format.parameter_order, format.openai_wrapper_trigger);
         tools_parser = p.trigger_rule("tool-calls", p.one_or_more(single_tool_parser + p.space()));
     } else {
         tools_parser = p.standard_json_tools(
             format.section_start, format.section_end, inputs.tools, inputs.parallel_tool_calls,
             inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED, name_field, args_field, format.tools_array_wrapped,
-            format.fun_name_is_key, format.id_field, format.gen_id_field, format.parameter_order);
+            format.fun_name_is_key, format.id_field, format.gen_id_field, format.parameter_order, format.openai_wrapper_trigger);
     }
 
     // Handle content wrappers if present
@@ -414,11 +395,11 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
                                            arguments.name_suffix) +
                            arguments.value_prefix +
                            (schema_info.resolves_to_string(param_schema) ?
-                                p.tool_arg_string_value(until_suffix) :
-                                p.tool_arg_json_value(p.schema(
+                                p.ac(p.tool_arg_string_value(until_suffix) +
+                                    p.tool_arg_close(p.literal(arguments.value_suffix)), arguments.value_suffix) :
+                                (p.tool_arg_json_value(p.schema(
                                     p.json(), "tool-" + name + "-arg-" + param_name + "-schema", param_schema, false)) +
-                                    p.space()) +
-                           p.tool_arg_close(p.literal(arguments.value_suffix)));
+                                    p.tool_arg_close(p.literal(arguments.value_suffix)))));
 
             auto named_arg = p.rule("tool-" + name + "-arg-" + param_name, arg);
             if (is_required) {
@@ -478,16 +459,12 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
 
     common_peg_parser tool_calls = p.eps();
 
-    const bool allow_direct_func_start =
-        is_structural_tool_marker(function.name_prefix) && !function.close.empty();
-
     if (!format.per_call_start.empty()) {
         auto wrapped_call = format.per_call_start + p.space() + tool_choice + p.space() + format.per_call_end;
-        auto single_call  = allow_direct_func_start ? (wrapped_call | tool_choice) : wrapped_call;
         if (inputs.parallel_tool_calls) {
-            tool_calls = p.trigger_rule("tool-call", single_call + p.zero_or_more(p.space() + single_call) + p.space());
+            tool_calls = p.trigger_rule("tool-call", wrapped_call + p.zero_or_more(p.space() + wrapped_call) + p.space());
         } else {
-            tool_calls = p.trigger_rule("tool-call", single_call + p.space());
+            tool_calls = p.trigger_rule("tool-call", wrapped_call + p.space());
         }
         if (!format.section_start.empty()) {
             tool_calls = p.trigger_rule("tool-calls",
@@ -511,17 +488,8 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
         tool_calls = p.optional(tool_calls);
     }
 
-    std::vector<std::string> trigger_markers;
-    if (!format.section_start.empty()) {
-        trigger_markers.push_back(format.section_start);
-    }
-    if (!format.per_call_start.empty()) {
-        trigger_markers.push_back(format.per_call_start);
-    }
-    if (allow_direct_func_start) {
-        trigger_markers.push_back(function.name_prefix);
-    }
-    auto content_before_tools = trigger_markers.empty() ? p.eps() : p.until_one_of(trigger_markers);
+    std::string trigger_marker       = !format.section_start.empty() ? format.section_start : format.per_call_start;
+    auto        content_before_tools = trigger_marker.empty() ? p.eps() : p.until(trigger_marker);
     return ctx.reasoning_parser + p.optional(p.content(content_before_tools)) + tool_calls + p.end();
 }
 
