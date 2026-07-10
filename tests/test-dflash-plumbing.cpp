@@ -781,6 +781,11 @@ int main(int argc, char ** argv) {
                  cuda_dispatch_generator.find("assert all_count == 361") != std::string::npos &&
                  cuda_dispatch_generator.find("assert half_count == 217") != std::string::npos,
         "CUDA FlashAttention generators and CMake must include turbo4_tcq and the new q KV types in ALL/HALF matrices");
+    ok &= expect(contains_ws(cuda_cmake,
+                     "elseif (CUDAToolkit_VERSION VERSION_GREATER_EQUAL \"12.4\" AND GGML_CUDA_COMPRESSION_MODE STREQUAL \"size\")") &&
+                 cuda_cmake.find("list(APPEND CUDA_FLAGS -Xfatbin=-compress-all)") != std::string::npos &&
+                 ggml_cmake.find("CUDA 12.4-12.7 support size via compress-all") != std::string::npos,
+        "CUDA 12.4-12.7 size mode must compress cubins through the fatbinary fallback");
     {
         const std::string half_order =
             "q5_0\n"

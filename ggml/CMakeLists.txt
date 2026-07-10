@@ -210,7 +210,7 @@ option(GGML_CUDA_FA_HALF_QUANTS             "ggml: compile K>=V half of KV cache
 option(GGML_CUDA_GRAPHS                     "ggml: use CUDA graphs (llama.cpp only)"          ${GGML_CUDA_GRAPHS_DEFAULT})
 option(GGML_CUDA_NCCL                       "ggml: use NVIDIA Collective Comm. Library"       ON)
 set   (GGML_CUDA_COMPRESSION_MODE "size" CACHE STRING
-                                            "ggml: cuda link binary compression mode; requires cuda 12.8+")
+                                            "ggml: cuda link binary compression mode; CUDA 12.4-12.7 support size via compress-all")
 set_property(CACHE GGML_CUDA_COMPRESSION_MODE PROPERTY STRINGS "none;speed;balance;size")
 
 set(GGML_CUDA_KVARN_FAST_DECODE_DEFAULT_PAIRS
