@@ -379,6 +379,37 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_bool("reasoning_control", params.sampling.reasoning_control))
         ->set_desc("Create the budget sampler on demand so reasoning can be ended at runtime"));
 
+    add((new field_str("reasoning_loop_guard"))
+        ->set_desc("Reasoning loop guard mode: off, force-close, or stop")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            ctx.params.reasoning_loop_guard.mode =
+                common_reasoning_loop_guard_mode_from_name(data.at("reasoning_loop_guard").get<std::string>());
+        }));
+
+    add((new field_num("reasoning_loop_min_tokens", params.reasoning_loop_guard.min_reasoning_tokens))
+        ->set_hard_limits(0, INT32_MAX)
+        ->set_desc("Minimum hidden reasoning tokens before loop checks"));
+
+    add((new field_num("reasoning_loop_window", params.reasoning_loop_guard.window_tokens))
+        ->set_hard_limits(1, INT32_MAX)
+        ->set_desc("Token tail window for reasoning loop checks"));
+
+    add((new field_num("reasoning_loop_max_period", params.reasoning_loop_guard.max_period))
+        ->set_hard_limits(1, INT32_MAX)
+        ->set_desc("Maximum periodic loop length to check"));
+
+    add((new field_num("reasoning_loop_min_coverage", params.reasoning_loop_guard.min_repeated_coverage))
+        ->set_hard_limits(1, INT32_MAX)
+        ->set_desc("Minimum repeated-token coverage before a loop trigger"));
+
+    add((new field_num("reasoning_loop_check_interval", params.reasoning_loop_guard.check_interval))
+        ->set_hard_limits(1, INT32_MAX)
+        ->set_desc("Accepted-token interval between loop checks"));
+
+    add((new field_num("reasoning_loop_interventions", params.reasoning_loop_guard.interventions_max))
+        ->set_hard_limits(0, INT32_MAX)
+        ->set_desc("Maximum force-close interventions before stopping"));
+
     add((new field_num("reasoning_budget_tokens", params.sampling.reasoning_budget_tokens))
         ->set_hard_limits(-1, INT32_MAX)
         ->set_desc("Number of tokens in the reasoning budget (-1 = disabled)"));
@@ -503,6 +534,7 @@ task_params eval_llama_cmpl_schema(
     // Sampling parameter defaults are loaded from the global server context (but individual requests can still them)
     params.sampling      = params_base.sampling;
     params.speculative   = params_base.speculative;
+    params.reasoning_loop_guard = params_base.reasoning_loop_guard;
     params.n_keep        = params_base.n_keep;
     params.n_predict     = params_base.n_predict;
     params.n_cache_reuse = params_base.n_cache_reuse;
@@ -541,6 +573,10 @@ task_params eval_llama_cmpl_schema(
         // if "reasoning_format" is not provided, its handler will not be called, we will need to handle it here
         auto reasoning_format = params.chat_parser_params.reasoning_format;
         params.chat_parser_params.reasoning_in_content = params.stream && (reasoning_format == COMMON_REASONING_FORMAT_DEEPSEEK_LEGACY);
+
+        common_validate_reasoning_loop_guard_params(params.reasoning_loop_guard);
+        params.sampling.reasoning_budget_tracking =
+            params.reasoning_loop_guard.mode != COMMON_REASONING_LOOP_GUARD_OFF;
     }
 
     // debugging

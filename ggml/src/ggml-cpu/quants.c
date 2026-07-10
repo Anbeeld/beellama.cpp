@@ -62,8 +62,8 @@ void quantize_row_q3_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, in
     quantize_row_q3_1_ref(x, y, k);
 }
 
-void quantize_row_q2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
-    quantize_row_q2_0_ref(x, y, k);
+void quantize_row_q2_0s(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q2_0s_ref(x, y, k);
 }
 
 void quantize_row_q2_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
@@ -633,19 +633,19 @@ void ggml_vec_dot_q3_1_q8_1(int n, float * GGML_RESTRICT s, size_t bs, const voi
     ggml_vec_dot_q3_1_q8_1_generic(n, s, bs, vx, bx, vy, by, nrc);
 }
 
-void ggml_vec_dot_q2_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+void ggml_vec_dot_q2_0s_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_0;
     const int nb = n / qk;
 
     assert(n % qk == 0);
-    assert(qk == QK2_0);
+    assert(qk == QK2_0S);
     assert(nrc == 1);
     UNUSED(nrc);
     UNUSED(bx);
     UNUSED(by);
     UNUSED(bs);
 
-    const block_q2_0 * GGML_RESTRICT x = vx;
+    const block_q2_0s * GGML_RESTRICT x = vx;
     const block_q8_0 * GGML_RESTRICT y = vy;
 
     float sumf = 0.0f;
@@ -665,8 +665,8 @@ void ggml_vec_dot_q2_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
     *s = sumf;
 }
 
-void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
-    ggml_vec_dot_q2_0_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
+void ggml_vec_dot_q2_0s_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    ggml_vec_dot_q2_0s_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
 }
 
 void ggml_vec_dot_q2_1_q8_1_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {

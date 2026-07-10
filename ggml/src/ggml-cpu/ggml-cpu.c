@@ -236,6 +236,42 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
+    [GGML_TYPE_Q6_0] = {
+        .from_float               = quantize_row_q6_0,
+        .vec_dot                  = ggml_vec_dot_q6_0_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_Q6_1] = {
+        .from_float               = quantize_row_q6_1,
+        .vec_dot                  = ggml_vec_dot_q6_1_q8_1,
+        .vec_dot_type             = GGML_TYPE_Q8_1,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_Q3_0] = {
+        .from_float               = quantize_row_q3_0,
+        .vec_dot                  = ggml_vec_dot_q3_0_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_Q3_1] = {
+        .from_float               = quantize_row_q3_1,
+        .vec_dot                  = ggml_vec_dot_q3_1_q8_1,
+        .vec_dot_type             = GGML_TYPE_Q8_1,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_Q2_0S] = {
+        .from_float               = quantize_row_q2_0s,
+        .vec_dot                  = ggml_vec_dot_q2_0s_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_Q2_1] = {
+        .from_float               = quantize_row_q2_1,
+        .vec_dot                  = ggml_vec_dot_q2_1_q8_1,
+        .vec_dot_type             = GGML_TYPE_Q8_1,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_Q4_0] = {
         .from_float               = quantize_row_q4_0,
         .vec_dot                  = ggml_vec_dot_q4_0_q8_0,
@@ -265,42 +301,6 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_Q5_1] = {
         .from_float               = quantize_row_q5_1,
         .vec_dot                  = ggml_vec_dot_q5_1_q8_1,
-        .vec_dot_type             = GGML_TYPE_Q8_1,
-        .nrows                    = 1,
-    },
-    [GGML_TYPE_Q6_0] = {
-        .from_float               = quantize_row_q6_0,
-        .vec_dot                  = ggml_vec_dot_q6_0_q8_0,
-        .vec_dot_type             = GGML_TYPE_Q8_0,
-        .nrows                    = 1,
-    },
-    [GGML_TYPE_Q6_1] = {
-        .from_float               = quantize_row_q6_1,
-        .vec_dot                  = ggml_vec_dot_q6_1_q8_1,
-        .vec_dot_type             = GGML_TYPE_Q8_1,
-        .nrows                    = 1,
-    },
-    [GGML_TYPE_Q3_0] = {
-        .from_float               = quantize_row_q3_0,
-        .vec_dot                  = ggml_vec_dot_q3_0_q8_0,
-        .vec_dot_type             = GGML_TYPE_Q8_0,
-        .nrows                    = 1,
-    },
-    [GGML_TYPE_Q3_1] = {
-        .from_float               = quantize_row_q3_1,
-        .vec_dot                  = ggml_vec_dot_q3_1_q8_1,
-        .vec_dot_type             = GGML_TYPE_Q8_1,
-        .nrows                    = 1,
-    },
-    [GGML_TYPE_Q2_0] = {
-        .from_float               = quantize_row_q2_0,
-        .vec_dot                  = ggml_vec_dot_q2_0_q8_0,
-        .vec_dot_type             = GGML_TYPE_Q8_0,
-        .nrows                    = 1,
-    },
-    [GGML_TYPE_Q2_1] = {
-        .from_float               = quantize_row_q2_1,
-        .vec_dot                  = ggml_vec_dot_q2_1_q8_1,
         .vec_dot_type             = GGML_TYPE_Q8_1,
         .nrows                    = 1,
     },
@@ -2048,10 +2048,6 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_ssm_conv(params, tensor);
             } break;
-        case GGML_OP_SSM_CONV_TREE:
-            {
-                ggml_compute_forward_ssm_conv_tree(params, tensor);
-            } break;
         case GGML_OP_SSM_SCAN:
             {
                 ggml_compute_forward_ssm_scan(params, tensor);
@@ -2100,10 +2096,6 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_gated_delta_net(params, tensor);
             } break;
-        case GGML_OP_GATED_DELTA_NET_TREE:
-            {
-                ggml_compute_forward_gated_delta_net_tree(params, tensor);
-            } break;
         case GGML_OP_KVARN_WHT:
             {
                 ggml_compute_forward_kvarn_wht(params, tensor);
@@ -2114,7 +2106,8 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_KVARN_VIEW:
             {
-                // no-op proxy consumed by native KVarN FlashAttention backends
+                // The CPU fallback materializes KVarN views while STORE owns
+                // the persistent record update; VIEW is a graph proxy here.
             } break;
         case GGML_OP_MAP_CUSTOM1:
             {
@@ -2296,7 +2289,6 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_COUNT_EQUAL:
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_GATED_DELTA_NET:
-        case GGML_OP_GATED_DELTA_NET_TREE:
         case GGML_OP_KVARN_WHT:
             {
                 n_tasks = n_threads;
@@ -2442,7 +2434,6 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_FLASH_ATTN_BACK:
         case GGML_OP_SSM_CONV:
-        case GGML_OP_SSM_CONV_TREE:
         case GGML_OP_SSM_SCAN:
             {
                 n_tasks = n_threads;
@@ -2875,7 +2866,7 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_ADD_ID:
                 case GGML_OP_ADD1:
                     {
-                        if (ggml_is_quantized(node->src[0]->type)) {
+                        if (ggml_is_quantized(node->src[0]->type) || node->src[0]->type == GGML_TYPE_F16) {
                             cur = ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
                         }
                     } break;
@@ -3025,16 +3016,11 @@ struct ggml_cplan ggml_graph_plan(
                         const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
                         cur = per_thread * sizeof(float) * n_tasks;
                     } break;
-                case GGML_OP_GATED_DELTA_NET_TREE:
-                    {
-                        const int64_t S_v = node->src[2]->ne[0];
-                        cur = S_v * sizeof(float) * n_tasks;
-                    } break;
                 case GGML_OP_KVARN_WHT:
                 case GGML_OP_KVARN_STORE:
                 case GGML_OP_KVARN_VIEW:
                     {
-                        cur = 0;  // no extra workspace needed
+                        cur = 0;
                     } break;
                 case GGML_OP_COUNT:
                     {

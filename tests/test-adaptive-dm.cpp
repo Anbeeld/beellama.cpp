@@ -30,19 +30,18 @@ static void observe_profit_cycle(
             0.0f, cycle_ms, 0.0f, cycle_ms);
 }
 
+static common_params_speculative make_dflash_spec(int n_max) {
+    common_params_speculative spec;
+    spec.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
+    spec.draft.n_max = n_max;
+    spec.draft.n_min = 0;
+    spec.draft.p_split = 0.1f;
+    spec.draft.p_min = 0.0f;
+    spec.draft.backend_sampling = true;
+    return spec;
+}
+
 int main() {
-    const float min = 0.30f;
-    const float max = 0.65f;
-
-    assert_close(server_adaptive_dm_required_fringe_for_n_max(2, 8, min, max), 0.30f);
-    assert_close(server_adaptive_dm_required_fringe_for_n_max(3, 8, min, max), 0.35833335f);
-    assert_close(server_adaptive_dm_required_fringe_for_n_max(4, 8, min, max), 0.41666669f);
-    assert_close(server_adaptive_dm_required_fringe_for_n_max(6, 8, min, max), 0.53333336f);
-    assert_close(server_adaptive_dm_required_fringe_for_n_max(8, 8, min, max), 0.65f);
-
-    assert_close(server_adaptive_dm_required_fringe_for_n_max(99, 8, min, max), 0.65f);
-    assert_close(server_adaptive_dm_required_fringe_for_n_max(4, 1, min, max), 0.30f);
-
     assert(server_adaptive_dm_probe_n_max(8, 0.25f) == 2);
     assert(server_adaptive_dm_probe_n_max(16, 0.25f) == 4);
     assert(server_adaptive_dm_probe_n_max(8, 0.50f) == 4);
@@ -229,16 +228,7 @@ int main() {
     assert(!server_adaptive_dm_should_preserve_for_continuation(0.0f, 0.0f));
 
     server_adaptive_dm_state state;
-    state.fringe_ring_idx = 7;
-    state.fringe_ring_count = 13;
-    state.rolling_fringe = 0.75f;
     state.adaptive_n_max = 6;
-    state.adaptive_probe_counter = 11;
-    state.off_dwell = 3;
-    state.explore_counter = 19;
-    state.fringe_epoch = 4;
-    state.fringe_epoch_reached[2] = 9;
-    state.fringe_epoch_accepted[2] = 5;
     state.profit_pos_accept_ewma[2] = 0.75f;
     state.profit_pos_samples[2] = 9;
     state.profit_depth[4].samples = 3;
@@ -246,11 +236,12 @@ int main() {
     state.profit_has_key = true;
     state.profit_key = {};
     state.profit_key.base_n_max = 8;
-    state.profit_key.branch_budget = 0;
-    state.profit_key.draft_topk = 1;
-    state.profit_key.dflash_cross_ctx = 1024;
-    state.profit_key.draft_temp = 0.0f;
-    state.profit_key.p_min = 0.0f;
+    state.profit_key.draft_n_min = 0;
+    state.profit_key.draft_p_split = 0.1f;
+    state.profit_key.draft_p_min = 0.0f;
+    state.profit_key.draft_backend_sampling = 1;
+    state.profit_key.draft_cache_type_k = GGML_TYPE_F16;
+    state.profit_key.draft_cache_type_v = GGML_TYPE_F16;
     state.profit_pending = true;
     state.profit_last_recommended_n = 4;
     state.profit_consecutive_below_profit = 2;
@@ -259,16 +250,7 @@ int main() {
     state.profit_baseline_probe_resume_n = 6;
     state.reset_request_state();
 
-    assert(state.fringe_ring_idx == 0);
-    assert(state.fringe_ring_count == 0);
-    assert(state.rolling_fringe == 0.0f);
     assert(state.adaptive_n_max == -1);
-    assert(state.adaptive_probe_counter == 0);
-    assert(state.off_dwell == 0);
-    assert(state.explore_counter == 0);
-    assert(state.fringe_epoch == 5);
-    assert(state.fringe_epoch_reached[2] == 0);
-    assert(state.fringe_epoch_accepted[2] == 0);
     // request resets are prompt-change boundaries. Profit telemetry is keyed
     // by configuration and survives, but the last request's recommendation
     // must not carry over to a different prompt class.
@@ -366,38 +348,8 @@ int main() {
         assert(warm_start.profit_depth[15].samples == 1);
     }
 
-    state.fringe_epoch = 2;
-    state.fringe_ring_idx = 0;
-    state.fringe_ring_count = 0;
-    state.fringe_ring[state.fringe_ring_idx++] = { 8, 8, 1 };
-    state.fringe_ring_count++;
-    state.fringe_ring[state.fringe_ring_idx++] = { 0, 8, 2 };
-    state.fringe_ring_count++;
-    state.fringe_ring[state.fringe_ring_idx++] = { 0, 8, 2 };
-    state.fringe_ring_count++;
-
-    auto decision = state.fringe_decision_at_window(8, 1, 1);
-    assert(decision.reached == 2);
-    assert(decision.accepted == 0);
-    assert_close(decision.fringe, 0.0f);
-
-    state.reset_request_state();
-    state.fringe_epoch = 3;
-    state.fringe_ring[0] = { 0, 5, 3 };
-    state.fringe_ring_idx = 1;
-    state.fringe_ring_count = 1;
-    state.fringe_epoch_reached[4] = 6;
-    state.fringe_epoch_accepted[4] = 3;
-
-    decision = state.fringe_decision_at_window(5, 1, 6);
-    assert(decision.reached == 6);
-    assert(decision.accepted == 3);
-    assert_close(decision.fringe, 0.5f);
-
-    assert(server_adaptive_dm_uses_fringe_controller(COMMON_SPECULATIVE_DM_CONTROLLER_FRINGE));
-    assert(!server_adaptive_dm_uses_fringe_controller(COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT));
-    assert(!server_adaptive_dm_uses_profit_controller(COMMON_SPECULATIVE_DM_CONTROLLER_FRINGE));
     assert(server_adaptive_dm_uses_profit_controller(COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT));
+    assert(!server_adaptive_dm_uses_profit_controller(COMMON_SPECULATIVE_DM_CONTROLLER_OFF));
 
     state.adaptive_n_max = 4;
     state.apply_profit_recommendation(2);
@@ -550,13 +502,7 @@ int main() {
     common_params_speculative empty_spec;
     state.reset_profit_if_config_changed(empty_spec, 1, 0);
     // actually need a proper spec struct; let's use the simpler check
-    common_params_speculative spec;
-    spec.n_max = 8;
-    spec.branch_budget = 0;
-    spec.draft_topk = 1;
-    spec.dflash_cross_ctx = 1024;
-    spec.sample_temp = 0.0f;
-    spec.p_min = 0.0f;
+    common_params_speculative spec = make_dflash_spec(8);
     common_params_sampling sampling;
     sampling.temp = 0.6f;
     sampling.top_k = 20;
@@ -575,7 +521,7 @@ int main() {
     assert(state.profit_depth[2].samples == 0);
     state.observe_profit_timing(2, 2, 1, 10.0f, 20.0f, 5.0f, 35.0f);
     state.adaptive_n_max = 8;
-    spec.dflash_cross_ctx = 2048;
+    spec.draft.p_split = 0.2f;
     state.reset_profit_if_config_changed(spec, 8, 0, &sampling);
     assert(state.profit_depth[2].samples == 0);
     assert(state.adaptive_n_max == -1);
@@ -585,13 +531,7 @@ int main() {
     // arbitrary positions in a long-context model.
     {
         server_adaptive_dm_state position;
-        common_params_speculative position_spec;
-        position_spec.n_max = 16;
-        position_spec.branch_budget = 0;
-        position_spec.draft_topk = 1;
-        position_spec.dflash_cross_ctx = 1024;
-        position_spec.sample_temp = 0.0f;
-        position_spec.p_min = 0.0f;
+        common_params_speculative position_spec = make_dflash_spec(16);
 
         position.reset_profit_if_config_changed(position_spec, 16, 900);
         position.observe_profit_timing(0, 0, 0, 0.0f, 30.0f, 0.0f, 30.0f);
@@ -705,13 +645,7 @@ int main() {
         server_adaptive_dm_state reprobe;
         reprobe.dm_profit_min_samples = 1;
         reprobe.dm_profit_baseline_interval = 3;
-        common_params_speculative reprobe_spec;
-        reprobe_spec.n_max = 8;
-        reprobe_spec.branch_budget = 0;
-        reprobe_spec.draft_topk = 1;
-        reprobe_spec.dflash_cross_ctx = 1024;
-        reprobe_spec.sample_temp = 0.0f;
-        reprobe_spec.p_min = 0.0f;
+        common_params_speculative reprobe_spec = make_dflash_spec(8);
         reprobe.reset_profit_if_config_changed(reprobe_spec, 8, 40000);
         reprobe.adaptive_n_max = 8;
         reprobe.observe_profit_timing(0, 0, 0, 0.0f, 40.0f, 0.0f, 40.0f);
@@ -733,13 +667,7 @@ int main() {
         server_adaptive_dm_state early;
         early.dm_profit_min_samples = 1;
         early.dm_profit_baseline_interval = 1;
-        common_params_speculative early_spec;
-        early_spec.n_max = 8;
-        early_spec.branch_budget = 0;
-        early_spec.draft_topk = 1;
-        early_spec.dflash_cross_ctx = 1024;
-        early_spec.sample_temp = 0.0f;
-        early_spec.p_min = 0.0f;
+        common_params_speculative early_spec = make_dflash_spec(8);
         early.reset_profit_if_config_changed(early_spec, 8, 4096);
         early.adaptive_n_max = 8;
         early.observe_profit_timing(0, 0, 0, 0.0f, 40.0f, 0.0f, 40.0f);

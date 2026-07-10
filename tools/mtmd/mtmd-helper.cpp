@@ -289,13 +289,8 @@ int32_t mtmd_helper_decode_image_chunk(
 
     const bool use_non_causal = mtmd_decode_use_non_causal(ctx, chunk);
     if (use_non_causal) {
-        const int32_t n_ubatch = llama_n_ubatch(lctx);
-        if (n_tokens > n_batch || n_tokens > n_ubatch) {
-            LOG_ERR("failed to decode %s: non-causal attention requires the full chunk in one batch (n_tokens = %d, n_batch = %d, n_ubatch = %d); increase --ubatch-size or lower --image-max-tokens\n",
-                    name, n_tokens, n_batch, n_ubatch);
-            return -1;
-        }
         llama_set_causal_attn(lctx, false);
+        // TODO @ngxson : need to make sure only one image is processed at a time, and n_ubatch must be enough to hold the image
     }
 
     while (i_batch < n_img_batches) { // split into batches

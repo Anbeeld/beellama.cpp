@@ -25,6 +25,17 @@ static constexpr uint32_t DSV4_STATE_MODE_PARTIAL  = 1;
 static constexpr uint32_t DSV4_K_CACHE_STATE_VER   = 1;
 static constexpr uint32_t DSV4_COMP_STATE_VER      = 1;
 
+// DSV4 builds its raw iSWA cache from plain llama_kv_cache instances.  KVarN
+// iSWA children use the same composite interface, so keep this boundary
+// explicit instead of assuming every iSWA child has the old concrete type.
+static llama_kv_cache * dsv4_require_standard_cache(llama_memory_i * memory) {
+    auto * cache = dynamic_cast<llama_kv_cache *>(memory);
+    if (cache == nullptr) {
+        throw std::runtime_error("DSV4 requires a standard KV cache child");
+    }
+    return cache;
+}
+
 static uint32_t dsv4_comp_size(uint32_t kv_size, uint32_t ratio) {
     return std::max<uint32_t>(1, (kv_size + ratio - 1)/ratio);
 }
@@ -956,8 +967,11 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
 
     kv_raw = std::make_unique<llama_kv_cache_iswa>(
             model, hparams_raw, type_k, type_v,
-            v_trans, offload, swa_full, unified_raw, kv_size, n_seq_max, n_ubatch, n_pad,
-            nullptr, filter_raw, reuse, nullptr);
+            // This raw DSV4 cache never enables KVarN. n_batch is therefore
+            // unused by its standard children; use n_ubatch to preserve the
+            // original allocation behavior through the common constructor.
+            v_trans, offload, swa_full, unified_raw, kv_size, n_seq_max, n_ubatch, n_ubatch, n_pad,
+            nullptr, filter_raw, reuse, nullptr, llama_kvarn_default_params());
 
     dsv4_make_k_only(hparams_csa);
     dsv4_make_k_only(hparams_hca);
@@ -1043,19 +1057,21 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
             bool embd_all) {
     GGML_UNUSED(embd_all);
 
-    const bool raw_per_seq  = kv_raw->get_base()->get_n_stream() != 1;
+    auto * const kv_raw_base = dsv4_require_standard_cache(kv_raw->get_base());
+    auto * const kv_raw_swa  = dsv4_require_standard_cache(kv_raw->get_swa());
+    const bool raw_per_seq  = kv_raw_base->get_n_stream() != 1;
     const bool comp_per_seq = csa_state->get_n_stream() > 1;
     const bool has_coupled = dsv4_batch_has_coupled(balloc.get_batch());
 
     const auto make_context = [&](std::vector<llama_ubatch> ubatches) -> llama_memory_context_ptr {
         auto ubatches_raw = dsv4_build_raw_write_ubatches(ubatches);
 
-        auto sinfos_raw_base_write = kv_raw->get_base()->prepare(ubatches_raw);
+        auto sinfos_raw_base_write = kv_raw_base->prepare(ubatches_raw);
         if (sinfos_raw_base_write.empty()) {
             return nullptr;
         }
 
-        auto sinfos_raw_swa_write = kv_raw->get_swa()->prepare(ubatches_raw);
+        auto sinfos_raw_swa_write = kv_raw_swa->prepare(ubatches_raw);
         if (sinfos_raw_swa_write.empty()) {
             return nullptr;
         }
@@ -1173,6 +1189,22 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
     }
 
     return res;
+}
+
+bool llama_kv_cache_dsv4::seq_rm_cell(llama_seq_id seq_id, uint32_t cell_idx) {
+    GGML_UNUSED(seq_id);
+    GGML_UNUSED(cell_idx);
+    // DSV4 compressed rows are derived from the complete running state and
+    // cannot be safely repaired after a single-cell removal.
+    return false;
+}
+
+int llama_kv_cache_dsv4::cells_at_pos(
+        llama_seq_id seq_id,
+        llama_pos pos,
+        uint32_t * cell_indices,
+        int n_max) {
+    return kv_raw->cells_at_pos(seq_id, pos, cell_indices, n_max);
 }
 
 void llama_kv_cache_dsv4::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
@@ -1357,7 +1389,7 @@ static llama_kv_cache::slot_info dsv4_build_full_sinfo(const llama_kv_cache * kv
 }
 
 llama_kv_cache_dsv4_raw_context::llama_kv_cache_dsv4_raw_context(llama_kv_cache_iswa * kv) :
-    kv_swa(kv->get_swa()),
+    kv_swa(dsv4_require_standard_cache(kv->get_swa())),
     ctx_base_mem(nullptr),
     ctx_swa_mem(nullptr),
     n_kv(kv_swa->get_size()),
@@ -1370,7 +1402,7 @@ llama_kv_cache_dsv4_raw_context::llama_kv_cache_dsv4_raw_context(
         llama_kv_cache_iswa * kv,
         llama_context * lctx,
         bool optimize) :
-    kv_swa(kv->get_swa()),
+    kv_swa(dsv4_require_standard_cache(kv->get_swa())),
     ctx_base_mem(kv->get_base()->init_update(lctx, optimize)),
     ctx_swa_mem(kv->get_swa()->init_update(lctx, optimize)),
     n_kv(kv_swa->get_size()),
@@ -1384,13 +1416,13 @@ llama_kv_cache_dsv4_raw_context::llama_kv_cache_dsv4_raw_context(
         slot_info_vec_t sinfos_swa_read,
         std::vector<llama_ubatch> ubatches,
         std::vector<llama_ubatch> ubatches_write) :
-    kv_swa(kv->get_swa()),
+    kv_swa(dsv4_require_standard_cache(kv->get_swa())),
     sinfos_write(std::move(sinfos_swa_write)),
     sinfos_read(std::move(sinfos_swa_read)),
     ubatches(std::move(ubatches)),
     ubatches_write(std::move(ubatches_write)),
     ctx_base_mem(std::make_unique<llama_kv_cache_context>(
-                kv->get_base(), std::move(sinfos_base_write), this->ubatches_write)),
+                dsv4_require_standard_cache(kv->get_base()), std::move(sinfos_base_write), this->ubatches_write)),
     ctx_swa_mem(nullptr),
     n_kv(kv_swa->get_size()),
     status(LLAMA_MEMORY_STATUS_SUCCESS) {

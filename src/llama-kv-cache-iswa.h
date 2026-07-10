@@ -32,6 +32,8 @@ public:
         const  layer_share_cb & share,
           llama_kvarn_params   kvarn = llama_kvarn_default_params());
 
+    // DSV4 uses a projected hparams view for its raw iSWA cache.  Keep this
+    // explicit overload so KVarN support does not erase that upstream need.
     llama_kv_cache_iswa(
             const llama_model & model,
             const llama_hparams & hparams,
@@ -43,12 +45,14 @@ public:
                          bool   unified,
                      uint32_t   kv_size,
                      uint32_t   n_seq_max,
+                     uint32_t   n_batch,
                      uint32_t   n_ubatch,
                      uint32_t   n_pad,
                llama_memory_t   mem_other,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
-        const  layer_share_cb & share);
+        const  layer_share_cb & share,
+          llama_kvarn_params   kvarn = llama_kvarn_default_params());
 
     ~llama_kv_cache_iswa() = default;
 
@@ -79,7 +83,6 @@ public:
     int cells_at_pos(llama_seq_id seq_id, llama_pos pos, uint32_t * cell_indices, int n_max) override;
 
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
-    void seq_cp_recurrent(llama_seq_id, llama_seq_id, llama_pos, llama_pos) override {}
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;

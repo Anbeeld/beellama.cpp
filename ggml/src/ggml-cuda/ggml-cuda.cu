@@ -28,6 +28,8 @@
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
+#include "ggml-cuda/kvarn-wht.cuh"
+#include "ggml-cuda/kvarn.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
@@ -1333,6 +1335,12 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
+    // Empty graph slices are valid no-op work.  cuBLAS rejects zero-sized
+    // GEMMs, so leave before conversions, temporary allocations, or dispatch.
+    if (ggml_is_empty(src0) || ggml_is_empty(src1) || ggml_is_empty(dst)) {
+        return;
+    }
+
     const int64_t ne_dst = ggml_nelements(dst);
     cudaStream_t main_stream = ctx.stream();
     CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), main_stream));
@@ -2254,6 +2262,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_SOLVE_TRI:
             ggml_cuda_op_solve_tri(ctx, dst);
             break;
+        case GGML_OP_KVARN_WHT:
+            ggml_cuda_op_kvarn_wht(ctx, dst);
+            break;
+        case GGML_OP_KVARN_STORE:
+            ggml_cuda_op_kvarn_store(ctx, dst);
+            break;
         case GGML_OP_FILL:
             ggml_cuda_op_fill(ctx, dst);
             break;
@@ -2390,9 +2404,25 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     GGML_UNUSED(backend);
 }
 
+#ifndef NDEBUG
+static const ggml_tensor * ggml_cuda_kvarn_view_base(const ggml_tensor * t) {
+    while (t != nullptr && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE)) {
+        t = t->src[0];
+    }
+    return t != nullptr && t->op == GGML_OP_KVARN_VIEW ? t : nullptr;
+}
+
+static bool ggml_cuda_allows_bufferless_kvarn_src(const ggml_tensor * node, int src_index, const ggml_tensor * src) {
+    return node->op == GGML_OP_FLASH_ATTN_EXT &&
+        (src_index == 1 || src_index == 2) &&
+        ggml_cuda_kvarn_view_base(src) != nullptr;
+}
+#endif
+
 static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
     return ggml_is_empty(t) || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_TRANSPOSE ||
-           t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
+           t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_KVARN_VIEW ||
+           t->op == GGML_OP_NONE;
 }
 
 #ifdef USE_CUDA_GRAPH
@@ -3911,6 +3941,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 assert(node->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device));
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     if (node->src[j] != nullptr) {
+                        if (ggml_cuda_allows_bufferless_kvarn_src(node, j, node->src[j])) {
+                            continue;
+                        }
                         assert(node->src[j]->buffer);
                         assert(node->src[j]->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
                                (integrated && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)));
@@ -4571,6 +4604,29 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
     return ggml_backend_cuda_host_buffer_type();
 }
 
+static bool ggml_backend_cuda_kvarn_native_ops(ggml_backend_dev_t dev) {
+#if defined(GGML_USE_MUSA)
+    GGML_UNUSED(dev);
+    return false;
+#else
+    if (dev == nullptr || dev->context == nullptr) {
+        return false;
+    }
+
+    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+    const int device = dev_ctx->device;
+    const auto & info = ggml_cuda_info();
+    if (device < 0 || device >= info.device_count || !turing_mma_available(info.devices[device].cc)) {
+        return false;
+    }
+
+    const size_t high_shared = ggml_cuda_kvarn_required_shared_bytes();
+    const size_t low_shared = ggml_cuda_kvarn_low_shared_bytes();
+    GGML_ASSERT(low_shared <= high_shared);
+    return info.devices[device].smpbo >= low_shared;
+#endif
+}
+
 // TODO: move these functions here
 static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
@@ -4960,6 +5016,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 #endif // GGML_USE_MUSA
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
+        case GGML_OP_KVARN_WHT:
+        case GGML_OP_KVARN_STORE:
+            return ggml_backend_cuda_kvarn_native_ops(dev);
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:
@@ -5149,6 +5208,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_kvarn_native_ops") == 0) {
+        return (void *)ggml_backend_cuda_kvarn_native_ops;
     }
     return nullptr;
 }

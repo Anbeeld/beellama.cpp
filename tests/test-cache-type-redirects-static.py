@@ -14,8 +14,8 @@ def main() -> None:
     bench = (ROOT / "tools" / "llama-bench" / "llama-bench.cpp").read_text(encoding="utf-8")
 
     expected = {
-        "turbo2": (2, "GGML_TYPE_Q2_0"),
-        "turbo2_tcq": (2, "GGML_TYPE_Q2_0"),
+        "turbo2": (2, "GGML_TYPE_Q2_0S"),
+        "turbo2_tcq": (2, "GGML_TYPE_Q2_0S"),
         "turbo3": (3, "GGML_TYPE_Q3_0"),
         "turbo3_tcq": (3, "GGML_TYPE_Q3_0"),
         "turbo4": (4, "GGML_TYPE_Q4_0"),

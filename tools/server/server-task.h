@@ -356,6 +356,7 @@ struct server_task_result_cmpl_final : server_task_result {
     std::string stopping_word;
     stop_type stop = STOP_TYPE_NONE;
     std::string stop_detail;
+
     int32_t reasoning_output_tokens = 0;
     int32_t visible_output_tokens = 0;
     bool loop_guard_triggered = false;
@@ -391,7 +392,7 @@ struct server_task_result_cmpl_final : server_task_result {
 
     virtual void update(task_result_state & state) override {
         is_updated = true;
-        oaicompat_msg = state.update_chat_msg(content, false, oaicompat_msg_diffs, true);
+        oaicompat_msg = state.update_chat_msg(content, false, oaicompat_msg_diffs);
 
         oai_resp_id = state.oai_resp_id;
         oai_resp_reasoning_id = state.oai_resp_reasoning_id;
@@ -600,32 +601,6 @@ struct server_prompt_data {
     }
 };
 
-struct server_prompt_checkpoint {
-    llama_pos pos_min;
-    llama_pos pos_max;
-
-    int64_t n_tokens;
-
-    std::vector<uint8_t> data;
-    std::vector<uint8_t> ring_data; // DFlash ring buffer state
-
-    size_t size() const {
-        return data.size() + ring_data.size();
-    }
-
-    bool empty() const {
-        return data.empty();
-    }
-
-    void clear() {
-        pos_min = 0;
-        pos_max = 0;
-        n_tokens = 0;
-        std::vector<uint8_t>().swap(data);
-        std::vector<uint8_t>().swap(ring_data);
-    }
-};
-
 struct server_prompt {
     server_tokens tokens;
 
@@ -649,13 +624,6 @@ struct server_prompt {
         return tokens.size();
     }
 
-    void clear() {
-        tokens.clear();
-        std::vector<uint8_t>().swap(data.main);
-        std::vector<uint8_t>().swap(data.drft);
-        checkpoints.clear();
-    }
-
     server_prompt clone() const {
         return server_prompt {
             tokens.clone(),
@@ -664,31 +632,6 @@ struct server_prompt {
         };
     }
 };
-
-size_t server_prompt_checkpoints_size(const std::list<common_prompt_checkpoint> & checkpoints);
-
-bool server_prompt_checkpoint_matches_restore_window(
-        const common_prompt_checkpoint & checkpoint,
-        llama_pos                        pos_min_thold,
-        llama_pos                        pos_next,
-        bool                             is_recurrent_or_hybrid);
-
-int server_prompt_effective_checkpoint_limit(
-        int  configured_checkpoints,
-        bool prompt_cache_boundary_required);
-
-bool server_prompt_checkpoint_creation_allowed(
-        bool boundary_only,
-        bool n_before_user_known,
-        bool is_on_user,
-        bool is_after_user,
-        bool near_prompt_end);
-
-server_prompt server_prompt_clone_with_checkpoint_budget(
-        const server_prompt & prompt,
-        size_t state_size,
-        size_t limit_size,
-        size_t max_checkpoints);
 
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
@@ -708,24 +651,9 @@ struct server_prompt_cache {
 
     size_t n_tokens() const;
 
-    bool prepare_save(
-            server_prompt & out,
-            const server_prompt & prompt,
-            size_t state_size_main,
-            size_t state_size_drft,
-            size_t reserved_size = 0);
-
-    bool commit_save(server_prompt && prompt);
-
     server_prompt * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
-    bool load(
-            server_prompt & prompt,
-            const server_tokens & tokens_new,
-            llama_context * ctx_main,
-            llama_context * ctx_drft,
-            int32_t id_slot,
-            bool allow_state_restore);
+    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot);
 
     void update();
 };

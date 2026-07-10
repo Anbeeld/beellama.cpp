@@ -2,8 +2,8 @@
 
 BeeLlama.cpp inherits most llama.cpp contribution conventions. For fork-specific
 work, open issues and PRs against `Anbeeld/beellama.cpp`, and update the
-BeeLlama docs when speculative decoding, DFlash, TurboQuant, or reasoning-loop
-behavior changes.
+BeeLlama docs when speculative decoding, KVarN or low-bit KV-cache behavior,
+or reasoning-loop behavior changes.
 
 The project differentiates between 3 levels of contributors:
 

@@ -48,6 +48,12 @@ def main() -> None:
             if identifier in text:
                 raise AssertionError(f"{relative_path} still exposes removed identifier {identifier}")
 
+    loader = (ROOT / "src/llama-model-loader.cpp").read_text(encoding="utf-8")
+    if "ftype_val == 43 || ftype_val == 44" not in loader:
+        raise AssertionError("legacy Bee TQ3/TQ4 file-type IDs must fail before their tensor IDs can be reinterpreted")
+    if "legacy Bee TQ3/TQ4 weight format was removed" not in loader:
+        raise AssertionError("legacy TQ rejection must explain how to recover")
+
 
 if __name__ == "__main__":
     main()

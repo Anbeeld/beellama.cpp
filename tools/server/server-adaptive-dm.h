@@ -21,26 +21,8 @@ static inline int server_adaptive_dm_probe_n_max(int base_n_max, float probe_fra
     return std::min(probe_n_max, base_n_max);
 }
 
-static inline float server_adaptive_dm_required_fringe_for_n_max(
-        int target_n_max,
-        int base_n_max,
-        float fringe_min,
-        float fringe_max) {
-    if (base_n_max <= 2 || target_n_max <= 2 || fringe_max <= fringe_min) {
-        return fringe_min;
-    }
-
-    const int bounded_n_max = std::clamp(target_n_max, 2, base_n_max);
-    const float t = (float)(bounded_n_max - 2) / (float)(base_n_max - 2);
-    return std::clamp(fringe_min + (fringe_max - fringe_min) * t, fringe_min, fringe_max);
-}
-
 static inline bool server_adaptive_dm_should_preserve_for_continuation(float prompt_similarity, float keep_fraction) {
     return prompt_similarity > 0.90f && keep_fraction > 0.90f;
-}
-
-static inline bool server_adaptive_dm_uses_fringe_controller(common_speculative_dm_controller controller) {
-    return controller == COMMON_SPECULATIVE_DM_CONTROLLER_FRINGE;
 }
 
 static inline bool server_adaptive_dm_uses_profit_controller(common_speculative_dm_controller controller) {
@@ -49,7 +31,7 @@ static inline bool server_adaptive_dm_uses_profit_controller(common_speculative_
 
 static inline const char * server_adaptive_dm_controller_name(common_speculative_dm_controller controller) {
     switch (controller) {
-        case COMMON_SPECULATIVE_DM_CONTROLLER_FRINGE: return "fringe";
+        case COMMON_SPECULATIVE_DM_CONTROLLER_OFF:    return "off";
         case COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT: return "profit";
     }
     return "unknown";
@@ -276,39 +258,17 @@ static inline int server_adaptive_dm_apply_profit_hysteresis(
 }
 
 struct server_adaptive_dm_state {
-    static constexpr int FRINGE_WINDOW = 32;
-    static constexpr int FRINGE_REACH_POSITIONS = SERVER_ADAPTIVE_DM_PROFIT_POSITIONS;
     static constexpr int PROFIT_POSITIONS = SERVER_ADAPTIVE_DM_PROFIT_POSITIONS;
     static constexpr int PROFIT_DEPTHS = SERVER_ADAPTIVE_DM_PROFIT_DEPTHS;
     static constexpr int PROFIT_CANDIDATES = SERVER_ADAPTIVE_DM_PROFIT_CANDIDATES;
 
-    struct fringe_entry {
-        int16_t  n_accepted;
-        int16_t  n_draft;
-        uint32_t epoch;
-    };
-
-    fringe_entry fringe_ring[FRINGE_WINDOW] = {};
-    int   fringe_ring_idx   = 0;
-    int   fringe_ring_count = 0;
-    float rolling_fringe    = 0.0f;
     int32_t adaptive_n_max  = -1;
-    int32_t adaptive_probe_counter = 0;
-    int32_t off_dwell       = 0;
-    int32_t explore_counter = 0;
-    uint32_t fringe_epoch   = 0;
-    int32_t fringe_epoch_reached[FRINGE_REACH_POSITIONS] = {};
-    int32_t fringe_epoch_accepted[FRINGE_REACH_POSITIONS] = {};
 
     bool    dm_adaptive       = true;
-    float   dm_fringe_min     = 0.30f;
-    float   dm_fringe_max     = 0.50f;
     int32_t dm_off_dwell      = 8;
-    int32_t dm_explore_interval = 12;
-    int32_t dm_min_reach      = 3;
     int32_t dm_probe_interval = 16;
     float   dm_probe_fraction = 0.25f;
-    int32_t dm_fringe_window  = 3;
+    float   dm_profit_high_acceptance_threshold = 0.50f;
     common_speculative_dm_controller dm_controller = COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT;
     float   dm_profit_min          = 0.05f;
     float   dm_profit_raise_margin = 0.05f;
@@ -332,12 +292,13 @@ struct server_adaptive_dm_state {
     };
 
     struct profit_config_key {
-        int32_t base_n_max       = -1;
-        int32_t branch_budget    = -1;
-        int32_t draft_topk       = -1;
-        int32_t dflash_cross_ctx = -1;
-        float   draft_temp       = -1.0f;
-        float   p_min            = -1.0f;
+        int32_t base_n_max            = -1;
+        int32_t draft_n_min           = -1;
+        float   draft_p_split          = -1.0f;
+        float   draft_p_min            = -1.0f;
+        int32_t draft_backend_sampling = -1;
+        int32_t draft_cache_type_k     = -1;
+        int32_t draft_cache_type_v     = -1;
         int32_t target_top_k     = -1;
         int32_t target_has_grammar = -1;
         int32_t target_grammar_lazy = -1;
@@ -356,7 +317,6 @@ struct server_adaptive_dm_state {
     int32_t profit_pending_requested_n_max = 0;
     int32_t profit_pending_n_draft = 0;
     int32_t profit_pending_n_accepted = 0;
-    bool    profit_pending_tree = false;
     uint32_t profit_epoch = 0;
     float   profit_current_score = 0.0f;
     int32_t profit_last_recommended_n = -1;
@@ -379,15 +339,15 @@ struct server_adaptive_dm_state {
     double  profit_request_depth_start_output_tokens[PROFIT_DEPTHS] = {};
     double  profit_request_depth_start_cycle_ms[PROFIT_DEPTHS] = {};
 
-    struct fringe_decision {
-        float fringe = 0.0f;
-        int   reached = 0;
-        int   accepted = 0;
-    };
-
-    void reset_fringe_epoch_reached() {
-        std::fill_n(fringe_epoch_reached, FRINGE_REACH_POSITIONS, 0);
-        std::fill_n(fringe_epoch_accepted, FRINGE_REACH_POSITIONS, 0);
+    void configure(const common_params_speculative & spec) {
+        dm_adaptive = server_adaptive_dm_uses_profit_controller(spec.dm_controller);
+        dm_profit_min = spec.dm_profit_min;
+        dm_profit_raise_margin = spec.dm_profit_raise_margin;
+        dm_profit_lower_margin = spec.dm_profit_lower_margin;
+        dm_profit_ewma_alpha = spec.dm_profit_ewma_alpha;
+        dm_profit_min_samples = spec.dm_profit_min_samples;
+        dm_profit_warmup = spec.dm_profit_warmup;
+        dm_profit_baseline_interval = spec.dm_profit_baseline_interval;
     }
 
     void profit_mark_request_measurement_boundary(bool require_depth_measurements) {
@@ -421,16 +381,7 @@ struct server_adaptive_dm_state {
             profit_has_key &&
             (profit_key.base_n_max <= 0 || resume_n_max <= profit_key.base_n_max);
 
-        std::fill_n(fringe_ring, FRINGE_WINDOW, fringe_entry{});
-        fringe_ring_idx = 0;
-        fringe_ring_count = 0;
-        rolling_fringe = 0.0f;
         adaptive_n_max = -1;
-        adaptive_probe_counter = 0;
-        off_dwell = 0;
-        explore_counter = 0;
-        fringe_epoch++;
-        reset_fringe_epoch_reached();
         reset_request_profit_state(false);
         profit_mark_request_measurement_boundary(!can_resume);
         if (can_resume) {
@@ -447,7 +398,6 @@ struct server_adaptive_dm_state {
         profit_pending_requested_n_max = 0;
         profit_pending_n_draft = 0;
         profit_pending_n_accepted = 0;
-        profit_pending_tree = false;
         profit_consecutive_below_profit = 0;
         profit_current_score = 0.0f;
         if (!preserve_recommendation) {
@@ -475,9 +425,6 @@ struct server_adaptive_dm_state {
         reset_request_profit_state();
         profit_mark_request_measurement_boundary(false);
         adaptive_n_max = -1;
-        adaptive_probe_counter = 0;
-        explore_counter = 0;
-        off_dwell = 0;
     }
 
     void reset_profit_if_config_changed(
@@ -488,11 +435,12 @@ struct server_adaptive_dm_state {
         (void) n_past;
         const profit_config_key next {
             base_n_max,
-            spec.branch_budget,
-            spec.draft_topk,
-            spec.dflash_cross_ctx,
-            spec.sample_temp,
-            spec.p_min,
+            spec.draft.n_min,
+            spec.draft.p_split,
+            spec.draft.p_min,
+            (int32_t) spec.draft.backend_sampling,
+            (int32_t) spec.draft.cache_type_k,
+            (int32_t) spec.draft.cache_type_v,
             sampling ? sampling->top_k : -1,
             sampling ? (common_grammar_value(sampling->grammar).empty() ? 0 : 1) : -1,
             sampling ? (sampling->grammar_lazy ? 1 : 0) : -1,
@@ -502,12 +450,13 @@ struct server_adaptive_dm_state {
         };
         const bool changed =
             !profit_has_key ||
-            profit_key.base_n_max       != next.base_n_max ||
-            profit_key.branch_budget    != next.branch_budget ||
-            profit_key.draft_topk       != next.draft_topk ||
-            profit_key.dflash_cross_ctx != next.dflash_cross_ctx ||
-            profit_key.draft_temp       != next.draft_temp ||
-            profit_key.p_min            != next.p_min ||
+            profit_key.base_n_max            != next.base_n_max ||
+            profit_key.draft_n_min           != next.draft_n_min ||
+            profit_key.draft_p_split          != next.draft_p_split ||
+            profit_key.draft_p_min            != next.draft_p_min ||
+            profit_key.draft_backend_sampling != next.draft_backend_sampling ||
+            profit_key.draft_cache_type_k     != next.draft_cache_type_k ||
+            profit_key.draft_cache_type_v     != next.draft_cache_type_v ||
             profit_key.target_top_k     != next.target_top_k ||
             profit_key.target_has_grammar != next.target_has_grammar ||
             profit_key.target_grammar_lazy != next.target_grammar_lazy ||
@@ -927,7 +876,7 @@ struct server_adaptive_dm_state {
             return false;
         }
 
-        return expected_accept >= (float) current_n * dm_fringe_max;
+        return expected_accept >= (float) current_n * dm_profit_high_acceptance_threshold;
     }
 
     bool profit_should_skip_active_explore(int current_n, int base_n_max) const {
@@ -951,7 +900,7 @@ struct server_adaptive_dm_state {
             return false;
         }
 
-        return expected_accept >= (float) current_n * dm_fringe_max;
+        return expected_accept >= (float) current_n * dm_profit_high_acceptance_threshold;
     }
 
     int profit_active_explore_depths(int current_n, int base_n_max, int * out, int out_cap) const {
@@ -1644,47 +1593,4 @@ struct server_adaptive_dm_state {
         return recommended;
     }
 
-    fringe_decision fringe_decision_at_window(int n_max, int window, int min_reach) const {
-        fringe_decision result;
-        if (n_max <= 0 || window <= 0) {
-            return result;
-        }
-
-        const int window_start = std::max(0, n_max - window);
-        for (int pos = window_start; pos < n_max; pos++) {
-            for (int i = 0; i < fringe_ring_count; i++) {
-                const int idx = (fringe_ring_idx - 1 - i + FRINGE_WINDOW) % FRINGE_WINDOW;
-                const auto & e = fringe_ring[idx];
-                if (e.epoch != fringe_epoch) {
-                    continue;
-                }
-                if (e.n_draft > pos) {
-                    result.reached++;
-                    if (e.n_accepted > pos) {
-                        result.accepted++;
-                    }
-                }
-            }
-        }
-
-        result.fringe = result.reached > 0 ? (float) result.accepted / result.reached : 0.0f;
-
-        if (result.reached < min_reach) {
-            int epoch_reached = 0;
-            int epoch_accepted = 0;
-            for (int pos = window_start; pos < n_max; pos++) {
-                if (pos < FRINGE_REACH_POSITIONS) {
-                    epoch_reached += fringe_epoch_reached[pos];
-                    epoch_accepted += fringe_epoch_accepted[pos];
-                }
-            }
-            if (epoch_reached >= min_reach) {
-                result.reached = epoch_reached;
-                result.accepted = epoch_accepted;
-                result.fringe = (float) epoch_accepted / epoch_reached;
-            }
-        }
-
-        return result;
-    }
 };

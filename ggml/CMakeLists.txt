@@ -259,6 +259,44 @@ function(ggml_cuda_select_kvarn_fast_decode_sources OUT_VAR PREFIX)
     set(${OUT_VAR} ${_selected_sources} PARENT_SCOPE)
 endfunction()
 
+function(ggml_cuda_get_fattn_vec_default_pairs OUT_VAR)
+    # Default vector policy: rank(K) <= rank(V), plus both F16 fallback axes.
+    # The order is high-to-low precision.
+    set(_types
+        f16
+        bf16
+        q8_0
+        q6_1
+        q6_0
+        q5_1
+        q5_0
+        q4_1
+        q4_0
+        q3_1
+        q3_0
+        q2_1
+        q2_0s
+    )
+
+    set(_pairs)
+    foreach(K_INDEX RANGE 0 12)
+        list(GET _types ${K_INDEX} K_TYPE)
+        foreach(V_INDEX RANGE 0 12)
+            list(GET _types ${V_INDEX} V_TYPE)
+            if (${K_INDEX} LESS_EQUAL ${V_INDEX} OR K_TYPE STREQUAL "f16" OR V_TYPE STREQUAL "f16")
+                list(APPEND _pairs "${K_TYPE}:${V_TYPE}")
+            endif()
+        endforeach()
+    endforeach()
+
+    list(LENGTH _pairs _pair_count)
+    if (NOT _pair_count EQUAL 103)
+        message(FATAL_ERROR "Default CUDA FA vec policy expected 103 pairs, got ${_pair_count}")
+    endif()
+
+    set(${OUT_VAR} ${_pairs} PARENT_SCOPE)
+endfunction()
+
 option(GGML_HIP                             "ggml: use HIP"                                   OFF)
 option(GGML_HIP_GRAPHS                      "ggml: use HIP graph"                              ON)
 option(GGML_HIP_RCCL                        "ggml: use ROCm Collective Comm. Library"         OFF)

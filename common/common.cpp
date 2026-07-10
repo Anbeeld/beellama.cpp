@@ -24,6 +24,7 @@
 #include <iterator>
 #include <regex>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -62,6 +63,58 @@
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
+
+common_reasoning_loop_guard_mode common_reasoning_loop_guard_mode_from_name(const std::string & value) {
+    if (value == "off") {
+        return COMMON_REASONING_LOOP_GUARD_OFF;
+    }
+    if (value == "force-close") {
+        return COMMON_REASONING_LOOP_GUARD_FORCE_CLOSE;
+    }
+    if (value == "stop") {
+        return COMMON_REASONING_LOOP_GUARD_STOP;
+    }
+    throw std::invalid_argument("invalid reasoning-loop-guard, expected one of: off, force-close, stop");
+}
+
+const char * common_reasoning_loop_guard_mode_name(common_reasoning_loop_guard_mode value) {
+    switch (value) {
+        case COMMON_REASONING_LOOP_GUARD_OFF:         return "off";
+        case COMMON_REASONING_LOOP_GUARD_FORCE_CLOSE: return "force-close";
+        case COMMON_REASONING_LOOP_GUARD_STOP:        return "stop";
+    }
+    return "unknown";
+}
+
+void common_validate_reasoning_loop_guard_params(const common_reasoning_loop_guard_params & params) {
+    if (params.min_reasoning_tokens < 0) {
+        throw std::invalid_argument("reasoning-loop-min-tokens must be >= 0");
+    }
+    if (params.window_tokens <= 0) {
+        throw std::invalid_argument("reasoning-loop-window must be > 0");
+    }
+    if (params.max_period <= 0) {
+        throw std::invalid_argument("reasoning-loop-max-period must be > 0");
+    }
+    if (params.min_repeated_coverage <= 0) {
+        throw std::invalid_argument("reasoning-loop-min-coverage must be > 0");
+    }
+    if (params.check_interval <= 0) {
+        throw std::invalid_argument("reasoning-loop-check-interval must be > 0");
+    }
+    if (params.interventions_max < 0) {
+        throw std::invalid_argument("reasoning-loop-interventions must be >= 0");
+    }
+    if (params.window_tokens < params.min_repeated_coverage) {
+        throw std::invalid_argument("reasoning-loop-window must be >= reasoning-loop-min-coverage");
+    }
+    if (params.max_period > params.window_tokens / 3) {
+        throw std::invalid_argument("reasoning-loop-max-period must be <= reasoning-loop-window / 3");
+    }
+    if (params.min_reasoning_tokens < params.min_repeated_coverage) {
+        throw std::invalid_argument("reasoning-loop-min-tokens must be >= reasoning-loop-min-coverage");
+    }
+}
 
 common_time_meas::common_time_meas(int64_t & t_acc, bool disable) : t_start_us(disable ? -1 : ggml_time_us()), t_acc(t_acc) {}
 
@@ -1621,6 +1674,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
+    cparams.kvarn  = params.kvarn;
 
     return cparams;
 }

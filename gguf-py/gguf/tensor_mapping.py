@@ -167,11 +167,20 @@ class TensorNameMap:
         MODEL_TENSOR.V_ENC_MSFA_NORM: (
             "model.vision_tower.timm_model.msfa.norm", # gemma3n
         ),
-        MODEL_TENSOR.DFLASH_FC: (
-            "fc",                  # dflash drafter
+        MODEL_TENSOR.A_CTC_OUT: (
+            "encoder.out",
         ),
-        MODEL_TENSOR.DFLASH_HIDDEN_NORM: (
-            "hidden_norm",         # dflash drafter
+        MODEL_TENSOR.A_CTC_OUT_MID: (
+            "encoder.out_mid",
+        ),
+        MODEL_TENSOR.A_QF_PROJ_QUERY: (
+            "projector.query",
+        ),
+        MODEL_TENSOR.A_QF_PROJ_NORM: (
+            "projector.qformer.layernorm",
+        ),
+        MODEL_TENSOR.A_QF_PROJ_LINEAR: (
+            "projector.linear",
         ),
     }
 

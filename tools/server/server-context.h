@@ -7,22 +7,10 @@
 #include <nlohmann/json_fwd.hpp>
 
 #include <cstddef>
-#include <cstdint>
 #include <memory>
 #include <set>
 
 struct server_context_impl; // private implementation
-
-struct common_params_speculative;
-
-struct server_dflash_recurrent_rollback_plan {
-    bool needs_backup_sequences = false;
-    bool needs_attention_backup_streams = false;
-};
-
-server_dflash_recurrent_rollback_plan server_context_dflash_recurrent_rollback_plan(
-        const common_params_speculative & speculative,
-        bool target_recurrent_or_hybrid);
 
 struct server_context_meta {
     std::string build_info;

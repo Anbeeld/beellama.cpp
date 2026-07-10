@@ -274,15 +274,11 @@ uint32_t llama_hparams::n_layer() const {
 }
 
 uint32_t llama_hparams::n_layer_kv() const {
-    uint32_t res = 0;
-
+    uint32_t result = 0;
     for (uint32_t il = 0; il < n_layer_all; ++il) {
-        if (has_kv(il)) {
-            res++;
-        }
+        result += has_kv(il) ? 1u : 0u;
     }
-
-    return res;
+    return result;
 }
 
 bool llama_hparams::use_mrope() const {

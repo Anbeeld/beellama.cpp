@@ -77,12 +77,6 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 //
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first = false);
 
-bool common_sampler_supports_reduced(struct common_sampler * gsmpl);
-bool common_sampler_blocks_speculative(const struct common_sampler * gsmpl);
-bool common_sampler_has_active_grammar(const struct common_sampler * gsmpl);
-bool common_sampler_reasoning_is_forcing(const struct common_sampler * gsmpl);
-bool common_sampler_stops_speculative_accept(const struct common_sampler * gsmpl, bool grammar_active_at_start);
-
 // generalized version of common_sampler_sample
 //
 // will cross-reference the sampled tokens with a batch of draft tokens and accept those that match
@@ -105,19 +99,6 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
         const std::vector<int> & idxs,
         const llama_tokens    & draft,
         bool                    grammar_first = false,
-        const common_sampler_accept_callback & on_accept = {});
-
-// DFlash verifier fast path: run the existing sampler chain over compact per-row
-// candidate lists instead of full-vocab logits. `candidate_ids` and
-// `candidate_logits` are row-major [n_rows][k]; logits may be logit-equivalent
-// values shifted by a row constant.
-std::vector<llama_token> common_sampler_sample_reduced_and_accept_n(
-        struct common_sampler * gsmpl,
-        const llama_token     * candidate_ids,
-        const float           * candidate_logits,
-        int32_t                 n_rows,
-        int32_t                 k,
-        const llama_tokens    & draft,
         const common_sampler_accept_callback & on_accept = {});
 
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
@@ -149,11 +130,7 @@ std::string common_sampler_print(const struct common_sampler * gsmpl);
 // get a string representation of the last accepted tokens
 std::string common_sampler_prev_str(common_sampler * gsmpl, llama_context * ctx, int n);
 
-common_reasoning_budget_state common_sampler_get_reasoning_budget_state(const struct common_sampler * gsmpl);
-
 bool common_sampler_force_reasoning_end(struct common_sampler * gsmpl);
-
-size_t common_sampler_reasoning_forced_token_count(const struct common_sampler * gsmpl);
 
 char        common_sampler_type_to_chr(enum common_sampler_type cnstr);
 std::string common_sampler_type_to_str(enum common_sampler_type cnstr);

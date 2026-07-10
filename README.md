@@ -1,16 +1,33 @@
-# llama.cpp
+# Anbeeld's BeeLlama.cpp
 
-![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
+![BeeLlama.cpp logo](beellama.jpg)
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp)](https://github.com/ggml-org/llama.cpp/releases)
-[![Server](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
-[![Docker](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
-[![Winget](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
+[![Release](https://img.shields.io/github/v/release/Anbeeld/beellama.cpp)](https://github.com/Anbeeld/beellama.cpp/releases)
 
-[Manifesto](https://github.com/ggml-org/llama.cpp/discussions/205) / [ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md)
+[Support BeeLlama development](https://anbeeld.com/support) / [upstream llama.cpp](https://github.com/ggml-org/llama.cpp) / [ggml](https://github.com/ggml-org/ggml)
 
-LLM inference in C/C++
+LLM inference in C/C++ - an Anbeeld fork of upstream llama.cpp.
+
+## BeeLlama v0.4.0
+
+BeeLlama v0.4.0 merges current upstream llama.cpp and keeps a focused set of
+fork extensions:
+
+- KVarN target KV-cache compression and low-bit standard KV cache types.
+- Profit-only adaptive depth for upstream `draft-dflash` speculation.
+- Server reasoning-loop protection.
+- Realtime reasoning-end control for in-flight chat completions.
+- KVarN KLD save/load tooling in `llama-perplexity`.
+
+Start with the [BeeLlama feature overview](docs/beellama-features.md),
+[argument reference](docs/beellama-args.md), and the
+[Qwen](docs/quickstart-qwen36-dflash.md) or
+[Gemma](docs/quickstart-gemma-4-31b-dflash.md) DFlash quickstart.
+
+Breaking changes in v0.4.0: TurboQuant/TCQ, DDTree, CopySpec, the old DFlash
+GPU-ring stack, and `GGML_CUDA_FA_HALF_QUANTS` were removed. Use upstream
+`--spec-type draft-dflash`; the old `dflash` spelling is a warned alias.
 
 ## Recent API changes
 

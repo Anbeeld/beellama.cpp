@@ -18,12 +18,14 @@ static void test_cublas_zero_dim_guard_present(const char * source_file) {
 
     const std::string source((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
 
-    const bool has_guard =
-        source.find("row_diff == 0")   != std::string::npos &&
-        source.find("src1_ncols == 0") != std::string::npos &&
-        source.find("ne10 == 0")       != std::string::npos &&
-        source.find("ne00 == 0")       != std::string::npos &&
-        source.find("ldc == 0")        != std::string::npos;
+    const auto impl = source.find("static void ggml_cuda_mul_mat_cublas_impl");
+    const auto guard = source.find(
+        "ggml_is_empty(src0) || ggml_is_empty(src1) || ggml_is_empty(dst)", impl);
+    const auto first_dispatch = source.find("CUBLAS_CHECK", impl);
+    const bool has_guard = impl != std::string::npos &&
+        guard != std::string::npos &&
+        first_dispatch != std::string::npos &&
+        guard < first_dispatch;
 
     if (!has_guard) {
         fprintf(stderr, "missing zero-dimension cuBLAS guard in %s\n", source_file);

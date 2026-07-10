@@ -72,10 +72,6 @@ public:
     int cells_at_pos(llama_seq_id seq_id, llama_pos pos, uint32_t * cell_indices, int n_max) override;
 
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
-    void seq_cp_recurrent(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
-    bool seq_rm_recurrent(llama_seq_id seq_id, llama_pos p0, llama_pos p1) override;
-    void recurrent_copy_profile_reset() override;
-    llama_memory_recurrent_copy_profile recurrent_copy_profile() const override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
@@ -99,15 +95,12 @@ public:
     llama_memory_i * get_mem_attn() const;
     llama_memory_recurrent * get_mem_recr() const;
 
-    void set_force_split_seq(bool v) override { force_split_seq = v; }
-
 private:
     const llama_hparams & hparams;
 
     const std::unique_ptr<llama_memory_i> mem_attn;
     const std::unique_ptr<llama_memory_recurrent> mem_recr;
 
-    bool force_split_seq = false;
 };
 
 class llama_memory_hybrid_context : public llama_memory_context_i {

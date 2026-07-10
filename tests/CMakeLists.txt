@@ -1,5 +1,63 @@
 llama_add_compile_flags()
 
+find_package(Python3 COMPONENTS Interpreter QUIET)
+
+if (Python3_Interpreter_FOUND)
+    add_test(
+        NAME test-removed-cache-types-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-removed-cache-types-static.py)
+    set_property(TEST test-removed-cache-types-static PROPERTY LABELS main)
+
+    add_test(
+        NAME test-cache-type-redirects-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-cache-type-redirects-static.py)
+    set_property(TEST test-cache-type-redirects-static PROPERTY LABELS main)
+
+    add_test(
+        NAME test-issue41-regressions-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-issue41-regressions-static.py)
+    set_property(TEST test-issue41-regressions-static PROPERTY LABELS cuda)
+
+    add_test(
+        NAME test-fattn-vec-dispatch-generated
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/gen-fattn-vec-dispatch.py --check)
+    set_property(TEST test-fattn-vec-dispatch-generated PROPERTY LABELS cuda)
+
+    add_test(
+        NAME test-hip-shuffle-compat-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-hip-shuffle-compat-static.py)
+    set_property(TEST test-hip-shuffle-compat-static PROPERTY LABELS hip)
+
+    add_test(
+        NAME test-convert-dflash-draft-to-upstream
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-convert-dflash-draft-to-upstream.py)
+    set_property(TEST test-convert-dflash-draft-to-upstream PROPERTY LABELS main)
+
+    add_test(
+        NAME test-server-loop-guard-checkpoint-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-server-loop-guard-checkpoint-static.py)
+    set_property(TEST test-server-loop-guard-checkpoint-static PROPERTY LABELS main)
+
+    add_test(
+        NAME test-spec-cession-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-spec-cession-static.py)
+    set_property(TEST test-spec-cession-static PROPERTY LABELS main)
+
+    add_test(
+        NAME test-upstream-merge-keepers-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-upstream-merge-keepers-static.py)
+    set_property(TEST test-upstream-merge-keepers-static PROPERTY LABELS main)
+endif()
+
 function(llama_build source)
     set(TEST_SOURCES ${source} ${ARGN})
 
@@ -234,6 +292,38 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
 
 llama_build_and_test(test-arg-parser.cpp)
 
+add_executable(test-kvarn test-kvarn.cpp ../src/llama-kvarn.cpp)
+target_include_directories(test-kvarn PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include)
+target_compile_features(test-kvarn PRIVATE cxx_std_17)
+target_link_libraries(test-kvarn PRIVATE ggml)
+if (LLAMA_TESTS_INSTALL)
+    install(TARGETS test-kvarn RUNTIME)
+endif()
+add_test(NAME test-kvarn WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-kvarn>)
+set_property(TEST test-kvarn PROPERTY LABELS main)
+
+llama_build_and_test(test-adaptive-dm.cpp)
+llama_build_and_test(test-perplexity-plumbing.cpp ARGS ${PROJECT_SOURCE_DIR})
+llama_build_and_test(test-cuda-fattn-route-policy.cpp ARGS ${PROJECT_SOURCE_DIR})
+llama_build_and_test(test-cuda-fattn-vec-policy.cpp ARGS ${PROJECT_SOURCE_DIR})
+llama_build_and_test(test-cuda-zero-dim-gemm.cpp ARGS ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda/ggml-cuda.cu)
+llama_build_and_test(test-cpu-out-prod.cpp)
+llama_build_and_test(test-cpu-fattn-support.cpp)
+
+# The tests subdirectory is configured before tools/server, so server-context
+# is not a CMake target yet at this point.  Match test-chat above and gate on
+# the build option instead; the target is resolved when the full project is
+# generated.
+if (LLAMA_BUILD_SERVER)
+    llama_build_and_test(test-server-loop-guard.cpp)
+    target_include_directories(test-server-loop-guard PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-server-loop-guard PRIVATE server-context)
+
+    llama_build_and_test(test-server-prompt-checkpoint.cpp)
+    target_include_directories(test-server-prompt-checkpoint PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)
+    target_link_libraries(test-server-prompt-checkpoint PRIVATE server-context)
+endif()
+
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
   llama_build_and_test(test-opt.cpp)
@@ -307,3 +397,9 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+add_executable(test-ggml-op-coverage test-ggml-op-coverage.cpp)
+target_include_directories(test-ggml-op-coverage PRIVATE ${PROJECT_SOURCE_DIR}/ggml/include)
+target_link_libraries(test-ggml-op-coverage PRIVATE ggml)
+add_test(NAME test-ggml-op-coverage COMMAND $<TARGET_FILE:test-ggml-op-coverage>)
+set_property(TEST test-ggml-op-coverage PROPERTY LABELS main)

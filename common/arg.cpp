@@ -298,6 +298,38 @@ struct handle_model_result {
     std::string preset_path;
 };
 
+static int32_t kvarn_bits_from_legacy_cache_type(const std::string & value) {
+    if (value == "turbo2" || value == "turbo2_tcq") {
+        return 2;
+    }
+    if (value == "turbo3" || value == "turbo3_tcq") {
+        return 3;
+    }
+    if (value == "turbo4" || value == "turbo4_tcq") {
+        return 4;
+    }
+    return 0;
+}
+
+static ggml_type kvarn_fallback_cache_type(int32_t bits) {
+    switch (bits) {
+        case 2:  return GGML_TYPE_Q2_0S;
+        case 3:  return GGML_TYPE_Q3_0;
+        case 4:  return GGML_TYPE_Q4_0;
+        case 5:  return GGML_TYPE_Q5_0;
+        case 6:  return GGML_TYPE_Q6_0;
+        case 8:  return GGML_TYPE_Q8_0;
+        default: return GGML_TYPE_F16;
+    }
+}
+
+// Upstream now owns GGML_TYPE_Q2_0.  Bee's retained 32-element variant is
+// intentionally presented as q2_0 at the cache CLI boundary, but keeps its
+// distinct internal name (q2_0s) to avoid a serialized-type collision.
+static const char * kv_cache_type_name(ggml_type type) {
+    return type == GGML_TYPE_Q2_0S ? "q2_0" : ggml_type_name(type);
+}
+
 const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_F32,
     GGML_TYPE_F16,
@@ -308,23 +340,109 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_IQ4_NL,
     GGML_TYPE_Q5_0,
     GGML_TYPE_Q5_1,
+    GGML_TYPE_Q6_0,
+    GGML_TYPE_Q6_1,
+    GGML_TYPE_Q3_0,
+    GGML_TYPE_Q3_1,
+    GGML_TYPE_Q2_0S,
+    GGML_TYPE_Q2_1,
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
+    const int32_t kvarn_bits = kvarn_bits_from_legacy_cache_type(s);
+    if (kvarn_bits != 0) {
+        const std::string replacement = string_format("q%d_0", kvarn_bits);
+        LOG_WRN("cache type '%s' was removed in v0.4.0; redirecting to '%s' for a draft context\n",
+                s.c_str(), replacement.c_str());
+        return kvarn_fallback_cache_type(kvarn_bits);
+    }
+
     for (const auto & type : kv_cache_types) {
-        if (ggml_type_name(type) == s) {
+        if (kv_cache_type_name(type) == s) {
             return type;
         }
     }
     throw std::runtime_error("Unsupported cache type: " + s);
 }
 
-static std::string get_all_kv_cache_types() {
+static std::string get_all_kv_cache_types(bool include_kvarn_pseudo_types = false) {
     std::ostringstream msg;
     for (const auto & type : kv_cache_types) {
-        msg << ggml_type_name(type) << (&type == &kv_cache_types.back() ? "" : ", ");
+        msg << kv_cache_type_name(type) << (&type == &kv_cache_types.back() ? "" : ", ");
+    }
+    if (include_kvarn_pseudo_types) {
+        msg << ", kvarn2, kvarn3, kvarn4, kvarn5, kvarn6, kvarn8";
     }
     return msg.str();
+}
+
+static int32_t kvarn_bits_from_cache_type(const std::string & value) {
+    if (value == "kvarn2") return 2;
+    if (value == "kvarn3") return 3;
+    if (value == "kvarn4") return 4;
+    if (value == "kvarn5") return 5;
+    if (value == "kvarn6") return 6;
+    if (value == "kvarn8") return 8;
+    return 0;
+}
+
+static llama_kvarn_type kvarn_type_from_bits(int32_t key_bits, int32_t value_bits) {
+    return llama_kvarn_type_from_name(
+            string_format("kvarn_k%dv%d_g128", key_bits, value_bits).c_str());
+}
+
+static void parse_target_cache_type(common_params & params, bool key, const std::string & value) {
+    const int32_t redirected_kvarn_bits = kvarn_bits_from_legacy_cache_type(value);
+    const std::string cache_type = redirected_kvarn_bits != 0
+        ? string_format("kvarn%d", redirected_kvarn_bits)
+        : value;
+
+    if (redirected_kvarn_bits != 0) {
+        LOG_WRN("cache type '%s' was removed in v0.4.0; redirecting to '%s'\n",
+                value.c_str(), cache_type.c_str());
+    }
+
+    const int32_t kvarn_bits = kvarn_bits_from_cache_type(cache_type);
+    if (kvarn_bits != 0) {
+        if (key) {
+            params.cache_kvarn_bits_k = kvarn_bits;
+            params.cache_type_k = kvarn_fallback_cache_type(kvarn_bits);
+        } else {
+            params.cache_kvarn_bits_v = kvarn_bits;
+            params.cache_type_v = kvarn_fallback_cache_type(kvarn_bits);
+        }
+        return;
+    }
+
+    if (key) {
+        params.cache_kvarn_bits_k = 0;
+        params.cache_type_k = kv_cache_type_from_str(cache_type);
+    } else {
+        params.cache_kvarn_bits_v = 0;
+        params.cache_type_v = kv_cache_type_from_str(cache_type);
+    }
+}
+
+static void parse_target_kvarn_swa_cache_type(common_params & params, bool key, const std::string & value) {
+    const int32_t redirected_kvarn_bits = kvarn_bits_from_legacy_cache_type(value);
+    const std::string cache_type = redirected_kvarn_bits != 0
+        ? string_format("kvarn%d", redirected_kvarn_bits)
+        : value;
+    if (redirected_kvarn_bits != 0) {
+        LOG_WRN("cache type '%s' was removed in v0.4.0; redirecting to '%s'\n",
+                value.c_str(), cache_type.c_str());
+    }
+
+    const int32_t kvarn_bits = kvarn_bits_from_cache_type(cache_type);
+    if (kvarn_bits == 0) {
+        throw std::runtime_error("SWA KVarN cache overrides require a KVarN pseudo type: " + value);
+    }
+
+    if (key) {
+        params.cache_kvarn_swa_bits_k = kvarn_bits;
+    } else {
+        params.cache_kvarn_swa_bits_v = kvarn_bits;
+    }
 }
 
 static bool parse_bool_value(const std::string & value) {
@@ -1049,6 +1167,82 @@ static utf8_argv make_utf8_argv() {
 }
 #endif
 
+static void common_params_kvarn_normalize(common_params & params) {
+    int32_t key_bits = params.cache_kvarn_bits_k;
+    int32_t value_bits = params.cache_kvarn_bits_v;
+    const int32_t swa_key_bits = params.cache_kvarn_swa_bits_k;
+    const int32_t swa_value_bits = params.cache_kvarn_swa_bits_v;
+
+    if (key_bits == 0 && value_bits == 0) {
+        if (swa_key_bits != 0 || swa_value_bits != 0) {
+            throw std::invalid_argument("KVarN SWA cache overrides require KVarN --cache-type-k and --cache-type-v");
+        }
+        params.kvarn = llama_kvarn_default_params();
+        return;
+    }
+
+    if (key_bits == 0) {
+        LOG_WRN("warning: --cache-type-v uses KVarN but --cache-type-k is %s; forcing K to kvarn%d\n",
+                kv_cache_type_name(params.cache_type_k), value_bits);
+        key_bits = value_bits;
+    } else if (value_bits == 0) {
+        LOG_WRN("warning: --cache-type-k uses KVarN but --cache-type-v is %s; forcing V to kvarn%d\n",
+                kv_cache_type_name(params.cache_type_v), key_bits);
+        value_bits = key_bits;
+    }
+
+    const llama_kvarn_type type = kvarn_type_from_bits(key_bits, value_bits);
+    if (type == LLAMA_KVARN_TYPE_INVALID) {
+        throw std::invalid_argument(string_format(
+                "invalid KVarN cache type combination: kvarn%d/kvarn%d", key_bits, value_bits));
+    }
+
+    params.kvarn = llama_kvarn_params_for_type(type);
+    params.cache_kvarn_bits_k = key_bits;
+    params.cache_kvarn_bits_v = value_bits;
+    params.cache_type_k = kvarn_fallback_cache_type(key_bits);
+    params.cache_type_v = kvarn_fallback_cache_type(value_bits);
+
+    if ((swa_key_bits == 0) != (swa_value_bits == 0)) {
+        throw std::invalid_argument("KVarN SWA cache overrides require both --cache-type-k-swa and --cache-type-v-swa");
+    }
+
+    if (swa_key_bits != 0) {
+        const llama_kvarn_type swa_type = kvarn_type_from_bits(swa_key_bits, swa_value_bits);
+        if (swa_type == LLAMA_KVARN_TYPE_INVALID) {
+            throw std::invalid_argument(string_format(
+                    "invalid KVarN SWA cache type combination: kvarn%d/kvarn%d", swa_key_bits, swa_value_bits));
+        }
+        params.kvarn.swa_key_bits = swa_key_bits;
+        params.kvarn.swa_value_bits = swa_value_bits;
+    }
+
+    if (params.grp_attn_n != 1) {
+        throw std::invalid_argument("KVarN does not support Self-Extend/group attention; use --grp-attn-n 1");
+    }
+}
+
+static common_speculative_dm_controller common_speculative_dm_controller_from_name(const std::string & value) {
+    if (value == "off") {
+        return COMMON_SPECULATIVE_DM_CONTROLLER_OFF;
+    }
+    if (value == "profit") {
+        return COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT;
+    }
+    if (value == "fringe") {
+        throw std::invalid_argument("the fringe adaptive draft-max controller was removed in v0.4.0; use profit or off");
+    }
+    throw std::invalid_argument("invalid spec-dm-controller, expected one of: off, profit");
+}
+
+static const char * common_speculative_dm_controller_name(common_speculative_dm_controller value) {
+    switch (value) {
+        case COMMON_SPECULATIVE_DM_CONTROLLER_OFF:    return "off";
+        case COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT: return "profit";
+    }
+    return "unknown";
+}
+
 bool common_params_parse(int argc, char ** argv, common_params & params, llama_example ex, void(*print_usage)(int, char **)) {
 #ifdef _WIN32
     auto utf8 = make_utf8_argv();
@@ -1077,7 +1271,11 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             common_params_print_completion(ctx_arg);
             exit(0);
         }
-        params.lr.init();
+        common_params_kvarn_normalize(ctx_arg.params);
+        ctx_arg.params.lr.init();
+        common_validate_reasoning_loop_guard_params(ctx_arg.params.reasoning_loop_guard);
+        ctx_arg.params.sampling.reasoning_budget_tracking =
+            ctx_arg.params.reasoning_loop_guard.mode != COMMON_REASONING_LOOP_GUARD_OFF;
     } catch (const std::invalid_argument & ex) {
         fprintf(stderr, "%s\n", ex.what());
         ctx_arg.params = params_org;
@@ -2183,11 +2381,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "KV cache data type for K\n"
             "allowed values: %s\n"
             "(default: %s)",
-            get_all_kv_cache_types().c_str(),
-            ggml_type_name(params.cache_type_k)
+            get_all_kv_cache_types(/*include_kvarn_pseudo_types =*/ true).c_str(),
+            kv_cache_type_name(params.cache_type_k)
         ),
         [](common_params & params, const std::string & value) {
-            params.cache_type_k = kv_cache_type_from_str(value);
+            parse_target_cache_type(params, /*key =*/ true, value);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_K"));
     add_opt(common_arg(
@@ -2196,13 +2394,31 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "KV cache data type for V\n"
             "allowed values: %s\n"
             "(default: %s)",
-            get_all_kv_cache_types().c_str(),
-            ggml_type_name(params.cache_type_v)
+            get_all_kv_cache_types(/*include_kvarn_pseudo_types =*/ true).c_str(),
+            kv_cache_type_name(params.cache_type_v)
         ),
         [](common_params & params, const std::string & value) {
-            params.cache_type_v = kv_cache_type_from_str(value);
+            parse_target_cache_type(params, /*key =*/ false, value);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
+    add_opt(common_arg(
+        {"--cache-type-k-swa"}, "TYPE",
+        "SWA-layer KVarN cache type override for K\n"
+        "allowed values: kvarn2, kvarn3, kvarn4, kvarn5, kvarn6, kvarn8\n"
+        "(default: same as --cache-type-k)",
+        [](common_params & params, const std::string & value) {
+            parse_target_kvarn_swa_cache_type(params, /*key =*/ true, value);
+        }
+    ).set_env("LLAMA_ARG_CACHE_TYPE_K_SWA"));
+    add_opt(common_arg(
+        {"--cache-type-v-swa"}, "TYPE",
+        "SWA-layer KVarN cache type override for V\n"
+        "allowed values: kvarn2, kvarn3, kvarn4, kvarn5, kvarn6, kvarn8\n"
+        "(default: same as --cache-type-v)",
+        [](common_params & params, const std::string & value) {
+            parse_target_kvarn_swa_cache_type(params, /*key =*/ false, value);
+        }
+    ).set_env("LLAMA_ARG_CACHE_TYPE_V_SWA"));
     add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",
@@ -3306,6 +3522,56 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET_MESSAGE"));
     add_opt(common_arg(
+        {"--reasoning-loop-guard"}, "MODE",
+        string_format("reasoning loop guard mode: off, force-close, or stop (default: %s)",
+            common_reasoning_loop_guard_mode_name(params.reasoning_loop_guard.mode)),
+        [](common_params & params, const std::string & value) {
+            params.reasoning_loop_guard.mode = common_reasoning_loop_guard_mode_from_name(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_LOOP_GUARD"));
+    add_opt(common_arg(
+        {"--reasoning-loop-min-tokens"}, "N",
+        string_format("minimum hidden reasoning tokens before loop checks (default: %d)", params.reasoning_loop_guard.min_reasoning_tokens),
+        [](common_params & params, int value) {
+            params.reasoning_loop_guard.min_reasoning_tokens = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_LOOP_MIN_TOKENS"));
+    add_opt(common_arg(
+        {"--reasoning-loop-window"}, "N",
+        string_format("token tail window for reasoning loop checks (default: %d)", params.reasoning_loop_guard.window_tokens),
+        [](common_params & params, int value) {
+            params.reasoning_loop_guard.window_tokens = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_LOOP_WINDOW"));
+    add_opt(common_arg(
+        {"--reasoning-loop-max-period"}, "N",
+        string_format("maximum periodic loop length to check (default: %d)", params.reasoning_loop_guard.max_period),
+        [](common_params & params, int value) {
+            params.reasoning_loop_guard.max_period = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_LOOP_MAX_PERIOD"));
+    add_opt(common_arg(
+        {"--reasoning-loop-min-coverage"}, "N",
+        string_format("minimum repeated token coverage before loop trigger (default: %d)", params.reasoning_loop_guard.min_repeated_coverage),
+        [](common_params & params, int value) {
+            params.reasoning_loop_guard.min_repeated_coverage = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_LOOP_MIN_COVERAGE"));
+    add_opt(common_arg(
+        {"--reasoning-loop-check-interval"}, "N",
+        string_format("accepted-token interval between loop checks (default: %d)", params.reasoning_loop_guard.check_interval),
+        [](common_params & params, int value) {
+            params.reasoning_loop_guard.check_interval = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_LOOP_CHECK_INTERVAL"));
+    add_opt(common_arg(
+        {"--reasoning-loop-interventions"}, "N",
+        string_format("maximum force-close interventions before stop (default: %d)", params.reasoning_loop_guard.interventions_max),
+        [](common_params & params, int value) {
+            params.reasoning_loop_guard.interventions_max = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_LOOP_INTERVENTIONS"));
+    add_opt(common_arg(
         {"--reasoning-preserve"},
         {"--no-reasoning-preserve"},
         "preserve reasoning trace in the full history, not just the last assistant message (default: template default)\n"
@@ -3652,13 +3918,102 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--spec-dm-controller"}, "MODE",
+        string_format("adaptive DFlash draft-max controller: off or profit (default: %s)",
+            common_speculative_dm_controller_name(params.speculative.dm_controller)),
+        [](common_params & params, const std::string & value) {
+            params.speculative.dm_controller = common_speculative_dm_controller_from_name(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_CONTROLLER"));
+    add_opt(common_arg(
+        {"--spec-dm-profit-min"}, "F",
+        string_format("minimum profit margin over the no-spec baseline before disabling dwell clears (default: %.4f)",
+            (double) params.speculative.dm_profit_min),
+        [](common_params & params, const std::string & value) {
+            const float f = std::stof(value);
+            if (f < 0.0f || f > 0.50f) {
+                throw std::invalid_argument("spec-dm-profit-min must be in [0.0, 0.50]");
+            }
+            params.speculative.dm_profit_min = f;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_PROFIT_MIN"));
+    add_opt(common_arg(
+        {"--spec-dm-profit-raise-margin"}, "F",
+        string_format("relative profit margin required to raise adaptive draft depth (default: %.4f)",
+            (double) params.speculative.dm_profit_raise_margin),
+        [](common_params & params, const std::string & value) {
+            const float f = std::stof(value);
+            if (f < 0.0f || f > 1.0f) {
+                throw std::invalid_argument("spec-dm-profit-raise-margin must be in [0.0, 1.0]");
+            }
+            params.speculative.dm_profit_raise_margin = f;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_PROFIT_RAISE_MARGIN"));
+    add_opt(common_arg(
+        {"--spec-dm-profit-lower-margin"}, "F",
+        string_format("relative profit margin required to lower adaptive draft depth (default: %.4f)",
+            (double) params.speculative.dm_profit_lower_margin),
+        [](common_params & params, const std::string & value) {
+            const float f = std::stof(value);
+            if (f < 0.0f || f > 1.0f) {
+                throw std::invalid_argument("spec-dm-profit-lower-margin must be in [0.0, 1.0]");
+            }
+            params.speculative.dm_profit_lower_margin = f;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_PROFIT_LOWER_MARGIN"));
+    add_opt(common_arg(
+        {"--spec-dm-profit-ewma-alpha"}, "F",
+        string_format("EWMA alpha for adaptive draft-max profit statistics (default: %.4f)",
+            (double) params.speculative.dm_profit_ewma_alpha),
+        [](common_params & params, const std::string & value) {
+            const float f = std::stof(value);
+            if (f < 0.01f || f > 1.0f) {
+                throw std::invalid_argument("spec-dm-profit-ewma-alpha must be in [0.01, 1.0]");
+            }
+            params.speculative.dm_profit_ewma_alpha = f;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_PROFIT_EWMA_ALPHA"));
+    add_opt(common_arg(
+        {"--spec-dm-profit-min-samples"}, "N",
+        string_format("minimum samples before adaptive draft-max profit stats are ready (default: %d)",
+            params.speculative.dm_profit_min_samples),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 64) {
+                throw std::invalid_argument("spec-dm-profit-min-samples must be in [1, 64]");
+            }
+            params.speculative.dm_profit_min_samples = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_PROFIT_MIN_SAMPLES"));
+    add_opt(common_arg(
+        {"--spec-dm-profit-warmup"}, "N",
+        string_format("measured samples for each initial positive-depth profit probe (default: %d, 0 = min samples)",
+            params.speculative.dm_profit_warmup),
+        [](common_params & params, int value) {
+            if (value < 0 || value > 64) {
+                throw std::invalid_argument("spec-dm-profit-warmup must be in [0, 64]");
+            }
+            params.speculative.dm_profit_warmup = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_PROFIT_WARMUP"));
+    add_opt(common_arg(
+        {"--spec-dm-profit-baseline-interval"}, "N",
+        string_format("active profit-controller cycles between no-spec baseline probes (default: %d, 0 = disabled)",
+            params.speculative.dm_profit_baseline_interval),
+        [](common_params & params, int value) {
+            if (value < 0 || value > 4096) {
+                throw std::invalid_argument("spec-dm-profit-baseline-interval must be in [0, 4096]");
+            }
+            params.speculative.dm_profit_baseline_interval = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_PROFIT_BASELINE_INTERVAL"));
+    add_opt(common_arg(
         {"--spec-draft-type-k", "-ctkd", "--cache-type-k-draft"}, "TYPE",
         string_format(
             "KV cache data type for K for the draft model\n"
             "allowed values: %s\n"
             "(default: %s)",
             get_all_kv_cache_types().c_str(),
-            ggml_type_name(params.speculative.draft.cache_type_k)
+            kv_cache_type_name(params.speculative.draft.cache_type_k)
         ),
         [](common_params & params, const std::string & value) {
             params.speculative.draft.cache_type_k = kv_cache_type_from_str(value);
@@ -3671,7 +4026,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "allowed values: %s\n"
             "(default: %s)",
             get_all_kv_cache_types().c_str(),
-            ggml_type_name(params.speculative.draft.cache_type_v)
+            kv_cache_type_name(params.speculative.draft.cache_type_v)
         ),
         [](common_params & params, const std::string & value) {
             params.speculative.draft.cache_type_v = kv_cache_type_from_str(value);
@@ -3784,7 +4139,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("comma-separated list of types of speculative decoding to use (default: %s)\n",
             common_speculative_type_name_str(params.speculative.types).c_str()),
         [](common_params & params, const std::string & value) {
-            const auto types_str = string_split<std::string>(value, ',');
+            auto types_str = string_split<std::string>(value, ',');
+            for (auto & type : types_str) {
+                if (type == "dflash") {
+                    LOG_WRN("speculative type 'dflash' was renamed in v0.4.0; redirecting to 'draft-dflash'\n");
+                    type = "draft-dflash";
+                }
+            }
             auto types = common_speculative_types_from_names(types_str);
             params.speculative.types.insert(params.speculative.types.end(), types.begin(), types.end());
         }

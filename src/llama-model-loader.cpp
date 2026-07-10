@@ -782,6 +782,10 @@ llama_model_loader::llama_model_loader(
         {
             uint32_t ftype_val = 0;
             if (get_key(LLM_KV_GENERAL_FILE_TYPE, ftype_val, false)) {
+                if (ftype_val == 43 || ftype_val == 44) {
+                    throw std::runtime_error(
+                        "legacy Bee TQ3/TQ4 weight format was removed in v0.4.0; re-quantize the model from source");
+                }
                 ftype = (llama_ftype) ftype_val;
             }
         }

@@ -430,13 +430,35 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        // BeeLlama KV-only formats.  Q2_0S is deliberately distinct from
+        // upstream Q2_0: it has a 32-element block and different math.
+        GGML_TYPE_Q6_0    = 43,
+        GGML_TYPE_Q6_1    = 44,
+        GGML_TYPE_Q3_0    = 45,
+        GGML_TYPE_Q3_1    = 46,
+        GGML_TYPE_Q2_0S   = 47,
+        GGML_TYPE_Q2_1    = 48,
+        GGML_TYPE_COUNT   = 49,
     };
 
     // precision
     enum ggml_prec {
         GGML_PREC_DEFAULT =  0, // stored as ggml_tensor.op_params, 0 by default
         GGML_PREC_F32     = 10,
+    };
+
+    // FLASH_ATTN_EXT op_params shared by the generic precision hint and KVarN's
+    // descriptor-native domain contract.
+    enum ggml_flash_attn_ext_op_param {
+        GGML_FLASH_ATTN_EXT_OP_PARAM_PREC         = 3,
+        GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN = 4,
+    };
+
+    enum ggml_flash_attn_ext_kvarn_domain {
+        GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO                 = 0,
+        GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED              = 1,
+        GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ORIGINAL             = 2,
+        GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V = 3,
     };
 
     // op hint
@@ -570,6 +592,12 @@ extern "C" {
         GGML_OP_RWKV_WKV7,
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
+
+        // KVarN record-oriented KV-cache operators.  They are not GGUF
+        // tensor types and are never serialized in model weights.
+        GGML_OP_KVARN_WHT,
+        GGML_OP_KVARN_STORE,
+        GGML_OP_KVARN_VIEW,
 
         GGML_OP_UNARY,
 
@@ -2572,8 +2600,40 @@ extern "C" {
             struct ggml_tensor  * v,
             struct ggml_tensor  * g,
             struct ggml_tensor  * beta,
-            struct ggml_tensor  * state,
-            int64_t               K);
+             struct ggml_tensor  * state,
+             int64_t               K);
+
+    // KVarN normalized Sylvester Walsh-Hadamard transform for 128/256/512
+    // head widths.  The transform is self-inverse.
+    GGML_API struct ggml_tensor * ggml_kvarn_wht(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   head_width);
+
+    // KVarN structured KV-cache operations.  Records span full 128-token
+    // tiles, so this deliberately remains separate from ggml_type.
+    GGML_API struct ggml_tensor * ggml_kvarn_store(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * current,
+            struct ggml_tensor  * indices,
+            struct ggml_tensor  * stage,
+            struct ggml_tensor  * records,
+            int                   bits,
+            int                   sinkhorn_iters,
+            bool                  value,
+            int                   stage_groups);
+
+    GGML_API struct ggml_tensor * ggml_kvarn_view(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * records,
+            struct ggml_tensor  * stage_after_store,
+            struct ggml_tensor  * indices,
+            int                   n_kv,
+            int                   stream_start,
+            int                   n_stream,
+            int                   bits,
+            bool                  value,
+            int                   stage_groups);
 
     // custom operators
 

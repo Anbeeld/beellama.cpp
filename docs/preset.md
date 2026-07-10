@@ -93,3 +93,26 @@ llama-server -hf user/repo:gpt-oss-120b-hf
 ```
 
 Please make sure to provide the correct `hf-repo` for each child preset. Otherwise, you may get error: `The specified tag is not a valid quantization scheme.`
+
+## BeeLlama KVarN and DFlash presets
+
+Bee-specific settings use the same option names without leading dashes. For
+example, a target-cache and upstream-DFlash server preset can contain:
+
+```ini
+[Qwen-DFlash-KVarN]
+model                 = /models/qwen.gguf
+spec-type             = draft-dflash
+spec-draft-model       = /models/qwen-dflash.gguf
+spec-draft-n-max       = 8
+spec-dm-controller     = profit
+cache-type-k           = kvarn4
+cache-type-v           = kvarn4
+flash-attn             = on
+reasoning-loop-guard   = force-close
+```
+
+Do not put removed TurboQuant/TCQ cache names, `spec-dflash-cross-ctx`, tree
+budget options, or `GGML_CUDA_FA_HALF_QUANTS` in a v0.4.0 preset. The legacy
+`dflash` spec-type spelling remains a warned compatibility alias, but new presets
+should use `draft-dflash`.

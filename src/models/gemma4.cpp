@@ -1,8 +1,4 @@
 #include "models.h"
-#include "ggml.h"
-#include "llama-context.h"
-
-#include <algorithm>
 
 void llama_model_gemma4::load_arch_hparams(llama_model_loader & ml) {
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
@@ -146,14 +142,6 @@ static ggml_tensor * ggml_view_2d_slice(ggml_context * ctx0, ggml_tensor * x, in
                         idx * x->ne[0] * x->ne[1] * ggml_element_size(x));
 }
 
-// Keep the scale op F32: CPU fallback does not implement BF16 scale.
-static ggml_tensor * ggml_bf16_scale_to_f32(ggml_context * ctx0, ggml_tensor * x, float scale) {
-    x = ggml_cast(ctx0, x, GGML_TYPE_F32);
-    x = ggml_scale(ctx0, x, scale);
-    x = ggml_cast(ctx0, x, GGML_TYPE_BF16);
-    return ggml_cast(ctx0, x, GGML_TYPE_F32);
-}
-
 // TODO @ngxson : maybe improve this in the future
 class llm_graph_input_logits_bias : public llm_graph_input_i {
 public:
@@ -191,9 +179,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     inpL = build_inp_embd(model.tok_embd);
 
     // important: do not normalize weights for raw embeddings input (i.e. encoded image emdeddings)
-    // BF16 precision: match training-time BF16 rounding for embedding scale.
-    inpL = ggml_cast(ctx0, inpL, GGML_TYPE_BF16);
-    inpL = ggml_bf16_scale_to_f32(ctx0, inpL, ubatch.token ? ggml_bf16_to_fp32(ggml_fp32_to_bf16(sqrtf(n_embd))) : 1.0f);
+    inpL = ggml_scale(ctx0, inpL, ubatch.token ? sqrtf(n_embd) : 1.0f);
     cb(inpL, "inp_scaled", -1);
 
     // inp_pos - contains the positions
@@ -203,15 +189,6 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     auto * inp_attn = build_attn_inp_kv_iswa();
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
-    const bool need_full_h_nextn = cparams.embeddings_nextn && !cparams.embeddings_nextn_masked;
-
-    const int64_t n_seq_tokens = ubatch.n_seq_tokens;
-
-    const int64_t dflash_capture_n_seqs =
-        ubatch.n_seqs_unq > 1 ? (int64_t) ubatch.n_seqs_unq : 1;
-
-    const int64_t dflash_capture_n_tokens =
-        ubatch.n_seqs_unq > 1 ? n_seq_tokens : (int64_t) ubatch.n_tokens;
 
     ggml_tensor * inp_per_layer = nullptr;
     if (model.per_layer_tok_embd) {
@@ -298,7 +275,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
 
         // TODO @ngxson : strip unused token right after the last KV layer to speed up prompt processing
         // keep all rows when extracting unmasked nextn embeddings (MTP target needs the hidden state for every token)
-        if (il == n_layer - 1 && inp_out_ids && !need_full_h_nextn) {
+        if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
             cur  = ggml_get_rows(ctx0,  cur, inp_out_ids);
             inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
         }
@@ -337,10 +314,8 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             cb(cur_moe, "ffn_norm_2", il);
 
             // custom MoE logits calculation (router operates on attn_out, not cur)
-            // BF16 precision: match training-time BF16 rounding for router norm+scale.
-            ggml_tensor * tmp = ggml_cast(ctx0, attn_out, GGML_TYPE_BF16);
-            tmp = ggml_rms_norm(ctx0, tmp, hparams.f_norm_rms_eps);
-            tmp = ggml_bf16_scale_to_f32(ctx0, tmp, 1.0f / ggml_bf16_to_fp32(ggml_fp32_to_bf16(sqrtf((float) n_embd))));
+            ggml_tensor * tmp = ggml_rms_norm(ctx0, attn_out, hparams.f_norm_rms_eps);
+            tmp = ggml_scale(ctx0, tmp, 1.0f / sqrtf((float) n_embd));
             tmp = ggml_mul(ctx0, tmp, model.layers[il].ffn_gate_inp_s);
             ggml_tensor * logits = build_lora_mm(model.layers[il].ffn_gate_inp, tmp); // [n_expert, n_tokens]
             cb(logits, "ffn_moe_logits", il);
@@ -395,24 +370,17 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             cb(cur, "pe_in", il);
 
             cur = build_lora_mm(model.layers[il].per_layer_inp_gate, cur); // [n_embd_per_layer, n_tokens]
-            cb(cur, "per_layer_inp_gate_mm", il);
             cur = ggml_gelu(ctx0, cur);
 
             ggml_tensor * inp_this_layer = ggml_view_2d_slice(ctx0, inp_per_layer, il); // [n_embd_per_layer, n_tokens]
 
-            // TODO(Gemma4 perf): strip unused output rows right after the last KV-producing layer.
-            // Do not implement this as a simple ggml_get_rows(cur/inpL) patch.
-            // Gemma4 ISWA attention masks are built from the original ubatch.n_tokens before
-            // the layer loop, and non-KV upper layers still consume those masks. Early row
-            // compaction needs a compact post-KV attention input/mask path first.
-            if (il == n_layer - 1 && inp_out_ids && !need_full_h_nextn) {
+            // TODO @ngxson : improve this
+            if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
                 inp_this_layer = ggml_get_rows(ctx0, inp_this_layer, inp_out_ids);
             }
-            cb(inp_this_layer, "inp_this_layer", il);
 
             cur = ggml_mul(ctx0, cur, inp_this_layer);
             cur = build_lora_mm(model.layers[il].per_layer_proj, cur); // [n_embd, n_tokens]
-            cb(cur, "per_layer_proj_mm_layer", il);
             cur = build_norm(cur, model.layers[il].per_layer_post_norm, nullptr, LLM_NORM_RMS, il);
             cb(cur, "per_layer_embd_out", il);
 
@@ -428,89 +396,6 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
-
-        if (cparams.hidden_gpu_n_seqs > 0 &&
-            cur->ne[1] == dflash_capture_n_tokens * dflash_capture_n_seqs) {
-            for (int s = 0; s < (int) dflash_capture_n_seqs && s < cparams.hidden_gpu_n_seqs; ++s) {
-                auto * hgpu = cparams.hidden_gpu_seqs[s];
-                if (!hgpu) {
-                    continue;
-                }
-
-                int hi = -1;
-                for (int i = 0; i < (int) hgpu->layer_ids.size(); ++i) {
-                    if (hgpu->layer_ids[i] == il) {
-                        hi = i;
-                        break;
-                    }
-                }
-                if (hi < 0 || dflash_capture_n_tokens > hgpu->max_tokens) {
-                    continue;
-                }
-
-                ggml_tensor * h_slice = ggml_view_2d(ctx0, cur,
-                    cur->ne[0], dflash_capture_n_tokens,
-                    cur->nb[1],
-                    (size_t) s * (size_t) dflash_capture_n_tokens * cur->nb[1]);
-                ggml_tensor * h_cont = ggml_cont(ctx0, h_slice);
-                ggml_tensor * h_dst = ggml_view_2d(ctx0, hgpu->layers[hi],
-                    hgpu->layers[hi]->ne[0], (int64_t) dflash_capture_n_tokens,
-                    hgpu->layers[hi]->nb[1], 0);
-                ggml_build_forward_expand(gf, ggml_cpy(ctx0, h_cont, h_dst));
-            }
-        }
-
-        // DFlash prefill staging: graph-copy the intersection of this ubatch
-        // with the capture window into prefill GPU buffers at the correct offset.
-        // Only copies dflash_prefill_n_tokens tokens starting at src_offset in
-        // the ubatch to dst_offset in the prefill staging buffer.
-        if (cparams.prefill_gpu_n_seqs > 0 &&
-            cparams.dflash_prefill_capture_active &&
-            cparams.dflash_prefill_n_tokens > 0 &&
-            cur->ne[1] == dflash_capture_n_tokens * dflash_capture_n_seqs) {
-            for (int s = 0; s < (int) dflash_capture_n_seqs && s < cparams.prefill_gpu_n_seqs; ++s) {
-                const int n_copy = cparams.dflash_prefill_n_tokens_seqs[s];
-                const int src_off = cparams.dflash_prefill_src_offsets[s];
-                const int dst_off = cparams.dflash_prefill_dst_offsets[s];
-                if (n_copy <= 0 || src_off < 0 || src_off + n_copy > dflash_capture_n_tokens) {
-                    continue;
-                }
-
-                auto * pgpu = cparams.prefill_gpu_seqs[s];
-                if (!pgpu) {
-                    continue;
-                }
-
-                int hi = -1;
-                for (int i = 0; i < (int) pgpu->layer_ids.size(); ++i) {
-                    if (pgpu->layer_ids[i] == il) {
-                        hi = i;
-                        break;
-                    }
-                }
-                if (hi < 0) {
-                    continue;
-                }
-                if (dst_off < 0 || dst_off + n_copy > pgpu->max_tokens) {
-                    continue;
-                }
-
-                ggml_tensor * h_slice = ggml_view_2d(ctx0, cur,
-                    cur->ne[0], (int64_t) n_copy,
-                    cur->nb[1],
-                    (size_t) s * (size_t) dflash_capture_n_tokens * cur->nb[1] +
-                    (size_t) src_off * cur->nb[1]);
-
-                ggml_tensor * h_cont = ggml_cont(ctx0, h_slice);
-
-                ggml_tensor * h_dst = ggml_view_2d(ctx0, pgpu->layers[hi],
-                    pgpu->layers[hi]->ne[0], (int64_t) n_copy,
-                    pgpu->layers[hi]->nb[1],
-                    (size_t) dst_off * pgpu->layers[hi]->nb[1]);
-
-                ggml_build_forward_expand(gf, ggml_cpy(ctx0, h_cont, h_dst));
-            }
-        }
 
         // input for next layer
         inpL = cur;
@@ -528,7 +413,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;
 
-    if (need_full_h_nextn && inp_out_ids) {
+    if (!cparams.embeddings_nextn_masked && inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
 
@@ -557,22 +442,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
-    const bool dflash_compact_verifier_only =
-        cparams.dflash_reduced_consumer_active && cparams.dflash_verify_logits;
-
-    if (cparams.dflash_verify_logits) {
-        const int topk = std::max(1, std::min(cparams.dflash_verify_topk, 64));
-        if (topk > 1) {
-            res->t_logits_argmax = ggml_topk_ext(ctx0, cur, topk, 0.0f, 0);
-        } else {
-            res->t_logits_argmax = ggml_argmax_ext(ctx0, cur, 0.0f, 0);
-        }
-        ggml_build_forward_expand(gf, res->t_logits_argmax);
-    }
-
-    if (!dflash_compact_verifier_only) {
-        ggml_build_forward_expand(gf, cur);
-    }
+    ggml_build_forward_expand(gf, cur);
 }
 
 // equivalent to get_per_layer_inputs() in python code
@@ -588,14 +458,8 @@ ggml_tensor * llama_model_gemma4::graph::build_inp_per_layer() {
         res->t_inp_tokens = inp->tokens;
 
         inp_per_layer = ggml_get_rows  (ctx0, model.per_layer_tok_embd, inp->tokens);
-        cb(inp_per_layer, "inp_per_layer_get_rows", -1);
         inp_per_layer = ggml_reshape_3d(ctx0, inp_per_layer, n_embd_per_layer, n_layer, n_tokens);
-        cb(inp_per_layer, "inp_per_layer_reshape", -1);
-        // BF16 precision: match training-time BF16 rounding for per-layer embedding scale.
-        inp_per_layer = ggml_cast      (ctx0, inp_per_layer, GGML_TYPE_BF16);
-        cb(inp_per_layer, "inp_per_layer_bf16", -1);
-        inp_per_layer = ggml_bf16_scale_to_f32(ctx0, inp_per_layer, ggml_bf16_to_fp32(ggml_fp32_to_bf16(tok_embd_scale)));
-        cb(inp_per_layer, "inp_per_layer_scaled", -1);
+        inp_per_layer = ggml_scale     (ctx0, inp_per_layer, tok_embd_scale);
         cb(inp_per_layer, "inp_per_layer_selected", -1);
 
         res->add_input(std::move(inp));
@@ -625,28 +489,20 @@ ggml_tensor * llama_model_gemma4::graph::project_per_layer_inputs(ggml_tensor * 
     const float per_layer_projection_scale = 1.0f / sqrtf((float) n_embd);
     const float per_layer_input_scale      = 1.0f / sqrtf(2.0f);
 
-    // note: per_layer_model_proj is classified as LLM_TENSOR_LAYER_REPEATING with
-    // GGML_OP_MUL_MAT and bid=0, so it routes through the layer buffer list (GPU under
-    // -ngl all). Exact backend placement can still be affected by buffer support and
-    // overrides, so this callback helps measure the matmul independently.
+    // note: this matrix multiplication will be performed in the input layer (i.e. on the CPU)
     ggml_tensor * per_layer_proj;
     per_layer_proj = ggml_mul_mat   (ctx0, model.per_layer_model_proj, inp_batch);
-    cb(per_layer_proj, "per_layer_proj_mm", -1);
     per_layer_proj = ggml_scale     (ctx0, per_layer_proj, per_layer_projection_scale);
-    cb(per_layer_proj, "per_layer_proj_scaled", -1);
     per_layer_proj = ggml_reshape_3d(ctx0, per_layer_proj, n_embd_per_layer, n_layer, n_tokens);
-    cb(per_layer_proj, "per_layer_proj_reshape", -1);
 
     per_layer_proj = build_norm(per_layer_proj, model.per_layer_proj_norm, nullptr, LLM_NORM_RMS, -1);
     cb(per_layer_proj, "per_layer_proj", -1);
 
     inp_per_layer = ggml_add  (ctx0, per_layer_proj, inp_per_layer);
-    cb(inp_per_layer, "inp_per_layer_add_proj", -1);
     inp_per_layer = ggml_scale(ctx0, inp_per_layer, per_layer_input_scale);
     cb(inp_per_layer, "inp_per_layer", -1);
 
     // permute to shape: [n_embd_per_layer, n_tokens, n_layer]
     inp_per_layer = ggml_cont(ctx0, ggml_permute(ctx0, inp_per_layer, 0, 2, 1, 3));
-    cb(inp_per_layer, "inp_per_layer_permute_cont", -1);
     return inp_per_layer;
 }

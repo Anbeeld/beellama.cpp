@@ -337,10 +337,6 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_gated_delta_net(ctx, idx);
             } break;
-        case GGML_OP_TURBO_WHT:
-            {
-                n_fuse = ggml_metal_op_turbo_wht(ctx, idx);
-            } break;
         case GGML_OP_SOLVE_TRI:
             {
                 n_fuse = ggml_metal_op_solve_tri(ctx, idx);
@@ -1678,39 +1674,6 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-int ggml_metal_op_turbo_wht(ggml_metal_op_t ctx, int idx) {
-    ggml_tensor * op = ctx->node(idx);
-
-    ggml_metal_library_t lib = ctx->lib;
-    ggml_metal_encoder_t enc = ctx->enc;
-
-    int direction;
-    memcpy(&direction, op->op_params, sizeof(int));
-
-    const int64_t n_elements = ggml_nelements(op->src[0]);
-    const int64_t n_groups = n_elements / 128;
-
-    auto pipeline = ggml_metal_library_get_pipeline_turbo_wht(lib);
-
-    ggml_metal_kargs_turbo_wht args = {
-        /*.n_elements =*/ n_elements,
-        /*.direction  =*/ direction,
-    };
-
-    int ida = 0;
-    ggml_metal_encoder_set_pipeline(enc, pipeline);
-    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), ida++);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), ida++);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         ida++);
-
-    // One thread per 128-element group, 256 threads per threadgroup
-    const int threads_per_tg = 256;
-    const int n_threadgroups = (n_groups + threads_per_tg - 1) / threads_per_tg;
-    ggml_metal_encoder_dispatch_threadgroups(enc, n_threadgroups, 1, 1, threads_per_tg, 1, 1);
-
-    return 1;
-}
-
 int ggml_metal_op_solve_tri(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -2990,8 +2953,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         // ne20*(nsg)
         // each simdgroup has a full f32 head vector in shared mem to accumulate results
         //
-// Extra 128 floats (512 bytes) for TurboQuant pre-dequantized block cache in threadgroup memory
-#define FATTN_SMEM(nsg) (GGML_PAD(((GGML_PAD(ne00, 128) + 4*ncpsg + 2*GGML_PAD(ne20, 128))*(nsg))*(sizeof(float)/2) + 128*sizeof(float), 16))
+#define FATTN_SMEM(nsg) (GGML_PAD(((GGML_PAD(ne00, 128) + 4*ncpsg + 2*GGML_PAD(ne20, 128))*(nsg))*(sizeof(float)/2), 16))
 
         int64_t nsg = 1;
 

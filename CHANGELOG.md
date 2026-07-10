@@ -1,5 +1,50 @@
 # Changelog
 
+## v0.4.0
+
+- Merged upstream llama.cpp at `049326a00` and re-based BeeLlama's maintained
+  extensions on its current model, memory, speculative, and server architecture.
+- Replaced the fork DFlash stack with upstream `draft-dflash`. `dflash` remains a
+  warned compatibility alias, and `scripts/convert-dflash-draft-to-upstream.py`
+  rewrites historical Bee/buun draft GGUF metadata and tensor names offline.
+  The converter deduplicates equal legacy/canonical metadata, rejects conflicting
+  values, and can reopen the output to verify every tensor type and checksum.
+- Corrected the upstream DFlash draft-context merge so it owns a normal KV cache.
+  Without this, draft graph reservation dereferenced a null memory context and
+  crashed both normal startup and the default memory-fit probe.
+- Removed TurboQuant/TCQ cache types, TQ weight formats, DDTree, CopySpec, the
+  old DFlash GPU ring/capture/tape paths, the fringe adaptive controller, and all
+  fork-only DFlash environment variables and arguments.
+- Redirected the removed `turbo2`/`turbo3`/`turbo4` and TCQ cache names to the
+  same-width KVarN presets with warnings. GGUF files marked as the former TQ3/TQ4
+  weight formats now fail early with a re-quantization error instead of being
+  interpreted as re-slotted v0.4.0 types.
+- Kept KVarN and its low-bit standard cache support. CUDA FlashAttention now
+  explicitly dispatches KVarN views to descriptor-native kernels, including clean
+  MMA fallback for valid pairs outside the fast decode matrix.
+- Replaced the three-tier FlashAttention quant build policy with a 103-pair
+  default standard vector matrix and a 169-pair `GGML_CUDA_FA_ALL_QUANTS` matrix.
+  KVarN keeps 15 balanced fast decode pairs by default and 36 with ALL. The
+  obsolete `GGML_CUDA_FA_HALF_QUANTS` option is gone.
+- Re-ported the profit-only adaptive DFlash controller and server reasoning-loop
+  guard onto upstream token/sampler and checkpoint behavior.
+- Added opted-in realtime reasoning control: a streaming chat completion armed
+  with `reasoning_control` can be moved to its final answer through
+  `/v1/chat/completions/control`.
+- Renamed Bee's internal Q2 cache enum to `GGML_TYPE_Q2_0S` while keeping `q2_0`
+  at the cache CLI boundary, avoiding a format collision with upstream's Q2_0
+  weight type. Saved sessions from older Bee releases are not compatible with
+  the re-slotted cache type IDs.
+- Rebased Bee's release workflow, package verification, CUDA 12.4/13.1 assets,
+  and container metadata on the new tree. Container descriptions now advertise
+  upstream DFlash and KVarN instead of removed TurboQuant/TCQ support.
+- RTX 3090 release validation measured Qwen3.6-27B KVarN4 KLD `0.002400`,
+  Gemma-4-31B KVarN4 KLD `0.402575` versus q5_0 `0.415296`, and upstream
+  DFlash at `73.81` median decode tokens/s with `40.1%` draft acceptance.
+  Upstream DFlash was `12.61%` slower than the v0.3.2 legacy DFlash stack in the
+  matched three-prompt server gate, so reduced verification/backend sampling
+  remain the first follow-up upstream contribution track.
+
 ## v0.3.2
 
 - Merged a newer upstream llama.cpp master after the current `main` baseline. Notable inherited changes include Granite 4 Vision, Gemma 4 MTP including E2B/E4B assistants, Gemma 4 unified conversion and audio-projector fixes, multimodal video input with ffmpeg in the released image, Qwen-VL frame merge support, Mistral-Medium-3.5 conversion, the unified LFM2/LFM2.5 tool parser and reasoning round-trip fixes, speculative vocab-compatibility checks, the placeholder-bitmap token counting and `*/input_tokens` API, optional server prompt logging, KV-cache cell-sharing/copy-avoidance fixes, `GGML_OP_COL2IM_1D`, ggml 0.14.0, CUDA 13.3 release images, HIP gfx1152/gfx1153 support, and backend/UI improvements across WebGPU, Vulkan, SYCL, Metal, CPU, and the Web UI.

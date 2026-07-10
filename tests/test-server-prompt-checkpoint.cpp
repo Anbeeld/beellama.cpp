@@ -12,65 +12,43 @@ static server_prompt make_prompt(const llama_tokens & tokens) {
 }
 
 int main() {
-    server_prompt_checkpoint ckpt {
-        /*.pos_min  = */ 1,
-        /*.pos_max  = */ 2,
-        /*.n_tokens = */ 3,
-        /*.data     = */ std::vector<uint8_t>(128),
-    };
-    ckpt.ring_data.resize(256);
+    {
+        common_prompt_checkpoint ckpt;
+        ckpt.n_tokens = 3;
+        ckpt.pos_min = 1;
+        ckpt.pos_max = 2;
+        ckpt.data_tgt.resize(128);
+        ckpt.data_dft.resize(64);
+        ckpt.data_spec.resize(32);
+        assert(ckpt.size() == 224);
 
-    ckpt.clear();
-
-    assert(ckpt.pos_min == 0);
-    assert(ckpt.pos_max == 0);
-    assert(ckpt.n_tokens == 0);
-    assert(ckpt.data.empty());
-    assert(ckpt.data.capacity() == 0);
-    assert(ckpt.ring_data.empty());
-    assert(ckpt.ring_data.capacity() == 0);
-
-    server_prompt prompt;
-    for (int i = 0; i < 4; ++i) {
-        auto & cur = prompt.checkpoints.emplace_back();
-        cur.n_tokens = i + 1;
-        cur.data_tgt.resize((size_t) (i + 1) * 100);
+        ckpt.clear();
+        assert(ckpt.n_tokens == 0);
+        assert(ckpt.pos_min == 0);
+        assert(ckpt.pos_max == 0);
+        assert(ckpt.empty());
+        assert(ckpt.size() == 0);
     }
 
     {
-        server_prompt budgeted = server_prompt_clone_with_checkpoint_budget(prompt, 250, 600, 3);
-        assert(budgeted.checkpoints.size() == 1);
-        assert(budgeted.checkpoints.front().n_tokens == 3);
-        assert(server_prompt_checkpoints_size(budgeted.checkpoints) == 300);
-    }
+        server_prompt prompt = make_prompt({1, 2, 3});
+        prompt.data.main.resize(64);
+        prompt.data.drft.resize(32);
+        auto & ckpt = prompt.checkpoints.emplace_back();
+        ckpt.n_tokens = 3;
+        ckpt.data_tgt.resize(16);
+        ckpt.data_dft.resize(8);
+        assert(prompt.size() == 120);
 
-    {
-        server_prompt budgeted = server_prompt_clone_with_checkpoint_budget(prompt, 600, 600, 3);
-        assert(budgeted.checkpoints.empty());
-    }
-
-    {
-        server_prompt budgeted = server_prompt_clone_with_checkpoint_budget(prompt, 0, 0, 3);
-        assert(budgeted.checkpoints.size() == 3);
-        assert(budgeted.checkpoints.front().n_tokens == 2);
-        assert(budgeted.checkpoints.back().n_tokens == 4);
-        assert(server_prompt_checkpoints_size(budgeted.checkpoints) == 900);
-    }
-
-    {
-        server_prompt budgeted = server_prompt_clone_with_checkpoint_budget(prompt, 0, 0, 1);
-        assert(budgeted.checkpoints.size() == 1);
-        assert(budgeted.checkpoints.front().n_tokens == 4);
-    }
-
-    {
-        server_prompt budgeted = server_prompt_clone_with_checkpoint_budget(prompt, 0, 0, 0);
-        assert(budgeted.checkpoints.empty());
+        const server_prompt clone = prompt.clone();
+        assert(clone.n_tokens() == 3);
+        assert(clone.data.size() == 96);
+        assert(clone.checkpoints.size() == 1);
+        assert(clone.size() == prompt.size());
     }
 
     {
         server_prompt_cache cache(1, 0);
-
         server_prompt existing = make_prompt({1, 2});
         existing.data.main.resize(700*KIB);
         cache.states.push_back(std::move(existing));
@@ -86,7 +64,20 @@ int main() {
 
     {
         server_prompt_cache cache(1, 0);
+        server_prompt current = make_prompt({3, 4});
+        auto & ckpt = current.checkpoints.emplace_back();
+        ckpt.n_tokens = 4;
+        ckpt.data_tgt.resize(200*KIB);
 
+        auto * saved = cache.alloc(current, 800*KIB, 0);
+        assert(saved != nullptr);
+        assert(saved->checkpoints.size() == 1);
+        assert(saved->size() == 1000*KIB);
+        assert(cache.size() == saved->size());
+    }
+
+    {
+        server_prompt_cache cache(1, 0);
         server_prompt existing = make_prompt({1, 2});
         existing.data.main.resize(100*KIB);
         cache.states.push_back(std::move(existing));
@@ -96,113 +87,18 @@ int main() {
         ckpt.n_tokens = 4;
         ckpt.data_tgt.resize(200*KIB);
 
-        auto * saved = cache.alloc(current, 800*KIB, 0);
-
-        assert(saved != nullptr);
-        assert(cache.size() <= cache.limit_size);
-        assert(saved->checkpoints.empty());
-    }
-
-    {
-        server_prompt_cache cache(1, 0);
-
-        server_prompt existing = make_prompt({1, 2});
-        existing.data.main.resize(100*KIB);
-        cache.states.push_back(std::move(existing));
-
-        server_prompt current = make_prompt({3, 4});
-        server_prompt prepared;
-
-        assert(!cache.prepare_save(prepared, current, 800*KIB, 0, 300*KIB));
-        assert(prepared.size() == 0);
+        assert(cache.alloc(current, 900*KIB, 0) == nullptr);
         assert(cache.states.size() == 1);
         assert(cache.size() == 100*KIB);
     }
 
     {
-        common_prompt_checkpoint ckpt;
-        ckpt.update_pos(17851, 17850, 17850);
-
-        assert(server_prompt_checkpoint_matches_restore_window(
-                ckpt,
-                /*pos_min_thold =*/ 17851,
-                /*pos_next =*/ 17851,
-                /*is_recurrent_or_hybrid =*/ false));
-        assert(!server_prompt_checkpoint_matches_restore_window(
-                ckpt,
-                /*pos_min_thold =*/ 17850,
-                /*pos_next =*/ 17851,
-                /*is_recurrent_or_hybrid =*/ false));
-
-        ckpt.update_pos(17851, 0, 17850);
-        assert(server_prompt_checkpoint_matches_restore_window(
-                ckpt,
-                /*pos_min_thold =*/ 0,
-                /*pos_next =*/ 17851,
-                /*is_recurrent_or_hybrid =*/ false));
-
-        ckpt.update_pos(17851, 17850, 17850);
-        assert(server_prompt_checkpoint_matches_restore_window(
-                ckpt,
-                /*pos_min_thold =*/ 0,
-                /*pos_next =*/ 17850,
-                /*is_recurrent_or_hybrid =*/ true));
-        assert(!server_prompt_checkpoint_matches_restore_window(
-                ckpt,
-                /*pos_min_thold =*/ 0,
-                /*pos_next =*/ 17849,
-                /*is_recurrent_or_hybrid =*/ true));
-
-        ckpt.update_pos(4123, 127, 127);
-        assert(server_prompt_checkpoint_matches_restore_window(
-                ckpt,
-                /*pos_min_thold =*/ 0,
-                /*pos_next =*/ 127,
-                /*is_recurrent_or_hybrid =*/ true));
-        assert(!server_prompt_checkpoint_matches_restore_window(
-                ckpt,
-                /*pos_min_thold =*/ 0,
-                /*pos_next =*/ 39,
-                /*is_recurrent_or_hybrid =*/ true));
+        server_prompt_cache cache(1, 0);
+        server_prompt current = make_prompt({3, 4});
+        assert(cache.alloc(current, 100*KIB, 0) != nullptr);
+        assert(cache.alloc(current, 100*KIB, 0) == nullptr);
+        assert(cache.states.size() == 1);
     }
-
-    {
-        assert(server_prompt_effective_checkpoint_limit(
-                /*configured_checkpoints =*/ 0,
-                /*prompt_cache_boundary_required =*/ false) == 0);
-        assert(server_prompt_effective_checkpoint_limit(
-                /*configured_checkpoints =*/ 0,
-                /*prompt_cache_boundary_required =*/ true) == 1);
-        assert(server_prompt_effective_checkpoint_limit(
-                /*configured_checkpoints =*/ 32,
-                /*prompt_cache_boundary_required =*/ true) == 32);
-
-        assert(server_prompt_checkpoint_creation_allowed(
-                /*boundary_only =*/ true,
-                /*n_before_user_known =*/ true,
-                /*is_on_user =*/ true,
-                /*is_after_user =*/ false,
-                /*near_prompt_end =*/ false));
-        assert(!server_prompt_checkpoint_creation_allowed(
-                /*boundary_only =*/ true,
-                /*n_before_user_known =*/ true,
-                /*is_on_user =*/ false,
-                /*is_after_user =*/ true,
-                /*near_prompt_end =*/ true));
-        assert(server_prompt_checkpoint_creation_allowed(
-                /*boundary_only =*/ false,
-                /*n_before_user_known =*/ true,
-                /*is_on_user =*/ false,
-                /*is_after_user =*/ true,
-                /*near_prompt_end =*/ true));
-    }
-
-    prompt.data.main.resize(64);
-    prompt.data.drft.resize(32);
-    prompt.clear();
-    assert(prompt.n_tokens() == 0);
-    assert(prompt.data.size() == 0);
-    assert(prompt.checkpoints.empty());
 
     return 0;
 }

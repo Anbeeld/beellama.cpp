@@ -213,7 +213,7 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_attn(
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
-    // Per-layer n_head_kv (may differ from scalar in RYS models)
+    // RYS variants can use different KV-head counts in full-attention layers.
     const int64_t n_head_kv_il = hparams.n_head_kv(il);
 
     // Order: joint QG projection, QG split, Q norm, KV projection, K norm, RoPE, attention

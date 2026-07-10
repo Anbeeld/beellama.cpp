@@ -9,6 +9,7 @@
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-dsa.h"
 #include "llama-kv-cache-dsv4.h"
+#include "llama-kv-cache-kvarn.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
@@ -22,6 +23,75 @@
 #include <unordered_set>
 
 // dedup helpers
+
+static enum ggml_flash_attn_ext_kvarn_domain llm_kvarn_attn_domain(
+        const ggml_tensor * q) {
+    // At this point Q is still in graph-builder layout [head_dim, n_head, n_tokens].
+    // True decode stays entirely in the rotated domain. Multi-row batches rotate
+    // Q/K but reconstruct V in the original domain inside native FlashAttention.
+    return q->ne[2] == 1 ?
+        GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED :
+        GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V;
+}
+
+static void llm_flash_attn_ext_set_kvarn_domain(
+        ggml_tensor * cur,
+        enum ggml_flash_attn_ext_kvarn_domain domain) {
+    while (cur != nullptr &&
+            (cur->op == GGML_OP_RESHAPE ||
+             cur->op == GGML_OP_PERMUTE ||
+             cur->op == GGML_OP_TRANSPOSE ||
+             cur->op == GGML_OP_VIEW ||
+             cur->op == GGML_OP_CONT) &&
+            cur->src[0] != nullptr) {
+        cur = cur->src[0];
+    }
+
+    if (cur != nullptr && cur->op == GGML_OP_FLASH_ATTN_EXT) {
+        cur->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN] = (int32_t) domain;
+    }
+}
+
+static ggml_tensor * ggml_kvarn_wht_aux(
+        ggml_context * ctx,
+        ggml_tensor * cur,
+        int64_t       head_width) {
+    GGML_ASSERT(head_width == 128 || head_width == 256 || head_width == 512);
+    if (!ggml_is_contiguous(cur)) {
+        cur = ggml_cont(ctx, cur);
+    }
+    return ggml_kvarn_wht(ctx, cur, (int) head_width);
+}
+
+static ggml_tensor * llm_kvarn_rot_for_dim(
+        ggml_tensor * rot_128,
+        ggml_tensor * rot_256,
+        ggml_tensor * rot_512,
+        int64_t       head_dim) {
+    switch (head_dim) {
+        case 128: return rot_128;
+        case 256: return rot_256;
+        case 512: return rot_512;
+        default:  return nullptr;
+    }
+}
+
+static void llm_kvarn_set_rot_inputs(
+        const llama_kv_cache_kvarn_context * kvarn,
+        ggml_tensor * rot_128,
+        ggml_tensor * rot_256,
+        ggml_tensor * rot_512) {
+    GGML_ASSERT(kvarn != nullptr);
+    if (rot_128 && rot_128->buffer) {
+        kvarn->set_input_kvarn_rot(rot_128);
+    }
+    if (rot_256 && rot_256->buffer) {
+        kvarn->set_input_kvarn_rot(rot_256);
+    }
+    if (rot_512 && rot_512->buffer) {
+        kvarn->set_input_kvarn_rot(rot_512);
+    }
+}
 
 static ggml_tensor * build_attn_inp_kq_mask(
         ggml_context * ctx,
@@ -481,6 +551,15 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     if (self_v_rot && self_v_rot->buffer) {
         mctx->set_input_v_rot(self_v_rot);
     }
+
+    if ((self_kvarn_rot_128 && self_kvarn_rot_128->buffer) ||
+            (self_kvarn_rot_256 && self_kvarn_rot_256->buffer) ||
+            (self_kvarn_rot_512 && self_kvarn_rot_512->buffer)) {
+        const auto * kvarn = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx);
+        GGML_ASSERT(kvarn != nullptr);
+        llm_kvarn_set_rot_inputs(kvarn,
+                self_kvarn_rot_128, self_kvarn_rot_256, self_kvarn_rot_512);
+    }
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
@@ -580,6 +659,22 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
         mctx->get_base()->set_input_v_rot(self_v_rot);
     }
 
+    if ((self_kvarn_rot_128 && self_kvarn_rot_128->buffer) ||
+            (self_kvarn_rot_256 && self_kvarn_rot_256->buffer) ||
+            (self_kvarn_rot_512 && self_kvarn_rot_512->buffer)) {
+        const auto * kvarn_base = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx->get_base());
+        const auto * kvarn_swa  = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx->get_swa());
+        GGML_ASSERT(kvarn_base != nullptr || kvarn_swa != nullptr);
+        llm_kvarn_set_rot_inputs(kvarn_base ? kvarn_base : kvarn_swa,
+                self_kvarn_rot_128, self_kvarn_rot_256, self_kvarn_rot_512);
+    }
+
+    if (self_kvarn_mat_idxs_swa && self_kvarn_mat_idxs_swa->buffer) {
+        const auto * kvarn_swa = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx->get_swa());
+        GGML_ASSERT(kvarn_swa != nullptr);
+        kvarn_swa->set_input_kvarn_mat_idxs(self_kvarn_mat_idxs_swa, ubatch);
+    }
+
     if (self_k_rot_swa && self_k_rot_swa->buffer) {
         mctx->get_swa()->set_input_k_rot(self_k_rot_swa);
     }
@@ -614,6 +709,14 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
 
     if (self_kq_mask_swa && self_kq_mask_swa->buffer) {
         res &= can_reuse_kq_mask(self_kq_mask_swa, mctx->get_swa(), params.ubatch, params.cparams);
+    }
+
+    // Re-bind the SWA KVarN view indices to the new per-batch context before
+    // graph construction asks it for native K/V views.
+    if (self_kvarn_mat_idxs_swa && self_kvarn_mat_idxs_swa->buffer) {
+        if (const auto * kvarn_swa = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx->get_swa())) {
+            kvarn_swa->set_mat_idxs(self_kvarn_mat_idxs_swa);
+        }
     }
 
     return res;
@@ -2600,6 +2703,11 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
+    if (const auto * kvarn = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur)) {
+        inp->self_kvarn_rot_128 = kvarn->build_input_kvarn_rot(ctx0, 128);
+        inp->self_kvarn_rot_256 = kvarn->build_input_kvarn_rot(ctx0, 256);
+        inp->self_kvarn_rot_512 = kvarn->build_input_kvarn_rot(ctx0, 512);
+    }
 
     return inp;
 }
@@ -2627,6 +2735,26 @@ ggml_tensor * llm_graph_context::build_attn(
             int       il) const {
     GGML_ASSERT(v_mla == nullptr);
 
+    const auto * mctx_cur = inp->mctx;
+    const auto * kvarn_ctx = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur);
+    const bool use_kvarn = kvarn_ctx != nullptr;
+    const auto kvarn_domain = use_kvarn ? llm_kvarn_attn_domain(q_cur) :
+        GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO;
+    const bool use_kvarn_rotated_domain = use_kvarn &&
+        kvarn_domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED;
+    const bool use_kvarn_mixed_domain = use_kvarn &&
+        kvarn_domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V;
+    const bool use_kvarn_q_rot = use_kvarn_rotated_domain || use_kvarn_mixed_domain;
+
+    if (use_kvarn) {
+        GGML_ASSERT(llama_kvarn_head_dim_supported((int) q_cur->ne[0]));
+        GGML_ASSERT(inp->self_k_rot == nullptr);
+        GGML_ASSERT(inp->self_v_rot == nullptr);
+        GGML_ASSERT(!use_kvarn_q_rot || llm_kvarn_rot_for_dim(
+                inp->self_kvarn_rot_128, inp->self_kvarn_rot_256,
+                inp->self_kvarn_rot_512, q_cur->ne[0]) != nullptr);
+    }
+
     if (inp->self_k_rot) {
         q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot);
         k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
@@ -2643,8 +2771,6 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_build_forward_expand(gf, v_cur);
     ggml_build_forward_expand(gf, k_cur);
 
-    const auto * mctx_cur = inp->mctx;
-
     // store to KV cache
     {
         const auto & k_idxs = inp->get_k_idxs();
@@ -2657,13 +2783,29 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kq_mask = inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    ggml_tensor * k = use_kvarn ? kvarn_ctx->get_k_native(ctx0, il) : mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = use_kvarn ? kvarn_ctx->get_v_native(ctx0, il) : mctx_cur->get_v(ctx0, il);
+    ggml_tensor * kvarn_rot = use_kvarn ? llm_kvarn_rot_for_dim(
+            inp->self_kvarn_rot_128, inp->self_kvarn_rot_256,
+            inp->self_kvarn_rot_512, q->ne[0]) : nullptr;
+
+    if (use_kvarn_q_rot) {
+        GGML_ASSERT(q->type == GGML_TYPE_F32);
+        GGML_ASSERT(kvarn_rot != nullptr);
+        q = ggml_kvarn_wht_aux(ctx0, q, kvarn_rot->ne[0]);
+    }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    if (use_kvarn) {
+        llm_flash_attn_ext_set_kvarn_domain(cur, kvarn_domain);
+    }
     cb(cur, "kqv_out", il);
 
-    if (inp->self_v_rot) {
+    if (use_kvarn_rotated_domain) {
+        GGML_ASSERT(cur->type == GGML_TYPE_F32);
+        GGML_ASSERT(kvarn_rot != nullptr);
+        cur = ggml_kvarn_wht_aux(ctx0, cur, kvarn_rot->ne[0]);
+    } else if (inp->self_v_rot) {
         cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
     }
 
@@ -2868,6 +3010,27 @@ ggml_tensor * llm_graph_context::build_attn(
     auto * k_rot = is_swa ? inp->self_k_rot_swa : inp->self_k_rot;
     auto * v_rot = is_swa ? inp->self_v_rot_swa : inp->self_v_rot;
 
+    const auto * mctx_iswa = inp->mctx;
+    const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
+    const auto * kvarn_ctx = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur);
+    const bool use_kvarn = kvarn_ctx != nullptr;
+    const auto kvarn_domain = use_kvarn ? llm_kvarn_attn_domain(q_cur) :
+        GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO;
+    const bool use_kvarn_rotated_domain = use_kvarn &&
+        kvarn_domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED;
+    const bool use_kvarn_mixed_domain = use_kvarn &&
+        kvarn_domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V;
+    const bool use_kvarn_q_rot = use_kvarn_rotated_domain || use_kvarn_mixed_domain;
+
+    if (use_kvarn) {
+        GGML_ASSERT(llama_kvarn_head_dim_supported((int) q_cur->ne[0]));
+        GGML_ASSERT(k_rot == nullptr);
+        GGML_ASSERT(v_rot == nullptr);
+        GGML_ASSERT(!use_kvarn_q_rot || llm_kvarn_rot_for_dim(
+                inp->self_kvarn_rot_128, inp->self_kvarn_rot_256,
+                inp->self_kvarn_rot_512, q_cur->ne[0]) != nullptr);
+    }
+
     if (k_rot) {
         q_cur = llama_mul_mat_hadamard(ctx0, q_cur, k_rot);
         if (k_cur) {
@@ -2892,10 +3055,6 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_build_forward_expand(gf, v_cur);
     }
 
-    const auto * mctx_iswa = inp->mctx;
-
-    const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
-
     // optionally store to KV cache
     if (k_cur) {
         const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
@@ -2912,13 +3071,29 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    ggml_tensor * k = use_kvarn ? kvarn_ctx->get_k_native(ctx0, il) : mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = use_kvarn ? kvarn_ctx->get_v_native(ctx0, il) : mctx_cur->get_v(ctx0, il);
+    ggml_tensor * kvarn_rot = use_kvarn ? llm_kvarn_rot_for_dim(
+            inp->self_kvarn_rot_128, inp->self_kvarn_rot_256,
+            inp->self_kvarn_rot_512, q->ne[0]) : nullptr;
+
+    if (use_kvarn_q_rot) {
+        GGML_ASSERT(q->type == GGML_TYPE_F32);
+        GGML_ASSERT(kvarn_rot != nullptr);
+        q = ggml_kvarn_wht_aux(ctx0, q, kvarn_rot->ne[0]);
+    }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    if (use_kvarn) {
+        llm_flash_attn_ext_set_kvarn_domain(cur, kvarn_domain);
+    }
     cb(cur, "kqv_out", il);
 
-    if (v_rot) {
+    if (use_kvarn_rotated_domain) {
+        GGML_ASSERT(cur->type == GGML_TYPE_F32);
+        GGML_ASSERT(kvarn_rot != nullptr);
+        cur = ggml_kvarn_wht_aux(ctx0, cur, kvarn_rot->ne[0]);
+    } else if (v_rot) {
         cur = llama_mul_mat_hadamard(ctx0, cur, v_rot);
     }
 
@@ -3052,9 +3227,24 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
 
     inp->self_k_rot = mctx_cur->get_base()->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->get_base()->build_input_v_rot(ctx0);
+    if (const auto * kvarn_base = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur->get_base())) {
+        inp->self_kvarn_rot_128 = kvarn_base->build_input_kvarn_rot(ctx0, 128);
+        inp->self_kvarn_rot_256 = kvarn_base->build_input_kvarn_rot(ctx0, 256);
+        inp->self_kvarn_rot_512 = kvarn_base->build_input_kvarn_rot(ctx0, 512);
+    }
 
     inp->self_k_rot_swa = mctx_cur->get_swa()->build_input_k_rot(ctx0);
     inp->self_v_rot_swa = mctx_cur->get_swa()->build_input_v_rot(ctx0);
+    if (const auto * kvarn_swa = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur->get_swa())) {
+        if (inp->self_kvarn_rot_128 == nullptr) {
+            inp->self_kvarn_rot_128 = kvarn_swa->build_input_kvarn_rot(ctx0, 128);
+            inp->self_kvarn_rot_256 = kvarn_swa->build_input_kvarn_rot(ctx0, 256);
+            inp->self_kvarn_rot_512 = kvarn_swa->build_input_kvarn_rot(ctx0, 512);
+        }
+        inp->self_kvarn_mat_idxs_swa = kvarn_swa->build_input_kvarn_mat_idxs(ctx0);
+        // Native K/V views are built before set_input() populates the tensor.
+        kvarn_swa->set_mat_idxs(inp->self_kvarn_mat_idxs_swa);
+    }
 
     return (llm_graph_input_attn_kv_iswa *) res->add_input(std::move(inp));
 }

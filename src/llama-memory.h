@@ -46,15 +46,6 @@ llama_memory_status llama_memory_status_combine(llama_memory_status s0, llama_me
 // helper function for checking if a memory status indicates a failure
 bool llama_memory_status_is_fail(llama_memory_status status);
 
-struct llama_memory_recurrent_copy_profile {
-    uint64_t layers_scanned = 0;
-    uint64_t tensors_copied = 0;
-    uint64_t cuda_d2d_queued = 0;
-    uint64_t fallback_copies = 0;
-    uint64_t enqueue_us = 0;
-    uint64_t sync_us = 0;
-};
-
 // the interface for managing the memory context during batch processing
 // this interface is implemented per memory type. see:
 //   - llama_kv_cache_context
@@ -139,18 +130,6 @@ struct llama_memory_i {
 
     virtual void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) = 0;
 
-    // Copy only recurrent state (skip KV/attention). Used by DFlash flat-mode backup
-    // where KV backup is unnecessary — flat mode rollback trims rejected positions
-    // without needing a full KV restore.
-    virtual void seq_cp_recurrent(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) = 0;
-    virtual bool seq_rm_recurrent(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-        GGML_UNUSED(seq_id);
-        GGML_UNUSED(p0);
-        GGML_UNUSED(p1);
-        return true;
-    }
-    virtual void recurrent_copy_profile_reset() {}
-    virtual llama_memory_recurrent_copy_profile recurrent_copy_profile() const { return {}; }
     virtual void seq_keep(llama_seq_id seq_id) = 0;
     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;
     virtual void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) = 0;
@@ -175,10 +154,6 @@ struct llama_memory_i {
 
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
-
-    // DFlash: force per-seq ubatch splits so each ubatch carries exactly one slot's tokens.
-    // Default no-op; hybrid memories override.
-    virtual void set_force_split_seq(bool /*v*/) {}
 
     // KV-cache-compatible hooks used by composite memories such as hybrid and iSWA.
     // Non-KV memory types keep the defaults and should not be used as attention memory.

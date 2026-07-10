@@ -91,11 +91,6 @@ void llama_kv_cache_dsa::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst
     kv_lid->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 
-void llama_kv_cache_dsa::seq_cp_recurrent(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
-    kv_mla->seq_cp_recurrent(seq_id_src, seq_id_dst, p0, p1);
-    kv_lid->seq_cp_recurrent(seq_id_src, seq_id_dst, p0, p1);
-}
-
 void llama_kv_cache_dsa::seq_keep(llama_seq_id seq_id) {
     kv_mla->seq_keep(seq_id);
     kv_lid->seq_keep(seq_id);

@@ -195,6 +195,46 @@ extern "C" {
 
     LLAMA_API const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_type);
 
+    // Experimental BeeLlama structured K/V cache.  Unlike a conventional
+    // ggml cache type, KVarN stores joint 128-token tiles and therefore has a
+    // separate context parameter object.
+    enum llama_kvarn_type {
+        LLAMA_KVARN_TYPE_INVALID  = -1,
+        LLAMA_KVARN_TYPE_DISABLED = 0,
+
+        LLAMA_KVARN_K2V2_G128, LLAMA_KVARN_K2V3_G128, LLAMA_KVARN_K2V4_G128,
+        LLAMA_KVARN_K3V2_G128, LLAMA_KVARN_K3V3_G128, LLAMA_KVARN_K3V4_G128,
+        LLAMA_KVARN_K4V2_G128, LLAMA_KVARN_K4V3_G128, LLAMA_KVARN_K4V4_G128,
+        LLAMA_KVARN_K2V5_G128, LLAMA_KVARN_K2V6_G128, LLAMA_KVARN_K2V8_G128,
+        LLAMA_KVARN_K3V5_G128, LLAMA_KVARN_K3V6_G128, LLAMA_KVARN_K3V8_G128,
+        LLAMA_KVARN_K4V5_G128, LLAMA_KVARN_K4V6_G128, LLAMA_KVARN_K4V8_G128,
+        LLAMA_KVARN_K5V2_G128, LLAMA_KVARN_K5V3_G128, LLAMA_KVARN_K5V4_G128,
+        LLAMA_KVARN_K5V5_G128, LLAMA_KVARN_K5V6_G128, LLAMA_KVARN_K5V8_G128,
+        LLAMA_KVARN_K6V2_G128, LLAMA_KVARN_K6V3_G128, LLAMA_KVARN_K6V4_G128,
+        LLAMA_KVARN_K6V5_G128, LLAMA_KVARN_K6V6_G128, LLAMA_KVARN_K6V8_G128,
+        LLAMA_KVARN_K8V2_G128, LLAMA_KVARN_K8V3_G128, LLAMA_KVARN_K8V4_G128,
+        LLAMA_KVARN_K8V5_G128, LLAMA_KVARN_K8V6_G128, LLAMA_KVARN_K8V8_G128,
+
+        LLAMA_KVARN_TYPE_COUNT,
+    };
+
+    struct llama_kvarn_params {
+        enum llama_kvarn_type type;
+        int32_t key_bits;
+        int32_t value_bits;
+        int32_t swa_key_bits;
+        int32_t swa_value_bits;
+        int32_t group;
+        int32_t sinkhorn_iters;
+        int32_t sink_tokens;
+        bool    fail_if_unsupported;
+    };
+
+    LLAMA_API const char *              llama_kvarn_type_name       (enum llama_kvarn_type type);
+    LLAMA_API enum llama_kvarn_type     llama_kvarn_type_from_name  (const char * name);
+    LLAMA_API struct llama_kvarn_params llama_kvarn_default_params  (void);
+    LLAMA_API struct llama_kvarn_params llama_kvarn_params_for_type (enum llama_kvarn_type type);
+
     enum llama_split_mode {
         LLAMA_SPLIT_MODE_NONE   = 0, // single GPU
         LLAMA_SPLIT_MODE_LAYER  = 1, // split layers and KV across GPUs
@@ -368,6 +408,7 @@ extern "C" {
 
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
+        struct llama_kvarn_params kvarn; // experimental structured K/V cache
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
@@ -1407,7 +1448,6 @@ extern "C" {
                             size_t num_trigger_patterns,
                const llama_token * trigger_tokens,
                             size_t num_trigger_tokens);
-
 
     /// NOTE: Avoid using on the full vocabulary as searching for repeated tokens can become slow. For example, apply top-k or top-p sampling first.
     LLAMA_API struct llama_sampler * llama_sampler_init_penalties(

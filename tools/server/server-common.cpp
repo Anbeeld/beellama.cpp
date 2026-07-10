@@ -1085,29 +1085,6 @@ json oaicompat_chat_params_parse(
         throw std::invalid_argument("invalid type for \"enable_thinking\" (expected boolean, got string)");
     }
 
-    // if the assistant message appears at the end of list, we do not add end-of-turn token
-    // for ex. this can be useful to modify the reasoning process in reasoning models
-    bool prefill_assistant_message = !inputs.messages.empty() && inputs.messages.back().role == "assistant" && opt.prefill_assistant;
-    common_chat_msg last_message;
-    if (prefill_assistant_message) {
-        last_message = inputs.messages.back();
-        inputs.messages.pop_back();
-
-        /* sanity check, max one assistant message at the end of the list */
-        if (!inputs.messages.empty() && inputs.messages.back().role == "assistant"){
-            throw std::invalid_argument("Cannot have 2 or more assistant messages at the end of the list.");
-        }
-
-        inputs.reasoning_format = COMMON_REASONING_FORMAT_NONE;
-
-        // Upstream guarded against assistant prefill + enable_thinking with a
-        // blanket error, but harnesses that track thinking tokens themselves
-        // (hermes, etc.) drive prefill-to-continue for thinking-only responses
-        // and need both on at once. Experimental fork: allow it.
-
-        inputs.add_generation_prompt = true;
-    }
-
     inputs.force_pure_content = opt.force_pure_content;
 
     // Apply chat template to the list of messages
@@ -1128,8 +1105,6 @@ json oaicompat_chat_params_parse(
     llama_params["grammar_triggers"]  = grammar_triggers;
     llama_params["preserved_tokens"]  = chat_params.preserved_tokens;
     llama_params["generation_prompt"] = chat_params.generation_prompt;
-    llama_params["thinking_start_tag"] = chat_params.thinking_start_tag;
-    llama_params["thinking_end_tag"] = chat_params.thinking_end_tag;
     for (const auto & stop : chat_params.additional_stops) {
         llama_params["stop"].push_back(stop);
     }

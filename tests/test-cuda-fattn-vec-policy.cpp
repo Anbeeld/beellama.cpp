@@ -35,6 +35,16 @@ static std::string slice_between(const std::string & text, const std::string & b
     return text.substr(b, e - b);
 }
 
+static size_t count_occurrences(const std::string & text, const std::string & needle) {
+    size_t count = 0;
+    size_t pos = 0;
+    while ((pos = text.find(needle, pos)) != std::string::npos) {
+        ++count;
+        pos += needle.size();
+    }
+    return count;
+}
+
 int main(int argc, char ** argv) {
     bool ok = true;
 
@@ -44,46 +54,43 @@ int main(int argc, char ** argv) {
     }
 
     const std::string root = argv[1];
+    const std::string generator = read_file(root + "/scripts/gen-fattn-vec-dispatch.py");
+    const std::string dispatch = read_file(root + "/ggml/src/ggml-cuda/fattn-vec-dispatch.cuh");
     const std::string vec = read_file(root + "/ggml/src/ggml-cuda/fattn-vec.cuh");
-    const std::string helpers = slice_between(vec,
-            "static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device()",
-            "template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap>");
-    const std::string kernel = slice_between(vec,
-            "template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap>",
-            "static __global__ void flash_attn_ext_vec");
-    const std::string body = slice_between(vec,
-            "static __global__ void flash_attn_ext_vec",
-            "template <int D, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap>");
 
-    ok &= expect(!helpers.empty(),
-        "VEC FA launch-bound helpers must be declared before the kernel template");
-    ok &= expect(helpers.find("ggml_cuda_fattn_vec_is_turbo_kv_type") != std::string::npos,
-        "VEC FA must centralize Turbo/TCQ type detection");
-    ok &= expect(helpers.find("GGML_TYPE_TURBO2_0") != std::string::npos &&
-                 helpers.find("GGML_TYPE_TURBO3_0") != std::string::npos &&
-                 helpers.find("GGML_TYPE_TURBO4_0") != std::string::npos &&
-                 helpers.find("GGML_TYPE_TURBO2_TCQ") != std::string::npos &&
-                 helpers.find("GGML_TYPE_TURBO3_TCQ") != std::string::npos &&
-                 helpers.find("GGML_TYPE_TURBO4_TCQ") != std::string::npos,
-        "VEC FA Turbo/TCQ detection must cover all Turbo cache families");
-    ok &= expect(helpers.find("ggml_cuda_fattn_vec_get_min_blocks") != std::string::npos,
-        "VEC FA must compute launch-bound min blocks from K/V cache types");
-    ok &= expect(helpers.find("? 2 : 1") != std::string::npos,
-        "VEC FA min blocks must be 2 only for Turbo/TCQ pairs and 1 otherwise");
+    const std::string all_branch = slice_between(dispatch,
+            "#if defined(GGML_CUDA_FA_ALL_QUANTS)",
+            "#else");
+    const std::string default_branch = slice_between(dispatch,
+            "#else",
+            "#endif");
 
-    ok &= expect(kernel.find("ggml_cuda_fattn_vec_get_nthreads_device(), (ggml_cuda_fattn_vec_get_min_blocks<type_K, type_V>())") != std::string::npos,
-        "VEC FA launch_bounds must use the K/V type-aware min-block policy");
-    ok &= expect(kernel.find("ggml_cuda_fattn_vec_get_nthreads_device(), ggml_cuda_fattn_vec_get_min_blocks<type_K, type_V>()") == std::string::npos,
-        "VEC FA launch_bounds min-block expression must be parenthesized for HIP's variadic macro parser");
-    ok &= expect(kernel.find("ggml_cuda_fattn_vec_get_nthreads_device(), 2") == std::string::npos,
-        "VEC FA launch_bounds must not force all cache types to minBlocksPerSM=2");
+    ok &= expect(generator.find("assert len(TYPES) == 13") != std::string::npos &&
+                 generator.find("assert len(pairs_default) == 103") != std::string::npos &&
+                 generator.find("assert len(pairs_all) == 169") != std::string::npos,
+        "the vector-pair generator must assert the 13-type, 103-default, and 169-ALL policy counts");
+    ok &= expect(generator.find("rank_k <= rank_v or type_k == \"GGML_TYPE_F16\" or type_v == \"GGML_TYPE_F16\"") != std::string::npos,
+        "the default vector-pair policy must preserve the F16 materialization axes");
+    ok &= expect(generator.find("GGML_TYPE_Q2_0S") != std::string::npos,
+        "the surviving fork q2 cache type must be q2_0s, not the upstream q2_0 type");
 
-    ok &= expect(body.find("constexpr bool K_is_turbo = ggml_cuda_fattn_vec_is_turbo_kv_type<type_K>();") != std::string::npos &&
-                 body.find("constexpr bool V_is_turbo = ggml_cuda_fattn_vec_is_turbo_kv_type<type_V>();") != std::string::npos,
-        "VEC FA kernel body must reuse the centralized Turbo/TCQ type helper");
-    ok &= expect(body.find("sparse_v_threshold") == std::string::npos &&
-                 body.find("if (dominated) { continue; }") == std::string::npos,
-        "VEC FA standard V path must not use a data-dependent sparse V skip");
+    ok &= expect(!all_branch.empty() && !default_branch.empty(),
+        "the generated vector dispatch must have distinct ALL and default branches");
+    ok &= expect(count_occurrences(all_branch, "FATTN_VEC_CASES_ALL_D(") == 169,
+        "the ALL vector dispatch must include every ordered pair of the 13 retained types");
+    ok &= expect(count_occurrences(default_branch, "FATTN_VEC_CASES_ALL_D(") == 103,
+        "the default vector dispatch must include exactly 103 pairs");
+    ok &= expect(dispatch.find("GGML_CUDA_FA_HALF_QUANTS") == std::string::npos,
+        "the removed HALF build tier must not survive in vector dispatch");
+
+    ok &= expect(vec.find("static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device()") != std::string::npos,
+        "the vector kernel helper section must remain present");
+    ok &= expect(vec.find("GGML_TYPE_TURBO") == std::string::npos &&
+                 vec.find("TCQ") == std::string::npos,
+        "the vector kernel must not retain TurboQuant or TCQ cache handling");
+    ok &= expect(vec.find("GGML_TYPE_Q2_0S") != std::string::npos &&
+                 vec.find("GGML_TYPE_Q6_1") != std::string::npos,
+        "the vector kernel must retain declarations for the fork low-bit cache types");
 
     return ok ? 0 : 1;
 }

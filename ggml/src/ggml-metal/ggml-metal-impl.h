@@ -101,7 +101,6 @@
 #define FC_SUM_ROWS                    1400
 #define FC_UPSCALE                     1500
 #define FC_GATED_DELTA_NET             1600
-#define FC_TURBO_WHT                   1700
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
@@ -927,11 +926,6 @@ typedef struct {
     uint64_t nb2;
     uint64_t nb3;
 } ggml_metal_kargs_gated_delta_net;
-
-typedef struct {
-    int64_t  n_elements;  // total elements in tensor
-    int32_t  direction;   // 0 = forward, 1 = inverse
-} ggml_metal_kargs_turbo_wht;
 
 typedef struct {
     int32_t  ne00;

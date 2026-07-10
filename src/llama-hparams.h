@@ -254,13 +254,6 @@ struct llama_hparams {
     // gemma4 per-layer embedding
     uint32_t n_embd_per_layer = 0;
 
-    // for DFlash drafter
-    uint32_t dflash_block_size        = 16;
-    uint32_t dflash_mask_token_id     = 0;
-    uint32_t dflash_n_target_features = 25600;
-    uint32_t dflash_n_target_layers   = 0;
-    uint32_t dflash_target_layer_ids[8] = {};
-
     // needed by encoder-decoder models (e.g. T5, FLAN-T5)
     // ref: https://github.com/ggml-org/llama.cpp/pull/8141
     llama_token dec_start_token_id = LLAMA_TOKEN_NULL;
@@ -371,7 +364,8 @@ struct llama_hparams {
     // number of effective layers (excludes nextn layers)
     uint32_t n_layer() const;
 
-    // number of layers for which has_kv() returns true
+    // Number of layers that allocate attention KV storage.  KVarN uses this
+    // for exact context sizing on models with a reduced KV layer range.
     uint32_t n_layer_kv() const;
 
     // note that this function uses different SWA parameters from those in the hparams

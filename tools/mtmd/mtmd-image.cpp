@@ -170,26 +170,15 @@ struct img_tool {
         // always align up first
         int h_bar = std::max(align_size, round_by_factor(height));
         int w_bar = std::max(align_size, round_by_factor(width));
-        auto n_pixels = [&]() { return (int64_t) h_bar * w_bar; };
-        auto clamp_to_max_pixels = [&]() {
-            if (n_pixels() <= max_pixels) {
-                return;
-            }
-            const auto beta = std::sqrt(static_cast<float>(n_pixels()) / max_pixels);
-            h_bar = std::max(align_size, floor_by_factor(h_bar / beta));
-            w_bar = std::max(align_size, floor_by_factor(w_bar / beta));
-        };
 
-        if (n_pixels() > max_pixels) {
+        if (h_bar * w_bar > max_pixels) {
             const auto beta = std::sqrt(static_cast<float>(height * width) / max_pixels);
             h_bar = std::max(align_size, floor_by_factor(height / beta));
             w_bar = std::max(align_size, floor_by_factor(width  / beta));
-        } else if (n_pixels() < min_pixels) {
+        } else if (h_bar * w_bar < min_pixels) {
             const auto beta = std::sqrt(static_cast<float>(min_pixels) / (height * width));
             h_bar = ceil_by_factor(height * beta);
             w_bar = ceil_by_factor(width * beta);
-            // Min-pixel upscaling can overshoot max_pixels after alignment.
-            clamp_to_max_pixels();
         }
 
         return {w_bar, h_bar};

@@ -1,7 +1,6 @@
 #include "getrows.cuh"
 #include "dequantize.cuh"
 #include "convert.cuh"
-#include "turbo-quant-cuda.cuh"
 
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void k_get_rows(
@@ -221,56 +220,8 @@ static void ggml_cuda_get_rows_switch_src0_type(
             get_rows_cuda_q<QK5_1, QR5_1, dequantize_q5_1>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
-        case GGML_TYPE_Q6_0:
-            get_rows_cuda_q<QK6_0, QR6_0, dequantize_q6_0>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
-            break;
-        case GGML_TYPE_Q6_1:
-            get_rows_cuda_q<QK6_1, QR6_1, dequantize_q6_1>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
-            break;
-        case GGML_TYPE_Q3_0: // 2-bit-plane layout: float2 dequant covers (iqs, iqs+16), so ratio 2
-            get_rows_cuda_q<QK3_0, 2, dequantize_q3_0>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
-            break;
-        case GGML_TYPE_Q3_1:
-            get_rows_cuda_q<QK3_1, 2, dequantize_q3_1>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
-            break;
-        case GGML_TYPE_Q2_0:
-            get_rows_cuda_q<QK2_0, 2, dequantize_q2_0>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
-            break;
-        case GGML_TYPE_Q2_1:
-            get_rows_cuda_q<QK2_1, 2, dequantize_q2_1>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
-            break;
         case GGML_TYPE_Q8_0:
             get_rows_cuda_q<QK8_0, QR8_0, dequantize_q8_0>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
-            break;
-        case GGML_TYPE_TURBO2_0:
-            get_rows_cuda_q<QK_TURBO2, QR_TURBO2_0, dequantize_turbo2_0>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
-            break;
-        case GGML_TYPE_TURBO3_0:
-            get_rows_cuda_q<QK_TURBO3, QR_TURBO3_0, dequantize_turbo3_0>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
-            break;
-        case GGML_TYPE_TURBO4_0:
-            get_rows_cuda_q<QK_TURBO4, QR_TURBO4_0, dequantize_turbo4_0>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
-            break;
-        case GGML_TYPE_TURBO4_TCQ:
-            get_rows_cuda_q<QK_TURBO4_TCQ, QR_TURBO4_TCQ, dequantize_turbo4_tcq>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
-            break;
-        case GGML_TYPE_TURBO3_TCQ:
-            get_rows_cuda_q<QK_TURBO3_TCQ, QR_TURBO3_TCQ, dequantize_turbo3_tcq>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
-            break;
-        case GGML_TYPE_TURBO2_TCQ:
-            get_rows_cuda_q<QK_TURBO2_TCQ, QR_TURBO2_TCQ, dequantize_turbo2_tcq>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         default:

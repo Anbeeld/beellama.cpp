@@ -384,7 +384,7 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             case GGML_TYPE_Q2_K:
             case GGML_TYPE_Q3_K:
             case GGML_TYPE_TQ1_0:
-            case GGML_TYPE_TQ2_0:
+            case GGML_TYPE_TQ2_0:   return_type = GGML_TYPE_Q4_0;   break;
             case GGML_TYPE_Q4_K:    return_type = GGML_TYPE_Q5_0;   break;
             case GGML_TYPE_Q5_K:    return_type = GGML_TYPE_Q5_1;   break;
             case GGML_TYPE_Q6_K:    return_type = GGML_TYPE_Q8_0;   break;
@@ -1337,21 +1337,9 @@ void llama_quant_free(quantize_state_impl * qs) {
 }
 
 llama_model * llama_quant_model_from_metadata(const llama_quant_model_desc * desc) {
-    struct llama_quant_metadata_model final : llama_model {
-        explicit llama_quant_metadata_model(const llama_model_params & params) : llama_model(params) {}
-
-        void load_stats(llama_model_loader &) override {}
-        void load_hparams(llama_model_loader &) override {}
-        void load_vocab(llama_model_loader &) override {}
-        bool load_tensors(llama_model_loader &) override { return false; }
-        void load_arch_hparams(llama_model_loader &) override {}
-        void load_arch_tensors(llama_model_loader &) override {}
-        std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params &) const override { return nullptr; }
-    };
-
     struct llama_model_params mparams = llama_model_default_params();
     auto arch = llm_arch_from_string(desc->architecture);
-    auto * model = new llama_quant_metadata_model(mparams);
+    auto * model = llama_model_create(arch, mparams);
     model->arch = arch;
 
     // infer llm_type: only LLM_TYPE_70B matters for quantization logic

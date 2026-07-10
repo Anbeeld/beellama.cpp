@@ -90,7 +90,6 @@ int main(int argc, char ** argv) {
         mparams.warmup           = params.warmup;
         mparams.image_min_tokens = params.image_min_tokens;
         mparams.image_max_tokens = params.image_max_tokens;
-        mparams.decoder_n_ubatch = llama_n_ubatch(llama_init->context());
         {
             // always enable debug callback
             mparams.cb_eval_user_data = &cb_data;

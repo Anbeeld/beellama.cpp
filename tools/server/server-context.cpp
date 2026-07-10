@@ -1,7 +1,9 @@
 #include "server-context.h"
 #include "server-chat.h"
+#include "server-adaptive-dm.h"
 #include "server-common.h"
 #include "server-http.h"
+#include "server-loop-guard.h"
 #include "server-task.h"
 #include "server-queue.h"
 #include "server-schema.h"
@@ -38,6 +40,31 @@
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+static bool server_reasoning_budget_state_is_reasoning(common_reasoning_budget_state state) {
+    return state == REASONING_BUDGET_COUNTING ||
+           state == REASONING_BUDGET_WAITING_UTF8 ||
+           state == REASONING_BUDGET_FORCING;
+}
+
+static bool server_accept_info_is_reasoning(const common_sampler_accept_info & info) {
+    return server_reasoning_budget_state_is_reasoning(info.reasoning_state_before) ||
+           server_reasoning_budget_state_is_reasoning(info.reasoning_state_after);
+}
+
+static std::string server_loop_guard_reason_to_string(const server_loop_guard_result & result) {
+    std::string reason = result.kind.empty() ? "unknown" : result.kind;
+    if (result.period > 0) {
+        reason += string_format(" period=%d", result.period);
+    }
+    if (result.coverage > 0) {
+        reason += string_format(" coverage=%d", result.coverage);
+    }
+    if (result.score > 0.0f) {
+        reason += string_format(" score=%.3f", (double) result.score);
+    }
+    return reason;
+}
 
 static uint32_t server_n_outputs_max(const common_params & params) {
     const uint32_t n_batch  = params.n_batch;
@@ -207,6 +234,15 @@ struct server_slot {
     bool truncated      = false;
 
     stop_type stop;
+    std::string stop_detail;
+
+    server_loop_guard loop_guard;
+    int32_t loop_guard_interventions = 0;
+    bool loop_guard_triggered = false;
+    std::string loop_guard_action;
+    std::string loop_guard_reason;
+    int32_t reasoning_output_tokens = 0;
+    int32_t visible_output_tokens = 0;
 
     std::string stopping_word;
 
@@ -297,6 +333,13 @@ struct server_slot {
     int32_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model
     std::vector<int32_t> n_accepted_per_pos; // Accepted tokens per draft position
 
+    // Profit-controller state is retained per slot so measurements remain
+    // attributable across compatible requests.
+    server_adaptive_dm_state adaptive_dm;
+    int64_t adaptive_cycle_start_us = 0;
+    float adaptive_draft_ms = 0.0f;
+    int32_t adaptive_requested_n_max = 0;
+
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
@@ -307,6 +350,14 @@ struct server_slot {
         has_new_line   = false;
         truncated      = false;
         stop           = STOP_TYPE_NONE;
+        stop_detail    = "";
+        loop_guard.reset();
+        loop_guard_interventions = 0;
+        loop_guard_triggered = false;
+        loop_guard_action = "";
+        loop_guard_reason = "";
+        reasoning_output_tokens = 0;
+        visible_output_tokens = 0;
         stopping_word  = "";
         n_sent_text    = 0;
 
@@ -414,6 +465,13 @@ struct server_slot {
         return !!spec;
     }
 
+    bool uses_dflash() const {
+        return task && std::find(
+                task->params.speculative.types.begin(),
+                task->params.speculative.types.end(),
+                COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != task->params.speculative.types.end();
+    }
+
     void add_token(const completion_token_output & token) {
         if (!is_processing()) {
             SLT_WRN(*this, "%s", "slot is not processing\n");
@@ -437,6 +495,10 @@ struct server_slot {
 
         if (n_remaining > 0) {
             n_draft_max = std::min(n_draft_max, n_remaining - 1);
+        }
+
+        if (uses_dflash() && adaptive_dm.dm_adaptive && adaptive_dm.adaptive_n_max >= 0) {
+            n_draft_max = std::min(n_draft_max, adaptive_dm.adaptive_n_max);
         }
 
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
@@ -1791,6 +1853,26 @@ private:
             slot.smpl.reset();
         }
 
+        slot.loop_guard.configure(task.params.reasoning_loop_guard);
+
+        const bool task_uses_dflash = std::find(
+                task.params.speculative.types.begin(),
+                task.params.speculative.types.end(),
+                COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != task.params.speculative.types.end();
+        if (slot.can_speculate() && task_uses_dflash) {
+            slot.adaptive_dm.configure(task.params.speculative);
+            const int base_n_max = common_speculative_n_max(&task.params.speculative);
+            slot.adaptive_dm.reset_profit_if_config_changed(
+                    task.params.speculative, base_n_max, slot.prompt.n_tokens(), &task.params.sampling);
+            slot.adaptive_dm.reset_request_state();
+            if (slot.adaptive_dm.dm_adaptive) {
+                slot.adaptive_dm.apply_profit_recommendation(
+                        slot.adaptive_dm.decide_profit_n_max(base_n_max));
+            } else {
+                slot.adaptive_dm.adaptive_n_max = -1;
+            }
+        }
+
         slot.task = std::make_unique<const server_task>(std::move(task));
 
         slot.state = slot.task->is_child()
@@ -1804,7 +1886,95 @@ private:
         return true;
     }
 
+    bool loop_guard_accept_enabled(const server_slot & slot) const {
+        return slot.task &&
+               slot.smpl &&
+               slot.task->params.reasoning_loop_guard.mode != COMMON_REASONING_LOOP_GUARD_OFF &&
+               slot.task->params.sampling.reasoning_budget_tracking;
+    }
+
+    bool handle_loop_guard_accept(server_slot & slot, const common_sampler_accept_info & info) {
+        if (!loop_guard_accept_enabled(slot) || !info.is_generated) {
+            return true;
+        }
+
+        if (!server_accept_info_is_reasoning(info)) {
+            slot.visible_output_tokens++;
+            return true;
+        }
+
+        slot.reasoning_output_tokens++;
+
+        const bool forcing_reasoning_end = info.reasoning_state_before == REASONING_BUDGET_FORCING ||
+                                           info.reasoning_state_after  == REASONING_BUDGET_FORCING;
+        if (forcing_reasoning_end) {
+            return true;
+        }
+
+        slot.loop_guard.accept(info.token, SERVER_LOOP_REGION_REASONING);
+
+        const bool token_is_eog = llama_vocab_is_eog(vocab, info.token);
+        if (!slot.loop_guard.should_check(SERVER_LOOP_REGION_REASONING, token_is_eog, forcing_reasoning_end)) {
+            return true;
+        }
+
+        const auto check = slot.loop_guard.check(SERVER_LOOP_REGION_REASONING);
+        if (!check.triggered) {
+            return true;
+        }
+
+        slot.loop_guard_triggered = true;
+        slot.loop_guard_reason = server_loop_guard_reason_to_string(check);
+
+        const auto & params = slot.task->params.reasoning_loop_guard;
+        if (params.mode == COMMON_REASONING_LOOP_GUARD_FORCE_CLOSE &&
+                slot.loop_guard_interventions < params.interventions_max &&
+                common_sampler_force_reasoning_end(slot.smpl.get())) {
+            slot.loop_guard_interventions++;
+            slot.loop_guard_action = "force-close";
+            SLT_WRN(slot, "reasoning loop guard force-closing hidden reasoning: %s\n", slot.loop_guard_reason.c_str());
+            return false;
+        }
+
+        slot.loop_guard_action = "stop";
+        slot.stop = STOP_TYPE_LIMIT;
+        slot.stop_detail = "reasoning_loop_guard";
+        slot.has_next_token = false;
+        SLT_WRN(slot, "reasoning loop guard stopping generation: %s\n", slot.loop_guard_reason.c_str());
+        return false;
+    }
+
+    common_sampler_accept_callback make_loop_guard_accept_callback(server_slot & slot) {
+        if (!loop_guard_accept_enabled(slot)) {
+            return {};
+        }
+
+        return [this, &slot](const common_sampler_accept_info & info) {
+            return handle_loop_guard_accept(slot, info);
+        };
+    }
+
+    void apply_adaptive_profit_decision(server_slot & slot) {
+        if (!slot.uses_dflash() || !slot.adaptive_dm.dm_adaptive) {
+            return;
+        }
+
+        const int base_n_max = common_speculative_n_max(&slot.task->params.speculative);
+        const int previous_n_max = slot.adaptive_dm.adaptive_n_max;
+        const int recommended_n_max = slot.adaptive_dm.decide_profit_n_max(base_n_max);
+        slot.adaptive_dm.apply_profit_recommendation(recommended_n_max);
+
+        if (slot.adaptive_dm.adaptive_n_max != previous_n_max) {
+            SLT_INF(slot, "adaptive draft-max profit: %d -> %d (score=%.2f)\n",
+                    previous_n_max,
+                    slot.adaptive_dm.adaptive_n_max,
+                    (double) slot.adaptive_dm.profit_current_score);
+        }
+    }
+
     bool process_token(completion_token_output & result, server_slot & slot) {
+        const bool stopped_before_process = slot.stop != STOP_TYPE_NONE && !slot.has_next_token;
+
         // remember which tokens were sampled - used for repetition penalties during sampling
         const std::string token_str = result.text_to_send;
         slot.sampled = result.tok;
@@ -1813,7 +1983,7 @@ private:
         if (slot.task->params.return_tokens) {
             slot.generated_tokens.push_back(result.tok);
         }
-        slot.has_next_token = true;
+        slot.has_next_token = !stopped_before_process;
 
         // check if there is incomplete UTF-8 character at the end
         bool incomplete = validate_utf8(slot.generated_text) < slot.generated_text.size();
@@ -1852,7 +2022,7 @@ private:
             }
         }
 
-        if (incomplete) {
+        if (incomplete && !stopped_before_process) {
             slot.has_next_token = true;
         }
 
@@ -1860,6 +2030,7 @@ private:
         if (!params_base.ctx_shift && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
             slot.truncated      = true;
             slot.stop           = STOP_TYPE_LIMIT;
+            slot.stop_detail    = "context_limit";
             slot.has_next_token = false;
 
             SLT_DBG(slot, "stopped due to running out of context capacity, prompt.n_tokens() = %d, task.n_tokens = %d, n_decoded = %d, n_ctx = %d\n",
@@ -1869,6 +2040,7 @@ private:
         // check the limits
         if (slot.n_decoded > 0 && slot.has_next_token && !slot.has_budget(params_base)) {
             slot.stop           = STOP_TYPE_LIMIT;
+            slot.stop_detail    = "token_limit";
             slot.has_next_token = false;
 
             SLT_DBG(slot, "stopped by limit, n_decoded = %d, n_predict = %d\n", slot.n_decoded, slot.task->params.n_predict);
@@ -1890,6 +2062,7 @@ private:
 
                     if (pos < slot.generated_text.size() && n_indent < slot.task->params.n_indent) {
                         slot.stop           = STOP_TYPE_LIMIT;
+                        slot.stop_detail    = "indentation_limit";
                         slot.has_next_token = false;
 
                         // cut the last line
@@ -1917,6 +2090,7 @@ private:
             // if we have seen a new line, we stop after a certain time limit, but only upon another new line
             if (slot.task->params.t_max_predict_ms > 0 && (ggml_time_us() - slot.t_start_generation > 1000.0f*slot.task->params.t_max_predict_ms)) {
                 slot.stop           = STOP_TYPE_LIMIT;
+                slot.stop_detail    = "time_limit";
                 slot.has_next_token = false;
 
                 SLT_DBG(slot, "stopped by time limit, n_decoded = %d, t_max_predict_ms = %d ms\n", slot.n_decoded, (int) slot.task->params.t_max_predict_ms);
@@ -1925,6 +2099,7 @@ private:
 
         if (llama_vocab_is_eog(vocab, result.tok)) {
             slot.stop           = STOP_TYPE_EOS;
+            slot.stop_detail    = "eos";
             slot.has_next_token = false;
 
             SLT_DBG(slot, "%s", "stopped by EOS\n");
@@ -2102,6 +2277,12 @@ private:
         res->has_new_line          = slot.has_new_line;
         res->stopping_word         = slot.stopping_word;
         res->stop                  = slot.stop;
+        res->stop_detail           = slot.stop_detail;
+        res->reasoning_output_tokens = slot.reasoning_output_tokens;
+        res->visible_output_tokens   = slot.visible_output_tokens;
+        res->loop_guard_triggered    = slot.loop_guard_triggered;
+        res->loop_guard_action       = slot.loop_guard_action;
+        res->loop_guard_reason       = slot.loop_guard_reason;
         res->post_sampling_probs   = slot.task->params.post_sampling_probs;
 
         res->verbose           = slot.task->params.verbose;
@@ -2892,6 +3073,12 @@ private:
 
             generating.push_back(&slot);
 
+            if (slot.uses_dflash() && slot.adaptive_dm.dm_adaptive) {
+                slot.adaptive_cycle_start_us = ggml_time_us();
+                slot.adaptive_draft_ms = 0.0f;
+                slot.adaptive_requested_n_max = 0;
+            }
+
             if (spec) {
                 common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
 
@@ -2901,6 +3088,9 @@ private:
                 const int n_draft_max = slot.get_n_draft_max();
 
                 if (n_draft_max > 0) {
+                    if (slot.uses_dflash() && slot.adaptive_dm.dm_adaptive) {
+                        slot.adaptive_requested_n_max = n_draft_max;
+                    }
                     GGML_ASSERT(slot.can_speculate());
 
                     if (!slot.spec_draft.empty()) {
@@ -2939,7 +3129,25 @@ private:
 
         // generate the actual drafts (if any)
         {
+            const int64_t t_draft_start = ggml_time_us();
             common_speculative_draft(spec.get());
+            const float shared_draft_ms = (ggml_time_us() - t_draft_start) / 1000.0f;
+            if (!drafting.empty()) {
+                size_t drafted_tokens_total = 0;
+                for (const auto * slot : drafting) {
+                    drafted_tokens_total += slot->spec_draft.size();
+                }
+                for (auto * slot : drafting) {
+                    if (slot->uses_dflash() && slot->adaptive_dm.dm_adaptive) {
+                        // Upstream drafts the cohort in one batched call. Attribute that
+                        // shared wall time by actual drafted-token work so a shallow
+                        // adaptive DFlash slot is not charged the same as a deep one.
+                        slot->adaptive_draft_ms = drafted_tokens_total > 0
+                            ? shared_draft_ms * (float) slot->spec_draft.size() / (float) drafted_tokens_total
+                            : 0.0f;
+                    }
+                }
+            }
         }
 
         // make checkpoints if needed
@@ -3731,10 +3939,19 @@ private:
 
             slot.i_batch = -1;
 
-            common_sampler_accept(slot.smpl.get(), id, true);
+            const auto accept_info = common_sampler_accept_with_info(slot.smpl.get(), id, true);
+            (void) handle_loop_guard_accept(slot, accept_info);
 
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
             const int64_t t_now = ggml_time_us();
+
+            if (slot.uses_dflash() && slot.adaptive_dm.dm_adaptive &&
+                    slot.adaptive_requested_n_max == 0 && slot.adaptive_cycle_start_us > 0) {
+                const float cycle_ms = std::max(0.001f,
+                        (float) (t_now - slot.adaptive_cycle_start_us) / 1000.0f);
+                slot.adaptive_dm.observe_profit_timing(0, 0, 0, 0.0f, cycle_ms, 0.0f, cycle_ms);
+                apply_adaptive_profit_decision(slot);
+            }
 
             slot.n_decoded += 1;
 
@@ -3782,12 +3999,29 @@ private:
             GGML_ASSERT(n_draft > 0);
 
             // verify and try to accept the draft
+            const int64_t t_verify_start = ggml_time_us();
             {
                 // save the sampler sampler state in case we need to restore it
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
+                // The loop guard observes sampler acceptance. A checkpoint restore discards
+                // every speculative acceptance from this pass, so its token tail, telemetry,
+                // and any force-close/stop action must be restored with the sampler.
+                const server_loop_guard loop_guard_save = slot.loop_guard;
+                const int32_t loop_guard_interventions_save = slot.loop_guard_interventions;
+                const bool loop_guard_triggered_save = slot.loop_guard_triggered;
+                const std::string loop_guard_action_save = slot.loop_guard_action;
+                const std::string loop_guard_reason_save = slot.loop_guard_reason;
+                const int32_t reasoning_output_tokens_save = slot.reasoning_output_tokens;
+                const int32_t visible_output_tokens_save = slot.visible_output_tokens;
+                const bool has_next_token_save = slot.has_next_token;
+                const stop_type stop_save = slot.stop;
+                const std::string stop_detail_save = slot.stop_detail;
+
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
-                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                const auto on_accept = make_loop_guard_accept_callback(slot);
+                auto accepted = common_sampler_sample_and_accept_n(
+                    slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, false, on_accept);
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
@@ -3826,6 +4060,16 @@ private:
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
                         slot.smpl = std::move(smpl_save);
+                        slot.loop_guard = loop_guard_save;
+                        slot.loop_guard_interventions = loop_guard_interventions_save;
+                        slot.loop_guard_triggered = loop_guard_triggered_save;
+                        slot.loop_guard_action = loop_guard_action_save;
+                        slot.loop_guard_reason = loop_guard_reason_save;
+                        slot.reasoning_output_tokens = reasoning_output_tokens_save;
+                        slot.visible_output_tokens = visible_output_tokens_save;
+                        slot.has_next_token = has_next_token_save;
+                        slot.stop = stop_save;
+                        slot.stop_detail = stop_detail_save;
 
                         return;
                     }
@@ -3841,6 +4085,7 @@ private:
             }
 
             const int64_t t_now = ggml_time_us();
+            const float verify_ms = (float) (t_now - t_verify_start) / 1000.0f;
 
             const auto ids = std::move(slot.spec_draft);
 
@@ -3849,6 +4094,24 @@ private:
             // update how many tokens out of those tested were accepted
             slot.n_draft_accepted += ids.size() - 1;
             slot.n_draft_verif_steps += 1;
+
+            if (slot.uses_dflash() && slot.adaptive_dm.dm_adaptive && slot.adaptive_cycle_start_us > 0) {
+                const int n_accepted = std::max(0, (int) ids.size() - 1);
+                const float cycle_ms = std::max(0.001f,
+                        (float) (t_now - slot.adaptive_cycle_start_us) / 1000.0f);
+                slot.adaptive_dm.observe_profit_acceptance((int) n_draft, n_accepted);
+                slot.adaptive_dm.observe_profit_timing(
+                        slot.adaptive_requested_n_max > 0
+                            ? slot.adaptive_requested_n_max
+                            : (int) n_draft,
+                        (int) n_draft,
+                        n_accepted,
+                        slot.adaptive_draft_ms,
+                        verify_ms,
+                        0.0f,
+                        cycle_ms);
+                apply_adaptive_profit_decision(slot);
+            }
 
             if (slot.n_accepted_per_pos.empty()) {
                 slot.n_accepted_per_pos.resize(common_speculative_n_max(&params_base.speculative), 0);
@@ -4514,6 +4777,9 @@ void server_routes::init_routes() {
 
         task_params tparams;
         tparams.sampling = params.sampling;
+        tparams.reasoning_loop_guard = params.reasoning_loop_guard;
+        tparams.sampling.reasoning_budget_tracking =
+            tparams.reasoning_loop_guard.mode != COMMON_REASONING_LOOP_GUARD_OFF;
         json default_generation_settings_for_props = json {
             { "params", tparams.to_json(true) },
             { "n_ctx",  meta->slot_n_ctx },

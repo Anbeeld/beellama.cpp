@@ -66,13 +66,13 @@ FROM ${BASE_CUDA_RUN_CONTAINER} AS base
 ARG BUILD_DATE=N/A
 ARG APP_VERSION=N/A
 ARG APP_REVISION=N/A
-ARG IMAGE_URL=https://github.com/ggml-org/llama.cpp
-ARG IMAGE_SOURCE=https://github.com/ggml-org/llama.cpp
+ARG IMAGE_URL=https://github.com/Anbeeld/beellama.cpp
+ARG IMAGE_SOURCE=https://github.com/Anbeeld/beellama.cpp
 LABEL org.opencontainers.image.created=$BUILD_DATE \
       org.opencontainers.image.version=$APP_VERSION \
       org.opencontainers.image.revision=$APP_REVISION \
-      org.opencontainers.image.title="llama.cpp" \
-      org.opencontainers.image.description="LLM inference in C/C++" \
+      org.opencontainers.image.title="BeeLlama.cpp" \
+      org.opencontainers.image.description="BeeLlama.cpp GGUF inference with upstream DFlash and KVarN KV-cache support" \
       org.opencontainers.image.url=$IMAGE_URL \
       org.opencontainers.image.source=$IMAGE_SOURCE
 

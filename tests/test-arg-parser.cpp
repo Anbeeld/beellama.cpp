@@ -200,7 +200,7 @@ static void test(void) {
     assert(params.cache_kvarn_bits_k == 4);
     assert(params.cache_kvarn_bits_v == 2);
     assert(params.cache_type_k == GGML_TYPE_Q4_0);
-    assert(params.cache_type_v == GGML_TYPE_Q2_0);
+    assert(params.cache_type_v == GGML_TYPE_Q2_0S);
     assert(!params.kv_unified);
     assert(common_context_params_to_llama(params).kvarn.type == LLAMA_KVARN_K4V2_G128);
     assert(!common_context_params_to_llama(params).kv_unified);
@@ -255,8 +255,8 @@ static void test(void) {
     assert(params.kvarn.value_bits == 2);
     assert(params.cache_kvarn_bits_k == 2);
     assert(params.cache_kvarn_bits_v == 2);
-    assert(params.cache_type_k == GGML_TYPE_Q2_0);
-    assert(params.cache_type_v == GGML_TYPE_Q2_0);
+    assert(params.cache_type_k == GGML_TYPE_Q2_0S);
+    assert(params.cache_type_v == GGML_TYPE_Q2_0S);
 
     params = common_params();
     argv = {"binary_name", "-m", "model_file.gguf", "--cache-type-k", "kvarn4", "--cache-type-v", "f16"};
@@ -282,7 +282,7 @@ static void test(void) {
     assert(params.cache_kvarn_bits_k == 5);
     assert(params.cache_kvarn_bits_v == 2);
     assert(params.cache_type_k == GGML_TYPE_Q5_0);
-    assert(params.cache_type_v == GGML_TYPE_Q2_0);
+    assert(params.cache_type_v == GGML_TYPE_Q2_0S);
 
     params = common_params();
     argv = {"binary_name", "-m", "model_file.gguf", "--cache-type-k", "kvarn6"};
@@ -321,7 +321,7 @@ static void test(void) {
     params = common_params();
     argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-type-k", "turbo2_tcq", "--spec-draft-type-v", "turbo4"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
-    assert(params.speculative.draft.cache_type_k == GGML_TYPE_Q2_0);
+    assert(params.speculative.draft.cache_type_k == GGML_TYPE_Q2_0S);
     assert(params.speculative.draft.cache_type_v == GGML_TYPE_Q4_0);
 
     params = common_params();
@@ -343,71 +343,13 @@ static void test(void) {
     argv = {"binary_name", "--spec-draft-n-max", "123"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
     assert(params.speculative.draft.n_max == 123);
-    assert(params.speculative.n_max == 123);
-
-    params = common_params();
-    argv = {"binary_name", "--spec-type", "mtp"};
-    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
-    assert(params.speculative.draft.n_max == 3);
-    assert(params.speculative.n_max == 3);
-    assert(params.n_batch == 2048);
-    assert(params.n_ubatch == 512);
 
     params = common_params();
     argv = {"binary_name", "--spec-type", "dflash"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
-    assert(params.speculative.n_max == 16);
-    assert(params.speculative.draft.n_max == 16);
-    assert(params.speculative.draft.n_ctx == 256);
-    assert(params.n_batch == 2048);
-    assert(params.n_ubatch == 512);
+    assert(params.speculative.types.back() == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH);
 
     params = common_params();
-    argv = {"binary_name", "--spec-type", "dflash", "--spec-draft-n-max", "7"};
-    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
-    assert(params.speculative.n_max == 7);
-    assert(params.speculative.draft.n_max == 7);
-    assert(params.speculative.draft.n_ctx == 256);
-
-    params = common_params();
-    argv = {"binary_name", "--spec-type", "dflash", "--spec-dflash-cross-ctx", "1024"};
-    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
-    assert(params.speculative.dflash_cross_ctx == 1024);
-    assert(params.speculative.draft.n_ctx == 256);
-
-    params = common_params();
-    argv = {"binary_name", "--spec-type", "dflash", "--spec-dflash-cross-ctx", "1024", "-cd", "1040"};
-    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
-    assert(params.speculative.dflash_cross_ctx == 1024);
-    assert(params.speculative.draft.n_ctx == 1040);
-
-    params = common_params();
-    const common_params_speculative defaults_speculative = params.speculative;
-    argv = {"binary_name", "--spec-dm-min-reach", "6"};
-    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
-    assert(params.speculative.dm_min_reach == defaults_speculative.dm_min_reach);
-
-    params = common_params();
-    argv = {"binary_name", "--spec-type", "mtp", "--spec-dm-min-reach", "6", "--spec-draft-temp", "0.5", "--spec-dflash-cross-ctx", "1024", "--spec-branch-budget", "4"};
-    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
-    assert(params.speculative.draft.n_max == 3);
-    assert(params.speculative.n_max == 3);
-    assert(params.speculative.dm_min_reach == defaults_speculative.dm_min_reach);
-    assert(params.speculative.sample_temp == defaults_speculative.sample_temp);
-    assert(params.speculative.dflash_cross_ctx == defaults_speculative.dflash_cross_ctx);
-    assert(params.speculative.branch_budget == defaults_speculative.branch_budget);
-
-    params = common_params();
-    argv = {"binary_name", "--spec-draft-model", "dflash-draft.gguf", "--spec-dflash-cross-ctx", "1024", "--spec-dm-min-reach", "6"};
-    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
-    assert(params.speculative.type() == COMMON_SPECULATIVE_TYPE_NONE);
-    assert(params.speculative.dflash_cross_ctx == 1024);
-    assert(params.speculative.dm_min_reach == 6);
-    assert(params.speculative.dflash_only_args_explicit);
-
-    params = common_params();
-    assert(params.speculative.draft.p_min == 0.0f);
-    assert(params.speculative.p_min == 0.0f);
     assert(params.speculative.dm_profit_min == 0.05f);
     assert(params.speculative.dm_profit_raise_margin == 0.05f);
     assert(params.speculative.dm_profit_lower_margin == 0.05f);
@@ -423,34 +365,13 @@ static void test(void) {
         assert(target == 256ull * 1024ull * 1024ull);
     }
 
-    argv = {"binary_name", "--spec-draft-p-min", "0"};
-    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
-    assert(params.speculative.draft.p_min == 0.0f);
-    assert(params.speculative.p_min == 0.0f);
-
-    argv = {"binary_name", "--draft-p-min", "0.25"};
-    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
-    assert(params.speculative.draft.p_min == 0.25f);
-    assert(params.speculative.p_min == 0.25f);
-
-    params = common_params();
-    argv = {"binary_name", "--spec-type", "dflash", "--spec-draft-temp", "0.5"};
-    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
-    assert(params.speculative.sample_temp == 0.5f);
-
-    params = common_params();
-    argv = {"binary_name", "--spec-type", "dflash", "--spec-draft-temp", "auto"};
-    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
-    assert(params.speculative.sample_temp == -1.0f);
-
     argv = {
         "binary_name",
-        "--spec-type", "dflash",
         "--spec-dm-controller", "fringe",
     };
-    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
-    assert(params.speculative.dm_controller == COMMON_SPECULATIVE_DM_CONTROLLER_FRINGE);
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
 
+    params = common_params();
     argv = {
         "binary_name",
         "--spec-type", "dflash",
@@ -552,10 +473,6 @@ static void test(void) {
 #endif // _WIN32
 
     printf("test-arg-parser: test download functions\n\n");
-    common_download_model_result download_result_fields;
-    download_result_fields.dflash_draft_path = "dflash-draft.gguf";
-    assert(download_result_fields.dflash_draft_path == "dflash-draft.gguf");
-
     const char * GOOD_URL = "http://ggml.ai/";
     const char * BAD_URL  = "http://ggml.ai/404";
 
@@ -565,7 +482,7 @@ static void test(void) {
     } catch (std::exception & e) {
         fprintf(stderr, "SKIP: could not fetch %s (%s)\n", GOOD_URL, e.what());
         printf("test-arg-parser: all tests OK\n\n");
-        return 0;
+        return;
     }
 
     {

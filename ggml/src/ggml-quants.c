@@ -456,8 +456,8 @@ void quantize_row_q3_1_ref(const float * GGML_RESTRICT x, block_q3_1 * GGML_REST
 }
 
 // 2-bit: byte j of qs holds elements j, j+8, j+16, j+24, two bits each
-void quantize_row_q2_0_ref(const float * GGML_RESTRICT x, block_q2_0 * GGML_RESTRICT y, int64_t k) {
-    static const int qk = QK2_0;
+void quantize_row_q2_0s_ref(const float * GGML_RESTRICT x, block_q2_0s * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK2_0S;
 
     assert(k % qk == 0);
 
@@ -894,8 +894,8 @@ void dequantize_row_q3_1(const block_q3_1 * GGML_RESTRICT x, float * GGML_RESTRI
     }
 }
 
-void dequantize_row_q2_0(const block_q2_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-    static const int qk = QK2_0;
+void dequantize_row_q2_0s(const block_q2_0s * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK2_0S;
 
     assert(k % qk == 0);
 
@@ -2708,10 +2708,10 @@ size_t quantize_q3_1(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
     return nrow * row_size;
 }
 
-size_t quantize_q2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+size_t quantize_q2_0s(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
     (void)quant_weights; // not used
-    const size_t row_size = ggml_row_size(GGML_TYPE_Q2_0, n_per_row);
-    quantize_row_q2_0_ref(src, dst, (int64_t)nrow*n_per_row);
+    const size_t row_size = ggml_row_size(GGML_TYPE_Q2_0S, n_per_row);
+    quantize_row_q2_0s_ref(src, dst, (int64_t)nrow*n_per_row);
     return nrow * row_size;
 }
 
@@ -5992,9 +5992,9 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
             {
                 VALIDATE_ROW_DATA_DM_F16_IMPL(block_q3_1, data, nb, d, m);
             } break;
-        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_Q2_0S:
             {
-                VALIDATE_ROW_DATA_D_F16_IMPL(block_q2_0, data, nb);
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_q2_0s, data, nb);
             } break;
         case GGML_TYPE_Q2_1:
             {

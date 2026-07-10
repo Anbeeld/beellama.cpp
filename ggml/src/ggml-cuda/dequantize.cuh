@@ -151,13 +151,13 @@ static __device__ __forceinline__ void dequantize_q3_1(const void * vx, const in
     v.y = (v.y * dm.x) + dm.y;
 }
 
-static __device__ __forceinline__ void dequantize_q2_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
-    const block_q2_0 * x = (const block_q2_0 *) vx;
+static __device__ __forceinline__ void dequantize_q2_0s(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_q2_0s * x = (const block_q2_0s *) vx;
 
     const float d = x[ib].d;
 
-    const uint8_t b = x[ib].qs[iqs % (QK2_0 / 4)];
-    const int     p = iqs / (QK2_0 / 4);
+    const uint8_t b = x[ib].qs[iqs % (QK2_0S / 4)];
+    const int     p = iqs / (QK2_0S / 4);
 
     v.x = (b >> (2*p))     & 0x03;
     v.y = (b >> (2*p + 4)) & 0x03;
