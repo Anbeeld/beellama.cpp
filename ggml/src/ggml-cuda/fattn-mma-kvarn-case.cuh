@@ -37,13 +37,9 @@ static inline fattn_kernel_t ggml_cuda_flash_attn_ext_mma_kvarn_select_kernel(
     constexpr bool V_is_K_view = false;
 
     if (k_original_domain) {
-        if (v_original_domain) {
-            return flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view,
-                GGML_CUDA_FATTN_KVARN_ORIGINAL_TYPE, GGML_CUDA_FATTN_KVARN_ORIGINAL_TYPE>;
-        }
-
+        GGML_ASSERT(v_original_domain);
         return flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view,
-            GGML_CUDA_FATTN_KVARN_ORIGINAL_TYPE, GGML_CUDA_FATTN_KVARN_TYPE>;
+            GGML_CUDA_FATTN_KVARN_ORIGINAL_TYPE, GGML_CUDA_FATTN_KVARN_ORIGINAL_TYPE>;
     }
 
     if (v_original_domain) {

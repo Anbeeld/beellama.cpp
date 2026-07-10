@@ -514,6 +514,16 @@ int main(int argc, char ** argv) {
                  cuda_fattn_mma_f16.find("flash_attn_ext_kvarn_inverse_wht_output_tile") == std::string::npos &&
                  vulkan_kvarn_store.find("Stage and records are rotated-domain for both K and V.") != std::string::npos,
         "KVarN prefill/decode must use mixed prompt attention plus all-rotated live stage rows without the failed output-WHT route");
+    ok &= expect(contains_ws(cuda_fattn_mma_kvarn_case, "GGML_ASSERT(v_original_domain);") &&
+                 contains_ws(cuda_fattn_mma_kvarn_case,
+                     "GGML_CUDA_FATTN_KVARN_ORIGINAL_TYPE, GGML_CUDA_FATTN_KVARN_ORIGINAL_TYPE>") &&
+                 contains_ws(cuda_fattn_mma_kvarn_case,
+                     "GGML_CUDA_FATTN_KVARN_TYPE, GGML_CUDA_FATTN_KVARN_ORIGINAL_TYPE>") &&
+                 contains_ws(cuda_fattn_mma_kvarn_case,
+                     "GGML_CUDA_FATTN_KVARN_TYPE, GGML_CUDA_FATTN_KVARN_TYPE>") &&
+                 !contains_ws(cuda_fattn_mma_kvarn_case,
+                     "GGML_CUDA_FATTN_KVARN_ORIGINAL_TYPE, GGML_CUDA_FATTN_KVARN_TYPE>"),
+        "KVarN MMA selection must not instantiate the impossible original-K/rotated-V domain");
     ok &= expect(ggml_backend_cpp.find("pending_new_split_inputs") != std::string::npos &&
                  ggml_backend_cpp.find("split->n_inputs + pending_new_split_inputs > GGML_SCHED_MAX_SPLIT_INPUTS") != std::string::npos,
         "backend scheduler must pre-count all new cross-backend inputs for a node before deciding whether to start a new split");
