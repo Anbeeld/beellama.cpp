@@ -62,6 +62,32 @@ def main() -> None:
         "ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, false, false)",
         "descriptor-native KVarN lost the upstream MMA fixup workspace allocation",
     )
+    kvarn_case = (ROOT / "ggml/src/ggml-cuda/fattn-mma-kvarn-case.cuh").read_text(encoding="utf-8")
+    require(
+        kvarn_case,
+        "GGML_ASSERT(v_original_domain);",
+        "KVarN MMA selection must reject the impossible original-K/rotated-V domain",
+    )
+    if "GGML_CUDA_FATTN_KVARN_ORIGINAL_TYPE, GGML_CUDA_FATTN_KVARN_TYPE>" in kvarn_case:
+        raise AssertionError("KVarN MMA selection still instantiates the impossible original-K/rotated-V domain")
+
+    ggml_cmake = (ROOT / "ggml/CMakeLists.txt").read_text(encoding="utf-8")
+    cuda_cmake = (ROOT / "ggml/src/ggml-cuda/CMakeLists.txt").read_text(encoding="utf-8")
+    require(
+        ggml_cmake,
+        "CUDA 12.4-12.7 support size via compress-all",
+        "the documented CUDA size-compression compatibility range regressed",
+    )
+    require(
+        cuda_cmake,
+        'CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.4" AND GGML_CUDA_COMPRESSION_MODE STREQUAL "size"',
+        "CUDA 12.4-12.7 size builds must select the fatbinary compression fallback",
+    )
+    require(
+        cuda_cmake,
+        "list(APPEND CUDA_FLAGS -Xfatbin=-compress-all)",
+        "CUDA 12.4-12.7 size builds lost the fatbinary compression flag",
+    )
     graph = (ROOT / "src/llama-graph.cpp").read_text(encoding="utf-8")
     for needle in (
         "llm_flash_attn_ext_set_kvarn_domain",

@@ -224,6 +224,8 @@ if (CUDAToolkit_FOUND)
         # - balance
         # - size
         list(APPEND CUDA_FLAGS -compress-mode=${GGML_CUDA_COMPRESSION_MODE})
+    elseif (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.4" AND GGML_CUDA_COMPRESSION_MODE STREQUAL "size")
+        list(APPEND CUDA_FLAGS -Xfatbin=-compress-all)
     endif()
 
     if (GGML_FATAL_WARNINGS)
