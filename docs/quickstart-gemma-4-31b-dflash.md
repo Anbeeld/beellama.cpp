@@ -1,10 +1,10 @@
-# Quickstart: Gemma 4 31B with upstream DFlash
+# Quickstart: Gemma 4 31B with DFlash
 
-v0.4.0 runs DFlash through llama.cpp's upstream `draft-dflash` implementation.
-This replaces BeeLlama's retired GPU-ring, tree-verification, and reduced-verifier
-paths.
+This guide starts a Gemma 4 31B target with an upstream-format DFlash drafter on
+CUDA. The multimodal projector is optional; remove `--mmproj` for a text-only
+deployment.
 
-## Build
+## 1. Build
 
 ```powershell
 cmake -B build -DGGML_CUDA=ON -DGGML_NATIVE=ON -DGGML_CUDA_FA=ON `
@@ -12,15 +12,14 @@ cmake -B build -DGGML_CUDA=ON -DGGML_NATIVE=ON -DGGML_CUDA_FA=ON `
 cmake --build build --config Release --parallel 16
 ```
 
-The default CUDA FlashAttention build has 103 vector cache pairs and supports all
-KVarN K/V combinations through native descriptor routing. Use
-`-DGGML_CUDA_FA_ALL_QUANTS=ON` only for the full 169 standard-pair and 36 KVarN
-fast-decode matrices. `GGML_CUDA_FA_HALF_QUANTS` no longer exists.
+The default build contains 103 standard FlashAttention cache pairs and 15
+balanced KVarN fast-decode pairs. Use `-DGGML_CUDA_FA_ALL_QUANTS=ON` only when
+the workload needs all 169 standard pairs and all 36 ordered KVarN pairs.
 
-## Models
+## 2. Prepare the models
 
-Provide a Gemma 4 target GGUF and a matching upstream-format DFlash draft GGUF.
-If a draft uses the historical `dflash-draft` schema, rewrite it before launch:
+Use a drafter trained for the exact Gemma target. Convert an earlier Bee/buun
+`dflash-draft` file to upstream metadata and tensor names before launch:
 
 ```powershell
 python scripts/convert-dflash-draft-to-upstream.py `
@@ -29,10 +28,7 @@ python scripts/convert-dflash-draft-to-upstream.py `
   --verify
 ```
 
-The optional multimodal projector remains a normal upstream `--mmproj` input;
-do not use retired fork-only speculative flags with it.
-
-## Launch
+## 3. Start the server
 
 ```powershell
 build\bin\llama-server.exe `
@@ -49,55 +45,42 @@ build\bin\llama-server.exe `
   -ngl all --port 8082 --jinja
 ```
 
-With `--spec-draft-n-max` omitted, BeeLlama uses the drafter's trained block
-depth (`dflash.block_size - 1`, normally 15). Pass the flag explicitly to
-override it; the profit controller remains enabled by default and adapts within
-that maximum.
+`--spec-draft-n-max` is intentionally omitted. BeeLlama reads
+`dflash.block_size` and uses one less than the block size, normally 15. The
+profit controller is already the default; it adapts within that maximum.
 
-The `-ub 512` setting above is suitable for serving. For KVarN quality or KLD
-measurements, rerun with `-ub 256`; the known `-ub 512` KLD drift is caused by
-ubatch cadence, not a cache defect.
+## 4. Verify startup and generation
 
-For a tighter KV budget, use a matched KVarN configuration:
+At INFO verbosity, startup should report the omitted-depth resolution and the
+same `n_max` in the DFlash implementation. Send a deterministic short request,
+confirm that text is generated, and inspect the timing summary for generated and
+accepted draft tokens.
+
+To verify an override, restart with `--spec-draft-n-max 4`; startup must report
+`n_max=4` and must not print the omitted-depth message. To keep a static depth,
+also pass `--spec-dm-controller off`.
+
+## 5. Choose and measure the target cache
+
+The command uses conventional q caches. For lower target-cache memory on a
+supported Gemma CUDA layout, try:
 
 ```text
 --cache-type-k kvarn4 --cache-type-v kvarn4
 ```
 
-KVarN is a target-context CUDA/Vulkan feature and must be validated on the exact
-model, context length, and ubatch you intend to serve. It is not a draft-cache
-replacement.
+KVarN is target-context-only and CUDA-native in v0.4.0; keep the draft cache on
+a standard type. For serving, `-ub 512` is a valid throughput choice. For KLD or
+cache-quality comparisons, rerun both legs with `-ub 256` and keep the corpus,
+context, batch, model files, and commit identical.
 
-## Adaptive draft depth
+## 6. Optional reasoning controls
 
-`--spec-dm-controller profit` adapts the upstream DFlash per-call draft limit.
-It uses accepted output tokens divided by measured cycle time, including periodic
-no-spec baseline samples. To pin the horizon, select `--spec-dm-controller off`
-and set `--spec-draft-n-max` directly.
+`--reasoning-loop-guard force-close` is the default and watches hidden reasoning
+for periodic repetition. A streaming chat request can instead opt into realtime
+control with `"reasoning_control": true`, then send its completion id and
+`"action": "reasoning_end"` to `/v1/chat/completions/control`.
 
-`--spec-draft-p-min` remains the per-position draft confidence threshold; it is
-not an adaptive-controller setting.
-
-## Reasoning-loop protection
-
-Enable a guard for thinking models with:
-
-```text
---reasoning-loop-guard force-close
-```
-
-The server reports guard telemetry in completion responses. `force-close` may
-intervene once or more times according to `--reasoning-loop-interventions`; `stop`
-ends the completion on a detected loop.
-
-An opted-in streaming request (`"reasoning_control": true`) can also be moved to
-its final answer by POSTing its completion id and `"action": "reasoning_end"` to
-`/v1/chat/completions/control`.
-
-## Migration notes
-
-- Use `draft-dflash`. The old `dflash` spelling is a warning-producing alias.
-- Removed options include `--spec-dflash-cross-ctx`, `--spec-branch-budget`, and
-  all `GGML_DFLASH_*` ring/capture settings.
-- TurboQuant/TCQ cache formats are removed. Choose q-cache types or KVarN for a
-  new deployment; historical command-line aliases only exist to ease migration.
+See the [argument reference](beellama-args.md) for exact defaults and
+[Migration from earlier versions](beellama-args.md#migration-from-earlier-versions)
+for removed fork DFlash and TurboQuant settings.

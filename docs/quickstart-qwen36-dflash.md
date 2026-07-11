@@ -1,10 +1,9 @@
-# Quickstart: Qwen 3.6 with upstream DFlash
+# Quickstart: Qwen 3.6 with DFlash
 
-This guide runs a Qwen 3.6 target together with an upstream-format DFlash draft
-model. v0.4.0 uses upstream speculative decoding: the canonical mode is
-`draft-dflash`, not the retired fork DFlash stack.
+This guide starts a Qwen 3.6 target with an upstream-format DFlash drafter on
+CUDA. Replace the model paths and context settings for your hardware.
 
-## Build
+## 1. Build
 
 ```powershell
 cmake -B build -DGGML_CUDA=ON -DGGML_NATIVE=ON -DGGML_CUDA_FA=ON `
@@ -12,15 +11,15 @@ cmake -B build -DGGML_CUDA=ON -DGGML_NATIVE=ON -DGGML_CUDA_FA=ON `
 cmake --build build --config Release --parallel 16
 ```
 
-The default CUDA FlashAttention build covers 103 standard cache pairs. Add
-`-DGGML_CUDA_FA_ALL_QUANTS=ON` only when an experiment needs the full 169-pair
-standard matrix and all 36 KVarN fast-decode pairs. There is no HALF build tier.
+The default build contains 103 standard FlashAttention cache pairs and 15
+balanced KVarN fast-decode pairs. Use `-DGGML_CUDA_FA_ALL_QUANTS=ON` only when
+the workload needs all 169 standard pairs and all 36 ordered KVarN pairs.
 
-## Models
+## 2. Prepare the models
 
-You need a Qwen 3.6 target GGUF and a DFlash draft GGUF trained for that target.
-The draft shares the target's embeddings and output projection at runtime. An old
-Bee/buun `dflash-draft` file must first be converted:
+The drafter must be trained for the target model and use upstream `dflash`
+metadata and tensor names. Convert an earlier Bee/buun `dflash-draft` GGUF
+without requantizing it:
 
 ```powershell
 python scripts/convert-dflash-draft-to-upstream.py `
@@ -29,9 +28,7 @@ python scripts/convert-dflash-draft-to-upstream.py `
   --verify
 ```
 
-## Launch
-
-Replace the paths and fit settings for your hardware.
+## 3. Start the server
 
 ```powershell
 build\bin\llama-server.exe `
@@ -47,65 +44,42 @@ build\bin\llama-server.exe `
   -ngl all --port 8082 --jinja
 ```
 
-With `--spec-draft-n-max` omitted, BeeLlama uses the drafter's trained block
-depth (`dflash.block_size - 1`, normally 15). Pass the flag explicitly to
-override it; the profit controller remains enabled by default and adapts within
-that maximum.
+`--spec-draft-n-max` is intentionally omitted. BeeLlama reads
+`dflash.block_size` and uses one less than the block size, normally 15. The
+profit controller is already the default; it adapts within that maximum.
 
-The `-ub 512` setting above is suitable for serving. For KVarN quality or KLD
-measurements, rerun with `-ub 256`; the known `-ub 512` KLD drift is caused by
-ubatch cadence, not a cache defect.
+## 4. Verify startup and generation
 
-For lower KV memory, use a matched KVarN pair rather than mixing one KVarN side
-with a standard cache:
+At INFO verbosity, startup should report the omitted-depth resolution and the
+same `n_max` in the DFlash implementation. Send a deterministic short request,
+confirm that text is generated, and inspect the timing summary for generated and
+accepted draft tokens.
+
+To verify an override, restart with `--spec-draft-n-max 4`; startup must report
+`n_max=4` and must not print the omitted-depth message. To keep a static depth,
+also pass `--spec-dm-controller off`.
+
+## 5. Choose and measure the target cache
+
+The command uses conventional q caches. For lower target-cache memory on a
+supported CUDA layout, try:
 
 ```text
 --cache-type-k kvarn4 --cache-type-v kvarn4
 ```
 
-KVarN is target-context-only and requires an offloaded, supported attention
-backend. Test quality at the exact context length and ubatch size you plan to
-serve.
+KVarN is target-context-only; keep the DFlash draft cache on a standard type.
+For serving, `-ub 512` is a valid throughput choice. For KLD or cache-quality
+comparisons, rerun both legs with `-ub 256` and keep the corpus, context, batch,
+model files, and commit identical.
 
-## Adaptive draft depth
+## 6. Optional reasoning controls
 
-The profit controller measures accepted tokens per wall-clock cycle and varies
-the DFlash horizon. It is enabled with `--spec-dm-controller profit`; choose
-`off` for a fixed `--spec-draft-n-max`. `--spec-draft-p-min` is independent: it
-stops an individual draft early when confidence is too low.
+`--reasoning-loop-guard force-close` is the default and watches hidden reasoning
+for periodic repetition. A streaming chat request can instead opt into realtime
+control with `"reasoning_control": true`, then send its completion id and
+`"action": "reasoning_end"` to `/v1/chat/completions/control`.
 
-Useful tuning controls are:
-
-- `--spec-dm-profit-min`
-- `--spec-dm-profit-raise-margin`
-- `--spec-dm-profit-lower-margin`
-- `--spec-dm-profit-min-samples`
-- `--spec-dm-profit-baseline-interval`
-
-Use the defaults first and compare a fixed-depth run with the same prompt,
-sampling settings, model files, and GPU before changing them.
-
-## Reasoning models
-
-For models that produce long hidden reasoning, the server can watch for repeated
-reasoning-token patterns:
-
-```text
---reasoning-loop-guard force-close
-```
-
-`force-close` asks the reasoning-budget sampler to finish the hidden section;
-`stop` ends generation on a trigger. Request JSON can override the guard and its
-window, coverage, period, and intervention settings.
-
-For interactive control instead of automatic detection, set
-`"reasoning_control": true` on a streaming chat request and POST its completion
-id with `"action": "reasoning_end"` to `/v1/chat/completions/control`.
-
-## Migration notes
-
-- `--spec-type dflash` remains a warned alias for `draft-dflash`.
-- `--spec-dflash-cross-ctx`, `--spec-branch-budget`, and the GPU-ring
-  environment variables were removed with the old fork verifier.
-- TurboQuant/TCQ cache types were removed. Their command-line spellings redirect
-  with a warning; use standard q cache types or KVarN explicitly in new setups.
+See the [argument reference](beellama-args.md) for exact defaults and
+[Migration from earlier versions](beellama-args.md#migration-from-earlier-versions)
+for removed fork DFlash and TurboQuant settings.
