@@ -26,6 +26,9 @@
   default standard vector matrix and a 169-pair `GGML_CUDA_FA_ALL_QUANTS` matrix.
   KVarN keeps 15 balanced fast decode pairs by default and 36 with ALL. The
   obsolete `GGML_CUDA_FA_HALF_QUANTS` option is gone.
+- Added migration errors for the removed `copyspec`, `suffix`, and `recycle`
+  speculative type names, pointing users to `draft-dflash` or upstream n-gram
+  modes instead of returning a generic unknown-type message.
 - Re-ported the profit-only adaptive DFlash controller and server reasoning-loop
   guard onto upstream token/sampler and checkpoint behavior.
 - Added opted-in realtime reasoning control: a streaming chat completion armed

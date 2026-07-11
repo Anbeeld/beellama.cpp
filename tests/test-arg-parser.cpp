@@ -6,9 +6,54 @@
 #include <vector>
 #include <sstream>
 #include <unordered_set>
+#include <functional>
+
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 #undef NDEBUG
 #include <cassert>
+
+static std::string capture_stderr(const std::function<void()> & fn) {
+    fflush(stderr);
+    FILE * capture = tmpfile();
+    assert(capture != nullptr);
+
+#ifdef _WIN32
+    const int stderr_fd = _fileno(stderr);
+    const int saved_fd  = _dup(stderr_fd);
+    assert(saved_fd >= 0);
+    assert(_dup2(_fileno(capture), stderr_fd) == 0);
+#else
+    const int stderr_fd = fileno(stderr);
+    const int saved_fd  = dup(stderr_fd);
+    assert(saved_fd >= 0);
+    assert(dup2(fileno(capture), stderr_fd) == 0);
+#endif
+
+    fn();
+    fflush(stderr);
+    assert(fseek(capture, 0, SEEK_SET) == 0);
+
+    std::string result;
+    char buffer[256];
+    while (fgets(buffer, sizeof(buffer), capture) != nullptr) {
+        result += buffer;
+    }
+
+#ifdef _WIN32
+    assert(_dup2(saved_fd, stderr_fd) == 0);
+    _close(saved_fd);
+#else
+    assert(dup2(saved_fd, stderr_fd) == 0);
+    close(saved_fd);
+#endif
+    fclose(capture);
+    return result;
+}
 
 static void test(void) {
     common_params params;
@@ -348,6 +393,18 @@ static void test(void) {
     argv = {"binary_name", "--spec-type", "dflash"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
     assert(params.speculative.types.back() == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH);
+
+    for (const std::string & removed : {"copyspec", "suffix", "recycle"}) {
+        params = common_params();
+        argv = {"binary_name", "--spec-type", removed};
+        bool parsed = true;
+        const std::string error = capture_stderr([&]() {
+            parsed = common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER);
+        });
+        assert(false == parsed);
+        assert(error.find("speculative type '" + removed +
+                          "' was removed in v0.4.0; use draft-dflash or upstream's ngram modes") != std::string::npos);
+    }
 
     params = common_params();
     assert(params.speculative.dm_profit_min == 0.05f);

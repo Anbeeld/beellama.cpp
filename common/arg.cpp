@@ -4141,6 +4141,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             auto types_str = string_split<std::string>(value, ',');
             for (auto & type : types_str) {
+                if (type == "copyspec" || type == "suffix" || type == "recycle") {
+                    throw std::invalid_argument(string_format(
+                        "speculative type '%s' was removed in v0.4.0; use draft-dflash or upstream's ngram modes",
+                        type.c_str()));
+                }
                 if (type == "dflash") {
                     LOG_WRN("speculative type 'dflash' was renamed in v0.4.0; redirecting to 'draft-dflash'\n");
                     type = "draft-dflash";
