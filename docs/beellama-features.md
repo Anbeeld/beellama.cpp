@@ -59,3 +59,7 @@ as F16 tensors.
 KVarN quality and speed are workload dependent. Report model file, cache types,
 context length, ubatch, prompt, sampling settings, hardware, and commit with every
 benchmark result.
+
+Run KVarN quality and KLD measurements with `-ub 256`. The known KLD drift at
+`-ub 512` is driven by ubatch cadence rather than a cache defect; `-ub 512`
+remains suitable for serving.

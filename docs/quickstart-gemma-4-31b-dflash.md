@@ -50,6 +50,10 @@ build\bin\llama-server.exe `
   -ngl all --port 8082 --jinja
 ```
 
+The `-ub 512` setting above is suitable for serving. For KVarN quality or KLD
+measurements, rerun with `-ub 256`; the known `-ub 512` KLD drift is caused by
+ubatch cadence, not a cache defect.
+
 For a tighter KV budget, use a matched KVarN configuration:
 
 ```text
