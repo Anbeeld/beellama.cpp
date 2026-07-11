@@ -28,10 +28,9 @@ quality and speed of the exact model and context you plan to serve.
 ### Measurement and validation
 
 Run KLD or perplexity with the same corpus, context, batch size, and cache pair
-as the intended workload. Use `-ub 256` for KLD comparisons: the known drift at
-`-ub 512` follows ubatch cadence rather than the KVarN store path. Record the
-model file, command, prompt or corpus, sampling settings, GPU, and commit with
-every result.
+as the intended workload. Keep both `-b` and `-ub` identical between baseline
+and candidate runs. Record the model file, command, prompt or corpus, sampling
+settings, GPU, and commit with every result.
 
 ### Known limitations
 
@@ -210,8 +209,8 @@ model, corpus, context, and batching constant.
 ### Measurement and validation
 
 Generate the base file first, then run the candidate with `--kl-divergence` and
-the same evaluation tokens. Use `-ub 256`, and treat a nonzero process exit as a
-failed measurement rather than a score.
+the same evaluation tokens, logical batch, and physical ubatch. Treat a nonzero
+process exit as a failed measurement rather than a score.
 
 ### Known limitations
 

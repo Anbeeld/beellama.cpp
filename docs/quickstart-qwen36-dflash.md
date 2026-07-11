@@ -69,9 +69,9 @@ supported CUDA layout, try:
 ```
 
 KVarN is target-context-only; keep the DFlash draft cache on a standard type.
-For serving, `-ub 512` is a valid throughput choice. For KLD or cache-quality
-comparisons, rerun both legs with `-ub 256` and keep the corpus, context, batch,
-model files, and commit identical.
+For KLD or cache-quality comparisons, use the intended serving ubatch and keep
+the corpus, context, logical batch, physical ubatch, model files, and commit
+identical between both legs.
 
 ## 6. Optional reasoning controls
 

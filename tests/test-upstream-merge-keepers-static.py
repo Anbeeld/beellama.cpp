@@ -85,6 +85,13 @@ def main() -> None:
     if "GGML_CUDA_FATTN_KVARN_ORIGINAL_TYPE, GGML_CUDA_FATTN_KVARN_TYPE>" in kvarn_case:
         raise AssertionError("KVarN MMA selection still instantiates the impossible original-K/rotated-V domain")
 
+    kvarn_cache = (ROOT / "src/llama-kv-cache-kvarn.h").read_text(encoding="utf-8")
+    require(
+        kvarn_cache,
+        "uint64_t(n_batch) + n_ubatch",
+        "non-SWA KVarN staging must cover the logical scheduler batch plus one physical ubatch",
+    )
+
     ggml_cmake = (ROOT / "ggml/CMakeLists.txt").read_text(encoding="utf-8")
     cuda_cmake = (ROOT / "ggml/src/ggml-cuda/CMakeLists.txt").read_text(encoding="utf-8")
     require(

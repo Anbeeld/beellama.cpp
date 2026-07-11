@@ -18,7 +18,6 @@
 namespace {
 
 constexpr uint32_t KVAR_N_GROUP = 128;
-constexpr uint32_t KVAR_N_MIN_TAIL_GROUPS = 4;
 // SWA keeps only local tail groups in F16; older window groups are served from
 // records. Keep this low enough that KVarN remains a KV-memory win over q5_0.
 constexpr uint32_t KVAR_N_SWA_TAIL_GROUPS = 2;
@@ -162,16 +161,13 @@ const std::vector<float> & kvarn_hadamard(int n) {
 }
 
 uint32_t kvarn_stage_tail_groups(uint32_t kv_size, uint32_t n_batch, uint32_t n_ubatch, uint32_t n_swa, bool is_swa) {
-    GGML_UNUSED(n_batch);
     GGML_UNUSED(n_swa);
 
     if (is_swa) {
         return KVAR_N_SWA_TAIL_GROUPS;
     }
 
-    const uint32_t in_flight_groups = std::max<uint32_t>(1u, (n_ubatch + KVAR_N_GROUP - 1u) / KVAR_N_GROUP);
-    const uint32_t min_tail_groups = KVAR_N_MIN_TAIL_GROUPS + (kv_size >= 65536u ? 2u : 0u);
-    return min_tail_groups + in_flight_groups;
+    return llama_kvarn_non_swa_tail_groups(kv_size, n_batch, n_ubatch);
 }
 
 uint32_t kvarn_swa_visible_groups(uint32_t kv_size, uint32_t n_swa) {

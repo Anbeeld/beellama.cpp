@@ -117,7 +117,7 @@ Key binaries are `llama-server`, `llama-cli`, `llama-bench`, and
 # Unit and regression tests
 ctest --test-dir build --output-on-failure
 
-# KVarN quality at the documented ubatch cadence
+# KVarN quality at the intended serving cadence
 build/bin/llama-perplexity -m model.gguf -f test.txt -c 4096 -b 512 -ub 256
 
 # Decode speed
@@ -132,8 +132,8 @@ build/bin/llama-server -m target.gguf \
   --port 8080
 ```
 
-KLD comparisons use `-ub 256`; `-ub 512` has a known cadence-dependent
-precision effect and is not a merge-regression baseline.
+KLD comparisons use matching `-b` and `-ub` values for the baseline and
+candidate. Record both values with every result.
 
 ## Git Conventions
 

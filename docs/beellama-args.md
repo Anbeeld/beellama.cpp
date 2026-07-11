@@ -75,7 +75,7 @@ configuration example.
 | `--save-all-logits FNAME`, `--kl-divergence-base FNAME` | — | Unused | Without `--kl-divergence`, writes the base run's compressed log probabilities to `FNAME`. |
 | `--kl-divergence` | — | Off | Compares the current run with the file supplied by `--kl-divergence-base` and returns a nonzero exit code on read or evaluation failure. |
 
-Use the same corpus, context, batch, and `-ub 256` for both KLD legs.
+Use the same corpus, context, logical batch, and physical ubatch for both KLD legs.
 
 ## CUDA FlashAttention build policy
 

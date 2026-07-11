@@ -1,4 +1,5 @@
 #include "llama-kvarn.h"
+#include "llama-kv-cache-kvarn.h"
 
 #include "ggml-backend.h"
 
@@ -47,6 +48,19 @@ static void test_type_table() {
     }
 
     require(llama_kvarn_type_desc_from_name("kvarn_k7v2_g128") == nullptr, "invalid type parsed");
+}
+
+static void test_stage_policy() {
+    require(llama_kvarn_non_swa_tail_groups(32768, 256, 256) == 6,
+            "short-context KVarN tail policy changed unexpectedly");
+    require(llama_kvarn_non_swa_tail_groups(65536, 256, 256) == 8,
+            "long-context KVarN precision floor changed unexpectedly");
+    require(llama_kvarn_non_swa_tail_groups(65536, 2048, 256) == 18,
+            "b2048/ub256 KVarN tail must cover the scheduler window");
+    require(llama_kvarn_non_swa_tail_groups(65536, 2048, 512) == 20,
+            "b2048/ub512 KVarN tail must cover the scheduler window");
+    require(llama_kvarn_non_swa_tail_groups(65536, 2048, 1024) == 24,
+            "b2048/ub1024 KVarN tail must cover the scheduler window");
 }
 
 static void test_tile_layout() {
@@ -1871,17 +1885,18 @@ static void test_native_flash_attention_gpu() {
 
     {
         constexpr int head_dim = 256;
-        constexpr int n_q_prefill = 512;
         constexpr int n_q_heads = 6;
         constexpr int n_kv_heads = 1;
         constexpr int n_kv = 4096;
-        constexpr int stage_groups = 5;
-        const std::vector<float> expected_prefill = test_native_flash_attention_output(
-                cpu_backend, false, false, head_dim, 4, 4, n_q_prefill, n_q_heads, n_kv_heads, n_kv, stage_groups);
-        const std::vector<float> actual_prefill = test_native_flash_attention_output(
-                gpu_backend, true, false, head_dim, 4, 4, n_q_prefill, n_q_heads, n_kv_heads, n_kv, stage_groups);
-        require_close_f32_rmse(actual_prefill, expected_prefill, 1e-2f,
-                "large-prefill multi-head original-domain KVarN FlashAttention differs from CPU reference");
+        constexpr int stage_groups = 25;
+        for (int n_q_prefill : { 512, 1024 }) {
+            const std::vector<float> expected_prefill = test_native_flash_attention_output(
+                    cpu_backend, false, false, head_dim, 4, 4, n_q_prefill, n_q_heads, n_kv_heads, n_kv, stage_groups);
+            const std::vector<float> actual_prefill = test_native_flash_attention_output(
+                    gpu_backend, true, false, head_dim, 4, 4, n_q_prefill, n_q_heads, n_kv_heads, n_kv, stage_groups);
+            require_close_f32_rmse(actual_prefill, expected_prefill, 1e-2f,
+                    "large-prefill multi-head original-domain KVarN FlashAttention differs from CPU reference");
+        }
     }
 
     {
@@ -2143,8 +2158,8 @@ static void test_store_paths_gpu() {
                 gpu_backend, 4, value, 16, 2, 4096, 512, 7);
         const std::vector<ggml_fp16_t> fallback_output = test_store_segmented_output(
                 gpu_backend, 4, value, 16, 2, 4096, 256, 7);
-        require_close_f16_rmse(workspace_output, fallback_output, 2e-3f,
-                "KVarN CUDA D256 workspace ubatch store output differs from 256-token fallback");
+        require(workspace_output == fallback_output,
+                "KVarN CUDA D256 workspace ubatch store output is not segmentation-independent");
     }
 
     for (int bits : { 2, 3, 4, 5, 6, 8 }) {
@@ -2519,6 +2534,7 @@ int main() {
     ggml_backend_load_all();
 
     test_type_table();
+    test_stage_policy();
     test_tile_layout();
     test_head_dimension_slicing();
     test_runtime_validation();
