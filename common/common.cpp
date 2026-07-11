@@ -488,6 +488,50 @@ std::string common_params_get_system_info(const common_params & params) {
     return os.str();
 }
 
+bool common_speculative_resolve_dflash_draft_n_max(
+        common_params_speculative & params,
+        const std::string & draft_model_path) {
+    const bool has_dflash = std::find(
+            params.types.begin(), params.types.end(),
+            COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params.types.end();
+    if (!has_dflash || params.draft_n_max_explicit) {
+        return true;
+    }
+
+    struct gguf_init_params gguf_params = {
+        /* .no_alloc = */ true,
+        /* .ctx      = */ nullptr,
+    };
+    gguf_context * ctx = gguf_init_from_file(draft_model_path.c_str(), gguf_params);
+    if (ctx == nullptr) {
+        COM_ERR("DFlash: failed to read draft model metadata from '%s'\n", draft_model_path.c_str());
+        return false;
+    }
+
+    int32_t block_size = 16; // matches the upstream DFlash fallback
+    const int64_t key = gguf_find_key(ctx, "dflash.block_size");
+    if (key >= 0) {
+        if (gguf_get_kv_type(ctx, key) != GGUF_TYPE_UINT32) {
+            COM_ERR("%s", "DFlash: metadata key dflash.block_size must be uint32\n");
+            gguf_free(ctx);
+            return false;
+        }
+        const uint32_t value = gguf_get_val_u32(ctx, key);
+        if (value == 0 || value > INT32_MAX) {
+            COM_ERR("DFlash: invalid dflash.block_size value: %" PRIu32 "\n", value);
+            gguf_free(ctx);
+            return false;
+        }
+        block_size = (int32_t) value;
+    }
+    gguf_free(ctx);
+
+    params.draft.n_max = block_size - 1;
+    COM_INF("DFlash: omitted --spec-draft-n-max defaults to the drafter block depth (%d); pass the flag to override\n",
+            params.draft.n_max);
+    return true;
+}
+
 //
 // String utils
 //

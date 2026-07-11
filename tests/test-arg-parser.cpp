@@ -1,7 +1,9 @@
 #include "arg.h"
 #include "common.h"
 #include "download.h"
+#include "gguf.h"
 
+#include <filesystem>
 #include <string>
 #include <vector>
 #include <sstream>
@@ -53,6 +55,22 @@ static std::string capture_stderr(const std::function<void()> & fn) {
 #endif
     fclose(capture);
     return result;
+}
+
+static void set_test_env(const char * name, const char * value) {
+#ifdef _WIN32
+    assert(_putenv_s(name, value) == 0);
+#else
+    assert(setenv(name, value, true) == 0);
+#endif
+}
+
+static void unset_test_env(const char * name) {
+#ifdef _WIN32
+    assert(_putenv_s(name, "") == 0);
+#else
+    assert(unsetenv(name) == 0);
+#endif
 }
 
 static void test(void) {
@@ -385,9 +403,53 @@ static void test(void) {
     assert(params.n_predict == 6789);
     assert(params.n_batch == 9090);
 
-    argv = {"binary_name", "--spec-draft-n-max", "123"};
+    unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-dflash"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.speculative.draft.n_max == 3);
+    assert(!params.speculative.draft_n_max_explicit);
+
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-n-max", "123"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
     assert(params.speculative.draft.n_max == 123);
+    assert(params.speculative.draft_n_max_explicit);
+
+    set_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX", "7");
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(params.speculative.draft.n_max == 7);
+    assert(params.speculative.draft_n_max_explicit);
+    unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
+
+    const std::filesystem::path dflash_fixture =
+            std::filesystem::temp_directory_path() / "beellama-dflash-depth-policy.gguf";
+    gguf_context * fixture = gguf_init_empty();
+    assert(fixture != nullptr);
+    gguf_set_val_str(fixture, "general.architecture", "dflash");
+    gguf_set_val_u32(fixture, "dflash.block_size", 16);
+    assert(gguf_write_to_file(fixture, dflash_fixture.string().c_str(), true));
+    gguf_free(fixture);
+
+    params = common_params();
+    params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
+    assert(common_speculative_resolve_dflash_draft_n_max(params.speculative, dflash_fixture.string()));
+    assert(params.speculative.draft.n_max == 15);
+
+    params = common_params();
+    params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
+    params.speculative.draft.n_max = 20;
+    params.speculative.draft_n_max_explicit = true;
+    assert(common_speculative_resolve_dflash_draft_n_max(params.speculative, dflash_fixture.string()));
+    assert(params.speculative.draft.n_max == 20);
+
+    params = common_params();
+    params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE };
+    assert(common_speculative_resolve_dflash_draft_n_max(params.speculative, dflash_fixture.string()));
+    assert(params.speculative.draft.n_max == 3);
+    assert(std::filesystem::remove(dflash_fixture));
 
     params = common_params();
     argv = {"binary_name", "--spec-type", "dflash"};

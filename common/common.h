@@ -392,6 +392,7 @@ struct common_params_speculative {
     // Adaptive DFlash draft horizon.  "profit" is the only retained Bee
     // controller; the old fringe controller was coupled to the retired fork
     // verifier and is intentionally not part of the v0.4.0 API.
+    bool draft_n_max_explicit = false;
     common_speculative_dm_controller dm_controller = COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT;
     float   dm_profit_min               = 0.05f;
     float   dm_profit_raise_margin      = 0.05f;
@@ -413,6 +414,12 @@ struct common_params_speculative {
         return needs_rs_seq ? draft.n_max : 0u;
     }
 };
+
+// Resolve Bee's omitted DFlash draft maximum before target-context allocation.
+// Returns false when the draft GGUF metadata cannot be read or is invalid.
+bool common_speculative_resolve_dflash_draft_n_max(
+        common_params_speculative & params,
+        const std::string & draft_model_path);
 
 struct common_params_vocoder {
     struct common_params_model model;

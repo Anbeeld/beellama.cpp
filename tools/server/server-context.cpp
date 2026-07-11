@@ -1073,6 +1073,12 @@ private:
         const bool is_resume = sleeping;
 
         params_base = params;
+        if (!common_speculative_resolve_dflash_draft_n_max(
+                    params_base.speculative,
+                    params_base.speculative.draft.mparams.path)) {
+            SRV_ERR("%s", "failed to resolve the omitted DFlash draft maximum\n");
+            return false;
+        }
         params_base.n_outputs_max = server_n_outputs_max(params_base);
 
         const bool has_mmproj = !params.mmproj.path.empty();

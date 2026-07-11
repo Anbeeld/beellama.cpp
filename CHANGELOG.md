@@ -34,6 +34,9 @@
   modes instead of returning a generic unknown-type message.
 - Re-ported the profit-only adaptive DFlash controller and server reasoning-loop
   guard onto upstream token/sampler and checkpoint behavior.
+- Made an omitted DFlash `--spec-draft-n-max` use the drafter's trained block
+  depth (`dflash.block_size - 1`, normally 15) instead of upstream's default 3.
+  Explicit values still win, and the profit controller remains default-on.
 - Added opted-in realtime reasoning control: a streaming chat completion armed
   with `reasoning_control` can be moved to its final answer through
   `/v1/chat/completions/control`.

@@ -34,6 +34,12 @@ is not accepted for a draft cache (`--spec-draft-type-k` / `--spec-draft-type-v`
 `--spec-type dflash` is a compatibility alias that warns and maps to
 `draft-dflash`.
 
+When DFlash is selected and `--spec-draft-n-max` (or
+`LLAMA_ARG_SPEC_DRAFT_N_MAX`) is omitted, BeeLlama reads the drafter's
+`dflash.block_size` metadata and uses `block_size - 1` (15 for a block-16
+drafter). An explicit value always wins; upstream then clamps values above the
+trained limit. The upstream default for this argument is 3.
+
 The retained Bee controller is profit-only:
 
 ```text
@@ -108,7 +114,7 @@ use descriptor-native MMA fallback.
 ## Examples
 
 ```text
-# Upstream DFlash with fixed depth
+# Upstream DFlash with an explicit fixed depth
 --spec-type draft-dflash --spec-draft-model draft.gguf --spec-draft-n-max 8 --spec-dm-controller off
 
 # KVarN target cache

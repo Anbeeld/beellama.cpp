@@ -133,6 +133,13 @@ def main() -> None:
     if "case LLM_ARCH_DFLASH:" in null_memory_arches:
         raise AssertionError("DFlash requires its own KV cache; routing it to null memory crashes graph reservation")
 
+    server_context = (ROOT / "tools/server/server-context.cpp").read_text(encoding="utf-8")
+    load_model = server_context.split("bool load_model(common_params & params)", 1)[1].split("bool init()", 1)[0]
+    resolve_pos = load_model.find("common_speculative_resolve_dflash_draft_n_max")
+    output_size_pos = load_model.find("params_base.n_outputs_max = server_n_outputs_max(params_base)")
+    if resolve_pos < 0 or output_size_pos < 0 or resolve_pos > output_size_pos:
+        raise AssertionError("the omitted DFlash draft maximum must resolve before server output-buffer sizing")
+
     release = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
     require(release, "name: Build / Release", "the Bee release workflow was replaced by upstream's generic workflow")
     require(release, "beellama-${{", "Bee release assets must retain fork-specific names")

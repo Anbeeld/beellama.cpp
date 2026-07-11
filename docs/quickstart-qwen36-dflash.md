@@ -38,7 +38,6 @@ build\bin\llama-server.exe `
   -m "D:\models\Qwen3.6-27B-Q4_K_M.gguf" `
   --spec-type draft-dflash `
   --spec-draft-model "D:\models\Qwen3.6-27B-DFlash.gguf" `
-  --spec-draft-n-max 8 `
   --spec-draft-n-min 0 `
   --spec-draft-p-min 0.0 `
   --spec-dm-controller profit `
@@ -47,6 +46,11 @@ build\bin\llama-server.exe `
   --ctx-size 32768 -b 1024 -ub 512 `
   -ngl all --port 8082 --jinja
 ```
+
+With `--spec-draft-n-max` omitted, BeeLlama uses the drafter's trained block
+depth (`dflash.block_size - 1`, normally 15). Pass the flag explicitly to
+override it; the profit controller remains enabled by default and adapts within
+that maximum.
 
 The `-ub 512` setting above is suitable for serving. For KVarN quality or KLD
 measurements, rerun with `-ub 256`; the known `-ub 512` KLD drift is caused by
