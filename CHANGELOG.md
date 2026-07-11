@@ -22,6 +22,9 @@
 - Kept KVarN and its low-bit standard cache support. CUDA FlashAttention now
   explicitly dispatches KVarN views to descriptor-native kernels, including clean
   MMA fallback for valid pairs outside the fast decode matrix.
+- Restored CUDA `SET_ROWS` and `GET_ROWS` support for the standard `q6_1`,
+  `q6_0`, `q3_1`, `q3_0`, `q2_1`, and `q2_0` KV-cache types after the upstream
+  merge dropped their backend dispatch and support declarations.
 - Replaced the three-tier FlashAttention quant build policy with a 103-pair
   default standard vector matrix and a 169-pair `GGML_CUDA_FA_ALL_QUANTS` matrix.
   KVarN keeps 15 balanced fast decode pairs by default and 36 with ALL. The

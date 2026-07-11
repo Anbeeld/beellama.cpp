@@ -298,6 +298,66 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb1, nb2, nb3,
             stream
         );
+    } else if (dst->type == GGML_TYPE_Q6_0) {
+        set_rows_cuda_quant<idx_t, block_q6_0, QK6_0, quantize_f32_q6_0_block>(
+            src0_d, src1_d, (block_q6_0*)dst->data,
+            ne00, ne01, ne02, ne03,
+            ne10, ne11, ne12, ne13,
+            nb01, nb02, nb03,
+            nb10, nb11, nb12,
+            nb1, nb2, nb3,
+            stream
+        );
+    } else if (dst->type == GGML_TYPE_Q6_1) {
+        set_rows_cuda_quant<idx_t, block_q6_1, QK6_1, quantize_f32_q6_1_block>(
+            src0_d, src1_d, (block_q6_1*)dst->data,
+            ne00, ne01, ne02, ne03,
+            ne10, ne11, ne12, ne13,
+            nb01, nb02, nb03,
+            nb10, nb11, nb12,
+            nb1, nb2, nb3,
+            stream
+        );
+    } else if (dst->type == GGML_TYPE_Q3_0) {
+        set_rows_cuda_quant<idx_t, block_q3_0, QK3_0, quantize_f32_q3_0_block>(
+            src0_d, src1_d, (block_q3_0*)dst->data,
+            ne00, ne01, ne02, ne03,
+            ne10, ne11, ne12, ne13,
+            nb01, nb02, nb03,
+            nb10, nb11, nb12,
+            nb1, nb2, nb3,
+            stream
+        );
+    } else if (dst->type == GGML_TYPE_Q3_1) {
+        set_rows_cuda_quant<idx_t, block_q3_1, QK3_1, quantize_f32_q3_1_block>(
+            src0_d, src1_d, (block_q3_1*)dst->data,
+            ne00, ne01, ne02, ne03,
+            ne10, ne11, ne12, ne13,
+            nb01, nb02, nb03,
+            nb10, nb11, nb12,
+            nb1, nb2, nb3,
+            stream
+        );
+    } else if (dst->type == GGML_TYPE_Q2_0S) {
+        set_rows_cuda_quant<idx_t, block_q2_0s, QK2_0S, quantize_f32_q2_0s_block>(
+            src0_d, src1_d, (block_q2_0s*)dst->data,
+            ne00, ne01, ne02, ne03,
+            ne10, ne11, ne12, ne13,
+            nb01, nb02, nb03,
+            nb10, nb11, nb12,
+            nb1, nb2, nb3,
+            stream
+        );
+    } else if (dst->type == GGML_TYPE_Q2_1) {
+        set_rows_cuda_quant<idx_t, block_q2_1, QK2_1, quantize_f32_q2_1_block>(
+            src0_d, src1_d, (block_q2_1*)dst->data,
+            ne00, ne01, ne02, ne03,
+            ne10, ne11, ne12, ne13,
+            nb01, nb02, nb03,
+            nb10, nb11, nb12,
+            nb1, nb2, nb3,
+            stream
+        );
     } else if (dst->type == GGML_TYPE_Q8_0) {
         set_rows_cuda_quant<idx_t, block_q8_0, QK8_0, quantize_f32_q8_0_block>(
             src0_d, src1_d, (block_q8_0*)dst->data,

@@ -53,6 +53,20 @@ def main() -> None:
         'strcmp(name, "ggml_backend_kvarn_native_ops")',
     ):
         require(cuda, needle, "the CUDA KVarN operation integration was lost during an upstream merge")
+
+    set_rows = (ROOT / "ggml/src/ggml-cuda/set-rows.cu").read_text(encoding="utf-8")
+    set_rows_support = cuda.rsplit("case GGML_OP_SET_ROWS:", 1)[1].split("case GGML_OP_SET:", 1)[0]
+    for cache_type in ("Q6_1", "Q6_0", "Q3_1", "Q3_0", "Q2_1", "Q2_0S"):
+        require(
+            set_rows,
+            f"dst->type == GGML_TYPE_{cache_type}",
+            f"CUDA SET_ROWS dispatch for {cache_type} was lost during an upstream merge",
+        )
+        require(
+            set_rows_support,
+            f"GGML_TYPE_{cache_type}",
+            f"CUDA SET_ROWS support declaration for {cache_type} was lost during an upstream merge",
+        )
     kvarn_wht = ROOT / "ggml/src/ggml-cuda/kvarn-wht.cu"
     if not kvarn_wht.is_file():
         raise AssertionError("the KVarN CUDA WHT kernel was removed with the unrelated TurboQuant WHT file")
