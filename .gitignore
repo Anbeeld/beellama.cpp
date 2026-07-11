@@ -163,6 +163,3 @@ AGENTS.local.md
 /artifacts/
 /release-packages/*/
 /servers
-
-# Codebooks are intentionally tracked despite *.bin
-!codebooks/**/*.bin

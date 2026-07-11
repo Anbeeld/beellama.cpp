@@ -179,14 +179,14 @@ int main(int argc, char ** argv) {
             }
 
             // generate a new draft
-            auto & draft_params = common_speculative_get_draft_params(spec, seq_id);
-            draft_params = common_speculative_draft_params{};
-            draft_params.drafting = true;
-            draft_params.n_max    = -1;
-            draft_params.n_past   = n_past;
-            draft_params.id_last  = id_last;
-            draft_params.prompt   = &prompt_tgt;
-            draft_params.result   = &draft; // output
+            common_speculative_get_draft_params(spec, seq_id) = {
+                /* .drafting   = */ true,
+                /* .n_max      = */ -1,
+                /* .n_past     = */ n_past,
+                /* .id_last    = */ id_last,
+                /* .prompt     = */ &prompt_tgt,
+                /* .result     = */ &draft, // output
+            };
             common_speculative_draft(spec);
 
             // save the original draft size
