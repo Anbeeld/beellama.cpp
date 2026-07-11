@@ -280,6 +280,9 @@ int main(int argc, char ** argv) {
             continue;
         }
 
+        // An empty draft leaves impl_last unset, so accepting it dereferences a null
+        // implementation in release builds. Upstream common_speculative_accept should
+        // eventually make no-draft calls safe; until then, do not call it without a draft.
         if (n_draft > 0) {
             common_speculative_accept(spec, seq_id, ids.size() - 1);
         }
