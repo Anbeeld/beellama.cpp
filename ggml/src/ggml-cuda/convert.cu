@@ -460,6 +460,41 @@ static __global__ void dequantize_block_iq4_nl(const void * __restrict__ vx, dst
 }
 
 template<typename dst_t>
+static __global__ void dequantize_block_iq4_nl_nc(
+        const void * __restrict__ vx, dst_t * __restrict__ yy,
+        const int64_t ne00, const int64_t ne01, const int64_t ne0203, const uint3 ne02,
+        const int64_t s01, const int64_t s02, const int64_t s03) {
+    const int64_t i00 = int64_t(blockIdx.x)*QK_K;
+    const int64_t tid = threadIdx.x;
+    const int64_t il  = tid/8; // 0...3
+    const int64_t ib  = tid%8; // 0...7 blocks of 32 values in a QK_K tile
+
+    if (i00 + ib*QK4_NL >= ne00) {
+        return;
+    }
+
+    for (int64_t i01 = blockIdx.y; i01 < ne01; i01 += gridDim.y) {
+        for (int64_t i0203 = blockIdx.z; i0203 < ne0203; i0203 += gridDim.z) {
+            const uint2 dm = fast_div_modulo((uint32_t) i0203, ne02);
+            const int64_t i02 = dm.y;
+            const int64_t i03 = dm.x;
+
+            const block_iq4_nl * x = (const block_iq4_nl *) vx
+                + i03*s03 + i02*s02 + i01*s01 + i00/QK4_NL + ib;
+            dst_t * y = yy + (i0203*ne01 + i01)*ne00 + i00 + ib*QK4_NL + 4*il;
+            const uint8_t * q4 = x->qs + 4*il;
+            const float d = (float) x->d;
+
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                y[j +  0] = ggml_cuda_cast<dst_t>(d * kvalues_iq4nl[q4[j] & 0xf]);
+                y[j + 16] = ggml_cuda_cast<dst_t>(d * kvalues_iq4nl[q4[j] >>  4]);
+            }
+        }
+    }
+}
+
+template<typename dst_t>
 static __global__ void dequantize_block_iq4_xs(const void * __restrict__ vx, dst_t * __restrict__ yy) {
     const int64_t i   = blockIdx.x;
     const block_iq4_xs * x = (const block_iq4_xs *)vx;
@@ -503,6 +538,20 @@ static void dequantize_block_cuda(const void * vx, dst_t * y,
     const dim3 num_blocks((ne00 + 2*CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / (2*CUDA_DEQUANTIZE_BLOCK_SIZE), (int)std::min(ne01, (int64_t)65535), (int)std::min(ne0203, (int64_t)65535));
     dequantize_block<qk, qr, dequantize_kernel><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>
         (vx, y, ne00, ne01, ne0203, ne02_fdv, s01, s02, s03);
+}
+
+template<typename dst_t>
+static void dequantize_block_iq4_nl_nc_cuda(const void * vx, dst_t * y,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+        const int64_t s01, const int64_t s02, const int64_t s03, cudaStream_t stream) {
+    const int64_t ne0203 = ne02*ne03;
+    const uint3 ne02_fdv = init_fastdiv_values(ne02);
+    const dim3 num_blocks(
+        (unsigned int) ((ne00 + QK_K - 1) / QK_K),
+        (unsigned int) std::min(ne01, (int64_t) 65535),
+        (unsigned int) std::min(ne0203, (int64_t) 65535));
+    dequantize_block_iq4_nl_nc<<<num_blocks, 32, 0, stream>>>(
+        vx, y, ne00, ne01, ne0203, ne02_fdv, s01, s02, s03);
 }
 
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
@@ -926,6 +975,8 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK2_1, 2, dequantize_q2_1>;
         case GGML_TYPE_Q8_0:
             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
+        case GGML_TYPE_IQ4_NL:
+            return dequantize_block_iq4_nl_nc_cuda;
         case GGML_TYPE_BF16:
             return convert_unary_cuda<nv_bfloat16>;
         default:

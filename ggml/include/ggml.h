@@ -1693,6 +1693,12 @@ extern "C" {
             struct ggml_tensor  * a,  // data
             struct ggml_tensor  * b); // row indices
 
+    GGML_API struct ggml_tensor * ggml_get_rows_as(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            enum ggml_type        type);
+
     GGML_API struct ggml_tensor * ggml_get_rows_back(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,  // gradients of ggml_get_rows result
@@ -1715,6 +1721,16 @@ extern "C" {
             struct ggml_tensor  * a,  // destination
             struct ggml_tensor  * b,  // source
             struct ggml_tensor  * c); // row indices
+
+    // Stores the same source rows into a body destination and an exact shadow
+    // destination in one backend operation. The result aliases shadow.
+    GGML_API struct ggml_tensor * ggml_set_rows_with_shadow(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * body,
+            struct ggml_tensor  * source,
+            struct ggml_tensor  * body_indices,
+            struct ggml_tensor  * shadow,
+            struct ggml_tensor  * shadow_indices);
 
     GGML_API struct ggml_tensor * ggml_diag(
         struct ggml_context     * ctx,
@@ -2456,6 +2472,27 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
+
+    // Attach per-sequence exact-KV arenas to an existing body FlashAttention
+    // operation. query_order packs caller queries in sequence-major order and
+    // run_desc records { arena, packed start, query count, consecutive run }.
+    // Backends compute both partials privately and publish one normalized dst.
+    GGML_API void ggml_flash_attn_ext_add_kv_tail(
+            struct ggml_tensor * a,
+            struct ggml_tensor * k_tail,
+            struct ggml_tensor * v_tail,
+            struct ggml_tensor * mask_tail,
+            struct ggml_tensor * query_order,
+            struct ggml_tensor * run_desc);
+
+    GGML_API struct ggml_tensor * ggml_kv_tail_attention_merge(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * body_attn,
+            struct ggml_tensor  * k_tail,
+            struct ggml_tensor  * v_tail,
+            struct ggml_tensor  * mask_tail,
+            struct ggml_tensor  * query_order,
+            struct ggml_tensor  * run_desc);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

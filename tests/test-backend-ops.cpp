@@ -2466,6 +2466,56 @@ struct test_set_rows : public test_case {
     }
 };
 
+// GGML_OP_SET_ROWS with a quantized body destination and an exact shadow.
+struct test_set_rows_with_shadow : public test_case {
+    const ggml_type body_type;
+    const ggml_type shadow_type;
+
+    test_set_rows_with_shadow(ggml_type body_type, ggml_type shadow_type)
+        : body_type(body_type), shadow_type(shadow_type) {}
+
+    std::string vars() override {
+        return std::string(ggml_type_name(body_type)) + "_body," +
+            ggml_type_name(shadow_type) + "_shadow,levels=2";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        constexpr int64_t n_embd = 256;
+        constexpr int64_t n_rows = 11;
+        constexpr int64_t n_write = 3;
+
+        ggml_tensor * body = ggml_new_tensor_2d(ctx, body_type, n_embd, n_rows);
+        ggml_set_name(body, "body");
+        ggml_tensor * source = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_write);
+        ggml_set_name(source, "source");
+        ggml_tensor * body_indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_write);
+        ggml_set_name(body_indices, "body_indices");
+        ggml_tensor * shadow = ggml_new_tensor_2d(ctx, shadow_type, n_embd, n_rows);
+        ggml_set_name(shadow, "shadow");
+        ggml_tensor * shadow_indices = ggml_new_tensor_2d(ctx, GGML_TYPE_I64, n_write, 2);
+        ggml_set_name(shadow_indices, "shadow_indices");
+
+        ggml_tensor * out = ggml_set_rows_with_shadow(
+                ctx, body, source, body_indices, shadow, shadow_indices);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I64) {
+                init_set_rows_row_ids(t, 11);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    double max_nmse_err() override {
+        return 1e-7;
+    }
+};
+
 // GGML_OP_ROPE + GGML_OP_VIEW + GGML_OP_SET_ROWS
 struct test_rope_set_rows : public test_case {
     const ggml_type type;
@@ -6627,9 +6677,21 @@ struct test_flash_attn_ext : public test_case {
     const ggml_type type_K;
     const ggml_type type_V;
     std::array<int32_t, 4> permute;
+    const int64_t n_tail;
+    const bool tail_only;
+    const ggml_type type_tail_k;
+    const ggml_type type_tail_v;
+    const bool tail_interleaved;
+    const bool tail_all_masked;
+    const bool canonical_body;
 
     std::string vars() override {
-        return VARS_TO_STR14(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute);
+        return VARS_TO_STR14(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute) +
+            " n_tail=" + std::to_string(n_tail) + " tail_only=" + std::to_string(int(tail_only)) +
+            " type_tail_k=" + ggml_type_name(type_tail_k) + " type_tail_v=" + ggml_type_name(type_tail_v) +
+            " tail_interleaved=" + std::to_string(int(tail_interleaved)) +
+            " tail_all_masked=" + std::to_string(int(tail_all_masked)) +
+            " canonical_body=" + std::to_string(int(canonical_body));
     }
 
     double max_nmse_err() override {
@@ -6645,9 +6707,14 @@ struct test_flash_attn_ext : public test_case {
 
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
-                        ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3})
+                        ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
+                        int64_t n_tail = 0, bool tail_only = false, ggml_type type_tail_k = GGML_TYPE_F16,
+                        ggml_type type_tail_v = GGML_TYPE_COUNT, bool tail_interleaved = false,
+                        bool tail_all_masked = false, bool canonical_body = false)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute) {}
+          type_K(type_K), type_V(type_V), permute(permute), n_tail(n_tail), tail_only(tail_only), type_tail_k(type_tail_k),
+          type_tail_v(type_tail_v == GGML_TYPE_COUNT ? type_tail_k : type_tail_v), tail_interleaved(tail_interleaved),
+          tail_all_masked(tail_all_masked), canonical_body(canonical_body) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -6706,6 +6773,30 @@ struct test_flash_attn_ext : public test_case {
         }
 
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
+        if (n_tail > 0) {
+            GGML_ASSERT(!tail_interleaved || (nr23[1] == 1 && nb == 4));
+            const int64_t arena_stride = GGML_PAD(n_tail + nb, 256);
+            const int64_t attention_stride = n_tail;
+            const int64_t n_active = tail_interleaved ? 2 : nr23[1];
+            const int64_t q_max = tail_interleaved ? 2 : nb;
+            const int64_t n_arenas = tail_interleaved ? 3 : nr23[1];
+            const int64_t n_tail_slots = arena_stride*n_arenas;
+            ggml_tensor * kt_storage = ggml_new_tensor_4d(ctx, type_tail_k, hsk_padded, nh, n_tail_slots, 1);
+            ggml_tensor * vt_storage = ggml_new_tensor_4d(ctx, type_tail_v, hsv_padded, nh, n_tail_slots, 1);
+            ggml_tensor * kt = ggml_permute(ctx, kt_storage, 0, 2, 1, 3);
+            ggml_tensor * vt = ggml_permute(ctx, vt_storage, 0, 2, 1, 3);
+            ggml_tensor * mt = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, attention_stride, nb, 1, nr23[1]);
+            ggml_tensor * qo = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, q_max, n_active);
+            ggml_tensor * rd = ggml_new_tensor_2d(
+                    ctx, GGML_TYPE_I32,
+                    6 + attention_stride + (canonical_body ? arena_stride : 0), n_active);
+            ggml_set_name(kt, "kt");
+            ggml_set_name(vt, "vt");
+            ggml_set_name(mt, "mt");
+            ggml_set_name(qo, "qo");
+            ggml_set_name(rd, "rd");
+            out = ggml_kv_tail_attention_merge(ctx, out, kt, vt, mt, qo, rd);
+        }
         ggml_flash_attn_ext_add_sinks(out, s);
         ggml_flash_attn_ext_set_prec (out, prec);
         ggml_set_name(out, "out");
@@ -6719,7 +6810,58 @@ struct test_flash_attn_ext : public test_case {
                 // make the sink values more noticeable in order to trigger a test failure when the implementation is wrong
                 init_tensor_uniform(t, -10.0f, 10.0f);
             } else if (strcmp(t->name, "m") == 0) {
-                init_tensor_kq_mask(t);
+                if (tail_only) {
+                    std::vector<ggml_fp16_t> values(ggml_nelements(t), ggml_fp32_to_fp16(-INFINITY));
+                    ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(values[0]));
+                } else {
+                    init_tensor_kq_mask(t);
+                }
+            } else if (strcmp(t->name, "mt") == 0) {
+                std::vector<ggml_fp16_t> values(ggml_nelements(t));
+                for (int64_t is = 0; is < t->ne[3]; ++is) {
+                    for (int64_t iq = 0; iq < t->ne[1]; ++iq) {
+                        for (int64_t token = 0; token < t->ne[0]; ++token) {
+                            values[(is*t->ne[1] + iq)*t->ne[0] + token] = ggml_fp32_to_fp16(
+                                !tail_all_masked && token < n_tail && token <= iq ? 0.0f : -INFINITY);
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(values[0]));
+            } else if (strcmp(t->name, "qo") == 0) {
+                std::vector<int32_t> values(ggml_nelements(t));
+                if (tail_interleaved) {
+                    values = { 0, 2, 1, 3 };
+                } else {
+                    for (int64_t is = 0; is < t->ne[1]; ++is) {
+                        for (int64_t query = 0; query < t->ne[0]; ++query) {
+                            values[is*t->ne[0] + query] = int32_t(is*nb + query);
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(values[0]));
+            } else if (strcmp(t->name, "rd") == 0) {
+                std::vector<int32_t> values(ggml_nelements(t), -1);
+                for (int64_t is = 0; is < t->ne[1]; ++is) {
+                    int32_t * desc = values.data() + t->ne[0]*is;
+                    desc[0] = int32_t(tail_interleaved ? 2*is : is);
+                    desc[1] = int32_t(is*(tail_interleaved ? 2 : nb));
+                    desc[2] = int32_t(tail_interleaved ? 2 : nb);
+                    desc[3] = int32_t(tail_interleaved ? 1 : t->ne[1] - is);
+                    desc[4] = int32_t(n_tail);
+                    desc[5] = canonical_body ? int32_t(kv) : -1;
+                    const int64_t attention_stride = n_tail;
+                    const int64_t arena_stride = GGML_PAD(n_tail + nb, 256);
+                    const int64_t physical_arena = tail_interleaved ? 2*is : is;
+                    for (int64_t token = 0; token < n_tail; ++token) {
+                        desc[6 + token] = int32_t(physical_arena*arena_stride + token);
+                    }
+                    if (canonical_body) {
+                        for (int64_t token = 0; token < kv; ++token) {
+                            desc[6 + attention_stride + token] = int32_t(is*kv + token);
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(values[0]));
             } else {
                 init_tensor_uniform(t);
             }
@@ -7898,6 +8040,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, true));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, true));
+    for (ggml_type body_type : {
+            GGML_TYPE_Q8_0,
+            GGML_TYPE_Q6_0, GGML_TYPE_Q6_1,
+            GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
+            GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_IQ4_NL,
+            GGML_TYPE_Q3_0, GGML_TYPE_Q3_1,
+            GGML_TYPE_Q2_0S, GGML_TYPE_Q2_1 }) {
+        for (ggml_type shadow_type : { GGML_TYPE_F16, GGML_TYPE_BF16 }) {
+            test_cases.emplace_back(new test_set_rows_with_shadow(body_type, shadow_type));
+        }
+    }
 
     for (int mode : { GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX, GGML_ROPE_TYPE_MROPE, GGML_ROPE_TYPE_VISION }) {
         for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
@@ -8807,6 +8960,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Standard quantized KV values use OUT_PROD in tiered body/tail attention.
+    // Keep this inventory aligned with the cache CLI, including Bee low-bit types.
+    for (ggml_type type_a : {
+            GGML_TYPE_Q8_0,
+            GGML_TYPE_Q6_0, GGML_TYPE_Q6_1,
+            GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
+            GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_IQ4_NL,
+            GGML_TYPE_Q3_0, GGML_TYPE_Q3_1,
+            GGML_TYPE_Q2_0S, GGML_TYPE_Q2_1 }) {
+        test_cases.emplace_back(new test_out_prod(type_a, GGML_TYPE_F32, 128, 1, 64, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_out_prod(type_a, GGML_TYPE_F32, 128, 16, 64, {2, 1}, {2, 1}));
+    }
+
     // ne2 sweep to cover the cublasSgemmStridedBatched path (dps2 == 1, ne2 > 1)
     for (int64_t ne2 : {1, 8, 16, 32}) {
         test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32,
@@ -9021,6 +9187,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // Standard-cache exact BF16 tails are rotated in place during KV shifts.
+    // Keep focused forward/backward coverage here because test-rope is not
+    // available in GGML_BACKEND_DL builds.
+    test_cases.emplace_back(new test_rope(
+        GGML_TYPE_BF16, {128, 4, 3, 1}, 128, GGML_ROPE_TYPE_NORMAL,
+        512, 1.0f, 0.0f, 1.0f, false, 0, true, true));
+    test_cases.emplace_back(new test_rope(
+        GGML_TYPE_BF16, {128, 4, 3, 1}, 128, GGML_ROPE_TYPE_NORMAL,
+        512, 1.0f, 0.0f, 1.0f, false, 0, false, false));
 
     for (int v : { 0, 1, 2, 3 }) {
         for (int dim : { 0, 1, 2, 3, }) {
@@ -9291,6 +9467,74 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q1_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_F16));
+    // Query-specific exact tails: isolate the tail partial, then exercise the
+    // FP32 global-softmax merge with a quantized body partial.
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 2, {2, 1}, 256, 2, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 4, true, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 2, {2, 1}, 256, 2, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 4, false, GGML_TYPE_BF16));
+    // Qwen3.6 geometry: 24 query heads over 4 KV heads with 256-wide K/V.
+    // Cover both the smallest tail and a full query-specific prefill tail.
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 256, 2, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 1, false, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 256, 2, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 128, true, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 256, 2, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 128, false, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 256, 64, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 64, false, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 256, 512, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 1, false, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 256, 64, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_NL, {0, 1, 2, 3}, 64, false, GGML_TYPE_BF16));
+    // Long quantized body forces the MMA stream-K completion/fixup route to
+    // publish its final max and denominator before the exact-tail merge.
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, 2, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 64, false, GGML_TYPE_F16));
+    // Exact-tail composite contract: every ordered F16/BF16 K/V pair.
+    for (const auto tail_types : {
+            std::pair{ GGML_TYPE_F16,  GGML_TYPE_F16  },
+            std::pair{ GGML_TYPE_BF16, GGML_TYPE_BF16 },
+            std::pair{ GGML_TYPE_F16,  GGML_TYPE_BF16 },
+            std::pair{ GGML_TYPE_BF16, GGML_TYPE_F16  } }) {
+        test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {2, 1}, 256, 4, true, false, 0, 0,
+            GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 32, false,
+            tail_types.first, tail_types.second));
+    }
+    // One-sided body storage uses an aligned same-type shadow for the exact side.
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {2, 1}, 256, 4, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_F16, {0, 1, 2, 3}, 32, false,
+        GGML_TYPE_BF16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {2, 1}, 256, 4, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 32, false,
+        GGML_TYPE_F16, GGML_TYPE_BF16));
+    // Merge modifiers and sanitization.
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {2, 1}, 256, 1, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 16, false, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {2, 1}, 256, 4, true, true, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 16, false, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {2, 1}, 256, 4, true, false, 8.0f, 0,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 16, false, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {2, 1}, 256, 4, true, false, 0, 10.0f,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 16, false, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {2, 1}, 256, 4, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 16, false,
+        GGML_TYPE_BF16, GGML_TYPE_BF16, false, true));
+    // Batched arena packing and a unified caller order {seq0,seq2,seq0,seq2}.
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {2, 3}, 256, 2, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 16, false, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {2, 1}, 256, 4, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 16, false,
+        GGML_TYPE_BF16, GGML_TYPE_F16, true));
+    // A sparse quantized body is packed in logical sequence order before the
+    // two-FA merge so unified and split physical cache layouts use one route.
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {2, 2}, 128, 4, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 16, false,
+        GGML_TYPE_BF16, GGML_TYPE_F16, false, false, true));
+    for (int hs : { 80, 96, 112 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {2, 1}, 256, 2, true, false, 0, 0,
+            GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 16, false, GGML_TYPE_BF16));
+    }
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));

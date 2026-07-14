@@ -1,11 +1,11 @@
 #include "common.cuh"
+#include "fattn.cuh"
 #include "fattn-common.cuh"
 #include "fattn-kvarn-dispatch.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn-wmma-f16.cuh"
-#include "fattn.cuh"
 
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -303,6 +303,27 @@ bool ggml_cuda_fa_pair_compiled(ggml_type type_K, ggml_type type_V) {
     return ggml_cuda_fattn_pair_compiled(type_K, type_V);
 }
 
+bool ggml_cuda_flash_attn_ext_tail_supported(
+        ggml_type body_k, ggml_type body_v, ggml_type tail_k, ggml_type tail_v, int64_t d_k, int64_t d_v) {
+#if defined(GGML_USE_HIP)
+    GGML_UNUSED(body_k);
+    GGML_UNUSED(body_v);
+    GGML_UNUSED(tail_k);
+    GGML_UNUSED(tail_v);
+    GGML_UNUSED(d_k);
+    GGML_UNUSED(d_v);
+    return false;
+#else
+    const bool body_supported = ggml_cuda_fattn_pair_compiled(body_k, body_v) ||
+        (body_k == GGML_TYPE_IQ4_NL && body_v == GGML_TYPE_IQ4_NL);
+    return body_supported &&
+        (tail_k == GGML_TYPE_F16 || tail_k == GGML_TYPE_BF16) &&
+        (tail_v == GGML_TYPE_F16 || tail_v == GGML_TYPE_BF16) &&
+        ggml_cuda_fattn_pair_compiled(tail_k, tail_v) &&
+        d_k > 0 && d_k <= 512 && d_v > 0 && d_v <= 512;
+#endif
+}
+
 static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_tensor * Q = dst->src[0];
     ggml_tensor * K = dst->src[1];
@@ -323,7 +344,7 @@ enum best_fattn_kernel {
 };
 
 static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
-    return ggml_cuda_fattn_kv_rank(type) >= 0;
+    return ggml_cuda_fattn_kv_rank(type) >= 0 || type == GGML_TYPE_IQ4_NL;
 }
 
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
@@ -468,6 +489,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // Use the WMMA kernel if possible:
     if (ggml_cuda_should_use_wmma_fattn(cc) && K->ne[1] % FATTN_KQ_STRIDE == 0 && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[0] != 192 && Q->ne[0] != 512 && Q->ne[0] != 576) {
+        if (KQV->src[5] != nullptr) {
+            return can_use_vector_kernel ? BEST_FATTN_KERNEL_VEC : BEST_FATTN_KERNEL_NONE;
+        }
         if (can_use_vector_kernel && Q->ne[1] <= 2) {
             return BEST_FATTN_KERNEL_VEC;
         }
@@ -554,16 +578,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
-void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    ggml_cuda_set_device(ctx.device);
-
-    if (ggml_cuda_flash_attn_ext_kvarn_uses_views(dst)) {
-        if (!ggml_cuda_flash_attn_ext_kvarn(ctx, dst)) {
-            GGML_ABORT("unsupported KVarN CUDA FlashAttention route");
-        }
-        return;
-    }
-
+static void ggml_cuda_flash_attn_ext_dispatch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
@@ -582,10 +597,86 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     }
 }
 
+#include "fattn-tail.cuh"
+
+static bool ggml_cuda_flash_attn_ext_tail_pass_supported(int device, const ggml_tensor * dst) {
+    const ggml_tensor * qo = dst->src[8];
+    const ggml_tensor * rd = dst->src[9];
+    const int64_t tail_stride = dst->src[7]->ne[0];
+    const int64_t body_map_offset = 6 + tail_stride;
+    if (!qo || !rd || qo->ne[0] <= 0 || qo->ne[1] <= 0 ||
+            rd->ne[0] < body_map_offset || rd->ne[1] != qo->ne[1]) {
+        return false;
+    }
+    ggml_tensor q = *dst->src[0];
+    ggml_cuda_tail_make_contiguous(q, q.ne[0], qo->ne[0], q.ne[2], qo->ne[1], sizeof(float));
+    ggml_tensor k = *dst->src[5];
+    ggml_cuda_tail_make_contiguous(k, k.ne[0], dst->src[7]->ne[0], k.ne[2], qo->ne[1], ggml_type_size(k.type));
+    ggml_tensor v = *dst->src[6];
+    ggml_cuda_tail_make_contiguous(v, v.ne[0], dst->src[7]->ne[0], v.ne[2], qo->ne[1], ggml_type_size(v.type));
+    ggml_tensor mask = *dst->src[7];
+    ggml_cuda_tail_make_contiguous(mask, mask.ne[0], qo->ne[0], 1, qo->ne[1], sizeof(half));
+    ggml_tensor pass = *dst;
+    pass.src[0] = &q;
+    pass.src[1] = &k;
+    pass.src[2] = &v;
+    pass.src[3] = &mask;
+    pass.src[4] = nullptr;
+    for (int i = 5; i < GGML_MAX_SRC; ++i) {
+        pass.src[i] = nullptr;
+    }
+    ggml_cuda_tail_make_contiguous(pass, pass.ne[0], pass.ne[1], qo->ne[0], qo->ne[1], sizeof(float));
+    if (ggml_cuda_get_best_fattn_kernel(device, &pass) == BEST_FATTN_KERNEL_NONE) {
+        return false;
+    }
+    if (rd->ne[0] > body_map_offset) {
+        const int64_t body_stride = rd->ne[0] - body_map_offset;
+        ggml_tensor kb = *dst->src[1];
+        ggml_cuda_tail_make_contiguous_type(kb, kb.ne[0], body_stride, kb.ne[2], qo->ne[1]);
+        ggml_tensor vb = *dst->src[2];
+        ggml_cuda_tail_make_contiguous_type(vb, vb.ne[0], body_stride, vb.ne[2], qo->ne[1]);
+        ggml_tensor mb = *dst->src[3];
+        ggml_cuda_tail_make_contiguous(mb, body_stride, qo->ne[0], 1, qo->ne[1], sizeof(half));
+        ggml_tensor body = pass;
+        body.src[1] = &kb;
+        body.src[2] = &vb;
+        body.src[3] = &mb;
+        body.src[4] = dst->src[4];
+        return ggml_cuda_get_best_fattn_kernel(device, &body) != BEST_FATTN_KERNEL_NONE;
+    }
+    return true;
+}
+
+void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_set_device(ctx.device);
+
+    if (ggml_cuda_flash_attn_ext_kvarn_uses_views(dst)) {
+        if (!ggml_cuda_flash_attn_ext_kvarn(ctx, dst)) {
+            GGML_ABORT("unsupported KVarN CUDA FlashAttention route");
+        }
+        return;
+    }
+
+    if (dst->src[5] != nullptr) {
+        ggml_cuda_flash_attn_ext_tail(ctx, dst);
+    } else {
+        ggml_cuda_flash_attn_ext_dispatch(ctx, dst);
+    }
+}
+
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     if (ggml_cuda_flash_attn_ext_kvarn_uses_views(dst)) {
         return ggml_cuda_flash_attn_ext_kvarn_supported(device, dst);
     }
 
+    if (dst->src[5] != nullptr) {
+        if (dst->src[6] == nullptr || dst->src[7] == nullptr || dst->src[8] == nullptr || dst->src[9] == nullptr ||
+                !ggml_cuda_flash_attn_ext_tail_supported(
+                    dst->src[1]->type, dst->src[2]->type, dst->src[5]->type, dst->src[6]->type,
+                    dst->src[0]->ne[0], dst->ne[0]) ||
+                !ggml_cuda_flash_attn_ext_tail_pass_supported(device, dst)) {
+            return false;
+        }
+    }
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }

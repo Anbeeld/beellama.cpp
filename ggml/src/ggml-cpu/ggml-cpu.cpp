@@ -494,7 +494,8 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             return (
                 (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) ||
                 (src0->type == GGML_TYPE_F16 && (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16)) ||
-                (ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 && src0->ne[2] == src1->ne[2] && src0->ne[3] == src1->ne[3])
+                (ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 &&
+                    src1->ne[2] % src0->ne[2] == 0 && src1->ne[3] % src0->ne[3] == 0)
             ) && op->type == GGML_TYPE_F32;
         default:
             return true;

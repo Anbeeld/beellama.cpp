@@ -9,6 +9,28 @@
 #include <cstdio>
 #include <cstdlib>
 
+#if !defined(GGML_CUDA_KVARN_FA)
+
+bool ggml_cuda_flash_attn_ext_kvarn_uses_views(const ggml_tensor * dst) {
+    return ggml_cuda_fattn_kvarn_uses_views(dst);
+}
+
+bool ggml_cuda_flash_attn_ext_kvarn_supported(int device, const ggml_tensor * dst) {
+    GGML_UNUSED(device);
+    GGML_UNUSED(dst);
+    return false;
+}
+
+bool ggml_cuda_flash_attn_ext_kvarn(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * dst) {
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(dst);
+    return false;
+}
+
+#else
+
 static __device__ __forceinline__ int ggml_cuda_fattn_kvarn_live_group_for_thread(
         const int64_t * indices,
         const int n_indices,
@@ -178,7 +200,7 @@ void ggml_cuda_fattn_kvarn_init_descs(
 }
 
 static inline bool ggml_cuda_fattn_kvarn_fast_decode_pair_enabled(int k_bits, int v_bits) {
-#if defined(GGML_CUDA_FA_ALL_QUANTS)
+#if defined(GGML_CUDA_FA_ALL_QUANTS) && defined(GGML_CUDA_KVARN_FAST_DECODE_ALL_PAIRS)
     return ggml_cuda_fattn_kvarn_valid_bits(k_bits) && ggml_cuda_fattn_kvarn_valid_bits(v_bits);
 #else
     switch (k_bits) {
@@ -194,7 +216,7 @@ static inline bool ggml_cuda_fattn_kvarn_fast_decode_pair_enabled(int k_bits, in
 }
 
 // Keep template references in sync with the decoder sources selected by CMake.
-#if defined(GGML_CUDA_FA_ALL_QUANTS)
+#if defined(GGML_CUDA_FA_ALL_QUANTS) && defined(GGML_CUDA_KVARN_FAST_DECODE_ALL_PAIRS)
 #define GGML_CUDA_FATTN_KVARN_FAST_DECODE_DISPATCH_K(DISPATCH_PAIR) \
     do { \
         switch (plan.k.bits) { \
@@ -645,3 +667,5 @@ bool ggml_cuda_flash_attn_ext_kvarn(
     ggml_cuda_flash_attn_ext_mma_kvarn(ctx, dst);
     return true;
 }
+
+#endif // GGML_CUDA_KVARN_FA

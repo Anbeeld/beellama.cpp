@@ -3926,16 +3926,21 @@ struct ggml_tensor * ggml_get_rows(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
         struct ggml_tensor  * b) {
+    enum ggml_type type = a->type == GGML_TYPE_I32 ? GGML_TYPE_I32 : GGML_TYPE_F32;
+    return ggml_get_rows_as(ctx, a, b, type);
+}
+
+struct ggml_tensor * ggml_get_rows_as(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        enum ggml_type        type) {
     GGML_ASSERT(a->ne[2] == b->ne[1]);
     GGML_ASSERT(a->ne[3] == b->ne[2]);
     GGML_ASSERT(b->ne[3] == 1);
     GGML_ASSERT(b->type == GGML_TYPE_I32);
 
-    // TODO: implement non F32 return
-    enum ggml_type type = GGML_TYPE_F32;
-    if (a->type == GGML_TYPE_I32) {
-        type = a->type;
-    }
+    GGML_ASSERT(type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16 || type == GGML_TYPE_I32);
     struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, a->ne[0], b->ne[0], b->ne[1], b->ne[2]);
 
     result->op     = GGML_OP_GET_ROWS;
@@ -3993,6 +3998,32 @@ struct ggml_tensor * ggml_set_rows(
     result->src[1] = c;
     result->src[2] = a; // note: order is weird due to legacy reasons (https://github.com/ggml-org/llama.cpp/pull/16063#discussion_r2385795931)
 
+    return result;
+}
+
+struct ggml_tensor * ggml_set_rows_with_shadow(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * body,
+        struct ggml_tensor  * source,
+        struct ggml_tensor  * body_indices,
+        struct ggml_tensor  * shadow,
+        struct ggml_tensor  * shadow_indices) {
+    GGML_ASSERT(body->ne[0] == source->ne[0] && shadow->ne[0] == source->ne[0]);
+    GGML_ASSERT(source->ne[1] == body_indices->ne[0] && source->ne[1] == shadow_indices->ne[0]);
+    GGML_ASSERT(source->type == GGML_TYPE_F32);
+    GGML_ASSERT(body_indices->type == GGML_TYPE_I64 && shadow_indices->type == GGML_TYPE_I64);
+    GGML_ASSERT(ggml_is_quantized(body->type));
+    GGML_ASSERT(shadow->type == GGML_TYPE_F16 || shadow->type == GGML_TYPE_BF16);
+    GGML_ASSERT(ggml_is_contiguous_rows(body) && ggml_is_contiguous_rows(source) &&
+            ggml_is_contiguous_rows(shadow));
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, shadow);
+    result->op = GGML_OP_SET_ROWS;
+    result->src[0] = source;
+    result->src[1] = body_indices;
+    result->src[2] = body;
+    result->src[3] = shadow;
+    result->src[4] = shadow_indices;
     return result;
 }
 
@@ -5537,6 +5568,44 @@ void ggml_flash_attn_ext_add_sinks(
     GGML_ASSERT(sinks->type == GGML_TYPE_F32);
 
     a->src[4] = sinks;
+}
+
+void ggml_flash_attn_ext_add_kv_tail(
+        struct ggml_tensor * a,
+        struct ggml_tensor * k_tail,
+        struct ggml_tensor * v_tail,
+        struct ggml_tensor * mask_tail,
+        struct ggml_tensor * query_order,
+        struct ggml_tensor * run_desc) {
+    GGML_ASSERT(a != NULL && a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(k_tail != NULL && v_tail != NULL && mask_tail != NULL && query_order != NULL && run_desc != NULL);
+    GGML_ASSERT(a->src[5] == NULL && a->src[6] == NULL && a->src[7] == NULL && a->src[8] == NULL && a->src[9] == NULL);
+    GGML_ASSERT((k_tail->type == GGML_TYPE_F32 || k_tail->type == GGML_TYPE_F16 || k_tail->type == GGML_TYPE_BF16) &&
+                (v_tail->type == GGML_TYPE_F32 || v_tail->type == GGML_TYPE_F16 || v_tail->type == GGML_TYPE_BF16));
+    GGML_ASSERT(mask_tail->type == GGML_TYPE_F16);
+    GGML_ASSERT(query_order->type == GGML_TYPE_I32 && query_order->ne[1] == run_desc->ne[1]);
+    GGML_ASSERT(run_desc->type == GGML_TYPE_I32 &&
+            run_desc->ne[0] >= 6 + mask_tail->ne[0] && run_desc->ne[1] > 0);
+
+    a->src[5] = k_tail;
+    a->src[6] = v_tail;
+    a->src[7] = mask_tail;
+    a->src[8] = query_order;
+    a->src[9] = run_desc;
+}
+
+struct ggml_tensor * ggml_kv_tail_attention_merge(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * body_attn,
+        struct ggml_tensor  * k_tail,
+        struct ggml_tensor  * v_tail,
+        struct ggml_tensor  * mask_tail,
+        struct ggml_tensor  * query_order,
+        struct ggml_tensor  * run_desc) {
+    GGML_UNUSED(ctx);
+    GGML_ASSERT(body_attn != NULL && body_attn->op == GGML_OP_FLASH_ATTN_EXT);
+    ggml_flash_attn_ext_add_kv_tail(body_attn, k_tail, v_tail, mask_tail, query_order, run_desc);
+    return body_attn;
 }
 
 // ggml_flash_attn_back

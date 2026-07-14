@@ -108,6 +108,10 @@ if (CUDAToolkit_FOUND)
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")
     ggml_cuda_select_kvarn_fast_decode_sources(SRCS "template-instances" ${SRCS})
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
+    if (GGML_CUDA_KVARN_FA)
+        set_property(SOURCE fattn-kvarn-dispatch.cu APPEND PROPERTY
+                     COMPILE_DEFINITIONS GGML_CUDA_KVARN_FA)
+    endif()
     file(GLOB   SRCS "template-instances/mmq*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/mmf*.cu")
@@ -135,6 +139,10 @@ if (CUDAToolkit_FOUND)
             list(GET PARTS 1 V_TYPE)
             ggml_add_fattn_vec_pair(GGML_SOURCES_CUDA "${FA_VEC_PREFIX}" "${K_TYPE}" "${V_TYPE}")
         endforeach()
+    endif()
+
+    if (GGML_CUDA_KVARN_FA AND GGML_CUDA_KVARN_FAST_DECODE_ALL_PAIRS)
+        add_compile_definitions(GGML_CUDA_KVARN_FAST_DECODE_ALL_PAIRS)
     endif()
 
     ggml_add_backend_library(ggml-cuda
