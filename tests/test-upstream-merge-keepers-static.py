@@ -88,9 +88,11 @@ def main() -> None:
     kvarn_cache = (ROOT / "src/llama-kv-cache-kvarn.h").read_text(encoding="utf-8")
     require(
         kvarn_cache,
-        "uint64_t(n_batch) + n_ubatch",
-        "non-SWA KVarN staging must cover the logical scheduler batch plus one physical ubatch",
+        "return 1;",
+        "non-SWA KVarN staging must retain exactly one incomplete reference group",
     )
+    if "kv_size >= 65536" in kvarn_cache:
+        raise AssertionError("non-SWA KVarN staging must not use a context-capacity precision heuristic")
 
     ggml_cmake = (ROOT / "ggml/CMakeLists.txt").read_text(encoding="utf-8")
     cuda_cmake = (ROOT / "ggml/src/ggml-cuda/CMakeLists.txt").read_text(encoding="utf-8")

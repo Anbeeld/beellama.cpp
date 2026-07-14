@@ -24,7 +24,10 @@ llama_kv_cache_dsa::llama_kv_cache_dsa(
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
     const layer_filter_cb & filter,
-    const  layer_reuse_cb & reuse) :
+    const  layer_reuse_cb & reuse,
+                 uint32_t   n_ubatch,
+                 uint32_t   tail_tokens,
+                ggml_type   tail_type) :
     hparams_lid(model.hparams), n_stream(unified ? 1 : n_seq_max) {
 
     LLAMA_LOG_INFO("%s: creating main KV cache, size = %u cells\n", __func__, kv_size);
@@ -32,7 +35,8 @@ llama_kv_cache_dsa::llama_kv_cache_dsa(
     kv_mla = std::make_unique<llama_kv_cache>(
             model, model.hparams, type_k, type_v,
             v_trans, offload, unified, kv_size, n_seq_max, n_pad,
-            n_swa, swa_type, nullptr, filter, reuse, nullptr);
+            n_swa, swa_type, nullptr, filter, reuse, nullptr,
+            n_ubatch, tail_tokens, tail_type);
 
     // we use llama_kv_cache for caching indexer keys
     // by hand-tweaking some hparams we fool it to create
@@ -120,6 +124,23 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_dsa::memory_breakdow
         mb[buft_size.first] += buft_size.second;
     }
     return mb;
+}
+
+uint32_t llama_kv_cache_dsa::get_kv_tail_group_count() const {
+    return kv_mla->get_kv_tail_group_count();
+}
+
+bool llama_kv_cache_dsa::get_kv_tail_coverage(
+        uint32_t group_index, llama_seq_id seq_id, llama_kv_tail_coverage_info & out) const {
+    return kv_mla->get_kv_tail_coverage(group_index, seq_id, out);
+}
+
+void llama_kv_cache_dsa::reset_kv_tail_planner_timing() {
+    kv_mla->reset_kv_tail_planner_timing();
+}
+
+uint64_t llama_kv_cache_dsa::get_kv_tail_planner_timing_ns() const {
+    return kv_mla->get_kv_tail_planner_timing_ns();
 }
 
 bool llama_kv_cache_dsa::requires_state_for_partial_restore() const {

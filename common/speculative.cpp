@@ -2241,6 +2241,8 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
+    result.kv_tail_tokens = "0";
+    result.kv_tail_type   = GGML_TYPE_F16;
     result.n_outputs_max = params.n_parallel;
 
     return result;
@@ -2277,6 +2279,8 @@ common_speculative_init_result::common_speculative_init_result(
     //       the extra memory for small models is likely negligible?
     cparams.n_rs_seq  = 0;
     cparams.ctx_other = ctx_tgt;
+    cparams.kv_tail_tokens = 0;
+    cparams.kv_tail_type   = GGML_TYPE_F16;
 
     std::string model_path;
     if (has_draft) {

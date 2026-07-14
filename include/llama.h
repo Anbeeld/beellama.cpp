@@ -375,6 +375,45 @@ extern "C" {
         struct llama_sampler * sampler;
     };
 
+    typedef struct llama_kv_tail_config llama_kv_tail_config;
+
+    struct llama_kv_tail_group_info {
+        const char * id;
+        const char * role;
+        uint32_t lowest_layer;
+        uint32_t n_layers;
+        uint32_t effective_window;
+    };
+
+    enum llama_kv_tail_coverage_state {
+        LLAMA_KV_TAIL_COVERAGE_NONE,
+        LLAMA_KV_TAIL_COVERAGE_PARTIAL,
+        LLAMA_KV_TAIL_COVERAGE_COMPLETE,
+    };
+
+    enum llama_kv_tail_degradation_flags {
+        LLAMA_KV_TAIL_DEGRADED_NONE            = 0,
+        LLAMA_KV_TAIL_DEGRADED_BODY_ONLY_STATE = 1 << 0,
+        LLAMA_KV_TAIL_DEGRADED_HISTORICAL_OP   = 1 << 1,
+    };
+
+    struct llama_kv_tail_coverage_info {
+        enum llama_kv_tail_coverage_state state;
+        uint32_t requested;
+        uint32_t exact;
+        uint32_t degradation_flags;
+    };
+
+    struct llama_kv_tail_coverage_aggregate {
+        uint32_t groups;
+        uint32_t complete_groups;
+        uint32_t partial_groups;
+        uint32_t none_groups;
+        uint64_t requested;
+        uint64_t exact;
+        uint32_t degradation_flags;
+    };
+
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations
     //       https://github.com/ggml-org/llama.cpp/pull/7544
     struct llama_context_params {
@@ -437,6 +476,12 @@ extern "C" {
         // a source/target/parent context
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
+
+        // Optional high-precision shadow for recent entries in standard quantized KV caches.
+        // A value of 0 preserves the ordinary cache path. Only F16 and BF16 are valid tail types.
+        uint32_t       kv_tail_tokens;
+        enum ggml_type kv_tail_type;
+        const struct llama_kv_tail_config * kv_tail_config; // borrowed only during context creation
     };
 
     struct llama_model_tensor_override {
@@ -490,6 +535,36 @@ extern "C" {
     // TODO: update API to start accepting pointers to params structs (https://github.com/ggml-org/llama.cpp/discussions/9172)
     LLAMA_API struct llama_model_params          llama_model_default_params(void);
     LLAMA_API struct llama_context_params        llama_context_default_params(void);
+    LLAMA_API struct llama_kv_tail_config * llama_kv_tail_config_init(const struct llama_model * model);
+    LLAMA_API void llama_kv_tail_config_free(struct llama_kv_tail_config * config);
+    LLAMA_API int32_t llama_kv_tail_config_group_count(const struct llama_kv_tail_config * config);
+    LLAMA_API bool llama_kv_tail_config_get_group_info(
+            const struct llama_kv_tail_config * config,
+            int32_t group_index,
+            struct llama_kv_tail_group_info * out);
+    LLAMA_API int32_t llama_kv_tail_config_group_layer(
+            const struct llama_kv_tail_config * config,
+            int32_t group_index,
+            int32_t layer_index);
+    LLAMA_API bool llama_kv_tail_config_set_auto(struct llama_kv_tail_config * config);
+    LLAMA_API bool llama_kv_tail_config_set_group(
+            struct llama_kv_tail_config * config,
+            const char * group_id,
+            uint32_t n_tokens);
+    LLAMA_API const char * llama_kv_tail_config_last_error(const struct llama_kv_tail_config * config);
+    LLAMA_API bool llama_kv_tail_get_coverage(
+            const struct llama_context * ctx,
+                         llama_seq_id   seq_id,
+                              uint32_t   group_index,
+            struct llama_kv_tail_coverage_info * out);
+    LLAMA_API bool llama_kv_tail_get_coverage_aggregate(
+            const struct llama_context * ctx,
+                         llama_seq_id   seq_id,
+            struct llama_kv_tail_coverage_aggregate * out);
+    // Host time spent planning, committing, and materializing standard-KV
+    // tail metadata. Accumulation is enabled by LLAMA_KV_TAIL_PLANNER_TIMING=1.
+    LLAMA_API void     llama_kv_tail_planner_timing_reset(struct llama_context * ctx);
+    LLAMA_API uint64_t llama_kv_tail_planner_timing_ns(const struct llama_context * ctx);
     LLAMA_API struct llama_sampler_chain_params  llama_sampler_chain_default_params(void);
     LLAMA_API struct llama_model_quantize_params llama_model_quantize_default_params(void);
 
@@ -826,10 +901,15 @@ extern "C" {
     // State / sessions
     //
 
+    typedef uint32_t llama_state_seq_flags;
+
     // Returns the *actual* size in bytes of the state
     // (logits, embedding and memory)
     // Only use when saving the state, not when restoring it, otherwise the size may be too small.
     LLAMA_API size_t llama_state_get_size(struct llama_context * ctx);
+    LLAMA_API size_t llama_state_get_size_ext(
+            struct llama_context * ctx,
+           llama_state_seq_flags   flags);
     LLAMA_API DEPRECATED(size_t llama_get_state_size(struct llama_context * ctx),
         "use llama_state_get_size instead");
 
@@ -840,6 +920,11 @@ extern "C" {
             struct llama_context * ctx,
                          uint8_t * dst,
                           size_t   size);
+    LLAMA_API size_t llama_state_get_data_ext(
+            struct llama_context * ctx,
+                         uint8_t * dst,
+                          size_t   size,
+           llama_state_seq_flags   flags);
     LLAMA_API DEPRECATED(size_t llama_copy_state_data(
             struct llama_context * ctx,
                          uint8_t * dst),
@@ -851,6 +936,11 @@ extern "C" {
             struct llama_context * ctx,
                    const uint8_t * src,
                           size_t   size);
+    LLAMA_API size_t llama_state_set_data_ext(
+            struct llama_context * ctx,
+                   const uint8_t * src,
+                          size_t   size,
+           llama_state_seq_flags   flags);
     LLAMA_API DEPRECATED(size_t llama_set_state_data(
             struct llama_context * ctx,
                    const uint8_t * src),
@@ -932,7 +1022,9 @@ extern "C" {
 // Getting the state for a seq_id with this flag invalidates all prior states gotten for that seq_id with this flag.
 #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
 
-    typedef uint32_t llama_state_seq_flags;
+// Deliberately export only the complete ordinary cache body. Loading into a
+// tail-enabled context starts with degraded exact-tail coverage.
+#define LLAMA_STATE_SEQ_FLAGS_BODY_ONLY 4
 
     LLAMA_API size_t llama_state_seq_get_size_ext(
             struct llama_context * ctx,

@@ -4,6 +4,8 @@
 #include "llama-cpp.h"
 
 #include <clocale>
+#include <algorithm>
+#include <cctype>
 #include <random>
 #include <vector>
 
@@ -45,6 +47,77 @@ static llama_tokens generate_tokens(llama_context * ctx, llama_sampler * smpl, i
     }
 
     return result;
+}
+
+static bool test_tail_state_contract(
+        llama_model * model, const common_params & params, const llama_tokens & tokens) {
+    if (params.kv_tail_tokens.empty() ||
+            !std::all_of(params.kv_tail_tokens.begin(), params.kv_tail_tokens.end(), ::isdigit) ||
+            std::stoul(params.kv_tail_tokens) == 0) {
+        return true;
+    }
+
+    auto source_params = common_context_params_to_llama(params);
+    auto source = llama_context_ptr{llama_init_from_model(model, source_params)};
+    if (!source) {
+        LOG_ERR("%s: failed to create source context\n", __func__);
+        return false;
+    }
+    int n_past = 0;
+    if (!common_prompt_batch_decode(source.get(), tokens, int(tokens.size()), n_past,
+            params.n_batch, {}, false)) {
+        return false;
+    }
+
+    const size_t exact_size = llama_state_get_size(source.get());
+    std::vector<uint8_t> exact(exact_size);
+    if (llama_state_get_data(source.get(), exact.data(), exact.size()) != exact.size()) {
+        LOG_ERR("%s: exact full-state size/write mismatch\n", __func__);
+        return false;
+    }
+
+    auto mismatch_params = source_params;
+    mismatch_params.kv_tail_tokens++;
+    auto mismatch = llama_context_ptr{llama_init_from_model(model, mismatch_params)};
+    if (!mismatch) {
+        LOG_ERR("%s: failed to create mismatch context\n", __func__);
+        return false;
+    }
+    if (llama_state_set_data(mismatch.get(), exact.data(), exact.size()) != 0) {
+        LOG_ERR("%s: mismatched tail configuration was accepted\n", __func__);
+        return false;
+    }
+
+    const auto body_flag = llama_state_seq_flags(LLAMA_STATE_SEQ_FLAGS_BODY_ONLY);
+    const size_t body_size = llama_state_get_size_ext(source.get(), body_flag);
+    std::vector<uint8_t> body(body_size);
+    if (llama_state_get_data_ext(source.get(), body.data(), body.size(), body_flag) != body.size()) {
+        LOG_ERR("%s: body-only full-state size/write mismatch\n", __func__);
+        return false;
+    }
+    llama_memory_clear(llama_get_memory(source.get()), true);
+    if (llama_state_set_data(source.get(), body.data(), body.size()) != body.size()) {
+        LOG_ERR("%s: body-only full state could not be restored\n", __func__);
+        return false;
+    }
+
+    llama_kv_tail_coverage_info coverage{};
+    if (!llama_kv_tail_get_coverage(source.get(), 0, 0, &coverage) ||
+            coverage.exact != 0 ||
+            (coverage.degradation_flags & LLAMA_KV_TAIL_DEGRADED_BODY_ONLY_STATE) == 0) {
+        LOG_ERR("%s: body-only restore did not expose degraded coverage\n", __func__);
+        return false;
+    }
+    llama_kv_tail_coverage_aggregate aggregate{};
+    if (!llama_kv_tail_get_coverage_aggregate(source.get(), 0, &aggregate) ||
+            aggregate.groups == 0 || aggregate.exact != 0 ||
+            aggregate.none_groups != aggregate.groups ||
+            (aggregate.degradation_flags & LLAMA_KV_TAIL_DEGRADED_BODY_ONLY_STATE) == 0) {
+        LOG_ERR("%s: aggregate body-only coverage is inconsistent\n", __func__);
+        return false;
+    }
+    LOG("\nPASS: exact mismatch rejection and explicit body-only tail state\n");
+    return true;
 }
 
 // Test 1: baseline
@@ -161,6 +234,10 @@ static bool test_seq_cp_host(struct llama_model * model, const struct common_par
     }
     n_past++;
 
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const float * logits_before_ptr = llama_get_logits_ith(ctx.get(), -1);
+    std::vector<float> logits_before(logits_before_ptr, logits_before_ptr + n_vocab);
+
     // Migrate KV cache from seq 0 to seq 1 (CPU path)
     {
         std::vector<uint8_t> seq_store(llama_state_seq_get_size(ctx.get(), 0));
@@ -180,6 +257,12 @@ static bool test_seq_cp_host(struct llama_model * model, const struct common_par
             return false;
         }
         LOG_TRC("%s: seq 1 restored, %zd bytes\n", __func__, nset);
+    }
+
+    const float * logits_after = llama_get_logits_ith(ctx.get(), -1);
+    if (!std::equal(logits_before.begin(), logits_before.end(), logits_after)) {
+        LOG_ERR("\n%s: state-only sequence migration changed output logits\n", __func__);
+        return false;
     }
 
     // Generate tokens on seq 1
@@ -233,6 +316,7 @@ static bool test_seq_cp_device(struct llama_model * model, const struct common_p
     }
     n_past++;
 
+
     // Migrate KV cache from seq 0 to seq 1 (on-device path)
     {
         std::vector<uint8_t> seq_store(llama_state_seq_get_size_ext(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE));
@@ -253,6 +337,7 @@ static bool test_seq_cp_device(struct llama_model * model, const struct common_p
         }
         LOG_TRC("%s: seq 1 restored, %zd bytes\n", __func__, nset);
     }
+
 
     // Generate tokens on seq 1
     auto result = generate_tokens(ctx.get(), smpl.get(), n_past, params.n_predict, 1);
@@ -334,6 +419,10 @@ int main(int argc, char ** argv) {
     // Test 1: baseline (saves state to disk)
     auto result_baseline = test_baseline(model, params, tokens);
     if (result_baseline.empty()) {
+        return 1;
+    }
+
+    if (!test_tail_state_contract(model, params, tokens)) {
         return 1;
     }
 

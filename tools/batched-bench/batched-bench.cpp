@@ -5,7 +5,12 @@
 
 #include <algorithm>
 #include <clocale>
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
+#include <fstream>
+#include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -68,8 +73,15 @@ int llama_batched_bench(int argc, char ** argv) {
     const llama_vocab * vocab   = llama_model_get_vocab(model);
     const int32_t       n_vocab = llama_vocab_n_tokens(vocab);
 
-    const auto get_token_rand = [n_vocab]() -> llama_token {
-        return std::rand() % n_vocab;
+    const uint64_t validation_seed = params.sampling.seed == LLAMA_DEFAULT_SEED ? 1 : params.sampling.seed;
+    const auto get_token = [n_vocab, validation_seed](int32_t seq_id, int32_t pos) -> llama_token {
+        uint64_t x = validation_seed ^ (uint64_t(uint32_t(seq_id)) << 32) ^ uint32_t(pos);
+        x ^= x >> 30;
+        x *= 0xbf58476d1ce4e5b9ULL;
+        x ^= x >> 27;
+        x *= 0x94d049bb133111ebULL;
+        x ^= x >> 31;
+        return llama_token(x % uint64_t(n_vocab));
     };
 
     auto * mem = llama_get_memory(ctx);
@@ -78,8 +90,66 @@ int llama_batched_bench(int argc, char ** argv) {
 
     llama_batch batch = llama_batch_init(n_kv_max, 0, 1);
 
+    std::unique_ptr<std::ofstream> logits_out;
+    if (!params.batched_bench_logits_out.empty()) {
+        logits_out = std::make_unique<std::ofstream>(
+                params.batched_bench_logits_out, std::ios::binary | std::ios::trunc);
+        if (!*logits_out) {
+            LOG_ERR("failed to open logits output: %s\n", params.batched_bench_logits_out.c_str());
+            llama_batch_free(batch);
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        const char magic[8] = { 'S', 'T', 'T', 'A', 'I', 'L', 'L', 'G' };
+        const uint32_t version = 1;
+        const uint32_t vocab_size = uint32_t(n_vocab);
+        logits_out->write(magic, sizeof(magic));
+        logits_out->write(reinterpret_cast<const char *>(&version), sizeof(version));
+        logits_out->write(reinterpret_cast<const char *>(&vocab_size), sizeof(vocab_size));
+    }
+
+    int32_t current_pp = -1;
+    int32_t current_tg = -1;
+    int32_t current_pl = -1;
+
+    const auto write_logits = [&](llama_context * decode_ctx, const llama_batch & decoded) {
+        if (!logits_out || current_pl < 0) {
+            return;
+        }
+        for (int32_t i = 0; i < decoded.n_tokens; ++i) {
+            if (!decoded.logits[i]) {
+                continue;
+            }
+            const float * row = llama_get_logits_ith(decode_ctx, i);
+            bool finite = row != nullptr;
+            int32_t top = -1;
+            float top_value = -std::numeric_limits<float>::infinity();
+            for (int32_t token = 0; row && token < n_vocab; ++token) {
+                finite = finite && std::isfinite(row[token]);
+                if (row[token] > top_value) {
+                    top_value = row[token];
+                    top = token;
+                }
+            }
+            const int32_t seq_id = decoded.n_seq_id[i] > 0 ? decoded.seq_id[i][0] : -1;
+            const int32_t position = decoded.pos[i];
+            const int32_t finite_i = finite ? 1 : 0;
+            const int32_t vocab_i = n_vocab;
+            for (const int32_t value : { current_pp, current_tg, current_pl, seq_id, position, finite_i, top, vocab_i }) {
+                logits_out->write(reinterpret_cast<const char *>(&value), sizeof(value));
+            }
+            if (row) {
+                logits_out->write(reinterpret_cast<const char *>(row), size_t(n_vocab)*sizeof(float));
+            } else {
+                std::vector<float> missing(size_t(n_vocab), std::numeric_limits<float>::quiet_NaN());
+                logits_out->write(reinterpret_cast<const char *>(missing.data()), missing.size()*sizeof(float));
+            }
+        }
+    };
+
     // decode in batches of ctx_params.n_batch tokens
-    auto decode_helper = [](llama_context * ctx, llama_batch & batch, int32_t n_batch, bool synchronize) {
+    auto decode_helper = [&](llama_context * ctx, llama_batch & batch, int32_t n_batch, bool synchronize) {
         for (int32_t i = 0; i < batch.n_tokens; i += n_batch) {
             const int32_t n_tokens = std::min(n_batch, batch.n_tokens - i);
 
@@ -99,9 +169,10 @@ int llama_batched_bench(int argc, char ** argv) {
                 return false;
             }
 
-            if (synchronize) {
+            if (synchronize || logits_out) {
                 llama_synchronize(ctx);
             }
+            write_logits(ctx, batch_view);
         }
 
         return true;
@@ -110,7 +181,7 @@ int llama_batched_bench(int argc, char ** argv) {
     // warm up
     {
         for (int i = 0; i < 16; ++i) {
-            common_batch_add(batch, get_token_rand(), i, { 0 }, false);
+            common_batch_add(batch, get_token(0, i), i, { 0 }, false);
         }
 
         if (!decode_helper(ctx, batch, ctx_params.n_batch, true)) {
@@ -135,6 +206,9 @@ int llama_batched_bench(int argc, char ** argv) {
                 const int pp = n_pp[i_pp];
                 const int tg = n_tg[i_tg];
                 const int pl = n_pl[i_pl];
+                current_pp = pp;
+                current_tg = tg;
+                current_pl = pl;
 
                 const int n_ctx_req = is_pp_shared ? (params.kv_unified ? pp : pl*pp) + pl*tg : pl*(pp + tg);
 
@@ -144,9 +218,21 @@ int llama_batched_bench(int argc, char ** argv) {
 
                 common_batch_clear(batch);
 
-                for (int j = 0; j < (is_pp_shared ? 1 : pl); ++j) {
+                const int prompt_sequences = is_pp_shared ? 1 : pl;
+                const auto add_prompt_token = [&](int j, int i) {
+                    common_batch_add(batch, get_token(j, i), i, { j }, i == pp - 1);
+                };
+                if (params.batched_bench_batch_layout == "seq-major") {
+                    for (int j = 0; j < prompt_sequences; ++j) {
+                        for (int i = 0; i < pp; ++i) {
+                            add_prompt_token(j, i);
+                        }
+                    }
+                } else {
                     for (int i = 0; i < pp; ++i) {
-                        common_batch_add(batch, get_token_rand(), i, { j }, i == pp - 1);
+                        for (int j = 0; j < prompt_sequences; ++j) {
+                            add_prompt_token(j, i);
+                        }
                     }
                 }
 
@@ -173,7 +259,7 @@ int llama_batched_bench(int argc, char ** argv) {
                     if (!params.kv_unified) {
                         // run one dummy token to apply the memory copy
                         common_batch_clear(batch);
-                        common_batch_add(batch, get_token_rand(), pp + 0, { 0 }, true);
+                        common_batch_add(batch, get_token(0, pp), pp + 0, { 0 }, true);
                         if (!decode_helper(ctx, batch, ctx_params.n_batch, true)) {
                             LOG_ERR("%s: llama_decode() failed\n", __func__);
                             llama_free(ctx);
@@ -193,7 +279,7 @@ int llama_batched_bench(int argc, char ** argv) {
                         for (int i = 0; i < tg; ++i) {
                             common_batch_clear(batch);
 
-                            common_batch_add(batch, get_token_rand(), pp + i, { j }, true);
+                            common_batch_add(batch, get_token(j, pp + i), pp + i, { j }, true);
 
                             if (!decode_helper(ctx, batch, ctx_params.n_batch, true)) {
                                 LOG_ERR("%s: llama_decode() failed\n", __func__);
@@ -210,7 +296,7 @@ int llama_batched_bench(int argc, char ** argv) {
                         common_batch_clear(batch);
 
                         for (int j = 0; j < pl; ++j) {
-                            common_batch_add(batch, get_token_rand(), pp + i, { j }, true);
+                            common_batch_add(batch, get_token(j, pp + i), pp + i, { j }, true);
                         }
 
                         if (!decode_helper(ctx, batch, ctx_params.n_batch, true)) {

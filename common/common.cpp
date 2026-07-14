@@ -1316,6 +1316,28 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
+    // Fitting runs before the final model-bound group manifest exists. For an
+    // explicit structured specification, conservatively fit every group at
+    // the largest requested length; final context creation resolves the exact
+    // per-group values after the model is loaded. Unknown `auto` remains zero.
+    if (params.kv_tail_tokens != "auto" && params.kv_tail_tokens.find_first_of(",=") != std::string::npos) {
+        uint32_t fit_tail_tokens = 0;
+        size_t begin = 0;
+        while (begin <= params.kv_tail_tokens.size()) {
+            const size_t end = params.kv_tail_tokens.find(',', begin);
+            const std::string entry = params.kv_tail_tokens.substr(
+                    begin, end == std::string::npos ? end : end - begin);
+            const size_t eq = entry.find('=');
+            const std::string value = eq == std::string::npos ? entry : entry.substr(eq + 1);
+            fit_tail_tokens = std::max(fit_tail_tokens, uint32_t(std::stoul(value)));
+            if (end == std::string::npos) {
+                break;
+            }
+            begin = end + 1;
+        }
+        cparams.kv_tail_tokens = fit_tail_tokens;
+    }
+
     if (params.fit_params) {
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
@@ -1405,6 +1427,73 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     if (params.sampling.backend_sampling) {
         cparams.samplers   = pimpl->samplers_seq_config.data();
         cparams.n_samplers = pimpl->samplers_seq_config.size();
+    }
+
+    std::unique_ptr<llama_kv_tail_config, decltype(&llama_kv_tail_config_free)> tail_config(
+            nullptr, llama_kv_tail_config_free);
+    const bool structured_tail = params.kv_tail_tokens == "auto" ||
+            params.kv_tail_tokens.find_first_of(",=") != std::string::npos;
+    if (structured_tail) {
+        tail_config.reset(llama_kv_tail_config_init(model));
+        if (!tail_config) {
+            COM_ERR("%s", "failed to create model-bound KV tail configuration\n");
+            return;
+        }
+        if (params.kv_tail_tokens == "auto") {
+            llama_kv_tail_config_set_auto(tail_config.get());
+        } else {
+            std::vector<std::string> entries;
+            size_t begin = 0;
+            while (begin <= params.kv_tail_tokens.size()) {
+                const size_t end = params.kv_tail_tokens.find(',', begin);
+                entries.push_back(params.kv_tail_tokens.substr(
+                        begin, end == std::string::npos ? end : end - begin));
+                if (end == std::string::npos) {
+                    break;
+                }
+                begin = end + 1;
+            }
+            const bool named = entries.front().find('=') != std::string::npos;
+            const int32_t n_groups = llama_kv_tail_config_group_count(tail_config.get());
+            if (!named && int32_t(entries.size()) != n_groups) {
+                COM_WRN("KV tail positional group count mismatch: expected %d, got %zu; disabling all groups\n",
+                        n_groups, entries.size());
+            } else {
+                std::unordered_set<std::string> assigned_ids;
+                for (size_t i = 0; i < entries.size(); ++i) {
+                    std::string id;
+                    std::string count;
+                    if (named) {
+                        const size_t eq = entries[i].find('=');
+                        id = entries[i].substr(0, eq);
+                        count = entries[i].substr(eq + 1);
+                    } else {
+                        llama_kv_tail_group_info info;
+                        GGML_ASSERT(llama_kv_tail_config_get_group_info(tail_config.get(), int32_t(i), &info));
+                        id = info.id;
+                        count = entries[i];
+                    }
+                    if (!assigned_ids.insert(id).second) {
+                        COM_WRN("duplicate KV tail group '%s'; disabling all groups\n", id.c_str());
+                        tail_config.reset(llama_kv_tail_config_init(model));
+                        break;
+                    }
+                    if (!llama_kv_tail_config_set_group(tail_config.get(), id.c_str(), uint32_t(std::stoul(count)))) {
+                        COM_WRN("invalid KV tail group configuration: %s; disabling all groups\n",
+                                llama_kv_tail_config_last_error(tail_config.get()));
+                        tail_config.reset(llama_kv_tail_config_init(model));
+                        break;
+                    }
+                }
+            }
+        }
+        cparams.kv_tail_config = tail_config.get();
+    } else if (cparams.kv_tail_tokens > 0) {
+        tail_config.reset(llama_kv_tail_config_init(model));
+        if (tail_config && llama_kv_tail_config_group_count(tail_config.get()) > 1) {
+            COM_WRN("uniform KV tail override applies %u tokens to every canonical cache group\n",
+                    cparams.kv_tail_tokens);
+        }
     }
 
     llama_context * lctx = llama_init_from_model(model, cparams);
@@ -1719,6 +1808,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
     cparams.kvarn  = params.kvarn;
+    cparams.kv_tail_tokens = params.kv_tail_tokens.find_first_of(",=") == std::string::npos &&
+            params.kv_tail_tokens != "auto" ? std::stoul(params.kv_tail_tokens) : 0;
+    cparams.kv_tail_type = params.kv_tail_type;
 
     return cparams;
 }

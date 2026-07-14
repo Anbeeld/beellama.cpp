@@ -445,6 +445,64 @@ static void parse_target_kvarn_swa_cache_type(common_params & params, bool key, 
     }
 }
 
+static void parse_kv_tail_tokens(common_params & params, const std::string & value) {
+    if (value == "auto") {
+        params.kv_tail_tokens = value;
+        return;
+    }
+
+    const std::regex number("0|[1-9][0-9]*");
+    const std::regex group_id("[A-Za-z][A-Za-z0-9-]*(?:@l[0-9]+)?");
+    std::set<std::string> names;
+    bool named = false;
+    bool positional = false;
+    size_t begin = 0;
+
+    do {
+        const size_t end = value.find(',', begin);
+        const std::string item = value.substr(begin, end == std::string::npos ? end : end - begin);
+        if (item.empty()) {
+            throw std::invalid_argument("invalid empty --kv-tail-tokens entry");
+        }
+
+        const size_t eq = item.find('=');
+        if (eq == std::string::npos) {
+            positional = true;
+            if (!std::regex_match(item, number)) {
+                throw std::invalid_argument("invalid --kv-tail-tokens value: " + item);
+            }
+            (void) std::stoul(item);
+        } else {
+            named = true;
+            const std::string name = item.substr(0, eq);
+            const std::string count = item.substr(eq + 1);
+            if (!std::regex_match(name, group_id) || !std::regex_match(count, number)) {
+                throw std::invalid_argument("invalid --kv-tail-tokens group entry: " + item);
+            }
+            if (!names.insert(name).second) {
+                throw std::invalid_argument("duplicate --kv-tail-tokens group: " + name);
+            }
+            (void) std::stoul(count);
+        }
+        begin = end == std::string::npos ? value.size() + 1 : end + 1;
+    } while (begin <= value.size());
+
+    if (named && positional) {
+        throw std::invalid_argument("--kv-tail-tokens cannot mix positional and named entries");
+    }
+    params.kv_tail_tokens = value;
+}
+
+static void parse_kv_tail_type(common_params & params, const std::string & value) {
+    if (value == "f16") {
+        params.kv_tail_type = GGML_TYPE_F16;
+    } else if (value == "bf16") {
+        params.kv_tail_type = GGML_TYPE_BF16;
+    } else {
+        throw std::invalid_argument("--kv-tail-type must be f16 or bf16");
+    }
+}
+
 static bool parse_bool_value(const std::string & value) {
     if (is_truthy(value)) {
         return true;
@@ -2402,6 +2460,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
+        {"--kv-tail-tokens"}, "SPEC",
+        "high-precision standard KV-cache tail: 0, auto, N, positional list, or named group list\n"
+        "(default: 0)",
+        [](common_params & params, const std::string & value) {
+            parse_kv_tail_tokens(params, value);
+        }
+    ).set_env("LLAMA_ARG_KV_TAIL_TOKENS"));
+    add_opt(common_arg(
+        {"--kv-tail-type"}, "TYPE",
+        "high-precision standard KV-cache tail type: f16 or bf16\n"
+        "(default: f16)",
+        [](common_params & params, const std::string & value) {
+            parse_kv_tail_type(params, value);
+        }
+    ).set_env("LLAMA_ARG_KV_TAIL_TYPE"));
+    add_opt(common_arg(
         {"--cache-type-k-swa"}, "TYPE",
         "SWA-layer KVarN cache type override for K\n"
         "allowed values: kvarn2, kvarn3, kvarn4, kvarn5, kvarn6, kvarn8\n"
@@ -3161,6 +3235,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             auto p = string_split<int>(value, ',');
             params.n_pl.insert(params.n_pl.end(), p.begin(), p.end());
+        }
+    ).set_examples({LLAMA_EXAMPLE_BENCH}));
+    add_opt(common_arg(
+        {"--batch-layout"}, "{seq-major,round-robin}",
+        "validation-only batched-bench prompt insertion order (default: seq-major)",
+        [](common_params & params, const std::string & value) {
+            if (value != "seq-major" && value != "round-robin") {
+                throw std::invalid_argument("invalid batch layout");
+            }
+            params.batched_bench_batch_layout = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_BENCH}));
+    add_opt(common_arg(
+        {"--logits-out"}, "FILE",
+        "validation-only batched-bench binary output for every requested logit row",
+        [](common_params & params, const std::string & value) {
+            params.batched_bench_logits_out = value;
         }
     ).set_examples({LLAMA_EXAMPLE_BENCH}));
     add_opt(common_arg(

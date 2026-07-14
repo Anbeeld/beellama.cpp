@@ -41,7 +41,10 @@ public:
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
     const layer_filter_cb & filter_recr = nullptr,
-          llama_kvarn_params kvarn = llama_kvarn_default_params());
+          llama_kvarn_params kvarn = llama_kvarn_default_params(),
+                 uint32_t   tail_tokens = 0,
+                 uint32_t   tail_tokens_swa = 0,
+                ggml_type   tail_type = GGML_TYPE_F16);
 
     ~llama_memory_hybrid_iswa() = default;
 
@@ -77,6 +80,11 @@ public:
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
+    uint32_t get_kv_tail_group_count() const override;
+    bool get_kv_tail_coverage(uint32_t group_index, llama_seq_id seq_id,
+            llama_kv_tail_coverage_info & out) const override;
+    void reset_kv_tail_planner_timing() override;
+    uint64_t get_kv_tail_planner_timing_ns() const override;
 
     // state write/load
 

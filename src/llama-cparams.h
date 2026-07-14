@@ -56,6 +56,10 @@ struct llama_cparams {
     // memory creation does not need to depend on the public params object.
     llama_kvarn_params kvarn;
 
+    uint32_t  kv_tail_tokens = 0;
+    uint32_t  kv_tail_tokens_swa = 0;
+    ggml_type kv_tail_type   = GGML_TYPE_F16;
+
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
 

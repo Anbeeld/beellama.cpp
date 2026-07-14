@@ -363,6 +363,8 @@ struct cmd_params {
     std::vector<int>                 n_ubatch;
     std::vector<bench_cache_type>    type_k;
     std::vector<bench_cache_type>    type_v;
+    std::vector<uint32_t>            kv_tail_tokens;
+    std::vector<ggml_type>           kv_tail_type;
     std::vector<int>                 n_threads;
     std::vector<std::string>         cpu_mask;
     std::vector<bool>                cpu_strict;
@@ -408,6 +410,8 @@ static const cmd_params cmd_params_defaults = {
     /* n_ubatch             */ { 512 },
     /* type_k               */ { { GGML_TYPE_F16, 0 } },
     /* type_v               */ { { GGML_TYPE_F16, 0 } },
+    /* kv_tail_tokens       */ { 0 },
+    /* kv_tail_type         */ { GGML_TYPE_F16 },
     /* n_threads            */ { common_cpu_get_num_math() },
     /* cpu_mask             */ { "0x0" },
     /* cpu_strict           */ { false },
@@ -480,6 +484,8 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -ub, --ubatch-size <n>                      (default: %s)\n", join(cmd_params_defaults.n_ubatch, ",").c_str());
     printf("  -ctk, --cache-type-k <t>                    (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_k, bench_cache_type_name), ",").c_str());
     printf("  -ctv, --cache-type-v <t>                    (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_v, bench_cache_type_name), ",").c_str());
+    printf("  --kv-tail-tokens <n>                        standard-cache exact tail length (default: 0)\n");
+    printf("  --kv-tail-type <f16|bf16>                   exact tail storage type (default: f16)\n");
     printf("  -t, --threads <n>                           (default: %s)\n", join(cmd_params_defaults.n_threads, ",").c_str());
     printf("  -C, --cpu-mask <hex,hex>                    (default: %s)\n", join(cmd_params_defaults.cpu_mask, ",").c_str());
     printf("  --cpu-strict <0|1>                          (default: %s)\n", join(cmd_params_defaults.cpu_strict, ",").c_str());
@@ -799,6 +805,34 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 params.type_v.insert(params.type_v.end(), types.begin(), types.end());
+            } else if (arg == "--kv-tail-tokens") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto values = parse_int_range(argv[i]);
+                for (int value : values) {
+                    if (value < 0) {
+                        invalid_param = true;
+                        break;
+                    }
+                    params.kv_tail_tokens.push_back(uint32_t(value));
+                }
+            } else if (arg == "--kv-tail-type") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                for (const auto & value : string_split<std::string>(argv[i], split_delim)) {
+                    if (value == "f16") {
+                        params.kv_tail_type.push_back(GGML_TYPE_F16);
+                    } else if (value == "bf16") {
+                        params.kv_tail_type.push_back(GGML_TYPE_BF16);
+                    } else {
+                        invalid_param = true;
+                        break;
+                    }
+                }
             } else if (arg == "-dev" || arg == "--device") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1232,6 +1266,12 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.type_v.empty()) {
         params.type_v = cmd_params_defaults.type_v;
     }
+    if (params.kv_tail_tokens.empty()) {
+        params.kv_tail_tokens = cmd_params_defaults.kv_tail_tokens;
+    }
+    if (params.kv_tail_type.empty()) {
+        params.kv_tail_type = cmd_params_defaults.kv_tail_type;
+    }
     if (params.n_gpu_layers.empty()) {
         params.n_gpu_layers = cmd_params_defaults.n_gpu_layers;
     }
@@ -1305,6 +1345,8 @@ struct cmd_params_instance {
     int                n_ubatch;
     bench_cache_type   type_k;
     bench_cache_type   type_v;
+    uint32_t           kv_tail_tokens;
+    ggml_type          kv_tail_type;
     int                n_threads;
     std::string        cpu_mask;
     bool               cpu_strict;
@@ -1398,6 +1440,8 @@ struct cmd_params_instance {
         cparams.type_k          = type_k.ggml;
         cparams.type_v          = type_v.ggml;
         cparams.kvarn           = kvarn_params_from_cache_pair(type_k, type_v);
+        cparams.kv_tail_tokens  = kv_tail_tokens;
+        cparams.kv_tail_type    = kv_tail_type;
         cparams.offload_kqv     = !no_kv_offload;
         cparams.flash_attn_type = flash_attn;
         cparams.embeddings      = embeddings;
@@ -1432,6 +1476,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & nub : params.n_ubatch)
     for (const auto & tk_arg : params.type_k)
     for (const auto & tv_arg : params.type_v)
+    for (const auto & tail_n : params.kv_tail_tokens)
+    for (const auto & tail_type : params.kv_tail_type)
     for (const auto & nkvo : params.no_kv_offload)
     for (const auto & fa : params.flash_attn)
     for (const auto & nt : params.n_threads)
@@ -1456,6 +1502,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_ubatch     = */ nub,
                 /* .type_k       = */ tk,
                 /* .type_v       = */ tv,
+                /* .kv_tail_tokens = */ tail_n,
+                /* .kv_tail_type = */ tail_type,
                 /* .n_threads    = */ nt,
                 /* .cpu_mask     = */ cm,
                 /* .cpu_strict   = */ cs,
@@ -1493,6 +1541,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_ubatch     = */ nub,
                 /* .type_k       = */ tk,
                 /* .type_v       = */ tv,
+                /* .kv_tail_tokens = */ tail_n,
+                /* .kv_tail_type = */ tail_type,
                 /* .n_threads    = */ nt,
                 /* .cpu_mask     = */ cm,
                 /* .cpu_strict   = */ cs,
@@ -1530,6 +1580,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_ubatch     = */ nub,
                 /* .type_k       = */ tk,
                 /* .type_v       = */ tv,
+                /* .kv_tail_tokens = */ tail_n,
+                /* .kv_tail_type = */ tail_type,
                 /* .n_threads    = */ nt,
                 /* .cpu_mask     = */ cm,
                 /* .cpu_strict   = */ cs,
@@ -1576,6 +1628,8 @@ struct test {
     int                      poll;
     bench_cache_type         type_k;
     bench_cache_type         type_v;
+    uint32_t                 kv_tail_tokens;
+    ggml_type                kv_tail_type;
     int                      n_gpu_layers;
     int                      n_cpu_moe;
     llama_split_mode         split_mode;
@@ -1597,6 +1651,7 @@ struct test {
     int                      n_depth;
     std::string              test_time;
     std::vector<uint64_t>    samples_ns;
+    std::vector<uint64_t>    planner_ns;
 
     test(const cmd_params_instance & inst, const llama_model * lmodel, const llama_context * ctx) :
         cpu_info(get_cpu_info()),
@@ -1616,6 +1671,8 @@ struct test {
         poll           = inst.poll;
         type_k         = inst.type_k;
         type_v         = inst.type_v;
+        kv_tail_tokens = inst.kv_tail_tokens;
+        kv_tail_type   = inst.kv_tail_type;
         n_gpu_layers   = inst.n_gpu_layers;
         n_cpu_moe      = inst.n_cpu_moe;
         split_mode     = inst.split_mode;
@@ -1686,7 +1743,7 @@ struct test {
             "build_commit",   "build_number",   "cpu_info",      "gpu_info",       "backends",
             "model_filename", "model_type",     "model_size",    "model_n_params", "n_batch",
             "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
-            "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
+            "type_k",         "type_v",         "kv_tail_tokens", "kv_tail_type",   "n_gpu_layers",  "n_cpu_moe",      "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "use_mmap",      "use_direct_io",  "embeddings",
             "no_op_offload",  "no_host",        "fit_target",     "fit_min_ctx",
@@ -1703,7 +1760,7 @@ struct test {
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
-            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn") {
+            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn" || field == "kv_tail_tokens") {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" ||
@@ -1770,6 +1827,8 @@ struct test {
                                             std::to_string(poll),
                                             bench_cache_type_name(type_k),
                                             bench_cache_type_name(type_v),
+                                            std::to_string(kv_tail_tokens),
+                                            ggml_type_name(kv_tail_type),
                                             std::to_string(n_gpu_layers),
                                             std::to_string(n_cpu_moe),
                                             split_mode_str(split_mode),
@@ -1902,6 +1961,7 @@ struct json_printer : public printer {
         fprintf(fout, "  {\n");
         print_fields(test::get_fields(), t.get_values());
         fprintf(fout, "    \"samples_ns\": [ %s ],\n", join(t.samples_ns, ", ").c_str());
+        fprintf(fout, "    \"planner_ns\": [ %s ],\n", join(t.planner_ns, ", ").c_str());
         fprintf(fout, "    \"samples_ts\": [ %s ]\n", join(t.get_ts(), ", ").c_str());
         fprintf(fout, "  }");
         fflush(fout);
@@ -1922,6 +1982,7 @@ struct jsonl_printer : public printer {
         fprintf(fout, "{");
         print_fields(test::get_fields(), t.get_values());
         fprintf(fout, "\"samples_ns\": [ %s ],", join(t.samples_ns, ", ").c_str());
+        fprintf(fout, "\"planner_ns\": [ %s ],", join(t.planner_ns, ", ").c_str());
         fprintf(fout, "\"samples_ts\": [ %s ]", join(t.get_ts(), ", ").c_str());
         fprintf(fout, "}\n");
         fflush(fout);
@@ -2076,6 +2137,13 @@ struct markdown_printer : public printer {
         }
         if (params.type_v.size() > 1 || params.type_v != cmd_params_defaults.type_v || cache_type_list_has_kvarn(params.type_k)) {
             fields.emplace_back("type_v");
+        }
+        if (params.kv_tail_tokens.size() > 1 || params.kv_tail_tokens != cmd_params_defaults.kv_tail_tokens) {
+            fields.emplace_back("kv_tail_tokens");
+        }
+        if (params.kv_tail_type.size() > 1 || params.kv_tail_type != cmd_params_defaults.kv_tail_type ||
+            std::any_of(params.kv_tail_tokens.begin(), params.kv_tail_tokens.end(), [](uint32_t value) { return value > 0; })) {
+            fields.emplace_back("kv_tail_type");
         }
         if (params.main_gpu.size() > 1 || params.main_gpu != cmd_params_defaults.main_gpu) {
             fields.emplace_back("main_gpu");
@@ -2549,6 +2617,7 @@ int llama_bench(int argc, char ** argv) {
                 }
             }
 
+            llama_kv_tail_planner_timing_reset(ctx);
             uint64_t t_start = get_time_ns();
 
             if (t.n_prompt > 0) {
@@ -2580,6 +2649,7 @@ int llama_bench(int argc, char ** argv) {
 
             uint64_t t_ns = get_time_ns() - t_start;
             t.samples_ns.push_back(t_ns);
+            t.planner_ns.push_back(llama_kv_tail_planner_timing_ns(ctx));
         }
 
         if (p) {

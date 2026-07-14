@@ -4,6 +4,12 @@ find_package(Python3 COMPONENTS Interpreter QUIET)
 
 if (Python3_Interpreter_FOUND)
     add_test(
+        NAME test-std-kv-tail-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-std-kv-tail-static.py)
+    set_property(TEST test-std-kv-tail-static PROPERTY LABELS main)
+
+    add_test(
         NAME test-removed-cache-types-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-removed-cache-types-static.py)
@@ -291,6 +297,9 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp)
+llama_build_and_test(test-kv-cache-tail.cpp ../src/llama-kv-cache-tail.cpp)
+target_include_directories(test-kv-cache-tail PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_build_and_test(test-std-kv-tail-graph.cpp)
 
 add_executable(test-kvarn test-kvarn.cpp ../src/llama-kvarn.cpp)
 target_include_directories(test-kvarn PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include)

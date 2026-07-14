@@ -1170,6 +1170,10 @@ struct llama_model_deepseek4 : public llama_model_base {
                 float kq_scale,
                 int il) const;
 
+        ggml_tensor * build_raw_tail(
+                llm_graph_input_dsv4_raw * inp_attn,
+                int il) const;
+
         ggml_tensor * build_hca_attention(
                 llm_graph_input_dsv4 * inp_dsv4,
                 llm_graph_input_dsv4_raw * inp_attn,

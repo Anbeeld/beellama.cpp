@@ -31,7 +31,10 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
                             /* layer filters */
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
-          llama_kvarn_params kvarn) :
+          llama_kvarn_params kvarn,
+                 uint32_t tail_tokens,
+                 uint32_t tail_tokens_swa,
+                ggml_type tail_type) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache_iswa(
         model,
@@ -52,7 +55,10 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
             : filter_attn,
         nullptr,
         nullptr,
-        kvarn
+        kvarn,
+        tail_tokens,
+        tail_tokens_swa,
+        tail_type
     )),
     mem_recr(new llama_memory_recurrent(
         model,
@@ -202,6 +208,23 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_iswa::memory_br
         mb[buft_size.first] += buft_size.second;
     }
     return mb;
+}
+
+uint32_t llama_memory_hybrid_iswa::get_kv_tail_group_count() const {
+    return mem_attn->get_kv_tail_group_count();
+}
+
+bool llama_memory_hybrid_iswa::get_kv_tail_coverage(
+        uint32_t group_index, llama_seq_id seq_id, llama_kv_tail_coverage_info & out) const {
+    return mem_attn->get_kv_tail_coverage(group_index, seq_id, out);
+}
+
+void llama_memory_hybrid_iswa::reset_kv_tail_planner_timing() {
+    mem_attn->reset_kv_tail_planner_timing();
+}
+
+uint64_t llama_memory_hybrid_iswa::get_kv_tail_planner_timing_ns() const {
+    return mem_attn->get_kv_tail_planner_timing_ns();
 }
 
 bool llama_memory_hybrid_iswa::requires_state_for_partial_restore() const {

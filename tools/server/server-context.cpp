@@ -2668,6 +2668,19 @@ private:
                     res->n_decode_total          = metrics.n_decode_total;
                     res->n_busy_slots_total      = metrics.n_busy_slots_total;
 
+                    for (const server_slot & slot : slots) {
+                        llama_kv_tail_coverage_aggregate tail_coverage;
+                        if (!llama_kv_tail_get_coverage_aggregate(ctx_tgt, slot.id, &tail_coverage)) {
+                            continue;
+                        }
+                        res->kv_tail_requested += tail_coverage.requested;
+                        res->kv_tail_exact += tail_coverage.exact;
+                        res->kv_tail_complete_groups += tail_coverage.complete_groups;
+                        res->kv_tail_partial_groups += tail_coverage.partial_groups;
+                        res->kv_tail_none_groups += tail_coverage.none_groups;
+                        res->kv_tail_degraded_sequences += tail_coverage.degradation_flags != 0;
+                    }
+
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
                     }
@@ -4670,6 +4683,30 @@ void server_routes::init_routes() {
                     {"name",  "n_busy_slots_per_decode"},
                     {"help",  "Average number of busy slots per llama_decode() call"},
                     {"value",  (float) res_task->n_busy_slots_total / std::max((float) res_task->n_decode_total, 1.f)}
+            },{
+                    {"name",  "kv_tail_requested_tokens"},
+                    {"help",  "Configured exact-tail tokens currently requested across server slots and cache groups."},
+                    {"value",  res_task->kv_tail_requested}
+            },{
+                    {"name",  "kv_tail_exact_tokens"},
+                    {"help",  "Exact-tail tokens currently covered across server slots and cache groups."},
+                    {"value",  res_task->kv_tail_exact}
+            },{
+                    {"name",  "kv_tail_complete_groups"},
+                    {"help",  "Server slot cache groups with complete exact-tail coverage."},
+                    {"value",  res_task->kv_tail_complete_groups}
+            },{
+                    {"name",  "kv_tail_partial_groups"},
+                    {"help",  "Server slot cache groups with partial exact-tail coverage."},
+                    {"value",  res_task->kv_tail_partial_groups}
+            },{
+                    {"name",  "kv_tail_none_groups"},
+                    {"help",  "Server slot cache groups with no exact-tail coverage."},
+                    {"value",  res_task->kv_tail_none_groups}
+            },{
+                    {"name",  "kv_tail_degraded_sequences"},
+                    {"help",  "Server slots reporting an explicit exact-tail degradation reason."},
+                    {"value",  res_task->kv_tail_degraded_sequences}
             }}}
         };
 

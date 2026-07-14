@@ -14,12 +14,187 @@
 #include "llama-ext.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <vector>
+
+struct llama_kv_tail_config {
+    struct group {
+        std::string id;
+        std::string role;
+        uint32_t lowest_layer;
+        uint32_t effective_window;
+        std::vector<int32_t> layers;
+        uint32_t n_tokens = 0;
+        bool assigned = false;
+    };
+
+    const llama_model * model = nullptr;
+    std::vector<group> groups;
+    std::string error;
+    bool automatic = false;
+};
+
+llama_kv_tail_config * llama_kv_tail_config_init(const llama_model * model) {
+    if (!model) {
+        return nullptr;
+    }
+    auto * result = new llama_kv_tail_config;
+    result->model = model;
+
+    llama_kv_tail_config::group full { "", "full", UINT32_MAX, model->hparams.n_ctx_train, {} };
+    llama_kv_tail_config::group swa  { "", "swa",  UINT32_MAX, model->hparams.n_swa, {} };
+    for (uint32_t il = 0; il < model->hparams.n_layer_all; ++il) {
+        if (!model->hparams.has_kv(il) || model->hparams.is_recr(il)) {
+            continue;
+        }
+        auto & group = model->hparams.is_swa(il) ? swa : full;
+        group.lowest_layer = std::min(group.lowest_layer, il);
+        group.layers.push_back(int32_t(il));
+    }
+    for (auto * group : { &full, &swa }) {
+        if (!group->layers.empty()) {
+            group->id = group->role + "@l" + std::to_string(group->lowest_layer);
+            result->groups.push_back(std::move(*group));
+        }
+    }
+    std::sort(result->groups.begin(), result->groups.end(), [](const auto & a, const auto & b) {
+        return a.lowest_layer < b.lowest_layer;
+    });
+    return result;
+}
+
+void llama_kv_tail_config_free(llama_kv_tail_config * config) {
+    delete config;
+}
+
+int32_t llama_kv_tail_config_group_count(const llama_kv_tail_config * config) {
+    return config ? int32_t(config->groups.size()) : -1;
+}
+
+bool llama_kv_tail_config_get_group_info(
+        const llama_kv_tail_config * config, int32_t group_index, llama_kv_tail_group_info * out) {
+    if (!config || !out || group_index < 0 || size_t(group_index) >= config->groups.size()) {
+        return false;
+    }
+    const auto & group = config->groups[size_t(group_index)];
+    *out = { group.id.c_str(), group.role.c_str(), group.lowest_layer,
+            uint32_t(group.layers.size()), group.effective_window };
+    return true;
+}
+
+int32_t llama_kv_tail_config_group_layer(
+        const llama_kv_tail_config * config, int32_t group_index, int32_t layer_index) {
+    if (!config || group_index < 0 || size_t(group_index) >= config->groups.size() ||
+            layer_index < 0 || size_t(layer_index) >= config->groups[size_t(group_index)].layers.size()) {
+        return -1;
+    }
+    return config->groups[size_t(group_index)].layers[size_t(layer_index)];
+}
+
+bool llama_kv_tail_config_set_auto(llama_kv_tail_config * config) {
+    if (!config) {
+        return false;
+    }
+    config->automatic = true;
+    config->error.clear();
+    for (auto & group : config->groups) {
+        group.assigned = false;
+        group.n_tokens = 0;
+    }
+    return true;
+}
+
+bool llama_kv_tail_config_set_group(
+        llama_kv_tail_config * config, const char * group_id, uint32_t n_tokens) {
+    if (!config || !group_id) {
+        return false;
+    }
+    config->automatic = false;
+    std::vector<llama_kv_tail_config::group *> matches;
+    for (auto & group : config->groups) {
+        if (group.id == group_id || group.role == group_id) {
+            matches.push_back(&group);
+        }
+    }
+    if (matches.size() != 1) {
+        config->error = matches.empty() ? "unknown KV tail group: " + std::string(group_id) :
+                "ambiguous KV tail group alias: " + std::string(group_id);
+        return false;
+    }
+    if (matches[0]->assigned) {
+        config->error = "duplicate KV tail group assignment: " + matches[0]->id;
+        return false;
+    }
+    matches[0]->n_tokens = n_tokens;
+    matches[0]->assigned = true;
+    config->error.clear();
+    return true;
+}
+
+const char * llama_kv_tail_config_last_error(const llama_kv_tail_config * config) {
+    return config ? config->error.c_str() : "null KV tail config";
+}
+
+bool llama_kv_tail_get_coverage(
+        const llama_context * ctx,
+        llama_seq_id seq_id,
+        uint32_t group_index,
+        llama_kv_tail_coverage_info * out) {
+    if (!ctx || !out) {
+        return false;
+    }
+    const llama_memory_t memory = ctx->get_memory();
+    return memory && group_index < memory->get_kv_tail_group_count() &&
+            memory->get_kv_tail_coverage(group_index, seq_id, *out);
+}
+
+bool llama_kv_tail_get_coverage_aggregate(
+        const llama_context * ctx,
+        llama_seq_id seq_id,
+        llama_kv_tail_coverage_aggregate * out) {
+    if (!ctx || !out) {
+        return false;
+    }
+
+    *out = {};
+    const llama_memory_t memory = ctx->get_memory();
+    if (!memory) {
+        return false;
+    }
+    const uint32_t n_groups = memory->get_kv_tail_group_count();
+    for (uint32_t group = 0; group < n_groups; ++group) {
+        llama_kv_tail_coverage_info info;
+        if (!memory->get_kv_tail_coverage(group, seq_id, info)) {
+            return false;
+        }
+        ++out->groups;
+        out->requested += info.requested;
+        out->exact += info.exact;
+        out->degradation_flags |= info.degradation_flags;
+        switch (info.state) {
+            case LLAMA_KV_TAIL_COVERAGE_COMPLETE: ++out->complete_groups; break;
+            case LLAMA_KV_TAIL_COVERAGE_PARTIAL:  ++out->partial_groups;  break;
+            case LLAMA_KV_TAIL_COVERAGE_NONE:     ++out->none_groups;     break;
+        }
+    }
+    return true;
+}
+
+void llama_kv_tail_planner_timing_reset(llama_context * ctx) {
+    if (ctx && ctx->get_memory()) {
+        ctx->get_memory()->reset_kv_tail_planner_timing();
+    }
+}
+
+uint64_t llama_kv_tail_planner_timing_ns(const llama_context * ctx) {
+    return ctx && ctx->get_memory() ? ctx->get_memory()->get_kv_tail_planner_timing_ns() : 0;
+}
 
 //
 // llama_context
@@ -115,6 +290,38 @@ llama_context::llama_context(
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
     cparams.kvarn             = params.kvarn;
+    cparams.kv_tail_tokens    = std::min(params.kv_tail_tokens, cparams.n_ctx);
+    cparams.kv_tail_tokens_swa = std::min(params.kv_tail_tokens,
+            std::min(cparams.n_ctx, hparams.n_swa > 0 ? hparams.n_swa : cparams.n_ctx));
+    cparams.kv_tail_type      = params.kv_tail_type;
+    if (params.kv_tail_config) {
+        const auto & config = *params.kv_tail_config;
+        if (config.model != &model) {
+            throw std::invalid_argument("KV tail config was created for a different model");
+        }
+        cparams.kv_tail_tokens = 0;
+        cparams.kv_tail_tokens_swa = 0;
+        if (config.automatic) {
+            LLAMA_LOG_WARN("%s: no validated automatic KV tail recommendation; resolving all groups to zero\n", __func__);
+        } else if (std::any_of(config.groups.begin(), config.groups.end(), [](const auto & group) {
+                return !group.assigned;
+            })) {
+            LLAMA_LOG_WARN("%s: incomplete KV tail group configuration; resolving all groups to zero\n", __func__);
+        } else {
+            for (const auto & group : config.groups) {
+                const uint32_t effective_window = std::min(group.effective_window, cparams.n_ctx);
+                const uint32_t resolved = std::min(group.n_tokens, effective_window);
+                if (group.role == "swa") {
+                    cparams.kv_tail_tokens_swa = resolved;
+                } else {
+                    cparams.kv_tail_tokens = resolved;
+                }
+                LLAMA_LOG_INFO("KV tail: group=%s layers=%u requested=%u effective=%u type=%s\n",
+                        group.id.c_str(), uint32_t(group.layers.size()), group.n_tokens, resolved,
+                        ggml_type_name(cparams.kv_tail_type));
+            }
+        }
+    }
 
     cparams.ctx_other = nullptr;
 
@@ -356,6 +563,9 @@ llama_context::llama_context(
             /*.swa_full  =*/ params.swa_full,
             /*.ctx_type  =*/ cparams.ctx_type,
             /*.kvarn     =*/ cparams.kvarn,
+            /*.kv_tail_tokens =*/ cparams.kv_tail_tokens,
+            /*.kv_tail_tokens_swa =*/ cparams.kv_tail_tokens_swa,
+            /*.kv_tail_type   =*/ cparams.kv_tail_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
         };
 
@@ -2292,14 +2502,16 @@ void llama_context::output_reorder() {
 //
 
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+    const uint32_t tail_nodes = (cparams.kv_tail_tokens > 0 || cparams.kv_tail_tokens_swa > 0) ?
+            32u*model.hparams.n_layer_all : 0;
     if (model.arch == LLM_ARCH_QWEN3NEXT ||
         model.arch == LLM_ARCH_KIMI_LINEAR ||
         model.arch == LLM_ARCH_QWEN35 ||
         model.arch == LLM_ARCH_QWEN35MOE ||
         model.arch == LLM_ARCH_DEEPSEEK4) {
-        return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
+        return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors()) + tail_nodes;
     }
-    uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
+    uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors()) + tail_nodes;
     for (const auto & lora : model.loras) {
         res += lora->get_n_nodes();
     }
@@ -2664,7 +2876,8 @@ public:
         for (const auto & winfo : winfos) {
             auto * buft = ggml_backend_buffer_get_type(winfo.tensor->buffer);
 
-            const int64_t n = winfo.size/ggml_element_size(winfo.tensor);
+            GGML_ASSERT(winfo.size % ggml_type_size(winfo.tensor->type) == 0);
+            const int64_t n = (winfo.size/ggml_type_size(winfo.tensor->type))*ggml_blck_size(winfo.tensor->type);
 
             auto & mbuf = mbufs_new[buft];
 
@@ -2795,7 +3008,8 @@ public:
         for (const auto & rinfo : rinfos) {
             auto * buft = ggml_backend_buffer_get_type(rinfo.tensor->buffer);
 
-            const int64_t n = rinfo.size/ggml_element_size(rinfo.tensor);
+            GGML_ASSERT(rinfo.size % ggml_type_size(rinfo.tensor->type) == 0);
+            const int64_t n = (rinfo.size/ggml_type_size(rinfo.tensor->type))*ggml_blck_size(rinfo.tensor->type);
 
             auto & mbuf = mbufs_new[buft];
 
@@ -2854,27 +3068,36 @@ private:
     const llama_memory_buffers & mbufs;
 };
 
-size_t llama_context::state_get_size() {
-    llama_io_write_dummy io(false);
+size_t llama_context::state_get_size(llama_state_seq_flags flags) {
+    llama_io_write_dummy io(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
     try {
-        return state_write_data(io);
+        return state_write_data(io, flags);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error getting state size: %s\n", __func__, err.what());
         return 0;
     }
 }
 
-size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
+size_t llama_context::state_get_data(uint8_t * dst, size_t size, llama_state_seq_flags flags) {
+    if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+        LLAMA_LOG_ERROR("%s: on-device full-context state is not supported\n", __func__);
+        return 0;
+    }
     llama_io_write_host io(dst, size);
     try {
-        return state_write_data(io);
+        return state_write_data(io, flags);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
         return 0;
     }
 }
 
-size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
+size_t llama_context::state_set_data(const uint8_t * src, size_t size, llama_state_seq_flags flags) {
+    if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+        LLAMA_LOG_ERROR("%s: on-device full-context state is not supported\n", __func__);
+        return 0;
+    }
+    GGML_UNUSED(flags);
     llama_io_read_host io(src, size);
     try {
         return state_read_data(io);
@@ -3080,7 +3303,7 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
     return res;
 }
 
-size_t llama_context::state_write_data(llama_io_write_i & io) {
+size_t llama_context::state_write_data(llama_io_write_i & io, llama_state_seq_flags flags) {
     LLAMA_LOG_DEBUG("%s: writing state\n", __func__);
 
     // write model info
@@ -3094,7 +3317,7 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
 
     if (memory != nullptr) {
         LLAMA_LOG_DEBUG("%s: - writing memory module\n", __func__);
-        memory->state_write(io);
+        memory->state_write(io, -1, flags);
     }
 
     return io.n_bytes();
@@ -3458,6 +3681,9 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.kv_tail_tokens              =*/ 0,
+        /*.kv_tail_type                =*/ GGML_TYPE_F16,
+        /*.kv_tail_config              =*/ nullptr,
     };
 
     return result;
@@ -3991,20 +4217,34 @@ bool llama_save_session_file(llama_context * ctx, const char * path_session, con
 // Returns the *actual* size of the state.
 // Intended to be used when saving to state to a buffer.
 size_t llama_state_get_size(llama_context * ctx) {
-    return ctx->state_get_size();
+    return llama_state_get_size_ext(ctx, 0);
+}
+
+size_t llama_state_get_size_ext(llama_context * ctx, llama_state_seq_flags flags) {
+    return ctx->state_get_size(flags);
 }
 
 size_t llama_state_get_data(llama_context * ctx, uint8_t * dst, size_t size) {
+    return llama_state_get_data_ext(ctx, dst, size, 0);
+}
+
+size_t llama_state_get_data_ext(
+        llama_context * ctx, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
     ctx->synchronize();
 
-    return ctx->state_get_data(dst, size);
+    return ctx->state_get_data(dst, size, flags);
 }
 
 // Sets the state reading from the specified source address
 size_t llama_state_set_data(llama_context * ctx, const uint8_t * src, size_t size) {
+    return llama_state_set_data_ext(ctx, src, size, 0);
+}
+
+size_t llama_state_set_data_ext(
+        llama_context * ctx, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
     ctx->synchronize();
 
-    return ctx->state_set_data(src, size);
+    return ctx->state_set_data(src, size, flags);
 }
 
 bool llama_state_load_file(llama_context * ctx, const char * path_session, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {

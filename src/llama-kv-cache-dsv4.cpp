@@ -40,6 +40,14 @@ static uint32_t dsv4_comp_size(uint32_t kv_size, uint32_t ratio) {
     return std::max<uint32_t>(1, (kv_size + ratio - 1)/ratio);
 }
 
+static uint32_t dsv4_physical_ubatch(uint32_t n_ubatch, uint32_t n_seq_max) {
+    const uint64_t expanded = uint64_t(n_ubatch)*std::max<uint32_t>(1, n_seq_max);
+    if (expanded > uint64_t(std::numeric_limits<uint32_t>::max())) {
+        throw std::overflow_error("DSV4 coupled physical ubatch overflows uint32_t");
+    }
+    return uint32_t(expanded);
+}
+
 static int64_t dsv4_stream_offset(uint32_t n_stream, llama_seq_id seq_id, uint32_t size) {
     if (n_stream <= 1) {
         return 0;
@@ -941,7 +949,9 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
                  uint32_t   n_ubatch,
                  uint32_t   n_pad,
     const layer_filter_cb & filter,
-    const  layer_reuse_cb & reuse) :
+    const  layer_reuse_cb & reuse,
+                 uint32_t   tail_tokens,
+                ggml_type   tail_type) :
     hparams_raw(model.hparams),
     hparams_csa(model.hparams),
     hparams_hca(model.hparams),
@@ -967,11 +977,12 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
 
     kv_raw = std::make_unique<llama_kv_cache_iswa>(
             model, hparams_raw, type_k, type_v,
-            // This raw DSV4 cache never enables KVarN. n_batch is therefore
-            // unused by its standard children; use n_ubatch to preserve the
-            // original allocation behavior through the common constructor.
-            v_trans, offload, swa_full, unified_raw, kv_size, n_seq_max, n_ubatch, n_ubatch, n_pad,
-            nullptr, filter_raw, reuse, nullptr, llama_kvarn_default_params());
+            // Coupled tokens can fan out to one raw row per sequence. Size both
+            // the raw SWA write window and exact-tail reserve for that bound.
+            v_trans, offload, swa_full, unified_raw, kv_size, n_seq_max,
+            dsv4_physical_ubatch(n_ubatch, n_seq_max), dsv4_physical_ubatch(n_ubatch, n_seq_max), n_pad,
+            nullptr, filter_raw, reuse, nullptr, llama_kvarn_default_params(),
+            0, tail_tokens, tail_type);
 
     dsv4_make_k_only(hparams_csa);
     dsv4_make_k_only(hparams_hca);
@@ -1269,6 +1280,23 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_dsv4::memory_breakdo
     return mb;
 }
 
+uint32_t llama_kv_cache_dsv4::get_kv_tail_group_count() const {
+    return kv_raw->get_kv_tail_group_count();
+}
+
+bool llama_kv_cache_dsv4::get_kv_tail_coverage(
+        uint32_t group_index, llama_seq_id seq_id, llama_kv_tail_coverage_info & out) const {
+    return kv_raw->get_kv_tail_coverage(group_index, seq_id, out);
+}
+
+void llama_kv_cache_dsv4::reset_kv_tail_planner_timing() {
+    kv_raw->reset_kv_tail_planner_timing();
+}
+
+uint64_t llama_kv_cache_dsv4::get_kv_tail_planner_timing_ns() const {
+    return kv_raw->get_kv_tail_planner_timing_ns();
+}
+
 void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     const bool partial_only = flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
 
@@ -1483,8 +1511,29 @@ uint32_t llama_kv_cache_dsv4_raw_context::get_n_write() const {
     return ubatches_write[i_next].n_tokens;
 }
 
+uint32_t llama_kv_cache_dsv4_raw_context::get_tail_tokens() const {
+    return kv_swa->get_tail_tokens();
+}
+
+uint32_t llama_kv_cache_dsv4_raw_context::get_tail_arena_stride() const {
+    return kv_swa->get_tail_arena_stride();
+}
+
+uint32_t llama_kv_cache_dsv4_raw_context::get_tail_attention_stride(uint32_t n_query_tokens) const {
+    return kv_swa->get_tail_attention_stride(n_query_tokens);
+}
+
 ggml_tensor * llama_kv_cache_dsv4_raw_context::get_k(ggml_context * ctx, int32_t il) const {
     return kv_swa->get_k(ctx, il, n_kv, sinfos_read[i_next]);
+}
+
+ggml_tensor * llama_kv_cache_dsv4_raw_context::get_k_tail(ggml_context * ctx, int32_t il) const {
+    return kv_swa->get_k_tail(ctx, il);
+}
+
+ggml_tensor * llama_kv_cache_dsv4_raw_context::get_k_tail_fallback(
+        ggml_context * ctx, int32_t il, ggml_tensor * body_idxs) const {
+    return kv_swa->get_k_tail_fallback(ctx, il, body_idxs);
 }
 
 ggml_tensor * llama_kv_cache_dsv4_raw_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
@@ -1516,6 +1565,29 @@ ggml_tensor * llama_kv_cache_dsv4_raw_context::cpy_k(ggml_context * ctx, ggml_te
     return res;
 }
 
+ggml_tensor * llama_kv_cache_dsv4_raw_context::cpy_k_tail(
+        ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * tail_idxs, int32_t il) const {
+    if (tail_idxs == nullptr || k_cur->ne[2] == tail_idxs->ne[0]) {
+        return kv_swa->cpy_k_tail(ctx, k_cur, tail_idxs, il);
+    }
+
+    GGML_ASSERT(tail_idxs->ne[0] % k_cur->ne[2] == 0);
+    const int64_t n_fanout = tail_idxs->ne[0] / k_cur->ne[2];
+    ggml_tensor * res = nullptr;
+    for (int64_t s = 0; s < n_fanout; ++s) {
+        ggml_tensor * tail_idxs_s = ggml_view_1d(
+                ctx, tail_idxs, k_cur->ne[2], s*k_cur->ne[2]*ggml_element_size(tail_idxs));
+        ggml_tensor * cur = kv_swa->cpy_k_tail(ctx, k_cur, tail_idxs_s, il);
+        if (res == nullptr) {
+            res = cur;
+        } else {
+            res = ggml_add(ctx, res, ggml_sub(ctx, cur, cur));
+        }
+    }
+
+    return res;
+}
+
 ggml_tensor * llama_kv_cache_dsv4_raw_context::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
     const uint32_t n_tokens = ubatches_write.empty() ? ubatch.n_tokens : ubatches_write[i_next].n_tokens;
 
@@ -1523,6 +1595,11 @@ ggml_tensor * llama_kv_cache_dsv4_raw_context::build_input_k_idxs(ggml_context *
     ggml_set_input(k_idxs);
 
     return k_idxs;
+}
+
+ggml_tensor * llama_kv_cache_dsv4_raw_context::build_input_tail_idxs(
+        ggml_context * ctx, const llama_ubatch & ubatch) const {
+    return kv_swa->build_input_tail_idxs(ctx, ubatches_write.empty() ? ubatch : ubatches_write[i_next]);
 }
 
 ggml_tensor * llama_kv_cache_dsv4_raw_context::build_input_k_rot(ggml_context * ctx) const {
@@ -1533,8 +1610,20 @@ void llama_kv_cache_dsv4_raw_context::set_input_k_idxs(ggml_tensor * dst) const 
     kv_swa->set_input_k_idxs(dst, &ubatches_write[i_next], sinfos_write[i_next]);
 }
 
+void llama_kv_cache_dsv4_raw_context::set_input_tail_idxs(
+        ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    kv_swa->set_input_tail_idxs(dst, ubatches_write.empty() ? ubatch : &ubatches_write[i_next]);
+}
+
 void llama_kv_cache_dsv4_raw_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     kv_swa->set_input_kq_mask(dst, ubatch, causal_attn);
+}
+
+void llama_kv_cache_dsv4_raw_context::set_input_kq_mask_tail(
+        ggml_tensor * body, ggml_tensor * exact,
+        ggml_tensor * read_idxs, ggml_tensor * body_read_idxs, ggml_tensor * bias_read_idxs,
+        const llama_ubatch * ubatch) const {
+    kv_swa->set_input_kq_mask_tail(body, exact, read_idxs, body_read_idxs, bias_read_idxs, ubatch, n_kv);
 }
 
 void llama_kv_cache_dsv4_raw_context::set_input_k_rot(ggml_tensor * dst) const {

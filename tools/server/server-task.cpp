@@ -1585,6 +1585,13 @@ json server_task_result_metrics::to_json() {
         { "n_decode_total",                  n_decode_total },
         { "n_busy_slots_total",              n_busy_slots_total },
 
+        { "kv_tail_requested",               kv_tail_requested },
+        { "kv_tail_exact",                   kv_tail_exact },
+        { "kv_tail_complete_groups",         kv_tail_complete_groups },
+        { "kv_tail_partial_groups",          kv_tail_partial_groups },
+        { "kv_tail_none_groups",             kv_tail_none_groups },
+        { "kv_tail_degraded_sequences",      kv_tail_degraded_sequences },
+
         { "slots",                           slots_data },
     };
 }

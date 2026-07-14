@@ -147,9 +147,9 @@ struct llama_context {
     // state save/load
     //
 
-    size_t state_get_size();
-    size_t state_get_data(      uint8_t * dst, size_t size);
-    size_t state_set_data(const uint8_t * src, size_t size);
+    size_t state_get_size(llama_state_seq_flags flags = 0);
+    size_t state_get_data(      uint8_t * dst, size_t size, llama_state_seq_flags flags = 0);
+    size_t state_set_data(const uint8_t * src, size_t size, llama_state_seq_flags flags = 0);
 
     size_t state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags);
 
@@ -267,7 +267,7 @@ private:
     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
 
     // TODO: read/write lora adapters and cvec
-    size_t state_write_data(llama_io_write_i & io);
+    size_t state_write_data(llama_io_write_i & io, llama_state_seq_flags flags = 0);
     size_t state_read_data (llama_io_read_i  & io);
 
     size_t state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags);

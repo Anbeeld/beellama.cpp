@@ -170,6 +170,18 @@ static void test(void) {
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
     params = common_params();
+    argv = {"binary_name", "--kv-tail-tokens", "auto,128"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+
+    params = common_params();
+    argv = {"binary_name", "--kv-tail-tokens", "full=128,full=256"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+
+    params = common_params();
+    argv = {"binary_name", "--kv-tail-type", "f32"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+
+    params = common_params();
     argv = {"binary_name", "--spec-draft-type-k", "kvarn8"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
@@ -240,8 +252,45 @@ static void test(void) {
     argv = {"binary_name", "-m", "model_file.gguf"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.model.path == "model_file.gguf");
+    assert(params.kv_tail_tokens == "0");
+    assert(params.kv_tail_type == GGML_TYPE_F16);
+    assert(common_context_params_to_llama(params).kv_tail_tokens == 0);
+    assert(common_context_params_to_llama(params).kv_tail_type == GGML_TYPE_F16);
 
-    argv = {"binary_name", "-t", "1234"};
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--kv-tail-tokens", "2048", "--kv-tail-type", "bf16"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.kv_tail_tokens == "2048");
+    assert(params.kv_tail_type == GGML_TYPE_BF16);
+    assert(common_context_params_to_llama(params).kv_tail_tokens == 2048);
+    assert(common_context_params_to_llama(params).kv_tail_type == GGML_TYPE_BF16);
+
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--kv-tail-tokens", "auto"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.kv_tail_tokens == "auto");
+
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--kv-tail-tokens", "128,512"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.kv_tail_tokens == "128,512");
+
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--kv-tail-tokens", "full@l0=128,swa@l1=512"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.kv_tail_tokens == "full@l0=128,swa@l1=512");
+
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--batch-layout", "round-robin", "--logits-out", "tail-logits.bin"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_BENCH));
+    assert(params.batched_bench_batch_layout == "round-robin");
+    assert(params.batched_bench_logits_out == "tail-logits.bin");
+
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--batch-layout", "invalid"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_BENCH));
+
+    argv = {"binary_name", "-m", "model_file.gguf", "-t", "1234"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.cpuparams.n_threads == 1234);
 

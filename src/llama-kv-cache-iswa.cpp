@@ -30,13 +30,16 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
-          llama_kvarn_params kvarn) :
+          llama_kvarn_params kvarn,
+                 uint32_t tail_tokens,
+                 uint32_t tail_tokens_swa,
+                ggml_type tail_type) :
     llama_kv_cache_iswa(
             model, model.hparams,
             type_k, type_v,
             v_trans, offload, swa_full, unified,
             kv_size, n_seq_max, n_batch, n_ubatch, n_pad,
-            mem_other, filter, reuse, share, kvarn) {
+            mem_other, filter, reuse, share, kvarn, tail_tokens, tail_tokens_swa, tail_type) {
 }
 
 llama_kv_cache_iswa::llama_kv_cache_iswa(
@@ -57,7 +60,10 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
-          llama_kvarn_params kvarn) : unified(unified) {
+          llama_kvarn_params kvarn,
+                 uint32_t tail_tokens,
+                 uint32_t tail_tokens_swa,
+                ggml_type tail_type) : unified(unified) {
 
     // chain filters
     const layer_filter_cb filter_base = [&](int32_t il) {
@@ -109,6 +115,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                 __func__, llama_kvarn_type_name(kvarn.type), llama_kvarn_type_name(kvarn_swa.type));
     }
 
+    bool warned_kvarn_tail = false;
     auto make_cache = [&](uint32_t size, uint32_t n_swa, llama_swa_type swa_type,
                           const layer_filter_cb & layer_filter, llama_memory_t cache_mem_other,
                           const llama_kvarn_params & cache_kvarn) -> std::unique_ptr<llama_memory_i> {
@@ -117,6 +124,11 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         const bool kvarn_ok = cache_kvarn.type != LLAMA_KVARN_TYPE_DISABLED &&
             !(n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE && n_seq_max > 1 && !unified);
         if (kvarn_ok) {
+            const uint32_t requested_tail = n_swa > 0 ? tail_tokens_swa : tail_tokens;
+            if (requested_tail > 0 && !warned_kvarn_tail) {
+                LLAMA_LOG_WARN("%s: standard KV tail is ignored by KVarN cache components; standard components still apply it\n", __func__);
+                warned_kvarn_tail = true;
+            }
             // Structured KVarN records do not participate in cross-context
             // sharing, so cache_mem_other and share are intentionally omitted.
             return std::make_unique<llama_kv_cache_kvarn>(
@@ -128,7 +140,8 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         return std::make_unique<llama_kv_cache>(
                 model, hparams, type_k, type_v,
                 v_trans, offload, unified, size, n_seq_max, n_pad,
-                n_swa, swa_type, cache_mem_other, layer_filter, reuse, share);
+                n_swa, swa_type, cache_mem_other, layer_filter, reuse, share,
+                n_ubatch, n_swa > 0 ? tail_tokens_swa : tail_tokens, tail_type);
     };
 
     LLAMA_LOG_INFO("%s: creating non-SWA KV cache, size = %u cells\n", __func__, size_base);
@@ -219,6 +232,26 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_iswa::memory_breakdo
         mb[buft_size.first] += buft_size.second;
     }
     return mb;
+}
+
+uint32_t llama_kv_cache_iswa::get_kv_tail_group_count() const {
+    return kv_base->get_kv_tail_group_count() + kv_swa->get_kv_tail_group_count();
+}
+
+bool llama_kv_cache_iswa::get_kv_tail_coverage(
+        uint32_t group_index, llama_seq_id seq_id, llama_kv_tail_coverage_info & out) const {
+    const uint32_t n_base = kv_base->get_kv_tail_group_count();
+    return group_index < n_base ? kv_base->get_kv_tail_coverage(group_index, seq_id, out) :
+            kv_swa->get_kv_tail_coverage(group_index - n_base, seq_id, out);
+}
+
+void llama_kv_cache_iswa::reset_kv_tail_planner_timing() {
+    kv_base->reset_kv_tail_planner_timing();
+    kv_swa->reset_kv_tail_planner_timing();
+}
+
+uint64_t llama_kv_cache_iswa::get_kv_tail_planner_timing_ns() const {
+    return kv_base->get_kv_tail_planner_timing_ns() + kv_swa->get_kv_tail_planner_timing_ns();
 }
 
 bool llama_kv_cache_iswa::requires_state_for_partial_restore() const {

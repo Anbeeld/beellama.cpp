@@ -30,7 +30,10 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
-          llama_kvarn_params   kvarn = llama_kvarn_default_params());
+          llama_kvarn_params   kvarn = llama_kvarn_default_params(),
+                     uint32_t   tail_tokens = 0,
+                     uint32_t   tail_tokens_swa = 0,
+                    ggml_type   tail_type = GGML_TYPE_F16);
 
     // DSV4 uses a projected hparams view for its raw iSWA cache.  Keep this
     // explicit overload so KVarN support does not erase that upstream need.
@@ -52,7 +55,10 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
-          llama_kvarn_params   kvarn = llama_kvarn_default_params());
+          llama_kvarn_params   kvarn = llama_kvarn_default_params(),
+                     uint32_t   tail_tokens = 0,
+                     uint32_t   tail_tokens_swa = 0,
+                    ggml_type   tail_type = GGML_TYPE_F16);
 
     ~llama_kv_cache_iswa() = default;
 
@@ -91,6 +97,11 @@ public:
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
+    uint32_t get_kv_tail_group_count() const override;
+    bool get_kv_tail_coverage(uint32_t group_index, llama_seq_id seq_id,
+            llama_kv_tail_coverage_info & out) const override;
+    void reset_kv_tail_planner_timing() override;
+    uint64_t get_kv_tail_planner_timing_ns() const override;
 
     // state write/load
 

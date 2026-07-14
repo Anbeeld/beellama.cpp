@@ -636,6 +636,10 @@ struct common_params {
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
+    // Kept unresolved until the target model's canonical cache groups are known.
+    std::string kv_tail_tokens = "0";
+    ggml_type   kv_tail_type   = GGML_TYPE_F16;
+
     // KVarN is selected by its pseudo cache-type names in the argument parser.
     // The backing ggml types remain the matching standard q formats for layers
     // that are not eligible for structured KVarN storage.
@@ -749,6 +753,8 @@ struct common_params {
     std::vector<int32_t> n_pp;
     std::vector<int32_t> n_tg;
     std::vector<int32_t> n_pl;
+    std::string batched_bench_batch_layout = "seq-major";
+    std::string batched_bench_logits_out;
 
     // retrieval params
     std::vector<std::string> context_files; // context files to embed

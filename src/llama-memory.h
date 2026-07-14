@@ -29,6 +29,10 @@ struct llama_memory_params {
     // fork-specific structured KVarN cache; disabled leaves upstream memory selection unchanged
     llama_kvarn_params kvarn;
 
+    uint32_t  kv_tail_tokens;
+    uint32_t  kv_tail_tokens_swa;
+    ggml_type kv_tail_type;
+
     llama_memory_t mem_other;
 };
 
@@ -138,6 +142,14 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
+
+    virtual uint32_t get_kv_tail_group_count() const { return 0; }
+    virtual bool get_kv_tail_coverage(
+            uint32_t /* group_index */,
+            llama_seq_id /* seq_id */,
+            llama_kv_tail_coverage_info & /* out */) const { return false; }
+    virtual void reset_kv_tail_planner_timing() {}
+    virtual uint64_t get_kv_tail_planner_timing_ns() const { return 0; }
 
     //
     // state write/read

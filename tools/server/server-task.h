@@ -540,6 +540,13 @@ struct server_task_result_metrics : server_task_result {
     uint64_t n_decode_total     = 0;
     uint64_t n_busy_slots_total = 0;
 
+    uint64_t kv_tail_requested          = 0;
+    uint64_t kv_tail_exact              = 0;
+    uint64_t kv_tail_complete_groups    = 0;
+    uint64_t kv_tail_partial_groups     = 0;
+    uint64_t kv_tail_none_groups        = 0;
+    uint64_t kv_tail_degraded_sequences = 0;
+
     // while we can also use std::vector<server_slot> this requires copying the slot object which can be quite messy
     // therefore, we use json to temporarily store the slot.to_json() result
     json slots_data = json::array();
