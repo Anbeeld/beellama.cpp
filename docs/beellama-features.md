@@ -75,6 +75,66 @@ The user-facing `q2_0` cache name must not be treated as upstream's Q2_0 weight
 format. A requested CUDA FlashAttention pair must be compiled by the selected
 build tier.
 
+## Optional exact tail for standard quantized caches
+
+### What it is
+
+`--kv-tail-tokens` overlays the newest attention-visible entries with F16 or
+BF16 K/V while retaining the complete selected standard quantized cache. Source
+selection is per query, so a 512-token prefill does not make the same 512 rows
+exact for every query. Body and tail logits share one FP32 softmax; the runtime
+does not normalize two attention results independently.
+
+The shadow pool is owned by the standard cache and identifies rows by stream,
+physical cell, and generation. Sequence copies share exact rows within one
+stream and copy them into context-local slots across streams. Position shifts
+rotate exact K rows together with the quantized body. CUDA reads the compact
+pool directly through per-query slot indices and merges against ordinary
+FlashAttention normalization metadata; generic backends gather only the
+configured compact tail width. Neither route materializes the full cache.
+
+### When to use it
+
+Use the tail when q2 through q8 standard caches save needed context memory but
+recent-token quantization changes quality. Start with 64, 128, or 256 tokens and
+measure the exact model and workload. Larger values read more F16/BF16 data and
+are not performance-neutral.
+
+For the documented RTX 3090 Qwen3.6-27B Q5_K_S, symmetric q4_0, BF16-reference
+workload, tail 64 is the measured knee: mean KLD improved 22.8%, while paired
+prompt and generation benchmarks regressed 3.63% and 2.64%. This is an explicit
+workload recommendation, not a broad `auto` match.
+
+### Key arguments and APIs
+
+- [`--kv-tail-tokens`](beellama-args.md#high-precision-tail-for-standard-caches)
+- [`--kv-tail-type`](beellama-args.md#high-precision-tail-for-standard-caches)
+- `llama_kv_tail_config_*` for model-bound group discovery and overrides
+- `llama_kv_tail_get_coverage` for per-sequence, per-group coverage
+- `llama_kv_tail_get_coverage_aggregate` for context/server aggregation
+- `LLAMA_STATE_SEQ_FLAGS_BODY_ONLY` for an intentional lower-precision state export
+
+Implementation decisions and non-local hardware verification packages are in
+[`development/std-quant-kv-tail.md`](development/std-quant-kv-tail.md) and
+[`development/std-quant-kv-tail-backend-verification.md`](development/std-quant-kv-tail-backend-verification.md).
+
+### State and compatibility
+
+The default length is zero. That path allocates no shadows, builds no tail
+inputs, and retains ordinary FlashAttention dispatch. Exact tail states reject
+a different resolved length or F16/BF16 type. A preceding unframed body-only
+state and an explicit framed body-only state remain loadable; both begin with
+observable degraded coverage and refill from original activations on later
+writes. Dequantized body rows are never labeled exact.
+
+### Measurement and validation
+
+Compare against the same ordinary cache pair with identical context, batch,
+ubatch, prompt, and sampling settings. Record persistent VRAM and both prompt
+and generation speed as functions of tail length. `auto` is conservative: no
+unknown model/body/backend combination is enabled, and this release contains no
+recommendation without a recorded quality and performance curve.
+
 ## Upstream DFlash with profit adaptation
 
 ### What it is

@@ -17,6 +17,31 @@ KVarN values are `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`, `kvarn6`, and
 | `--cache-type-k-swa TYPE` | `LLAMA_ARG_CACHE_TYPE_K_SWA` | Same as `--cache-type-k` | Overrides KVarN K precision for SWA layers. Accepts only the six `kvarnN` values, requires target KVarN, and must be paired with the V override. |
 | `--cache-type-v-swa TYPE` | `LLAMA_ARG_CACHE_TYPE_V_SWA` | Same as `--cache-type-v` | Overrides KVarN V precision for SWA layers. Accepts only the six `kvarnN` values, requires target KVarN, and must be paired with the K override. |
 
+## High-precision tail for standard caches
+
+The standard-cache tail keeps the complete ordinary quantized cache and a compact
+F16 or BF16 shadow for each query's newest visible entries. It applies only to
+quantized sides of target-model standard attention caches. Draft and auxiliary
+contexts remain at the disabled default, and KVarN components warn and ignore it.
+
+| Argument | Env var | Default | Behavior |
+|---|---|---|---|
+| `--kv-tail-tokens SPEC` | `LLAMA_ARG_KV_TAIL_TOKENS` | `0` | `0` keeps the ordinary cache path. A number applies to every cache group. `N0,N1` follows canonical group order, while `full=N,swa=N` accepts unique role aliases or structural IDs such as `full@l0`. Invalid, duplicate, incomplete, or wrong-length specifications disable every group. `auto` resolves to zero unless the exact model structure, ordered body pair, tail type, and backend have a published recommendation. |
+| `--kv-tail-type TYPE` | `LLAMA_ARG_KV_TAIL_TYPE` | `f16` | Selects `f16` or `bf16` exact-shadow storage for the context. Other types are rejected. |
+
+Explicit values are capped by the group's effective attention window and context
+capacity. Startup logs show the structural group ID, participating layer count,
+requested length, resolved length, type, physical slots, payload bytes, and
+in-flight reserve. Only a quantized K side receives a K shadow, and only a
+quantized V side receives a V shadow.
+
+Tail-enabled state uses a framed standard-memory section. Exact restore requires
+the same structural group, resolved length, and tail type. The extended full and
+sequence state APIs accept `LLAMA_STATE_SEQ_FLAGS_BODY_ONLY` to deliberately omit
+exact shadows; loading that state into a tail-enabled context is valid, but the
+coverage API reports `LLAMA_KV_TAIL_DEGRADED_BODY_ONLY_STATE` until new writes
+refill the recent window.
+
 ## DFlash and adaptive draft depth
 
 The first five rows are upstream speculative controls with Bee-specific DFlash
