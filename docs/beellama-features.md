@@ -79,19 +79,31 @@ build tier.
 
 ### What it is
 
-`--kv-tail-tokens` overlays the newest attention-visible entries with F16 or
-BF16 K/V while retaining the complete selected standard quantized cache. Source
-selection is per query, so a 512-token prefill does not make the same 512 rows
-exact for every query. Body and tail logits share one FP32 softmax; the runtime
-does not normalize two attention results independently.
+`--kv-tail-tokens` makes the newest attention-visible entries exact in F16 or
+BF16. A partial request overlays a compact exact shadow while retaining the
+complete selected standard quantized cache. A request covering a group's full
+visibility window may instead promote its owned body to native F16/BF16 when
+that representation is supported and its memory increment is no greater than
+the overlay. Shared quantized bodies are never promoted. Source selection is
+per query, so a 512-token prefill does not make the same 512 rows exact for
+every query. Body and tail logits share one FP32 softmax; the runtime does not
+normalize two attention results independently.
 
-The shadow pool is owned by the standard cache and identifies rows by stream,
-physical cell, and generation. Sequence copies share exact rows within one
-stream and copy them into context-local slots across streams. Position shifts
-rotate exact K rows together with the quantized body. CUDA reads the compact
-pool directly through per-query slot indices and merges against ordinary
-FlashAttention normalization metadata; generic backends gather only the
-configured compact tail width. Neither route materializes the full cache.
+The overlay shadow pool is owned by the standard cache and identifies rows by
+stream, physical cell, and generation. Sequence copies share exact rows within
+one stream and copy them into context-local slots across streams. Position
+shifts rotate exact K rows together with the quantized body. CUDA can read the
+compact pool directly through per-query slot indices and merge against ordinary
+FlashAttention normalization metadata; the generic graph gathers only the
+configured compact tail width. Neither overlay route materializes the full
+cache. Native-exact groups use the ordinary body graph and allocate no shadow.
+
+SWA storage remains upstream-aligned at `W + U` physical rows (window plus
+ubatch reserve); this feature does not compact the SWA ring. Sparse packing of
+generic body rows is enabled only when the complete physical stream fits in the
+per-sequence arena, so cached-graph eligibility cannot change with occupancy,
+restore, or coverage degradation. Outside that bound the ordinary body route is
+used.
 
 ### When to use it
 
@@ -100,10 +112,10 @@ recent-token quantization changes quality. Start with 64, 128, or 256 tokens and
 measure the exact model and workload. Larger values read more F16/BF16 data and
 are not performance-neutral.
 
-For the documented RTX 3090 Qwen3.6-27B Q5_K_S, symmetric q4_0, BF16-reference
-workload, tail 64 is the measured knee: mean KLD improved 22.8%, while paired
-prompt and generation benchmarks regressed 3.63% and 2.64%. This is an explicit
-workload recommendation, not a broad `auto` match.
+`auto` requests 1024 exact tokens for every applicable canonical standard-cache
+group and caps each request by that group's effective context or attention
+window. It is deliberately architecture-agnostic and is not a claim that 1024
+is the quality or performance optimum for a particular model.
 
 ### Key arguments and APIs
 
@@ -120,20 +132,36 @@ Implementation decisions and non-local hardware verification packages are in
 
 ### State and compatibility
 
-The default length is zero. That path allocates no shadows, builds no tail
-inputs, and retains ordinary FlashAttention dispatch. Exact tail states reject
-a different resolved length or F16/BF16 type. A preceding unframed body-only
-state and an explicit framed body-only state remain loadable; both begin with
-observable degraded coverage and refill from original activations on later
-writes. Dequantized body rows are never labeled exact.
+The default length is zero. That path preserves the ordinary topology and
+allocation, builds no tail inputs, and retains ordinary FlashAttention
+dispatch. Overlay states reject a different structural group, resolved length,
+representation, or F16/BF16 type. Native-exact state is already present in the
+ordinary body and has no duplicate shadow section. A preceding unframed
+body-only state and an explicit framed body-only state remain loadable into an
+overlay context; both begin with observable degraded coverage and refill from
+original activations on later writes. Dequantized body rows are never labeled
+exact. Server metrics report requested and exact tokens, coverage group states,
+and degraded sequences.
+
+### Backend routes
+
+CUDA supports the generic graph and the attached-tail FlashAttention route.
+CPU and Vulkan support the complete generic standard-quant graph. Metal, HIP,
+SYCL, and generic OpenCL contain the same generic operator families, subject to
+their normal device and toolchain capabilities. OpenCL's Adreno-transformed
+weight layouts are rejected by these row operators; flat standard-cache storage
+uses the generic kernels. CANN does not yet provide native packed standard-quant
+SET_ROWS and OUT_PROD kernels, so such operations are rejected by CANN and may
+be scheduled to another backend. Startup diagnostics name the selected native
+or generic route; generic long-context attention can be substantially slower.
 
 ### Measurement and validation
 
 Compare against the same ordinary cache pair with identical context, batch,
-ubatch, prompt, and sampling settings. Record persistent VRAM and both prompt
-and generation speed as functions of tail length. `auto` is conservative: no
-unknown model/body/backend combination is enabled, and this release contains no
-recommendation without a recorded quality and performance curve.
+ubatch, prompt, and sampling settings. Record the selected representation,
+persistent VRAM, and both prompt and generation speed as functions of tail
+length. Treat the uniform capped-1024 `auto` setting as a starting policy and
+measure the exact workload before deploying it.
 
 ## Upstream DFlash with profit adaptation
 

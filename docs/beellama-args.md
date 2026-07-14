@@ -19,28 +19,42 @@ KVarN values are `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`, `kvarn6`, and
 
 ## High-precision tail for standard caches
 
-The standard-cache tail keeps the complete ordinary quantized cache and a compact
-F16 or BF16 shadow for each query's newest visible entries. It applies only to
-quantized sides of target-model standard attention caches. Draft and auxiliary
-contexts remain at the disabled default, and KVarN components warn and ignore it.
+The standard-cache tail makes the newest attention-visible entries exact in F16
+or BF16. A partial tail keeps the complete ordinary quantized cache and adds a
+compact shadow. A full-window request may instead promote an owned cache group
+to a native exact body when promotion is supported and costs no more memory than
+the shadow. It applies only to quantized sides of target-model standard
+attention caches. Draft and auxiliary contexts remain at the disabled default,
+and KVarN components warn and ignore it.
 
 | Argument | Env var | Default | Behavior |
 |---|---|---|---|
-| `--kv-tail-tokens SPEC` | `LLAMA_ARG_KV_TAIL_TOKENS` | `0` | `0` keeps the ordinary cache path. A number applies to every cache group. `N0,N1` follows canonical group order, while `full=N,swa=N` accepts unique role aliases or structural IDs such as `full@l0`. Invalid, duplicate, incomplete, or wrong-length specifications disable every group. `auto` resolves to zero unless the exact model structure, ordered body pair, tail type, and backend have a published recommendation. |
-| `--kv-tail-type TYPE` | `LLAMA_ARG_KV_TAIL_TYPE` | `f16` | Selects `f16` or `bf16` exact-shadow storage for the context. Other types are rejected. |
+| `--kv-tail-tokens SPEC` | `LLAMA_ARG_KV_TAIL_TOKENS` | `0` | `0` keeps the ordinary cache path. A number applies to every cache group. `N0,N1` follows canonical group order, while `full=N,swa=N` accepts unique role aliases or structural IDs such as `full@l0`. Invalid, duplicate, incomplete, or wrong-length specifications disable every group. `auto` requests 1024 exact tokens for every applicable standard-cache group, capped by that group's effective context or attention window. This is a uniform policy, not a model-specific optimum. |
+| `--kv-tail-type TYPE` | `LLAMA_ARG_KV_TAIL_TYPE` | `f16` | Selects `f16` or `bf16` exact storage for overlay shadows or a promoted native-exact body. Other types are rejected. |
 
 Explicit values are capped by the group's effective attention window and context
-capacity. Startup logs show the structural group ID, participating layer count,
-requested length, resolved length, type, physical slots, payload bytes, and
-in-flight reserve. Only a quantized K side receives a K shadow, and only a
-quantized V side receives a V shadow.
+capacity. Startup logs show the structural group ID, participating layers,
+requested and effective lengths, selected overlay or native-exact
+representation, actual body and shadow types, physical rows, arena and sink
+rows, and memory increments. Only a quantized K side receives an added K
+shadow, and only a quantized V side receives an added V shadow. A native-exact
+group has no shadow or tail planner because its ordinary body is exact.
 
-Tail-enabled state uses a framed standard-memory section. Exact restore requires
-the same structural group, resolved length, and tail type. The extended full and
-sequence state APIs accept `LLAMA_STATE_SEQ_FLAGS_BODY_ONLY` to deliberately omit
-exact shadows; loading that state into a tail-enabled context is valid, but the
-coverage API reports `LLAMA_KV_TAIL_DEGRADED_BODY_ONLY_STATE` until new writes
-refill the recent window.
+SWA groups keep the upstream-aligned physical `W + U` allocation, where `W` is
+the sliding window and `U` is the ubatch reserve. Exact-tail selection does not
+compact or otherwise change that ring. The generic sparse-body route is used
+only when the complete physical stream fits in the per-sequence exact arena;
+larger streams deterministically use the ordinary body route.
+
+Overlay state uses a framed standard-memory section. Exact restore requires the
+same structural group, resolved length, representation, and exact type. Native
+exact state is carried by the ordinary body and does not serialize a duplicate
+shadow. The extended full and sequence state APIs accept
+`LLAMA_STATE_SEQ_FLAGS_BODY_ONLY` to deliberately omit overlay shadows; loading
+that state into a tail-enabled context is valid, but the coverage API reports
+`LLAMA_KV_TAIL_DEGRADED_BODY_ONLY_STATE` until new writes refill the recent
+window. Server metrics expose requested/exact token totals, complete/partial/no
+coverage group counts, and degraded-sequence counts.
 
 ## DFlash and adaptive draft depth
 
