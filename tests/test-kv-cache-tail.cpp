@@ -22,6 +22,52 @@ static llama_kv_tail_identity id(uint32_t cell, uint64_t generation = 1) {
 }
 
 int main() {
+    assert(!llama_kv_tail_sparse_body_capacity_safe(0, 0));
+    assert(llama_kv_tail_sparse_body_capacity_safe(255, 256));
+    assert(llama_kv_tail_sparse_body_capacity_safe(256, 256));
+    assert(!llama_kv_tail_sparse_body_capacity_safe(257, 256));
+
+    // Automatic resolution is architecture-agnostic for standard KV groups:
+    // every applicable group requests 1024 and is capped by its own window.
+    std::vector<llama_kv_tail_group_request> group_requests = {
+        { 0, 65536, true },
+    };
+    auto resolved_groups = llama_kv_tail_resolve_groups(true, true, group_requests);
+    CHECK(resolved_groups.valid);
+    CHECK(resolved_groups.tokens == std::vector<uint32_t>({ 1024 }));
+
+    group_requests = {
+        { 0, 16384, true },
+        { 0, 1024,  true },
+    };
+    resolved_groups = llama_kv_tail_resolve_groups(true, true, group_requests);
+    CHECK(resolved_groups.tokens == std::vector<uint32_t>({ 1024, 1024 }));
+
+    group_requests = {
+        { 0, 384, true },       // small standard context
+        { 0, 8192, false },     // recurrent/raw-special/non-standard group
+    };
+    resolved_groups = llama_kv_tail_resolve_groups(true, true, group_requests);
+    CHECK(resolved_groups.tokens == std::vector<uint32_t>({ 384, 0 }));
+
+    // Unknown model architecture does not matter when the group is ordinary
+    // standard KV; applicability, not a model-name table, is authoritative.
+    group_requests = { { 0, 2048, true } };
+    resolved_groups = llama_kv_tail_resolve_groups(true, true, group_requests);
+    CHECK(resolved_groups.tokens == std::vector<uint32_t>({ 1024 }));
+
+    // Explicit values bypass auto while retaining per-group caps.
+    group_requests = { { 1536, 4096, true }, { 2048, 512, true } };
+    resolved_groups = llama_kv_tail_resolve_groups(false, true, group_requests);
+    CHECK(resolved_groups.valid);
+    CHECK(resolved_groups.tokens == std::vector<uint32_t>({ 1536, 512 }));
+
+    // An incomplete explicit specification fails atomically; it cannot leave
+    // one group enabled from a partially applied request.
+    resolved_groups = llama_kv_tail_resolve_groups(false, false, group_requests);
+    CHECK(!resolved_groups.valid);
+    CHECK(resolved_groups.tokens == std::vector<uint32_t>({ 0, 0 }));
+
     // Single-sequence decode never has ragged sequence-membership levels, so
     // every write receives an arena destination and needs no discard sink.
     // Multi-sequence batches retain one ubatch-sized sink for absent levels.
@@ -43,59 +89,109 @@ int main() {
             uint64_t physical_body_rows,
             uint64_t promotion_bytes_per_row,
             uint64_t overlay_bytes_per_row,
+            uint64_t requested_body_bytes_per_row = 5632,
             bool native_capable = true,
             bool already_exact = false,
+            bool has_owned_body = true,
+            bool has_shared_body = false,
+            bool shadow_k_capable = true,
+            bool shadow_v_capable = true,
             ggml_type body_type_k = GGML_TYPE_Q5_0,
             ggml_type body_type_v = GGML_TYPE_Q5_0) {
         return llama_kv_tail_storage_request {
             body_type_k, body_type_v, GGML_TYPE_BF16,
-            n_tokens, 1, 512, visibility_window,
-            physical_body_rows, promotion_bytes_per_row, overlay_bytes_per_row,
-            native_capable, already_exact,
+            n_tokens, n_tokens, 1, 512, visibility_window,
+            physical_body_rows, requested_body_bytes_per_row,
+            promotion_bytes_per_row, overlay_bytes_per_row,
+            native_capable, already_exact, has_owned_body, has_shared_body,
+            shadow_k_capable, shadow_v_capable,
         };
     };
 
     auto storage = llama_kv_tail_storage_plan_for(storage_request(0, 1024, 1536, 10752, 16384));
     CHECK(storage.kind == LLAMA_KV_TAIL_STORAGE_DISABLED);
+    CHECK(storage.requested_tokens == 0);
+    CHECK(storage.effective_tokens == 0);
+    CHECK(storage.visibility_window == 1024);
+    CHECK(storage.requested_body_type_k == GGML_TYPE_Q5_0);
+    CHECK(storage.requested_body_type_v == GGML_TYPE_Q5_0);
+    CHECK(storage.actual_body_type_k == GGML_TYPE_Q5_0);
+    CHECK(storage.actual_body_type_v == GGML_TYPE_Q5_0);
+    CHECK(!storage.shadow_k && !storage.shadow_v);
+    CHECK(storage.physical_body_rows == 1536);
     CHECK(storage.layout.total_slots == 0);
 
     storage = llama_kv_tail_storage_plan_for(storage_request(512, 1024, 1536, 10752, 16384));
     CHECK(storage.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY);
+    CHECK(storage.requested_tokens == 512);
+    CHECK(storage.effective_tokens == 512);
+    CHECK(storage.visibility_window == 1024);
+    CHECK(storage.shadow_k && storage.shadow_v);
+    CHECK(storage.shadow_type_k == GGML_TYPE_BF16);
+    CHECK(storage.shadow_type_v == GGML_TYPE_BF16);
     CHECK(storage.layout.arena_stride == 1024);
     CHECK(storage.layout.sink_slots == 0);
+    CHECK(storage.requested_body_bytes == uint64_t(1536)*5632);
+    CHECK(storage.actual_body_bytes == storage.requested_body_bytes);
+    CHECK(storage.shadow_bytes == uint64_t(1024)*16384);
+    CHECK(storage.promotion_increment == uint64_t(1536)*10752);
+    CHECK(storage.overlay_increment == uint64_t(1024)*16384);
+    CHECK(storage.has_owned_body);
+    CHECK(!storage.has_shared_body);
 
     // Gemma's compact SWA topology: 1536 promoted rows cost less than a
     // 1536-row symmetric overlay and the requested span covers all visibility.
     storage = llama_kv_tail_storage_plan_for(storage_request(1024, 1024, 1536, 10752, 16384));
     CHECK(storage.kind == LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT);
     CHECK(storage.body_promoted);
-    CHECK(storage.body_type_k == GGML_TYPE_BF16);
-    CHECK(storage.body_type_v == GGML_TYPE_BF16);
-    CHECK(storage.promotion_bytes == uint64_t(1536)*10752);
-    CHECK(storage.overlay_bytes == uint64_t(1536)*16384);
+    CHECK(storage.actual_body_type_k == GGML_TYPE_BF16);
+    CHECK(storage.actual_body_type_v == GGML_TYPE_BF16);
+    CHECK(!storage.shadow_k && !storage.shadow_v);
+    CHECK(storage.actual_body_bytes == storage.requested_body_bytes + storage.promotion_increment);
+    CHECK(storage.shadow_bytes == 0);
+    CHECK(storage.promotion_increment == uint64_t(1536)*10752);
+    CHECK(storage.overlay_increment == uint64_t(1536)*16384);
 
     // A full-sized SWA body is eligible by visibility but not by byte cost.
     storage = llama_kv_tail_storage_plan_for(storage_request(1024, 1024, 16384, 10752, 16384));
     CHECK(storage.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY);
 
     // A shared quantized source cannot be promoted by the child context.
-    storage = llama_kv_tail_storage_plan_for(storage_request(1024, 1024, 1536, 10752, 16384, false));
+    storage = llama_kv_tail_storage_plan_for(storage_request(
+            1024, 1024, 1536, 10752, 16384, 5632, false, false, false, true));
     CHECK(storage.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY);
+    CHECK(!storage.has_owned_body && storage.has_shared_body);
 
     // An already-exact body satisfies any requested suffix without an overlay.
     storage = llama_kv_tail_storage_plan_for(storage_request(
-            512, 1024, 1536, 0, 0, true, true, GGML_TYPE_BF16, GGML_TYPE_F16));
+            512, 1024, 1536, 0, 0, 16384, true, true, true, false,
+            true, true, GGML_TYPE_BF16, GGML_TYPE_F16));
     CHECK(storage.kind == LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT);
     CHECK(!storage.body_promoted);
-    CHECK(storage.body_type_k == GGML_TYPE_BF16);
-    CHECK(storage.body_type_v == GGML_TYPE_F16);
+    CHECK(storage.actual_body_type_k == GGML_TYPE_BF16);
+    CHECK(storage.actual_body_type_v == GGML_TYPE_F16);
 
     // One-sided promotion preserves the side which was already exact.
     storage = llama_kv_tail_storage_plan_for(storage_request(
-            1024, 1024, 1536, 4096, 8192, true, false, GGML_TYPE_Q5_0, GGML_TYPE_F16));
+            1024, 1024, 1536, 4096, 8192, 12288, true, false, true, false,
+            true, true, GGML_TYPE_Q5_0, GGML_TYPE_F16));
     CHECK(storage.kind == LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT);
-    CHECK(storage.body_type_k == GGML_TYPE_BF16);
-    CHECK(storage.body_type_v == GGML_TYPE_F16);
+    CHECK(storage.actual_body_type_k == GGML_TYPE_BF16);
+    CHECK(storage.actual_body_type_v == GGML_TYPE_F16);
+
+    // A structurally empty group cannot allocate or advertise exact coverage.
+    storage = llama_kv_tail_storage_plan_for(storage_request(
+            1024, 1024, 0, 0, 0, 0, false, false, false, false, false, false));
+    CHECK(storage.kind == LLAMA_KV_TAIL_STORAGE_DISABLED);
+    CHECK(storage.requested_tokens == 1024);
+    CHECK(storage.effective_tokens == 0);
+
+    // The plan preserves the uncapped request separately from its effective span.
+    auto capped = storage_request(1024, 1024, 1536, 10752, 16384);
+    capped.requested_tokens = 4096;
+    storage = llama_kv_tail_storage_plan_for(capped);
+    CHECK(storage.requested_tokens == 4096);
+    CHECK(storage.effective_tokens == 1024);
 
     // Equal persistent cost chooses the simpler native graph.
     storage = llama_kv_tail_storage_plan_for(storage_request(1024, 1024, 1536, 4096, 4096));

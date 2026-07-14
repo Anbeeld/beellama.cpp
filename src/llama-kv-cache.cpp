@@ -124,7 +124,8 @@ llama_kv_cache::llama_kv_cache(
     const  layer_share_cb & share,
                  uint32_t   n_ubatch,
                  uint32_t   tail_tokens,
-                ggml_type   tail_type) :
+                ggml_type   tail_type,
+                 uint32_t   tail_tokens_requested) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa),
     tail_tokens(tail_tokens), tail_type(tail_type), swa_type(swa_type),
@@ -154,9 +155,13 @@ llama_kv_cache::llama_kv_cache(
 
     uint64_t promotion_bytes_per_row = 0;
     uint64_t overlay_bytes_per_row = 0;
+    uint64_t requested_body_bytes_per_row = 0;
     bool native_capable = true;
     bool already_exact = true;
     bool has_owned_layer = false;
+    bool has_shared_layer = false;
+    bool shadow_k_capable = false;
+    bool shadow_v_capable = false;
     bool have_source_type = false;
     ggml_type plan_body_type_k = type_k;
     ggml_type plan_body_type_v = type_v;
@@ -198,6 +203,7 @@ llama_kv_cache::llama_kv_cache(
             }
 
             if (shared_layer) {
+                has_shared_layer = true;
                 if (!have_source_type) {
                     plan_body_type_k = actual_type_k;
                     plan_body_type_v = actual_type_v;
@@ -210,6 +216,10 @@ llama_kv_cache::llama_kv_cache(
             const bool quant_k = ggml_is_quantized(actual_type_k);
             const bool quant_v = has_v && ggml_is_quantized(actual_type_v);
             const bool layer_has_quant = quant_k || quant_v;
+            add_row_bytes(requested_body_bytes_per_row, ggml_row_size(actual_type_k, actual_k_dim));
+            if (has_v) {
+                add_row_bytes(requested_body_bytes_per_row, ggml_row_size(actual_type_v, actual_v_dim));
+            }
             already_exact = already_exact && !layer_has_quant;
             if (shared_layer && layer_has_quant) {
                 native_capable = false;
@@ -232,10 +242,12 @@ llama_kv_cache::llama_kv_cache(
 
             if (layer_has_quant) {
                 if (quant_k || actual_type_k == GGML_TYPE_F16 || actual_type_k == GGML_TYPE_BF16) {
+                    shadow_k_capable = true;
                     const ggml_type shadow_type = quant_k ? tail_type : actual_type_k;
                     add_row_bytes(overlay_bytes_per_row, ggml_row_size(shadow_type, actual_k_dim));
                 }
                 if (has_v && (quant_v || actual_type_v == GGML_TYPE_F16 || actual_type_v == GGML_TYPE_BF16)) {
+                    shadow_v_capable = true;
                     const ggml_type shadow_type = quant_v ? tail_type : actual_type_v;
                     add_row_bytes(overlay_bytes_per_row, ggml_row_size(shadow_type, actual_v_dim));
                 }
@@ -249,42 +261,52 @@ llama_kv_cache::llama_kv_cache(
     }
 
     const uint32_t visibility_window = n_swa > 0 ? std::min(n_swa, kv_size) : kv_size;
+    if (tail_tokens_requested == UINT32_MAX) {
+        tail_tokens_requested = tail_tokens;
+    }
     tail_plan = llama_kv_tail_storage_plan_for({
         plan_body_type_k,
         plan_body_type_v,
         tail_type,
+        tail_tokens_requested,
         tail_tokens,
         n_seq_max,
         n_ubatch,
         visibility_window,
         uint64_t(kv_size)*n_stream,
+        requested_body_bytes_per_row,
         promotion_bytes_per_row,
         overlay_bytes_per_row,
         native_capable,
         already_exact,
+        has_owned_layer,
+        has_shared_layer,
+        shadow_k_capable,
+        shadow_v_capable,
     });
 
     if (tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY) {
         tail_arena_stride = tail_plan.layout.arena_stride;
-        tail_attention_stride = tail_tokens;
+        tail_attention_stride = tail_plan.effective_tokens;
         tail_sink_slots = tail_plan.layout.sink_slots;
         tail_slots = tail_plan.layout.total_slots;
         tail = std::make_unique<llama_kv_tail_store>(
-                tail_tokens, n_seq_max, tail_arena_stride, tail_sink_slots);
+                tail_plan.effective_tokens, n_seq_max, tail_arena_stride, tail_sink_slots);
         const char * timing = std::getenv("LLAMA_KV_TAIL_PLANNER_TIMING");
         tail_planner_timing_enabled = timing && std::strcmp(timing, "1") == 0;
         tail_generations.assign(n_stream, std::vector<uint64_t>(kv_size, 0));
     }
 
-    if (tail_tokens > 0) {
-        const char * storage = tail_plan.kind == LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT ? "native_exact" : "overlay";
+    if (tail_plan.requested_tokens > 0) {
+        const char * storage = tail_plan.kind == LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT ? "native_exact" :
+                tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY ? "overlay" : "disabled";
         LLAMA_LOG_INFO("%s: standard KV tail plan: storage=%s requested=%u effective=%u window=%u body=%s/%s actual=%s/%s physical_rows=%llu arena=%u sink=%u overlay_rows=%u promotion=%.2f MiB overlay=%.2f MiB\n",
-                __func__, storage, tail_tokens, tail_tokens, visibility_window,
+                __func__, storage, tail_plan.requested_tokens, tail_plan.effective_tokens, tail_plan.visibility_window,
                 ggml_type_name(type_k), ggml_type_name(type_v),
-                ggml_type_name(tail_plan.body_type_k), ggml_type_name(tail_plan.body_type_v),
-                (unsigned long long) uint64_t(kv_size)*n_stream,
+                ggml_type_name(tail_plan.actual_body_type_k), ggml_type_name(tail_plan.actual_body_type_v),
+                (unsigned long long) tail_plan.physical_body_rows,
                 tail_plan.layout.arena_stride, tail_plan.layout.sink_slots, tail_plan.layout.total_slots,
-                tail_plan.promotion_bytes/1024.0/1024.0, tail_plan.overlay_bytes/1024.0/1024.0);
+                tail_plan.promotion_increment/1024.0/1024.0, tail_plan.overlay_increment/1024.0/1024.0);
     }
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
@@ -370,7 +392,7 @@ llama_kv_cache::llama_kv_cache(
 
                 ggml_tensor * k_tail = nullptr;
                 ggml_tensor * v_tail = nullptr;
-                if (tail) {
+                if (tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY) {
                     ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(layer_share.k->buffer);
                     ggml_context * ctx = ctx_for_buft(buft);
                     if (!ctx) {
@@ -438,15 +460,17 @@ llama_kv_cache::llama_kv_cache(
         const bool has_v = !is_mla;
 
         const bool native_exact = tail_plan.kind == LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT;
-        ggml_type layer_type_k = native_exact ? tail_plan.body_type_k : type_k;
-        ggml_type layer_type_v = native_exact ? tail_plan.body_type_v : type_v;
+        ggml_type layer_type_k = native_exact ? tail_plan.actual_body_type_k : type_k;
+        ggml_type layer_type_v = native_exact ? tail_plan.actual_body_type_v : type_v;
 
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, layer_type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, layer_type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
         const bool layer_has_quant = ggml_is_quantized(layer_type_k) || (has_v && ggml_is_quantized(layer_type_v));
-        const bool shadow_k = tail && has_k && layer_has_quant && (ggml_is_quantized(layer_type_k) ||
+        const bool shadow_k = tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY &&
+                tail_plan.shadow_k && has_k && layer_has_quant && (ggml_is_quantized(layer_type_k) ||
                 layer_type_k == GGML_TYPE_F16 || layer_type_k == GGML_TYPE_BF16);
-        const bool shadow_v = tail && has_v && layer_has_quant && (ggml_is_quantized(layer_type_v) ||
+        const bool shadow_v = tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY &&
+                tail_plan.shadow_v && has_v && layer_has_quant && (ggml_is_quantized(layer_type_v) ||
                 layer_type_v == GGML_TYPE_F16 || layer_type_v == GGML_TYPE_BF16);
         ggml_tensor * k_tail = shadow_k ? ggml_new_tensor_2d(ctx,
                 ggml_is_quantized(layer_type_k) ? tail_type : layer_type_k, n_embd_k_gqa, tail_slots) : nullptr;
@@ -536,12 +560,12 @@ llama_kv_cache::llama_kv_cache(
                 ids << (i ? "," : "") << layers[i].il;
             }
             LLAMA_LOG_INFO("%s: tail type=%s requested=%u effective=%u storage=native_exact physical_rows=%llu shadow=0.00 MiB sink=0 planner=0 state_tail=0 total=%.2f MiB\n",
-                    __func__, ggml_type_name(tail_type), tail_tokens, tail_tokens,
+                    __func__, ggml_type_name(tail_type), tail_plan.requested_tokens, tail_plan.effective_tokens,
                     (unsigned long long) uint64_t(kv_size)*n_stream,
                     (memory_size_k + memory_size_v)/1024.0/1024.0);
             LLAMA_LOG_INFO("KV tail: group=%s layers=%s representation=native_exact route=body body=%s/%s shadow=none requested=%u effective=%u\n",
                     n_swa > 0 ? "swa" : "full", ids.str().c_str(),
-                    actual_type_k_name, actual_type_v_name, tail_tokens, tail_tokens);
+                    actual_type_k_name, actual_type_v_name, tail_plan.requested_tokens, tail_plan.effective_tokens);
         }
 
         if (tail) {
@@ -561,7 +585,7 @@ llama_kv_cache::llama_kv_cache(
                     "(arena=%llu = %u*%u, sink=%u), "
                     "K=%.2f MiB (arena=%.2f sink=%.2f) V=%.2f MiB (arena=%.2f sink=%.2f) "
                     "metadata>=%.2f MiB total=%.2f MiB\n",
-                    __func__, ggml_type_name(tail_type), tail_tokens, tail_tokens, tail_slots,
+                    __func__, ggml_type_name(tail_type), tail_plan.requested_tokens, tail_plan.effective_tokens, tail_slots,
                     (unsigned long long) arena_slots, tail_arena_stride, n_seq_max, tail_sink_slots,
                     tail_k_bytes/1024.0/1024.0, tail_k_arena_bytes/1024.0/1024.0,
                     tail_k_sink_bytes/1024.0/1024.0, tail_v_bytes/1024.0/1024.0,
@@ -600,7 +624,7 @@ llama_kv_cache::llama_kv_cache(
                 const std::string shadow_types = key.substr(p2 + 1);
                 LLAMA_LOG_INFO("KV tail: group=%s layers=%s dev=%s route=%s body=%s shadow=%s requested=%u effective=%u\n",
                         n_swa > 0 ? "swa" : "full", ids.str().c_str(), dev_name.c_str(), route.c_str(),
-                        body_types.c_str(), shadow_types.c_str(), tail_tokens, tail_tokens);
+                        body_types.c_str(), shadow_types.c_str(), tail_plan.requested_tokens, tail_plan.effective_tokens);
                 if (route == "generic") {
                     LLAMA_LOG_WARN("KV tail: explicit positive request uses catastrophic generic attention for "
                             "group=%s layers=%s dev=%s; correctness is preserved but long-context performance may collapse\n",
@@ -2015,7 +2039,7 @@ bool llama_kv_cache::get_kv_tail_coverage(
     const auto & cells = v_cells[seq_to_stream[seq_id]];
     const uint32_t available = cells.seq_size(seq_id);
     if (tail_plan.kind == LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT) {
-        const uint32_t exact = std::min(tail_tokens, available);
+        const uint32_t exact = std::min(tail_plan.effective_tokens, available);
         out = {
             exact > 0 ? LLAMA_KV_TAIL_COVERAGE_COMPLETE : LLAMA_KV_TAIL_COVERAGE_NONE,
             exact,
@@ -2861,7 +2885,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
     }
 
     const bool body_only = (flags & LLAMA_STATE_SEQ_FLAGS_BODY_ONLY) != 0;
-    if (!tail && !body_only) {
+    if (tail_plan.kind != LLAMA_KV_TAIL_STORAGE_OVERLAY && !body_only) {
         state_write_body(io, seq_id);
         return;
     }
@@ -2871,7 +2895,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
     state_write_body(body_counter, seq_id);
 
     llama_io_write_counter tail_counter(skip_tensors);
-    if (tail && !body_only) {
+    if (tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY && !body_only) {
         state_write_tail(tail_counter, seq_id);
     }
 
@@ -2888,7 +2912,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
     io.write(&LLAMA_KV_TAIL_STATE_MAGIC, sizeof(LLAMA_KV_TAIL_STATE_MAGIC));
     io.write(&LLAMA_KV_TAIL_STATE_VERSION, sizeof(LLAMA_KV_TAIL_STATE_VERSION));
     io.write(&state_flags, sizeof(state_flags));
-    io.write(&tail_tokens, sizeof(tail_tokens));
+    io.write(&tail_plan.effective_tokens, sizeof(tail_plan.effective_tokens));
     io.write(&state_tail_type, sizeof(state_tail_type));
     io.write_string(group_id);
     io.write(&body_size, sizeof(body_size));
@@ -2900,7 +2924,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         throw std::runtime_error("KV tail state body size changed while writing");
     }
     const size_t tail_begin = io.n_bytes();
-    if (tail && !body_only) {
+    if (tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY && !body_only) {
         state_write_tail(io, seq_id);
     }
     if (io.n_bytes() - tail_begin != tail_size) {
@@ -2918,7 +2942,7 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
     io.read(&marker, sizeof(marker));
     if (marker != LLAMA_KV_TAIL_STATE_MAGIC) {
         state_read_body(io, seq_id, marker);
-        if (tail) {
+        if (tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY) {
             if (seq_id == -1) {
                 tail->clear();
             } else {
@@ -2957,7 +2981,8 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
         throw std::runtime_error("KV tail state cache-group ID does not match the context");
     }
     const bool body_only = (state_flags & LLAMA_KV_TAIL_STATE_BODY_ONLY) != 0;
-    if (!body_only && tail_size > 0 && (!tail || state_tail_tokens != tail_tokens || state_tail_type != int32_t(tail_type))) {
+    if (!body_only && tail_size > 0 && (tail_plan.kind != LLAMA_KV_TAIL_STORAGE_OVERLAY ||
+            state_tail_tokens != tail_plan.effective_tokens || state_tail_type != int32_t(tail_type))) {
         throw std::runtime_error("KV tail state configuration does not match the context");
     }
 
@@ -2972,7 +2997,7 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
     const size_t tail_begin = io.n_bytes();
     if (tail_size > 0) {
         state_read_tail(io, seq_id, restored_cells);
-    } else if (tail) {
+    } else if (tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY) {
         if (seq_id == -1) {
             tail->clear();
         } else {
@@ -3868,7 +3893,7 @@ uint32_t llama_kv_cache_context::get_tail_arena_stride() const {
 }
 
 uint32_t llama_kv_cache::get_tail_attention_stride(uint32_t n_query_tokens) const {
-    if (!tail) {
+    if (tail_plan.kind != LLAMA_KV_TAIL_STORAGE_OVERLAY) {
         return 0;
     }
     if (n_query_tokens == 0) {
@@ -4189,7 +4214,7 @@ bool llama_kv_cache::can_pack_tail_body(const llama_ubatch & ubatch) const {
         // occupancy or coverage: a graph selected while the cache is small
         // must remain valid at its full physical capacity.  When the complete
         // stream fits, every possible visible-body subset fits as well.
-        if (cells.size() > tail_arena_stride) {
+        if (!llama_kv_tail_sparse_body_capacity_safe(cells.size(), tail_arena_stride)) {
             return false;
         }
     }

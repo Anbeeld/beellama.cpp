@@ -2982,7 +2982,7 @@ static void build_attn_inp_tail(
              ggml_tensor *& kq_mask_tail,
              ggml_tensor *& tail_query_order,
              ggml_tensor *& tail_run_desc,
-                    bool   pack_sparse_body = false) {
+                    bool   pack_sparse_body) {
     tail_idxs = mctx->build_input_tail_idxs(ctx0, ubatch);
     if (mctx->get_tail_tokens() == 0) {
         return;
@@ -3009,10 +3009,13 @@ static void build_attn_inp_tail(
         ggml_set_input(tail_query_order);
     }
     if (!tail_run_desc) {
-        const int64_t desc_stride = pack_sparse_body && mctx->can_pack_tail_body(ubatch) ?
+        const bool sparse_body = pack_sparse_body && mctx->can_pack_tail_body(ubatch);
+        const int64_t desc_stride = sparse_body ?
                 int64_t(6 + attention_stride + arena_stride) : int64_t(6 + attention_stride);
         tail_run_desc = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, desc_stride, n_active);
         ggml_set_input(tail_run_desc);
+        LLAMA_LOG_DEBUG("%s: standard KV tail body route=%s physical-capacity-bound=%u\n",
+                __func__, sparse_body ? "sparse-packed" : "ordinary", arena_stride);
     }
 }
 
@@ -3682,7 +3685,7 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
         build_attn_inp_tail(ctx0, ubatch, mctx_cur->get_base(), inp->self_kq_mask,
                 inp->self_tail_idxs, inp->self_tail_read_idxs, inp->self_tail_body_read_idxs,
                 inp->self_tail_bias_read_idxs, inp->self_kq_mask_tail,
-                inp->self_tail_query_order, inp->self_tail_run_desc);
+                inp->self_tail_query_order, inp->self_tail_run_desc, true);
     }
 
     {
@@ -3696,7 +3699,7 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
         build_attn_inp_tail(ctx0, ubatch, mctx_cur->get_swa(), inp->self_kq_mask_swa,
                 inp->self_tail_idxs_swa, inp->self_tail_read_idxs_swa,
                 inp->self_tail_body_read_idxs_swa, inp->self_tail_bias_read_idxs_swa,
-                inp->self_kq_mask_tail_swa, inp->self_tail_query_order, inp->self_tail_run_desc_swa);
+                inp->self_kq_mask_tail_swa, inp->self_tail_query_order, inp->self_tail_run_desc_swa, true);
     }
 
     inp->self_k_rot = mctx_cur->get_base()->build_input_k_rot(ctx0);
@@ -3929,7 +3932,7 @@ llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa()
         build_attn_inp_tail(ctx0, ubatch, attn_ctx->get_base(), inp_attn->self_kq_mask,
                 inp_attn->self_tail_idxs, inp_attn->self_tail_read_idxs,
                 inp_attn->self_tail_body_read_idxs, inp_attn->self_tail_bias_read_idxs,
-                inp_attn->self_kq_mask_tail, inp_attn->self_tail_query_order, inp_attn->self_tail_run_desc);
+                inp_attn->self_kq_mask_tail, inp_attn->self_tail_query_order, inp_attn->self_tail_run_desc, true);
     }
 
     {
@@ -3941,7 +3944,7 @@ llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa()
         build_attn_inp_tail(ctx0, ubatch, attn_ctx->get_swa(), inp_attn->self_kq_mask_swa,
                 inp_attn->self_tail_idxs_swa, inp_attn->self_tail_read_idxs_swa,
                 inp_attn->self_tail_body_read_idxs_swa, inp_attn->self_tail_bias_read_idxs_swa,
-                inp_attn->self_kq_mask_tail_swa, inp_attn->self_tail_query_order, inp_attn->self_tail_run_desc_swa);
+                inp_attn->self_kq_mask_tail_swa, inp_attn->self_tail_query_order, inp_attn->self_tail_run_desc_swa, true);
     }
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid_iswa>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);

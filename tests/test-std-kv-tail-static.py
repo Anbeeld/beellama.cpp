@@ -33,7 +33,6 @@ def main() -> None:
             for name, source in (
                 ("CUDA OUT_PROD", cuda_out_prod),
                 ("CPU OUT_PROD", cpu_out_prod),
-                ("backend operation matrix", backend_tests),
             )
             if cache_type not in source
         ]
@@ -43,6 +42,11 @@ def main() -> None:
     if missing:
         details = "; ".join(f"{cache_type}: {', '.join(routes)}" for cache_type, routes in missing.items())
         raise AssertionError(f"registered standard cache type lacks a tail route: {details}")
+    if "common_kv_cache_types()" not in backend_tests:
+        raise AssertionError("backend operation matrix is not derived from the standard cache type registry")
+    for operation in ("test_get_rows", "test_set_rows_with_shadow", "test_out_prod"):
+        if operation not in backend_tests:
+            raise AssertionError(f"backend operation matrix lacks {operation}")
 
     cmake = (ROOT / "src/CMakeLists.txt").read_text(encoding="utf-8")
     if "llama-kv-cache-tail.cpp" not in cmake:
@@ -52,10 +56,10 @@ def main() -> None:
     constructor = cache_source.split("llama_kv_cache::llama_kv_cache(", 1)[1].split(
         "void llama_kv_cache::clear(bool data)", 1
     )[0]
-    if "const bool shadow_k = tail &&" not in cache_source:
-        raise AssertionError("K tail storage must remain null when the tail feature is disabled")
-    if "const bool shadow_v = tail &&" not in cache_source:
-        raise AssertionError("V tail storage must remain null when the tail feature is disabled")
+    if "const bool shadow_k = tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY" not in cache_source:
+        raise AssertionError("K shadow allocation must follow the explicit overlay storage plan")
+    if "const bool shadow_v = tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY" not in cache_source:
+        raise AssertionError("V shadow allocation must follow the explicit overlay storage plan")
     if constructor.find("if (other)") > constructor.find("if (tail_tokens > 0)"):
         raise AssertionError("shared-cache size must resolve before exact-tail generation storage is allocated")
     if "tail_plan = llama_kv_tail_storage_plan_for" not in constructor:
@@ -64,6 +68,15 @@ def main() -> None:
         raise AssertionError("exact-shadow allocation must be guarded by the overlay storage plan")
     if "tail_plan.kind == LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT" not in cache_source:
         raise AssertionError("raw standard cache lacks the native-exact storage route")
+
+    cache_header = (ROOT / "src/llama-kv-cache.h").read_text(encoding="utf-8")
+    get_tail_tokens = cache_header.split("uint32_t get_tail_tokens() const", 1)[1].split("}", 1)[0]
+    if "tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY" not in get_tail_tokens:
+        raise AssertionError("tail graph topology must follow the explicit overlay storage plan")
+
+    context_source = (ROOT / "src/llama-context.cpp").read_text(encoding="utf-8")
+    if "llama_kv_tail_resolve_groups" not in context_source or "config.automatic ? automatic_standard : true" not in context_source:
+        raise AssertionError("automatic and explicit group resolution are not separated at context construction")
 
     iswa_source = (ROOT / "src/llama-kv-cache-iswa.cpp").read_text(encoding="utf-8")
     if "llama_kv_tail_storage_plan_for" in iswa_source or "LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT" in iswa_source:
@@ -98,6 +111,10 @@ def main() -> None:
         raise AssertionError("model graph does not use native tail attention")
     if "ggml_cuda_flash_attn_ext_tail" not in cuda_fattn:
         raise AssertionError("CUDA lacks the native tail-attention dispatch")
+
+    tail_build_calls = re.findall(r"build_attn_inp_tail\((?:(?!\);).)*\);", graph, re.DOTALL)[1:]
+    if not tail_build_calls or any(not re.search(r",\s*true\s*\);$", call) for call in tail_build_calls):
+        raise AssertionError("every standard-cache wrapper must select sparse-body packing by the shared capacity invariant")
 
     dsv4_cache = (ROOT / "src/llama-kv-cache-dsv4.cpp").read_text(encoding="utf-8")
     dsv4_graph = (ROOT / "src/models/deepseek4.cpp").read_text(encoding="utf-8")

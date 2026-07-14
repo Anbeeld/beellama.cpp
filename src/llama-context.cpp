@@ -7,6 +7,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-kv-cache-kvarn.h"
+#include "llama-kv-cache-tail.h"
 #include "llama-kvarn.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
@@ -293,6 +294,8 @@ llama_context::llama_context(
     cparams.kv_tail_tokens    = std::min(params.kv_tail_tokens, cparams.n_ctx);
     cparams.kv_tail_tokens_swa = std::min(params.kv_tail_tokens,
             std::min(cparams.n_ctx, hparams.n_swa > 0 ? hparams.n_swa : cparams.n_ctx));
+    cparams.kv_tail_tokens_requested = params.kv_tail_tokens;
+    cparams.kv_tail_tokens_swa_requested = params.kv_tail_tokens;
     cparams.kv_tail_type      = params.kv_tail_type;
     if (params.kv_tail_config) {
         const auto & config = *params.kv_tail_config;
@@ -301,23 +304,37 @@ llama_context::llama_context(
         }
         cparams.kv_tail_tokens = 0;
         cparams.kv_tail_tokens_swa = 0;
-        if (config.automatic) {
-            LLAMA_LOG_WARN("%s: no validated automatic KV tail recommendation; resolving all groups to zero\n", __func__);
-        } else if (std::any_of(config.groups.begin(), config.groups.end(), [](const auto & group) {
-                return !group.assigned;
-            })) {
+        cparams.kv_tail_tokens_requested = 0;
+        cparams.kv_tail_tokens_swa_requested = 0;
+        const bool explicit_complete = !std::any_of(config.groups.begin(), config.groups.end(), [](const auto & group) {
+            return !group.assigned;
+        });
+        const bool automatic_standard = params.kvarn.type == LLAMA_KVARN_TYPE_DISABLED &&
+                model.arch != LLM_ARCH_DEEPSEEK4;
+        std::vector<llama_kv_tail_group_request> requests;
+        requests.reserve(config.groups.size());
+        for (const auto & group : config.groups) {
+            requests.push_back({ group.n_tokens, std::min(group.effective_window, cparams.n_ctx),
+                    config.automatic ? automatic_standard : true });
+        }
+        const auto resolution = llama_kv_tail_resolve_groups(
+                config.automatic, explicit_complete, requests);
+        if (!resolution.valid) {
             LLAMA_LOG_WARN("%s: incomplete KV tail group configuration; resolving all groups to zero\n", __func__);
         } else {
-            for (const auto & group : config.groups) {
-                const uint32_t effective_window = std::min(group.effective_window, cparams.n_ctx);
-                const uint32_t resolved = std::min(group.n_tokens, effective_window);
+            for (size_t i = 0; i < config.groups.size(); ++i) {
+                const auto & group = config.groups[i];
+                const uint32_t requested = config.automatic ? 1024 : group.n_tokens;
+                const uint32_t resolved = resolution.tokens[i];
                 if (group.role == "swa") {
+                    cparams.kv_tail_tokens_swa_requested = requested;
                     cparams.kv_tail_tokens_swa = resolved;
                 } else {
+                    cparams.kv_tail_tokens_requested = requested;
                     cparams.kv_tail_tokens = resolved;
                 }
                 LLAMA_LOG_INFO("KV tail: group=%s layers=%u requested=%u effective=%u type=%s\n",
-                        group.id.c_str(), uint32_t(group.layers.size()), group.n_tokens, resolved,
+                        group.id.c_str(), uint32_t(group.layers.size()), requested, resolved,
                         ggml_type_name(cparams.kv_tail_type));
             }
         }
@@ -565,6 +582,8 @@ llama_context::llama_context(
             /*.kvarn     =*/ cparams.kvarn,
             /*.kv_tail_tokens =*/ cparams.kv_tail_tokens,
             /*.kv_tail_tokens_swa =*/ cparams.kv_tail_tokens_swa,
+            /*.kv_tail_tokens_requested =*/ cparams.kv_tail_tokens_requested,
+            /*.kv_tail_tokens_swa_requested =*/ cparams.kv_tail_tokens_swa_requested,
             /*.kv_tail_type   =*/ cparams.kv_tail_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
         };

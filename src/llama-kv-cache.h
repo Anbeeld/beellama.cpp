@@ -118,9 +118,10 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
-                     uint32_t   n_ubatch = 0,
-                     uint32_t   tail_tokens = 0,
-                    ggml_type   tail_type = GGML_TYPE_F16);
+                 uint32_t   n_ubatch = 0,
+                 uint32_t   tail_tokens = 0,
+                ggml_type   tail_type = GGML_TYPE_F16,
+                 uint32_t   tail_tokens_requested = UINT32_MAX);
 
     ~llama_kv_cache() = default;
 
@@ -205,8 +206,12 @@ public:
     ggml_tensor * get_k_tail_fallback(ggml_context * ctx, int32_t il, ggml_tensor * body_idxs) const;
     ggml_tensor * get_v_tail_fallback(ggml_context * ctx, int32_t il, ggml_tensor * body_idxs) const;
     uint32_t get_tail_slots() const { return tail_slots; }
-    uint32_t get_tail_tokens() const { return tail ? tail_tokens : 0; }
-    uint32_t get_tail_arena_stride() const { return tail ? tail_arena_stride : 0; }
+    uint32_t get_tail_tokens() const {
+        return tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY ? tail_plan.effective_tokens : 0;
+    }
+    uint32_t get_tail_arena_stride() const {
+        return tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY ? tail_plan.layout.arena_stride : 0;
+    }
     uint32_t get_tail_attention_stride(uint32_t n_query_tokens = 0) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
@@ -313,11 +318,26 @@ private:
     const ggml_type tail_type = GGML_TYPE_F16;
     llama_kv_tail_storage_plan tail_plan {
         LLAMA_KV_TAIL_STORAGE_DISABLED,
+        0,
+        0,
+        0,
         GGML_TYPE_F16,
         GGML_TYPE_F16,
+        GGML_TYPE_F16,
+        GGML_TYPE_F16,
+        false,
+        false,
+        GGML_TYPE_COUNT,
+        GGML_TYPE_COUNT,
+        0,
         { 0, 0, 0 },
         0,
         0,
+        0,
+        0,
+        0,
+        false,
+        false,
         false,
     };
     uint32_t tail_arena_stride = 0;

@@ -76,20 +76,30 @@ static bool test_tail_state_contract(
         return false;
     }
 
-    auto mismatch_params = source_params;
-    mismatch_params.kv_tail_tokens++;
-    auto mismatch = llama_context_ptr{llama_init_from_model(model, mismatch_params)};
-    if (!mismatch) {
-        LOG_ERR("%s: failed to create mismatch context\n", __func__);
-        return false;
-    }
-    if (llama_state_set_data(mismatch.get(), exact.data(), exact.size()) != 0) {
-        LOG_ERR("%s: mismatched tail configuration was accepted\n", __func__);
+    llama_kv_tail_coverage_info coverage_before{};
+    if (!llama_kv_tail_get_coverage(source.get(), 0, 0, &coverage_before)) {
+        LOG_ERR("%s: failed to query initial tail coverage\n", __func__);
         return false;
     }
 
     const auto body_flag = llama_state_seq_flags(LLAMA_STATE_SEQ_FLAGS_BODY_ONLY);
     const size_t body_size = llama_state_get_size_ext(source.get(), body_flag);
+    const bool has_overlay_state = exact_size > body_size;
+
+    if (has_overlay_state) {
+        auto mismatch_params = source_params;
+        mismatch_params.kv_tail_tokens++;
+        auto mismatch = llama_context_ptr{llama_init_from_model(model, mismatch_params)};
+        if (!mismatch) {
+            LOG_ERR("%s: failed to create mismatch context\n", __func__);
+            return false;
+        }
+        if (llama_state_set_data(mismatch.get(), exact.data(), exact.size()) != 0) {
+            LOG_ERR("%s: mismatched overlay tail configuration was accepted\n", __func__);
+            return false;
+        }
+    }
+
     std::vector<uint8_t> body(body_size);
     if (llama_state_get_data_ext(source.get(), body.data(), body.size(), body_flag) != body.size()) {
         LOG_ERR("%s: body-only full-state size/write mismatch\n", __func__);
@@ -101,22 +111,32 @@ static bool test_tail_state_contract(
         return false;
     }
 
-    llama_kv_tail_coverage_info coverage{};
-    if (!llama_kv_tail_get_coverage(source.get(), 0, 0, &coverage) ||
-            coverage.exact != 0 ||
-            (coverage.degradation_flags & LLAMA_KV_TAIL_DEGRADED_BODY_ONLY_STATE) == 0) {
-        LOG_ERR("%s: body-only restore did not expose degraded coverage\n", __func__);
+    llama_kv_tail_coverage_info coverage_after{};
+    if (!llama_kv_tail_get_coverage(source.get(), 0, 0, &coverage_after)) {
+        LOG_ERR("%s: failed to query restored tail coverage\n", __func__);
         return false;
     }
     llama_kv_tail_coverage_aggregate aggregate{};
-    if (!llama_kv_tail_get_coverage_aggregate(source.get(), 0, &aggregate) ||
-            aggregate.groups == 0 || aggregate.exact != 0 ||
-            aggregate.none_groups != aggregate.groups ||
-            (aggregate.degradation_flags & LLAMA_KV_TAIL_DEGRADED_BODY_ONLY_STATE) == 0) {
-        LOG_ERR("%s: aggregate body-only coverage is inconsistent\n", __func__);
+    if (!llama_kv_tail_get_coverage_aggregate(source.get(), 0, &aggregate) || aggregate.groups == 0) {
+        LOG_ERR("%s: failed to query aggregate restored coverage\n", __func__);
         return false;
     }
-    LOG("\nPASS: exact mismatch rejection and explicit body-only tail state\n");
+    if (has_overlay_state) {
+        if (coverage_after.exact != 0 ||
+                (coverage_after.degradation_flags & LLAMA_KV_TAIL_DEGRADED_BODY_ONLY_STATE) == 0 ||
+                aggregate.exact != 0 || aggregate.none_groups != aggregate.groups ||
+                (aggregate.degradation_flags & LLAMA_KV_TAIL_DEGRADED_BODY_ONLY_STATE) == 0) {
+            LOG_ERR("%s: overlay body-only restore did not expose degraded coverage\n", __func__);
+            return false;
+        }
+    } else if (coverage_after.state != coverage_before.state ||
+            coverage_after.requested != coverage_before.requested ||
+            coverage_after.exact != coverage_before.exact || coverage_after.degradation_flags != 0 ||
+            aggregate.degradation_flags != 0) {
+        LOG_ERR("%s: native-exact body state did not preserve exact coverage\n", __func__);
+        return false;
+    }
+    LOG("\nPASS: representation-specific full and body-only tail state\n");
     return true;
 }
 

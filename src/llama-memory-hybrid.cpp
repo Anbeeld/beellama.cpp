@@ -32,7 +32,8 @@ llama_memory_hybrid::llama_memory_hybrid(
     const layer_filter_cb & filter_recr,
                  uint32_t   n_ubatch,
                  uint32_t   tail_tokens,
-                ggml_type   tail_type) :
+                ggml_type   tail_type,
+                 uint32_t   tail_tokens_requested) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache(
         model,
@@ -55,7 +56,8 @@ llama_memory_hybrid::llama_memory_hybrid(
         nullptr,
         n_ubatch,
         tail_tokens,
-        tail_type
+        tail_type,
+        tail_tokens_requested
     )),
     mem_recr(new llama_memory_recurrent(
         model,

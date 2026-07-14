@@ -1,5 +1,6 @@
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "llama-kv-cache-tail.h"
 
 #include <cmath>
 #include <cstdio>
@@ -9,6 +10,34 @@
 static void fail(const char * message) {
     std::fprintf(stderr, "%s\n", message);
     std::exit(1);
+}
+
+static void test_representation_topology() {
+    const auto make_plan = [](uint32_t requested, uint32_t effective, uint32_t window,
+                              bool native_capable, bool already_exact, uint64_t promotion,
+                              uint64_t overlay) {
+        return llama_kv_tail_storage_plan_for({
+            GGML_TYPE_Q4_0, GGML_TYPE_Q5_0, GGML_TYPE_F16,
+            requested, effective, 1, 32, window, 4096,
+            96, promotion, overlay, native_capable, already_exact,
+            true, false, true, true,
+        });
+    };
+
+    const auto disabled = make_plan(0, 0, 4096, true, false, 64, 64);
+    const auto overlay = make_plan(256, 256, 4096, true, false, 64, 64);
+    const auto native = make_plan(4096, 4096, 4096, true, false, 64, 64);
+    if (disabled.kind != LLAMA_KV_TAIL_STORAGE_DISABLED || disabled.shadow_k || disabled.shadow_v) {
+        fail("disabled representation unexpectedly requires tail graph inputs");
+    }
+    if (overlay.kind != LLAMA_KV_TAIL_STORAGE_OVERLAY || !overlay.shadow_k || !overlay.shadow_v ||
+            overlay.layout.total_slots == 0) {
+        fail("overlay representation lacks shadow graph topology");
+    }
+    if (native.kind != LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT || native.shadow_k || native.shadow_v ||
+            native.layout.total_slots == 0) {
+        fail("native-exact representation unexpectedly requires a shadow merge graph");
+    }
 }
 
 static void test_shadow_roundtrip(ggml_backend_t backend) {
@@ -336,6 +365,7 @@ static void test_attention_graph(ggml_backend_t backend) {
 }
 
 int main() {
+    test_representation_topology();
     ggml_backend_load_all();
     ggml_backend_t backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     if (!backend) {

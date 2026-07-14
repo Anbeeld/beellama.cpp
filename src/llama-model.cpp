@@ -2137,7 +2137,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* kvarn             */ params.kvarn,
                             /* tail_tokens       */ params.kv_tail_tokens,
                             /* tail_tokens_swa   */ params.kv_tail_tokens_swa,
-                            /* tail_type         */ params.kv_tail_type);
+                            /* tail_type         */ params.kv_tail_type,
+                            /* tail requested    */ params.kv_tail_tokens_requested,
+                            /* SWA requested     */ params.kv_tail_tokens_swa_requested);
                     } else {
                         if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
                             auto mem_attn = std::make_unique<llama_kv_cache_kvarn>(
@@ -2186,7 +2188,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 /* filter_recr       */ std::move(filter_recr),
                                 /* n_ubatch          */ cparams.n_ubatch,
                                 /* tail_tokens       */ params.kv_tail_tokens,
-                                /* tail_type         */ params.kv_tail_type);
+                                /* tail_type         */ params.kv_tail_type,
+                                /* tail requested    */ params.kv_tail_tokens_requested);
                         }
                     }
                 } else {
@@ -2236,7 +2239,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 filter,
                                 reuse,
                                 params.kv_tail_tokens_swa,
-                                params.kv_tail_type);
+                                params.kv_tail_type,
+                                params.kv_tail_tokens_swa_requested);
                     } else if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         GGML_ASSERT(hparams.is_swa_any());
 
@@ -2273,7 +2277,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     params.kvarn,
                                     params.kv_tail_tokens,
                                     params.kv_tail_tokens_swa,
-                                    params.kv_tail_type);
+                                    params.kv_tail_type,
+                                    params.kv_tail_tokens_requested,
+                                    params.kv_tail_tokens_swa_requested);
                         } else {
                             res = new llama_kv_cache_iswa(
                                     *this,
@@ -2295,7 +2301,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     params.kvarn,
                                     params.kv_tail_tokens,
                                     params.kv_tail_tokens_swa,
-                                    params.kv_tail_type);
+                                    params.kv_tail_type,
+                                    params.kv_tail_tokens_requested,
+                                    params.kv_tail_tokens_swa_requested);
                         }
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
@@ -2336,7 +2344,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     nullptr,
                                     cparams.n_ubatch,
                                     params.kv_tail_tokens,
-                                    params.kv_tail_type);
+                                    params.kv_tail_type,
+                                    params.kv_tail_tokens_requested);
                         }
                     }
                 }

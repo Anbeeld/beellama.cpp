@@ -33,13 +33,16 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
           llama_kvarn_params kvarn,
                  uint32_t tail_tokens,
                  uint32_t tail_tokens_swa,
-                ggml_type tail_type) :
+                ggml_type tail_type,
+                 uint32_t tail_tokens_requested,
+                 uint32_t tail_tokens_swa_requested) :
     llama_kv_cache_iswa(
             model, model.hparams,
             type_k, type_v,
             v_trans, offload, swa_full, unified,
             kv_size, n_seq_max, n_batch, n_ubatch, n_pad,
-            mem_other, filter, reuse, share, kvarn, tail_tokens, tail_tokens_swa, tail_type) {
+            mem_other, filter, reuse, share, kvarn, tail_tokens, tail_tokens_swa, tail_type,
+            tail_tokens_requested, tail_tokens_swa_requested) {
 }
 
 llama_kv_cache_iswa::llama_kv_cache_iswa(
@@ -63,7 +66,16 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
           llama_kvarn_params kvarn,
                  uint32_t tail_tokens,
                  uint32_t tail_tokens_swa,
-                ggml_type tail_type) : unified(unified) {
+                ggml_type tail_type,
+                 uint32_t tail_tokens_requested,
+                 uint32_t tail_tokens_swa_requested) : unified(unified) {
+
+    if (tail_tokens_requested == UINT32_MAX) {
+        tail_tokens_requested = tail_tokens;
+    }
+    if (tail_tokens_swa_requested == UINT32_MAX) {
+        tail_tokens_swa_requested = tail_tokens_swa;
+    }
 
     // chain filters
     const layer_filter_cb filter_base = [&](int32_t il) {
@@ -141,7 +153,8 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                 model, hparams, type_k, type_v,
                 v_trans, offload, unified, size, n_seq_max, n_pad,
                 n_swa, swa_type, cache_mem_other, layer_filter, reuse, share,
-                n_ubatch, n_swa > 0 ? tail_tokens_swa : tail_tokens, tail_type);
+                n_ubatch, n_swa > 0 ? tail_tokens_swa : tail_tokens, tail_type,
+                n_swa > 0 ? tail_tokens_swa_requested : tail_tokens_requested);
     };
 
     LLAMA_LOG_INFO("%s: creating non-SWA KV cache, size = %u cells\n", __func__, size_base);

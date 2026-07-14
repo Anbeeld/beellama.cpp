@@ -66,28 +66,75 @@ enum llama_kv_tail_storage_kind {
     LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT,
 };
 
+struct llama_kv_tail_group_request {
+    uint32_t requested_tokens;
+    uint32_t effective_window;
+    bool applicable_standard_kv;
+};
+
+struct llama_kv_tail_group_resolution {
+    bool valid;
+    std::vector<uint32_t> tokens;
+};
+
+// Resolve the model-bound group configuration atomically. Automatic mode is
+// intentionally architecture-agnostic for this release: every applicable
+// standard KV group requests 1024 exact tokens, capped by its own window.
+llama_kv_tail_group_resolution llama_kv_tail_resolve_groups(
+        bool automatic,
+        bool explicit_complete,
+        const std::vector<llama_kv_tail_group_request> & groups);
+
+// Sparse body packing must remain valid for every future occupancy of a
+// cached graph. It is therefore safe only when the complete physical stream,
+// not merely its currently live rows, fits in the reserved arena.
+bool llama_kv_tail_sparse_body_capacity_safe(
+        uint32_t physical_stream_rows,
+        uint32_t arena_stride);
+
 struct llama_kv_tail_storage_request {
-    ggml_type body_type_k;
-    ggml_type body_type_v;
+    ggml_type requested_body_type_k;
+    ggml_type requested_body_type_v;
     ggml_type exact_type;
-    uint32_t n_tokens;
+    uint32_t requested_tokens;
+    uint32_t effective_tokens;
     uint32_t n_seq_max;
     uint32_t n_ubatch;
     uint32_t visibility_window;
     uint64_t physical_body_rows;
+    uint64_t requested_body_bytes_per_row;
     uint64_t promotion_bytes_per_row;
     uint64_t overlay_bytes_per_row;
     bool native_capable;
     bool already_exact;
+    bool has_owned_body;
+    bool has_shared_body;
+    bool shadow_k_capable;
+    bool shadow_v_capable;
 };
 
 struct llama_kv_tail_storage_plan {
     llama_kv_tail_storage_kind kind;
-    ggml_type body_type_k;
-    ggml_type body_type_v;
+    uint32_t requested_tokens;
+    uint32_t effective_tokens;
+    uint32_t visibility_window;
+    ggml_type requested_body_type_k;
+    ggml_type requested_body_type_v;
+    ggml_type actual_body_type_k;
+    ggml_type actual_body_type_v;
+    bool shadow_k;
+    bool shadow_v;
+    ggml_type shadow_type_k;
+    ggml_type shadow_type_v;
+    uint64_t physical_body_rows;
     llama_kv_tail_layout layout;
-    uint64_t promotion_bytes;
-    uint64_t overlay_bytes;
+    uint64_t requested_body_bytes;
+    uint64_t actual_body_bytes;
+    uint64_t shadow_bytes;
+    uint64_t promotion_increment;
+    uint64_t overlay_increment;
+    bool has_owned_body;
+    bool has_shared_body;
     bool body_promoted;
 };
 

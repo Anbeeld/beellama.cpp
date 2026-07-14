@@ -50,18 +50,62 @@ static uint64_t checked_tail_bytes(uint64_t rows, uint64_t bytes_per_row) {
     return rows*bytes_per_row;
 }
 
+llama_kv_tail_group_resolution llama_kv_tail_resolve_groups(
+        bool automatic,
+        bool explicit_complete,
+        const std::vector<llama_kv_tail_group_request> & groups) {
+    llama_kv_tail_group_resolution result { automatic || explicit_complete, {} };
+    result.tokens.reserve(groups.size());
+    if (!result.valid) {
+        result.tokens.assign(groups.size(), 0);
+        return result;
+    }
+
+    constexpr uint32_t auto_tokens = 1024;
+    for (const auto & group : groups) {
+        const uint32_t requested = automatic ? auto_tokens : group.requested_tokens;
+        result.tokens.push_back(group.applicable_standard_kv ?
+                std::min(requested, group.effective_window) : 0);
+    }
+    return result;
+}
+
+bool llama_kv_tail_sparse_body_capacity_safe(
+        uint32_t physical_stream_rows,
+        uint32_t arena_stride) {
+    return arena_stride > 0 && physical_stream_rows <= arena_stride;
+}
+
 llama_kv_tail_storage_plan llama_kv_tail_storage_plan_for(
         const llama_kv_tail_storage_request & request) {
     llama_kv_tail_storage_plan result {
         LLAMA_KV_TAIL_STORAGE_DISABLED,
-        request.body_type_k,
-        request.body_type_v,
+        request.requested_tokens,
+        request.effective_tokens,
+        request.visibility_window,
+        request.requested_body_type_k,
+        request.requested_body_type_v,
+        request.requested_body_type_k,
+        request.requested_body_type_v,
+        false,
+        false,
+        GGML_TYPE_COUNT,
+        GGML_TYPE_COUNT,
+        request.physical_body_rows,
         { 0, 0, 0 },
+        checked_tail_bytes(request.physical_body_rows, request.requested_body_bytes_per_row),
         0,
         0,
+        0,
+        0,
+        request.has_owned_body,
+        request.has_shared_body,
         false,
     };
-    if (request.n_tokens == 0) {
+    result.actual_body_bytes = result.requested_body_bytes;
+    if (request.effective_tokens == 0 || request.physical_body_rows == 0 ||
+            (!request.has_owned_body && !request.has_shared_body)) {
+        result.effective_tokens = 0;
         return result;
     }
     if (request.exact_type != GGML_TYPE_F16 && request.exact_type != GGML_TYPE_BF16) {
@@ -69,30 +113,43 @@ llama_kv_tail_storage_plan llama_kv_tail_storage_plan_for(
     }
 
     result.layout = llama_kv_tail_layout_for(
-            request.n_tokens, request.n_seq_max, request.n_ubatch);
-    result.promotion_bytes = checked_tail_bytes(
+            request.effective_tokens, request.n_seq_max, request.n_ubatch);
+    result.promotion_increment = checked_tail_bytes(
             request.physical_body_rows, request.promotion_bytes_per_row);
-    result.overlay_bytes = checked_tail_bytes(
+    result.overlay_increment = checked_tail_bytes(
             result.layout.total_slots, request.overlay_bytes_per_row);
 
-    const ggml_type promoted_k = ggml_is_quantized(request.body_type_k) ?
-            request.exact_type : request.body_type_k;
-    const ggml_type promoted_v = ggml_is_quantized(request.body_type_v) ?
-            request.exact_type : request.body_type_v;
+    const ggml_type promoted_k = ggml_is_quantized(request.requested_body_type_k) ?
+            request.exact_type : request.requested_body_type_k;
+    const ggml_type promoted_v = ggml_is_quantized(request.requested_body_type_v) ?
+            request.exact_type : request.requested_body_type_v;
     const bool full_visibility = request.visibility_window > 0 &&
-            request.n_tokens >= request.visibility_window;
+            request.effective_tokens >= request.visibility_window;
     const bool use_native = request.already_exact ||
             (full_visibility && request.native_capable &&
-             result.promotion_bytes <= result.overlay_bytes);
+             result.promotion_increment <= result.overlay_increment);
 
     if (use_native) {
         result.kind = LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT;
-        result.body_type_k = promoted_k;
-        result.body_type_v = promoted_v;
-        result.body_promoted = promoted_k != request.body_type_k ||
-                promoted_v != request.body_type_v;
+        result.actual_body_type_k = promoted_k;
+        result.actual_body_type_v = promoted_v;
+        result.body_promoted = promoted_k != request.requested_body_type_k ||
+                promoted_v != request.requested_body_type_v;
+        if (result.promotion_increment > std::numeric_limits<uint64_t>::max() - result.requested_body_bytes) {
+            throw std::overflow_error("standard KV tail promoted body byte count overflows uint64_t");
+        }
+        result.actual_body_bytes = result.requested_body_bytes + result.promotion_increment;
     } else {
         result.kind = LLAMA_KV_TAIL_STORAGE_OVERLAY;
+        result.shadow_k = request.shadow_k_capable;
+        result.shadow_v = request.shadow_v_capable;
+        result.shadow_type_k = result.shadow_k ?
+                (ggml_is_quantized(request.requested_body_type_k) ? request.exact_type : request.requested_body_type_k) :
+                GGML_TYPE_COUNT;
+        result.shadow_type_v = result.shadow_v ?
+                (ggml_is_quantized(request.requested_body_type_v) ? request.exact_type : request.requested_body_type_v) :
+                GGML_TYPE_COUNT;
+        result.shadow_bytes = result.overlay_increment;
     }
     return result;
 }

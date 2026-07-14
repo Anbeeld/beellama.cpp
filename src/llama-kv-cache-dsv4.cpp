@@ -951,7 +951,8 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
                  uint32_t   tail_tokens,
-                ggml_type   tail_type) :
+                ggml_type   tail_type,
+                 uint32_t   tail_tokens_requested) :
     hparams_raw(model.hparams),
     hparams_csa(model.hparams),
     hparams_hca(model.hparams),
@@ -982,7 +983,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
             v_trans, offload, swa_full, unified_raw, kv_size, n_seq_max,
             dsv4_physical_ubatch(n_ubatch, n_seq_max), dsv4_physical_ubatch(n_ubatch, n_seq_max), n_pad,
             nullptr, filter_raw, reuse, nullptr, llama_kvarn_default_params(),
-            0, tail_tokens, tail_type);
+            0, tail_tokens, tail_type, 0, tail_tokens_requested);
 
     dsv4_make_k_only(hparams_csa);
     dsv4_make_k_only(hparams_hca);

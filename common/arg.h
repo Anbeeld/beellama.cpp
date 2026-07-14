@@ -111,6 +111,10 @@ namespace common_arg_utils {
     bool is_autoy(const std::string & value);
 }
 
+// Canonical cache-type registry shared by CLI validation and backend coverage
+// tests. Callers should filter this list by the operation contract they need.
+const std::vector<ggml_type> & common_kv_cache_types();
+
 struct common_params_context {
     enum llama_example ex = LLAMA_EXAMPLE_COMMON;
     common_params & params;

@@ -348,6 +348,10 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_Q2_1,
 };
 
+const std::vector<ggml_type> & common_kv_cache_types() {
+    return kv_cache_types;
+}
+
 static ggml_type kv_cache_type_from_str(const std::string & s) {
     const int32_t kvarn_bits = kvarn_bits_from_legacy_cache_type(s);
     if (kvarn_bits != 0) {

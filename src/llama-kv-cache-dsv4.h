@@ -85,7 +85,8 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
                      uint32_t   tail_tokens = 0,
-                    ggml_type   tail_type = GGML_TYPE_F16);
+                    ggml_type   tail_type = GGML_TYPE_F16,
+                     uint32_t   tail_tokens_requested = UINT32_MAX);
 
     ~llama_kv_cache_dsv4() = default;
 

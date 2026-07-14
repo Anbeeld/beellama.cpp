@@ -44,7 +44,9 @@ public:
           llama_kvarn_params kvarn = llama_kvarn_default_params(),
                  uint32_t   tail_tokens = 0,
                  uint32_t   tail_tokens_swa = 0,
-                ggml_type   tail_type = GGML_TYPE_F16);
+                ggml_type   tail_type = GGML_TYPE_F16,
+                 uint32_t   tail_tokens_requested = UINT32_MAX,
+                 uint32_t   tail_tokens_swa_requested = UINT32_MAX);
 
     ~llama_memory_hybrid_iswa() = default;
 

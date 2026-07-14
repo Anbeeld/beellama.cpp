@@ -42,7 +42,8 @@ public:
     const layer_filter_cb & filter_recr = nullptr,
                  uint32_t   n_ubatch = 0,
                  uint32_t   tail_tokens = 0,
-                ggml_type   tail_type = GGML_TYPE_F16);
+                ggml_type   tail_type = GGML_TYPE_F16,
+                 uint32_t   tail_tokens_requested = UINT32_MAX);
 
     llama_memory_hybrid(
         const llama_model & model,
