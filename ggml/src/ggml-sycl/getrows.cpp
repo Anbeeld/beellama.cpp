@@ -16,9 +16,9 @@
 #include "getrows.hpp"
 
 
-template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
+template<int qk, int qr, dequantize_kernel_t dequantize_kernel>
 static void k_get_rows(
-            const void * src0, const int32_t * src1, dst_t * dst,
+            const void * src0, const int32_t * src1, void * dst, ggml_type dst_type,
             int64_t ne00, /*int64_t ne01, int64_t ne02, int64_t ne03,*/
             /*int64_t ne10, int64_t ne11,*/ int64_t ne12, /*int64_t ne13,*/
             /*size_t s0,*/ size_t s1, size_t s2, size_t s3,
@@ -44,7 +44,7 @@ static void k_get_rows(
 
     const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
 
-    dst_t * dst_row = dst + i10*s1 + i11*s2 + i12*s3;
+    const size_t dst_row = i10*s1 + i11*s2 + i12*s3;
     const void * src0_row = (const char *)src0 + i01*nb01 + i11*nb02 + i12*nb03;
 
     const int ib = i00/qk; // block index
@@ -56,8 +56,20 @@ static void k_get_rows(
     dfloat2 v;
     dequantize_kernel(src0_row, ib, iqs, v);
 
-    dst_row[iybs + iqs + 0] = v.x();
-    dst_row[iybs + iqs + y_offset] = v.y();
+    const size_t ix0 = dst_row + iybs + iqs + 0;
+    const size_t ix1 = dst_row + iybs + iqs + y_offset;
+    if (dst_type == GGML_TYPE_F32) {
+        ((float *) dst)[ix0] = v.x();
+        ((float *) dst)[ix1] = v.y();
+    } else if (dst_type == GGML_TYPE_F16) {
+        ((sycl::half *) dst)[ix0] = v.x();
+        ((sycl::half *) dst)[ix1] = v.y();
+#ifdef GGML_SYCL_HAS_BF16
+    } else if (dst_type == GGML_TYPE_BF16) {
+        ((sycl::ext::oneapi::bfloat16 *) dst)[ix0] = v.x();
+        ((sycl::ext::oneapi::bfloat16 *) dst)[ix1] = v.y();
+#endif
+    }
 }
 
 template<typename src0_t, typename dst_t>
@@ -96,7 +108,7 @@ static void k_get_rows_float(
 template <int qk, int qr, dequantize_kernel_t dq>
 static void get_rows_sycl(ggml_backend_sycl_context & ctx, const ggml_tensor *src0, const ggml_tensor *src1,
                           ggml_tensor *dst, const void *src0_dd,
-                          const int32_t *src1_dd, float *dst_dd,
+                          const int32_t *src1_dd, void *dst_dd,
                           queue_ptr stream) {
 
     GGML_TENSOR_BINARY_OP_LOCALS
@@ -117,16 +129,45 @@ static void get_rows_sycl(ggml_backend_sycl_context & ctx, const ggml_tensor *sr
     //const size_t s13 = nb13 / ggml_element_size(src1);
 
     GGML_ASSERT(ne00 % 2 == 0);
+    const ggml_type dst_type = dst->type;
 
     stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
                          [=](sycl::nd_item<3> item_ct1) {
                              k_get_rows<qk, qr, dq>(
-                                 src0_dd, src1_dd, dst_dd, ne00, ne12, s1, s2,
+                                 src0_dd, src1_dd, dst_dd, dst_type, ne00, ne12, s1, s2,
                                  s3, nb01, nb02, nb03, s10, s11, s12, item_ct1);
                          });
 
     GGML_UNUSED(dst);
     GGML_UNUSED(ctx);
+}
+
+template <typename src0_t, typename dst_t>
+static void get_rows_sycl_float(ggml_backend_sycl_context & ctx, const ggml_tensor * src0,
+                                const ggml_tensor * src1, ggml_tensor * dst,
+                                const src0_t * src0_dd, const int32_t * src1_dd,
+                                dst_t * dst_dd, queue_ptr stream);
+
+template <typename src0_t>
+static void get_rows_sycl_float_dispatch(ggml_backend_sycl_context & ctx, const ggml_tensor * src0,
+                                         const ggml_tensor * src1, ggml_tensor * dst,
+                                         const src0_t * src0_dd, const int32_t * src1_dd) {
+    switch (dst->type) {
+        case GGML_TYPE_F32:
+            get_rows_sycl_float(ctx, src0, src1, dst, src0_dd, src1_dd, (float *) dst->data, ctx.stream());
+            break;
+        case GGML_TYPE_F16:
+            get_rows_sycl_float(ctx, src0, src1, dst, src0_dd, src1_dd, (sycl::half *) dst->data, ctx.stream());
+            break;
+#ifdef GGML_SYCL_HAS_BF16
+        case GGML_TYPE_BF16:
+            get_rows_sycl_float(ctx, src0, src1, dst, src0_dd, src1_dd,
+                                (sycl::ext::oneapi::bfloat16 *) dst->data, ctx.stream());
+            break;
+#endif
+        default:
+            GGML_ABORT("fatal error: unsupported get_rows destination type=%s\n", ggml_type_name(dst->type));
+    }
 }
 
 template <typename src0_t, typename dst_t>
@@ -170,7 +211,8 @@ static void get_rows_sycl_float(ggml_backend_sycl_context & ctx, const ggml_tens
 
 void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(dst->src[1]->type == GGML_TYPE_I32);
-    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_I32 );
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16 ||
+                dst->type == GGML_TYPE_BF16 || dst->type == GGML_TYPE_I32);
 
     GGML_ASSERT(dst->src[0]->nb[0] == ggml_type_size(dst->src[0]->type));
     GGML_ASSERT(dst->src[1]->nb[0] == ggml_type_size(dst->src[1]->type));
@@ -180,18 +222,23 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     /* TODO: Refactor and remove duplicates */
     switch (dst->src[0]->type) {
         case GGML_TYPE_F16:
-            get_rows_sycl_float(ctx, dst->src[0], dst->src[1], dst, (const sycl::half *)dst->src[0]->data,
-                                src1_i32, (float *)dst->data, ctx.stream());
+            get_rows_sycl_float_dispatch(ctx, dst->src[0], dst->src[1], dst,
+                                         (const sycl::half *) dst->src[0]->data, src1_i32);
             break;
         case GGML_TYPE_BF16:
-            get_rows_sycl_float(ctx, dst->src[0], dst->src[1], dst, (const sycl::ext::oneapi::bfloat16 *)dst->src[0]->data,
-                                src1_i32, (float *)dst->data, ctx.stream());
+#ifdef GGML_SYCL_HAS_BF16
+            get_rows_sycl_float_dispatch(ctx, dst->src[0], dst->src[1], dst,
+                                         (const sycl::ext::oneapi::bfloat16 *) dst->src[0]->data, src1_i32);
+#else
+            GGML_ABORT("fatal error: BF16 get_rows requires GGML_SYCL_HAS_BF16\n");
+#endif
             break;
         case GGML_TYPE_F32:
-            get_rows_sycl_float(ctx, dst->src[0], dst->src[1], dst, (const float *)dst->src[0]->data,
-            src1_i32, (float *)dst->data, ctx.stream());
+            get_rows_sycl_float_dispatch(ctx, dst->src[0], dst->src[1], dst,
+                                         (const float *) dst->src[0]->data, src1_i32);
             break;
         case GGML_TYPE_I32:
+            GGML_ASSERT(dst->type == GGML_TYPE_I32);
             get_rows_sycl_float(ctx, dst->src[0], dst->src[1], dst, (const int32_t *)dst->src[0]->data,
             src1_i32, (int32_t *)dst->data, ctx.stream());
             break;
@@ -270,6 +317,30 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
         case GGML_TYPE_Q5_1:
             get_rows_sycl<QK5_1, QR5_1, dequantize_q5_1>(ctx, dst->src[0], dst->src[1], dst, (const float *)dst->src[0]->data,
             src1_i32, (float *)dst->data, ctx.stream());
+            break;
+        case GGML_TYPE_Q6_0:
+            get_rows_sycl<QK6_0, QR6_0, dequantize_q6_0>(ctx, dst->src[0], dst->src[1], dst, dst->src[0]->data,
+            src1_i32, dst->data, ctx.stream());
+            break;
+        case GGML_TYPE_Q6_1:
+            get_rows_sycl<QK6_1, QR6_1, dequantize_q6_1>(ctx, dst->src[0], dst->src[1], dst, dst->src[0]->data,
+            src1_i32, dst->data, ctx.stream());
+            break;
+        case GGML_TYPE_Q3_0:
+            get_rows_sycl<QK3_0, 2, dequantize_q3_0>(ctx, dst->src[0], dst->src[1], dst, dst->src[0]->data,
+            src1_i32, dst->data, ctx.stream());
+            break;
+        case GGML_TYPE_Q3_1:
+            get_rows_sycl<QK3_1, 2, dequantize_q3_1>(ctx, dst->src[0], dst->src[1], dst, dst->src[0]->data,
+            src1_i32, dst->data, ctx.stream());
+            break;
+        case GGML_TYPE_Q2_0S:
+            get_rows_sycl<QK2_0S, 2, dequantize_q2_0s>(ctx, dst->src[0], dst->src[1], dst, dst->src[0]->data,
+            src1_i32, dst->data, ctx.stream());
+            break;
+        case GGML_TYPE_Q2_1:
+            get_rows_sycl<QK2_1, 2, dequantize_q2_1>(ctx, dst->src[0], dst->src[1], dst, dst->src[0]->data,
+            src1_i32, dst->data, ctx.stream());
             break;
         case GGML_TYPE_Q5_K:
             get_rows_sycl<QK_K, 1, dequantize_q5_K>(ctx, dst->src[0], dst->src[1], dst, (const float *)dst->src[0]->data,

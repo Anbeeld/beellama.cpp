@@ -1,5 +1,14 @@
 #include "common.cuh"
 
+static __device__ __forceinline__ void dequantize_iq4_nl(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_iq4_nl * x = (const block_iq4_nl *) vx;
+    const float d = x[ib].d;
+    const uint8_t q = x[ib].qs[iqs];
+
+    v.x = d*kvalues_iq4nl[q & 0x0f];
+    v.y = d*kvalues_iq4nl[q >> 4];
+}
+
 static __device__ __forceinline__ void dequantize_q1_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q1_0 * x = (const block_q1_0 *) vx;
 

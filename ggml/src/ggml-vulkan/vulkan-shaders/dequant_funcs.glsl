@@ -115,6 +115,55 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
 }
 #endif
 
+#if defined(DATA_A_Q6_0) || defined(DATA_A_Q6_1)
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    const uint h = uint(data_a[a_offset + ib].qh[iqs % 8u]) >> (4u * (iqs / 8u));
+    const uint q = uint(data_a[a_offset + ib].qs[iqs]);
+    return vec2(
+        (q & 0x0fu) | ((h & 0x03u) << 4u),
+        (q >> 4u)   | ((h & 0x0cu) << 2u));
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    const vec2 a = dequantize(ib, iqs, a_offset);
+    const vec2 b = dequantize(ib, iqs + 1u, a_offset);
+    return vec4(a.x, a.y, b.x, b.y);
+}
+#endif
+
+#if defined(DATA_A_Q3_0) || defined(DATA_A_Q3_1)
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    const uint qh = uint(data_a[a_offset + ib].qh[0]) |
+                    (uint(data_a[a_offset + ib].qh[1]) << 8u) |
+                    (uint(data_a[a_offset + ib].qh[2]) << 16u) |
+                    (uint(data_a[a_offset + ib].qh[3]) << 24u);
+    const uint q = uint(data_a[a_offset + ib].qs[iqs % 8u]);
+    const uint plane = iqs / 8u;
+    return vec2(
+        ((q >> (2u*plane))      & 0x03u) | (((qh >> iqs)         & 1u) << 2u),
+        ((q >> (2u*plane + 4u)) & 0x03u) | (((qh >> (iqs + 16u)) & 1u) << 2u));
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    const vec2 a = dequantize(ib, iqs, a_offset);
+    const vec2 b = dequantize(ib, iqs + 1u, a_offset);
+    return vec4(a.x, a.y, b.x, b.y);
+}
+#endif
+
+#if defined(DATA_A_Q2_0S) || defined(DATA_A_Q2_1)
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    const uint q = uint(data_a[a_offset + ib].qs[iqs % 8u]);
+    const uint plane = iqs / 8u;
+    return vec2(
+        (q >> (2u*plane))      & 0x03u,
+        (q >> (2u*plane + 4u)) & 0x03u);
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    const vec2 a = dequantize(ib, iqs, a_offset);
+    const vec2 b = dequantize(ib, iqs + 1u, a_offset);
+    return vec4(a.x, a.y, b.x, b.y);
+}
+#endif
+
 #if defined(DATA_A_Q8_0)
 vec2 dequantize(uint ib, uint iqs, uint a_offset) {
     return vec2(int(data_a[a_offset + ib].qs[iqs]), int(data_a[a_offset + ib].qs[iqs + 1]));
@@ -529,6 +578,24 @@ vec2 get_dm(uint ib, uint a_offset) {
 }
 #endif
 
+#if defined(DATA_A_Q6_0)
+vec2 get_dm(uint ib, uint a_offset) {
+    return vec2(float(data_a[a_offset + ib].d), -32.0f*float(data_a[a_offset + ib].d));
+}
+#endif
+
+#if defined(DATA_A_Q3_0)
+vec2 get_dm(uint ib, uint a_offset) {
+    return vec2(float(data_a[a_offset + ib].d), -4.0f*float(data_a[a_offset + ib].d));
+}
+#endif
+
+#if defined(DATA_A_Q2_0S)
+vec2 get_dm(uint ib, uint a_offset) {
+    return vec2(float(data_a[a_offset + ib].d), -2.0f*float(data_a[a_offset + ib].d));
+}
+#endif
+
 #if defined(DATA_A_Q1_0)
 vec2 get_dm(uint ib, uint a_offset) {
     const float d = float(data_a[a_offset + ib].d);
@@ -550,8 +617,13 @@ vec2 get_dm(uint ib, uint a_offset) {
 
 #if defined(DATA_A_Q4_1) || defined(DATA_A_Q5_1)
 vec2 get_dm(uint ib, uint a_offset) {
-    const vec2 dm = vec2(data_a_packed32[a_offset + ib].dm);
-    return dm;
+    return vec2(data_a_packed32[a_offset + ib].dm);
+}
+#endif
+
+#if defined(DATA_A_Q6_1) || defined(DATA_A_Q3_1) || defined(DATA_A_Q2_1)
+vec2 get_dm(uint ib, uint a_offset) {
+    return vec2(float(data_a[a_offset + ib].d), float(data_a[a_offset + ib].m));
 }
 #endif
 

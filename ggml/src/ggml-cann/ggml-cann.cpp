@@ -2397,6 +2397,38 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
  * @return bool Returns true if the operation is supported by the backend,
  *              otherwise false.
  */
+static bool ggml_cann_get_rows_shapes_supported(const ggml_tensor * op) {
+    const ggml_tensor * src = op->src[0];
+    const ggml_tensor * indices = op->src[1];
+    return src != nullptr && indices != nullptr && indices->type == GGML_TYPE_I32 &&
+           src->ne[2] == indices->ne[1] && src->ne[3] == indices->ne[2] && indices->ne[3] == 1 &&
+           op->ne[0] == src->ne[0] && op->ne[1] == indices->ne[0] &&
+           op->ne[2] == indices->ne[1] && op->ne[3] == indices->ne[2] &&
+           ggml_is_contiguous_rows(src) && ggml_is_contiguous_rows(op);
+}
+
+static bool ggml_cann_set_rows_shapes_supported(const ggml_tensor * op) {
+    const ggml_tensor * src = op->src[0];
+    const ggml_tensor * indices = op->src[1];
+    return src != nullptr && indices != nullptr && src->type == GGML_TYPE_F32 &&
+           (indices->type == GGML_TYPE_I32 || indices->type == GGML_TYPE_I64) &&
+           op->ne[0] == src->ne[0] && op->ne[2] == src->ne[2] && op->ne[3] == src->ne[3] &&
+           src->ne[1] == indices->ne[0] && indices->ne[1] > 0 && indices->ne[2] > 0 && indices->ne[3] == 1 &&
+           src->ne[2] % indices->ne[1] == 0 && src->ne[3] % indices->ne[2] == 0 &&
+           ggml_is_contiguous_rows(op) && ggml_is_contiguous_rows(src);
+}
+
+static bool ggml_cann_out_prod_shapes_supported(const ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * src1 = op->src[1];
+    return src0 != nullptr && src1 != nullptr && op->type == GGML_TYPE_F32 &&
+           src1->type == GGML_TYPE_F32 && src0->ne[0] == op->ne[0] &&
+           src1->ne[0] == op->ne[1] && src0->ne[1] == src1->ne[1] &&
+           src1->ne[2] == op->ne[2] && src1->ne[3] == op->ne[3] &&
+           op->ne[2] % src0->ne[2] == 0 && op->ne[3] % src0->ne[3] == 0 &&
+           ggml_is_contiguous_rows(src0) && ggml_is_contiguous_rows(op);
+}
+
 static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     switch (op->op) {
         case GGML_OP_UNARY:
@@ -2473,6 +2505,18 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
         // embedding
         case GGML_OP_GET_ROWS:
             {
+                if (!ggml_cann_get_rows_shapes_supported(op)) {
+                    return false;
+                }
+#ifdef ASCEND_310P
+                if (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16) {
+                    return false;
+                }
+#else
+                if (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16 && op->type != GGML_TYPE_BF16) {
+                    return false;
+                }
+#endif
                 switch (op->src[0]->type) {
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:
@@ -2488,6 +2532,9 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
             break;
         case GGML_OP_SET_ROWS:
             {
+                if (!ggml_cann_set_rows_shapes_supported(op)) {
+                    return false;
+                }
                 switch (op->type) {
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:
@@ -2586,7 +2633,6 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_DUP:
         case GGML_OP_IM2COL:
-        case GGML_OP_CONCAT:
         case GGML_OP_REPEAT:
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
@@ -2631,6 +2677,9 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                 // Ger is not supported on 310p device
                 return false;
 #endif
+                if (!ggml_cann_out_prod_shapes_supported(op)) {
+                    return false;
+                }
                 switch (op->src[0]->type) {
                     case GGML_TYPE_F16:
                     case GGML_TYPE_F32:
@@ -2639,6 +2688,16 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                         return false;
                 }
             }
+        case GGML_OP_CONCAT:
+            if (op->src[0] == nullptr || op->src[1] == nullptr ||
+                op->src[0]->type != op->type || op->src[1]->type != op->type) {
+                return false;
+            }
+#ifdef ASCEND_310P
+            return op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16;
+#else
+            return op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16;
+#endif
         case GGML_OP_CONV_TRANSPOSE_1D:
             return true;
         case GGML_OP_SCALE:
@@ -2650,7 +2709,13 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
             if (op->src[2]) {
                 return false;
             }
-            return true;
+            if (op->src[0] == nullptr || op->src[0]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous_rows(op->src[0]) || !ggml_is_contiguous_rows(op)) {
+                return false;
+            }
+            return op->src[1] == nullptr ||
+                   ((op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_F32) &&
+                    ggml_is_contiguous_rows(op->src[1]));
         case GGML_OP_FLASH_ATTN_EXT:
             {
 #ifdef ASCEND_310P

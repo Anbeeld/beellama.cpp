@@ -1048,6 +1048,34 @@ void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t
     }
 }
 
+static bool ggml_metal_is_std_cache_quant(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q8_0: case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1: case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1: case GGML_TYPE_Q6_0: case GGML_TYPE_Q6_1:
+        case GGML_TYPE_Q3_0: case GGML_TYPE_Q3_1: case GGML_TYPE_Q2_0S: case GGML_TYPE_Q2_1:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool ggml_metal_is_set_rows_type(enum ggml_type type, bool has_bfloat) {
+    return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 ||
+           (type == GGML_TYPE_BF16 && has_bfloat) || ggml_metal_is_std_cache_quant(type);
+}
+
+static bool ggml_metal_set_rows_shapes_supported(
+        const struct ggml_tensor * dst,
+        const struct ggml_tensor * src,
+        const struct ggml_tensor * indices) {
+    return dst != NULL && src != NULL && indices != NULL &&
+        dst->ne[0] == src->ne[0] && dst->ne[2] == src->ne[2] && dst->ne[3] == src->ne[3] &&
+        src->ne[1] == indices->ne[0] && indices->ne[1] > 0 && indices->ne[2] > 0 && indices->ne[3] == 1 &&
+        src->ne[2] % indices->ne[1] == 0 && src->ne[3] % indices->ne[2] == 0 &&
+        src->ne[0] % ggml_blck_size(dst->type) == 0 &&
+        ggml_is_contiguous_rows(dst) && ggml_is_contiguous_rows(src);
+}
+
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op) {
     const bool has_simdgroup_mm        = dev->props.has_simdgroup_mm;
     const bool has_simdgroup_reduction = dev->props.has_simdgroup_reduction;
@@ -1058,7 +1086,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return false;
         }
 
-        for (size_t i = 0, n = 3; i < n; ++i) {
+        for (size_t i = 0, n = GGML_MAX_SRC; i < n; ++i) {
             if (op->src[i] != NULL && op->src[i]->type == GGML_TYPE_BF16) {
                 return false;
             }
@@ -1174,7 +1202,12 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_SUM_ROWS:
         case GGML_OP_CUMSUM:
         case GGML_OP_MEAN:
+            return has_simdgroup_reduction && ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_SOFT_MAX:
+            return has_simdgroup_reduction && op->type == GGML_TYPE_F32 &&
+                op->src[0] != NULL && op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(op->src[0]) &&
+                (op->src[1] == NULL || op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_F32) &&
+                (op->src[2] == NULL || op->src[2]->type == GGML_TYPE_F32);
         case GGML_OP_GROUP_NORM:
         case GGML_OP_L2_NORM:
             return has_simdgroup_reduction && ggml_is_contiguous_rows(op->src[0]);
@@ -1226,6 +1259,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_ROLL:
             return true;
         case GGML_OP_FLASH_ATTN_EXT:
+            if (op->src[5] != NULL) {
+                return false;
+            }
             // for new head sizes, add checks here
             if (op->src[0]->ne[0] != 32 &&
                 op->src[0]->ne[0] != 40 &&
@@ -1293,6 +1329,12 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                            case GGML_TYPE_Q4_1:
                            case GGML_TYPE_Q5_0:
                            case GGML_TYPE_Q5_1:
+                           case GGML_TYPE_Q6_0:
+                           case GGML_TYPE_Q6_1:
+                           case GGML_TYPE_Q3_0:
+                           case GGML_TYPE_Q3_1:
+                           case GGML_TYPE_Q2_0S:
+                           case GGML_TYPE_Q2_1:
                            case GGML_TYPE_IQ4_NL:
                            case GGML_TYPE_I32:
                                 return true;
@@ -1320,10 +1362,18 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
+                    case GGML_TYPE_Q6_0:
+                    case GGML_TYPE_Q6_1:
+                    case GGML_TYPE_Q3_0:
+                    case GGML_TYPE_Q3_1:
+                    case GGML_TYPE_Q2_0S:
+                    case GGML_TYPE_Q2_1:
+                    case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_Q8_0:
                         switch (op->type) {
                             case GGML_TYPE_F32:
                             case GGML_TYPE_F16:
+                            case GGML_TYPE_BF16:
                                 return true;
                             default:
                                 return false;
@@ -1335,28 +1385,51 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 };
             }
         case GGML_OP_GET_ROWS:
-            return op->src[0]->type != GGML_TYPE_NVFP4;
+            if (op->src[0] == NULL || op->src[1] == NULL || op->src[1]->type != GGML_TYPE_I32 ||
+                !ggml_is_contiguous_rows(op->src[0]) || !ggml_is_contiguous_rows(op)) {
+                return false;
+            }
+            if (op->src[0]->type == GGML_TYPE_I32) {
+                return op->type == GGML_TYPE_I32;
+            }
+            if (ggml_metal_is_std_cache_quant(op->src[0]->type)) {
+                return op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 ||
+                       (op->type == GGML_TYPE_BF16 && has_bfloat);
+            }
+            return op->type == GGML_TYPE_F32 && op->src[0]->type != GGML_TYPE_NVFP4;
         case GGML_OP_SET_ROWS:
             {
-                if (op->src[0]->type != GGML_TYPE_F32 && op->src[0]->type != GGML_TYPE_F16) {
+                if (op->src[0] == NULL || op->src[1] == NULL ||
+                    (op->src[1]->type != GGML_TYPE_I32 && op->src[1]->type != GGML_TYPE_I64)) {
                     return false;
                 }
-
-                switch (op->type) {
-                    case GGML_TYPE_F32:
-                    case GGML_TYPE_F16:
-                    case GGML_TYPE_BF16:
-                    case GGML_TYPE_Q8_0:
-                    case GGML_TYPE_Q4_0:
-                    case GGML_TYPE_Q4_1:
-                    case GGML_TYPE_Q5_0:
-                    case GGML_TYPE_Q5_1:
-                    case GGML_TYPE_IQ4_NL:
-                        return true;
-                    default:
-                        return false;
-                };
+                if (op->src[3] == NULL) {
+                    const bool types_supported =
+                        (op->src[0]->type == GGML_TYPE_F32 && ggml_metal_is_set_rows_type(op->type, has_bfloat)) ||
+                        (op->src[0]->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F16) ||
+                        (op->src[0]->type == GGML_TYPE_BF16 && op->type == GGML_TYPE_BF16 && has_bfloat);
+                    return types_supported &&
+                        ggml_metal_set_rows_shapes_supported(op, op->src[0], op->src[1]);
+                }
+                return op->src[0]->type == GGML_TYPE_F32 && op->src[2] != NULL && op->src[4] != NULL &&
+                    ggml_metal_is_std_cache_quant(op->src[2]->type) &&
+                    (op->src[3]->type == GGML_TYPE_F16 || (op->src[3]->type == GGML_TYPE_BF16 && has_bfloat)) &&
+                    op->src[1]->type == GGML_TYPE_I64 && op->src[4]->type == GGML_TYPE_I64 &&
+                    op->src[4]->ne[0] == op->src[1]->ne[0] && op->src[4]->ne[1] > 0 &&
+                    op->src[4]->ne[2] == 1 && op->src[4]->ne[3] == 1 &&
+                    op->src[3]->ne[0] == op->src[0]->ne[0] &&
+                    op->src[3]->ne[2] == op->src[0]->ne[2] && op->src[3]->ne[3] == op->src[0]->ne[3] &&
+                    ggml_is_contiguous_rows(op->src[3]) &&
+                    ggml_metal_set_rows_shapes_supported(op->src[2], op->src[0], op->src[1]);
             }
+        case GGML_OP_OUT_PROD:
+            return op->src[0] != NULL && op->src[1] != NULL && op->type == GGML_TYPE_F32 &&
+                (op->src[0]->type == GGML_TYPE_F32 || ggml_metal_is_std_cache_quant(op->src[0]->type)) &&
+                op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(op->src[0]) &&
+                ggml_is_contiguous_rows(op) && op->src[0]->ne[0] == op->ne[0] &&
+                op->src[1]->ne[0] == op->ne[1] && op->src[1]->ne[2] == op->ne[2] &&
+                op->src[1]->ne[3] == op->ne[3] && op->src[0]->ne[1] == op->src[1]->ne[1] &&
+                op->ne[2] % op->src[0]->ne[2] == 0 && op->ne[3] % op->src[0]->ne[3] == 0;
         case GGML_OP_DIAG:
             return true;
         case GGML_OP_OPT_STEP_ADAMW:

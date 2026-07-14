@@ -22,7 +22,8 @@ kernel void kernel_concat_f32(
     ulong           nb1,
     ulong           nb2,
     ulong           nb3,
-    int             dim
+    int             dim,
+    int             element_size
 ) {
     src0 = src0 + offset0;
     src1 = src1 + offset1;
@@ -35,18 +36,17 @@ kernel void kernel_concat_f32(
     int o[4] = {0, 0, 0, 0};
     o[dim] = dim == 0 ? ne00 : (dim == 1 ? ne01 : (dim == 2 ? ne02 : ne03));
 
-    global const float * x;
+    global const char * x;
 
     for (int i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
         if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
-            x = (global const float *)(src0 + (i3       )*nb03 + (i2       )*nb02 + (i1       )*nb01 + (i0       )*nb00);
+            x = src0 + (i3       )*nb03 + (i2       )*nb02 + (i1       )*nb01 + (i0       )*nb00;
         } else {
-            x = (global const float *)(src1 + (i3 - o[3])*nb13 + (i2 - o[2])*nb12 + (i1 - o[1])*nb11 + (i0 - o[0])*nb10);
+            x = src1 + (i3 - o[3])*nb13 + (i2 - o[2])*nb12 + (i1 - o[1])*nb11 + (i0 - o[0])*nb10;
         }
 
-        global float * y = (global float *)(dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
-
-        *y = *x;
+        global char * y = dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0;
+        for (int b = 0; b < element_size; ++b) y[b] = x[b];
     }
 }
 
@@ -77,7 +77,8 @@ kernel void kernel_concat_f32_pack(
     int             dim,
     int             ne1,
     int             ne2,
-    int             ne3
+    int             ne3,
+    int             element_size
 ) {
     src0 = src0 + offset0;
     src1 = src1 + offset1;
@@ -104,15 +105,14 @@ kernel void kernel_concat_f32_pack(
     o[dim] = dim == 0 ? ne00 : (dim == 1 ? ne01 : (dim == 2 ? ne02 : ne03));
 
     for (int i0 = lane; i0 < ne0; i0 += tpr) {
-        global const float * x;
+        global const char * x;
         if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
-            x = (global const float *)(src0 + (i3       )*nb03 + (i2       )*nb02 + (i1       )*nb01 + (i0       )*nb00);
+            x = src0 + (i3       )*nb03 + (i2       )*nb02 + (i1       )*nb01 + (i0       )*nb00;
         } else {
-            x = (global const float *)(src1 + (i3 - o[3])*nb13 + (i2 - o[2])*nb12 + (i1 - o[1])*nb11 + (i0 - o[0])*nb10);
+            x = src1 + (i3 - o[3])*nb13 + (i2 - o[2])*nb12 + (i1 - o[1])*nb11 + (i0 - o[0])*nb10;
         }
 
-        global float * y = (global float *)(dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
-
-        *y = *x;
+        global char * y = dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0;
+        for (int b = 0; b < element_size; ++b) y[b] = x[b];
     }
 }

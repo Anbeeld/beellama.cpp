@@ -1,0 +1,50 @@
+#version 450
+
+#include "types.glsl"
+#include "generic_binary_head.glsl"
+#include "dequant_funcs.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+float load_quant_value(uint block, uint element) {
+#if QUANT_R == 1
+    vec2 q = dequantize(block, element, 0);
+    return q.x * get_dm(block, 0).x + get_dm(block, 0).y;
+#else
+    const uint half_block = QUANT_K/2;
+    vec2 q = dequantize(block, element % half_block, 0);
+    const float v = element < half_block ? q.x : q.y;
+    const vec2 dm = get_dm(block, 0);
+    return v*dm.x + dm.y;
+#endif
+}
+
+void main() {
+#ifdef NEEDS_INIT_IQ_SHMEM
+    init_iq_shmem(gl_WorkGroupSize);
+#endif
+
+    const uint i0 = gl_GlobalInvocationID.x;
+    const uint i1 = gl_GlobalInvocationID.y;
+    const uint i23 = gl_GlobalInvocationID.z;
+    if (i0 >= p.ne00 || i1 >= p.ne10 || i23 >= p.ne22*p.ne23) {
+        return;
+    }
+
+    const uint i2 = i23 % p.ne22;
+    const uint i3 = i23 / p.ne22;
+    const uint dps2 = p.ne22/p.ne02;
+    const uint dps3 = p.ne23/p.ne03;
+    const uint a_slice = get_aoffset() + (i2/dps2)*p.nb02 + (i3/dps3)*p.nb03;
+    const uint b_slice = get_boffset() + i2*p.nb12 + i3*p.nb13;
+
+    float sum = 0.0;
+    for (uint k = 0; k < p.ne01; ++k) {
+        const uint block = a_slice + k*p.nb01 + i0/QUANT_K;
+        const float value = load_quant_value(block, i0 % QUANT_K);
+        const float weight = float(data_b[b_slice + i1*p.nb10 + k*p.nb11]);
+        sum = fma(value, weight, sum);
+    }
+
+    data_d[get_doffset() + i0*p.nb20 + i1*p.nb21 + i2*p.nb22 + i3*p.nb23] = D_TYPE(sum);
+}

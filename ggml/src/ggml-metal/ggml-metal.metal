@@ -221,6 +221,195 @@ void quantize_q1_0(device const float * src, device block_q1_0 & dst) {
     }
 }
 
+template <typename type4x4>
+void dequantize_q6_0(device const block_q6_0 * xb, short il, thread type4x4 & reg) {
+    float4x4 tmp;
+    const float d = xb->d;
+    for (int i = 0; i < 16; ++i) {
+        const int idx = 16 * il + i;
+        const int j = idx % 16;
+        const uint8_t h = (xb->qh[j % 8] >> (4 * (j / 8))) & 0x0F;
+        const uint8_t q = idx < 16 ? ((xb->qs[j] & 0x0F) | ((h & 0x03) << 4))
+                                   : ((xb->qs[j] >>   4) | ((h & 0x0C) << 2));
+        tmp[i / 4][i % 4] = ((float) q - 32.0f) * d;
+    }
+    reg = (type4x4) tmp;
+}
+
+template <typename type4x4>
+void dequantize_q6_1(device const block_q6_1 * xb, short il, thread type4x4 & reg) {
+    float4x4 tmp;
+    const float d = xb->d;
+    const float m = xb->m;
+    for (int i = 0; i < 16; ++i) {
+        const int idx = 16 * il + i;
+        const int j = idx % 16;
+        const uint8_t h = (xb->qh[j % 8] >> (4 * (j / 8))) & 0x0F;
+        const uint8_t q = idx < 16 ? ((xb->qs[j] & 0x0F) | ((h & 0x03) << 4))
+                                   : ((xb->qs[j] >>   4) | ((h & 0x0C) << 2));
+        tmp[i / 4][i % 4] = (float) q * d + m;
+    }
+    reg = (type4x4) tmp;
+}
+
+template <typename type4x4>
+void dequantize_q3_0(device const block_q3_0 * xb, short il, thread type4x4 & reg) {
+    float4x4 tmp;
+    const float d = xb->d;
+    for (int i = 0; i < 16; ++i) {
+        const int idx = 16 * il + i;
+        const uint8_t q = ((xb->qs[idx % 8] >> (2 * (idx / 8))) & 0x03) |
+                          (((xb->qh[idx / 8] >> (idx % 8)) & 1) << 2);
+        tmp[i / 4][i % 4] = ((float) q - 4.0f) * d;
+    }
+    reg = (type4x4) tmp;
+}
+
+template <typename type4x4>
+void dequantize_q3_1(device const block_q3_1 * xb, short il, thread type4x4 & reg) {
+    float4x4 tmp;
+    const float d = xb->d;
+    const float m = xb->m;
+    for (int i = 0; i < 16; ++i) {
+        const int idx = 16 * il + i;
+        const uint8_t q = ((xb->qs[idx % 8] >> (2 * (idx / 8))) & 0x03) |
+                          (((xb->qh[idx / 8] >> (idx % 8)) & 1) << 2);
+        tmp[i / 4][i % 4] = (float) q * d + m;
+    }
+    reg = (type4x4) tmp;
+}
+
+template <typename type4x4>
+void dequantize_q2_0s(device const block_q2_0s * xb, short il, thread type4x4 & reg) {
+    float4x4 tmp;
+    const float d = xb->d;
+    for (int i = 0; i < 16; ++i) {
+        const int idx = 16 * il + i;
+        const uint8_t q = (xb->qs[idx % 8] >> (2 * (idx / 8))) & 0x03;
+        tmp[i / 4][i % 4] = ((float) q - 2.0f) * d;
+    }
+    reg = (type4x4) tmp;
+}
+
+template <typename type4x4>
+void dequantize_q2_1(device const block_q2_1 * xb, short il, thread type4x4 & reg) {
+    float4x4 tmp;
+    const float d = xb->d;
+    const float m = xb->m;
+    for (int i = 0; i < 16; ++i) {
+        const int idx = 16 * il + i;
+        const uint8_t q = (xb->qs[idx % 8] >> (2 * (idx / 8))) & 0x03;
+        tmp[i / 4][i % 4] = (float) q * d + m;
+    }
+    reg = (type4x4) tmp;
+}
+
+void quantize_q6_0(device const float * src, device block_q6_0 & dst) {
+    float amax = 0.0f;
+    float vmax = 0.0f;
+    for (int j = 0; j < QK6_0; ++j) {
+        if (fabs(src[j]) > amax) {
+            amax = fabs(src[j]);
+            vmax = src[j];
+        }
+    }
+    float d = vmax / -32.0f;
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+    float sumqx = 0.0f;
+    float sumq2 = 0.0f;
+    for (int j = 0; j < QK6_0 / 4; ++j) dst.qh[j] = 0;
+    for (int j = 0; j < QK6_0 / 2; ++j) {
+        const uint8_t q0 = (uint8_t) clamp((int) floor(src[j] * id + 32.5f), 0, 63);
+        const uint8_t q1 = (uint8_t) clamp((int) floor(src[j + 16] * id + 32.5f), 0, 63);
+        dst.qs[j] = (q0 & 0x0F) | ((q1 & 0x0F) << 4);
+        dst.qh[j % 8] |= ((q0 >> 4) | ((q1 >> 4) << 2)) << (4 * (j / 8));
+
+        const float v0 = (float) q0 - 32.0f;
+        const float v1 = (float) q1 - 32.0f;
+        const float w0 = src[j] * src[j];
+        const float w1 = src[j + 16] * src[j + 16];
+        sumqx += w0 * v0 * src[j] + w1 * v1 * src[j + 16];
+        sumq2 += w0 * v0 * v0 + w1 * v1 * v1;
+    }
+    if (sumq2 > 0.0f) d = sumqx / sumq2;
+    dst.d = d;
+}
+
+void quantize_q6_1(device const float * src, device block_q6_1 & dst) {
+    float vmin = FLT_MAX;
+    float vmax = -FLT_MAX;
+    for (int j = 0; j < QK6_1; ++j) {
+        vmin = min(vmin, src[j]);
+        vmax = max(vmax, src[j]);
+    }
+    const float d = (vmax - vmin) / 63.0f;
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+    dst.d = d;
+    dst.m = vmin;
+    for (int j = 0; j < QK6_1 / 4; ++j) dst.qh[j] = 0;
+    for (int j = 0; j < QK6_1 / 2; ++j) {
+        const uint8_t q0 = (uint8_t) clamp((int) floor((src[j] - vmin) * id + 0.5f), 0, 63);
+        const uint8_t q1 = (uint8_t) clamp((int) floor((src[j + 16] - vmin) * id + 0.5f), 0, 63);
+        dst.qs[j] = (q0 & 0x0F) | ((q1 & 0x0F) << 4);
+        dst.qh[j % 8] |= ((q0 >> 4) | ((q1 >> 4) << 2)) << (4 * (j / 8));
+    }
+}
+
+template <int levels, bool affine>
+void quantize_planar_values(device const float * src, thread float & d, thread float & m,
+                            thread uint8_t (&qs)[8], thread uint8_t (&qh)[4]) {
+    float vmin = FLT_MAX;
+    float vmax = -FLT_MAX;
+    float amax = 0.0f;
+    float signed_max = 0.0f;
+    for (int j = 0; j < 32; ++j) {
+        vmin = min(vmin, src[j]);
+        vmax = max(vmax, src[j]);
+        if (fabs(src[j]) > amax) {
+            amax = fabs(src[j]);
+            signed_max = src[j];
+        }
+    }
+    m = affine ? vmin : 0.0f;
+    d = affine ? (vmax - vmin) / (levels - 1) : signed_max / -(levels / 2);
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+    for (int j = 0; j < 8; ++j) qs[j] = 0;
+    for (int j = 0; j < 4; ++j) qh[j] = 0;
+    for (int j = 0; j < 32; ++j) {
+        const float shifted = affine ? (src[j] - m) * id + 0.5f : src[j] * id + levels / 2 + 0.5f;
+        const uint8_t q = (uint8_t) clamp((int) floor(shifted), 0, levels - 1);
+        qs[j % 8] |= (q & 3) << (2 * (j / 8));
+        if (levels == 8) qh[j / 8] |= ((q >> 2) & 1) << (j % 8);
+    }
+}
+
+void quantize_q3_0(device const float * src, device block_q3_0 & dst) {
+    float d, m; uint8_t qs[8], qh[4];
+    quantize_planar_values<8, false>(src, d, m, qs, qh);
+    dst.d = d;
+    for (int j = 0; j < 8; ++j) dst.qs[j] = qs[j];
+    for (int j = 0; j < 4; ++j) dst.qh[j] = qh[j];
+}
+void quantize_q3_1(device const float * src, device block_q3_1 & dst) {
+    float d, m; uint8_t qs[8], qh[4];
+    quantize_planar_values<8, true>(src, d, m, qs, qh);
+    dst.d = d; dst.m = m;
+    for (int j = 0; j < 8; ++j) dst.qs[j] = qs[j];
+    for (int j = 0; j < 4; ++j) dst.qh[j] = qh[j];
+}
+void quantize_q2_0s(device const float * src, device block_q2_0s & dst) {
+    float d, m; uint8_t qs[8], qh[4];
+    quantize_planar_values<4, false>(src, d, m, qs, qh);
+    dst.d = d;
+    for (int j = 0; j < 8; ++j) dst.qs[j] = qs[j];
+}
+void quantize_q2_1(device const float * src, device block_q2_1 & dst) {
+    float d, m; uint8_t qs[8], qh[4];
+    quantize_planar_values<4, true>(src, d, m, qs, qh);
+    dst.d = d; dst.m = m;
+    for (int j = 0; j < 8; ++j) dst.qs[j] = qs[j];
+}
+
 void quantize_q4_0(device const float * src, device block_q4_0 & dst) {
 #pragma METAL fp math_mode(safe)
     float amax = 0.0f; // absolute max
@@ -7704,6 +7893,12 @@ template [[host_name("kernel_cpy_f32_q4_0")]]   kernel cpy_f_q_t kernel_cpy_f32_
 template [[host_name("kernel_cpy_f32_q4_1")]]   kernel cpy_f_q_t kernel_cpy_f32_q<QK4_1,  block_q4_1,   quantize_q4_1>;
 template [[host_name("kernel_cpy_f32_q5_0")]]   kernel cpy_f_q_t kernel_cpy_f32_q<QK5_0,  block_q5_0,   quantize_q5_0>;
 template [[host_name("kernel_cpy_f32_q5_1")]]   kernel cpy_f_q_t kernel_cpy_f32_q<QK5_1,  block_q5_1,   quantize_q5_1>;
+template [[host_name("kernel_cpy_f32_q6_0")]]   kernel cpy_f_q_t kernel_cpy_f32_q<QK6_0,  block_q6_0,   quantize_q6_0>;
+template [[host_name("kernel_cpy_f32_q6_1")]]   kernel cpy_f_q_t kernel_cpy_f32_q<QK6_1,  block_q6_1,   quantize_q6_1>;
+template [[host_name("kernel_cpy_f32_q3_0")]]   kernel cpy_f_q_t kernel_cpy_f32_q<QK3_0,  block_q3_0,   quantize_q3_0>;
+template [[host_name("kernel_cpy_f32_q3_1")]]   kernel cpy_f_q_t kernel_cpy_f32_q<QK3_1,  block_q3_1,   quantize_q3_1>;
+template [[host_name("kernel_cpy_f32_q2_0s")]]  kernel cpy_f_q_t kernel_cpy_f32_q<QK2_0S, block_q2_0s,  quantize_q2_0s>;
+template [[host_name("kernel_cpy_f32_q2_1")]]   kernel cpy_f_q_t kernel_cpy_f32_q<QK2_1,  block_q2_1,   quantize_q2_1>;
 template [[host_name("kernel_cpy_f32_iq4_nl")]] kernel cpy_f_q_t kernel_cpy_f32_q<QK4_NL, block_iq4_nl, quantize_iq4_nl>;
 
 template<typename T4x4, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread T4x4 &)>
@@ -7750,6 +7945,13 @@ template [[host_name("kernel_cpy_q4_1_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<
 template [[host_name("kernel_cpy_q5_0_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q5_0, 2, dequantize_q5_0>;
 template [[host_name("kernel_cpy_q5_1_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q5_1, 2, dequantize_q5_1>;
 template [[host_name("kernel_cpy_q8_0_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q8_0, 2, dequantize_q8_0>;
+template [[host_name("kernel_cpy_iq4_nl_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_iq4_nl, 2, dequantize_iq4_nl>;
+template [[host_name("kernel_cpy_q6_0_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q6_0, 2, dequantize_q6_0>;
+template [[host_name("kernel_cpy_q6_1_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q6_1, 2, dequantize_q6_1>;
+template [[host_name("kernel_cpy_q3_0_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q3_0, 2, dequantize_q3_0>;
+template [[host_name("kernel_cpy_q3_1_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q3_1, 2, dequantize_q3_1>;
+template [[host_name("kernel_cpy_q2_0s_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q2_0s, 2, dequantize_q2_0s>;
+template [[host_name("kernel_cpy_q2_1_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q2_1, 2, dequantize_q2_1>;
 
 template [[host_name("kernel_cpy_q1_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q1_0, 8, dequantize_q1_0>;
 template [[host_name("kernel_cpy_q4_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q4_0, 2, dequantize_q4_0>;
@@ -7757,6 +7959,28 @@ template [[host_name("kernel_cpy_q4_1_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<
 template [[host_name("kernel_cpy_q5_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q5_0, 2, dequantize_q5_0>;
 template [[host_name("kernel_cpy_q5_1_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q5_1, 2, dequantize_q5_1>;
 template [[host_name("kernel_cpy_q8_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q8_0, 2, dequantize_q8_0>;
+template [[host_name("kernel_cpy_iq4_nl_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_iq4_nl, 2, dequantize_iq4_nl>;
+template [[host_name("kernel_cpy_q6_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q6_0, 2, dequantize_q6_0>;
+template [[host_name("kernel_cpy_q6_1_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q6_1, 2, dequantize_q6_1>;
+template [[host_name("kernel_cpy_q3_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q3_0, 2, dequantize_q3_0>;
+template [[host_name("kernel_cpy_q3_1_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q3_1, 2, dequantize_q3_1>;
+template [[host_name("kernel_cpy_q2_0s_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q2_0s, 2, dequantize_q2_0s>;
+template [[host_name("kernel_cpy_q2_1_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q2_1, 2, dequantize_q2_1>;
+
+#if defined(GGML_METAL_HAS_BF16)
+template [[host_name("kernel_cpy_q8_0_bf16")]] kernel cpy_q_f_t kernel_cpy_q_f32<bfloat4x4, block_q8_0, 2, dequantize_q8_0>;
+template [[host_name("kernel_cpy_q4_0_bf16")]] kernel cpy_q_f_t kernel_cpy_q_f32<bfloat4x4, block_q4_0, 2, dequantize_q4_0>;
+template [[host_name("kernel_cpy_q4_1_bf16")]] kernel cpy_q_f_t kernel_cpy_q_f32<bfloat4x4, block_q4_1, 2, dequantize_q4_1>;
+template [[host_name("kernel_cpy_iq4_nl_bf16")]] kernel cpy_q_f_t kernel_cpy_q_f32<bfloat4x4, block_iq4_nl, 2, dequantize_iq4_nl>;
+template [[host_name("kernel_cpy_q5_0_bf16")]] kernel cpy_q_f_t kernel_cpy_q_f32<bfloat4x4, block_q5_0, 2, dequantize_q5_0>;
+template [[host_name("kernel_cpy_q5_1_bf16")]] kernel cpy_q_f_t kernel_cpy_q_f32<bfloat4x4, block_q5_1, 2, dequantize_q5_1>;
+template [[host_name("kernel_cpy_q6_0_bf16")]] kernel cpy_q_f_t kernel_cpy_q_f32<bfloat4x4, block_q6_0, 2, dequantize_q6_0>;
+template [[host_name("kernel_cpy_q6_1_bf16")]] kernel cpy_q_f_t kernel_cpy_q_f32<bfloat4x4, block_q6_1, 2, dequantize_q6_1>;
+template [[host_name("kernel_cpy_q3_0_bf16")]] kernel cpy_q_f_t kernel_cpy_q_f32<bfloat4x4, block_q3_0, 2, dequantize_q3_0>;
+template [[host_name("kernel_cpy_q3_1_bf16")]] kernel cpy_q_f_t kernel_cpy_q_f32<bfloat4x4, block_q3_1, 2, dequantize_q3_1>;
+template [[host_name("kernel_cpy_q2_0s_bf16")]] kernel cpy_q_f_t kernel_cpy_q_f32<bfloat4x4, block_q2_0s, 2, dequantize_q2_0s>;
+template [[host_name("kernel_cpy_q2_1_bf16")]] kernel cpy_q_f_t kernel_cpy_q_f32<bfloat4x4, block_q2_1, 2, dequantize_q2_1>;
+#endif
 
 template<typename T>
 kernel void kernel_concat(
@@ -9524,7 +9748,7 @@ kernel void kernel_mul_mv_mxfp4_f32(
     kernel_mul_mv_mxfp4_f32_impl<N_R0_MXFP4, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
-template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread float4x4 &)>
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread float4x4 &), typename TD>
 kernel void kernel_get_rows_q(
         constant ggml_metal_kargs_get_rows & args,
         device const void * src0,
@@ -9544,12 +9768,12 @@ kernel void kernel_get_rows_q(
     const int32_t i03 = i12;
 
     auto psrc = (device const block_q *) ((const device char *) src0 + i03*args.nb03 + i02*args.nb02 +   r*args.nb01);
-    auto pdst = (device      float4x4 *) ((      device char *) dst  + i12*args.nb3  + i11*args.nb2  + i10*args.nb1);
+    auto pdst = (device matrix<TD, 4, 4> *) ((device char *) dst + i12*args.nb3 + i11*args.nb2 + i10*args.nb1);
 
     for (int ind = iw0*ntg.x + tiitg; ind < args.ne00t;) {
         float4x4 temp;
         dequantize_func(psrc + ind/nl, ind%nl, temp);
-        pdst[ind] = temp;
+        pdst[ind] = (matrix<TD, 4, 4>) temp;
 
         break;
     }
@@ -9588,34 +9812,74 @@ typedef decltype(kernel_get_rows_f<float, float>) get_rows_f_t;
 
 template [[host_name("kernel_get_rows_f32")]]  kernel get_rows_f_t kernel_get_rows_f<float, float>;
 template [[host_name("kernel_get_rows_f16")]]  kernel get_rows_f_t kernel_get_rows_f<half,  float>;
+template [[host_name("kernel_get_rows_f32_f16")]] kernel get_rows_f_t kernel_get_rows_f<float, half>;
+template [[host_name("kernel_get_rows_f16_f16")]] kernel get_rows_f_t kernel_get_rows_f<half,  half>;
 template [[host_name("kernel_get_rows_i32")]]  kernel get_rows_f_t kernel_get_rows_f<int32_t, int32_t>;
 #if defined(GGML_METAL_HAS_BF16)
 template [[host_name("kernel_get_rows_bf16")]] kernel get_rows_f_t kernel_get_rows_f<bfloat, float>;
+template [[host_name("kernel_get_rows_f32_bf16")]]  kernel get_rows_f_t kernel_get_rows_f<float,  bfloat>;
+template [[host_name("kernel_get_rows_f16_bf16")]]  kernel get_rows_f_t kernel_get_rows_f<half,   bfloat>;
+template [[host_name("kernel_get_rows_bf16_f16")]]  kernel get_rows_f_t kernel_get_rows_f<bfloat, half>;
+template [[host_name("kernel_get_rows_bf16_bf16")]] kernel get_rows_f_t kernel_get_rows_f<bfloat, bfloat>;
 #endif
 
-typedef decltype(kernel_get_rows_q<block_q4_0, 2, dequantize_q4_0>) get_rows_q_t;
+typedef decltype(kernel_get_rows_q<block_q4_0, 2, dequantize_q4_0, float>) get_rows_q_t;
 
-template [[host_name("kernel_get_rows_q1_0")]]    kernel get_rows_q_t kernel_get_rows_q<block_q1_0,    8, dequantize_q1_0>;
-template [[host_name("kernel_get_rows_q4_0")]]    kernel get_rows_q_t kernel_get_rows_q<block_q4_0,    2, dequantize_q4_0>;
-template [[host_name("kernel_get_rows_q4_1")]]    kernel get_rows_q_t kernel_get_rows_q<block_q4_1,    2, dequantize_q4_1>;
-template [[host_name("kernel_get_rows_q5_0")]]    kernel get_rows_q_t kernel_get_rows_q<block_q5_0,    2, dequantize_q5_0>;
-template [[host_name("kernel_get_rows_q5_1")]]    kernel get_rows_q_t kernel_get_rows_q<block_q5_1,    2, dequantize_q5_1>;
-template [[host_name("kernel_get_rows_q8_0")]]    kernel get_rows_q_t kernel_get_rows_q<block_q8_0,    2, dequantize_q8_0>;
-template [[host_name("kernel_get_rows_mxfp4")]]   kernel get_rows_q_t kernel_get_rows_q<block_mxfp4,   2, dequantize_mxfp4>;
-template [[host_name("kernel_get_rows_q2_K")]]    kernel get_rows_q_t kernel_get_rows_q<block_q2_K,    QK_NL, dequantize_q2_K>;
-template [[host_name("kernel_get_rows_q3_K")]]    kernel get_rows_q_t kernel_get_rows_q<block_q3_K,    QK_NL, dequantize_q3_K>;
-template [[host_name("kernel_get_rows_q4_K")]]    kernel get_rows_q_t kernel_get_rows_q<block_q4_K,    QK_NL, dequantize_q4_K>;
-template [[host_name("kernel_get_rows_q5_K")]]    kernel get_rows_q_t kernel_get_rows_q<block_q5_K,    QK_NL, dequantize_q5_K>;
-template [[host_name("kernel_get_rows_q6_K")]]    kernel get_rows_q_t kernel_get_rows_q<block_q6_K,    QK_NL, dequantize_q6_K>;
-template [[host_name("kernel_get_rows_iq2_xxs")]] kernel get_rows_q_t kernel_get_rows_q<block_iq2_xxs, QK_NL, dequantize_iq2_xxs>;
-template [[host_name("kernel_get_rows_iq2_xs")]]  kernel get_rows_q_t kernel_get_rows_q<block_iq2_xs,  QK_NL, dequantize_iq2_xs>;
-template [[host_name("kernel_get_rows_iq3_xxs")]] kernel get_rows_q_t kernel_get_rows_q<block_iq3_xxs, QK_NL, dequantize_iq3_xxs>;
-template [[host_name("kernel_get_rows_iq3_s")]]   kernel get_rows_q_t kernel_get_rows_q<block_iq3_s,   QK_NL, dequantize_iq3_s>;
-template [[host_name("kernel_get_rows_iq2_s")]]   kernel get_rows_q_t kernel_get_rows_q<block_iq2_s,   QK_NL, dequantize_iq2_s>;
-template [[host_name("kernel_get_rows_iq1_s")]]   kernel get_rows_q_t kernel_get_rows_q<block_iq1_s,   QK_NL, dequantize_iq1_s>;
-template [[host_name("kernel_get_rows_iq1_m")]]   kernel get_rows_q_t kernel_get_rows_q<block_iq1_m,   QK_NL, dequantize_iq1_m>;
-template [[host_name("kernel_get_rows_iq4_nl")]]  kernel get_rows_q_t kernel_get_rows_q<block_iq4_nl,  2,     dequantize_iq4_nl>;
-template [[host_name("kernel_get_rows_iq4_xs")]]  kernel get_rows_q_t kernel_get_rows_q<block_iq4_xs,  QK_NL, dequantize_iq4_xs>;
+template [[host_name("kernel_get_rows_q1_0")]]    kernel get_rows_q_t kernel_get_rows_q<block_q1_0,    8, dequantize_q1_0, float>;
+template [[host_name("kernel_get_rows_q4_0")]]    kernel get_rows_q_t kernel_get_rows_q<block_q4_0,    2, dequantize_q4_0, float>;
+template [[host_name("kernel_get_rows_q4_1")]]    kernel get_rows_q_t kernel_get_rows_q<block_q4_1,    2, dequantize_q4_1, float>;
+template [[host_name("kernel_get_rows_q5_0")]]    kernel get_rows_q_t kernel_get_rows_q<block_q5_0,    2, dequantize_q5_0, float>;
+template [[host_name("kernel_get_rows_q5_1")]]    kernel get_rows_q_t kernel_get_rows_q<block_q5_1,    2, dequantize_q5_1, float>;
+template [[host_name("kernel_get_rows_q6_0")]]    kernel get_rows_q_t kernel_get_rows_q<block_q6_0,    2, dequantize_q6_0, float>;
+template [[host_name("kernel_get_rows_q6_1")]]    kernel get_rows_q_t kernel_get_rows_q<block_q6_1,    2, dequantize_q6_1, float>;
+template [[host_name("kernel_get_rows_q3_0")]]    kernel get_rows_q_t kernel_get_rows_q<block_q3_0,    2, dequantize_q3_0, float>;
+template [[host_name("kernel_get_rows_q3_1")]]    kernel get_rows_q_t kernel_get_rows_q<block_q3_1,    2, dequantize_q3_1, float>;
+template [[host_name("kernel_get_rows_q2_0s")]]   kernel get_rows_q_t kernel_get_rows_q<block_q2_0s,   2, dequantize_q2_0s, float>;
+template [[host_name("kernel_get_rows_q2_1")]]    kernel get_rows_q_t kernel_get_rows_q<block_q2_1,    2, dequantize_q2_1, float>;
+template [[host_name("kernel_get_rows_q8_0")]]    kernel get_rows_q_t kernel_get_rows_q<block_q8_0,    2, dequantize_q8_0, float>;
+template [[host_name("kernel_get_rows_mxfp4")]]   kernel get_rows_q_t kernel_get_rows_q<block_mxfp4,   2, dequantize_mxfp4, float>;
+template [[host_name("kernel_get_rows_q2_K")]]    kernel get_rows_q_t kernel_get_rows_q<block_q2_K,    QK_NL, dequantize_q2_K, float>;
+template [[host_name("kernel_get_rows_q3_K")]]    kernel get_rows_q_t kernel_get_rows_q<block_q3_K,    QK_NL, dequantize_q3_K, float>;
+template [[host_name("kernel_get_rows_q4_K")]]    kernel get_rows_q_t kernel_get_rows_q<block_q4_K,    QK_NL, dequantize_q4_K, float>;
+template [[host_name("kernel_get_rows_q5_K")]]    kernel get_rows_q_t kernel_get_rows_q<block_q5_K,    QK_NL, dequantize_q5_K, float>;
+template [[host_name("kernel_get_rows_q6_K")]]    kernel get_rows_q_t kernel_get_rows_q<block_q6_K,    QK_NL, dequantize_q6_K, float>;
+template [[host_name("kernel_get_rows_iq2_xxs")]] kernel get_rows_q_t kernel_get_rows_q<block_iq2_xxs, QK_NL, dequantize_iq2_xxs, float>;
+template [[host_name("kernel_get_rows_iq2_xs")]]  kernel get_rows_q_t kernel_get_rows_q<block_iq2_xs,  QK_NL, dequantize_iq2_xs, float>;
+template [[host_name("kernel_get_rows_iq3_xxs")]] kernel get_rows_q_t kernel_get_rows_q<block_iq3_xxs, QK_NL, dequantize_iq3_xxs, float>;
+template [[host_name("kernel_get_rows_iq3_s")]]   kernel get_rows_q_t kernel_get_rows_q<block_iq3_s,   QK_NL, dequantize_iq3_s, float>;
+template [[host_name("kernel_get_rows_iq2_s")]]   kernel get_rows_q_t kernel_get_rows_q<block_iq2_s,   QK_NL, dequantize_iq2_s, float>;
+template [[host_name("kernel_get_rows_iq1_s")]]   kernel get_rows_q_t kernel_get_rows_q<block_iq1_s,   QK_NL, dequantize_iq1_s, float>;
+template [[host_name("kernel_get_rows_iq1_m")]]   kernel get_rows_q_t kernel_get_rows_q<block_iq1_m,   QK_NL, dequantize_iq1_m, float>;
+template [[host_name("kernel_get_rows_iq4_nl")]]  kernel get_rows_q_t kernel_get_rows_q<block_iq4_nl,  2,     dequantize_iq4_nl, float>;
+template [[host_name("kernel_get_rows_iq4_xs")]]  kernel get_rows_q_t kernel_get_rows_q<block_iq4_xs,  QK_NL, dequantize_iq4_xs, float>;
+
+template [[host_name("kernel_get_rows_q8_0_f16")]]   kernel get_rows_q_t kernel_get_rows_q<block_q8_0,   2, dequantize_q8_0, half>;
+template [[host_name("kernel_get_rows_q4_0_f16")]]   kernel get_rows_q_t kernel_get_rows_q<block_q4_0,   2, dequantize_q4_0, half>;
+template [[host_name("kernel_get_rows_q4_1_f16")]]   kernel get_rows_q_t kernel_get_rows_q<block_q4_1,   2, dequantize_q4_1, half>;
+template [[host_name("kernel_get_rows_iq4_nl_f16")]] kernel get_rows_q_t kernel_get_rows_q<block_iq4_nl, 2, dequantize_iq4_nl, half>;
+template [[host_name("kernel_get_rows_q5_0_f16")]]   kernel get_rows_q_t kernel_get_rows_q<block_q5_0,   2, dequantize_q5_0, half>;
+template [[host_name("kernel_get_rows_q5_1_f16")]]   kernel get_rows_q_t kernel_get_rows_q<block_q5_1,   2, dequantize_q5_1, half>;
+template [[host_name("kernel_get_rows_q6_0_f16")]]   kernel get_rows_q_t kernel_get_rows_q<block_q6_0,   2, dequantize_q6_0, half>;
+template [[host_name("kernel_get_rows_q6_1_f16")]]   kernel get_rows_q_t kernel_get_rows_q<block_q6_1,   2, dequantize_q6_1, half>;
+template [[host_name("kernel_get_rows_q3_0_f16")]]   kernel get_rows_q_t kernel_get_rows_q<block_q3_0,   2, dequantize_q3_0, half>;
+template [[host_name("kernel_get_rows_q3_1_f16")]]   kernel get_rows_q_t kernel_get_rows_q<block_q3_1,   2, dequantize_q3_1, half>;
+template [[host_name("kernel_get_rows_q2_0s_f16")]]  kernel get_rows_q_t kernel_get_rows_q<block_q2_0s,  2, dequantize_q2_0s, half>;
+template [[host_name("kernel_get_rows_q2_1_f16")]]   kernel get_rows_q_t kernel_get_rows_q<block_q2_1,   2, dequantize_q2_1, half>;
+
+#if defined(GGML_METAL_HAS_BF16)
+template [[host_name("kernel_get_rows_q8_0_bf16")]]   kernel get_rows_q_t kernel_get_rows_q<block_q8_0,   2, dequantize_q8_0, bfloat>;
+template [[host_name("kernel_get_rows_q4_0_bf16")]]   kernel get_rows_q_t kernel_get_rows_q<block_q4_0,   2, dequantize_q4_0, bfloat>;
+template [[host_name("kernel_get_rows_q4_1_bf16")]]   kernel get_rows_q_t kernel_get_rows_q<block_q4_1,   2, dequantize_q4_1, bfloat>;
+template [[host_name("kernel_get_rows_iq4_nl_bf16")]] kernel get_rows_q_t kernel_get_rows_q<block_iq4_nl, 2, dequantize_iq4_nl, bfloat>;
+template [[host_name("kernel_get_rows_q5_0_bf16")]]   kernel get_rows_q_t kernel_get_rows_q<block_q5_0,   2, dequantize_q5_0, bfloat>;
+template [[host_name("kernel_get_rows_q5_1_bf16")]]   kernel get_rows_q_t kernel_get_rows_q<block_q5_1,   2, dequantize_q5_1, bfloat>;
+template [[host_name("kernel_get_rows_q6_0_bf16")]]   kernel get_rows_q_t kernel_get_rows_q<block_q6_0,   2, dequantize_q6_0, bfloat>;
+template [[host_name("kernel_get_rows_q6_1_bf16")]]   kernel get_rows_q_t kernel_get_rows_q<block_q6_1,   2, dequantize_q6_1, bfloat>;
+template [[host_name("kernel_get_rows_q3_0_bf16")]]   kernel get_rows_q_t kernel_get_rows_q<block_q3_0,   2, dequantize_q3_0, bfloat>;
+template [[host_name("kernel_get_rows_q3_1_bf16")]]   kernel get_rows_q_t kernel_get_rows_q<block_q3_1,   2, dequantize_q3_1, bfloat>;
+template [[host_name("kernel_get_rows_q2_0s_bf16")]]  kernel get_rows_q_t kernel_get_rows_q<block_q2_0s,  2, dequantize_q2_0s, bfloat>;
+template [[host_name("kernel_get_rows_q2_1_bf16")]]   kernel get_rows_q_t kernel_get_rows_q<block_q2_1,   2, dequantize_q2_1, bfloat>;
+#endif
 
 template<typename TS, typename TI, typename block_q, void (*quantize_func)(device const float *, device block_q &)>
 kernel void kernel_set_rows_q32(
@@ -9709,8 +9973,91 @@ template [[host_name("kernel_set_rows_f32_i64_q5_0")]]   kernel set_rows_q32_t k
 template [[host_name("kernel_set_rows_f32_i32_q5_0")]]   kernel set_rows_q32_t kernel_set_rows_q32<float, int32_t, block_q5_0,   quantize_q5_0>;
 template [[host_name("kernel_set_rows_f32_i64_q5_1")]]   kernel set_rows_q32_t kernel_set_rows_q32<float, int64_t, block_q5_1,   quantize_q5_1>;
 template [[host_name("kernel_set_rows_f32_i32_q5_1")]]   kernel set_rows_q32_t kernel_set_rows_q32<float, int32_t, block_q5_1,   quantize_q5_1>;
+template [[host_name("kernel_set_rows_f32_i64_q6_0")]]   kernel set_rows_q32_t kernel_set_rows_q32<float, int64_t, block_q6_0,   quantize_q6_0>;
+template [[host_name("kernel_set_rows_f32_i32_q6_0")]]   kernel set_rows_q32_t kernel_set_rows_q32<float, int32_t, block_q6_0,   quantize_q6_0>;
+template [[host_name("kernel_set_rows_f32_i64_q6_1")]]   kernel set_rows_q32_t kernel_set_rows_q32<float, int64_t, block_q6_1,   quantize_q6_1>;
+template [[host_name("kernel_set_rows_f32_i32_q6_1")]]   kernel set_rows_q32_t kernel_set_rows_q32<float, int32_t, block_q6_1,   quantize_q6_1>;
+template [[host_name("kernel_set_rows_f32_i64_q3_0")]]   kernel set_rows_q32_t kernel_set_rows_q32<float, int64_t, block_q3_0,   quantize_q3_0>;
+template [[host_name("kernel_set_rows_f32_i32_q3_0")]]   kernel set_rows_q32_t kernel_set_rows_q32<float, int32_t, block_q3_0,   quantize_q3_0>;
+template [[host_name("kernel_set_rows_f32_i64_q3_1")]]   kernel set_rows_q32_t kernel_set_rows_q32<float, int64_t, block_q3_1,   quantize_q3_1>;
+template [[host_name("kernel_set_rows_f32_i32_q3_1")]]   kernel set_rows_q32_t kernel_set_rows_q32<float, int32_t, block_q3_1,   quantize_q3_1>;
+template [[host_name("kernel_set_rows_f32_i64_q2_0s")]]  kernel set_rows_q32_t kernel_set_rows_q32<float, int64_t, block_q2_0s,  quantize_q2_0s>;
+template [[host_name("kernel_set_rows_f32_i32_q2_0s")]]  kernel set_rows_q32_t kernel_set_rows_q32<float, int32_t, block_q2_0s,  quantize_q2_0s>;
+template [[host_name("kernel_set_rows_f32_i64_q2_1")]]   kernel set_rows_q32_t kernel_set_rows_q32<float, int64_t, block_q2_1,   quantize_q2_1>;
+template [[host_name("kernel_set_rows_f32_i32_q2_1")]]   kernel set_rows_q32_t kernel_set_rows_q32<float, int32_t, block_q2_1,   quantize_q2_1>;
 template [[host_name("kernel_set_rows_f32_i64_iq4_nl")]] kernel set_rows_q32_t kernel_set_rows_q32<float, int64_t, block_iq4_nl, quantize_iq4_nl>;
 template [[host_name("kernel_set_rows_f32_i32_iq4_nl")]] kernel set_rows_q32_t kernel_set_rows_q32<float, int32_t, block_iq4_nl, quantize_iq4_nl>;
+
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread float4x4 &)>
+kernel void kernel_out_prod_q(
+        constant ggml_metal_kargs_out_prod & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint gid [[thread_position_in_grid]]) {
+    const uint64_t total = (uint64_t) args.ne0 * args.ne1 * args.ne2 * args.ne3;
+    if ((uint64_t) gid >= total) return;
+
+    const int i0 = gid % args.ne0;
+    const int i1 = (gid / args.ne0) % args.ne1;
+    const int i2 = (gid / ((uint64_t) args.ne0 * args.ne1)) % args.ne2;
+    const int i3 = gid / ((uint64_t) args.ne0 * args.ne1 * args.ne2);
+    const int r2 = args.ne2 / args.ne02;
+    const int r3 = args.ne3 / args.ne03;
+    const int i02 = i2 / r2;
+    const int i03 = i3 / r3;
+
+    float acc = 0.0f;
+    for (int j = 0; j < args.ne01; ++j) {
+        device const block_q * block = (device const block_q *)
+            (src0 + i03 * args.nb03 + i02 * args.nb02 + j * args.nb01) + i0 / 32;
+        float4x4 values;
+        const int local = i0 % 32;
+        dequantize_func(block, local / 16, values);
+        const float a = values[(local % 16) / 4][local % 4];
+        const float b = *(device const float *)
+            (src1 + i3 * args.nb13 + i2 * args.nb12 + j * args.nb11 + i1 * args.nb10);
+        acc += a * b;
+    }
+    *(device float *)(dst + i3 * args.nb3 + i2 * args.nb2 + i1 * args.nb1 + i0 * sizeof(float)) = acc;
+}
+
+kernel void kernel_out_prod_f32(
+        constant ggml_metal_kargs_out_prod & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint gid [[thread_position_in_grid]]) {
+    const uint64_t total = (uint64_t) args.ne0 * args.ne1 * args.ne2 * args.ne3;
+    if ((uint64_t) gid >= total) return;
+    const int i0 = gid % args.ne0;
+    const int i1 = (gid / args.ne0) % args.ne1;
+    const int i2 = (gid / ((uint64_t) args.ne0 * args.ne1)) % args.ne2;
+    const int i3 = gid / ((uint64_t) args.ne0 * args.ne1 * args.ne2);
+    const int i02 = i2 / (args.ne2 / args.ne02);
+    const int i03 = i3 / (args.ne3 / args.ne03);
+    float acc = 0.0f;
+    for (int j = 0; j < args.ne01; ++j) {
+        const float a = *(device const float *)(src0 + i03 * args.nb03 + i02 * args.nb02 + j * args.nb01 + i0 * sizeof(float));
+        const float b = *(device const float *)(src1 + i3 * args.nb13 + i2 * args.nb12 + j * args.nb11 + i1 * args.nb10);
+        acc += a * b;
+    }
+    *(device float *)(dst + i3 * args.nb3 + i2 * args.nb2 + i1 * args.nb1 + i0 * sizeof(float)) = acc;
+}
+
+typedef decltype(kernel_out_prod_q<block_q4_0, 2, dequantize_q4_0>) out_prod_q_t;
+template [[host_name("kernel_out_prod_q8_0_f32")]]   kernel out_prod_q_t kernel_out_prod_q<block_q8_0,   2, dequantize_q8_0>;
+template [[host_name("kernel_out_prod_q4_0_f32")]]   kernel out_prod_q_t kernel_out_prod_q<block_q4_0,   2, dequantize_q4_0>;
+template [[host_name("kernel_out_prod_q4_1_f32")]]   kernel out_prod_q_t kernel_out_prod_q<block_q4_1,   2, dequantize_q4_1>;
+template [[host_name("kernel_out_prod_iq4_nl_f32")]] kernel out_prod_q_t kernel_out_prod_q<block_iq4_nl, 2, dequantize_iq4_nl>;
+template [[host_name("kernel_out_prod_q5_0_f32")]]   kernel out_prod_q_t kernel_out_prod_q<block_q5_0,   2, dequantize_q5_0>;
+template [[host_name("kernel_out_prod_q5_1_f32")]]   kernel out_prod_q_t kernel_out_prod_q<block_q5_1,   2, dequantize_q5_1>;
+template [[host_name("kernel_out_prod_q6_0_f32")]]   kernel out_prod_q_t kernel_out_prod_q<block_q6_0,   2, dequantize_q6_0>;
+template [[host_name("kernel_out_prod_q6_1_f32")]]   kernel out_prod_q_t kernel_out_prod_q<block_q6_1,   2, dequantize_q6_1>;
+template [[host_name("kernel_out_prod_q3_0_f32")]]   kernel out_prod_q_t kernel_out_prod_q<block_q3_0,   2, dequantize_q3_0>;
+template [[host_name("kernel_out_prod_q3_1_f32")]]   kernel out_prod_q_t kernel_out_prod_q<block_q3_1,   2, dequantize_q3_1>;
+template [[host_name("kernel_out_prod_q2_0s_f32")]]  kernel out_prod_q_t kernel_out_prod_q<block_q2_0s,  2, dequantize_q2_0s>;
+template [[host_name("kernel_out_prod_q2_1_f32")]]   kernel out_prod_q_t kernel_out_prod_q<block_q2_1,   2, dequantize_q2_1>;
 
 kernel void kernel_diag_f32(
         constant ggml_metal_kargs_diag & args,

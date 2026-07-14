@@ -211,6 +211,24 @@ static void set_rows_sycl(ggml_backend_sycl_context & ctx, const ggml_tensor * s
         case GGML_TYPE_Q5_0:
             set_rows_sycl_q<TIdx, block_q5_0, QK5_0, cpy_blck_f32_q5_0>(src0_d, src1_d, (block_q5_0 *)dst->data, ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, nb00, nb01, nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, stream);
             break;
+        case GGML_TYPE_Q6_0:
+            set_rows_sycl_q<TIdx, block_q6_0, QK6_0, cpy_blck_f32_q6_0>(src0_d, src1_d, (block_q6_0 *)dst->data, ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, nb00, nb01, nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, stream);
+            break;
+        case GGML_TYPE_Q6_1:
+            set_rows_sycl_q<TIdx, block_q6_1, QK6_1, cpy_blck_f32_q6_1>(src0_d, src1_d, (block_q6_1 *)dst->data, ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, nb00, nb01, nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, stream);
+            break;
+        case GGML_TYPE_Q3_0:
+            set_rows_sycl_q<TIdx, block_q3_0, QK3_0, cpy_blck_f32_q3_0>(src0_d, src1_d, (block_q3_0 *)dst->data, ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, nb00, nb01, nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, stream);
+            break;
+        case GGML_TYPE_Q3_1:
+            set_rows_sycl_q<TIdx, block_q3_1, QK3_1, cpy_blck_f32_q3_1>(src0_d, src1_d, (block_q3_1 *)dst->data, ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, nb00, nb01, nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, stream);
+            break;
+        case GGML_TYPE_Q2_0S:
+            set_rows_sycl_q<TIdx, block_q2_0s, QK2_0S, cpy_blck_f32_q2_0s>(src0_d, src1_d, (block_q2_0s *)dst->data, ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, nb00, nb01, nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, stream);
+            break;
+        case GGML_TYPE_Q2_1:
+            set_rows_sycl_q<TIdx, block_q2_1, QK2_1, cpy_blck_f32_q2_1>(src0_d, src1_d, (block_q2_1 *)dst->data, ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, nb00, nb01, nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, stream);
+            break;
         case GGML_TYPE_Q4_1:
             set_rows_sycl_q<TIdx, block_q4_1, QK4_1, cpy_blck_f32_q4_1>(src0_d, src1_d, (block_q4_1 *)dst->data, ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, nb00, nb01, nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, stream);
             break;
@@ -232,17 +250,38 @@ static void set_rows_sycl(ggml_backend_sycl_context & ctx, const ggml_tensor * s
     }
 }
 
-void ggml_sycl_op_set_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
-    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
-    const ggml_tensor * src0 = dst->src[0];
-    const ggml_tensor * src1 = dst->src[1];
-
-    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
-    GGML_ASSERT(dst->src[1]->type == GGML_TYPE_I64 || dst->src[1]->type == GGML_TYPE_I32);
+static void ggml_sycl_set_rows_one(ggml_backend_sycl_context & ctx, const ggml_tensor * src0,
+                                   const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);
 
     if (src1->type == GGML_TYPE_I64) {
         set_rows_sycl<float, int64_t>(ctx, src0, src1, dst);
     } else {
         set_rows_sycl<float, int32_t>(ctx, src0, src1, dst);
+    }
+}
+
+void ggml_sycl_op_set_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/5);
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    if (dst->src[3] == nullptr) {
+        ggml_sycl_set_rows_one(ctx, src0, src1, dst);
+        return;
+    }
+
+    GGML_ASSERT(dst->src[2] != nullptr && dst->src[4] != nullptr);
+    ggml_sycl_set_rows_one(ctx, src0, src1, dst->src[2]);
+
+    const ggml_tensor * shadow_indices = dst->src[4];
+    for (int64_t level = 0; level < shadow_indices->ne[1]; ++level) {
+        ggml_tensor level_indices = *shadow_indices;
+        level_indices.ne[1] = 1;
+        level_indices.ne[2] = 1;
+        level_indices.ne[3] = 1;
+        level_indices.data = (char *) shadow_indices->data + level * shadow_indices->nb[1];
+        ggml_sycl_set_rows_one(ctx, src0, &level_indices, dst->src[3]);
     }
 }

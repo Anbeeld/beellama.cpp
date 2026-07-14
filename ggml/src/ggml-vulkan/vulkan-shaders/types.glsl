@@ -166,6 +166,97 @@ struct block_q5_1_packed32
 #define DATA_A_QUANT_LEGACY
 #endif
 
+#define QUANT_K_Q6_0 32
+#define QUANT_R_Q6_0 2
+struct block_q6_0 {
+    float16_t d;
+    uint8_t qh[8];
+    uint8_t qs[16];
+};
+#if defined(DATA_A_Q6_0)
+#define QUANT_K QUANT_K_Q6_0
+#define QUANT_R QUANT_R_Q6_0
+#define QUANT_AUXF 1
+#define A_TYPE block_q6_0
+#define DATA_A_QUANT_LEGACY
+#endif
+
+#define QUANT_K_Q6_1 32
+#define QUANT_R_Q6_1 2
+struct block_q6_1 {
+    float16_t d;
+    float16_t m;
+    uint8_t qh[8];
+    uint8_t qs[16];
+};
+#if defined(DATA_A_Q6_1)
+#define QUANT_K QUANT_K_Q6_1
+#define QUANT_R QUANT_R_Q6_1
+#define QUANT_AUXF 2
+#define A_TYPE block_q6_1
+#define DATA_A_QUANT_LEGACY
+#endif
+
+#define QUANT_K_Q3_0 32
+#define QUANT_R_Q3_0 2
+struct block_q3_0 {
+    float16_t d;
+    uint8_t qh[4];
+    uint8_t qs[8];
+};
+#if defined(DATA_A_Q3_0)
+#define QUANT_K QUANT_K_Q3_0
+#define QUANT_R QUANT_R_Q3_0
+#define QUANT_AUXF 1
+#define A_TYPE block_q3_0
+#define DATA_A_QUANT_LEGACY
+#endif
+
+#define QUANT_K_Q3_1 32
+#define QUANT_R_Q3_1 2
+struct block_q3_1 {
+    float16_t d;
+    float16_t m;
+    uint8_t qh[4];
+    uint8_t qs[8];
+};
+#if defined(DATA_A_Q3_1)
+#define QUANT_K QUANT_K_Q3_1
+#define QUANT_R QUANT_R_Q3_1
+#define QUANT_AUXF 2
+#define A_TYPE block_q3_1
+#define DATA_A_QUANT_LEGACY
+#endif
+
+#define QUANT_K_Q2_0S 32
+#define QUANT_R_Q2_0S 2
+struct block_q2_0s {
+    float16_t d;
+    uint8_t qs[8];
+};
+#if defined(DATA_A_Q2_0S)
+#define QUANT_K QUANT_K_Q2_0S
+#define QUANT_R QUANT_R_Q2_0S
+#define QUANT_AUXF 1
+#define A_TYPE block_q2_0s
+#define DATA_A_QUANT_LEGACY
+#endif
+
+#define QUANT_K_Q2_1 32
+#define QUANT_R_Q2_1 2
+struct block_q2_1 {
+    float16_t d;
+    float16_t m;
+    uint8_t qs[8];
+};
+#if defined(DATA_A_Q2_1)
+#define QUANT_K QUANT_K_Q2_1
+#define QUANT_R QUANT_R_Q2_1
+#define QUANT_AUXF 2
+#define A_TYPE block_q2_1
+#define DATA_A_QUANT_LEGACY
+#endif
+
 #define QUANT_K_Q8_0 32
 #define QUANT_R_Q8_0 1
 

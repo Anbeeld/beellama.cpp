@@ -77,6 +77,7 @@ set(GGML_OPENCL_KERNELS
     solve_tri
     im2col_f32
     im2col_f16
+    kv_tail
     mean
     mul_mv_f16_f16
     mul_mv_f16_f32_1row

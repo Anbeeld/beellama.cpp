@@ -109,6 +109,89 @@ static __dpct_inline__ void dequantize_q4_1(const void *vx, const int64_t ib,
 #endif // GGML_SYCL_F16
 }
 
+static __dpct_inline__ void dequantize_q6_0(const void *vx, const int64_t ib,
+                                            const int iqs, dfloat2 &v) {
+    const block_q6_0 * x = (const block_q6_0 *) vx;
+    const dfloat d = x[ib].d;
+    const uint8_t h = (x[ib].qh[iqs % (QK6_0 / 4)] >> (4 * (iqs / (QK6_0 / 4)))) & 0x0F;
+
+    v.x() = ((x[ib].qs[iqs] & 0x0F) | ((h & 0x03) << 4)) - 32;
+    v.y() = ((x[ib].qs[iqs] >>   4) | ((h & 0x0C) << 2)) - 32;
+    v.x() *= d;
+    v.y() *= d;
+}
+
+static __dpct_inline__ void dequantize_q6_1(const void *vx, const int64_t ib,
+                                            const int iqs, dfloat2 &v) {
+    const block_q6_1 * x = (const block_q6_1 *) vx;
+    const dfloat d = x[ib].dm[0];
+    const dfloat m = x[ib].dm[1];
+    const uint8_t h = (x[ib].qh[iqs % (QK6_1 / 4)] >> (4 * (iqs / (QK6_1 / 4)))) & 0x0F;
+
+    v.x() = (x[ib].qs[iqs] & 0x0F) | ((h & 0x03) << 4);
+    v.y() = (x[ib].qs[iqs] >>   4) | ((h & 0x0C) << 2);
+    v.x() = sycl::fma(v.x(), d, m);
+    v.y() = sycl::fma(v.y(), d, m);
+}
+
+static __dpct_inline__ void dequantize_q3_0(const void *vx, const int64_t ib,
+                                            const int iqs, dfloat2 &v) {
+    const block_q3_0 * x = (const block_q3_0 *) vx;
+    const dfloat d = x[ib].d;
+    const uint32_t qh = (uint32_t) x[ib].qh[0]       | ((uint32_t) x[ib].qh[1] <<  8) |
+                        ((uint32_t) x[ib].qh[2] << 16) | ((uint32_t) x[ib].qh[3] << 24);
+    const uint8_t b = x[ib].qs[iqs % (QK3_0 / 4)];
+    const int p = iqs / (QK3_0 / 4);
+
+    v.x() = (((b >> (2 * p))     & 0x03) | (((qh >> (iqs +  0)) & 1) << 2)) - 4;
+    v.y() = (((b >> (2 * p + 4)) & 0x03) | (((qh >> (iqs + 16)) & 1) << 2)) - 4;
+    v.x() *= d;
+    v.y() *= d;
+}
+
+static __dpct_inline__ void dequantize_q3_1(const void *vx, const int64_t ib,
+                                            const int iqs, dfloat2 &v) {
+    const block_q3_1 * x = (const block_q3_1 *) vx;
+    const dfloat d = x[ib].dm[0];
+    const dfloat m = x[ib].dm[1];
+    const uint32_t qh = (uint32_t) x[ib].qh[0]       | ((uint32_t) x[ib].qh[1] <<  8) |
+                        ((uint32_t) x[ib].qh[2] << 16) | ((uint32_t) x[ib].qh[3] << 24);
+    const uint8_t b = x[ib].qs[iqs % (QK3_1 / 4)];
+    const int p = iqs / (QK3_1 / 4);
+
+    v.x() = ((b >> (2 * p))     & 0x03) | (((qh >> (iqs +  0)) & 1) << 2);
+    v.y() = ((b >> (2 * p + 4)) & 0x03) | (((qh >> (iqs + 16)) & 1) << 2);
+    v.x() = sycl::fma(v.x(), d, m);
+    v.y() = sycl::fma(v.y(), d, m);
+}
+
+static __dpct_inline__ void dequantize_q2_0s(const void *vx, const int64_t ib,
+                                             const int iqs, dfloat2 &v) {
+    const block_q2_0s * x = (const block_q2_0s *) vx;
+    const dfloat d = x[ib].d;
+    const uint8_t b = x[ib].qs[iqs % (QK2_0S / 4)];
+    const int p = iqs / (QK2_0S / 4);
+
+    v.x() = ((b >> (2 * p))     & 0x03) - 2;
+    v.y() = ((b >> (2 * p + 4)) & 0x03) - 2;
+    v.x() *= d;
+    v.y() *= d;
+}
+
+static __dpct_inline__ void dequantize_q2_1(const void *vx, const int64_t ib,
+                                            const int iqs, dfloat2 &v) {
+    const block_q2_1 * x = (const block_q2_1 *) vx;
+    const dfloat d = x[ib].dm[0];
+    const dfloat m = x[ib].dm[1];
+    const uint8_t b = x[ib].qs[iqs % (QK2_1 / 4)];
+    const int p = iqs / (QK2_1 / 4);
+
+    v.x() = (b >> (2 * p))     & 0x03;
+    v.y() = (b >> (2 * p + 4)) & 0x03;
+    v.x() = sycl::fma(v.x(), d, m);
+    v.y() = sycl::fma(v.y(), d, m);
+}
+
 static __dpct_inline__ void dequantize_q4_K(const void *vx, const int64_t ib,
                                             const int iqs, dfloat2 &v) {
 #if QK_K == 256

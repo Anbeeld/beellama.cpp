@@ -462,6 +462,126 @@ inline void cpy_blck_f32_q5_1(const char * cxi, char * cdsti) {
     memcpy(dsti->qh, &qh, sizeof(qh));
 }
 
+inline void cpy_blck_f32_q6_0(const char * cxi, char * cdsti) {
+    const float * x = (const float *) cxi;
+    block_q6_0 * y = (block_q6_0 *) cdsti;
+    float amax = 0.0f;
+    float vmax = 0.0f;
+    for (int j = 0; j < QK6_0; ++j) {
+        if (sycl::fabs(x[j]) > amax) {
+            amax = sycl::fabs(x[j]);
+            vmax = x[j];
+        }
+    }
+    const float d = vmax / -32.0f;
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+    float sumqx = 0.0f;
+    float sumq2 = 0.0f;
+    for (int j = 0; j < QK6_0 / 4; ++j) {
+        y->qh[j] = 0;
+    }
+    for (int j = 0; j < QK6_0 / 2; ++j) {
+        const uint8_t q0 = (uint8_t) sycl::clamp((int) sycl::floor(x[j] * id + 32.5f), 0, 63);
+        const uint8_t q1 = (uint8_t) sycl::clamp((int) sycl::floor(x[j + QK6_0 / 2] * id + 32.5f), 0, 63);
+        y->qs[j] = (q0 & 0x0F) | ((q1 & 0x0F) << 4);
+        y->qh[j % (QK6_0 / 4)] |= ((q0 >> 4) | ((q1 >> 4) << 2)) << (4 * (j / (QK6_0 / 4)));
+
+        const float v0 = (float) ((int) q0 - 32);
+        const float v1 = (float) ((int) q1 - 32);
+        const float x0 = x[j];
+        const float x1 = x[j + QK6_0 / 2];
+        const float w0 = x0 * x0;
+        const float w1 = x1 * x1;
+        sumqx += w0 * v0 * x0 + w1 * v1 * x1;
+        sumq2 += w0 * v0 * v0 + w1 * v1 * v1;
+    }
+    y->d = sumq2 > 0.0f ? sumqx / sumq2 : d;
+}
+
+inline void cpy_blck_f32_q6_1(const char * cxi, char * cdsti) {
+    const float * x = (const float *) cxi;
+    block_q6_1 * y = (block_q6_1 *) cdsti;
+    float vmin = FLT_MAX;
+    float vmax = -FLT_MAX;
+    for (int j = 0; j < QK6_1; ++j) {
+        vmin = sycl::fmin(vmin, x[j]);
+        vmax = sycl::fmax(vmax, x[j]);
+    }
+    const float d = (vmax - vmin) / 63.0f;
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+    y->d = d;
+    y->m = vmin;
+    for (int j = 0; j < QK6_1 / 4; ++j) {
+        y->qh[j] = 0;
+    }
+    for (int j = 0; j < QK6_1 / 2; ++j) {
+        const uint8_t q0 = (uint8_t) sycl::clamp((int) sycl::floor((x[j] - vmin) * id + 0.5f), 0, 63);
+        const uint8_t q1 = (uint8_t) sycl::clamp((int) sycl::floor((x[j + QK6_1 / 2] - vmin) * id + 0.5f), 0, 63);
+        y->qs[j] = (q0 & 0x0F) | ((q1 & 0x0F) << 4);
+        y->qh[j % (QK6_1 / 4)] |= ((q0 >> 4) | ((q1 >> 4) << 2)) << (4 * (j / (QK6_1 / 4)));
+    }
+}
+
+template <typename block_t, int qk, int levels, bool affine>
+inline void cpy_blck_f32_planar(const char * cxi, char * cdsti) {
+    const float * x = (const float *) cxi;
+    block_t * y = (block_t *) cdsti;
+    float vmin = FLT_MAX;
+    float vmax = -FLT_MAX;
+    float amax = 0.0f;
+    float signed_max = 0.0f;
+    for (int j = 0; j < qk; ++j) {
+        vmin = sycl::fmin(vmin, x[j]);
+        vmax = sycl::fmax(vmax, x[j]);
+        if (sycl::fabs(x[j]) > amax) {
+            amax = sycl::fabs(x[j]);
+            signed_max = x[j];
+        }
+    }
+    const int center = levels / 2;
+    const float d = affine ? (vmax - vmin) / (levels - 1) : signed_max / -center;
+    const float m = affine ? vmin : 0.0f;
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+    y->d = d;
+    if constexpr (affine) {
+        y->m = m;
+    }
+    for (int j = 0; j < qk / 4; ++j) {
+        y->qs[j] = 0;
+    }
+    uint32_t qh = 0;
+    for (int j = 0; j < qk; ++j) {
+        const float shifted = affine ? (x[j] - m) * id + 0.5f : x[j] * id + center + 0.5f;
+        const uint8_t q = (uint8_t) sycl::clamp((int) sycl::floor(shifted), 0, levels - 1);
+        y->qs[j % (qk / 4)] |= (q & 0x03) << (2 * (j / (qk / 4)));
+        if constexpr (levels == 8) {
+            qh |= ((q >> 2) & 1u) << j;
+        }
+    }
+    if constexpr (levels == 8) {
+        y->qh[0] = (uint8_t) (qh >> 0);
+        y->qh[1] = (uint8_t) (qh >> 8);
+        y->qh[2] = (uint8_t) (qh >> 16);
+        y->qh[3] = (uint8_t) (qh >> 24);
+    }
+}
+
+inline void cpy_blck_f32_q3_0(const char * cxi, char * cdsti) {
+    cpy_blck_f32_planar<block_q3_0, QK3_0, 8, false>(cxi, cdsti);
+}
+
+inline void cpy_blck_f32_q3_1(const char * cxi, char * cdsti) {
+    cpy_blck_f32_planar<block_q3_1, QK3_1, 8, true>(cxi, cdsti);
+}
+
+inline void cpy_blck_f32_q2_0s(const char * cxi, char * cdsti) {
+    cpy_blck_f32_planar<block_q2_0s, QK2_0S, 4, false>(cxi, cdsti);
+}
+
+inline void cpy_blck_f32_q2_1(const char * cxi, char * cdsti) {
+    cpy_blck_f32_planar<block_q2_1, QK2_1, 4, true>(cxi, cdsti);
+}
+
 inline void cpy_blck_f32_iq4_nl(const char * cxi, char * cdsti) {
     const float *  xi   = (const float *) cxi;
     block_iq4_nl * dsti = (block_iq4_nl *) cdsti;

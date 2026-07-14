@@ -31,7 +31,11 @@ void main() {
             TEMP_TYPE v = TEMP_TYPE(data_a[a_offset + i00]);
 #endif
 #ifndef OPTIMIZATION_ERROR_WORKAROUND
+#if defined(DATA_D_BF16)
+            data_d[d_offset + i00] = D_TYPE(fp32_to_bf16(float(v)));
+#else
             data_d[d_offset + i00] = D_TYPE(v);
+#endif
 #else
             data_d[d_offset + i00] = D_TYPE(v);
 #endif

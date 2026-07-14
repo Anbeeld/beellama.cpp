@@ -4896,6 +4896,9 @@ static void ggml_compute_forward_get_rows_q(
     const int ir0 = dr*ith;
     const int ir1 = MIN(ir0 + dr, nr);
 
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_BF16);
+    std::vector<float> tmp(dst->type == GGML_TYPE_F32 ? 0 : nc);
+
     for (int64_t i = ir0; i < ir1; ++i) {
         const int64_t i12 = i/(ne11*ne10);
         const int64_t i11 = (i - i12*ne11*ne10)/ne10;
@@ -4904,9 +4907,19 @@ static void ggml_compute_forward_get_rows_q(
 
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
-        dequantize_row_q(
-                (const void *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
-                     (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3), nc);
+        const void * src_row = (const char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03;
+        void * dst_row = (char *) dst->data + i10*nb1 + i11*nb2 + i12*nb3;
+
+        if (dst->type == GGML_TYPE_F32) {
+            dequantize_row_q(src_row, (float *) dst_row, nc);
+        } else {
+            dequantize_row_q(src_row, tmp.data(), nc);
+            if (dst->type == GGML_TYPE_F16) {
+                ggml_cpu_fp32_to_fp16(tmp.data(), (ggml_fp16_t *) dst_row, nc);
+            } else {
+                ggml_cpu_fp32_to_bf16(tmp.data(), (ggml_bf16_t *) dst_row, nc);
+            }
+        }
     }
 }
 
@@ -4937,6 +4950,9 @@ static void ggml_compute_forward_get_rows_f16(
     const int ir0 = dr*ith;
     const int ir1 = MIN(ir0 + dr, nr);
 
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_BF16);
+    std::vector<float> tmp(dst->type == GGML_TYPE_BF16 ? nc : 0);
+
     for (int64_t i = ir0; i < ir1; ++i) {
         const int64_t i12 = i/(ne11*ne10);
         const int64_t i11 = (i - i12*ne11*ne10)/ne10;
@@ -4950,9 +4966,11 @@ static void ggml_compute_forward_get_rows_f16(
         void * dst_row = (char *) dst->data + i10*nb1 + i11*nb2 + i12*nb3;
         if (dst->type == GGML_TYPE_F16) {
             std::memcpy(dst_row, src_row, nc*sizeof(ggml_fp16_t));
-        } else {
-            GGML_ASSERT(dst->type == GGML_TYPE_F32);
+        } else if (dst->type == GGML_TYPE_F32) {
             ggml_cpu_fp16_to_fp32(src_row, (float *) dst_row, nc);
+        } else {
+            ggml_cpu_fp16_to_fp32(src_row, tmp.data(), nc);
+            ggml_cpu_fp32_to_bf16(tmp.data(), (ggml_bf16_t *) dst_row, nc);
         }
     }
 }
@@ -4984,6 +5002,9 @@ static void ggml_compute_forward_get_rows_bf16(
     const int ir0 = dr*ith;
     const int ir1 = MIN(ir0 + dr, nr);
 
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_BF16);
+    std::vector<float> tmp(dst->type == GGML_TYPE_F16 ? nc : 0);
+
     for (int64_t i = ir0; i < ir1; ++i) {
         const int64_t i12 = i/(ne11*ne10);
         const int64_t i11 = (i - i12*ne11*ne10)/ne10;
@@ -4997,9 +5018,11 @@ static void ggml_compute_forward_get_rows_bf16(
         void * dst_row = (char *) dst->data + i10*nb1 + i11*nb2 + i12*nb3;
         if (dst->type == GGML_TYPE_BF16) {
             std::memcpy(dst_row, src_row, nc*sizeof(ggml_bf16_t));
-        } else {
-            GGML_ASSERT(dst->type == GGML_TYPE_F32);
+        } else if (dst->type == GGML_TYPE_F32) {
             ggml_cpu_bf16_to_fp32(src_row, (float *) dst_row, nc);
+        } else {
+            ggml_cpu_bf16_to_fp32(src_row, tmp.data(), nc);
+            ggml_cpu_fp32_to_fp16(tmp.data(), (ggml_fp16_t *) dst_row, nc);
         }
     }
 }
@@ -5031,6 +5054,8 @@ static void ggml_compute_forward_get_rows_f32(
     const int ir0 = dr*ith;
     const int ir1 = MIN(ir0 + dr, nr);
 
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_BF16);
+
     for (int64_t i = ir0; i < ir1; ++i) {
         const int64_t i12 = i/(ne11*ne10);
         const int64_t i11 = (i - i12*ne11*ne10)/ne10;
@@ -5039,9 +5064,46 @@ static void ggml_compute_forward_get_rows_f32(
 
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
-        ggml_vec_cpy_f32(nc,
-                (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3),
-                (float *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03));
+        const float * src_row = (const float *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03);
+        void * dst_row = (char *) dst->data + i10*nb1 + i11*nb2 + i12*nb3;
+        if (dst->type == GGML_TYPE_F32) {
+            ggml_vec_cpy_f32(nc, (float *) dst_row, src_row);
+        } else if (dst->type == GGML_TYPE_F16) {
+            ggml_cpu_fp32_to_fp16(src_row, (ggml_fp16_t *) dst_row, nc);
+        } else {
+            ggml_cpu_fp32_to_bf16(src_row, (ggml_bf16_t *) dst_row, nc);
+        }
+    }
+}
+
+static void ggml_compute_forward_get_rows_i32(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(ne0 == ne00 && ne02 == ne11 && nb00 == sizeof(int32_t));
+    GGML_ASSERT(ggml_nrows(dst) == ggml_nelements(src1));
+
+    const int64_t nr = ggml_nelements(src1);
+    const int64_t dr = (nr + params->nth - 1)/params->nth;
+    const int64_t ir0 = dr*params->ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t i = ir0; i < ir1; ++i) {
+        const int64_t i12 = i/(ne11*ne10);
+        const int64_t i11 = (i - i12*ne11*ne10)/ne10;
+        const int64_t i10 = i - i12*ne11*ne10 - i11*ne10;
+        const int64_t i01 = *(const int32_t *) ((const char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+
+        GGML_ASSERT(i01 >= 0 && i01 < ne01);
+        std::memcpy(
+                (char *) dst->data + i10*nb1 + i11*nb2 + i12*nb3,
+                (const char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03,
+                ne00*sizeof(int32_t));
     }
 }
 
@@ -5096,9 +5158,12 @@ void ggml_compute_forward_get_rows(
                 ggml_compute_forward_get_rows_bf16(params, dst);
             } break;
         case GGML_TYPE_F32:
-        case GGML_TYPE_I32:
             {
                 ggml_compute_forward_get_rows_f32(params, dst);
+            } break;
+        case GGML_TYPE_I32:
+            {
+                ggml_compute_forward_get_rows_i32(params, dst);
             } break;
         default:
             {

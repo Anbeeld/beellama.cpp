@@ -568,6 +568,12 @@ static bool ggml_sycl_is_quantized_type(enum ggml_type type) {
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q6_0:
+        case GGML_TYPE_Q6_1:
+        case GGML_TYPE_Q3_0:
+        case GGML_TYPE_Q3_1:
+        case GGML_TYPE_Q2_0S:
+        case GGML_TYPE_Q2_1:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:
@@ -591,6 +597,26 @@ static bool ggml_sycl_is_quantized_type(enum ggml_type type) {
     }
 }
 
+static bool ggml_sycl_is_std_cache_quant(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q6_0:
+        case GGML_TYPE_Q6_1:
+        case GGML_TYPE_Q3_0:
+        case GGML_TYPE_Q3_1:
+        case GGML_TYPE_Q2_0S:
+        case GGML_TYPE_Q2_1:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static bool ggml_sycl_can_quantize_rows_sycl(enum ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0:
@@ -598,6 +624,12 @@ static bool ggml_sycl_can_quantize_rows_sycl(enum ggml_type type) {
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q6_0:
+        case GGML_TYPE_Q6_1:
+        case GGML_TYPE_Q3_0:
+        case GGML_TYPE_Q3_1:
+        case GGML_TYPE_Q2_0S:
+        case GGML_TYPE_Q2_1:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:
@@ -715,6 +747,36 @@ static void ggml_sycl_quantize_rows_sycl(const char * cx, char * cdst, const ggm
             break;
         case GGML_TYPE_Q5_0:
             ggml_sycl_quantize_rows_q<SrcScalar, cpy_blck_f32_q5_0, QK5_0>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01,
+                                                                            nb02, nb03, ne10, ne11, ne12, nb10, nb11,
+                                                                            nb12, nb13, stream);
+            break;
+        case GGML_TYPE_Q6_0:
+            ggml_sycl_quantize_rows_q<SrcScalar, cpy_blck_f32_q6_0, QK6_0>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01,
+                                                                            nb02, nb03, ne10, ne11, ne12, nb10, nb11,
+                                                                            nb12, nb13, stream);
+            break;
+        case GGML_TYPE_Q6_1:
+            ggml_sycl_quantize_rows_q<SrcScalar, cpy_blck_f32_q6_1, QK6_1>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01,
+                                                                            nb02, nb03, ne10, ne11, ne12, nb10, nb11,
+                                                                            nb12, nb13, stream);
+            break;
+        case GGML_TYPE_Q3_0:
+            ggml_sycl_quantize_rows_q<SrcScalar, cpy_blck_f32_q3_0, QK3_0>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01,
+                                                                            nb02, nb03, ne10, ne11, ne12, nb10, nb11,
+                                                                            nb12, nb13, stream);
+            break;
+        case GGML_TYPE_Q3_1:
+            ggml_sycl_quantize_rows_q<SrcScalar, cpy_blck_f32_q3_1, QK3_1>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01,
+                                                                            nb02, nb03, ne10, ne11, ne12, nb10, nb11,
+                                                                            nb12, nb13, stream);
+            break;
+        case GGML_TYPE_Q2_0S:
+            ggml_sycl_quantize_rows_q<SrcScalar, cpy_blck_f32_q2_0s, QK2_0S>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01,
+                                                                              nb02, nb03, ne10, ne11, ne12, nb10, nb11,
+                                                                              nb12, nb13, stream);
+            break;
+        case GGML_TYPE_Q2_1:
+            ggml_sycl_quantize_rows_q<SrcScalar, cpy_blck_f32_q2_1, QK2_1>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01,
                                                                             nb02, nb03, ne10, ne11, ne12, nb10, nb11,
                                                                             nb12, nb13, stream);
             break;
@@ -1161,6 +1223,24 @@ void ggml_sycl_cpy(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, co
         ggml_sycl_quantize_rows_sycl<ggml_bf16_t>(src0_ddc, src1_ddc, src0, src1, ne, ne00, ne01, ne02,
                                                   nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11,
                                                   nb12, nb13, main_stream);
+#endif
+    } else if (ggml_sycl_is_std_cache_quant(src0->type) && src1->type == GGML_TYPE_F32) {
+        ggml_tensor proxy = *src1;
+        proxy.src[0] = const_cast<ggml_tensor *>(src0);
+        const to_fp32_sycl_t convert = ggml_get_to_fp32_sycl(src0->type, &proxy);
+        GGML_ASSERT(convert != nullptr && ggml_is_contiguous(src0) && ggml_is_contiguous(src1));
+        convert(src0->data, (float *) src1->data, ne, main_stream);
+    } else if (ggml_sycl_is_std_cache_quant(src0->type) && src1->type == GGML_TYPE_F16) {
+        ggml_tensor proxy = *src1;
+        proxy.src[0] = const_cast<ggml_tensor *>(src0);
+        const to_fp16_sycl_t convert = ggml_get_to_fp16_sycl(src0->type, &proxy);
+        GGML_ASSERT(convert != nullptr && ggml_is_contiguous(src0) && ggml_is_contiguous(src1));
+        convert(src0->data, (sycl::half *) src1->data, ne, main_stream);
+#ifdef GGML_SYCL_HAS_BF16
+    } else if (ggml_sycl_is_std_cache_quant(src0->type) && src1->type == GGML_TYPE_BF16) {
+        const to_bf16_sycl_t convert = ggml_get_to_bf16_sycl(src0->type, nullptr);
+        GGML_ASSERT(convert != nullptr && ggml_is_contiguous(src0) && ggml_is_contiguous(src1));
+        convert(src0->data, (sycl::ext::oneapi::bfloat16 *) src1->data, ne, main_stream);
 #endif
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
         ggml_cpy_f32_f32_sycl(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10,

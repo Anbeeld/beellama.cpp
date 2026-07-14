@@ -5574,6 +5574,54 @@ static ggml_backend_buffer_t ggml_backend_sycl_device_buffer_from_host_ptr(ggml_
     return nullptr;
 }
 
+static bool ggml_sycl_is_std_cache_quant(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q6_0:
+        case GGML_TYPE_Q6_1:
+        case GGML_TYPE_Q3_0:
+        case GGML_TYPE_Q3_1:
+        case GGML_TYPE_Q2_0S:
+        case GGML_TYPE_Q2_1:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool ggml_sycl_is_set_rows_type(ggml_type type) {
+    return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 ||
+#ifdef GGML_SYCL_HAS_BF16
+           type == GGML_TYPE_BF16 ||
+#endif
+           type == GGML_TYPE_Q1_0 || ggml_sycl_is_std_cache_quant(type);
+}
+
+static bool ggml_sycl_is_shadow_type(ggml_type type) {
+    return type == GGML_TYPE_F16
+#ifdef GGML_SYCL_HAS_BF16
+           || type == GGML_TYPE_BF16
+#endif
+           ;
+}
+
+static bool ggml_sycl_set_rows_shapes_supported(
+        const ggml_tensor * dst,
+        const ggml_tensor * src,
+        const ggml_tensor * indices) {
+    return dst != nullptr && src != nullptr && indices != nullptr &&
+           dst->ne[0] == src->ne[0] && dst->ne[2] == src->ne[2] && dst->ne[3] == src->ne[3] &&
+           src->ne[1] == indices->ne[0] && indices->ne[1] > 0 && indices->ne[2] > 0 && indices->ne[3] == 1 &&
+           src->ne[2] % indices->ne[1] == 0 && src->ne[3] % indices->ne[2] == 0 &&
+           src->ne[0] % ggml_blck_size(dst->type) == 0 &&
+           ggml_is_contiguous_rows(dst) && ggml_is_contiguous_rows(src);
+}
+
 static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_sycl_device_context *sycl_ctx =
         (ggml_backend_sycl_device_context *)dev->context;
@@ -5583,6 +5631,7 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
             {
                 ggml_type src0_type = op->src[0]->type;
                 ggml_type src1_type = op->src[1]->type;
+
                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F32) {
                     return true;
                 }
@@ -5659,15 +5708,31 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                 return true;
             }
         case GGML_OP_OUT_PROD:
-            return op->type == GGML_TYPE_F32 &&
-                   (op->src[0]->type == GGML_TYPE_F32 ||
-                    (op->src[0]->type == GGML_TYPE_Q1_0 && op->src[0]->ne[2] == op->src[1]->ne[2] &&
-                     op->src[0]->ne[3] == op->src[1]->ne[3])) &&
-                   op->src[1]->type == GGML_TYPE_F32;
+            return op->type == GGML_TYPE_F32 && op->src[0] != nullptr && op->src[1] != nullptr &&
+                   (op->src[0]->type == GGML_TYPE_F32 || ggml_sycl_is_std_cache_quant(op->src[0]->type)) &&
+                   op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) &&
+                   ggml_is_contiguous(op) && op->src[0]->ne[0] == op->ne[0] &&
+                   op->src[1]->ne[0] == op->ne[1] && op->src[1]->ne[2] == op->ne[2] &&
+                   op->src[1]->ne[3] == op->ne[3] && op->src[0]->ne[1] == op->src[1]->ne[1] &&
+                   op->ne[2] % op->src[0]->ne[2] == 0 && op->ne[3] % op->src[0]->ne[3] == 0;
         case GGML_OP_GET_ROWS:
             {
+                if (op->src[0] == nullptr || op->src[1] == nullptr || op->src[1]->type != GGML_TYPE_I32 ||
+                    !ggml_is_contiguous_rows(op->src[0]) || !ggml_is_contiguous_rows(op)) {
+                    return false;
+                }
+                if (op->src[0]->type == GGML_TYPE_I32) {
+                    return op->type == GGML_TYPE_I32;
+                }
+                if (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16 && op->type != GGML_TYPE_BF16) {
+                    return false;
+                }
+#ifndef GGML_SYCL_HAS_BF16
+                if (op->type == GGML_TYPE_BF16 || op->src[0]->type == GGML_TYPE_BF16) {
+                    return false;
+                }
+#endif
                 switch (op->src[0]->type) {
-                    case GGML_TYPE_I32:
                     case GGML_TYPE_F16:
                     case GGML_TYPE_BF16:
                     case GGML_TYPE_F32:
@@ -5690,6 +5755,12 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                     case GGML_TYPE_Q4_K:
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
+                    case GGML_TYPE_Q6_0:
+                    case GGML_TYPE_Q6_1:
+                    case GGML_TYPE_Q3_0:
+                    case GGML_TYPE_Q3_1:
+                    case GGML_TYPE_Q2_0S:
+                    case GGML_TYPE_Q2_1:
                     case GGML_TYPE_Q5_K:
                     case GGML_TYPE_Q6_K:
                     case GGML_TYPE_Q8_0:
@@ -5706,21 +5777,40 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
 
         case GGML_OP_SET_ROWS:
             {
-
-                auto res = ((op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
-                         op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q5_0 ||
-                         op->type == GGML_TYPE_Q1_0 ||
-                         op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_IQ4_NL ||
-                         op->type == GGML_TYPE_MXFP4 || op->type == GGML_TYPE_NVFP4) &&
-                        op->src[0]->type == GGML_TYPE_F32 &&
-                        (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32));
-                return res;
+                if (op->src[0] == nullptr || op->src[1] == nullptr || op->src[0]->type != GGML_TYPE_F32 ||
+                    (op->src[1]->type != GGML_TYPE_I64 && op->src[1]->type != GGML_TYPE_I32)) {
+                    return false;
+                }
+                if (op->src[3] == nullptr) {
+                    return ggml_sycl_is_set_rows_type(op->type) &&
+                           ggml_sycl_set_rows_shapes_supported(op, op->src[0], op->src[1]);
+                }
+                return op->src[2] != nullptr && op->src[4] != nullptr &&
+                       ggml_sycl_is_std_cache_quant(op->src[2]->type) &&
+                       ggml_sycl_is_shadow_type(op->src[3]->type) &&
+                       op->src[1]->type == GGML_TYPE_I64 && op->src[4]->type == GGML_TYPE_I64 &&
+                       op->src[4]->ne[0] == op->src[1]->ne[0] && op->src[4]->ne[1] > 0 &&
+                       op->src[4]->ne[2] == 1 && op->src[4]->ne[3] == 1 &&
+                       op->src[3]->ne[0] == op->src[0]->ne[0] &&
+                       op->src[3]->ne[2] == op->src[0]->ne[2] && op->src[3]->ne[3] == op->src[0]->ne[3] &&
+                       ggml_is_contiguous_rows(op->src[3]) &&
+                       ggml_sycl_set_rows_shapes_supported(op->src[2], op->src[0], op->src[1]);
             }
             break;
         case GGML_OP_CPY:
             {
                 ggml_type src0_type = op->src[0]->type;
                 ggml_type src1_type = op->src[1]->type;
+
+                if (ggml_sycl_is_std_cache_quant(src0_type) &&
+                    (src1_type == GGML_TYPE_F32 || src1_type == GGML_TYPE_F16 || src1_type == GGML_TYPE_BF16)) {
+#ifndef GGML_SYCL_HAS_BF16
+                    if (src1_type == GGML_TYPE_BF16) {
+                        return false;
+                    }
+#endif
+                    return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
+                }
 
                 if (src0_type == GGML_TYPE_F16) {
                     if (src1_type == GGML_TYPE_Q2_K ||
@@ -5821,6 +5911,11 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                 return src0_type == GGML_TYPE_F32;
             }
         case GGML_OP_CONCAT:
+            return op->src[0] != nullptr && op->src[1] != nullptr &&
+                   op->src[0]->type == op->type && op->src[1]->type == op->type &&
+                   (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
+                    op->type == GGML_TYPE_I8 || op->type == GGML_TYPE_I16 ||
+                    op->type == GGML_TYPE_I32 || op->type == GGML_TYPE_I64);
         case GGML_OP_DUP:
         case GGML_OP_ARGMAX:
         case GGML_OP_NONE:
@@ -5866,7 +5961,9 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
         case GGML_OP_DIAG_MASK_INF:
             return true;
         case GGML_OP_SOFT_MAX:
-            return true;
+            return op->type == GGML_TYPE_F32 && op->src[0] != nullptr && op->src[0]->type == GGML_TYPE_F32 &&
+                   (op->src[1] == nullptr || op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_F32) &&
+                   (op->src[2] == nullptr || op->src[2]->type == GGML_TYPE_F32);
         case GGML_OP_SOFT_MAX_BACK: {
             float max_bias = 0.0f;
             memcpy(&max_bias, (const float *) op->op_params + 1, sizeof(float));

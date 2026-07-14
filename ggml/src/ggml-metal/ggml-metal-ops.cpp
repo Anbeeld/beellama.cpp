@@ -357,6 +357,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_set_rows(ctx, idx);
             } break;
+        case GGML_OP_OUT_PROD:
+            {
+                n_fuse = ggml_metal_op_out_prod(ctx, idx);
+            } break;
         case GGML_OP_DIAG:
             {
                 n_fuse = ggml_metal_op_diag(ctx, idx);
@@ -1161,7 +1165,7 @@ int ggml_metal_op_get_rows(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
 
-    auto pipeline = ggml_metal_library_get_pipeline_get_rows(lib, op->src[0]->type);
+    auto pipeline = ggml_metal_library_get_pipeline_get_rows(lib, op->src[0]->type, op->type);
 
     ggml_metal_kargs_get_rows args = {
         /*.ne00t =*/ ggml_is_quantized(op->src[0]->type) ? ne00/16 : ne00,
@@ -1193,22 +1197,18 @@ int ggml_metal_op_get_rows(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-int ggml_metal_op_set_rows(ggml_metal_op_t ctx, int idx) {
-    ggml_tensor * op = ctx->node(idx);
-
+static void ggml_metal_set_rows_one(ggml_metal_op_t ctx, const ggml_tensor * src0,
+                                    const ggml_tensor * src1, ggml_tensor * dst) {
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
 
-    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
-    GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
-    GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
-    GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
-    GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
-    GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
+    ggml_tensor proxy = *dst;
+    proxy.src[0] = const_cast<ggml_tensor *>(src0);
+    proxy.src[1] = const_cast<ggml_tensor *>(src1);
 
-    auto pipeline = ggml_metal_library_get_pipeline_set_rows(lib, op);
+    auto pipeline = ggml_metal_library_get_pipeline_set_rows(lib, &proxy);
 
-    const int32_t nk0 = ne0/ggml_blck_size(op->type);
+    const int32_t nk0 = dst->ne[0] / ggml_blck_size(dst->type);
 
     int nth = 32; // SIMD width
 
@@ -1230,28 +1230,78 @@ int ggml_metal_op_set_rows(ggml_metal_op_t ctx, int idx) {
 
     ggml_metal_kargs_set_rows args = {
         /*.nk0  =*/ nk0,
-        /*.ne01 =*/ ne01,
-        /*.nb01 =*/ nb01,
-        /*.nb02 =*/ nb02,
-        /*.nb03 =*/ nb03,
-        /*.ne11 =*/ ne11,
-        /*.ne12 =*/ ne12,
-        /*.nb10 =*/ nb10,
-        /*.nb11 =*/ nb11,
-        /*.nb12 =*/ nb12,
-        /*.nb1  =*/ nb1,
-        /*.nb2  =*/ nb2,
-        /*.nb3  =*/ nb3,
+        /*.ne01 =*/ (int32_t) src0->ne[1],
+        /*.nb01 =*/ src0->nb[1],
+        /*.nb02 =*/ src0->nb[2],
+        /*.nb03 =*/ src0->nb[3],
+        /*.ne11 =*/ (int32_t) src1->ne[1],
+        /*.ne12 =*/ (int32_t) src1->ne[2],
+        /*.nb10 =*/ src1->nb[0],
+        /*.nb11 =*/ src1->nb[1],
+        /*.nb12 =*/ src1->nb[2],
+        /*.nb1  =*/ dst->nb[1],
+        /*.nb2  =*/ dst->nb[2],
+        /*.nb3  =*/ dst->nb[3],
     };
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(src0), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(src1), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst),  3);
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nrptg - 1)/nrptg, ne02, ne03, nth, nrptg, 1);
+    ggml_metal_encoder_dispatch_threadgroups(enc,
+            (src0->ne[1] + nrptg - 1) / nrptg, src0->ne[2], src0->ne[3], nth, nrptg, 1);
+}
 
+int ggml_metal_op_set_rows(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    if (op->src[3] == nullptr) {
+        ggml_metal_set_rows_one(ctx, op->src[0], op->src[1], op);
+        return 1;
+    }
+
+    GGML_ASSERT(op->src[2] != nullptr && op->src[4] != nullptr);
+    ggml_metal_set_rows_one(ctx, op->src[0], op->src[1], op->src[2]);
+
+    const ggml_tensor * shadow_indices = op->src[4];
+    for (int64_t level = 0; level < shadow_indices->ne[1]; ++level) {
+        ggml_tensor level_indices = *shadow_indices;
+        level_indices.ne[1] = 1;
+        level_indices.ne[2] = 1;
+        level_indices.ne[3] = 1;
+        level_indices.data = (char *) shadow_indices->data + level * shadow_indices->nb[1];
+        ggml_metal_set_rows_one(ctx, op->src[0], &level_indices, op->src[3]);
+    }
+
+    return 1;
+}
+
+int ggml_metal_op_out_prod(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    auto pipeline = ggml_metal_library_get_pipeline_out_prod(lib, op);
+    ggml_metal_kargs_out_prod args = {
+        (int32_t) op->src[0]->ne[0], (int32_t) op->src[0]->ne[1],
+        (int32_t) op->src[0]->ne[2], (int32_t) op->src[0]->ne[3],
+        op->src[0]->nb[1], op->src[0]->nb[2], op->src[0]->nb[3],
+        (int32_t) op->src[1]->ne[0], (int32_t) op->src[1]->ne[2], (int32_t) op->src[1]->ne[3],
+        op->src[1]->nb[0], op->src[1]->nb[1], op->src[1]->nb[2], op->src[1]->nb[3],
+        (int32_t) op->ne[0], (int32_t) op->ne[1], (int32_t) op->ne[2], (int32_t) op->ne[3],
+        op->nb[1], op->nb[2], op->nb[3],
+    };
+
+    const uint64_t total = ggml_nelements(op);
+    const int nth = std::min<uint64_t>(total, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 3);
+    ggml_metal_encoder_dispatch_threadgroups(enc, (total + nth - 1) / nth, 1, 1, nth, 1, 1);
     return 1;
 }
 
