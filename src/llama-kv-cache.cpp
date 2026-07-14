@@ -142,44 +142,150 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
-    if (tail_tokens > 0) {
-        if (tail_type != GGML_TYPE_F16 && tail_type != GGML_TYPE_BF16) {
-            throw std::invalid_argument("standard KV tail type must be F16 or BF16");
-        }
-        if (!ggml_is_quantized(type_k) && !ggml_is_quantized(type_v)) {
-            LLAMA_LOG_WARN("%s: high-precision KV tail ignored because neither standard cache side is quantized\n", __func__);
-        } else {
-            constexpr uint32_t tail_fa_stride = 256;
-            const uint64_t arena_need = uint64_t(tail_tokens) + n_ubatch;
-            const uint64_t arena_rounded = ((arena_need + tail_fa_stride - 1)/tail_fa_stride)*tail_fa_stride;
-            if (arena_rounded > uint64_t(std::numeric_limits<uint32_t>::max())) {
-                throw std::overflow_error("standard KV tail arena stride overflows uint32_t");
-            }
-            tail_arena_stride = uint32_t(arena_rounded);
-            tail_attention_stride = tail_tokens;
-            tail_sink_slots = n_ubatch;
-            const uint64_t n_slots = uint64_t(tail_arena_stride)*n_seq_max + tail_sink_slots;
-            if (n_slots > uint64_t(std::numeric_limits<uint32_t>::max())) {
-                throw std::overflow_error("standard KV tail slot count overflows uint32_t");
-            }
-            tail_slots = uint32_t(n_slots);
-            tail = std::make_unique<llama_kv_tail_store>(
-                    tail_tokens, n_seq_max, tail_arena_stride, tail_sink_slots);
-            const char * timing = std::getenv("LLAMA_KV_TAIL_PLANNER_TIMING");
-            tail_planner_timing_enabled = timing && std::strcmp(timing, "1") == 0;
-            tail_generations.assign(n_stream, std::vector<uint64_t>(kv_size, 0));
-            LLAMA_LOG_INFO("%s: standard KV tail enabled: tokens = %u, attention stride = %u, arena stride = %u, sink slots = %u, slots = %u, type = %s\n",
-                    __func__, tail_tokens, tail_attention_stride, tail_arena_stride,
-                    tail_sink_slots, tail_slots, ggml_type_name(tail_type));
-        }
-    }
-
     GGML_ASSERT(kv_size % n_pad == 0);
 
     const uint32_t n_layer = hparams.n_layer_all;
-
-    // number of layers that actually allocate KV tensors (used for context mem sizing)
     const uint32_t n_layer_kv = hparams.n_layer_kv();
+    const bool is_mla = hparams.is_mla();
+
+    if (tail_tokens > 0 && tail_type != GGML_TYPE_F16 && tail_type != GGML_TYPE_BF16) {
+        throw std::invalid_argument("standard KV tail type must be F16 or BF16");
+    }
+
+    uint64_t promotion_bytes_per_row = 0;
+    uint64_t overlay_bytes_per_row = 0;
+    bool native_capable = true;
+    bool already_exact = true;
+    bool has_owned_layer = false;
+    bool have_source_type = false;
+    ggml_type plan_body_type_k = type_k;
+    ggml_type plan_body_type_v = type_v;
+
+    const auto add_row_bytes = [](uint64_t & total, size_t value) {
+        if (uint64_t(value) > std::numeric_limits<uint64_t>::max() - total) {
+            throw std::overflow_error("standard KV tail row byte count overflows uint64_t");
+        }
+        total += uint64_t(value);
+    };
+
+    if (tail_tokens > 0) {
+        for (uint32_t il = 0; il < n_layer; ++il) {
+            if (!hparams.has_kv(il) || (filter && !filter(il))) {
+                continue;
+            }
+
+            const uint32_t owned_k_dim = hparams.n_embd_k_gqa(il);
+            const uint32_t owned_v_dim = !v_trans ? hparams.n_embd_v_gqa(il) : hparams.n_embd_v_gqa_max();
+            const bool has_v = !is_mla;
+            bool shared_layer = false;
+            ggml_type actual_type_k = type_k;
+            ggml_type actual_type_v = type_v;
+            uint32_t actual_k_dim = owned_k_dim;
+            uint32_t actual_v_dim = owned_v_dim;
+
+            if (share && other) {
+                const int32_t il_share = share(il);
+                if (il_share >= 0) {
+                    const auto & source = other->layers[other->map_layer_ids.at(il_share)];
+                    shared_layer = true;
+                    actual_type_k = source.k->type;
+                    actual_k_dim = uint32_t(source.k->ne[0]);
+                    if (has_v && source.v) {
+                        actual_type_v = source.v->type;
+                        actual_v_dim = uint32_t(source.v->ne[0]);
+                    }
+                }
+            }
+
+            if (shared_layer) {
+                if (!have_source_type) {
+                    plan_body_type_k = actual_type_k;
+                    plan_body_type_v = actual_type_v;
+                    have_source_type = true;
+                }
+            } else {
+                has_owned_layer = true;
+            }
+
+            const bool quant_k = ggml_is_quantized(actual_type_k);
+            const bool quant_v = has_v && ggml_is_quantized(actual_type_v);
+            const bool layer_has_quant = quant_k || quant_v;
+            already_exact = already_exact && !layer_has_quant;
+            if (shared_layer && layer_has_quant) {
+                native_capable = false;
+            }
+
+            if (!shared_layer) {
+                if (quant_k) {
+                    const size_t body = ggml_row_size(actual_type_k, actual_k_dim);
+                    const size_t exact = ggml_row_size(tail_type, actual_k_dim);
+                    GGML_ASSERT(exact >= body);
+                    add_row_bytes(promotion_bytes_per_row, exact - body);
+                }
+                if (quant_v) {
+                    const size_t body = ggml_row_size(actual_type_v, actual_v_dim);
+                    const size_t exact = ggml_row_size(tail_type, actual_v_dim);
+                    GGML_ASSERT(exact >= body);
+                    add_row_bytes(promotion_bytes_per_row, exact - body);
+                }
+            }
+
+            if (layer_has_quant) {
+                if (quant_k || actual_type_k == GGML_TYPE_F16 || actual_type_k == GGML_TYPE_BF16) {
+                    const ggml_type shadow_type = quant_k ? tail_type : actual_type_k;
+                    add_row_bytes(overlay_bytes_per_row, ggml_row_size(shadow_type, actual_k_dim));
+                }
+                if (has_v && (quant_v || actual_type_v == GGML_TYPE_F16 || actual_type_v == GGML_TYPE_BF16)) {
+                    const ggml_type shadow_type = quant_v ? tail_type : actual_type_v;
+                    add_row_bytes(overlay_bytes_per_row, ggml_row_size(shadow_type, actual_v_dim));
+                }
+            }
+        }
+
+        if (has_owned_layer) {
+            plan_body_type_k = type_k;
+            plan_body_type_v = type_v;
+        }
+    }
+
+    const uint32_t visibility_window = n_swa > 0 ? std::min(n_swa, kv_size) : kv_size;
+    tail_plan = llama_kv_tail_storage_plan_for({
+        plan_body_type_k,
+        plan_body_type_v,
+        tail_type,
+        tail_tokens,
+        n_seq_max,
+        n_ubatch,
+        visibility_window,
+        uint64_t(kv_size)*n_stream,
+        promotion_bytes_per_row,
+        overlay_bytes_per_row,
+        native_capable,
+        already_exact,
+    });
+
+    if (tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY) {
+        tail_arena_stride = tail_plan.layout.arena_stride;
+        tail_attention_stride = tail_tokens;
+        tail_sink_slots = tail_plan.layout.sink_slots;
+        tail_slots = tail_plan.layout.total_slots;
+        tail = std::make_unique<llama_kv_tail_store>(
+                tail_tokens, n_seq_max, tail_arena_stride, tail_sink_slots);
+        const char * timing = std::getenv("LLAMA_KV_TAIL_PLANNER_TIMING");
+        tail_planner_timing_enabled = timing && std::strcmp(timing, "1") == 0;
+        tail_generations.assign(n_stream, std::vector<uint64_t>(kv_size, 0));
+    }
+
+    if (tail_tokens > 0) {
+        const char * storage = tail_plan.kind == LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT ? "native_exact" : "overlay";
+        LLAMA_LOG_INFO("%s: standard KV tail plan: storage=%s requested=%u effective=%u window=%u body=%s/%s actual=%s/%s physical_rows=%llu arena=%u sink=%u overlay_rows=%u promotion=%.2f MiB overlay=%.2f MiB\n",
+                __func__, storage, tail_tokens, tail_tokens, visibility_window,
+                ggml_type_name(type_k), ggml_type_name(type_v),
+                ggml_type_name(tail_plan.body_type_k), ggml_type_name(tail_plan.body_type_v),
+                (unsigned long long) uint64_t(kv_size)*n_stream,
+                tail_plan.layout.arena_stride, tail_plan.layout.sink_slots, tail_plan.layout.total_slots,
+                tail_plan.promotion_bytes/1024.0/1024.0, tail_plan.overlay_bytes/1024.0/1024.0);
+    }
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
@@ -239,8 +345,6 @@ llama_kv_cache::llama_kv_cache(
         LLAMA_LOG_WARN("%s: the V embeddings have different sizes across layers and FA is not enabled - padding V cache to %d\n",
                 __func__, hparams.n_embd_v_gqa_max());
     }
-
-    const bool is_mla = hparams.is_mla();
 
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
@@ -333,8 +437,9 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
-        ggml_type layer_type_k = type_k;
-        ggml_type layer_type_v = type_v;
+        const bool native_exact = tail_plan.kind == LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT;
+        ggml_type layer_type_k = native_exact ? tail_plan.body_type_k : type_k;
+        ggml_type layer_type_v = native_exact ? tail_plan.body_type_v : type_v;
 
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, layer_type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, layer_type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
@@ -417,11 +522,27 @@ llama_kv_cache::llama_kv_cache(
     {
         const size_t memory_size_k = size_k_bytes();
         const size_t memory_size_v = size_v_bytes();
+        const char * actual_type_k_name = layers.empty() || !layers[0].k ? "none" : ggml_type_name(layers[0].k->type);
+        const char * actual_type_v_name = layers.empty() || !layers[0].v ? "none" : ggml_type_name(layers[0].v->type);
 
         LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u/%u seqs), K (%s): %7.2f MiB, V (%s): %7.2f MiB\n", __func__,
                 (float)(memory_size_k + memory_size_v) / (1024.0f * 1024.0f), kv_size, (int) layers.size(), n_seq_max, n_stream,
-                ggml_type_name(type_k), (float)memory_size_k / (1024.0f * 1024.0f),
-                ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
+                actual_type_k_name, (float)memory_size_k / (1024.0f * 1024.0f),
+                actual_type_v_name, (float)memory_size_v / (1024.0f * 1024.0f));
+
+        if (tail_plan.kind == LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT) {
+            std::ostringstream ids;
+            for (size_t i = 0; i < layers.size(); ++i) {
+                ids << (i ? "," : "") << layers[i].il;
+            }
+            LLAMA_LOG_INFO("%s: tail type=%s requested=%u effective=%u storage=native_exact physical_rows=%llu shadow=0.00 MiB sink=0 planner=0 state_tail=0 total=%.2f MiB\n",
+                    __func__, ggml_type_name(tail_type), tail_tokens, tail_tokens,
+                    (unsigned long long) uint64_t(kv_size)*n_stream,
+                    (memory_size_k + memory_size_v)/1024.0/1024.0);
+            LLAMA_LOG_INFO("KV tail: group=%s layers=%s representation=native_exact route=body body=%s/%s shadow=none requested=%u effective=%u\n",
+                    n_swa > 0 ? "swa" : "full", ids.str().c_str(),
+                    actual_type_k_name, actual_type_v_name, tail_tokens, tail_tokens);
+        }
 
         if (tail) {
             size_t tail_k_bytes = 0;
@@ -1493,6 +1614,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
         for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
             tail_write_levels = std::max(tail_write_levels, uint32_t(ubatch.n_seq_id[i]));
         }
+        GGML_ASSERT(tail_write_levels <= n_seq_max);
         tail_write_slots.assign(uint64_t(ubatch.n_tokens)*tail_write_levels, LLAMA_KV_TAIL_BODY_SLOT);
     }
 
@@ -1550,6 +1672,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
                 int64_t & slot = tail_write_slots[uint64_t(level)*ubatch.n_tokens + i];
                 if (slot == LLAMA_KV_TAIL_BODY_SLOT) {
+                    GGML_ASSERT(i < tail_sink_slots);
                     slot = int64_t(sink_base + i);
                 }
                 GGML_ASSERT(slot >= 0 && uint64_t(slot) < tail_slots);
@@ -1891,10 +2014,21 @@ bool llama_kv_cache::get_kv_tail_coverage(
     }
     const auto & cells = v_cells[seq_to_stream[seq_id]];
     const uint32_t available = cells.seq_size(seq_id);
-    if (!tail) {
+    if (tail_plan.kind == LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT) {
+        const uint32_t exact = std::min(tail_tokens, available);
+        out = {
+            exact > 0 ? LLAMA_KV_TAIL_COVERAGE_COMPLETE : LLAMA_KV_TAIL_COVERAGE_NONE,
+            exact,
+            exact,
+            0,
+        };
+        return true;
+    }
+    if (tail_plan.kind == LLAMA_KV_TAIL_STORAGE_DISABLED) {
         out = { LLAMA_KV_TAIL_COVERAGE_NONE, 0, 0, 0 };
         return true;
     }
+    GGML_ASSERT(tail);
     const auto coverage = tail->coverage(seq_id, available);
     out = { coverage.state, coverage.requested, coverage.exact, coverage.degradation_flags };
     return true;

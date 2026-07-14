@@ -47,6 +47,53 @@ struct llama_kv_tail_source_run {
     uint32_t length;
 };
 
+struct llama_kv_tail_layout {
+    uint32_t arena_stride;
+    uint32_t sink_slots;
+    uint32_t total_slots;
+};
+
+// Reserve a discard sink only when a batch can contain ragged sequence
+// memberships. With one sequence every write has exactly one arena target.
+llama_kv_tail_layout llama_kv_tail_layout_for(
+        uint32_t n_tokens,
+        uint32_t n_seq_max,
+        uint32_t n_ubatch);
+
+enum llama_kv_tail_storage_kind {
+    LLAMA_KV_TAIL_STORAGE_DISABLED,
+    LLAMA_KV_TAIL_STORAGE_OVERLAY,
+    LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT,
+};
+
+struct llama_kv_tail_storage_request {
+    ggml_type body_type_k;
+    ggml_type body_type_v;
+    ggml_type exact_type;
+    uint32_t n_tokens;
+    uint32_t n_seq_max;
+    uint32_t n_ubatch;
+    uint32_t visibility_window;
+    uint64_t physical_body_rows;
+    uint64_t promotion_bytes_per_row;
+    uint64_t overlay_bytes_per_row;
+    bool native_capable;
+    bool already_exact;
+};
+
+struct llama_kv_tail_storage_plan {
+    llama_kv_tail_storage_kind kind;
+    ggml_type body_type_k;
+    ggml_type body_type_v;
+    llama_kv_tail_layout layout;
+    uint64_t promotion_bytes;
+    uint64_t overlay_bytes;
+    bool body_promoted;
+};
+
+llama_kv_tail_storage_plan llama_kv_tail_storage_plan_for(
+        const llama_kv_tail_storage_request & request);
+
 // Backend-neutral ownership and source-selection metadata for one physical
 // standard-cache group. Payload tensors are owned by llama_kv_cache; this class
 // assigns their compact slot indices and never reconstructs exact data.

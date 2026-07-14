@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -21,6 +22,102 @@ static llama_kv_tail_identity id(uint32_t cell, uint64_t generation = 1) {
 }
 
 int main() {
+    // Single-sequence decode never has ragged sequence-membership levels, so
+    // every write receives an arena destination and needs no discard sink.
+    // Multi-sequence batches retain one ubatch-sized sink for absent levels.
+    const auto single_layout = llama_kv_tail_layout_for(1024, 1, 512);
+    CHECK(single_layout.arena_stride == 1536);
+    CHECK(single_layout.sink_slots == 0);
+    CHECK(single_layout.total_slots == 1536);
+
+    const auto multi_layout = llama_kv_tail_layout_for(1024, 4, 512);
+    CHECK(multi_layout.arena_stride == 1536);
+    CHECK(multi_layout.sink_slots == 512);
+    CHECK(multi_layout.total_slots == 6656);
+
+    // Representation is selected from visibility, ownership, and aggregate
+    // byte cost rather than from a model or cache-role special case.
+    const auto storage_request = [](
+            uint32_t n_tokens,
+            uint32_t visibility_window,
+            uint64_t physical_body_rows,
+            uint64_t promotion_bytes_per_row,
+            uint64_t overlay_bytes_per_row,
+            bool native_capable = true,
+            bool already_exact = false,
+            ggml_type body_type_k = GGML_TYPE_Q5_0,
+            ggml_type body_type_v = GGML_TYPE_Q5_0) {
+        return llama_kv_tail_storage_request {
+            body_type_k, body_type_v, GGML_TYPE_BF16,
+            n_tokens, 1, 512, visibility_window,
+            physical_body_rows, promotion_bytes_per_row, overlay_bytes_per_row,
+            native_capable, already_exact,
+        };
+    };
+
+    auto storage = llama_kv_tail_storage_plan_for(storage_request(0, 1024, 1536, 10752, 16384));
+    CHECK(storage.kind == LLAMA_KV_TAIL_STORAGE_DISABLED);
+    CHECK(storage.layout.total_slots == 0);
+
+    storage = llama_kv_tail_storage_plan_for(storage_request(512, 1024, 1536, 10752, 16384));
+    CHECK(storage.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY);
+    CHECK(storage.layout.arena_stride == 1024);
+    CHECK(storage.layout.sink_slots == 0);
+
+    // Gemma's compact SWA topology: 1536 promoted rows cost less than a
+    // 1536-row symmetric overlay and the requested span covers all visibility.
+    storage = llama_kv_tail_storage_plan_for(storage_request(1024, 1024, 1536, 10752, 16384));
+    CHECK(storage.kind == LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT);
+    CHECK(storage.body_promoted);
+    CHECK(storage.body_type_k == GGML_TYPE_BF16);
+    CHECK(storage.body_type_v == GGML_TYPE_BF16);
+    CHECK(storage.promotion_bytes == uint64_t(1536)*10752);
+    CHECK(storage.overlay_bytes == uint64_t(1536)*16384);
+
+    // A full-sized SWA body is eligible by visibility but not by byte cost.
+    storage = llama_kv_tail_storage_plan_for(storage_request(1024, 1024, 16384, 10752, 16384));
+    CHECK(storage.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY);
+
+    // A shared quantized source cannot be promoted by the child context.
+    storage = llama_kv_tail_storage_plan_for(storage_request(1024, 1024, 1536, 10752, 16384, false));
+    CHECK(storage.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY);
+
+    // An already-exact body satisfies any requested suffix without an overlay.
+    storage = llama_kv_tail_storage_plan_for(storage_request(
+            512, 1024, 1536, 0, 0, true, true, GGML_TYPE_BF16, GGML_TYPE_F16));
+    CHECK(storage.kind == LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT);
+    CHECK(!storage.body_promoted);
+    CHECK(storage.body_type_k == GGML_TYPE_BF16);
+    CHECK(storage.body_type_v == GGML_TYPE_F16);
+
+    // One-sided promotion preserves the side which was already exact.
+    storage = llama_kv_tail_storage_plan_for(storage_request(
+            1024, 1024, 1536, 4096, 8192, true, false, GGML_TYPE_Q5_0, GGML_TYPE_F16));
+    CHECK(storage.kind == LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT);
+    CHECK(storage.body_type_k == GGML_TYPE_BF16);
+    CHECK(storage.body_type_v == GGML_TYPE_F16);
+
+    // Equal persistent cost chooses the simpler native graph.
+    storage = llama_kv_tail_storage_plan_for(storage_request(1024, 1024, 1536, 4096, 4096));
+    CHECK(storage.kind == LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT);
+
+    bool layout_overflow = false;
+    try {
+        (void) llama_kv_tail_layout_for(std::numeric_limits<uint32_t>::max(), 1, 512);
+    } catch (const std::overflow_error &) {
+        layout_overflow = true;
+    }
+    CHECK(layout_overflow);
+
+    bool storage_overflow = false;
+    try {
+        (void) llama_kv_tail_storage_plan_for(storage_request(
+                1024, 1024, std::numeric_limits<uint64_t>::max(), 2, 1));
+    } catch (const std::overflow_error &) {
+        storage_overflow = true;
+    }
+    CHECK(storage_overflow);
+
     // Incremental per-sequence live-cell accounting covers membership,
     // removal, keep, shift eviction, and reset without a cache scan.
     llama_kv_cells cells;

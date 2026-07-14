@@ -24,6 +24,79 @@ static uint32_t checked_tail_slot_count(uint32_t arena_stride, uint32_t n_seq_ma
     return uint32_t(total);
 }
 
+llama_kv_tail_layout llama_kv_tail_layout_for(
+        uint32_t n_tokens,
+        uint32_t n_seq_max,
+        uint32_t n_ubatch) {
+    constexpr uint32_t tail_fa_stride = 256;
+    const uint64_t arena_need = uint64_t(n_tokens) + n_ubatch;
+    const uint64_t arena_rounded = ((arena_need + tail_fa_stride - 1)/tail_fa_stride)*tail_fa_stride;
+    if (arena_rounded > uint64_t(INT32_MAX)) {
+        throw std::overflow_error("standard KV tail arena stride overflows int32_t");
+    }
+
+    const uint32_t sink_slots = n_seq_max > 1 ? n_ubatch : 0;
+    return {
+        uint32_t(arena_rounded),
+        sink_slots,
+        checked_tail_slot_count(uint32_t(arena_rounded), n_seq_max, sink_slots),
+    };
+}
+
+static uint64_t checked_tail_bytes(uint64_t rows, uint64_t bytes_per_row) {
+    if (bytes_per_row != 0 && rows > std::numeric_limits<uint64_t>::max()/bytes_per_row) {
+        throw std::overflow_error("standard KV tail byte count overflows uint64_t");
+    }
+    return rows*bytes_per_row;
+}
+
+llama_kv_tail_storage_plan llama_kv_tail_storage_plan_for(
+        const llama_kv_tail_storage_request & request) {
+    llama_kv_tail_storage_plan result {
+        LLAMA_KV_TAIL_STORAGE_DISABLED,
+        request.body_type_k,
+        request.body_type_v,
+        { 0, 0, 0 },
+        0,
+        0,
+        false,
+    };
+    if (request.n_tokens == 0) {
+        return result;
+    }
+    if (request.exact_type != GGML_TYPE_F16 && request.exact_type != GGML_TYPE_BF16) {
+        throw std::invalid_argument("standard KV tail type must be F16 or BF16");
+    }
+
+    result.layout = llama_kv_tail_layout_for(
+            request.n_tokens, request.n_seq_max, request.n_ubatch);
+    result.promotion_bytes = checked_tail_bytes(
+            request.physical_body_rows, request.promotion_bytes_per_row);
+    result.overlay_bytes = checked_tail_bytes(
+            result.layout.total_slots, request.overlay_bytes_per_row);
+
+    const ggml_type promoted_k = ggml_is_quantized(request.body_type_k) ?
+            request.exact_type : request.body_type_k;
+    const ggml_type promoted_v = ggml_is_quantized(request.body_type_v) ?
+            request.exact_type : request.body_type_v;
+    const bool full_visibility = request.visibility_window > 0 &&
+            request.n_tokens >= request.visibility_window;
+    const bool use_native = request.already_exact ||
+            (full_visibility && request.native_capable &&
+             result.promotion_bytes <= result.overlay_bytes);
+
+    if (use_native) {
+        result.kind = LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT;
+        result.body_type_k = promoted_k;
+        result.body_type_v = promoted_v;
+        result.body_promoted = promoted_k != request.body_type_k ||
+                promoted_v != request.body_type_v;
+    } else {
+        result.kind = LLAMA_KV_TAIL_STORAGE_OVERLAY;
+    }
+    return result;
+}
+
 llama_kv_tail_store::llama_kv_tail_store(uint32_t n_tokens, uint32_t n_seq_max, uint32_t n_slots) :
         llama_kv_tail_store(
             n_tokens,

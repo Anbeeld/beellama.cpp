@@ -49,13 +49,25 @@ def main() -> None:
         raise AssertionError("standard-tail source is not independently listed in src/CMakeLists.txt")
 
     cache_source = (ROOT / "src/llama-kv-cache.cpp").read_text(encoding="utf-8")
-    constructor = cache_source.split("llama_kv_cache::llama_kv_cache(", 1)[1].split("GGML_ASSERT(kv_size % n_pad == 0);", 1)[0]
+    constructor = cache_source.split("llama_kv_cache::llama_kv_cache(", 1)[1].split(
+        "void llama_kv_cache::clear(bool data)", 1
+    )[0]
     if "const bool shadow_k = tail &&" not in cache_source:
         raise AssertionError("K tail storage must remain null when the tail feature is disabled")
     if "const bool shadow_v = tail &&" not in cache_source:
         raise AssertionError("V tail storage must remain null when the tail feature is disabled")
     if constructor.find("if (other)") > constructor.find("if (tail_tokens > 0)"):
         raise AssertionError("shared-cache size must resolve before exact-tail generation storage is allocated")
+    if "tail_plan = llama_kv_tail_storage_plan_for" not in constructor:
+        raise AssertionError("raw standard cache must select one explicit persistent-tail representation")
+    if "tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY" not in constructor:
+        raise AssertionError("exact-shadow allocation must be guarded by the overlay storage plan")
+    if "tail_plan.kind == LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT" not in cache_source:
+        raise AssertionError("raw standard cache lacks the native-exact storage route")
+
+    iswa_source = (ROOT / "src/llama-kv-cache-iswa.cpp").read_text(encoding="utf-8")
+    if "llama_kv_tail_storage_plan_for" in iswa_source or "LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT" in iswa_source:
+        raise AssertionError("iSWA wrapper must not override raw-cache representation planning")
 
     ggml_cmake = (ROOT / "ggml/CMakeLists.txt").read_text(encoding="utf-8")
     cuda_cmake = (ROOT / "ggml/src/ggml-cuda/CMakeLists.txt").read_text(encoding="utf-8")

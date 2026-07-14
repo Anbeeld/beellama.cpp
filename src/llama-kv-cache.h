@@ -311,6 +311,15 @@ private:
 
     const uint32_t tail_tokens = 0;
     const ggml_type tail_type = GGML_TYPE_F16;
+    llama_kv_tail_storage_plan tail_plan {
+        LLAMA_KV_TAIL_STORAGE_DISABLED,
+        GGML_TYPE_F16,
+        GGML_TYPE_F16,
+        { 0, 0, 0 },
+        0,
+        0,
+        false,
+    };
     uint32_t tail_arena_stride = 0;
     uint32_t tail_attention_stride = 0;
     uint32_t tail_sink_slots = 0;
