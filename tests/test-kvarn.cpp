@@ -51,16 +51,12 @@ static void test_type_table() {
 }
 
 static void test_stage_policy() {
-    require(llama_kvarn_non_swa_tail_groups(32768, 256, 256) == 6,
-            "short-context KVarN tail policy changed unexpectedly");
-    require(llama_kvarn_non_swa_tail_groups(65536, 256, 256) == 8,
-            "long-context KVarN precision floor changed unexpectedly");
-    require(llama_kvarn_non_swa_tail_groups(65536, 2048, 256) == 18,
-            "b2048/ub256 KVarN tail must cover the scheduler window");
-    require(llama_kvarn_non_swa_tail_groups(65536, 2048, 512) == 20,
-            "b2048/ub512 KVarN tail must cover the scheduler window");
-    require(llama_kvarn_non_swa_tail_groups(65536, 2048, 1024) == 24,
-            "b2048/ub1024 KVarN tail must cover the scheduler window");
+    require(llama_kvarn_non_swa_tail_groups(0, 0) == 1,
+            "non-SWA KVarN must retain one incomplete reference group");
+    require(llama_kvarn_non_swa_tail_groups(2048, 128) == 1,
+            "reference KVarN tail must not scale with the scheduler batch");
+    require(llama_kvarn_non_swa_tail_groups(2048, 512) == 1,
+            "reference KVarN tail must not scale with the physical ubatch");
 }
 
 static void test_tile_layout() {

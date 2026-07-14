@@ -3,7 +3,6 @@
 #include "llama-kv-cache.h"
 #include "llama-kvarn.h"
 
-#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <unordered_map>
@@ -14,14 +13,13 @@ struct llama_model;
 
 bool llama_kvarn_backend_supports_native_ops(ggml_backend_dev_t dev);
 
-inline uint32_t llama_kvarn_non_swa_tail_groups(uint32_t kv_size, uint32_t n_batch, uint32_t n_ubatch) {
-    constexpr uint32_t group = 128;
-    const uint32_t in_flight_groups = std::max<uint32_t>(1u, (n_ubatch + group - 1u) / group);
-    const uint32_t min_tail_groups = 4u + (kv_size >= 65536u ? 2u : 0u);
-    const uint64_t scheduler_window = uint64_t(n_batch) + n_ubatch;
-    const uint32_t scheduler_window_groups = std::max<uint32_t>(
-        1u, uint32_t((scheduler_window + group - 1u) / group));
-    return std::max(min_tail_groups + in_flight_groups, scheduler_window_groups);
+inline uint32_t llama_kvarn_non_swa_tail_groups(uint32_t n_batch, uint32_t n_ubatch) {
+    GGML_UNUSED(n_batch);
+    GGML_UNUSED(n_ubatch);
+
+    // Reference KVarN keeps only the currently incomplete 128-token group in
+    // F16. Completed groups are quantized before the next group is evaluated.
+    return 1;
 }
 
 class llama_kv_cache_kvarn;
@@ -147,11 +145,10 @@ public:
     bool apply_pending_stream_copies(llama_context * lctx);
     bool is_swa() const { return swa; }
 
-    // Dynamic staging: the lossless F16 ring covers both the precision floor
-    // around the active ubatch and the scheduler window used by large prefills.
-    //   non-SWA tail_groups = max(
-    //       4 + long_ctx_min + ceil(n_ubatch / KVAR_N_GROUP),
-    //       ceil((n_batch + n_ubatch) / KVAR_N_GROUP))
+    // Reference-faithful staging keeps one incomplete 128-token group lossless.
+    // Use n_ubatch <= KVAR_N_GROUP so completed groups are not flushed before
+    // queries from the same physical ubatch have consumed them.
+    //   non-SWA tail_groups = 1
     //   SWA tail_groups     = KVAR_N_SWA_TAIL_GROUPS
     //   stage_groups        = tail_groups + 1 for non-SWA, tail_groups for SWA
     // The +1 is only the permanent sink slot for non-SWA. SWA has no sink slot,
@@ -208,7 +205,7 @@ private:
     const uint32_t n_stream;
     // Declaration order matters: stage_groups depends on tail_groups, so
     // tail_groups must be declared first (C++ initializes members in order).
-    const uint32_t tail_groups;   // non-SWA bounded current-ubatch tail; SWA fixed local tail
+    const uint32_t tail_groups;   // non-SWA scheduler span; SWA fixed local tail
     const uint32_t stage_groups;   // F16 stage depth (non-SWA sink + tail; SWA tail only)
     const bool swa;
     const uint32_t n_groups_per_stream;

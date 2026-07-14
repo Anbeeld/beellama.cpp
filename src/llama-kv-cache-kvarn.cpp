@@ -160,14 +160,12 @@ const std::vector<float> & kvarn_hadamard(int n) {
     }
 }
 
-uint32_t kvarn_stage_tail_groups(uint32_t kv_size, uint32_t n_batch, uint32_t n_ubatch, uint32_t n_swa, bool is_swa) {
-    GGML_UNUSED(n_swa);
-
+uint32_t kvarn_stage_tail_groups(uint32_t n_batch, uint32_t n_ubatch, bool is_swa) {
     if (is_swa) {
         return KVAR_N_SWA_TAIL_GROUPS;
     }
 
-    return llama_kvarn_non_swa_tail_groups(kv_size, n_batch, n_ubatch);
+    return llama_kvarn_non_swa_tail_groups(n_batch, n_ubatch);
 }
 
 uint32_t kvarn_swa_visible_groups(uint32_t kv_size, uint32_t n_swa) {
@@ -472,10 +470,10 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     params(params),
     n_stream(unified ? 1u : n_seq_max),
     // Dynamic staging: size the lossless F16 ring from position semantics.
-    // Non-SWA keeps a permanent sink slot plus enough tail groups for the active
-    // ubatch. SWA has no sink, so every stage slot is part of the local tail.
+    // Non-SWA keeps a permanent sink slot plus the scheduler-span tail. SWA has
+    // no sink, so every stage slot is part of the local tail.
     tail_groups(kvarn_stage_tail_groups(
-        kv_size, n_batch, n_ubatch, n_swa, n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE)),
+        n_batch, n_ubatch, n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE)),
     stage_groups((n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE) ? tail_groups : tail_groups + 1u),
     swa(n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE),
     // SWA: the metadata window may span one more 128-token tile than its nominal
@@ -554,8 +552,8 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     const size_t v_record_size = kvarn_record_bytes(this->params.value_bits);
     const int64_t n_record_groups = int64_t(n_groups_per_stream) * n_stream;
     // Stage depth is a cache property derived from position semantics. Non-SWA
-    // caches keep a bounded current-ubatch/recent-token span; SWA keeps only the
-    // live tail while older visible tiles live in the compressed record ring.
+    // caches cover the logical scheduler batch plus one physical ubatch; SWA
+    // keeps only the live tail while older visible tiles use the record ring.
     // Backends read stage_groups from op_params[7] instead of assuming 3.
     const int64_t n_stage_tokens = int64_t(KVAR_N_GROUP) * int64_t(stage_groups) * n_stream;
     size_t raw_bytes = 0;
