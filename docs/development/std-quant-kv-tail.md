@@ -51,6 +51,9 @@ normalization state. Tail work and scratch therefore scale with `N`, not the
 MMA body route and a view-aware non-contiguous IQ4-to-F16 converter; it does not
 fall back to whole-cache graph materialization.
 
+Standard quantized tails default to BF16. An explicit `--kv-tail-type f16`
+request remains supported and takes precedence over that default.
+
 The rejected prototype exposed every reserved shadow slot to softmax. Although
 masked slots were mathematically zero, changing `n_seq_max` changed reduction
 width and could change sampled output. It also imposed work proportional to
@@ -129,15 +132,15 @@ suffix or exposes historical degradation rather than reconstructing rows.
 
 ## Local artifact and benchmark manifest
 
-- Qwen hybrid target: `D:/models/Qwen3.6-27B-GGUF/Qwen3.6-27B-Q5_K_S.gguf`
-- Gemma SWA/global target: `D:/models/gemma-4-12b-it-GGUF/gemma-4-12b-it-UD-Q8_K_XL.gguf`
+- Qwen hybrid target: `<QWEN_TARGET_GGUF>`
+- Gemma SWA/global target: `<GEMMA_TARGET_GGUF>`
 - Build: `tmp/build-local-3090-cuda13.1-default.ps1 -Parallel 16`
 - GPU: RTX 3090, CUDA 13.1, architecture 86
 - Required comparison controls: identical prompt or corpus, `-b`, `-ub`,
   context, sampler, cache pair, model file, and commit
 
 No pure full-attention target or complete retrieval/agentic validation corpus
-exists under the authorized `D:/models` artifact root. No file was downloaded.
+exists under the configured model artifact root. No file was downloaded.
 Consequently, `auto` remains conservative and has no nonzero entry; every
 unknown key resolves to zero. The measurements below establish an explicit
 Qwen operating point, but do not silently promote it to `auto` without the

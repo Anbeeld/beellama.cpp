@@ -296,7 +296,13 @@ llama_context::llama_context(
             std::min(cparams.n_ctx, hparams.n_swa > 0 ? hparams.n_swa : cparams.n_ctx));
     cparams.kv_tail_tokens_requested = params.kv_tail_tokens;
     cparams.kv_tail_tokens_swa_requested = params.kv_tail_tokens;
-    cparams.kv_tail_type      = params.kv_tail_type;
+    if (params.kv_tail_type != GGML_TYPE_COUNT &&
+            params.kv_tail_type != GGML_TYPE_F16 && params.kv_tail_type != GGML_TYPE_BF16) {
+        throw std::invalid_argument("KV tail type must be F16, BF16, or the cache-family default");
+    }
+    cparams.kv_tail_type = params.kv_tail_type == GGML_TYPE_COUNT ?
+            (params.kvarn.type == LLAMA_KVARN_TYPE_DISABLED ? GGML_TYPE_BF16 : GGML_TYPE_F16) :
+            params.kv_tail_type;
     if (params.kv_tail_config) {
         const auto & config = *params.kv_tail_config;
         if (config.model != &model) {
@@ -3723,7 +3729,7 @@ llama_context_params llama_context_default_params() {
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
         /*.kv_tail_tokens              =*/ 0,
-        /*.kv_tail_type                =*/ GGML_TYPE_F16,
+        /*.kv_tail_type                =*/ GGML_TYPE_COUNT,
         /*.kv_tail_config              =*/ nullptr,
     };
 

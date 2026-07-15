@@ -28,7 +28,7 @@ contexts remain on standard cache types and do not inherit the target tail.
 | Argument | Env var | Default | Behavior |
 |---|---|---|---|
 | `--kv-tail-tokens SPEC` | `LLAMA_ARG_KV_TAIL_TOKENS` | `0` | For standard caches, `0` keeps the ordinary cache path. For KVarN, omitted or `0` retains the intrinsic 128-token exact suffix. A number applies to every canonical group; KVarN rounds positive values upward to complete 128-token groups. `N0,N1` follows canonical group order, while `full=N,swa=N` accepts unique role aliases or structural IDs such as `full@l0`. Invalid, duplicate, incomplete, or wrong-length specifications resolve additional coverage to zero, while KVarN still retains its intrinsic suffix. `auto` requests 1024 exact tokens per applicable target-cache group, capped by that group's effective context or attention window. |
-| `--kv-tail-type TYPE` | `LLAMA_ARG_KV_TAIL_TYPE` | `f16` | Selects `f16` or `bf16` exact storage for overlay shadows or a promoted native-exact body. Other types are rejected. |
+| `--kv-tail-type TYPE` | `LLAMA_ARG_KV_TAIL_TYPE` | `bf16` for standard caches; `f16` for KVarN | Selects `f16` or `bf16` exact storage for overlay shadows or a promoted native-exact body. An explicit value overrides the cache-family default in either direction. Other types are rejected. |
 
 Explicit values are capped by the group's effective attention window and context
 capacity. KVarN values are also rounded upward to 128-token groups. Startup logs

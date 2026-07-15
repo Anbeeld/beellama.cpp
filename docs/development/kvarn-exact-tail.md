@@ -33,6 +33,8 @@ eviction.
 
 The overlay stores canonical post-RoPE K and canonical V in the selected F16 or
 BF16 type. KVarN records retain their rotated K domain and original V domain.
+KVarN defaults to the paper-faithful F16 representation; an explicit BF16
+request remains supported and takes precedence over that default.
 Each query receives exact source indices for its own logical suffix. The body
 route excludes sink/tail overlap and exports its final FP32 row maximum and
 softmax denominator. CUDA merges the exact suffix against that metadata, so

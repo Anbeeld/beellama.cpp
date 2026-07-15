@@ -638,7 +638,7 @@ struct common_params {
 
     // Kept unresolved until the target model's canonical cache groups are known.
     std::string kv_tail_tokens = "0";
-    ggml_type   kv_tail_type   = GGML_TYPE_F16;
+    ggml_type   kv_tail_type   = GGML_TYPE_COUNT;
 
     // KVarN is selected by its pseudo cache-type names in the argument parser.
     // The backing ggml types remain the matching standard q formats for layers

@@ -35,7 +35,8 @@ intrinsic 128-token exact suffix. A positive request enlarges that suffix,
 rounding upward to complete 128-token KVarN groups and capping at the group's
 full or SWA visibility window. `auto`, positional lists, named roles, and
 structural group IDs use the same group resolution as standard-cache tails.
-F16 is the paper-faithful default; BF16 is an explicit supported alternative.
+F16 is the paper-faithful KVarN default. Standard quantized tails default to
+BF16. Either cache family accepts an explicit F16 or BF16 override.
 A request covering the whole group uses one native F16/BF16 cache instead of
 allocating compressed records plus a redundant exact overlay.
 
@@ -96,6 +97,8 @@ build tier.
 `--kv-tail-tokens` makes the newest attention-visible entries exact in F16 or
 BF16 for standard quantized and KVarN target caches. A partial request overlays
 a compact exact shadow while retaining the complete selected quantized cache.
+A standard quantized tail defaults to BF16, while a KVarN tail defaults to F16;
+`--kv-tail-type` can explicitly select either representation for either family.
 A request covering a group's full
 visibility window may instead promote its owned body to native F16/BF16 when
 that representation is supported and its memory increment is no greater than

@@ -477,8 +477,9 @@ extern "C" {
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
 
-        // Optional high-precision shadow for recent entries in standard quantized KV caches.
-        // A value of 0 preserves the ordinary cache path. Only F16 and BF16 are valid tail types.
+        // Optional high-precision shadow for recent entries in quantized KV caches.
+        // A value of 0 preserves the ordinary standard-cache path. F16 and BF16 are explicit tail
+        // types; GGML_TYPE_COUNT selects BF16 for standard caches and F16 for KVarN.
         uint32_t       kv_tail_tokens;
         enum ggml_type kv_tail_type;
         const struct llama_kv_tail_config * kv_tail_config; // borrowed only during context creation
