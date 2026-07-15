@@ -256,6 +256,12 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_iswa::memory_breakdo
     return mb;
 }
 
+llama_kv_memory_stats llama_kv_cache_iswa::kv_memory_stats() const {
+    llama_kv_memory_stats result = kv_base->kv_memory_stats();
+    result.add(kv_swa->kv_memory_stats());
+    return result;
+}
+
 uint32_t llama_kv_cache_iswa::get_kv_tail_group_count() const {
     return kv_base->get_kv_tail_group_count() + kv_swa->get_kv_tail_group_count();
 }

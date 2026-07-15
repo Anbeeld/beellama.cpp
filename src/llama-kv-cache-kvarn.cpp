@@ -598,6 +598,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     params(params),
     n_stream(unified ? 1u : n_seq_max),
     n_seq_max(n_seq_max),
+    kv_size(kv_size),
     // Dynamic staging: size the lossless F16 ring from position semantics.
     // Non-SWA keeps a permanent sink slot plus the scheduler-span tail. SWA has
     // no sink, so every stage slot is part of the local tail.
@@ -1089,6 +1090,30 @@ bool llama_kv_cache_kvarn::apply_pending_stream_copies(llama_context * lctx) {
     pending_stream_copies.tail_src_slots.clear();
     pending_stream_copies.tail_dst_slots.clear();
     return true;
+}
+
+llama_kv_memory_stats llama_kv_cache_kvarn::kv_memory_stats() const {
+    llama_kv_memory_stats result;
+    llama_kv_memory_component_stats & component = swa ? result.swa : result.global;
+
+    for (const auto & layer : layers) {
+        component.k_payload_bytes += ggml_nbytes(layer.k_records);
+        component.v_payload_bytes += ggml_nbytes(layer.v_records);
+        component.staging_bytes += ggml_nbytes(layer.k_stage) + ggml_nbytes(layer.v_stage);
+        component.exact_tail_bytes += layer.k_tail ? ggml_nbytes(layer.k_tail) : 0;
+        component.exact_tail_bytes += layer.v_tail ? ggml_nbytes(layer.v_tail) : 0;
+    }
+
+    uint64_t allocated = 0;
+    for (const auto & [buft, size] : memory_breakdown()) {
+        GGML_UNUSED(buft);
+        allocated += size;
+    }
+    const uint64_t accounted = component.k_payload_bytes + component.v_payload_bytes +
+            component.exact_tail_bytes + component.staging_bytes;
+    component.padding_bytes = allocated > accounted ? allocated - accounted : 0;
+    component.allocated_capacity_tokens = kv_size;
+    return result;
 }
 
 bool llama_kv_cache_kvarn::get_kv_tail_coverage(

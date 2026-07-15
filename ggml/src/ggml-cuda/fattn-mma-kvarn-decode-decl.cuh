@@ -23,6 +23,7 @@ struct ggml_cuda_fattn_kvarn_decode_args {
     float * partial;
     float2 * partial_meta;
     float * dst;
+    float2 * dst_meta;
     float scale;
     float logit_softcap;
     int64_t nb01;

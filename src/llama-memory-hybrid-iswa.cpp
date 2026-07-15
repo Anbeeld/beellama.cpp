@@ -214,6 +214,10 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_iswa::memory_br
     return mb;
 }
 
+llama_kv_memory_stats llama_memory_hybrid_iswa::kv_memory_stats() const {
+    return mem_attn->kv_memory_stats();
+}
+
 uint32_t llama_memory_hybrid_iswa::get_kv_tail_group_count() const {
     return mem_attn->get_kv_tail_group_count();
 }

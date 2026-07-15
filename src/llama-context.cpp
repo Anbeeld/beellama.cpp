@@ -4462,6 +4462,11 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
     return ctx->memory_breakdown();
 }
 
+llama_kv_memory_stats llama_get_kv_memory_stats(const struct llama_context * ctx) {
+    llama_memory_t memory = ctx ? ctx->get_memory() : nullptr;
+    return memory ? memory->kv_memory_stats() : llama_kv_memory_stats{};
+}
+
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
 }

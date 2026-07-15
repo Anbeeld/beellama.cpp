@@ -1,6 +1,7 @@
 #pragma once
 
 #include "fattn-common.cuh"
+#include "fattn-kvarn-dispatch.cuh"
 
 template<typename T>
 static __global__ void k_flash_attn_ext_tail_pack_arenas(
@@ -548,6 +549,12 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
     const size_t body_alloc_size = ggml_cuda_tail_pass_alloc_size(ctx, body_pass);
     ggml_cuda_pool_alloc<uint8_t> body_alloc(pool, body_alloc_size);
     body_pass.data = body_alloc.get();
+    const uint64_t tail_pack_bytes = kt_alloc.actual_size + vt_alloc.actual_size +
+            q_alloc.actual_size + mask_alloc.actual_size + kb_alloc.actual_size +
+            vb_alloc.actual_size + body_mask_alloc.actual_size;
+    const uint64_t tail_plan_input_bytes = ggml_nbytes(mt) + ggml_nbytes(qo) + ggml_nbytes(rd);
+    const uint64_t tail_base_bytes = body_meta_alloc.actual_size + tail_meta_alloc.actual_size +
+            tail_pack_bytes + body_alloc.actual_size + tail_plan_input_bytes;
     if (ggml_cuda_flash_attn_ext_kvarn_uses_views(&body_pass)) {
         if (!ggml_cuda_flash_attn_ext_kvarn(ctx, &body_pass)) {
             GGML_ABORT("unsupported structured body in exact-tail attention");
@@ -586,6 +593,14 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
         }
 #undef GGML_CUDA_LAUNCH_INDEXED_SMALL
         CUDA_CHECK(cudaGetLastError());
+        ggml_cuda_kv_memory_transient_stats_record_tail(
+                body_meta_alloc.actual_size,
+                tail_meta_alloc.actual_size,
+                tail_pack_bytes,
+                body_alloc.actual_size,
+                0,
+                tail_plan_input_bytes,
+                tail_base_bytes);
         return;
     }
 
@@ -606,6 +621,14 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
     const size_t tail_alloc_size = ggml_cuda_tail_pass_alloc_size(ctx, tail_pass);
     ggml_cuda_pool_alloc<uint8_t> tail_alloc(pool, tail_alloc_size);
     tail_pass.data = tail_alloc.get();
+    ggml_cuda_kv_memory_transient_stats_record_tail(
+            body_meta_alloc.actual_size,
+            tail_meta_alloc.actual_size,
+            tail_pack_bytes,
+            body_alloc.actual_size,
+            tail_alloc.actual_size,
+            tail_plan_input_bytes,
+            tail_base_bytes + tail_alloc.actual_size);
     ggml_cuda_flash_attn_ext_dispatch(ctx, &tail_pass);
 
     const dim3 grid(q_max, n_head, n_active);

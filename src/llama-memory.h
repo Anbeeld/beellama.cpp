@@ -2,6 +2,7 @@
 
 #include "llama.h"
 #include "llama-graph.h"
+#include "llama-kv-memory-stats.h"
 
 #include <cstdint>
 #include <map>
@@ -144,6 +145,7 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
+    virtual llama_kv_memory_stats kv_memory_stats() const { return {}; }
 
     virtual uint32_t get_kv_tail_group_count() const { return 0; }
     virtual bool get_kv_tail_coverage(

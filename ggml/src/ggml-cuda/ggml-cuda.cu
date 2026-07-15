@@ -25,6 +25,7 @@
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
+#include "ggml-cuda/fattn-kvarn-dispatch.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
@@ -4627,6 +4628,36 @@ static bool ggml_backend_cuda_kvarn_native_ops(ggml_backend_dev_t dev) {
 #endif
 }
 
+static bool ggml_backend_cuda_memory_checkpoint(
+        int device, uint64_t * used_bytes, uint64_t * free_bytes, uint64_t * total_bytes) {
+    if (used_bytes == nullptr || free_bytes == nullptr || total_bytes == nullptr ||
+            device < 0 || device >= ggml_backend_cuda_get_device_count()) {
+        return false;
+    }
+
+    int previous_device = 0;
+    if (cudaGetDevice(&previous_device) != cudaSuccess || cudaSetDevice(device) != cudaSuccess) {
+        return false;
+    }
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        cudaSetDevice(previous_device);
+        return false;
+    }
+
+    size_t free_value = 0;
+    size_t total_value = 0;
+    const cudaError_t result = cudaMemGetInfo(&free_value, &total_value);
+    cudaSetDevice(previous_device);
+    if (result != cudaSuccess || free_value > total_value) {
+        return false;
+    }
+
+    *free_bytes = free_value;
+    *total_bytes = total_value;
+    *used_bytes = total_value - free_value;
+    return true;
+}
+
 // TODO: move these functions here
 static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
@@ -5270,6 +5301,21 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_kv_tail_attention_supported") == 0) {
         return (void *)ggml_cuda_flash_attn_ext_tail_supported;
+    }
+    if (strcmp(name, "ggml_backend_kvarn_route_stats_reset") == 0) {
+        return (void *)ggml_cuda_fattn_kvarn_route_stats_reset;
+    }
+    if (strcmp(name, "ggml_backend_kvarn_route_stats_get") == 0) {
+        return (void *)ggml_cuda_fattn_kvarn_route_stats_get;
+    }
+    if (strcmp(name, "ggml_backend_kv_memory_transient_stats_reset") == 0) {
+        return (void *)ggml_cuda_kv_memory_transient_stats_reset;
+    }
+    if (strcmp(name, "ggml_backend_kv_memory_transient_stats_get") == 0) {
+        return (void *)ggml_cuda_kv_memory_transient_stats_get;
+    }
+    if (strcmp(name, "ggml_backend_cuda_memory_checkpoint") == 0) {
+        return (void *)ggml_backend_cuda_memory_checkpoint;
     }
     return nullptr;
 }

@@ -4,6 +4,8 @@
 #include <sstream>
 #include <string>
 
+#include "../ggml/src/ggml-cuda/fattn-kvarn-route-policy.h"
+
 static std::string read_file(const std::string & path) {
     std::ifstream file(path);
     if (!file.good()) {
@@ -47,6 +49,39 @@ int main(int argc, char ** argv) {
     const std::string fattn = read_file(root + "/ggml/src/ggml-cuda/fattn.cu");
     const std::string kvarn = read_file(root + "/ggml/src/ggml-cuda/fattn-kvarn-dispatch.cu");
     const std::string cmake = read_file(root + "/ggml/CMakeLists.txt");
+
+    const auto expect_route = [&](const ggml_cuda_fattn_kvarn_route_input & base,
+                                  ggml_cuda_fattn_kvarn_route expected,
+                                  const char * message) {
+        auto without_meta = base;
+        without_meta.body_meta_requested = false;
+        auto with_meta = base;
+        with_meta.body_meta_requested = true;
+        ok &= expect(ggml_cuda_fattn_kvarn_select_route(without_meta) == expected, message);
+        ok &= expect(ggml_cuda_fattn_kvarn_select_route(with_meta) == expected,
+            "optional body metadata changed an eligible KVarN route");
+    };
+
+    expect_route({256, 1, 6, 4, 4, false, false, false, true, false},
+        GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_SPLIT,
+        "Qwen-like D256 global decode did not select split decode");
+    expect_route({512, 1, 16, 4, 4, false, false, false, true, false},
+        GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_SPLIT,
+        "Gemma-like D512 global decode did not select split decode");
+    expect_route({256, 1, 2, 4, 4, true, false, true, true, false},
+        GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_VECTOR,
+        "Gemma-like D256 SWA decode did not select vector decode");
+    for (int n_q = 2; n_q <= 8; ++n_q) {
+        expect_route({256, n_q, 6, 4, 4, false, false, false, true, false},
+            GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_SPLIT,
+            "supported multi-token verification shape did not select split decode");
+    }
+    expect_route({384, 1, 6, 4, 4, false, false, false, false, false},
+        GGML_CUDA_FATTN_KVARN_ROUTE_GENERIC_MMA,
+        "unsupported head shape did not remain on generic fallback");
+    expect_route({256, 64, 6, 4, 4, false, false, false, false, true},
+        GGML_CUDA_FATTN_KVARN_ROUTE_PROMPT_PREFILL,
+        "prompt/prefill shape did not retain the prompt route");
     const std::string allocation = slice_between(fattn,
             "size_t ggml_cuda_flash_attn_ext_get_alloc_size",
             "void ggml_cuda_flash_attn_ext");
@@ -72,6 +107,10 @@ int main(int argc, char ** argv) {
     ok &= expect(kvarn.find("ggml_cuda_flash_attn_ext_mma_kvarn(ctx, dst);") != std::string::npos &&
                  kvarn.find("return true;") != std::string::npos,
         "unsupported KVarN fast-decode pairs must fall through to descriptor-native MMA");
+    ok &= expect(kvarn.find("if (dst->src[8] == nullptr)") == std::string::npos,
+        "optional body metadata must not disable specialized KVarN decode routes");
+    ok &= expect(kvarn.find("args.dst_meta") != std::string::npos,
+        "specialized KVarN decode must receive the optional body metadata destination");
     ok &= expect(kvarn.find("#if defined(GGML_CUDA_FA_ALL_QUANTS)") != std::string::npos &&
                  kvarn.find("GGML_CUDA_FA_HALF_QUANTS") == std::string::npos,
         "KVarN fast decode must have only default and ALL build tiers");

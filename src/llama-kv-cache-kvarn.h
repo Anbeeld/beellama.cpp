@@ -200,6 +200,7 @@ public:
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
+    llama_kv_memory_stats kv_memory_stats() const override;
     uint32_t get_kv_tail_group_count() const override { return 1; }
     bool get_kv_tail_coverage(
             uint32_t group_index,
@@ -280,6 +281,7 @@ private:
     const llama_kvarn_params params;
     const uint32_t n_stream;
     const uint32_t n_seq_max;
+    const uint32_t kv_size;
     // Declaration order matters: stage_groups depends on tail_groups, so
     // tail_groups must be declared first (C++ initializes members in order).
     const uint32_t tail_groups;   // non-SWA scheduler span; SWA fixed local tail

@@ -26,6 +26,7 @@
 #include "fit.h"
 #include "ggml.h"
 #include "llama.h"
+#include "../../src/llama-ext.h"
 
 #ifdef _WIN32
 #    define WIN32_LEAN_AND_MEAN
@@ -391,6 +392,7 @@ struct cmd_params {
     int                              delay;
     bool                             verbose;
     bool                             progress;
+    bool                             kv_memory;
     bool                             no_warmup;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
@@ -438,6 +440,7 @@ static const cmd_params cmd_params_defaults = {
     /* delay                */ 0,
     /* verbose              */ false,
     /* progress             */ false,
+    /* kv_memory            */ false,
     /* no_warmup            */ false,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
@@ -457,6 +460,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --list-devices                              list available devices and exit\n");
     printf("  -v, --verbose                               verbose output\n");
     printf("  --progress                                  print test progress indicators\n");
+    printf("  --kv-memory                                capture synchronized KV component and CUDA allocation checkpoints\n");
     printf("  --no-warmup                                 skip warmup runs before benchmarking\n");
     printf("  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)\n");
     printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 4096)\n");
@@ -673,6 +677,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.prio                 = cmd_params_defaults.prio;
     params.delay                = cmd_params_defaults.delay;
     params.progress             = cmd_params_defaults.progress;
+    params.kv_memory            = cmd_params_defaults.kv_memory;
     params.no_warmup            = cmd_params_defaults.no_warmup;
     params.offline              = cmd_params_defaults.offline;
 
@@ -1179,6 +1184,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 params.verbose = true;
             } else if (arg == "--progress") {
                 params.progress = true;
+            } else if (arg == "--kv-memory") {
+                params.kv_memory = true;
             } else if (arg == "--no-warmup") {
                 params.no_warmup = true;
             } else if (arg == "-fitt" || arg == "--fit-target") {
@@ -1629,7 +1636,47 @@ struct test {
     bench_cache_type         type_k;
     bench_cache_type         type_v;
     uint32_t                 kv_tail_tokens;
+    uint32_t                 kv_tail_tokens_effective;
     ggml_type                kv_tail_type;
+    uint64_t                 kvarn_route_split = 0;
+    uint64_t                 kvarn_route_vector = 0;
+    uint64_t                 kvarn_route_generic = 0;
+    uint64_t                 kvarn_route_prefill = 0;
+    uint64_t                 kv_k_payload_bytes = 0;
+    uint64_t                 kv_v_payload_bytes = 0;
+    uint64_t                 kv_exact_tail_bytes = 0;
+    uint64_t                 kv_exact_overlay_bytes = 0;
+    uint64_t                 kv_native_exact_bytes = 0;
+    uint64_t                 kv_staging_bytes = 0;
+    uint64_t                 kv_metadata_bytes = 0;
+    uint64_t                 kv_padding_bytes = 0;
+    uint64_t                 kv_resident_bytes = 0;
+    uint64_t                 kv_global_resident_bytes = 0;
+    uint64_t                 kv_swa_resident_bytes = 0;
+    uint64_t                 kv_allocated_capacity_tokens = 0;
+    uint64_t                 kv_live_tokens = 0;
+    uint64_t                 kv_descriptor_bytes = 0;
+    uint64_t                 kv_partial_output_bytes = 0;
+    uint64_t                 kv_partial_meta_bytes = 0;
+    uint64_t                 kv_tail_body_meta_bytes = 0;
+    uint64_t                 kv_tail_exact_meta_bytes = 0;
+    uint64_t                 kv_tail_pack_bytes = 0;
+    uint64_t                 kv_tail_body_output_bytes = 0;
+    uint64_t                 kv_tail_exact_output_bytes = 0;
+    uint64_t                 kv_tail_plan_input_bytes = 0;
+    uint64_t                 kv_transient_bytes = 0;
+    uint64_t                 kv_peak_bytes = 0;
+    uint64_t                 cuda_used_model_bytes = 0;
+    uint64_t                 cuda_used_context_bytes = 0;
+    uint64_t                 cuda_used_prefill_bytes = 0;
+    uint64_t                 cuda_used_peak_bytes = 0;
+    uint64_t                 cuda_used_after_context_bytes = 0;
+    uint64_t                 cuda_total_bytes = 0;
+    uint64_t                 cuda_compute_buffer_bytes = 0;
+    int64_t                  cuda_context_delta_bytes = 0;
+    int64_t                  cuda_peak_delta_bytes = 0;
+    int64_t                  cuda_reconciliation_delta_bytes = 0;
+    int64_t                  cuda_teardown_delta_bytes = 0;
     int                      n_gpu_layers;
     int                      n_cpu_moe;
     llama_split_mode         split_mode;
@@ -1672,6 +1719,13 @@ struct test {
         type_k         = inst.type_k;
         type_v         = inst.type_v;
         kv_tail_tokens = inst.kv_tail_tokens;
+        const uint32_t tail_window = uint32_t(std::max(0, inst.n_prompt + inst.n_gen + inst.n_depth));
+        if (inst.type_k.kvarn_bits != 0 || inst.type_v.kvarn_bits != 0) {
+            const uint32_t covered = std::max<uint32_t>(128, kv_tail_tokens);
+            kv_tail_tokens_effective = std::min(tail_window, (covered + 127u) / 128u * 128u);
+        } else {
+            kv_tail_tokens_effective = std::min(tail_window, kv_tail_tokens);
+        }
         kv_tail_type   = inst.kv_tail_type;
         n_gpu_layers   = inst.n_gpu_layers;
         n_cpu_moe      = inst.n_cpu_moe;
@@ -1743,7 +1797,19 @@ struct test {
             "build_commit",   "build_number",   "cpu_info",      "gpu_info",       "backends",
             "model_filename", "model_type",     "model_size",    "model_n_params", "n_batch",
             "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
-            "type_k",         "type_v",         "kv_tail_tokens", "kv_tail_type",   "n_gpu_layers",  "n_cpu_moe",      "split_mode",
+            "type_k",         "type_v",         "kv_tail_tokens", "kv_tail_tokens_effective", "kv_tail_type",
+            "kvarn_route_split", "kvarn_route_vector", "kvarn_route_generic", "kvarn_route_prefill",
+            "kv_k_payload_bytes", "kv_v_payload_bytes", "kv_exact_tail_bytes", "kv_exact_overlay_bytes",
+            "kv_native_exact_bytes", "kv_staging_bytes",
+            "kv_metadata_bytes", "kv_padding_bytes", "kv_resident_bytes", "kv_global_resident_bytes",
+            "kv_swa_resident_bytes", "kv_allocated_capacity_tokens", "kv_live_tokens", "kv_descriptor_bytes",
+            "kv_partial_output_bytes", "kv_partial_meta_bytes", "kv_tail_body_meta_bytes", "kv_tail_exact_meta_bytes",
+            "kv_tail_pack_bytes", "kv_tail_body_output_bytes", "kv_tail_exact_output_bytes", "kv_tail_plan_input_bytes",
+            "kv_transient_bytes", "kv_peak_bytes", "cuda_used_model_bytes", "cuda_used_context_bytes",
+            "cuda_used_prefill_bytes", "cuda_used_peak_bytes", "cuda_used_after_context_bytes", "cuda_total_bytes",
+            "cuda_compute_buffer_bytes", "cuda_context_delta_bytes", "cuda_peak_delta_bytes",
+            "cuda_reconciliation_delta_bytes", "cuda_teardown_delta_bytes",
+            "n_gpu_layers",  "n_cpu_moe",      "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "use_mmap",      "use_direct_io",  "embeddings",
             "no_op_offload",  "no_host",        "fit_target",     "fit_min_ctx",
@@ -1756,11 +1822,18 @@ struct test {
     enum field_type { STRING, BOOL, INT, FLOAT };
 
     static field_type get_field_type(const std::string & field) {
+        const bool bytes_field = field.size() >= 6 && field.compare(field.size() - 6, 6, "_bytes") == 0;
+        if (bytes_field || string_starts_with(field, "cuda_") ||
+                field == "kv_allocated_capacity_tokens" || field == "kv_live_tokens") {
+            return INT;
+        }
         if (field == "build_number" || field == "n_batch" || field == "n_ubatch" || field == "n_threads" ||
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
-            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn" || field == "kv_tail_tokens") {
+            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn" || field == "kv_tail_tokens" ||
+            field == "kv_tail_tokens_effective" || field == "kvarn_route_split" || field == "kvarn_route_vector" ||
+            field == "kvarn_route_generic" || field == "kvarn_route_prefill") {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" ||
@@ -1828,8 +1901,48 @@ struct test {
                                             bench_cache_type_name(type_k),
                                             bench_cache_type_name(type_v),
                                             std::to_string(kv_tail_tokens),
+                                            std::to_string(kv_tail_tokens_effective),
                                             ggml_type_name(kv_tail_type),
-                                            std::to_string(n_gpu_layers),
+                                            std::to_string(kvarn_route_split),
+                                             std::to_string(kvarn_route_vector),
+                                             std::to_string(kvarn_route_generic),
+                                             std::to_string(kvarn_route_prefill),
+                                             std::to_string(kv_k_payload_bytes),
+                                             std::to_string(kv_v_payload_bytes),
+                                             std::to_string(kv_exact_tail_bytes),
+                                             std::to_string(kv_exact_overlay_bytes),
+                                             std::to_string(kv_native_exact_bytes),
+                                             std::to_string(kv_staging_bytes),
+                                             std::to_string(kv_metadata_bytes),
+                                             std::to_string(kv_padding_bytes),
+                                             std::to_string(kv_resident_bytes),
+                                             std::to_string(kv_global_resident_bytes),
+                                             std::to_string(kv_swa_resident_bytes),
+                                             std::to_string(kv_allocated_capacity_tokens),
+                                             std::to_string(kv_live_tokens),
+                                             std::to_string(kv_descriptor_bytes),
+                                             std::to_string(kv_partial_output_bytes),
+                                             std::to_string(kv_partial_meta_bytes),
+                                             std::to_string(kv_tail_body_meta_bytes),
+                                             std::to_string(kv_tail_exact_meta_bytes),
+                                             std::to_string(kv_tail_pack_bytes),
+                                             std::to_string(kv_tail_body_output_bytes),
+                                             std::to_string(kv_tail_exact_output_bytes),
+                                             std::to_string(kv_tail_plan_input_bytes),
+                                             std::to_string(kv_transient_bytes),
+                                             std::to_string(kv_peak_bytes),
+                                             std::to_string(cuda_used_model_bytes),
+                                             std::to_string(cuda_used_context_bytes),
+                                             std::to_string(cuda_used_prefill_bytes),
+                                             std::to_string(cuda_used_peak_bytes),
+                                             std::to_string(cuda_used_after_context_bytes),
+                                             std::to_string(cuda_total_bytes),
+                                             std::to_string(cuda_compute_buffer_bytes),
+                                             std::to_string(cuda_context_delta_bytes),
+                                             std::to_string(cuda_peak_delta_bytes),
+                                             std::to_string(cuda_reconciliation_delta_bytes),
+                                             std::to_string(cuda_teardown_delta_bytes),
+                                             std::to_string(n_gpu_layers),
                                             std::to_string(n_cpu_moe),
                                             split_mode_str(split_mode),
                                             std::to_string(main_gpu),
@@ -2388,6 +2501,33 @@ static std::unique_ptr<printer> create_printer(output_formats format) {
 // satisfies -Wmissing-declarations
 int llama_bench(int argc, char ** argv);
 
+struct bench_kvarn_route_stats {
+    uint64_t decode_split;
+    uint64_t decode_vector;
+    uint64_t generic_mma;
+    uint64_t prompt_prefill;
+};
+
+struct bench_kv_memory_transient_stats {
+    uint64_t kvarn_descriptor_bytes;
+    uint64_t kvarn_partial_output_bytes;
+    uint64_t kvarn_partial_meta_bytes;
+    uint64_t kvarn_total_bytes;
+    uint64_t tail_body_meta_bytes;
+    uint64_t tail_exact_meta_bytes;
+    uint64_t tail_pack_bytes;
+    uint64_t tail_body_output_bytes;
+    uint64_t tail_exact_output_bytes;
+    uint64_t tail_plan_input_bytes;
+    uint64_t tail_total_bytes;
+};
+
+using bench_kvarn_route_stats_reset_fn = void (*)();
+using bench_kvarn_route_stats_get_fn = void (*)(bench_kvarn_route_stats *);
+using bench_kv_memory_transient_stats_reset_fn = void (*)();
+using bench_kv_memory_transient_stats_get_fn = void (*)(bench_kv_memory_transient_stats *);
+using bench_cuda_memory_checkpoint_fn = bool (*)(int, uint64_t *, uint64_t *, uint64_t *);
+
 int llama_bench(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
     // try to set locale for unicode characters in markdown
@@ -2407,6 +2547,30 @@ int llama_bench(int argc, char ** argv) {
 
     // initialize backends
     ggml_backend_load_all();
+
+    bench_kvarn_route_stats_reset_fn kvarn_route_stats_reset = nullptr;
+    bench_kvarn_route_stats_get_fn kvarn_route_stats_get = nullptr;
+    bench_kv_memory_transient_stats_reset_fn kv_memory_transient_stats_reset = nullptr;
+    bench_kv_memory_transient_stats_get_fn kv_memory_transient_stats_get = nullptr;
+    bench_cuda_memory_checkpoint_fn cuda_memory_checkpoint = nullptr;
+    for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+        ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+        auto reset = reinterpret_cast<bench_kvarn_route_stats_reset_fn>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_kvarn_route_stats_reset"));
+        auto get = reinterpret_cast<bench_kvarn_route_stats_get_fn>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_kvarn_route_stats_get"));
+        if (reset != nullptr && get != nullptr) {
+            kvarn_route_stats_reset = reset;
+            kvarn_route_stats_get = get;
+            kv_memory_transient_stats_reset = reinterpret_cast<bench_kv_memory_transient_stats_reset_fn>(
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_kv_memory_transient_stats_reset"));
+            kv_memory_transient_stats_get = reinterpret_cast<bench_kv_memory_transient_stats_get_fn>(
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_kv_memory_transient_stats_get"));
+            cuda_memory_checkpoint = reinterpret_cast<bench_cuda_memory_checkpoint_fn>(
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_memory_checkpoint"));
+            break;
+        }
+    }
 
     cmd_params params = parse_cmd_params(argc, argv);
 
@@ -2511,6 +2675,23 @@ int llama_bench(int argc, char ** argv) {
             prev_inst = &inst;
         }
 
+        uint64_t cuda_used_model = 0;
+        uint64_t cuda_free_model = 0;
+        uint64_t cuda_total = 0;
+        if (params.kv_memory) {
+            if (kv_memory_transient_stats_reset == nullptr || kv_memory_transient_stats_get == nullptr ||
+                    cuda_memory_checkpoint == nullptr) {
+                fprintf(stderr, "%s: error: CUDA KV memory telemetry is unavailable\n", __func__);
+                llama_model_free(lmodel);
+                return 1;
+            }
+            if (!cuda_memory_checkpoint(inst.main_gpu, &cuda_used_model, &cuda_free_model, &cuda_total)) {
+                fprintf(stderr, "%s: error: failed to capture the synchronized model-only CUDA checkpoint\n", __func__);
+                llama_model_free(lmodel);
+                return 1;
+            }
+        }
+
         llama_context * ctx = llama_init_from_model(lmodel, cparams);
         if (ctx == NULL) {
             fprintf(stderr, "%s: error: failed to create context with model '%s'\n", __func__, inst.model.c_str());
@@ -2519,6 +2700,47 @@ int llama_bench(int argc, char ** argv) {
         }
 
         test t(inst, lmodel, ctx);
+
+        if (params.kv_memory) {
+            const llama_kv_memory_stats kv_stats = llama_get_kv_memory_stats(ctx);
+            t.kv_k_payload_bytes = kv_stats.k_payload_bytes();
+            t.kv_v_payload_bytes = kv_stats.v_payload_bytes();
+            t.kv_exact_tail_bytes = kv_stats.exact_tail_bytes();
+            t.kv_exact_overlay_bytes = kv_stats.exact_overlay_bytes();
+            t.kv_native_exact_bytes = kv_stats.native_exact_bytes();
+            t.kv_staging_bytes = kv_stats.global.staging_bytes + kv_stats.swa.staging_bytes;
+            t.kv_metadata_bytes = kv_stats.global.metadata_bytes + kv_stats.swa.metadata_bytes;
+            t.kv_padding_bytes = kv_stats.global.padding_bytes + kv_stats.swa.padding_bytes;
+            t.kv_resident_bytes = kv_stats.resident_bytes();
+            t.kv_global_resident_bytes = kv_stats.global.resident_bytes();
+            t.kv_swa_resident_bytes = kv_stats.swa.resident_bytes();
+            t.kv_allocated_capacity_tokens = kv_stats.allocated_capacity_tokens();
+            t.cuda_used_model_bytes = cuda_used_model;
+            t.cuda_total_bytes = cuda_total;
+
+            const llama_memory_breakdown breakdown = llama_get_memory_breakdown(ctx);
+            for (const auto & [buft, memory] : breakdown) {
+                ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+                if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    t.cuda_compute_buffer_bytes += memory.compute;
+                }
+            }
+
+            uint64_t cuda_free_context = 0;
+            uint64_t cuda_total_context = 0;
+            if (!cuda_memory_checkpoint(inst.main_gpu, &t.cuda_used_context_bytes,
+                    &cuda_free_context, &cuda_total_context)) {
+                fprintf(stderr, "%s: error: failed to capture the synchronized post-context CUDA checkpoint\n", __func__);
+                llama_free(ctx);
+                llama_model_free(lmodel);
+                return 1;
+            }
+            t.cuda_context_delta_bytes = int64_t(t.cuda_used_context_bytes) - int64_t(t.cuda_used_model_bytes);
+        }
+
+        if (kvarn_route_stats_reset != nullptr) {
+            kvarn_route_stats_reset();
+        }
 
         llama_memory_clear(llama_get_memory(ctx), false);
 
@@ -2577,6 +2799,10 @@ int llama_bench(int argc, char ** argv) {
             }
         }
 
+        if (params.kv_memory) {
+            kv_memory_transient_stats_reset();
+        }
+
         for (int i = 0; i < params.reps; i++) {
             llama_memory_clear(llama_get_memory(ctx), false);
 
@@ -2617,6 +2843,21 @@ int llama_bench(int argc, char ** argv) {
                 }
             }
 
+            if (params.kv_memory && t.cuda_used_prefill_bytes == 0) {
+                // State-cached depth runs do not retain a queryable token-position span after
+                // restore, but the benchmark case owns the exact logical depth at this checkpoint.
+                t.kv_live_tokens = uint64_t(t.n_depth + t.n_prompt);
+                uint64_t cuda_free_prefill = 0;
+                uint64_t cuda_total_prefill = 0;
+                if (!cuda_memory_checkpoint(inst.main_gpu, &t.cuda_used_prefill_bytes,
+                        &cuda_free_prefill, &cuda_total_prefill)) {
+                    fprintf(stderr, "%s: error: failed to capture the synchronized post-prefill CUDA checkpoint\n", __func__);
+                    llama_free(ctx);
+                    llama_model_free(lmodel);
+                    return 1;
+                }
+            }
+
             llama_kv_tail_planner_timing_reset(ctx);
             uint64_t t_start = get_time_ns();
 
@@ -2650,6 +2891,63 @@ int llama_bench(int argc, char ** argv) {
             uint64_t t_ns = get_time_ns() - t_start;
             t.samples_ns.push_back(t_ns);
             t.planner_ns.push_back(llama_kv_tail_planner_timing_ns(ctx));
+            if (params.kv_memory) {
+                uint64_t cuda_used_peak = 0;
+                uint64_t cuda_free_peak = 0;
+                uint64_t cuda_total_peak = 0;
+                if (!cuda_memory_checkpoint(inst.main_gpu, &cuda_used_peak,
+                        &cuda_free_peak, &cuda_total_peak)) {
+                    fprintf(stderr, "%s: error: failed to capture the synchronized decode CUDA checkpoint\n", __func__);
+                    llama_free(ctx);
+                    llama_model_free(lmodel);
+                    return 1;
+                }
+                t.cuda_used_peak_bytes = std::max({t.cuda_used_peak_bytes,
+                        t.cuda_used_prefill_bytes, cuda_used_peak});
+            }
+        }
+
+        if (kvarn_route_stats_get != nullptr) {
+            bench_kvarn_route_stats stats = {};
+            kvarn_route_stats_get(&stats);
+            t.kvarn_route_split = stats.decode_split;
+            t.kvarn_route_vector = stats.decode_vector;
+            t.kvarn_route_generic = stats.generic_mma;
+            t.kvarn_route_prefill = stats.prompt_prefill;
+        }
+
+        if (params.kv_memory) {
+            bench_kv_memory_transient_stats stats = {};
+            kv_memory_transient_stats_get(&stats);
+            t.kv_descriptor_bytes = stats.kvarn_descriptor_bytes;
+            t.kv_partial_output_bytes = stats.kvarn_partial_output_bytes;
+            t.kv_partial_meta_bytes = stats.kvarn_partial_meta_bytes;
+            t.kv_tail_body_meta_bytes = stats.tail_body_meta_bytes;
+            t.kv_tail_exact_meta_bytes = stats.tail_exact_meta_bytes;
+            t.kv_tail_pack_bytes = stats.tail_pack_bytes;
+            t.kv_tail_body_output_bytes = stats.tail_body_output_bytes;
+            t.kv_tail_exact_output_bytes = stats.tail_exact_output_bytes;
+            t.kv_tail_plan_input_bytes = stats.tail_plan_input_bytes;
+            t.kv_transient_bytes = stats.kvarn_total_bytes + stats.tail_total_bytes;
+            t.kv_peak_bytes = t.kv_resident_bytes + t.kv_transient_bytes;
+            t.cuda_peak_delta_bytes = int64_t(t.cuda_used_peak_bytes) - int64_t(t.cuda_used_model_bytes);
+            t.cuda_reconciliation_delta_bytes = t.cuda_peak_delta_bytes -
+                    int64_t(t.kv_resident_bytes + t.kv_transient_bytes + t.cuda_compute_buffer_bytes);
+
+            llama_perf_context_print(ctx);
+            llama_free(ctx);
+            ctx = nullptr;
+
+            uint64_t cuda_free_after = 0;
+            uint64_t cuda_total_after = 0;
+            if (!cuda_memory_checkpoint(inst.main_gpu, &t.cuda_used_after_context_bytes,
+                    &cuda_free_after, &cuda_total_after)) {
+                fprintf(stderr, "%s: error: failed to capture the synchronized post-teardown CUDA checkpoint\n", __func__);
+                llama_model_free(lmodel);
+                return 1;
+            }
+            t.cuda_teardown_delta_bytes = int64_t(t.cuda_used_after_context_bytes) -
+                    int64_t(t.cuda_used_model_bytes);
         }
 
         if (p) {
@@ -2662,9 +2960,10 @@ int llama_bench(int argc, char ** argv) {
             fflush(p_err->fout);
         }
 
-        llama_perf_context_print(ctx);
-
-        llama_free(ctx);
+        if (ctx != nullptr) {
+            llama_perf_context_print(ctx);
+            llama_free(ctx);
+        }
 
         ggml_threadpool_free_fn(threadpool);
     }

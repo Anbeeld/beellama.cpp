@@ -15,6 +15,7 @@
 #include <map>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_set>
 #include <vector>
 
 static bool ggml_is_power_of_2(int n) {
@@ -1319,6 +1320,42 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
     }
 
     return res;
+}
+
+llama_kv_memory_stats llama_kv_cache::kv_memory_stats() const {
+    llama_kv_memory_stats result;
+    llama_kv_memory_component_stats & component = n_swa > 0 ? result.swa : result.global;
+
+    std::unordered_set<const ggml_tensor *> seen;
+    const auto account = [&seen](const ggml_tensor * tensor, uint64_t & total) {
+        if (tensor != nullptr && seen.insert(tensor).second) {
+            total += ggml_nbytes(tensor);
+        }
+    };
+    const auto account_payload = [&account](const ggml_tensor * tensor, uint64_t & payload, uint64_t & native_exact) {
+        if (tensor != nullptr && (tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_BF16)) {
+            account(tensor, native_exact);
+        } else {
+            account(tensor, payload);
+        }
+    };
+    for (const auto & layer : layers) {
+        account_payload(layer.k, component.k_payload_bytes, component.native_exact_bytes);
+        account_payload(layer.v, component.v_payload_bytes, component.native_exact_bytes);
+        account(layer.k_tail, component.exact_tail_bytes);
+        account(layer.v_tail, component.exact_tail_bytes);
+    }
+
+    uint64_t allocated = 0;
+    for (const auto & [buft, size] : memory_breakdown()) {
+        GGML_UNUSED(buft);
+        allocated += size;
+    }
+    const uint64_t accounted = component.k_payload_bytes + component.v_payload_bytes +
+            component.exact_tail_bytes + component.native_exact_bytes;
+    component.padding_bytes = allocated > accounted ? allocated - accounted : 0;
+    component.allocated_capacity_tokens = get_size();
+    return result;
 }
 
 bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info) {

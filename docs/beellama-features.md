@@ -47,6 +47,60 @@ as the intended workload. Keep both `-b` and `-ub` identical between baseline
 and candidate runs. Record the model file, command, prompt or corpus, sampling
 settings, GPU, and commit with every result.
 
+The CUDA specialized split and SWA-vector decode routes publish the same
+optional FP32 `(maximum, denominator)` metadata as upstream FlashAttention.
+An attached exact tail therefore does not force KVarN through the generic MMA
+fallback. `llama-bench` reports requested and effective tail sizes plus split,
+vector, generic, and prefill route counts so this remains observable.
+
+The July 2026 RTX 3090 / CUDA 13.1 recovery run used the Qwen 3.6 27B Q5_K_S
+and Gemma 4 31B Q5_K_S models, `-b 2048 -ub 512`, 128 decode tokens, and five
+repetitions in the canonical 56-row matrix. Ratios below use each run's matched
+BF16 median at the same depth:
+
+| Model | Context | KVarN4 request 0 / effective 128 | KVarN4 request 1024 | 1024 versus default |
+|---|---:|---:|---:|---:|
+| Qwen 3.6 27B | 16K | 0.983x | 0.971x | 0.988x |
+| Qwen 3.6 27B | 32K | 1.060x | 1.048x | 0.989x |
+| Qwen 3.6 27B | 64K | 1.176x | 1.168x | 0.993x |
+| Gemma 4 31B | 16K | 0.839x | 1.116x | 1.330x |
+
+No accepted KVarN row used generic MMA fallback. Qwen used split decode;
+Gemma request-zero exercised both D512 split and D256 SWA-vector decode. A
+requested 1024-token tail promotes Gemma's fully covered SWA group to native
+exact storage, explaining why that row can be faster than its request-zero
+mixed compressed/exact route.
+
+`llama-bench --kv-memory` enables synchronized CUDA checkpoints and cache-owned
+component accounting. It is intentionally opt-in and excluded from speed runs.
+The corresponding 18-row measurement found:
+
+| Model / context | Request | Q4_0 KV-related peak | KVarN4 KV-related peak | KVarN4 difference |
+|---|---:|---:|---:|---:|
+| Qwen 16K | 0 | 292.50 MiB | 395.21 MiB | +35.1% |
+| Qwen 16K | 1024 | 503.70 MiB | 447.71 MiB | -11.1% |
+| Qwen 64K | 0 | 1156.50 MiB | 1253.35 MiB | +8.4% |
+| Qwen 64K | 1024 | 1559.70 MiB | 1305.85 MiB | -16.3% |
+| Gemma 16K | 0 | 703.12 MiB | 1683.66 MiB | +139.4% |
+| Gemma 16K | 1024 | 1936.89 MiB | 1823.04 MiB | -5.9% |
+
+Request-zero is an explicit architectural tradeoff rather than a hidden
+regression: KVarN must retain its intrinsic F16 suffix and compression staging,
+while Q4_0 request-zero has neither an exact overlay nor tail-merge scratch.
+Removing those KVarN allocations merely to beat Q4_0 would violate the quality
+and exact-tail contract. At matched 1024/2048 requests KVarN retains a peak
+advantage because its tail-attention transient high-water is smaller. From
+Qwen 16K to 64K, exact and staging residency stay constant, compressed K and V
+each grow by 420 MiB, and transient high-water grows by only 18.14 MiB; no
+full-context exact mirror or unexpected context-sized metadata was found.
+
+Native-exact promotion is reported separately from compact exact-overlay bytes.
+CUDA allocation remainders are also reported with their sign: positive values
+are non-KV scheduler/graph/backend reservations, while negative values denote
+allocator reuse/overlap or driver-baseline release rather than negative cache
+ownership. Repeated grouped contexts showed only bounded first-use CUDA
+reservation and zero cumulative per-context growth.
+
 ### Known limitations
 
 KVarN is target-context-only and v0.4.0 enables native placement only on a CUDA

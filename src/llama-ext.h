@@ -5,6 +5,7 @@
 // try as much as possible to not include this header in the rest of the codebase
 
 #include "llama.h"
+#include "llama-kv-memory-stats.h"
 
 #include <cstdint>
 #include <map>
@@ -89,6 +90,7 @@ LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
+LLAMA_API llama_kv_memory_stats llama_get_kv_memory_stats(const struct llama_context * ctx);
 
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0

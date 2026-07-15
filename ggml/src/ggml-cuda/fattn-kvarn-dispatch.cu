@@ -1,4 +1,5 @@
 #include "fattn-kvarn-dispatch.cuh"
+#include "fattn-kvarn-route-policy.h"
 
 #include "fattn-common.cuh"
 #include "fattn-kvarn-vec-decl.cuh"
@@ -8,6 +9,117 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
+
+static std::atomic<uint64_t> g_kvarn_route_decode_split{0};
+static std::atomic<uint64_t> g_kvarn_route_decode_vector{0};
+static std::atomic<uint64_t> g_kvarn_route_generic_mma{0};
+static std::atomic<uint64_t> g_kvarn_route_prompt_prefill{0};
+
+static std::atomic<uint64_t> g_kv_mem_kvarn_descriptor{0};
+static std::atomic<uint64_t> g_kv_mem_kvarn_partial_output{0};
+static std::atomic<uint64_t> g_kv_mem_kvarn_partial_meta{0};
+static std::atomic<uint64_t> g_kv_mem_kvarn_total{0};
+static std::atomic<uint64_t> g_kv_mem_tail_body_meta{0};
+static std::atomic<uint64_t> g_kv_mem_tail_exact_meta{0};
+static std::atomic<uint64_t> g_kv_mem_tail_pack{0};
+static std::atomic<uint64_t> g_kv_mem_tail_body_output{0};
+static std::atomic<uint64_t> g_kv_mem_tail_exact_output{0};
+static std::atomic<uint64_t> g_kv_mem_tail_plan_input{0};
+static std::atomic<uint64_t> g_kv_mem_tail_total{0};
+static std::atomic<bool> g_kv_mem_stats_enabled{false};
+
+static void ggml_cuda_atomic_max(std::atomic<uint64_t> & dst, uint64_t value) {
+    uint64_t current = dst.load(std::memory_order_relaxed);
+    while (current < value && !dst.compare_exchange_weak(
+            current, value, std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
+}
+
+void ggml_cuda_fattn_kvarn_route_stats_reset() {
+    g_kvarn_route_decode_split.store(0, std::memory_order_relaxed);
+    g_kvarn_route_decode_vector.store(0, std::memory_order_relaxed);
+    g_kvarn_route_generic_mma.store(0, std::memory_order_relaxed);
+    g_kvarn_route_prompt_prefill.store(0, std::memory_order_relaxed);
+}
+
+void ggml_cuda_fattn_kvarn_route_stats_get(ggml_cuda_fattn_kvarn_route_stats * stats) {
+    if (stats == nullptr) {
+        return;
+    }
+    stats->decode_split = g_kvarn_route_decode_split.load(std::memory_order_relaxed);
+    stats->decode_vector = g_kvarn_route_decode_vector.load(std::memory_order_relaxed);
+    stats->generic_mma = g_kvarn_route_generic_mma.load(std::memory_order_relaxed);
+    stats->prompt_prefill = g_kvarn_route_prompt_prefill.load(std::memory_order_relaxed);
+}
+
+void ggml_cuda_kv_memory_transient_stats_reset() {
+    g_kv_mem_stats_enabled.store(false, std::memory_order_relaxed);
+    g_kv_mem_kvarn_descriptor.store(0, std::memory_order_relaxed);
+    g_kv_mem_kvarn_partial_output.store(0, std::memory_order_relaxed);
+    g_kv_mem_kvarn_partial_meta.store(0, std::memory_order_relaxed);
+    g_kv_mem_kvarn_total.store(0, std::memory_order_relaxed);
+    g_kv_mem_tail_body_meta.store(0, std::memory_order_relaxed);
+    g_kv_mem_tail_exact_meta.store(0, std::memory_order_relaxed);
+    g_kv_mem_tail_pack.store(0, std::memory_order_relaxed);
+    g_kv_mem_tail_body_output.store(0, std::memory_order_relaxed);
+    g_kv_mem_tail_exact_output.store(0, std::memory_order_relaxed);
+    g_kv_mem_tail_plan_input.store(0, std::memory_order_relaxed);
+    g_kv_mem_tail_total.store(0, std::memory_order_relaxed);
+    g_kv_mem_stats_enabled.store(true, std::memory_order_release);
+}
+
+void ggml_cuda_kv_memory_transient_stats_get(ggml_cuda_kv_memory_transient_stats * stats) {
+    g_kv_mem_stats_enabled.store(false, std::memory_order_release);
+    if (stats == nullptr) {
+        return;
+    }
+    stats->kvarn_descriptor_bytes = g_kv_mem_kvarn_descriptor.load(std::memory_order_relaxed);
+    stats->kvarn_partial_output_bytes = g_kv_mem_kvarn_partial_output.load(std::memory_order_relaxed);
+    stats->kvarn_partial_meta_bytes = g_kv_mem_kvarn_partial_meta.load(std::memory_order_relaxed);
+    stats->kvarn_total_bytes = g_kv_mem_kvarn_total.load(std::memory_order_relaxed);
+    stats->tail_body_meta_bytes = g_kv_mem_tail_body_meta.load(std::memory_order_relaxed);
+    stats->tail_exact_meta_bytes = g_kv_mem_tail_exact_meta.load(std::memory_order_relaxed);
+    stats->tail_pack_bytes = g_kv_mem_tail_pack.load(std::memory_order_relaxed);
+    stats->tail_body_output_bytes = g_kv_mem_tail_body_output.load(std::memory_order_relaxed);
+    stats->tail_exact_output_bytes = g_kv_mem_tail_exact_output.load(std::memory_order_relaxed);
+    stats->tail_plan_input_bytes = g_kv_mem_tail_plan_input.load(std::memory_order_relaxed);
+    stats->tail_total_bytes = g_kv_mem_tail_total.load(std::memory_order_relaxed);
+}
+
+void ggml_cuda_kv_memory_transient_stats_record_kvarn(
+        uint64_t descriptor_bytes,
+        uint64_t partial_output_bytes,
+        uint64_t partial_meta_bytes,
+        uint64_t total_bytes) {
+    if (!g_kv_mem_stats_enabled.load(std::memory_order_acquire)) {
+        return;
+    }
+    ggml_cuda_atomic_max(g_kv_mem_kvarn_descriptor, descriptor_bytes);
+    ggml_cuda_atomic_max(g_kv_mem_kvarn_partial_output, partial_output_bytes);
+    ggml_cuda_atomic_max(g_kv_mem_kvarn_partial_meta, partial_meta_bytes);
+    ggml_cuda_atomic_max(g_kv_mem_kvarn_total, total_bytes);
+}
+
+void ggml_cuda_kv_memory_transient_stats_record_tail(
+        uint64_t body_meta_bytes,
+        uint64_t exact_meta_bytes,
+        uint64_t pack_bytes,
+        uint64_t body_output_bytes,
+        uint64_t exact_output_bytes,
+        uint64_t plan_input_bytes,
+        uint64_t total_bytes) {
+    if (!g_kv_mem_stats_enabled.load(std::memory_order_acquire)) {
+        return;
+    }
+    ggml_cuda_atomic_max(g_kv_mem_tail_body_meta, body_meta_bytes);
+    ggml_cuda_atomic_max(g_kv_mem_tail_exact_meta, exact_meta_bytes);
+    ggml_cuda_atomic_max(g_kv_mem_tail_pack, pack_bytes);
+    ggml_cuda_atomic_max(g_kv_mem_tail_body_output, body_output_bytes);
+    ggml_cuda_atomic_max(g_kv_mem_tail_exact_output, exact_output_bytes);
+    ggml_cuda_atomic_max(g_kv_mem_tail_plan_input, plan_input_bytes);
+    ggml_cuda_atomic_max(g_kv_mem_tail_total, total_bytes);
+}
 
 #if !defined(GGML_CUDA_KVARN_FA)
 
@@ -349,6 +461,11 @@ static bool ggml_cuda_flash_attn_ext_kvarn_vec_d(
     const size_t meta_count = (size_t) plan.n_stream * n_q_heads * n_splits;
     ggml_cuda_pool_alloc<float> partial(pool, partial_count);
     ggml_cuda_pool_alloc<float2> partial_meta(pool, meta_count);
+    ggml_cuda_kv_memory_transient_stats_record_kvarn(
+            k_desc.actual_size + v_desc.actual_size,
+            partial.actual_size,
+            partial_meta.actual_size,
+            k_desc.actual_size + v_desc.actual_size + partial.actual_size + partial_meta.actual_size);
 
     if (getenv("GGML_CUDA_FA_ROUTE_DEBUG") != nullptr) {
         fprintf(stderr,
@@ -370,6 +487,7 @@ static bool ggml_cuda_flash_attn_ext_kvarn_vec_d(
     args.partial = partial.get();
     args.partial_meta = partial_meta.get();
     args.dst = (float *) dst->data;
+    args.dst_meta = dst->src[8] != nullptr ? (float2 *) dst->src[8]->data : nullptr;
     args.scale = scale;
     args.logit_softcap = logit_softcap;
     args.nb01 = Q->nb[1];
@@ -490,6 +608,11 @@ static bool ggml_cuda_flash_attn_ext_kvarn_decode_d(
     const size_t meta_count = (size_t) plan.n_stream * n_q_heads * n_q * n_splits;
     ggml_cuda_pool_alloc<float> partial(pool, partial_count);
     ggml_cuda_pool_alloc<float2> partial_meta(pool, meta_count);
+    ggml_cuda_kv_memory_transient_stats_record_kvarn(
+            k_desc.actual_size + v_desc.actual_size,
+            partial.actual_size,
+            partial_meta.actual_size,
+            k_desc.actual_size + v_desc.actual_size + partial.actual_size + partial_meta.actual_size);
 
     if (getenv("GGML_CUDA_FA_ROUTE_DEBUG") != nullptr) {
         fprintf(stderr,
@@ -512,6 +635,7 @@ static bool ggml_cuda_flash_attn_ext_kvarn_decode_d(
     args.partial = partial.get();
     args.partial_meta = partial_meta.get();
     args.dst = (float *) dst->data;
+    args.dst_meta = dst->src[8] != nullptr ? (float2 *) dst->src[8]->data : nullptr;
     args.scale = scale;
     args.logit_softcap = logit_softcap;
     args.nb01 = Q->nb[1];
@@ -667,18 +791,37 @@ bool ggml_cuda_flash_attn_ext_kvarn(
         return false;
     }
 
-    // Exact-tail attention needs the body's max/rowsum metadata. The MMA
-    // split/combine path already produces it; the decode-specialized kernels
-    // intentionally keep their lean output-only ABI.
-    if (dst->src[8] == nullptr) {
+    const ggml_tensor * Q = dst->src[0];
+    const bool prompt_prefill = Q->ne[1] > 8;
+    const bool vector_eligible = !prompt_prefill && ggml_cuda_flash_attn_ext_kvarn_vec_supported(plan, dst);
+    const bool split_eligible = !prompt_prefill && ggml_cuda_flash_attn_ext_kvarn_decode_supported(plan, dst);
+    const int gqa = plan.n_kv_heads > 0 && Q->ne[2] % plan.n_kv_heads == 0 ?
+        int(Q->ne[2] / plan.n_kv_heads) : 0;
+    const ggml_cuda_fattn_kvarn_route route = ggml_cuda_fattn_kvarn_select_route({
+        int(Q->ne[0]), int(Q->ne[1]), gqa, plan.k.bits, plan.v.bits,
+        plan.k.swa && plan.v.swa, dst->src[8] != nullptr,
+        vector_eligible, split_eligible, prompt_prefill,
+    });
+
+    if (route == GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_VECTOR) {
         if (ggml_cuda_flash_attn_ext_kvarn_vec(ctx, dst, plan)) {
+            g_kvarn_route_decode_vector.fetch_add(1, std::memory_order_relaxed);
             return true;
         }
+    }
+    if (route == GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_SPLIT ||
+            route == GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_VECTOR) {
         if (ggml_cuda_flash_attn_ext_kvarn_decode(ctx, dst, plan)) {
+            g_kvarn_route_decode_split.fetch_add(1, std::memory_order_relaxed);
             return true;
         }
     }
 
+    if (prompt_prefill) {
+        g_kvarn_route_prompt_prefill.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        g_kvarn_route_generic_mma.fetch_add(1, std::memory_order_relaxed);
+    }
     ggml_cuda_flash_attn_ext_mma_kvarn(ctx, dst);
     return true;
 }
