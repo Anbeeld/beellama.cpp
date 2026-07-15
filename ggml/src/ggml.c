@@ -5464,32 +5464,6 @@ struct ggml_tensor * ggml_arange(
 
 // ggml_flash_attn_ext
 
-static struct ggml_tensor * ggml_kvarn_view_base(struct ggml_tensor * tensor) {
-    while (tensor != NULL && (tensor->op == GGML_OP_PERMUTE || tensor->op == GGML_OP_RESHAPE)) {
-        tensor = tensor->src[0];
-    }
-    return tensor != NULL && tensor->op == GGML_OP_KVARN_VIEW ? tensor : NULL;
-}
-
-static void ggml_flash_attn_ext_add_kvarn_deps(
-        struct ggml_tensor * result,
-        struct ggml_tensor * k,
-        struct ggml_tensor * v) {
-    struct ggml_tensor * k_view = ggml_kvarn_view_base(k);
-    struct ggml_tensor * v_view = ggml_kvarn_view_base(v);
-    if (k_view == NULL && v_view == NULL) {
-        return;
-    }
-
-    GGML_ASSERT(k_view != NULL && v_view != NULL);
-    // Keep record/stage dependencies alive even though the FA inputs are
-    // reshaped views.  Native backends consume these through the extra slots.
-    result->src[5] = k_view->src[1];
-    result->src[6] = k_view->src[2];
-    result->src[7] = v_view->src[1];
-    result->src[8] = v_view->src[2];
-}
-
 struct ggml_tensor * ggml_flash_attn_ext(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
@@ -5530,8 +5504,6 @@ struct ggml_tensor * ggml_flash_attn_ext(
     result->src[1] = k;
     result->src[2] = v;
     result->src[3] = mask;
-    ggml_flash_attn_ext_add_kvarn_deps(result, k, v);
-
     return result;
 }
 
@@ -6444,11 +6416,11 @@ struct ggml_tensor * ggml_kvarn_wht(
         struct ggml_tensor  * a,
         int                   head_width) {
     GGML_ASSERT(ggml_is_contiguous(a));
-    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16 || a->type == GGML_TYPE_BF16);
     GGML_ASSERT(head_width == 128 || head_width == 256 || head_width == 512);
     GGML_ASSERT(ggml_nelements(a) % head_width == 0);
 
-    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, a->ne);
+    struct ggml_tensor * result = ggml_new_tensor(ctx, a->type, 4, a->ne);
 
     result->op = GGML_OP_KVARN_WHT;
     result->src[0] = a;
@@ -6473,6 +6445,7 @@ enum {
     GGML_KVARN_OP_PARAM_HEAD_SLICES       = 5,
     GGML_KVARN_OP_PARAM_STAGE_GROUPS      = 7,
     GGML_KVARN_OP_PARAM_TAIL_GROUPS       = 8,
+    GGML_KVARN_OP_PARAM_EAGER_RECORDS     = 9,
 };
 
 struct ggml_tensor * ggml_kvarn_store(
@@ -6515,6 +6488,7 @@ struct ggml_tensor * ggml_kvarn_store(
     ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_HEAD_SLICES, 1);
     ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_STAGE_GROUPS, stage_groups);
     ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_TAIL_GROUPS, stage_groups - 1);
+    ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_EAGER_RECORDS, 0);
     return result;
 }
 
@@ -6561,6 +6535,8 @@ struct ggml_tensor * ggml_kvarn_view(
         tail_groups = stage_groups - 1;
     }
     ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_TAIL_GROUPS, tail_groups);
+    ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_EAGER_RECORDS,
+            ggml_get_op_params_i32(stage_after_store, GGML_KVARN_OP_PARAM_EAGER_RECORDS));
     return result;
 }
 

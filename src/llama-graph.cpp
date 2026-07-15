@@ -2707,7 +2707,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * kq_b_tail,
          ggml_tensor * tail_read_idxs,
          ggml_tensor * tail_query_order,
-         ggml_tensor * tail_run_desc) const {
+         ggml_tensor * tail_run_desc,
+         enum ggml_flash_attn_ext_kvarn_domain kvarn_domain) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2755,6 +2756,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+        if (kvarn_domain != GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO) {
+            cur->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN] = (int32_t) kvarn_domain;
+        }
         if (use_native_tail) {
             GGML_ASSERT(tail_query_order && tail_run_desc);
             cur = ggml_kv_tail_attention_merge(
@@ -3157,10 +3161,8 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // The SET_ROWS results alias the complete persistent shadow tensors and
     // carry the write dependency needed by same-graph attention reads.
-    ggml_tensor * k_tail = use_kvarn ? nullptr :
-            (k_tail_written ? k_tail_written : mctx_cur->get_k_tail(ctx0, il));
-    ggml_tensor * v_tail = use_kvarn ? nullptr :
-            (v_tail_written ? v_tail_written : mctx_cur->get_v_tail(ctx0, il));
+    ggml_tensor * k_tail = k_tail_written ? k_tail_written : mctx_cur->get_k_tail(ctx0, il);
+    ggml_tensor * v_tail = v_tail_written ? v_tail_written : mctx_cur->get_v_tail(ctx0, il);
     const bool gather_k_tail = k_tail != nullptr;
     const bool gather_v_tail = v_tail != nullptr;
     ggml_tensor * tail_read_idxs = inp->get_tail_read_idxs();
@@ -3194,13 +3196,21 @@ ggml_tensor * llm_graph_context::build_attn(
             v_tail = gather_tail(v_tail);
         }
     }
+    if (use_kvarn && k_tail) {
+        GGML_ASSERT(v_tail && kvarn_rot);
+        k_tail = ggml_kvarn_wht_aux(ctx0, k_tail, kvarn_rot->ne[0]);
+        if (use_kvarn_rotated_domain) {
+            v_tail = ggml_kvarn_wht_aux(ctx0, v_tail, kvarn_rot->ne[0]);
+        }
+    }
     ggml_tensor * kq_b_tail = build_attn_bias_tail(
             kq_b, inp->get_tail_bias_read_idxs(), inp->get_kq_mask_tail());
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il,
             k_tail, v_tail, inp->get_kq_mask_tail(), kq_b_tail,
             use_indexed_tail ? tail_read_idxs : nullptr,
-            use_indexed_tail ? inp->get_tail_query_order() : nullptr,
-            use_indexed_tail ? inp->get_tail_run_desc() : nullptr);
+            (use_indexed_tail || use_kvarn) ? inp->get_tail_query_order() : nullptr,
+            (use_indexed_tail || use_kvarn) ? inp->get_tail_run_desc() : nullptr,
+            kvarn_domain);
     if (use_kvarn) {
         llm_flash_attn_ext_set_kvarn_domain(cur, kvarn_domain);
     }
@@ -3509,10 +3519,8 @@ ggml_tensor * llm_graph_context::build_attn(
         q = ggml_kvarn_wht_aux(ctx0, q, kvarn_rot->ne[0]);
     }
 
-    ggml_tensor * k_tail = use_kvarn ? nullptr :
-            (k_tail_written ? k_tail_written : mctx_cur->get_k_tail(ctx0, il));
-    ggml_tensor * v_tail = use_kvarn ? nullptr :
-            (v_tail_written ? v_tail_written : mctx_cur->get_v_tail(ctx0, il));
+    ggml_tensor * k_tail = k_tail_written ? k_tail_written : mctx_cur->get_k_tail(ctx0, il);
+    ggml_tensor * v_tail = v_tail_written ? v_tail_written : mctx_cur->get_v_tail(ctx0, il);
     const bool gather_k_tail = k_tail != nullptr;
     const bool gather_v_tail = v_tail != nullptr;
     ggml_tensor * tail_read_idxs = inp->get_tail_read_idxs(is_swa);
@@ -3546,13 +3554,21 @@ ggml_tensor * llm_graph_context::build_attn(
             v_tail = gather_tail(v_tail);
         }
     }
+    if (use_kvarn && k_tail) {
+        GGML_ASSERT(v_tail && kvarn_rot);
+        k_tail = ggml_kvarn_wht_aux(ctx0, k_tail, kvarn_rot->ne[0]);
+        if (use_kvarn_rotated_domain) {
+            v_tail = ggml_kvarn_wht_aux(ctx0, v_tail, kvarn_rot->ne[0]);
+        }
+    }
     ggml_tensor * kq_b_tail = build_attn_bias_tail(
             kq_b, inp->get_tail_bias_read_idxs(is_swa), inp->get_kq_mask_tail(is_swa));
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il,
             k_tail, v_tail, inp->get_kq_mask_tail(is_swa), kq_b_tail,
             use_indexed_tail ? tail_read_idxs : nullptr,
-            use_indexed_tail ? inp->get_tail_query_order() : nullptr,
-            use_indexed_tail ? inp->get_tail_run_desc(is_swa) : nullptr);
+            (use_indexed_tail || use_kvarn) ? inp->get_tail_query_order() : nullptr,
+            (use_indexed_tail || use_kvarn) ? inp->get_tail_run_desc(is_swa) : nullptr,
+            kvarn_domain);
     if (use_kvarn) {
         llm_flash_attn_ext_set_kvarn_domain(cur, kvarn_domain);
     }

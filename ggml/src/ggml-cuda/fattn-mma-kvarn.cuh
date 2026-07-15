@@ -17,6 +17,7 @@ enum {
     GGML_CUDA_FATTN_KVARN_OP_PARAM_VIEW_SWA          = 6,
     GGML_CUDA_FATTN_KVARN_OP_PARAM_STAGE_GROUPS      = 7,
     GGML_CUDA_FATTN_KVARN_OP_PARAM_TAIL_GROUPS       = 8,
+    GGML_CUDA_FATTN_KVARN_OP_PARAM_EAGER_RECORDS     = 9,
 };
 
 struct ggml_cuda_fattn_kvarn_desc {
@@ -25,6 +26,7 @@ struct ggml_cuda_fattn_kvarn_desc {
     const int64_t * indices;
     int n_record_heads;
     int live_group;
+    int live_pos;
     int stream;
     int head_base;
     int groups_per_stream;
@@ -35,20 +37,58 @@ struct ggml_cuda_fattn_kvarn_desc {
     int value;
     int swa;
     int head_slices;
+    int eager_records;
     // Large prefill can reconstruct one side in the original domain in the MMA tile loader.
     // Decode-width paths keep rotated-domain K/V and rotate Q/output in the graph.
     int original_domain;
 };
 
+static __device__ __forceinline__ bool ggml_cuda_fattn_kvarn_group_from_stage(
+        const ggml_cuda_fattn_kvarn_desc & desc,
+        const int group) {
+    if (desc.eager_records) {
+        if (!desc.swa && group == 0) {
+            return true;
+        }
+        return group == desc.live_group && desc.live_pos < GGML_CUDA_FATTN_KVARN_DIM - 1;
+    }
+    if (desc.swa) {
+        const int stage_begin = desc.live_group >= (desc.tail_groups - 1) ?
+            desc.live_group - (desc.tail_groups - 1) : 0;
+        return group >= stage_begin && group <= desc.live_group;
+    }
+    return group == 0 ||
+        (group > 0 && group <= desc.live_group && group + (desc.tail_groups - 1) >= desc.live_group);
+}
+
+static __device__ __forceinline__ bool ggml_cuda_fattn_kvarn_group_from_record(
+        const ggml_cuda_fattn_kvarn_desc & desc,
+        const int group) {
+    if (group < 0 || ggml_cuda_fattn_kvarn_group_from_stage(desc, group)) {
+        return false;
+    }
+    if (desc.eager_records) {
+        const bool completed = group < desc.live_group ||
+            (group == desc.live_group && desc.live_pos == GGML_CUDA_FATTN_KVARN_DIM - 1);
+        if (!completed) {
+            return false;
+        }
+        return desc.swa ? desc.live_group - group < desc.groups_per_stream :
+            group > 0 && group < desc.groups_per_stream;
+    }
+    if (desc.swa) {
+        const int distance = desc.live_group - group;
+        return distance >= desc.tail_groups && distance < desc.groups_per_stream + desc.tail_groups;
+    }
+    return group < desc.live_group && group < desc.groups_per_stream;
+}
+
 static __device__ __forceinline__ bool ggml_cuda_fattn_kvarn_swa_group_from_record(
         const ggml_cuda_fattn_kvarn_desc & desc,
         const int group,
         const int stage_begin) {
-    if (group < 0 || group >= stage_begin) {
-        return false;
-    }
-    const int distance = desc.live_group - group;
-    return distance >= desc.tail_groups && distance < desc.groups_per_stream + desc.tail_groups;
+    GGML_UNUSED(stage_begin);
+    return desc.swa && ggml_cuda_fattn_kvarn_group_from_record(desc, group);
 }
 
 struct ggml_cuda_fattn_kvarn_plan_side {
@@ -65,6 +105,7 @@ struct ggml_cuda_fattn_kvarn_plan_side {
     int head_slices   = 1;
     bool value        = false;
     bool swa          = false;
+    bool eager_records = false;
 };
 
 struct ggml_cuda_fattn_kvarn_plan {
@@ -154,6 +195,7 @@ static inline bool ggml_cuda_fattn_kvarn_unwrap_view(
     side.stream_start = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_VIEW_STREAM_START);
     side.n_stream = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_VIEW_N_STREAM);
     side.swa = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_VIEW_SWA) != 0;
+    side.eager_records = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_EAGER_RECORDS) != 0;
     const int head_slices_param = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_HEAD_SLICES);
     side.head_slices = head_slices_param > 0 ? head_slices_param : 1;
     side.stage_groups = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_STAGE_GROUPS);

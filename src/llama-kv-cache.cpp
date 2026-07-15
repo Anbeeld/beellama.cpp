@@ -120,12 +120,13 @@ llama_kv_cache::llama_kv_cache(
            llama_swa_type   swa_type,
            llama_memory_t   mem_other,
     const layer_filter_cb & filter,
-    const  layer_reuse_cb & reuse,
-    const  layer_share_cb & share,
+        const  layer_reuse_cb & reuse,
+        const  layer_share_cb & share,
                  uint32_t   n_ubatch,
                  uint32_t   tail_tokens,
                 ggml_type   tail_type,
-                 uint32_t   tail_tokens_requested) :
+                 uint32_t   tail_tokens_requested,
+                     bool   tail_metadata_only) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa),
     tail_tokens(tail_tokens), tail_type(tail_type), swa_type(swa_type),
@@ -284,6 +285,32 @@ llama_kv_cache::llama_kv_cache(
         shadow_k_capable,
         shadow_v_capable,
     });
+
+    if (tail_metadata_only && tail_tokens > 0) {
+        // A metadata-only cache owns cells, generations, and source selection,
+        // while its caller owns the exact payload tensors. Keep this generic so
+        // every structured cache can reuse the same logical tail machinery.
+        tail_plan = llama_kv_tail_storage_plan_for({
+            type_k,
+            type_v,
+            tail_type,
+            tail_tokens_requested,
+            tail_tokens,
+            n_seq_max,
+            n_ubatch,
+            visibility_window,
+            uint64_t(kv_size)*n_stream,
+            1,
+            0,
+            1,
+            false,
+            false,
+            true,
+            false,
+            true,
+            true,
+        });
+    }
 
     if (tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY) {
         tail_arena_stride = tail_plan.layout.arena_stride;
@@ -3253,6 +3280,47 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
 
 }
 
+std::vector<int32_t> llama_kv_cache::state_tail_payload_slots(llama_seq_id seq_id) const {
+    GGML_ASSERT(tail);
+
+    std::vector<int32_t> result;
+    std::unordered_map<int32_t, uint32_t> payload_by_slot;
+    for (const auto & entry : tail->snapshot(seq_id)) {
+        if (entry.identity.stream >= v_cells.size()) {
+            continue;
+        }
+        const auto & cells = v_cells[entry.identity.stream];
+        bool found = false;
+        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+            bool included = !cells.is_empty(cell) && (seq_id == -1 || cells.seq_has(cell, seq_id));
+            if (included && seq_id != -1) {
+                included = !llama_hparams::is_masked_swa(
+                        n_swa, swa_type, cells.pos_get(cell), cells.seq_pos_max(seq_id));
+            }
+            if (!included) {
+                continue;
+            }
+            if (cell == entry.identity.cell) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            continue;
+        }
+        if (payload_by_slot.emplace(entry.slot, uint32_t(result.size())).second) {
+            result.push_back(entry.slot);
+        }
+    }
+    return result;
+}
+
+std::vector<std::vector<int32_t>> llama_kv_cache::take_restored_tail_payload_slots() {
+    std::vector<std::vector<int32_t>> result;
+    result.swap(restored_tail_payload_slots);
+    return result;
+}
+
 void llama_kv_cache::state_write_tail(llama_io_write_i & io, llama_seq_id seq_id) const {
     GGML_ASSERT(tail);
 
@@ -3267,8 +3335,11 @@ void llama_kv_cache::state_write_tail(llama_io_write_i & io, llama_seq_id seq_id
     };
 
     std::vector<record> records;
-    std::vector<int32_t> payload_slots;
+    std::vector<int32_t> payload_slots = state_tail_payload_slots(seq_id);
     std::unordered_map<int32_t, uint32_t> payload_by_slot;
+    for (uint32_t payload = 0; payload < payload_slots.size(); ++payload) {
+        payload_by_slot.emplace(payload_slots[payload], payload);
+    }
 
     for (const auto & entry : tail->snapshot(seq_id)) {
         if (entry.identity.stream >= v_cells.size()) {
@@ -3296,10 +3367,8 @@ void llama_kv_cache::state_write_tail(llama_io_write_i & io, llama_seq_id seq_id
             continue;
         }
 
-        auto [it, inserted] = payload_by_slot.emplace(entry.slot, uint32_t(payload_slots.size()));
-        if (inserted) {
-            payload_slots.push_back(entry.slot);
-        }
+        const auto it = payload_by_slot.find(entry.slot);
+        GGML_ASSERT(it != payload_by_slot.end());
         records.push_back({ entry.seq_id, entry.identity.stream, ordinal, entry.identity.generation,
                 entry.position, entry.insertion_ordinal, it->second });
     }
@@ -3387,6 +3456,7 @@ void llama_kv_cache::state_read_tail(
     } else {
         tail->seq_rm(seq_id, -1, -1);
     }
+    restored_tail_payload_slots.clear();
     std::vector<std::vector<int32_t>> slots(n_payload);
     for (const auto & record : records) {
         if (record.stream >= restored_cells.size() ||
@@ -3443,6 +3513,7 @@ void llama_kv_cache::state_read_tail(
             }
         }
     }
+    restored_tail_payload_slots = std::move(slots);
 }
 
 bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id) {
@@ -3914,6 +3985,13 @@ uint32_t llama_kv_cache::get_tail_attention_stride(uint32_t n_query_tokens) cons
         return uint32_t(required);
     }
     return uint32_t((required + fa_tile - 1)/fa_tile*fa_tile);
+}
+
+llama_kv_cache::stream_copy_info llama_kv_cache::take_pending_tail_copies() {
+    stream_copy_info result;
+    result.tail_src_slots.swap(sc_info.tail_src_slots);
+    result.tail_dst_slots.swap(sc_info.tail_dst_slots);
+    return result;
 }
 
 uint32_t llama_kv_cache_context::get_tail_attention_stride(uint32_t n_query_tokens) const {

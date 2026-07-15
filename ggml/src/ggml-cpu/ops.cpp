@@ -11244,6 +11244,7 @@ static constexpr int KVAR_N_OP_PARAM_STORE_SWA = 4;
 static constexpr int KVAR_N_OP_PARAM_HEAD_SLICES = 5;
 static constexpr int KVAR_N_OP_PARAM_STAGE_GROUPS = 7;
 static constexpr int KVAR_N_OP_PARAM_TAIL_GROUPS = 8;
+static constexpr int KVAR_N_OP_PARAM_EAGER_RECORDS = 9;
 
 static void kvarn_cpu_hadamard(float * values) {
     for (int stride = 1; stride < KVAR_N_GROUP; stride *= 2) {
@@ -11298,8 +11299,8 @@ void ggml_compute_forward_kvarn_wht(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
     const ggml_tensor * src = dst->src[0];
-    GGML_ASSERT(src->type == GGML_TYPE_F32);
-    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(src->type == GGML_TYPE_F32 || src->type == GGML_TYPE_F16 || src->type == GGML_TYPE_BF16);
+    GGML_ASSERT(dst->type == src->type);
 
     int head_width;
     memcpy(&head_width, dst->op_params, sizeof(int));
@@ -11309,8 +11310,22 @@ void ggml_compute_forward_kvarn_wht(
     const int64_t n_total = ggml_nelements(src);
     GGML_ASSERT(n_total % head_width == 0);
     const int64_t n_groups = n_total / head_width;
-    const float * src_data = (const float *) src->data;
-    float * dst_data = (float *) dst->data;
+    const auto load = [&](int64_t index) {
+        switch (src->type) {
+            case GGML_TYPE_F32:  return ((const float *) src->data)[index];
+            case GGML_TYPE_F16:  return ggml_fp16_to_fp32(((const ggml_fp16_t *) src->data)[index]);
+            case GGML_TYPE_BF16: return ggml_bf16_to_fp32(((const ggml_bf16_t *) src->data)[index]);
+            default:             GGML_ABORT("unsupported KVarN WHT input type");
+        }
+    };
+    const auto store = [&](int64_t index, float value) {
+        switch (dst->type) {
+            case GGML_TYPE_F32:  ((float *) dst->data)[index] = value; break;
+            case GGML_TYPE_F16:  ((ggml_fp16_t *) dst->data)[index] = ggml_fp32_to_fp16(value); break;
+            case GGML_TYPE_BF16: ((ggml_bf16_t *) dst->data)[index] = ggml_fp32_to_bf16(value); break;
+            default:             GGML_ABORT("unsupported KVarN WHT output type");
+        }
+    };
 
     const int64_t ith = params->ith;
     const int64_t nth = params->nth;
@@ -11319,19 +11334,17 @@ void ggml_compute_forward_kvarn_wht(
 
     for (int64_t g = grp_start; g < grp_end; ++g) {
         std::array<std::array<float, KVAR_N_GROUP>, 4> values = {};
-        const float * in = src_data + g * head_width;
         for (int slice = 0; slice < head_slices; ++slice) {
             for (int d = 0; d < KVAR_N_GROUP; ++d) {
-                values[slice][d] = in[slice * KVAR_N_GROUP + d];
+                values[slice][d] = load(g * head_width + slice * KVAR_N_GROUP + d);
             }
         }
 
         kvarn_cpu_hadamard_head(values, head_slices);
 
-        float * out = dst_data + g * head_width;
         for (int slice = 0; slice < head_slices; ++slice) {
             for (int d = 0; d < KVAR_N_GROUP; ++d) {
-                out[slice * KVAR_N_GROUP + d] = values[slice][d];
+                store(g * head_width + slice * KVAR_N_GROUP + d, values[slice][d]);
             }
         }
     }
@@ -11503,6 +11516,7 @@ void ggml_compute_forward_kvarn_store(const ggml_compute_params * params, ggml_t
     const int stage_groups = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_STAGE_GROUPS);
     const int tail_groups_param = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_TAIL_GROUPS);
     const int tail_groups = tail_groups_param > 0 ? tail_groups_param : stage_groups - 1;
+    const bool eager_records = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_EAGER_RECORDS) != 0;
     const int head_slices_param = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_HEAD_SLICES);
     const int head_slices = head_slices_param > 0 ? head_slices_param : 1;
     GGML_ASSERT(head_slices == 1 || head_slices == 2 || head_slices == 4);
@@ -11532,7 +11546,7 @@ void ggml_compute_forward_kvarn_store(const ggml_compute_params * params, ggml_t
 
         const int64_t stage_base = stream * 128 * stage_groups;
 
-        if (pos == 0 && (swa ? group >= tail_groups : group > tail_groups)) {
+        if (!eager_records && pos == 0 && (swa ? group >= tail_groups : group > tail_groups)) {
             const int64_t flush_group = group - tail_groups;
             const int64_t flush_ring = swa ? flush_group % groups_per_stream : flush_group;
             const int64_t flush_slot = swa ? flush_group % stage_groups : 1 + ((flush_group - 1) % tail_groups);
@@ -11561,6 +11575,15 @@ void ggml_compute_forward_kvarn_store(const ggml_compute_params * params, ggml_t
                     char * out = (char *) stage->data + d * stage->nb[0] + h * stage->nb[1] + stage_pos * stage->nb[2];
                     *(ggml_fp16_t *) out = ggml_fp32_to_fp16(rows[slice][d]);
                 }
+            }
+        }
+
+        if (eager_records && pos == KVAR_N_GROUP - 1 && (swa || group > 0)) {
+            const int64_t record_ring = swa ? group % groups_per_stream : group;
+            const int64_t record_group = stream * groups_per_stream + record_ring;
+            for (int64_t h = 0; h < n_heads; ++h) {
+                uint8_t * record = (uint8_t *) records->data + h * records->nb[1] + record_group * records->nb[2];
+                kvarn_cpu_quantize_stage(stage, h, stage_base, stage_slot, bits, iterations, value, record);
             }
         }
     }

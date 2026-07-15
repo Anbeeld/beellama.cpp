@@ -16,10 +16,7 @@ static __device__ __forceinline__ bool ggml_cuda_fattn_kvarn_decode_group_from_r
     if (desc.swa) {
         return false;
     }
-    const int live_group = desc.live_group;
-    const bool from_stage = group == 0 ||
-        (group > 0 && group <= live_group && group + (desc.tail_groups - 1) >= live_group);
-    return !from_stage && group < live_group && group < desc.groups_per_stream;
+    return ggml_cuda_fattn_kvarn_group_from_record(desc, group);
 }
 
 // True when an absolute SWA group sits in the record store (not the live/stage tail and
@@ -30,10 +27,7 @@ static __device__ __forceinline__ bool ggml_cuda_fattn_kvarn_decode_swa_record_b
     if (group_global < 0) {
         return false;
     }
-    const int live_group = desc.live_group;
-    const int stage_begin = live_group >= (desc.tail_groups - 1) ? live_group - (desc.tail_groups - 1) : 0;
-    const bool from_stage = group_global >= stage_begin && group_global <= live_group;
-    return !from_stage && ggml_cuda_fattn_kvarn_swa_group_from_record(desc, group_global, stage_begin);
+    return ggml_cuda_fattn_kvarn_group_from_record(desc, group_global);
 }
 
 // Per-split tile plan: whether the cooperative direct-record fast path is usable, the in-group

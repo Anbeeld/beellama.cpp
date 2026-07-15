@@ -34,12 +34,10 @@ ggml_cuda_fattn_kvarn_vec_resolve(
         }
         group = (int) (abs_pos / GGML_CUDA_FATTN_KVARN_DIM);
         ref.pos = (int) (abs_pos - (int64_t) group * GGML_CUDA_FATTN_KVARN_DIM);
-        const int stage_begin = desc.live_group >= (desc.tail_groups - 1) ?
-            desc.live_group - (desc.tail_groups - 1) : 0;
-        if (group >= stage_begin && group <= desc.live_group) {
+        if (ggml_cuda_fattn_kvarn_group_from_stage(desc, group)) {
             ref.source = GGML_CUDA_FATTN_KVARN_VEC_STAGE;
             ref.stage_pos = (group % desc.stage_groups) * GGML_CUDA_FATTN_KVARN_DIM + ref.pos;
-        } else if (ggml_cuda_fattn_kvarn_swa_group_from_record(desc, group, stage_begin)) {
+        } else if (ggml_cuda_fattn_kvarn_group_from_record(desc, group)) {
             ref.source = GGML_CUDA_FATTN_KVARN_VEC_RECORD;
             ref.record_group = group % desc.groups_per_stream;
         }
@@ -48,16 +46,14 @@ ggml_cuda_fattn_kvarn_vec_resolve(
 
     group = token / GGML_CUDA_FATTN_KVARN_DIM;
     ref.pos = token - group * GGML_CUDA_FATTN_KVARN_DIM;
-    const bool from_stage = group == 0 ||
-        (group > 0 && group <= desc.live_group &&
-         group + (desc.tail_groups - 1) >= desc.live_group);
+    const bool from_stage = ggml_cuda_fattn_kvarn_group_from_stage(desc, group);
     if (from_stage) {
         ref.source = GGML_CUDA_FATTN_KVARN_VEC_STAGE;
         const int stage_base = desc.stream * GGML_CUDA_FATTN_KVARN_DIM * desc.stage_groups;
         ref.stage_pos = stage_base + (group == 0 ? ref.pos :
             GGML_CUDA_FATTN_KVARN_DIM +
             ((group - 1) % desc.tail_groups) * GGML_CUDA_FATTN_KVARN_DIM + ref.pos);
-    } else if (group < desc.live_group && group < desc.groups_per_stream) {
+    } else if (ggml_cuda_fattn_kvarn_group_from_record(desc, group)) {
         ref.source = GGML_CUDA_FATTN_KVARN_VEC_RECORD;
         ref.record_group = desc.stream * desc.groups_per_stream + group;
     }

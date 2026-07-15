@@ -626,8 +626,17 @@ static bool ggml_cuda_flash_attn_ext_tail_pass_supported(int device, const ggml_
         pass.src[i] = nullptr;
     }
     ggml_cuda_tail_make_contiguous(pass, pass.ne[0], pass.ne[1], qo->ne[0], qo->ne[1], sizeof(float));
-    if (ggml_cuda_get_best_fattn_kernel(device, &pass) == BEST_FATTN_KERNEL_NONE) {
+    // Tails up to one native KVarN group use the direct indexed-small kernel
+    // below, so they do not need to satisfy the padded upstream FA geometry.
+    // This matters for D512, whose generic FA route requires a 256-token KV
+    // stride even though the direct exact-tail kernel supports 128 tokens.
+    if (tail_stride > 128 &&
+            ggml_cuda_get_best_fattn_kernel(device, &pass) == BEST_FATTN_KERNEL_NONE) {
         return false;
+    }
+    if (ggml_cuda_flash_attn_ext_kvarn_uses_views(dst)) {
+        return rd->ne[0] == body_map_offset &&
+            ggml_cuda_flash_attn_ext_kvarn_supported(device, dst);
     }
     if (rd->ne[0] > body_map_offset) {
         const int64_t body_stride = rd->ne[0] - body_map_offset;
@@ -650,6 +659,13 @@ static bool ggml_cuda_flash_attn_ext_tail_pass_supported(int device, const ggml_
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
 
+    const bool has_exact_tail = dst->src[5] != nullptr && dst->src[6] != nullptr && dst->src[7] != nullptr &&
+        dst->src[8] != nullptr && dst->src[9] != nullptr;
+    if (has_exact_tail) {
+        ggml_cuda_flash_attn_ext_tail(ctx, dst);
+        return;
+    }
+
     if (ggml_cuda_flash_attn_ext_kvarn_uses_views(dst)) {
         if (!ggml_cuda_flash_attn_ext_kvarn(ctx, dst)) {
             GGML_ABORT("unsupported KVarN CUDA FlashAttention route");
@@ -657,26 +673,24 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         return;
     }
 
-    if (dst->src[5] != nullptr) {
-        ggml_cuda_flash_attn_ext_tail(ctx, dst);
-    } else {
-        ggml_cuda_flash_attn_ext_dispatch(ctx, dst);
-    }
+    ggml_cuda_flash_attn_ext_dispatch(ctx, dst);
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
-    if (ggml_cuda_flash_attn_ext_kvarn_uses_views(dst)) {
-        return ggml_cuda_flash_attn_ext_kvarn_supported(device, dst);
-    }
-
-    if (dst->src[5] != nullptr) {
-        if (dst->src[6] == nullptr || dst->src[7] == nullptr || dst->src[8] == nullptr || dst->src[9] == nullptr ||
-                !ggml_cuda_flash_attn_ext_tail_supported(
+    const bool has_exact_tail = dst->src[5] != nullptr && dst->src[6] != nullptr && dst->src[7] != nullptr &&
+        dst->src[8] != nullptr && dst->src[9] != nullptr;
+    if (has_exact_tail) {
+        if (!ggml_cuda_flash_attn_ext_tail_supported(
                     dst->src[1]->type, dst->src[2]->type, dst->src[5]->type, dst->src[6]->type,
                     dst->src[0]->ne[0], dst->ne[0]) ||
                 !ggml_cuda_flash_attn_ext_tail_pass_supported(device, dst)) {
             return false;
         }
+        return true;
+    }
+
+    if (ggml_cuda_flash_attn_ext_kvarn_uses_views(dst)) {
+        return ggml_cuda_flash_attn_ext_kvarn_supported(device, dst);
     }
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }

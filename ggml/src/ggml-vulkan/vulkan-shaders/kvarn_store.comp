@@ -14,6 +14,7 @@ layout(push_constant) uniform parameter {
     uint swa; // SWA sliding-window ring store (absolute-position indices, no group-0 sink)
     uint stage_groups; // dynamic F16 stage depth
     uint tail_groups;  // lossless tail groups within the stage
+    uint eager_records; // commit each record at its closing token
 } p;
 
 layout(binding = 0, std430) readonly buffer Current { float data_current[]; };
@@ -257,7 +258,7 @@ void main() {
         }
 
         const uint stage_base = stream * KVAR_N_DIM * p.stage_groups;
-        if (pos == 0 && (p.swa != 0u ? group >= p.tail_groups : group > p.tail_groups)) {
+        if (p.eager_records == 0u && pos == 0 && (p.swa != 0u ? group >= p.tail_groups : group > p.tail_groups)) {
             const uint flush_group = group - p.tail_groups;
             const uint flush_ring = p.swa != 0u ? flush_group % p.groups_per_stream : flush_group;
             const uint flush_record_group = stream * p.groups_per_stream + flush_ring;
@@ -273,5 +274,11 @@ void main() {
         const uint stage_pos = stage_base + stage_slot * KVAR_N_DIM + pos;
         store_stage_pair(stage_pos, head, lane);
         barrier();
+        if (p.eager_records != 0u && pos == KVAR_N_DIM - 1u && (p.swa != 0u || group > 0u)) {
+            const uint record_ring = p.swa != 0u ? group % p.groups_per_stream : group;
+            const uint record_group = stream * p.groups_per_stream + record_ring;
+            const uint record_base = (record_group * p.n_heads + head) * p.record_words;
+            quantize_stage(head, stage_base, group, record_base, lane);
+        }
     }
 }

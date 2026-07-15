@@ -22,13 +22,14 @@ constexpr uint32_t KVAR_N_GROUP = 128;
 // records. Keep this low enough that KVarN remains a KV-memory win over q5_0.
 constexpr uint32_t KVAR_N_SWA_TAIL_GROUPS = 2;
 constexpr uint32_t KVAR_N_STATE_MAGIC = 0x4e52564b; // "KVRN"
-// Version 11: tail_groups is explicit and SWA stages no longer allocate a
-// non-existent sink slot. Version 9: D256/D512 records use the full logical-head Hadamard instead of
+// Version 12 stores canonical exact-tail payloads and remaps SWA record rings
+// across physical ubatch layouts. Version 11: tail_groups is explicit and SWA
+// stages no longer allocate a non-existent sink slot. Version 9: D256/D512 records use the full logical-head Hadamard instead of
 // independent 128-wide slice rotations. Version 8: KVarN K/V stage rows and compressed records are all
 // rotated-domain. Older states are rejected because their staged V rows may
 // otherwise be restored in the wrong domain. Version 5 added stage_groups
 // validation. Version 10 rejects states with the pre-dedup SWA record-ring layout.
-constexpr uint32_t KVAR_N_STATE_VERSION = 11;
+constexpr uint32_t KVAR_N_STATE_VERSION = 12;
 constexpr uint32_t KVAR_N_STATE_RECORDS_FULL = 0;
 constexpr uint32_t KVAR_N_STATE_STAGE_ONLY_PARTIAL = 1;
 
@@ -83,6 +84,48 @@ void read_kvarn_tensor_slice(llama_io_read_i & io, ggml_tensor * tensor, size_t 
         throw std::runtime_error("mismatched KVarN cache tensor slice size");
     }
     io.read_tensor(tensor, offset, size);
+}
+
+void read_kvarn_swa_records(
+        llama_io_read_i & io,
+        ggml_tensor * tensor,
+        uint32_t saved_groups,
+        uint32_t current_groups,
+        llama_pos saved_pos_max,
+        bool on_device) {
+    const size_t group_bytes = tensor->nb[2];
+    uint64_t saved_size;
+    io.read(&saved_size, sizeof(saved_size));
+    if (saved_size != uint64_t(saved_groups)*group_bytes) {
+        throw std::runtime_error("mismatched KVarN SWA record tensor size");
+    }
+    if (on_device) {
+        if (saved_groups != current_groups) {
+            throw std::runtime_error("on-device KVarN SWA state cannot remap record-ring depth");
+        }
+        io.read_tensor(tensor, 0, saved_size);
+        return;
+    }
+    std::vector<uint8_t> saved(saved_size);
+    if (!saved.empty()) {
+        io.read(saved.data(), saved.size());
+    }
+    ggml_backend_tensor_memset(tensor, 0, 0, ggml_nbytes(tensor));
+    if (saved_pos_max < llama_pos(KVAR_N_GROUP - 1)) {
+        return;
+    }
+
+    const int64_t last_complete = (int64_t(saved_pos_max) + 1) / KVAR_N_GROUP - 1;
+    const int64_t first_saved = std::max<int64_t>(0, last_complete - int64_t(saved_groups) + 1);
+    const int64_t first_current = std::max<int64_t>(first_saved, last_complete - int64_t(current_groups) + 1);
+    for (int64_t group = first_current; group <= last_complete; ++group) {
+        const uint32_t src = uint32_t(group % saved_groups);
+        const uint32_t dst = uint32_t(group % current_groups);
+        ggml_backend_tensor_set(tensor,
+                saved.data() + size_t(src)*group_bytes,
+                size_t(dst)*group_bytes,
+                group_bytes);
+    }
 }
 
 void zero_kvarn_tensor_range(ggml_tensor * tensor, size_t offset, size_t size) {
@@ -178,11 +221,10 @@ uint32_t kvarn_record_groups_per_stream(uint32_t kv_size, uint32_t n_ubatch, uin
         return (kv_size + KVAR_N_GROUP - 1u) / KVAR_N_GROUP;
     }
 
+    GGML_UNUSED(tail_groups);
     const uint32_t visible_groups = kvarn_swa_visible_groups(kv_size, n_swa);
     const uint32_t in_flight_groups = std::max<uint32_t>(1u, (n_ubatch + KVAR_N_GROUP - 1u) / KVAR_N_GROUP);
-    const uint32_t record_groups = visible_groups > tail_groups ?
-        visible_groups - tail_groups + in_flight_groups - 1u : in_flight_groups;
-    return std::max<uint32_t>(1u, record_groups);
+    return std::max<uint32_t>(1u, visible_groups + in_flight_groups - 1u);
 }
 
 } // namespace
@@ -253,6 +295,37 @@ ggml_tensor * llama_kv_cache_kvarn_context::get_v(ggml_context * ctx, int32_t il
     return get_v_native(ctx, il);
 }
 
+ggml_tensor * llama_kv_cache_kvarn_context::get_k_tail(ggml_context * ctx, int32_t il) const {
+    return cache->get_tail(ctx, il, false);
+}
+
+ggml_tensor * llama_kv_cache_kvarn_context::get_v_tail(ggml_context * ctx, int32_t il) const {
+    return cache->get_tail(ctx, il, true);
+}
+
+uint32_t llama_kv_cache_kvarn_context::get_tail_slots() const {
+    return base()->get_tail_slots();
+}
+
+uint32_t llama_kv_cache_kvarn_context::get_tail_tokens() const {
+    return base()->get_tail_tokens();
+}
+
+uint32_t llama_kv_cache_kvarn_context::get_tail_arena_stride() const {
+    return base()->get_tail_arena_stride();
+}
+
+uint32_t llama_kv_cache_kvarn_context::get_tail_attention_stride(uint32_t n_query_tokens) const {
+    return base()->get_tail_attention_stride(n_query_tokens);
+}
+
+bool llama_kv_cache_kvarn_context::can_pack_tail_body(const llama_ubatch & ubatch) const {
+    GGML_UNUSED(ubatch);
+    // Structured body tensors are descriptor views, not row-addressable cache
+    // payloads. The body remains native and only the exact overlay is packed.
+    return false;
+}
+
 ggml_tensor * llama_kv_cache_kvarn_context::get_k_native(ggml_context * ctx, int32_t il) const {
     const auto it = stored_k.find(cache->mapped_layer_id(il));
     GGML_ASSERT(it != stored_k.end());
@@ -293,12 +366,41 @@ ggml_tensor * llama_kv_cache_kvarn_context::cpy_v(
     return result;
 }
 
+ggml_tensor * llama_kv_cache_kvarn_context::cpy_k_with_tail(
+        ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *, int32_t) const {
+    return nullptr;
+}
+
+ggml_tensor * llama_kv_cache_kvarn_context::cpy_v_with_tail(
+        ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *, int32_t) const {
+    return nullptr;
+}
+
+ggml_tensor * llama_kv_cache_kvarn_context::cpy_k_tail(
+        ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * tail_idxs, int32_t il) const {
+    return cache->store_tail(ctx, k_cur, tail_idxs, il, false);
+}
+
+ggml_tensor * llama_kv_cache_kvarn_context::cpy_v_tail(
+        ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * tail_idxs, int32_t il) const {
+    return cache->store_tail(ctx, v_cur, tail_idxs, il, true);
+}
+
 ggml_tensor * llama_kv_cache_kvarn_context::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
     return base()->build_input_k_idxs(ctx, ubatch);
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
     return base()->build_input_v_idxs(ctx, ubatch);
+}
+
+ggml_tensor * llama_kv_cache_kvarn_context::build_input_tail_idxs(
+        ggml_context * ctx, const llama_ubatch & ubatch) const {
+    return base()->build_input_tail_idxs(ctx, ubatch);
+}
+
+ggml_tensor * llama_kv_cache_kvarn_context::build_input_tail_body_idxs(ggml_context * ctx) const {
+    return base()->build_input_tail_body_idxs(ctx);
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::build_input_k_rot(ggml_context * ctx) const {
@@ -387,6 +489,15 @@ void llama_kv_cache_kvarn_context::set_input_v_idxs(ggml_tensor * dst, const lla
     base()->set_input_v_idxs(dst, ubatch);
 }
 
+void llama_kv_cache_kvarn_context::set_input_tail_idxs(
+        ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    base()->set_input_tail_idxs(dst, ubatch);
+}
+
+void llama_kv_cache_kvarn_context::set_input_tail_body_idxs(ggml_tensor * dst) const {
+    base()->set_input_tail_body_idxs(dst);
+}
+
 void llama_kv_cache_kvarn_context::set_input_k_idxs_backend(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     if (cache->is_swa()) {
         std::vector<int64_t> data(ubatch->n_tokens);
@@ -420,6 +531,20 @@ void llama_kv_cache_kvarn_context::set_input_kq_mask(
         const llama_ubatch * ubatch,
         bool causal_attn) const {
     base()->set_input_kq_mask(dst, ubatch, causal_attn);
+}
+
+void llama_kv_cache_kvarn_context::set_input_kq_mask_tail(
+        ggml_tensor * body, ggml_tensor * exact,
+        ggml_tensor * read_idxs, ggml_tensor * body_read_idxs, ggml_tensor * bias_read_idxs,
+        const llama_ubatch * ubatch) const {
+    base()->set_input_kq_mask_tail(
+            body, exact, read_idxs, body_read_idxs, bias_read_idxs, ubatch);
+}
+
+void llama_kv_cache_kvarn_context::set_input_tail_body_plan(
+        ggml_tensor * query_order, ggml_tensor * run_desc,
+        ggml_tensor * body_mask, const llama_ubatch * ubatch) const {
+    base()->set_input_tail_body_plan(query_order, run_desc, body_mask, ubatch);
 }
 
 void llama_kv_cache_kvarn_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
@@ -465,10 +590,14 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         uint32_t n_swa,
         llama_swa_type swa_type,
         const layer_filter_cb & filter,
-        const layer_reuse_cb & reuse) :
+        const layer_reuse_cb & reuse,
+        uint32_t tail_tokens,
+        ggml_type tail_type,
+        uint32_t tail_tokens_requested) :
     hparams(hparams),
     params(params),
     n_stream(unified ? 1u : n_seq_max),
+    n_seq_max(n_seq_max),
     // Dynamic staging: size the lossless F16 ring from position semantics.
     // Non-SWA keeps a permanent sink slot plus the scheduler-span tail. SWA has
     // no sink, so every stage slot is part of the local tail.
@@ -481,6 +610,8 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     // The record ring stores only tiles older than the F16 tail; loaders account
     // for the tail offset when deciding whether a ring slot is live.
     n_groups_per_stream(kvarn_record_groups_per_stream(kv_size, n_ubatch, n_swa, swa, tail_groups)),
+    exact_tail_tokens(tail_tokens),
+    exact_tail_type(tail_type),
     metadata(std::make_unique<llama_kv_cache>(
         model,
         hparams,
@@ -497,7 +628,12 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         nullptr,
         [](int32_t) { return false; },
         nullptr,
-        nullptr)) {
+        nullptr,
+        n_ubatch,
+        tail_tokens,
+        tail_type,
+        tail_tokens_requested,
+        true)) {
     GGML_ASSERT(n_stream > 0);
     GGML_ASSERT(swa || kv_size % KVAR_N_GROUP == 0);
     GGML_ASSERT(stage_groups >= 2 && "KVarN stage depth must be at least 2");
@@ -534,7 +670,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         }
 
         ggml_init_params ctx_params = {
-            /*.mem_size   =*/ size_t((4u + 4u * n_stream) * hparams.n_layer_kv() * ggml_tensor_overhead()),
+            /*.mem_size   =*/ size_t((6u + 4u * n_stream) * hparams.n_layer_kv() * ggml_tensor_overhead()),
             /*.mem_buffer =*/ nullptr,
             /*.no_alloc   =*/ true,
         };
@@ -598,11 +734,18 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         auto * v_records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, v_record_size, n_head_v_sliced, n_record_groups);
         auto * k_stage = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, KVAR_N_GROUP, n_head_k_sliced, n_stage_tokens);
         auto * v_stage = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, KVAR_N_GROUP, n_head_v_sliced, n_stage_tokens);
+        const uint32_t exact_slots = metadata->get_tail_slots();
+        auto * k_tail = exact_slots > 0 ? ggml_new_tensor_2d(
+                ctx, tail_type, uint64_t(head_dim_k)*n_head_kv, exact_slots) : nullptr;
+        auto * v_tail = exact_slots > 0 ? ggml_new_tensor_2d(
+                ctx, tail_type, uint64_t(head_dim_v)*n_head_kv, exact_slots) : nullptr;
 
         ggml_format_name(k_records, "cache_kvarn_k_records_l%d", il);
         ggml_format_name(v_records, "cache_kvarn_v_records_l%d", il);
         ggml_format_name(k_stage, "cache_kvarn_k_stage_l%d", il);
         ggml_format_name(v_stage, "cache_kvarn_v_stage_l%d", il);
+        k_tail && ggml_format_name(k_tail, "cache_kvarn_k_tail_l%d", il);
+        v_tail && ggml_format_name(v_tail, "cache_kvarn_v_tail_l%d", il);
 
         std::vector<ggml_tensor *> k_records_stream;
         std::vector<ggml_tensor *> v_records_stream;
@@ -658,6 +801,8 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
             v_records,
             k_stage,
             v_stage,
+            k_tail,
+            v_tail,
             std::move(k_records_stream),
             std::move(v_records_stream),
             std::move(k_stage_stream),
@@ -837,6 +982,13 @@ void llama_kv_cache_kvarn::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_d
     }
 
     metadata->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+    auto tail_copies = metadata->take_pending_tail_copies();
+    pending_stream_copies.tail_src_slots.insert(
+            pending_stream_copies.tail_src_slots.end(),
+            tail_copies.tail_src_slots.begin(), tail_copies.tail_src_slots.end());
+    pending_stream_copies.tail_dst_slots.insert(
+            pending_stream_copies.tail_dst_slots.end(),
+            tail_copies.tail_dst_slots.begin(), tail_copies.tail_dst_slots.end());
 }
 
 void llama_kv_cache_kvarn::seq_keep(llama_seq_id seq_id) {
@@ -910,14 +1062,52 @@ bool llama_kv_cache_kvarn::apply_pending_stream_copies(llama_context * lctx) {
         copy_kvarn_stream(pending_stream_copies.ssrc[i], pending_stream_copies.sdst[i]);
     }
 
+    const size_t n_tail_copy = pending_stream_copies.tail_src_slots.size();
+    GGML_ASSERT(n_tail_copy == pending_stream_copies.tail_dst_slots.size());
+    for (auto & layer : layers) {
+        for (ggml_tensor * tensor : { layer.k_tail, layer.v_tail }) {
+            if (!tensor || n_tail_copy == 0) {
+                continue;
+            }
+            const size_t row_size = ggml_row_size(tensor->type, tensor->ne[0]);
+            std::vector<uint8_t> rows(n_tail_copy*row_size);
+            for (size_t i = 0; i < n_tail_copy; ++i) {
+                const int32_t slot = pending_stream_copies.tail_src_slots[i];
+                GGML_ASSERT(slot >= 0 && int64_t(slot) < tensor->ne[1]);
+                ggml_backend_tensor_get(tensor, rows.data() + i*row_size, size_t(slot)*row_size, row_size);
+            }
+            for (size_t i = 0; i < n_tail_copy; ++i) {
+                const int32_t slot = pending_stream_copies.tail_dst_slots[i];
+                GGML_ASSERT(slot >= 0 && int64_t(slot) < tensor->ne[1]);
+                ggml_backend_tensor_set(tensor, rows.data() + i*row_size, size_t(slot)*row_size, row_size);
+            }
+        }
+    }
+
     pending_stream_copies.ssrc.clear();
     pending_stream_copies.sdst.clear();
+    pending_stream_copies.tail_src_slots.clear();
+    pending_stream_copies.tail_dst_slots.clear();
     return true;
+}
+
+bool llama_kv_cache_kvarn::get_kv_tail_coverage(
+        uint32_t group_index, llama_seq_id seq_id, llama_kv_tail_coverage_info & out) const {
+    return metadata->get_kv_tail_coverage(group_index, seq_id, out);
+}
+
+void llama_kv_cache_kvarn::reset_kv_tail_planner_timing() {
+    metadata->reset_kv_tail_planner_timing();
+}
+
+uint64_t llama_kv_cache_kvarn::get_kv_tail_planner_timing_ns() const {
+    return metadata->get_kv_tail_planner_timing_ns();
 }
 
 void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     metadata->state_write(io, seq_id, flags);
     const bool partial_state = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0 && seq_id >= 0;
+    const bool body_only = (flags & LLAMA_STATE_SEQ_FLAGS_BODY_ONLY) != 0;
 
     std::vector<uint32_t> saved_streams;
     if (seq_id == -1) {
@@ -944,10 +1134,19 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
     }
     const uint32_t state_kind = partial_state ? KVAR_N_STATE_STAGE_ONLY_PARTIAL : KVAR_N_STATE_RECORDS_FULL;
     io.write(&state_kind, sizeof(state_kind));
-    // Version 11+: record both stage and tail depth so SWA no-sink stages and
+    // Record both stage and workspace depth so SWA no-sink stages and
     // non-SWA sink stages cannot be restored into each other's layout.
     io.write(&stage_groups, sizeof(stage_groups));
     io.write(&tail_groups, sizeof(tail_groups));
+    const uint32_t has_exact_tail = exact_tail_tokens > 0 ? 1u : 0u;
+    const int32_t state_exact_type = int32_t(exact_tail_type);
+    const std::vector<int32_t> exact_payload_slots = has_exact_tail && !body_only ?
+        metadata->state_tail_payload_slots(seq_id) : std::vector<int32_t>{};
+    const uint32_t n_exact_payloads = uint32_t(exact_payload_slots.size());
+    io.write(&has_exact_tail, sizeof(has_exact_tail));
+    io.write(&exact_tail_tokens, sizeof(exact_tail_tokens));
+    io.write(&state_exact_type, sizeof(state_exact_type));
+    io.write(&n_exact_payloads, sizeof(n_exact_payloads));
 
     // n_groups_used is single-valued across all saved streams. This is correct
     // because when seq_id >= 0, saved_streams has exactly 1 entry (the stream
@@ -969,6 +1168,15 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
     // SWA ring: always serialize all ring slots — the live window may wrap around
     // and occupy any slot, so partial serialization by group index is not meaningful.
     io.write(&n_groups_used, sizeof(n_groups_used));
+    llama_pos saved_pos_max = -1;
+    if (seq_id >= 0) {
+        saved_pos_max = metadata->seq_pos_max(seq_id);
+    } else {
+        for (uint32_t id = 0; id < n_seq_max; ++id) {
+            saved_pos_max = std::max(saved_pos_max, metadata->seq_pos_max(id));
+        }
+    }
+    io.write(&saved_pos_max, sizeof(saved_pos_max));
 
     for (const auto & layer : layers) {
         io.write(&layer.il, sizeof(layer.il));
@@ -984,11 +1192,26 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
             write_kvarn_tensor(io, layer.k_stage_stream[stream]);
             write_kvarn_tensor(io, layer.v_stage_stream[stream]);
         }
+        const uint64_t k_tail_row = layer.k_tail ? ggml_row_size(layer.k_tail->type, layer.k_tail->ne[0]) : 0;
+        const uint64_t v_tail_row = layer.v_tail ? ggml_row_size(layer.v_tail->type, layer.v_tail->ne[0]) : 0;
+        io.write(&k_tail_row, sizeof(k_tail_row));
+        io.write(&v_tail_row, sizeof(v_tail_row));
+        for (const int32_t slot : exact_payload_slots) {
+            GGML_ASSERT(slot >= 0);
+            if (layer.k_tail) {
+                io.write_tensor(layer.k_tail, size_t(slot)*k_tail_row, k_tail_row);
+            }
+            if (layer.v_tail) {
+                io.write_tensor(layer.v_tail, size_t(slot)*v_tail_row, v_tail_row);
+            }
+        }
     }
 }
 
 void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     metadata->state_read(io, seq_id, flags);
+    std::vector<std::vector<int32_t>> exact_destinations = metadata->take_restored_tail_payload_slots();
+    const bool on_device = (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) != 0;
 
     uint32_t magic;
     uint32_t version;
@@ -1002,9 +1225,10 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
         type != params.type || n_layers != layers.size()) {
         throw std::runtime_error("incompatible KVarN cache state");
     }
-    if (version < 11) {
+    if (version < KVAR_N_STATE_VERSION) {
         throw std::runtime_error(
-            "incompatible KVarN cache state: re-save prompt cache with this build");
+            "incompatible KVarN cache state version 11: canonical exact-tail payloads are absent; "
+            "re-save the prompt cache with this build");
     }
 
     uint32_t n_saved_streams;
@@ -1027,14 +1251,8 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
         throw std::runtime_error("invalid KVarN cache state kind");
     }
 
-    // Version 8 rejects older stage-domain states; version 9 rejects D>128
-    // independent-slice records; version 10 rejects the old full-overlap SWA
-    // record ring; version 11 carries explicit tail depth for SWA no-sink
-    // stages. The reader still does not implement
-    // stage-slot remap on restore (the plan's full save/restore matrix allows
-    // remapping logical live groups into differently-sized stages). For now,
-    // any stage_groups mismatch is rejected explicitly so the stage is never
-    // silently corrupted. Remap support is a follow-up.
+    // The stage contains only the fixed sink/incomplete-group workspace. It is
+    // independent of physical ubatch; SWA record-ring depth is remapped below.
     uint32_t saved_stage_groups;
     io.read(&saved_stage_groups, sizeof(saved_stage_groups));
     if (saved_stage_groups < 2) {
@@ -1055,11 +1273,28 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
             saved_tail_groups, tail_groups));
     }
 
+    uint32_t has_exact_tail;
+    uint32_t saved_exact_tail_tokens;
+    int32_t saved_exact_type;
+    uint32_t n_exact_payloads;
+    io.read(&has_exact_tail, sizeof(has_exact_tail));
+    io.read(&saved_exact_tail_tokens, sizeof(saved_exact_tail_tokens));
+    io.read(&saved_exact_type, sizeof(saved_exact_type));
+    io.read(&n_exact_payloads, sizeof(n_exact_payloads));
+    if (has_exact_tail != uint32_t(exact_tail_tokens > 0) ||
+            saved_exact_tail_tokens != exact_tail_tokens ||
+            saved_exact_type != int32_t(exact_tail_type) ||
+            n_exact_payloads != exact_destinations.size()) {
+        throw std::runtime_error("KVarN exact-tail state configuration does not match the context");
+    }
+
     uint32_t n_groups_used;
     io.read(&n_groups_used, sizeof(n_groups_used));
-    if (n_groups_used == 0 || n_groups_used > n_groups_per_stream) {
+    if (n_groups_used == 0 || (!swa && n_groups_used > n_groups_per_stream)) {
         throw std::runtime_error("invalid KVarN cache group count");
     }
+    llama_pos saved_pos_max;
+    io.read(&saved_pos_max, sizeof(saved_pos_max));
 
     const uint32_t seq_stream = seq_id == -1 ? 0 : metadata->get_stream_for_seq(seq_id);
     if (seq_id != -1 && seq_stream >= n_stream) {
@@ -1093,15 +1328,64 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
             const size_t v_records_total = n_groups_per_stream * layer.v_records_stream[stream_dst]->nb[2];
 
             if (state_kind == KVAR_N_STATE_RECORDS_FULL) {
-                read_kvarn_tensor_slice(io, layer.k_records_stream[stream_dst], 0, k_records_used);
-                zero_kvarn_tensor_range(layer.k_records_stream[stream_dst], k_records_used, k_records_total - k_records_used);
+                if (swa) {
+                    read_kvarn_swa_records(io, layer.k_records_stream[stream_dst],
+                            n_groups_used, n_groups_per_stream, saved_pos_max, on_device);
+                    read_kvarn_swa_records(io, layer.v_records_stream[stream_dst],
+                            n_groups_used, n_groups_per_stream, saved_pos_max, on_device);
+                } else {
+                    read_kvarn_tensor_slice(io, layer.k_records_stream[stream_dst], 0, k_records_used);
+                    zero_kvarn_tensor_range(layer.k_records_stream[stream_dst], k_records_used, k_records_total - k_records_used);
 
-                read_kvarn_tensor_slice(io, layer.v_records_stream[stream_dst], 0, v_records_used);
-                zero_kvarn_tensor_range(layer.v_records_stream[stream_dst], v_records_used, v_records_total - v_records_used);
+                    read_kvarn_tensor_slice(io, layer.v_records_stream[stream_dst], 0, v_records_used);
+                    zero_kvarn_tensor_range(layer.v_records_stream[stream_dst], v_records_used, v_records_total - v_records_used);
+                }
             }
 
             read_kvarn_tensor(io, layer.k_stage_stream[stream_dst]);
             read_kvarn_tensor(io, layer.v_stage_stream[stream_dst]);
+        }
+        uint64_t k_tail_row;
+        uint64_t v_tail_row;
+        io.read(&k_tail_row, sizeof(k_tail_row));
+        io.read(&v_tail_row, sizeof(v_tail_row));
+        const uint64_t expected_k_tail_row = layer.k_tail ? ggml_row_size(layer.k_tail->type, layer.k_tail->ne[0]) : 0;
+        const uint64_t expected_v_tail_row = layer.v_tail ? ggml_row_size(layer.v_tail->type, layer.v_tail->ne[0]) : 0;
+        if (k_tail_row != expected_k_tail_row || v_tail_row != expected_v_tail_row) {
+            throw std::runtime_error("KVarN exact-tail state layer layout mismatch");
+        }
+        for (uint32_t payload = 0; payload < n_exact_payloads; ++payload) {
+            if (exact_destinations[payload].empty()) {
+                throw std::runtime_error("KVarN exact-tail state contains an unreferenced payload");
+            }
+            if (layer.k_tail) {
+                if (on_device) {
+                    if (exact_destinations[payload].size() != 1) {
+                        throw std::runtime_error("on-device KVarN exact-tail state requires one destination slot per payload");
+                    }
+                    io.read_tensor(layer.k_tail, size_t(exact_destinations[payload][0])*k_tail_row, k_tail_row);
+                } else {
+                    std::vector<uint8_t> row(k_tail_row);
+                    io.read(row.data(), row.size());
+                    for (const int32_t slot : exact_destinations[payload]) {
+                        ggml_backend_tensor_set(layer.k_tail, row.data(), size_t(slot)*k_tail_row, k_tail_row);
+                    }
+                }
+            }
+            if (layer.v_tail) {
+                if (on_device) {
+                    if (exact_destinations[payload].size() != 1) {
+                        throw std::runtime_error("on-device KVarN exact-tail state requires one destination slot per payload");
+                    }
+                    io.read_tensor(layer.v_tail, size_t(exact_destinations[payload][0])*v_tail_row, v_tail_row);
+                } else {
+                    std::vector<uint8_t> row(v_tail_row);
+                    io.read(row.data(), row.size());
+                    for (const int32_t slot : exact_destinations[payload]) {
+                        ggml_backend_tensor_set(layer.v_tail, row.data(), size_t(slot)*v_tail_row, v_tail_row);
+                    }
+                }
+            }
         }
     }
 }
@@ -1116,6 +1400,43 @@ int32_t llama_kv_cache_kvarn::mapped_layer_id(int32_t il) const {
 
 const llama_kv_cache_kvarn::layer & llama_kv_cache_kvarn::layer_for(int32_t il) const {
     return layers.at(map_layer_ids.at(il));
+}
+
+ggml_tensor * llama_kv_cache_kvarn::get_tail(
+        ggml_context * ctx, int32_t il, bool value) const {
+    const auto & layer = layer_for(il);
+    ggml_tensor * tensor = value ? layer.v_tail : layer.k_tail;
+    if (!tensor) {
+        return nullptr;
+    }
+    const uint32_t head_dim = value ? layer.head_dim_v : layer.head_dim_k;
+    return ggml_view_4d(ctx, tensor,
+            head_dim, layer.n_head_kv, metadata->get_tail_slots(), 1,
+            ggml_row_size(tensor->type, head_dim), tensor->nb[1], tensor->nb[2], 0);
+}
+
+ggml_tensor * llama_kv_cache_kvarn::store_tail(
+        ggml_context * ctx, ggml_tensor * current, ggml_tensor * indices,
+        int32_t il, bool value) const {
+    const auto & layer = layer_for(il);
+    ggml_tensor * dst = value ? layer.v_tail : layer.k_tail;
+    if (!dst || !indices) {
+        return nullptr;
+    }
+    const uint32_t head_dim = value ? layer.head_dim_v : layer.head_dim_k;
+    const int64_t n_embd = int64_t(head_dim)*layer.n_head_kv;
+    const int64_t n_tokens = current->ne[2];
+    GGML_ASSERT(current->type == GGML_TYPE_F32 && current->ne[0] == head_dim &&
+            current->ne[1] == layer.n_head_kv && dst->ne[0] == n_embd);
+    GGML_ASSERT(indices->type == GGML_TYPE_I64 && indices->ne[0] == n_tokens);
+    current = ggml_cont_2d(ctx, current, n_embd, n_tokens);
+    ggml_tensor * written = dst;
+    for (int64_t level = 0; level < indices->ne[1]; ++level) {
+        ggml_tensor * level_idxs = ggml_view_1d(ctx, indices, n_tokens, level*indices->nb[1]);
+        written = ggml_set_rows(ctx, written, current, level_idxs);
+    }
+    return ggml_reshape_4d(ctx, written,
+            head_dim, layer.n_head_kv, metadata->get_tail_slots(), 1);
 }
 
 ggml_tensor * llama_kv_cache_kvarn::store(
@@ -1152,6 +1473,7 @@ ggml_tensor * llama_kv_cache_kvarn::store(
     result->op_params[4] = swa ? 1 : 0; // SWA sliding-window ring store
     result->op_params[5] = (int32_t) slices; // KVarN head-wide Hadamard slice count
     result->op_params[8] = int32_t(tail_groups);
+    result->op_params[9] = 1; // commit every completed record before it leaves the live workspace
     return result;
 }
 
@@ -1181,6 +1503,7 @@ ggml_tensor * llama_kv_cache_kvarn::view(
         int32_t(stage_groups));
     result->op_params[6] = swa ? 1 : 0;
     result->op_params[8] = int32_t(tail_groups);
+    result->op_params[9] = 1;
     const uint32_t slices = value ? layer.v_slices : layer.k_slices;
     if (slices > 1) {
         result = ggml_reshape_4d(

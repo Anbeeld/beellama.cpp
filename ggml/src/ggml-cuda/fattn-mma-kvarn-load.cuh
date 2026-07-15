@@ -51,21 +51,17 @@ static __device__ __forceinline__ float ggml_cuda_fattn_kvarn_load_rotated(
         if (abs_pos < 0) {
             return 0.0f;
         }
-        const int live_group = desc.live_group;
         group = (int) (abs_pos / GGML_CUDA_FATTN_KVARN_DIM);
         pos   = (int) (abs_pos - (int64_t) group * GGML_CUDA_FATTN_KVARN_DIM);
-        const int stage_begin = live_group >= (desc.tail_groups - 1) ? live_group - (desc.tail_groups - 1) : 0;
-        from_stage  = group >= stage_begin && group <= live_group;
-        from_record = !from_stage && ggml_cuda_fattn_kvarn_swa_group_from_record(desc, group, stage_begin);
+        from_stage  = ggml_cuda_fattn_kvarn_group_from_stage(desc, group);
+        from_record = ggml_cuda_fattn_kvarn_group_from_record(desc, group);
         stage_pos = (group % desc.stage_groups) * GGML_CUDA_FATTN_KVARN_DIM + pos;
         record_group = group % desc.groups_per_stream;
     } else {
-        const int live_group = desc.live_group;
         group = token / GGML_CUDA_FATTN_KVARN_DIM;
         pos   = token - group * GGML_CUDA_FATTN_KVARN_DIM;
-        from_stage = group == 0 ||
-            (group > 0 && group <= live_group && group + (desc.tail_groups - 1) >= live_group);
-        from_record = !from_stage && group < live_group && group < desc.groups_per_stream;
+        from_stage = ggml_cuda_fattn_kvarn_group_from_stage(desc, group);
+        from_record = ggml_cuda_fattn_kvarn_group_from_record(desc, group);
         const int stage_base = desc.stream * GGML_CUDA_FATTN_KVARN_DIM * desc.stage_groups;
         stage_pos = stage_base + (group == 0 ? pos :
             GGML_CUDA_FATTN_KVARN_DIM + ((group - 1) % desc.tail_groups) * GGML_CUDA_FATTN_KVARN_DIM + pos);

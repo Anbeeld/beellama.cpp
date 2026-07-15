@@ -340,6 +340,28 @@ llama_context::llama_context(
         }
     }
 
+    if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
+        const uint32_t full_window = cparams.n_ctx;
+        const uint32_t swa_window = std::min(cparams.n_ctx,
+                hparams.n_swa > 0 ? hparams.n_swa : cparams.n_ctx);
+        const uint32_t raw_full = cparams.kv_tail_tokens_requested;
+        const uint32_t raw_swa = cparams.kv_tail_tokens_swa_requested;
+        const auto full_policy = llama_kvarn_tail_policy_for(raw_full, full_window);
+        const auto swa_policy = llama_kvarn_tail_policy_for(raw_swa, swa_window);
+        cparams.kv_tail_tokens = full_policy.effective_tokens;
+        cparams.kv_tail_tokens_swa = swa_policy.effective_tokens;
+        cparams.kv_tail_tokens_requested = full_policy.requested_tokens;
+        cparams.kv_tail_tokens_swa_requested = swa_policy.requested_tokens;
+        LLAMA_LOG_INFO("KVarN exact tail: group=full raw=%u requested=%u effective=%u window=%u representation=%s\n",
+                raw_full, full_policy.requested_tokens, full_policy.effective_tokens, full_window,
+                full_policy.native_exact ? "native_exact" : "overlay");
+        if (hparams.n_swa > 0) {
+            LLAMA_LOG_INFO("KVarN exact tail: group=swa raw=%u requested=%u effective=%u window=%u representation=%s\n",
+                    raw_swa, swa_policy.requested_tokens, swa_policy.effective_tokens, swa_window,
+                    swa_policy.native_exact ? "native_exact" : "overlay");
+        }
+    }
+
     cparams.ctx_other = nullptr;
 
     // TODO: more generic

@@ -1131,7 +1131,9 @@ struct llm_graph_context {
             ggml_tensor * kq_b_tail = nullptr,
             ggml_tensor * tail_read_idxs = nullptr,
             ggml_tensor * tail_query_order = nullptr,
-            ggml_tensor * tail_run_desc = nullptr) const;
+            ggml_tensor * tail_run_desc = nullptr,
+            enum ggml_flash_attn_ext_kvarn_domain kvarn_domain =
+                GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

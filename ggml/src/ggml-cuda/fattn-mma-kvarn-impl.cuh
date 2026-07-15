@@ -12,10 +12,7 @@ static __device__ __forceinline__ int ggml_cuda_fattn_kvarn_mma_record_payload_b
 static __device__ __forceinline__ bool ggml_cuda_fattn_kvarn_mma_group_from_record(
         const ggml_cuda_fattn_kvarn_desc & desc,
         const int group) {
-    const int live_group = desc.live_group;
-    const bool from_stage = group == 0 ||
-        (group > 0 && group <= live_group && group + (desc.tail_groups - 1) >= live_group);
-    return !from_stage && group < live_group && group < desc.groups_per_stream;
+    return ggml_cuda_fattn_kvarn_group_from_record(desc, group);
 }
 
 struct ggml_cuda_fattn_kvarn_mma_tile {
@@ -48,10 +45,8 @@ static __device__ __forceinline__ ggml_cuda_fattn_kvarn_mma_tile ggml_cuda_fattn
         if (group0 != group1) {
             return tile;
         }
-        const int live_group = desc.live_group;
-        const int stage_begin = live_group >= (desc.tail_groups - 1) ? live_group - (desc.tail_groups - 1) : 0;
-        const bool from_stage = group0 >= stage_begin && group0 <= live_group;
-        const bool from_record = !from_stage && ggml_cuda_fattn_kvarn_swa_group_from_record(desc, group0, stage_begin);
+        const bool from_stage = ggml_cuda_fattn_kvarn_group_from_stage(desc, group0);
+        const bool from_record = ggml_cuda_fattn_kvarn_group_from_record(desc, group0);
         tile.pos_begin = (int) (first_idx - (int64_t) group0 * GGML_CUDA_FATTN_KVARN_DIM);
         if (from_stage) {
             tile.stage = true;
@@ -71,10 +66,7 @@ static __device__ __forceinline__ ggml_cuda_fattn_kvarn_mma_tile ggml_cuda_fattn
     }
 
     tile.pos_begin = k_start - group_first * GGML_CUDA_FATTN_KVARN_DIM;
-    const int live_group = desc.live_group;
-    const bool from_stage = group_first == 0 ||
-        (group_first > 0 && group_first <= live_group &&
-         group_first + (desc.tail_groups - 1) >= live_group);
+    const bool from_stage = ggml_cuda_fattn_kvarn_group_from_stage(desc, group_first);
     if (from_stage) {
         const int stage_base = desc.stream * GGML_CUDA_FATTN_KVARN_DIM * desc.stage_groups;
         tile.stage = true;
@@ -141,22 +133,18 @@ static __device__ __forceinline__ bool ggml_cuda_fattn_kvarn_load_rotated_slice_
         if (desc.swa) {
             const int64_t abs_pos = desc.indices[token];
             if (abs_pos >= 0) {
-                const int live_group = desc.live_group;
                 const int group = (int) (abs_pos / GGML_CUDA_FATTN_KVARN_DIM);
                 pos = (int) (abs_pos - (int64_t) group * GGML_CUDA_FATTN_KVARN_DIM);
-                const int stage_begin = live_group >= (desc.tail_groups - 1) ? live_group - (desc.tail_groups - 1) : 0;
-                from_stage  = group >= stage_begin && group <= live_group;
-                from_record = !from_stage && ggml_cuda_fattn_kvarn_swa_group_from_record(desc, group, stage_begin);
+                from_stage  = ggml_cuda_fattn_kvarn_group_from_stage(desc, group);
+                from_record = ggml_cuda_fattn_kvarn_group_from_record(desc, group);
                 stage_pos = (group % desc.stage_groups) * GGML_CUDA_FATTN_KVARN_DIM + pos;
                 record_group = group % desc.groups_per_stream;
             }
         } else {
-            const int live_group = desc.live_group;
             const int group = token / GGML_CUDA_FATTN_KVARN_DIM;
             pos = token - group * GGML_CUDA_FATTN_KVARN_DIM;
-            from_stage = group == 0 ||
-                (group > 0 && group <= live_group && group + (desc.tail_groups - 1) >= live_group);
-            from_record = !from_stage && group < live_group && group < desc.groups_per_stream;
+            from_stage = ggml_cuda_fattn_kvarn_group_from_stage(desc, group);
+            from_record = ggml_cuda_fattn_kvarn_group_from_record(desc, group);
             const int stage_base = desc.stream * GGML_CUDA_FATTN_KVARN_DIM * desc.stage_groups;
             stage_pos = stage_base + (group == 0 ? pos :
                 GGML_CUDA_FATTN_KVARN_DIM + ((group - 1) % desc.tail_groups) * GGML_CUDA_FATTN_KVARN_DIM + pos);

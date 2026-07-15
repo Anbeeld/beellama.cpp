@@ -169,7 +169,7 @@ static __global__ void ggml_cuda_fattn_kvarn_window_f16_partial_kernel(
     constexpr bool needs_fixup = false;
     constexpr bool is_fixup = true;
     flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup>
-        (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, partial_ptr, scale, slope, logit_softcap,
+        (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, partial_ptr, nullptr, scale, slope, logit_softcap,
          ne01, ne02, gqa_ratio, ne11, nb01 / (int32_t) sizeof(float2), nb02 / (int32_t) sizeof(float2),
          nb11 / (int32_t) sizeof(half2), nb21 / (int32_t) sizeof(half2), nb31 / (int32_t) sizeof(half),
          jt, zt_gqa, 0, iter_k);
@@ -236,7 +236,7 @@ static __global__ void ggml_cuda_fattn_kvarn_window_f16_direct_kernel(
     constexpr bool needs_fixup = false;
     constexpr bool is_fixup = false;
     flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup>
-        (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, nullptr, scale, slope, logit_softcap,
+        (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, nullptr, nullptr, scale, slope, logit_softcap,
          ne01, ne02, gqa_ratio, ne11, nb01 / (int32_t) sizeof(float2), nb02 / (int32_t) sizeof(float2),
          nb11 / (int32_t) sizeof(half2), nb21 / (int32_t) sizeof(half2), nb31 / (int32_t) sizeof(half),
          jt, zt_gqa, 0, iter_k);
@@ -329,6 +329,7 @@ __launch_bounds__(D, 1)
 static __global__ void ggml_cuda_fattn_kvarn_window_finalize_kernel(
         float * acc_ptr,
         const float2 * acc_meta_ptr,
+        float2 * dst_meta_ptr,
         const int n_rows) {
     const int row = blockIdx.x;
     const int d = threadIdx.x;
@@ -339,6 +340,9 @@ static __global__ void ggml_cuda_fattn_kvarn_window_finalize_kernel(
     const float rowsum = acc_meta_ptr[row].y;
     float & v = acc_ptr[(size_t) row * D + d];
     v = rowsum > 0.0f ? v / rowsum : 0.0f;
+    if (d == 0 && dst_meta_ptr != nullptr) {
+        dst_meta_ptr[row] = acc_meta_ptr[row];
+    }
 }
 
 template<int D, int ncols1, int ncols2>
@@ -346,6 +350,7 @@ __launch_bounds__(D, 1)
 static __global__ void ggml_cuda_fattn_kvarn_window_single_finalize_kernel(
         const float2 * partial_ptr,
         float * dst_ptr,
+        float2 * dst_meta_ptr,
         const uint3 ne01,
         const int ne02,
         const int ne12,
@@ -374,12 +379,16 @@ static __global__ void ggml_cuda_fattn_kvarn_window_single_finalize_kernel(
 
     const int q_head = z_KV * gqa_ratio + zt_gqa * ncols2 + c;
     const size_t out_off = ((size_t) sequence * ne01.z * ne02 + (size_t) q * ne02 + q_head) * D + d;
+    const size_t row_off = ((size_t) sequence * ne01.z + q) * ne02 + q_head;
 
     const float2 part_meta = partial_ptr[((size_t) ntiles_dst + tile) * ncols + jc];
     const float2 * partial_data = partial_ptr + (size_t) ntiles_dst * (2 * ncols) +
         ((size_t) tile * ncols + jc) * (D / 2);
     const float part = ((const float *) partial_data)[d];
     dst_ptr[out_off] = part_meta.y > 0.0f ? part / part_meta.y : 0.0f;
+    if (d == 0 && dst_meta_ptr != nullptr) {
+        dst_meta_ptr[row_off] = part_meta;
+    }
 }
 
 template <int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap>
@@ -396,6 +405,7 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * mask = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+    float2 * const dst_meta = dst->src[8] != nullptr ? (float2 *) dst->src[8]->data : nullptr;
     const enum ggml_flash_attn_ext_kvarn_domain domain = ggml_cuda_fattn_kvarn_domain(dst);
     if (!ggml_cuda_fattn_kvarn_window_enabled() ||
             Q->ne[1] <= 1 || sinks != nullptr ||
@@ -558,7 +568,7 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
             mask ? (int64_t) mask->nb[3] : 0);
         ggml_cuda_kernel_launch_params single_finalize_params(merge_grid, merge_block, 0, stream);
         ggml_cuda_kernel_launch(ggml_cuda_fattn_kvarn_window_single_finalize_kernel<DV, ncols1, ncols2>, single_finalize_params,
-            partial.get(), (float *) dst->data, ne01, Q->ne[2], plan.n_kv_heads, gqa_ratio, ntiles_dst);
+            partial.get(), (float *) dst->data, dst_meta, ne01, Q->ne[2], plan.n_kv_heads, gqa_ratio, ntiles_dst);
         CUDA_CHECK(cudaGetLastError());
         return true;
     }
@@ -605,7 +615,7 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
 
     ggml_cuda_kernel_launch_params finalize_params(finalize_grid, merge_block, 0, stream);
     ggml_cuda_kernel_launch(ggml_cuda_fattn_kvarn_window_finalize_kernel<DV>, finalize_params,
-        (float *) dst->data, acc_meta.get(), n_rows);
+        (float *) dst->data, acc_meta.get(), dst_meta, n_rows);
     CUDA_CHECK(cudaGetLastError());
     return true;
 }

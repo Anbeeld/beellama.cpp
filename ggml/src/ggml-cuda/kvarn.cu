@@ -24,6 +24,7 @@ static constexpr int KVAR_N_OP_PARAM_STORE_SWA = 4;     // store: SWA sliding-wi
 static constexpr int KVAR_N_OP_PARAM_HEAD_SLICES = 5;   // 1/2/4 slices per logical K/V head
 static constexpr int KVAR_N_OP_PARAM_STAGE_GROUPS = 7;  // dynamic F16 stage depth
 static constexpr int KVAR_N_OP_PARAM_TAIL_GROUPS = 8;   // lossless tail groups within the stage
+static constexpr int KVAR_N_OP_PARAM_EAGER_RECORDS = 9; // materialize a record when its closing token is stored
 
 // Resolve stage_groups from op_params[7]. Constructors set this explicitly;
 // backends assert it before deriving stream counts.
@@ -882,6 +883,7 @@ static __global__ void kvarn_store_kernel_hishmem(
         bool swa,
         int stage_groups,
         int tail_groups,
+        bool eager_records,
         const int * skip_if_workspace_valid) {
     extern __shared__ float shared[];
     const int head = blockIdx.x;
@@ -902,7 +904,7 @@ static __global__ void kvarn_store_kernel_hishmem(
         }
 
         const int stage_base = stream * KVAR_N_DIM * stage_groups;
-        if (pos == 0 && (swa ? group >= tail_groups : group > tail_groups)) {
+        if (!eager_records && pos == 0 && (swa ? group >= tail_groups : group > tail_groups)) {
             const int flush_group = group - tail_groups;
             const int flush_ring = swa ? flush_group % groups_per_stream : flush_group;
             const int flush_record_group = stream * groups_per_stream + flush_ring;
@@ -917,6 +919,13 @@ static __global__ void kvarn_store_kernel_hishmem(
         stage[(stage_pos * n_heads + head) * KVAR_N_DIM + threadIdx.x] =
             __float2half_rn(shared[threadIdx.x]);
         __syncthreads();
+        if (eager_records && pos == KVAR_N_DIM - 1 && (swa || group > 0)) {
+            const int record_ring = swa ? group % groups_per_stream : group;
+            const int record_group = stream * groups_per_stream + record_ring;
+            uint8_t * record = records + ((int64_t) record_group * n_heads + head) * record_bytes;
+            kvarn_quantize_stage(stage, record, n_heads, head, stage_base, group,
+                    bits, iterations, value, swa, stage_groups, tail_groups, shared);
+        }
     }
 }
 
@@ -937,6 +946,7 @@ static __global__ void kvarn_store_kernel_headwide(
         int stage_groups,
         int tail_groups,
         int head_slices,
+        bool eager_records,
         const int * skip_if_workspace_valid) {
     extern __shared__ float shared[];
     const int head0 = blockIdx.x * head_slices;
@@ -959,7 +969,7 @@ static __global__ void kvarn_store_kernel_headwide(
         }
 
         const int stage_base = stream * KVAR_N_DIM * stage_groups;
-        if (pos == 0 && (swa ? group >= tail_groups : group > tail_groups)) {
+        if (!eager_records && pos == 0 && (swa ? group >= tail_groups : group > tail_groups)) {
             const int flush_group = group - tail_groups;
             const int flush_ring = swa ? flush_group % groups_per_stream : flush_group;
             const int flush_record_group = stream * groups_per_stream + flush_ring;
@@ -988,6 +998,16 @@ static __global__ void kvarn_store_kernel_headwide(
                 __float2half_rn(values[slice]);
         }
         __syncthreads();
+        if (eager_records && pos == KVAR_N_DIM - 1 && (swa || group > 0)) {
+            const int record_ring = swa ? group % groups_per_stream : group;
+            const int record_group = stream * groups_per_stream + record_ring;
+            for (int slice = 0; slice < head_slices; ++slice) {
+                const int head = head0 + slice;
+                uint8_t * record = records + ((int64_t) record_group * n_heads + head) * record_bytes;
+                kvarn_quantize_stage(stage, record, n_heads, head, stage_base, group,
+                        bits, iterations, value, swa, stage_groups, tail_groups, shared);
+            }
+        }
     }
 }
 
@@ -1005,7 +1025,8 @@ static __global__ void kvarn_store_kernel_lowshmem(
         int iterations,
         bool value,
         int stage_groups,
-        int tail_groups) {
+        int tail_groups,
+        bool eager_records) {
     extern __shared__ float shared[];
     const int head = blockIdx.x;
 
@@ -1020,7 +1041,7 @@ static __global__ void kvarn_store_kernel_lowshmem(
         }
 
         const int stage_base = stream * KVAR_N_DIM * stage_groups;
-        if (group > tail_groups && pos == 0) {
+        if (!eager_records && group > tail_groups && pos == 0) {
             const int flush_group = group - tail_groups;
             const int flush_record_group = stream * groups_per_stream + flush_group;
             uint8_t * record = records + (flush_record_group * n_heads + head) * record_bytes;
@@ -1033,6 +1054,12 @@ static __global__ void kvarn_store_kernel_lowshmem(
         stage[(stage_pos * n_heads + head) * KVAR_N_DIM + threadIdx.x] =
             __float2half_rn(shared[threadIdx.x]);
         __syncthreads();
+        if (eager_records && pos == KVAR_N_DIM - 1 && group > 0) {
+            const int record_group = stream * groups_per_stream + group;
+            uint8_t * record = records + ((int64_t) record_group * n_heads + head) * record_bytes;
+            kvarn_quantize_stage_lowshmem(stage, record, n_heads, head, stage_base, group,
+                    bits, iterations, value, tail_groups, shared);
+        }
     }
 }
 
@@ -1435,6 +1462,7 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const int head_slices = head_slices_param > 0 ? head_slices_param : 1;
     const int stage_groups = kvarn_resolve_stage_groups(dst);
     const int tail_groups = kvarn_resolve_tail_groups(dst, stage_groups);
+    const bool eager_records = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_EAGER_RECORDS) != 0;
     GGML_ASSERT(ggml_cuda_kvarn_valid_bits(bits));
     GGML_ASSERT(head_slices == 1 || head_slices == 2 || head_slices == 4);
     GGML_ASSERT((KVAR_N_TILE_VALUES * bits) % 8 == 0);
@@ -1480,14 +1508,16 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         workspace_hint &&
         active_streams > 0 &&
         active_streams <= n_stream &&
-        grid_fits;
+        grid_fits &&
+        !eager_records;
     const bool use_direct =
         smpbo >= KVAR_N_SHARED_BYTES &&
         head_slices == 1 &&
         direct_hint &&
         active_streams > 0 &&
         active_streams <= n_stream &&
-        n_tokens <= 65535;
+        n_tokens <= 65535 &&
+        !eager_records;
     if (head_slices > 1 && use_workspace) {
 #if defined(GGML_USE_HIP)
         CUDA_CHECK(hipFuncSetAttribute(
@@ -1592,6 +1622,7 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             stage_groups,
             tail_groups,
             head_slices,
+            eager_records,
             workspace_valid.get());
         kvarn_prof_end(prof, stream);
         return;
@@ -1626,6 +1657,7 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             stage_groups,
             tail_groups,
             head_slices,
+            eager_records,
             nullptr);
         kvarn_prof_end(prof, stream);
         return;
@@ -1720,6 +1752,7 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             swa,
             stage_groups,
             tail_groups,
+            eager_records,
             workspace_valid.get());
         kvarn_prof_end(prof, stream);
         return;
@@ -1802,6 +1835,7 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             swa,
             stage_groups,
             tail_groups,
+            eager_records,
             nullptr);
         kvarn_prof_end(prof, stream);
     } else {
@@ -1822,7 +1856,8 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             iterations,
             value,
             stage_groups,
-            tail_groups);
+            tail_groups,
+            eager_records);
         kvarn_prof_end(prof, stream);
     }
 }

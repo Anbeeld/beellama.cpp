@@ -127,7 +127,6 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                 __func__, llama_kvarn_type_name(kvarn.type), llama_kvarn_type_name(kvarn_swa.type));
     }
 
-    bool warned_kvarn_tail = false;
     auto make_cache = [&](uint32_t size, uint32_t n_swa, llama_swa_type swa_type,
                           const layer_filter_cb & layer_filter, llama_memory_t cache_mem_other,
                           const llama_kvarn_params & cache_kvarn) -> std::unique_ptr<llama_memory_i> {
@@ -136,17 +135,27 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         const bool kvarn_ok = cache_kvarn.type != LLAMA_KVARN_TYPE_DISABLED &&
             !(n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE && n_seq_max > 1 && !unified);
         if (kvarn_ok) {
-            const uint32_t requested_tail = n_swa > 0 ? tail_tokens_swa : tail_tokens;
-            if (requested_tail > 0 && !warned_kvarn_tail) {
-                LLAMA_LOG_WARN("%s: standard KV tail is ignored by KVarN cache components; standard components still apply it\n", __func__);
-                warned_kvarn_tail = true;
+            const uint32_t exact_tokens = n_swa > 0 ? tail_tokens_swa : tail_tokens;
+            const uint32_t exact_requested = n_swa > 0 ? tail_tokens_swa_requested : tail_tokens_requested;
+            const uint32_t visibility_window = n_swa > 0 ? std::min(size, n_swa) : size;
+            if (exact_tokens >= visibility_window) {
+                // Full-window precision has one native exact representation;
+                // do not allocate structured records that would never be read.
+                // The requested tail type becomes the native cache type; an
+                // additional overlay would duplicate every visible token.
+                return std::make_unique<llama_kv_cache>(
+                        model, hparams, tail_type, tail_type,
+                        v_trans, offload, unified, size, n_seq_max, n_pad,
+                        n_swa, swa_type, nullptr, layer_filter, reuse, nullptr,
+                        n_ubatch, 0, tail_type, 0);
             }
             // Structured KVarN records do not participate in cross-context
             // sharing, so cache_mem_other and share are intentionally omitted.
             return std::make_unique<llama_kv_cache_kvarn>(
                     model, hparams, cache_kvarn, offload, unified,
                     size, n_seq_max, n_batch, n_ubatch, n_pad,
-                    n_swa, swa_type, layer_filter, reuse);
+                    n_swa, swa_type, layer_filter, reuse,
+                    exact_tokens, tail_type, exact_requested);
         }
 
         return std::make_unique<llama_kv_cache>(

@@ -419,6 +419,7 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
     ggml_cuda_pool & pool = ctx.pool();
     ggml_cuda_pool_alloc<float2> body_meta_alloc(pool, n_body_rows);
     ggml_cuda_pool_alloc<float2> tail_meta_alloc(pool, indexed_small ? 1 : n_tail_rows);
+    CUDA_CHECK(cudaMemsetAsync(body_meta_alloc.get(), 0, n_body_rows*sizeof(float2), ctx.stream()));
 
     const size_t kt_elements = size_t(d_k)*tail_stride*n_head_k*n_active;
     const size_t vt_elements = size_t(d_v)*tail_stride*n_head_v*n_active;
@@ -547,7 +548,13 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
     const size_t body_alloc_size = ggml_cuda_tail_pass_alloc_size(ctx, body_pass);
     ggml_cuda_pool_alloc<uint8_t> body_alloc(pool, body_alloc_size);
     body_pass.data = body_alloc.get();
-    ggml_cuda_flash_attn_ext_dispatch(ctx, &body_pass);
+    if (ggml_cuda_flash_attn_ext_kvarn_uses_views(&body_pass)) {
+        if (!ggml_cuda_flash_attn_ext_kvarn(ctx, &body_pass)) {
+            GGML_ABORT("unsupported structured body in exact-tail attention");
+        }
+    } else {
+        ggml_cuda_flash_attn_ext_dispatch(ctx, &body_pass);
+    }
 
     if (indexed_small) {
         float scale = 1.0f;

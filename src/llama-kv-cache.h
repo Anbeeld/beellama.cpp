@@ -121,7 +121,8 @@ public:
                  uint32_t   n_ubatch = 0,
                  uint32_t   tail_tokens = 0,
                 ggml_type   tail_type = GGML_TYPE_F16,
-                 uint32_t   tail_tokens_requested = UINT32_MAX);
+                 uint32_t   tail_tokens_requested = UINT32_MAX,
+                     bool   tail_metadata_only = false);
 
     ~llama_kv_cache() = default;
 
@@ -213,6 +214,9 @@ public:
         return tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY ? tail_plan.layout.arena_stride : 0;
     }
     uint32_t get_tail_attention_stride(uint32_t n_query_tokens = 0) const;
+    stream_copy_info take_pending_tail_copies();
+    std::vector<int32_t> state_tail_payload_slots(llama_seq_id seq_id) const;
+    std::vector<std::vector<int32_t>> take_restored_tail_payload_slots();
 
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
@@ -348,6 +352,7 @@ private:
     std::vector<std::vector<uint64_t>> tail_generations;
     uint64_t tail_ordinal = 0;
     std::vector<int64_t> tail_write_slots;
+    std::vector<std::vector<int32_t>> restored_tail_payload_slots;
     uint32_t tail_write_levels = 0;
     bool tail_preparing = false;
     bool tail_planner_timing_enabled = false;

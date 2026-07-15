@@ -1475,7 +1475,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 float2 * dstk_fixup_meta = dstk_fixup + (gridDim.x + blockIdx.x)*ncols;
                 dstk_fixup_meta[jc_cwm] = KQ_cmr;
             }
-            if (!needs_fixup && !is_fixup && dst_final_meta && threadIdx.x < T_B_KQ::I) {
+            if (!is_kvarn_kv && !needs_fixup && !is_fixup && dst_final_meta && threadIdx.x < T_B_KQ::I) {
                 const int j = jc_cwm / ncols2;
                 const int c = jc_cwm % ncols2;
                 if (jt*ncols1 + j < int(ne01.z) && zt_gqa*ncols2 + c < gqa_ratio) {
@@ -1517,7 +1517,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 float2 * dstk_fixup_meta = dstk_fixup + (gridDim.x + blockIdx.x)*ncols;
                 dstk_fixup_meta[jc_cwm] = KQ_cmr;
             }
-            if (!needs_fixup && !is_fixup && dst_final_meta && thread_should_write) {
+            if (!is_kvarn_kv && !needs_fixup && !is_fixup && dst_final_meta && thread_should_write) {
                 const int j = jc_cwm / ncols2;
                 const int c = jc_cwm % ncols2;
                 if (jt*ncols1 + j < int(ne01.z) && zt_gqa*ncols2 + c < gqa_ratio) {
@@ -1593,7 +1593,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             float2 * dstk_fixup_meta = dstk_fixup + (gridDim.x + blockIdx.x)*ncols;
             dstk_fixup_meta[(threadIdx.y/np)*cols_per_warp + threadIdx.x] = make_float2(KQ_cmn, KQ_crs);
         }
-        if (!needs_fixup && !is_fixup && dst_final_meta &&
+        if (!is_kvarn_kv && !needs_fixup && !is_fixup && dst_final_meta &&
                 (cols_per_warp == warp_size || threadIdx.x < cols_per_warp)) {
             const int jc = (threadIdx.y/np)*cols_per_warp + threadIdx.x;
             if (jc < ncols) {

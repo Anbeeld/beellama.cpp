@@ -31,28 +31,30 @@ bool ggml_cuda_flash_attn_ext_kvarn(
 
 #else
 
-static __device__ __forceinline__ int ggml_cuda_fattn_kvarn_live_group_for_thread(
+static __device__ __forceinline__ int ggml_cuda_fattn_kvarn_live_index_for_thread(
         const int64_t * indices,
         const int n_indices,
         const int stream,
         const int groups_per_stream,
         const bool swa) {
-    int live_group = 0;
+    int live_index = 0;
     for (int i = threadIdx.x; i < n_indices; i += blockDim.x) {
         const int64_t idx = indices[i];
         if (swa) {
             if (idx >= 0) {
-                live_group = max(live_group, (int) (idx / GGML_CUDA_FATTN_KVARN_DIM));
+                live_index = max(live_index, (int) idx);
             }
         } else {
             const int group_global = (int) (idx / GGML_CUDA_FATTN_KVARN_DIM);
             const int idx_stream = group_global / groups_per_stream;
             if (idx_stream == stream) {
-                live_group = max(live_group, group_global - stream * groups_per_stream);
+                const int local_index = (group_global - stream * groups_per_stream) *
+                    GGML_CUDA_FATTN_KVARN_DIM + (int) (idx % GGML_CUDA_FATTN_KVARN_DIM);
+                live_index = max(live_index, local_index);
             }
         }
     }
-    return live_group;
+    return live_index;
 }
 
 static __global__ void ggml_cuda_fattn_kvarn_init_descs_kernel(
@@ -69,6 +71,7 @@ static __global__ void ggml_cuda_fattn_kvarn_init_descs_kernel(
         int k_tail_groups,
         int k_bits,
         bool k_swa,
+        bool k_eager_records,
         const uint8_t * v_records,
         const half * v_stage,
         const int64_t * v_indices,
@@ -82,6 +85,7 @@ static __global__ void ggml_cuda_fattn_kvarn_init_descs_kernel(
         int v_tail_groups,
         int v_bits,
         bool v_swa,
+        bool v_eager_records,
         int n_stream,
         int n_kv_heads,
         int slices,
@@ -98,9 +102,9 @@ static __global__ void ggml_cuda_fattn_kvarn_init_descs_kernel(
     const int v_stream = v_stream_start + out_stream;
     __shared__ int k_partial[GGML_CUDA_FATTN_KVARN_DIM];
     __shared__ int v_partial[GGML_CUDA_FATTN_KVARN_DIM];
-    k_partial[threadIdx.x] = ggml_cuda_fattn_kvarn_live_group_for_thread(
+    k_partial[threadIdx.x] = ggml_cuda_fattn_kvarn_live_index_for_thread(
         k_indices, k_n_indices, k_stream, k_groups_per_stream, k_swa);
-    v_partial[threadIdx.x] = ggml_cuda_fattn_kvarn_live_group_for_thread(
+    v_partial[threadIdx.x] = ggml_cuda_fattn_kvarn_live_index_for_thread(
         v_indices, v_n_indices, v_stream, v_groups_per_stream, v_swa);
     __syncthreads();
 
@@ -122,7 +126,8 @@ static __global__ void ggml_cuda_fattn_kvarn_init_descs_kernel(
         k_desc.stage = k_stage;
         k_desc.indices = k_indices;
         k_desc.n_record_heads = k_n_record_heads;
-        k_desc.live_group = k_partial[0];
+        k_desc.live_group = k_partial[0] / GGML_CUDA_FATTN_KVARN_DIM;
+        k_desc.live_pos = k_partial[0] % GGML_CUDA_FATTN_KVARN_DIM;
         k_desc.stream = k_stream;
         k_desc.head_base = h * slices;
         k_desc.groups_per_stream = k_groups_per_stream;
@@ -133,6 +138,7 @@ static __global__ void ggml_cuda_fattn_kvarn_init_descs_kernel(
         k_desc.value = 0;
         k_desc.swa = k_swa ? 1 : 0;
         k_desc.head_slices = k_head_slices;
+        k_desc.eager_records = k_eager_records ? 1 : 0;
         k_desc.original_domain = k_original_domain;
 
         ggml_cuda_fattn_kvarn_desc & v_desc = v_descs[(size_t) out_stream * n_kv_heads + h];
@@ -140,7 +146,8 @@ static __global__ void ggml_cuda_fattn_kvarn_init_descs_kernel(
         v_desc.stage = v_stage;
         v_desc.indices = v_indices;
         v_desc.n_record_heads = v_n_record_heads;
-        v_desc.live_group = v_partial[0];
+        v_desc.live_group = v_partial[0] / GGML_CUDA_FATTN_KVARN_DIM;
+        v_desc.live_pos = v_partial[0] % GGML_CUDA_FATTN_KVARN_DIM;
         v_desc.stream = v_stream;
         v_desc.head_base = h * slices;
         v_desc.groups_per_stream = v_groups_per_stream;
@@ -151,6 +158,7 @@ static __global__ void ggml_cuda_fattn_kvarn_init_descs_kernel(
         v_desc.value = 1;
         v_desc.swa = v_swa ? 1 : 0;
         v_desc.head_slices = v_head_slices;
+        v_desc.eager_records = v_eager_records ? 1 : 0;
         v_desc.original_domain = v_original_domain;
     }
 }
@@ -176,6 +184,7 @@ void ggml_cuda_fattn_kvarn_init_descs(
         plan.k.tail_groups,
         plan.k.bits,
         plan.k.swa,
+        plan.k.eager_records,
         (const uint8_t *) plan.v.records->data,
         (const half *) plan.v.stage->data,
         (const int64_t *) plan.v.indices->data,
@@ -189,6 +198,7 @@ void ggml_cuda_fattn_kvarn_init_descs(
         plan.v.tail_groups,
         plan.v.bits,
         plan.v.swa,
+        plan.v.eager_records,
         plan.n_stream,
         plan.n_kv_heads,
         plan.slices,
@@ -657,11 +667,16 @@ bool ggml_cuda_flash_attn_ext_kvarn(
         return false;
     }
 
-    if (ggml_cuda_flash_attn_ext_kvarn_vec(ctx, dst, plan)) {
-        return true;
-    }
-    if (ggml_cuda_flash_attn_ext_kvarn_decode(ctx, dst, plan)) {
-        return true;
+    // Exact-tail attention needs the body's max/rowsum metadata. The MMA
+    // split/combine path already produces it; the decode-specialized kernels
+    // intentionally keep their lean output-only ABI.
+    if (dst->src[8] == nullptr) {
+        if (ggml_cuda_flash_attn_ext_kvarn_vec(ctx, dst, plan)) {
+            return true;
+        }
+        if (ggml_cuda_flash_attn_ext_kvarn_decode(ctx, dst, plan)) {
+            return true;
+        }
     }
 
     ggml_cuda_flash_attn_ext_mma_kvarn(ctx, dst);

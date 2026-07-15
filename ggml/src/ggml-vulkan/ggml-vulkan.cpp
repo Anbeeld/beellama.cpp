@@ -1233,6 +1233,7 @@ struct vk_op_kvarn_store_push_constants {
     uint32_t swa;
     uint32_t stage_groups;
     uint32_t tail_groups;
+    uint32_t eager_records;
 };
 static_assert(sizeof(vk_op_kvarn_store_push_constants) <= 128,
         "sizeof(vk_op_kvarn_store_push_constants) must be <= 128");
@@ -3842,6 +3843,7 @@ static constexpr int KVAR_N_OP_PARAM_STORE_VALUE = 2;
 static constexpr int KVAR_N_OP_PARAM_STORE_SWA = 4;
 static constexpr int KVAR_N_OP_PARAM_STAGE_GROUPS = 7;
 static constexpr int KVAR_N_OP_PARAM_TAIL_GROUPS = 8;
+static constexpr int KVAR_N_OP_PARAM_EAGER_RECORDS = 9;
 
 static bool ggml_vk_kvarn_stage_shape_valid(const ggml_tensor * stage, const ggml_tensor * records, int stage_groups) {
     if (stage_groups < 2 || stage->ne[2] % (KVAR_N_GROUP * stage_groups) != 0) {
@@ -9567,6 +9569,7 @@ static void ggml_vk_kvarn_store(ggml_backend_vk_context * ctx, vk_context& subct
     const int stage_groups = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_STAGE_GROUPS);
     const int tail_groups_param = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_TAIL_GROUPS);
     const int tail_groups = tail_groups_param > 0 ? tail_groups_param : stage_groups - 1;
+    const bool eager_records = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_EAGER_RECORDS) != 0;
     GGML_ASSERT(ggml_vk_kvarn_valid_bits(bits));
     GGML_ASSERT(stage_groups >= 2);
     GGML_ASSERT(tail_groups >= 1 && tail_groups <= stage_groups);
@@ -9591,6 +9594,7 @@ static void ggml_vk_kvarn_store(ggml_backend_vk_context * ctx, vk_context& subct
         swa ? 1u : 0u,
         (uint32_t) stage_groups,
         (uint32_t) tail_groups,
+        eager_records ? 1u : 0u,
     };
 
     const vk_subbuffer current_buf = ggml_vk_tensor_subbuffer(ctx, current);
@@ -17392,6 +17396,13 @@ static bool ggml_backend_vk_kvarn_native_ops(ggml_backend_dev_t dev) {
     return false;
 }
 
+static const ggml_tensor * ggml_backend_vk_kvarn_view_base(const ggml_tensor * tensor) {
+    while (tensor != nullptr && (tensor->op == GGML_OP_RESHAPE || tensor->op == GGML_OP_PERMUTE)) {
+        tensor = tensor->src[0];
+    }
+    return tensor != nullptr && tensor->op == GGML_OP_KVARN_VIEW ? tensor : nullptr;
+}
+
 static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
     const vk_device& device = ggml_vk_get_device(ctx->device);
@@ -17537,7 +17548,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 // Attached exact-tail acceleration is CUDA-only. Vulkan uses
                 // the backend-native generic tail graph instead, and must not
                 // silently ignore the attached tail operands.
-                if (op->src[5] != nullptr) {
+                if (op->src[5] != nullptr ||
+                        ggml_backend_vk_kvarn_view_base(op->src[1]) != nullptr ||
+                        ggml_backend_vk_kvarn_view_base(op->src[2]) != nullptr) {
                     return false;
                 }
                 bool coopmat2 = device->coopmat2;

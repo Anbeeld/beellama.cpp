@@ -3,6 +3,7 @@
 #include "llama-kv-cache.h"
 #include "llama-kvarn.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <unordered_map>
@@ -12,6 +13,43 @@ struct llama_hparams;
 struct llama_model;
 
 bool llama_kvarn_backend_supports_native_ops(ggml_backend_dev_t dev);
+
+struct llama_kvarn_tail_policy {
+    uint32_t raw_requested_tokens;
+    uint32_t requested_tokens;
+    uint32_t effective_tokens;
+    uint32_t exact_groups;
+    bool native_exact;
+};
+
+inline llama_kvarn_tail_policy llama_kvarn_tail_policy_for(
+        uint32_t raw_requested_tokens,
+        uint32_t effective_window) {
+    constexpr uint32_t group_size = 128;
+    if (effective_window == 0) {
+        return { raw_requested_tokens, 0, 0, 0, true };
+    }
+
+    const uint32_t intrinsic = std::min(group_size, effective_window);
+    const uint64_t rounded = raw_requested_tokens == 0 ? 0 :
+        ((uint64_t(raw_requested_tokens) + group_size - 1u) / group_size) * group_size;
+    const uint32_t explicit_tokens = uint32_t(std::min<uint64_t>(rounded, effective_window));
+    const uint32_t effective_tokens = std::max(intrinsic, explicit_tokens);
+    return {
+        raw_requested_tokens,
+        effective_tokens,
+        effective_tokens,
+        (effective_tokens + group_size - 1u) / group_size,
+        effective_tokens == effective_window,
+    };
+}
+
+// Completed groups are committed eagerly. Only the currently incomplete group
+// needs persistent quantization workspace, regardless of physical ubatch size.
+inline uint32_t llama_kvarn_workspace_groups(uint32_t n_ubatch) {
+    GGML_UNUSED(n_ubatch);
+    return 1;
+}
 
 inline uint32_t llama_kvarn_non_swa_tail_groups(uint32_t n_batch, uint32_t n_ubatch) {
     GGML_UNUSED(n_batch);
@@ -46,6 +84,13 @@ public:
 
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const override;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const override;
+    ggml_tensor * get_k_tail(ggml_context * ctx, int32_t il) const override;
+    ggml_tensor * get_v_tail(ggml_context * ctx, int32_t il) const override;
+    uint32_t get_tail_slots() const override;
+    uint32_t get_tail_tokens() const override;
+    uint32_t get_tail_arena_stride() const override;
+    uint32_t get_tail_attention_stride(uint32_t n_query_tokens = 0) const override;
+    bool can_pack_tail_body(const llama_ubatch & ubatch) const override;
     ggml_tensor * get_k_native(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v_native(ggml_context * ctx, int32_t il) const;
 
@@ -59,18 +104,37 @@ public:
 
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const override;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const override;
+    ggml_tensor * cpy_k_with_tail(
+            ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs,
+            ggml_tensor * tail_idxs, int32_t il) const override;
+    ggml_tensor * cpy_v_with_tail(
+            ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs,
+            ggml_tensor * tail_idxs, int32_t il) const override;
+    ggml_tensor * cpy_k_tail(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * tail_idxs, int32_t il) const override;
+    ggml_tensor * cpy_v_tail(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * tail_idxs, int32_t il) const override;
 
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const override;
     ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const override;
+    ggml_tensor * build_input_tail_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const override;
+    ggml_tensor * build_input_tail_body_idxs(ggml_context * ctx) const override;
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const override;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const override;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const override;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const override;
+    void set_input_tail_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const override;
+    void set_input_tail_body_idxs(ggml_tensor * dst) const override;
     void set_input_k_idxs_backend(ggml_tensor * dst, const llama_ubatch * ubatch) const override;
     void set_input_v_idxs_backend(ggml_tensor * dst, const llama_ubatch * ubatch) const override;
     void set_input_k_shift(ggml_tensor * dst) const override;
     void set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const override;
+    void set_input_kq_mask_tail(
+            ggml_tensor * body, ggml_tensor * exact,
+            ggml_tensor * read_idxs, ggml_tensor * body_read_idxs, ggml_tensor * bias_read_idxs,
+            const llama_ubatch * ubatch) const override;
+    void set_input_tail_body_plan(
+            ggml_tensor * query_order, ggml_tensor * run_desc,
+            ggml_tensor * body_mask, const llama_ubatch * ubatch) const override;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const override;
     void set_input_k_rot(ggml_tensor * dst) const override;
     void set_input_v_rot(ggml_tensor * dst) const override;
@@ -105,7 +169,10 @@ public:
             uint32_t n_swa = 0,
             llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE,
             const layer_filter_cb & filter = nullptr,
-            const layer_reuse_cb & reuse = nullptr);
+            const layer_reuse_cb & reuse = nullptr,
+            uint32_t tail_tokens = 0,
+            ggml_type tail_type = GGML_TYPE_F16,
+            uint32_t tail_tokens_requested = UINT32_MAX);
 
     llama_memory_context_ptr init_batch(
             llama_batch_allocr & balloc,
@@ -133,6 +200,13 @@ public:
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
+    uint32_t get_kv_tail_group_count() const override { return 1; }
+    bool get_kv_tail_coverage(
+            uint32_t group_index,
+            llama_seq_id seq_id,
+            llama_kv_tail_coverage_info & out) const override;
+    void reset_kv_tail_planner_timing() override;
+    uint64_t get_kv_tail_planner_timing_ns() const override;
 
     bool requires_state_for_partial_restore() const override;
     bool state_seq_restore_requires_exclusive_kv_stream() const override;
@@ -146,19 +220,15 @@ public:
     bool is_swa() const { return swa; }
 
     // Reference-faithful staging keeps one incomplete 128-token group lossless.
-    // Use n_ubatch <= KVAR_N_GROUP so completed groups are not flushed before
-    // queries from the same physical ubatch have consumed them.
+    // Completed records are committed eagerly, so physical ubatch size does not
+    // change the logical exact suffix.
     //   non-SWA tail_groups = 1
-    //   SWA tail_groups     = KVAR_N_SWA_TAIL_GROUPS
+    //   SWA tail_groups     = 2 physical wrap-safety slots
     //   stage_groups        = tail_groups + 1 for non-SWA, tail_groups for SWA
     // The +1 is only the permanent sink slot for non-SWA. SWA has no sink slot,
-    // so all F16 stage groups are live local tail groups. Its record ring also
+    // so both F16 slots are physical quantization workspace. The SWA record ring
     // carries the active ubatch span because early query rows can still attend
-    // older window groups after later rows have flushed newer groups into the
-    // ring. KVarN cache state is versioned to carry stage_groups/tail_groups so
-    // restore can validate the saved layout against the current cache. The W2
-    // gate rejects any layout mismatch; remap for differing save/restore ubatch
-    // is future.
+    // older window groups after later rows advance the ring.
     uint32_t get_stage_groups() const { return stage_groups; }
     uint32_t get_tail_groups()  const { return tail_groups; }
 
@@ -177,6 +247,10 @@ public:
             const llama_kv_cache::slot_info & sinfo,
             bool value,
             ggml_tensor * mat_idxs = nullptr) const;
+    ggml_tensor * get_tail(ggml_context * ctx, int32_t il, bool value) const;
+    ggml_tensor * store_tail(
+            ggml_context * ctx, ggml_tensor * current, ggml_tensor * indices,
+            int32_t il, bool value) const;
 
 private:
     struct layer {
@@ -190,6 +264,8 @@ private:
         ggml_tensor * v_records;
         ggml_tensor * k_stage;
         ggml_tensor * v_stage;
+        ggml_tensor * k_tail;
+        ggml_tensor * v_tail;
         std::vector<ggml_tensor *> k_records_stream;
         std::vector<ggml_tensor *> v_records_stream;
         std::vector<ggml_tensor *> k_stage_stream;
@@ -203,12 +279,15 @@ private:
     const llama_hparams & hparams;
     const llama_kvarn_params params;
     const uint32_t n_stream;
+    const uint32_t n_seq_max;
     // Declaration order matters: stage_groups depends on tail_groups, so
     // tail_groups must be declared first (C++ initializes members in order).
     const uint32_t tail_groups;   // non-SWA scheduler span; SWA fixed local tail
     const uint32_t stage_groups;   // F16 stage depth (non-SWA sink + tail; SWA tail only)
     const bool swa;
     const uint32_t n_groups_per_stream;
+    const uint32_t exact_tail_tokens;
+    const ggml_type exact_tail_type;
 
     std::unique_ptr<llama_kv_cache> metadata;
     std::vector<layer> layers;
