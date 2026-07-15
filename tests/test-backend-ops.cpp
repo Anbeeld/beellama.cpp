@@ -9539,6 +9539,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // publish its final max and denominator before the exact-tail merge.
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, 2, true, false, 0, 0,
         GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 64, false, GGML_TYPE_F16));
+    // Gemma 4 geometry: D512 needs the indexed-small exact-tail kernel for a
+    // 128-token tail because the generic D512 FA route requires KV padding to 256.
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {8, 1}, 4096, 1, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, 128, false, GGML_TYPE_F16));
     // Exact-tail composite contract: every ordered F16/BF16 K/V pair.
     for (const auto tail_types : {
             std::pair{ GGML_TYPE_F16,  GGML_TYPE_F16  },

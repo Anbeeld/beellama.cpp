@@ -6,6 +6,7 @@
 #include <clocale>
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <random>
 #include <vector>
 
@@ -137,6 +138,140 @@ static bool test_tail_state_contract(
         return false;
     }
     LOG("\nPASS: representation-specific full and body-only tail state\n");
+    return true;
+}
+
+static bool test_cross_ubatch_tail_state(
+        llama_model * model, const common_params & params, const llama_tokens & tokens,
+        uint32_t source_ubatch, uint32_t destination_ubatch) {
+    if (params.kv_tail_tokens.empty() ||
+            !std::all_of(params.kv_tail_tokens.begin(), params.kv_tail_tokens.end(), ::isdigit) ||
+            std::stoul(params.kv_tail_tokens) == 0) {
+        return true;
+    }
+
+    auto source_params = common_context_params_to_llama(params);
+    source_params.n_ubatch = source_ubatch;
+    source_params.n_batch = std::max<uint32_t>(source_params.n_batch, source_ubatch);
+    auto destination_params = source_params;
+    destination_params.n_ubatch = destination_ubatch;
+    destination_params.n_batch = std::max<uint32_t>(destination_params.n_batch, destination_ubatch);
+
+    auto source = llama_context_ptr{llama_init_from_model(model, source_params)};
+    auto destination = llama_context_ptr{llama_init_from_model(model, destination_params)};
+    if (!source || !destination) {
+        LOG_ERR("%s: failed to create ubatch %u -> %u contexts\n",
+                __func__, source_ubatch, destination_ubatch);
+        return false;
+    }
+
+    int n_past = 0;
+    if (!common_prompt_batch_decode(source.get(), tokens, int(tokens.size()), n_past,
+            source_params.n_batch, {}, false)) {
+        return false;
+    }
+
+    std::vector<uint8_t> state(llama_state_get_size(source.get()));
+    if (llama_state_get_data(source.get(), state.data(), state.size()) != state.size() ||
+            llama_state_set_data(destination.get(), state.data(), state.size()) != state.size()) {
+        LOG_ERR("%s: full-state transfer failed for ubatch %u -> %u\n",
+                __func__, source_ubatch, destination_ubatch);
+        return false;
+    }
+
+    const llama_token probe = tokens.empty() ? 1 : tokens.back();
+    llama_batch_ptr source_batch(1, 0, 1);
+    llama_batch_ptr destination_batch(1, 0, 1);
+    common_batch_add(source_batch.get(), probe, n_past, {0}, true);
+    common_batch_add(destination_batch.get(), probe, n_past, {0}, true);
+    if (llama_decode(source.get(), source_batch.get()) ||
+            llama_decode(destination.get(), destination_batch.get())) {
+        LOG_ERR("%s: probe decode failed for ubatch %u -> %u\n",
+                __func__, source_ubatch, destination_ubatch);
+        return false;
+    }
+
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const float * expected = llama_get_logits_ith(source.get(), -1);
+    const float * actual = llama_get_logits_ith(destination.get(), -1);
+    double squared_error = 0.0;
+    double squared_reference = 0.0;
+    double max_abs_error = 0.0;
+    for (int32_t i = 0; i < n_vocab; ++i) {
+        const double diff = double(expected[i]) - double(actual[i]);
+        squared_error += diff*diff;
+        squared_reference += double(expected[i])*double(expected[i]);
+        max_abs_error = std::max(max_abs_error, std::fabs(diff));
+    }
+    const double nmse = squared_error/std::max(squared_reference, 1e-30);
+    if (!std::isfinite(nmse) || nmse > 1e-10 || max_abs_error > 1e-4) {
+        LOG_ERR("%s: logits changed for ubatch %u -> %u (nmse=%g max_abs=%g)\n",
+                __func__, source_ubatch, destination_ubatch, nmse, max_abs_error);
+        return false;
+    }
+
+    LOG("\nPASS: logical tail state ubatch %u -> %u\n", source_ubatch, destination_ubatch);
+    return true;
+}
+
+static bool test_kvarn_full_window_native_exact(
+        llama_model * model, const common_params & params, const llama_tokens & tokens) {
+    if (params.kvarn.type == LLAMA_KVARN_TYPE_DISABLED ||
+            params.kv_tail_tokens.empty() ||
+            !std::all_of(params.kv_tail_tokens.begin(), params.kv_tail_tokens.end(), ::isdigit)) {
+        return true;
+    }
+
+    auto candidate_params = common_context_params_to_llama(params);
+    if (candidate_params.n_ctx == 0 || candidate_params.kv_tail_tokens < candidate_params.n_ctx) {
+        return true;
+    }
+
+    auto oracle_params = candidate_params;
+    oracle_params.kvarn = llama_kvarn_default_params();
+    oracle_params.type_k = candidate_params.kv_tail_type;
+    oracle_params.type_v = candidate_params.kv_tail_type;
+    oracle_params.kv_tail_tokens = 0;
+    oracle_params.kv_tail_config = nullptr;
+
+    auto candidate = llama_context_ptr{llama_init_from_model(model, candidate_params)};
+    auto oracle = llama_context_ptr{llama_init_from_model(model, oracle_params)};
+    if (!candidate || !oracle) {
+        LOG_ERR("%s: failed to create promoted/oracle contexts\n", __func__);
+        return false;
+    }
+
+    int candidate_past = 0;
+    int oracle_past = 0;
+    if (!common_prompt_batch_decode(candidate.get(), tokens, int(tokens.size()), candidate_past,
+                candidate_params.n_batch, {}, false) ||
+            !common_prompt_batch_decode(oracle.get(), tokens, int(tokens.size()), oracle_past,
+                oracle_params.n_batch, {}, false)) {
+        LOG_ERR("%s: failed to decode promoted/oracle prompts\n", __func__);
+        return false;
+    }
+
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const float * actual = llama_get_logits_ith(candidate.get(), -1);
+    const float * expected = llama_get_logits_ith(oracle.get(), -1);
+    double squared_error = 0.0;
+    double squared_reference = 0.0;
+    double max_abs_error = 0.0;
+    for (int32_t i = 0; i < n_vocab; ++i) {
+        const double diff = double(actual[i]) - double(expected[i]);
+        squared_error += diff*diff;
+        squared_reference += double(expected[i])*double(expected[i]);
+        max_abs_error = std::max(max_abs_error, std::fabs(diff));
+    }
+    const double nmse = squared_error/std::max(squared_reference, 1e-30);
+    if (!std::isfinite(nmse) || nmse > 1e-10 || max_abs_error > 1e-4) {
+        LOG_ERR("%s: promoted exact cache differs from direct %s cache (nmse=%g max_abs=%g)\n",
+                __func__, ggml_type_name(candidate_params.kv_tail_type), nmse, max_abs_error);
+        return false;
+    }
+
+    LOG("\nPASS: full-window KVarN promotion matches direct %s cache\n",
+            ggml_type_name(candidate_params.kv_tail_type));
     return true;
 }
 
@@ -443,6 +578,13 @@ int main(int argc, char ** argv) {
     }
 
     if (!test_tail_state_contract(model, params, tokens)) {
+        return 1;
+    }
+    if (!test_cross_ubatch_tail_state(model, params, tokens, 128, 512) ||
+            !test_cross_ubatch_tail_state(model, params, tokens, 512, 128)) {
+        return 1;
+    }
+    if (!test_kvarn_full_window_native_exact(model, params, tokens)) {
         return 1;
     }
 
