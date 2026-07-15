@@ -2465,7 +2465,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
         {"--kv-tail-tokens"}, "SPEC",
-        "high-precision standard KV-cache tail: 0, auto, N, positional list, or named group list\n"
+        "exact KV-cache tail: 0, auto, N, positional list, or named group list\n"
+        "KVarN always retains an intrinsic 128-token exact suffix\n"
         "(default: 0)",
         [](common_params & params, const std::string & value) {
             parse_kv_tail_tokens(params, value);
@@ -2473,7 +2474,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_KV_TAIL_TOKENS"));
     add_opt(common_arg(
         {"--kv-tail-type"}, "TYPE",
-        "high-precision standard KV-cache tail type: f16 or bf16\n"
+        "exact KV-cache tail type: f16 or bf16\n"
         "(default: f16)",
         [](common_params & params, const std::string & value) {
             parse_kv_tail_type(params, value);

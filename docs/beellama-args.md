@@ -17,28 +17,33 @@ KVarN values are `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`, `kvarn6`, and
 | `--cache-type-k-swa TYPE` | `LLAMA_ARG_CACHE_TYPE_K_SWA` | Same as `--cache-type-k` | Overrides KVarN K precision for SWA layers. Accepts only the six `kvarnN` values, requires target KVarN, and must be paired with the V override. |
 | `--cache-type-v-swa TYPE` | `LLAMA_ARG_CACHE_TYPE_V_SWA` | Same as `--cache-type-v` | Overrides KVarN V precision for SWA layers. Accepts only the six `kvarnN` values, requires target KVarN, and must be paired with the K override. |
 
-## High-precision tail for standard caches
+## Exact tail for quantized caches
 
-The standard-cache tail makes the newest attention-visible entries exact in F16
-or BF16. A partial tail keeps the complete ordinary quantized cache and adds a
-compact shadow. A full-window request may instead promote an owned cache group
-to a native exact body when promotion is supported and costs no more memory than
-the shadow. It applies only to quantized sides of target-model standard
-attention caches. Draft and auxiliary contexts remain at the disabled default,
-and KVarN components warn and ignore it.
+The tail makes the newest attention-visible entries exact in F16 or BF16 for
+standard quantized and KVarN target caches. A partial tail keeps the complete
+quantized body and adds a compact shadow. A full-window request may instead
+promote an owned cache group to one native exact body. Draft and auxiliary
+contexts remain on standard cache types and do not inherit the target tail.
 
 | Argument | Env var | Default | Behavior |
 |---|---|---|---|
-| `--kv-tail-tokens SPEC` | `LLAMA_ARG_KV_TAIL_TOKENS` | `0` | `0` keeps the ordinary cache path. A number applies to every cache group. `N0,N1` follows canonical group order, while `full=N,swa=N` accepts unique role aliases or structural IDs such as `full@l0`. Invalid, duplicate, incomplete, or wrong-length specifications disable every group. `auto` requests 1024 exact tokens for every applicable standard-cache group, capped by that group's effective context or attention window. This is a uniform policy, not a model-specific optimum. |
+| `--kv-tail-tokens SPEC` | `LLAMA_ARG_KV_TAIL_TOKENS` | `0` | For standard caches, `0` keeps the ordinary cache path. For KVarN, omitted or `0` retains the intrinsic 128-token exact suffix. A number applies to every canonical group; KVarN rounds positive values upward to complete 128-token groups. `N0,N1` follows canonical group order, while `full=N,swa=N` accepts unique role aliases or structural IDs such as `full@l0`. Invalid, duplicate, incomplete, or wrong-length specifications resolve additional coverage to zero, while KVarN still retains its intrinsic suffix. `auto` requests 1024 exact tokens per applicable target-cache group, capped by that group's effective context or attention window. |
 | `--kv-tail-type TYPE` | `LLAMA_ARG_KV_TAIL_TYPE` | `f16` | Selects `f16` or `bf16` exact storage for overlay shadows or a promoted native-exact body. Other types are rejected. |
 
 Explicit values are capped by the group's effective attention window and context
-capacity. Startup logs show the structural group ID, participating layers,
-requested and effective lengths, selected overlay or native-exact
+capacity. KVarN values are also rounded upward to 128-token groups. Startup logs
+show raw, requested, effective, and window lengths, the structural group ID,
+participating layers, selected overlay or native-exact
 representation, actual body and shadow types, physical rows, arena and sink
 rows, and memory increments. Only a quantized K side receives an added K
 shadow, and only a quantized V side receives an added V shadow. A native-exact
 group has no shadow or tail planner because its ordinary body is exact.
+
+KVarN's physical staging depth is independent of this logical policy. Increasing
+`-ub` may increase transient work but never increases exact coverage. Completed
+128-token records are committed eagerly, while exact K/V payloads remain live
+only for the resolved suffix. Full-window promotion uses `--kv-tail-type` for
+both native K and V and allocates no KVarN records or overlay.
 
 SWA groups keep the upstream-aligned physical `W + U` allocation, where `W` is
 the sliding window and `U` is the ubatch reserve. Exact-tail selection does not
@@ -55,6 +60,12 @@ that state into a tail-enabled context is valid, but the coverage API reports
 `LLAMA_KV_TAIL_DEGRADED_BODY_ONLY_STATE` until new writes refill the recent
 window. Server metrics expose requested/exact token totals, complete/partial/no
 coverage group counts, and degraded-sequence counts.
+
+KVarN state version 12 stores logical compressed records and exact payloads
+independently of ubatch workspace, so state may move between `ub=128` and
+`ub=512`. It rejects version 11 rather than reinterpreting the old
+workspace-dependent layout. Tail length, type, preset, and structural-group
+mismatches also fail closed.
 
 ## DFlash and adaptive draft depth
 

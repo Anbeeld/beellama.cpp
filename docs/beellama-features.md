@@ -10,7 +10,10 @@ for exact names, environment variables, defaults, and validation ranges.
 
 KVarN compresses a target model's K and V cache into structured 2-, 3-, 4-,
 5-, 6-, or 8-bit records. K and V widths are independent, and supported Qwen
-3.6 and Gemma 4 SWA layers can use a separate KVarN pair.
+3.6 and Gemma 4 SWA layers can use a separate KVarN pair. Every KVarN group
+keeps the paper-defined exact 128-token sink and newest 128-token suffix around
+its compressed body. The physical ubatch controls only temporary workspace; it
+never enlarges that logical exact suffix.
 
 ### When to use it
 
@@ -24,6 +27,17 @@ quality and speed of the exact model and context you plan to serve.
 - [`--cache-type-v`](beellama-args.md#kvarn-cache-types-and-swa-overrides)
 - [`--cache-type-k-swa`](beellama-args.md#kvarn-cache-types-and-swa-overrides)
 - [`--cache-type-v-swa`](beellama-args.md#kvarn-cache-types-and-swa-overrides)
+- [`--kv-tail-tokens`](beellama-args.md#exact-tail-for-quantized-caches)
+- [`--kv-tail-type`](beellama-args.md#exact-tail-for-quantized-caches)
+
+With KVarN, omitted `--kv-tail-tokens` and numeric `0` both retain the
+intrinsic 128-token exact suffix. A positive request enlarges that suffix,
+rounding upward to complete 128-token KVarN groups and capping at the group's
+full or SWA visibility window. `auto`, positional lists, named roles, and
+structural group IDs use the same group resolution as standard-cache tails.
+F16 is the paper-faithful default; BF16 is an explicit supported alternative.
+A request covering the whole group uses one native F16/BF16 cache instead of
+allocating compressed records plus a redundant exact overlay.
 
 ### Measurement and validation
 
@@ -75,16 +89,17 @@ The user-facing `q2_0` cache name must not be treated as upstream's Q2_0 weight
 format. A requested CUDA FlashAttention pair must be compiled by the selected
 build tier.
 
-## Optional exact tail for standard quantized caches
+## Exact tails for quantized caches
 
 ### What it is
 
 `--kv-tail-tokens` makes the newest attention-visible entries exact in F16 or
-BF16. A partial request overlays a compact exact shadow while retaining the
-complete selected standard quantized cache. A request covering a group's full
+BF16 for standard quantized and KVarN target caches. A partial request overlays
+a compact exact shadow while retaining the complete selected quantized cache.
+A request covering a group's full
 visibility window may instead promote its owned body to native F16/BF16 when
 that representation is supported and its memory increment is no greater than
-the overlay. Shared quantized bodies are never promoted. Source selection is
+the overlay. Shared standard bodies are never promoted. Source selection is
 per query, so a 512-token prefill does not make the same 512 rows exact for
 every query. Body and tail logits share one FP32 softmax; the runtime does not
 normalize two attention results independently.
@@ -98,6 +113,15 @@ FlashAttention normalization metadata; the generic graph gathers only the
 configured compact tail width. Neither overlay route materializes the full
 cache. Native-exact groups use the ordinary body graph and allocate no shadow.
 
+KVarN differs from standard caches in three intentional ways. Its exact suffix
+has a non-disableable 128-token floor, positive requests round upward to 128
+tokens, and completed compressed records are written eagerly even while their
+tokens coexist in the exact suffix. The KVarN body exports its FP32 row maximum
+and denominator to the same tail merge used by ordinary FlashAttention. Sink,
+body, and suffix masks therefore contribute each key exactly once. F16/BF16
+canonical K/V rows are stored after RoPE for K and in the original V domain;
+the compressed body retains KVarN's rotated-domain records.
+
 SWA storage remains upstream-aligned at `W + U` physical rows (window plus
 ubatch reserve); this feature does not compact the SWA ring. Sparse packing of
 generic body rows is enabled only when the complete physical stream fits in the
@@ -107,20 +131,21 @@ used.
 
 ### When to use it
 
-Use the tail when q2 through q8 standard caches save needed context memory but
-recent-token quantization changes quality. Start with 64, 128, or 256 tokens and
-measure the exact model and workload. Larger values read more F16/BF16 data and
-are not performance-neutral.
+Use the tail when a quantized cache saves needed context memory but recent-token
+quantization changes quality. For standard q2 through q8 caches, start with 64,
+128, or 256 tokens. For KVarN, the starting point is its intrinsic 128-token
+suffix; try 512 or 1024 only after measuring the exact model and workload.
+Larger values read more F16/BF16 data and are not performance-neutral.
 
-`auto` requests 1024 exact tokens for every applicable canonical standard-cache
+`auto` requests 1024 exact tokens for every applicable canonical target-cache
 group and caps each request by that group's effective context or attention
 window. It is deliberately architecture-agnostic and is not a claim that 1024
 is the quality or performance optimum for a particular model.
 
 ### Key arguments and APIs
 
-- [`--kv-tail-tokens`](beellama-args.md#high-precision-tail-for-standard-caches)
-- [`--kv-tail-type`](beellama-args.md#high-precision-tail-for-standard-caches)
+- [`--kv-tail-tokens`](beellama-args.md#exact-tail-for-quantized-caches)
+- [`--kv-tail-type`](beellama-args.md#exact-tail-for-quantized-caches)
 - `llama_kv_tail_config_*` for model-bound group discovery and overrides
 - `llama_kv_tail_get_coverage` for per-sequence, per-group coverage
 - `llama_kv_tail_get_coverage_aggregate` for context/server aggregation
@@ -129,19 +154,23 @@ is the quality or performance optimum for a particular model.
 Implementation decisions and non-local hardware verification packages are in
 [`development/std-quant-kv-tail.md`](development/std-quant-kv-tail.md) and
 [`development/std-quant-kv-tail-backend-verification.md`](development/std-quant-kv-tail-backend-verification.md).
+KVarN-specific workspace, attention, and state decisions are in
+[`development/kvarn-exact-tail.md`](development/kvarn-exact-tail.md).
 
 ### State and compatibility
 
-The default length is zero. That path preserves the ordinary topology and
-allocation, builds no tail inputs, and retains ordinary FlashAttention
-dispatch. Overlay states reject a different structural group, resolved length,
-representation, or F16/BF16 type. Native-exact state is already present in the
-ordinary body and has no duplicate shadow section. A preceding unframed
-body-only state and an explicit framed body-only state remain loadable into an
-overlay context; both begin with observable degraded coverage and refill from
-original activations on later writes. Dequantized body rows are never labeled
-exact. Server metrics report requested and exact tokens, coverage group states,
-and degraded sequences.
+For standard caches, the default length is zero and preserves the ordinary
+topology. KVarN always resolves at least its intrinsic 128-token suffix.
+Overlay states reject a different structural group, resolved length,
+representation, KVarN preset, or F16/BF16 type. Native-exact state is already
+present in the ordinary body and has no duplicate shadow section. Standard
+body-only compatibility state and explicit body-only state begin with
+observable degraded coverage and refill from original activations on later
+writes. KVarN state version 12 stores logical compressed records plus exact
+payloads and remaps physical workspace on restore; version 11 is rejected
+because it serialized the old workspace-dependent layout. Dequantized body
+rows are never labeled exact. Server metrics report requested and exact tokens,
+coverage group states, and degraded sequences.
 
 ### Backend routes
 
