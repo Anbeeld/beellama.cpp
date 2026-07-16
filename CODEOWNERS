@@ -7,7 +7,6 @@
 #   - KVarN target KV cache and CUDA/Vulkan kernels
 #   - CUDA FlashAttention KVarN dispatch and low-bit cache support
 #   - Profit-only adaptive DFlash depth and reasoning loop guard
-#   - Legacy DFlash GGUF conversion and fork documentation
 
 # Upstream ggml-org references (retained for paths tracking upstream)
 #
@@ -141,7 +140,6 @@ requirements*.txt                       @CISC
 /tools/server/server-adaptive-dm.h       @Anbeeld
 /tools/server/server-loop-guard.*        @Anbeeld
 /tools/server/server-context.cpp         @Anbeeld
-/scripts/convert-dflash-draft-to-upstream.py @Anbeeld
 /docs/beellama-features.md               @Anbeeld
 /docs/beellama-args.md                   @Anbeeld
 /docs/quickstart-qwen36-dflash.md        @Anbeeld

@@ -324,16 +324,9 @@ cross-build oracle for speculative decoding.
 
 ### Known limitations
 
-The drafter must expose upstream `dflash` metadata and tensor names. Convert a
-historical Bee/buun `dflash-draft` file with:
-
-```text
-python scripts/convert-dflash-draft-to-upstream.py legacy.gguf upstream.gguf --verify
-```
-
-The conversion rewrites metadata and tensor names without requantizing. The
-profit controls apply only to DFlash; upstream simple, EAGLE3, MTP, and n-gram
-modes keep their own defaults.
+The drafter must expose upstream `dflash` architecture metadata and tensor
+names. Other DFlash GGUF schemas are unsupported. The profit controls apply only
+to DFlash; upstream simple, EAGLE3, MTP, and n-gram modes keep their own defaults.
 
 ## Reasoning loop guard and realtime control
 

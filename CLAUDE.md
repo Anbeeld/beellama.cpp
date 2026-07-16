@@ -12,9 +12,8 @@ keeps a small set of maintained extensions:
 
 The speculative implementation itself is upstream llama.cpp. Use
 `--spec-type draft-dflash`; `--spec-type dflash` is a warned compatibility alias.
-Legacy `dflash-draft` GGUFs can be rewritten with
-`scripts/convert-dflash-draft-to-upstream.py`; pass `--verify` to validate every
-converted tensor type and payload checksum.
+Draft GGUFs must use upstream's `dflash` architecture, metadata, and tensor
+names.
 
 ## Build
 

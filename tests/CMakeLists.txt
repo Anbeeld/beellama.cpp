@@ -40,10 +40,10 @@ if (Python3_Interpreter_FOUND)
     set_property(TEST test-hip-shuffle-compat-static PROPERTY LABELS hip)
 
     add_test(
-        NAME test-convert-dflash-draft-to-upstream
+        NAME test-upstream-dflash-only-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-convert-dflash-draft-to-upstream.py)
-    set_property(TEST test-convert-dflash-draft-to-upstream PROPERTY LABELS main)
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-upstream-dflash-only-static.py)
+    set_property(TEST test-upstream-dflash-only-static PROPERTY LABELS main)
 
     add_test(
         NAME test-server-loop-guard-checkpoint-static

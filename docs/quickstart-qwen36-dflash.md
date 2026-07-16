@@ -17,16 +17,9 @@ the workload needs all 169 standard pairs and all 36 ordered KVarN pairs.
 
 ## 2. Prepare the models
 
-The drafter must be trained for the target model and use upstream `dflash`
-metadata and tensor names. Convert an earlier Bee/buun `dflash-draft` GGUF
-without requantizing it:
-
-```powershell
-python scripts/convert-dflash-draft-to-upstream.py `
-  "D:\models\qwen-dflash-legacy.gguf" `
-  "D:\models\qwen-dflash-upstream.gguf" `
-  --verify
-```
+The drafter must be trained for the exact target model and use upstream
+`dflash` architecture metadata and tensor names. Other DFlash GGUF schemas are
+unsupported.
 
 ## 3. Start the server
 

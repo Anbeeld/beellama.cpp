@@ -109,7 +109,7 @@ behavior. The `--spec-dm-*` rows are Bee server additions.
 | Argument | Env var | Default | Behavior |
 |---|---|---|---|
 | `--spec-type draft-dflash` | `LLAMA_ARG_SPEC_TYPE` | `none` | Enables upstream DFlash. The earlier `dflash` value warns and redirects to `draft-dflash`. |
-| `--spec-draft-model FNAME`, `-md FNAME` | `LLAMA_ARG_SPEC_DRAFT_MODEL` | Unused | Loads the draft GGUF. Historical Bee `dflash-draft` files must first be rewritten with `scripts/convert-dflash-draft-to-upstream.py`. |
+| `--spec-draft-model FNAME`, `-md FNAME` | `LLAMA_ARG_SPEC_DRAFT_MODEL` | Unused | Loads an upstream-format `dflash` draft GGUF. |
 | `--spec-draft-n-max N` | `LLAMA_ARG_SPEC_DRAFT_N_MAX` | Upstream: `3`; omitted DFlash: `dflash.block_size - 1` | Sets the maximum draft depth. An explicit CLI or env value always wins; upstream clamps values above the drafter's trained limit. A block-16 drafter therefore defaults to 15 only when this setting is omitted. |
 | `--spec-draft-n-min N` | `LLAMA_ARG_SPEC_DRAFT_N_MIN` | `0` | Sets the minimum number of draft tokens used by upstream speculation. |
 | `--spec-draft-p-min P`, `--draft-p-min P` | `LLAMA_ARG_SPEC_DRAFT_P_MIN` | `0.0` | Stops an individual greedy draft when its probability falls below `P`; this is independent of the profit controller. |

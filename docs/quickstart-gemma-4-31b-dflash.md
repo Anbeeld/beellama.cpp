@@ -18,15 +18,9 @@ the workload needs all 169 standard pairs and all 36 ordered KVarN pairs.
 
 ## 2. Prepare the models
 
-Use a drafter trained for the exact Gemma target. Convert an earlier Bee/buun
-`dflash-draft` file to upstream metadata and tensor names before launch:
-
-```powershell
-python scripts/convert-dflash-draft-to-upstream.py `
-  "D:\models\gemma4-dflash-legacy.gguf" `
-  "D:\models\gemma4-dflash-upstream.gguf" `
-  --verify
-```
+Use a drafter trained for the exact Gemma target with upstream `dflash`
+architecture metadata and tensor names. Other DFlash GGUF schemas are
+unsupported.
 
 ## 3. Start the server
 

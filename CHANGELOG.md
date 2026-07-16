@@ -5,10 +5,8 @@
 - Merged upstream llama.cpp at `049326a00` and re-based BeeLlama's maintained
   extensions on its current model, memory, speculative, and server architecture.
 - Replaced the fork DFlash stack with upstream `draft-dflash`. `dflash` remains a
-  warned compatibility alias, and `scripts/convert-dflash-draft-to-upstream.py`
-  rewrites historical Bee/buun draft GGUF metadata and tensor names offline.
-  The converter deduplicates equal legacy/canonical metadata, rejects conflicting
-  values, and can reopen the output to verify every tensor type and checksum.
+  warned compatibility alias. Draft GGUFs must use upstream's `dflash`
+  architecture, metadata, and tensor names.
 - Corrected the upstream DFlash draft-context merge so it owns a normal KV cache.
   Without this, draft graph reservation dereferenced a null memory context and
   crashed both normal startup and the default memory-fit probe.
@@ -99,7 +97,7 @@
 
 ## v0.2.0
 
-- Added compatibility with upstream DFlash PR drafter GGUFs that use `general.architecture = dflash`. Bee now keeps this separate from the older `dflash-draft` schema, understands upstream metadata keys such as `dflash.block_size` and `dflash.target_layer_ids`, reads upstream tensor names, and keeps existing Bee/buun draft GGUF naming intact.
+- Added compatibility with upstream DFlash PR drafter GGUFs that use `general.architecture = dflash`, including upstream metadata keys and tensor names.
 - Tightened DFlash draft model discovery and converter behavior. Bee now prefers exact sibling DFlash draft directories, supports nested `dflash_config` metadata, scopes Gemma4 tokenizer handling correctly, and logs clearer DFlash metadata warnings and summaries during conversion.
 - Hardened recurrent memory, prompt-cache restore, and unified-KV scheduling. Recurrent resize now repairs its metadata after shrink/expand, the server shrinks recurrent state before prompt-cache save/load when it is safe, backup-sequence cleanup is tracked correctly, and non-parent tasks defer unified-KV admission so large pending prompts do not over-commit shared cells.
 - Added richer DFlash diagnostics, profiling, and validation. `GGML_DFLASH_PROFILE` now exposes categorized summary/replay/copy/prefill/verify/trace logging, routine decode timing is hidden behind debug logging instead of always printing, the profit controller now logs when it disables speculative depth, drafter/target contract and input validation are stricter, and Bee also exposes targeted debug envs such as `GGML_DFLASH_DEBUG`, `GGML_DFLASH_INPUT_DEBUG`, `GGML_DFLASH_CUDA_DEBUG`, `GGML_DFLASH_FORCE_CPU_CROSS`, `GGML_DFLASH_VERBOSE_CONTRACT`, and `GGML_DFLASH_CRASH_TRACE`.

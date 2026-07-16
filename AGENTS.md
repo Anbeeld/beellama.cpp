@@ -22,9 +22,8 @@ small:
   `/v1/chat/completions/control` endpoint.
 - INI presets and KLD measurement support in `llama-perplexity`.
 
-Historical Bee DFlash GGUFs use a different schema. Convert them offline with
-`scripts/convert-dflash-draft-to-upstream.py`; new code must use upstream's
-`dflash` architecture and tensor names.
+DFlash GGUFs must use upstream's `dflash` architecture, metadata, and tensor
+names.
 
 TurboQuant/TCQ, TQ3_1S/TQ4_1S, DDTree, CopySpec, the fork DFlash ring/tape and
 reduced-verifier paths, the fringe controller, and their arguments and
@@ -86,9 +85,6 @@ Key binaries are `llama-server`, `llama-cli`, `llama-bench`, and
   shader.
 - `tools/server/server-adaptive-dm.h` - profit adaptive draft-max controller.
 - `tools/server/server-loop-guard.cpp` / `.h` - reasoning loop detection.
-- `scripts/convert-dflash-draft-to-upstream.py` - verified legacy DFlash GGUF
-  conversion.
-
 ### Key Docs
 
 - `docs/beellama-features.md` - fork feature and compatibility matrix.
