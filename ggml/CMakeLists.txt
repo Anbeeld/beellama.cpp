@@ -206,15 +206,16 @@ option(GGML_CUDA_NO_PEER_COPY               "ggml: do not use peer to peer copie
 option(GGML_CUDA_NO_VMM                     "ggml: do not try to use CUDA VMM"                OFF)
 option(GGML_CUDA_FA                         "ggml: compile ggml FlashAttention CUDA kernels"  ON)
 option(GGML_CUDA_FA_ALL_QUANTS              "ggml: compile full K/V cache quant pair matrix for FlashAttention"     OFF)
-option(GGML_CUDA_KVARN_FA                   "ggml: compile native KVarN FlashAttention template instances"          ON)
-option(GGML_CUDA_KVARN_FAST_DECODE_ALL_PAIRS "ggml: compile the full KVarN CUDA fast-decode template matrix"       ON)
+option(GGML_CUDA_KVARN                      "ggml: compile CUDA KVarN kernels"                                        ON)
+unset(GGML_CUDA_KVARN_FA CACHE)
+unset(GGML_CUDA_KVARN_FAST_DECODE_ALL_PAIRS CACHE)
 option(GGML_CUDA_GRAPHS                     "ggml: use CUDA graphs (llama.cpp only)"          ${GGML_CUDA_GRAPHS_DEFAULT})
 option(GGML_CUDA_NCCL                       "ggml: use NVIDIA Collective Comm. Library"       ON)
 set   (GGML_CUDA_COMPRESSION_MODE "size" CACHE STRING
                                             "ggml: cuda link binary compression mode; CUDA 12.4-12.7 support size via compress-all")
 set_property(CACHE GGML_CUDA_COMPRESSION_MODE PROPERTY STRINGS "none;speed;balance;size")
 
-set(GGML_CUDA_KVARN_FAST_DECODE_DEFAULT_PAIRS
+set(GGML_CUDA_KVARN_DEFAULT_PAIRS
     k8-v8
     k8-v6
     k8-v5
@@ -232,25 +233,16 @@ set(GGML_CUDA_KVARN_FAST_DECODE_DEFAULT_PAIRS
     k2-v2
 )
 
-list(LENGTH GGML_CUDA_KVARN_FAST_DECODE_DEFAULT_PAIRS GGML_CUDA_KVARN_FAST_DECODE_DEFAULT_PAIR_COUNT)
-if (NOT GGML_CUDA_KVARN_FAST_DECODE_DEFAULT_PAIR_COUNT EQUAL 15)
-    message(FATAL_ERROR "Default KVarN fast decode policy expected 15 pairs, got ${GGML_CUDA_KVARN_FAST_DECODE_DEFAULT_PAIR_COUNT}")
+list(LENGTH GGML_CUDA_KVARN_DEFAULT_PAIRS GGML_CUDA_KVARN_DEFAULT_PAIR_COUNT)
+if (NOT GGML_CUDA_KVARN_DEFAULT_PAIR_COUNT EQUAL 15)
+    message(FATAL_ERROR "Default KVarN fast decode policy expected 15 pairs, got ${GGML_CUDA_KVARN_DEFAULT_PAIR_COUNT}")
 endif()
 
 function(ggml_cuda_select_kvarn_fast_decode_sources OUT_VAR PREFIX)
     set(_sources ${ARGN})
 
-    if (NOT GGML_CUDA_KVARN_FA)
+    if (NOT GGML_CUDA_KVARN)
         list(FILTER _sources EXCLUDE REGEX "fattn-mma-kvarn")
-        set(${OUT_VAR} ${_sources} PARENT_SCOPE)
-        return()
-    endif()
-
-    if (NOT GGML_CUDA_KVARN_FAST_DECODE_ALL_PAIRS)
-        list(FILTER _sources EXCLUDE REGEX "fattn-mma-kvarn-decode-instance-")
-        foreach(PAIR ${GGML_CUDA_KVARN_FAST_DECODE_DEFAULT_PAIRS})
-            list(APPEND _sources "${PREFIX}/fattn-mma-kvarn-decode-instance-${PAIR}.cu")
-        endforeach()
         set(${OUT_VAR} ${_sources} PARENT_SCOPE)
         return()
     endif()
@@ -258,8 +250,6 @@ function(ggml_cuda_select_kvarn_fast_decode_sources OUT_VAR PREFIX)
     if (GGML_CUDA_FA_ALL_QUANTS)
         set(${OUT_VAR} ${_sources} PARENT_SCOPE)
         return()
-    else()
-        set(_pairs ${GGML_CUDA_KVARN_FAST_DECODE_DEFAULT_PAIRS})
     endif()
 
     set(_selected_sources)
@@ -269,7 +259,7 @@ function(ggml_cuda_select_kvarn_fast_decode_sources OUT_VAR PREFIX)
         endif()
     endforeach()
 
-    foreach(PAIR ${_pairs})
+    foreach(PAIR ${GGML_CUDA_KVARN_DEFAULT_PAIRS})
         list(APPEND _selected_sources "${PREFIX}/fattn-mma-kvarn-decode-instance-${PAIR}.cu")
     endforeach()
 

@@ -40,10 +40,10 @@ Backend status is evidence-qualified:
 Source support is not a hardware pass. Any backend that rejects a required
 operation fails context construction instead of silently dropping the tail.
 
-Standard and KVarN CUDA FlashAttention instance policies are independently
-selectable. `GGML_CUDA_FA_ALL_QUANTS=ON` continues to enable every ordered
-standard pair. The standard-tail iteration build sets `GGML_CUDA_KVARN_FA=OFF`,
-which compiles no KVarN FlashAttention translation units or template pairs.
+`GGML_CUDA_KVARN=ON` compiles KVarN CUDA kernels by default, with 15 balanced
+fast-decode pairs in the standard build and all 36 ordered pairs when
+`GGML_CUDA_FA_ALL_QUANTS=ON`. The standard-tail iteration build sets
+`GGML_CUDA_KVARN=OFF`, which compiles no KVarN CUDA kernels or template pairs.
 
 ## Attention decision
 

@@ -165,7 +165,8 @@ Use the same corpus, context, logical batch, and physical ubatch for both KLD le
 
 | Argument | Env var | Default | Behavior |
 |---|---|---|---|
-| `-DGGML_CUDA_FA_ALL_QUANTS=ON` | — | Off | Expands the CUDA vector matrix from 103 to all 169 standard cache pairs and KVarN fast-decode instances from 15 balanced pairs to all 36 ordered bit pairs. Valid KVarN pairs outside the fast matrix use descriptor-native MMA. |
+| `-DGGML_CUDA_FA_ALL_QUANTS=ON` | — | Off | Expands the CUDA vector matrix from 103 to all 169 standard cache pairs and, when `GGML_CUDA_KVARN=ON`, KVarN fast-decode instances from 15 balanced pairs to all 36 ordered bit pairs. Valid KVarN pairs outside the fast matrix use descriptor-native MMA. |
+| `-DGGML_CUDA_KVARN=ON/OFF` | — | On | Compiles or omits all dedicated CUDA KVarN kernels and template instances. When enabled, `GGML_CUDA_FA_ALL_QUANTS` selects 15 default or all 36 fast-decode pairs. |
 
 ## Migration from earlier versions
 
@@ -181,3 +182,4 @@ Use the same corpus, context, logical batch, and physical ubatch for both KLD le
 | `--spec-dflash-default`, `--dflash-max-slots`, `--tree-budget`, `--draft-topk`, `--draft-model`, `--spec-replace`, `--spec-draft-replace` | Removed with the fork DFlash verifier and tree paths. | Use upstream `--spec-*` controls where an equivalent exists. |
 | `--spec-dflash-cross-ctx`, `--spec-branch-budget`, `--spec-draft-temp`, `GGML_DFLASH_*` | Removed with the fork ring, capture, and verifier implementation. | No direct replacement. |
 | `GGML_CUDA_FA_HALF_QUANTS` | Removed. | Use the default matrix or `GGML_CUDA_FA_ALL_QUANTS=ON`. |
+| `GGML_CUDA_KVARN_FA`, `GGML_CUDA_KVARN_FAST_DECODE_ALL_PAIRS` | Removed. | Use the default-on `GGML_CUDA_KVARN`; `GGML_CUDA_FA_ALL_QUANTS` selects 15 or 36 fast-decode pairs. |

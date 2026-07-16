@@ -49,6 +49,7 @@ int main(int argc, char ** argv) {
     const std::string fattn = read_file(root + "/ggml/src/ggml-cuda/fattn.cu");
     const std::string kvarn = read_file(root + "/ggml/src/ggml-cuda/fattn-kvarn-dispatch.cu");
     const std::string cmake = read_file(root + "/ggml/CMakeLists.txt");
+    const std::string cuda_cmake = read_file(root + "/ggml/src/ggml-cuda/CMakeLists.txt");
 
     const auto expect_route = [&](const ggml_cuda_fattn_kvarn_route_input & base,
                                   ggml_cuda_fattn_kvarn_route expected,
@@ -114,7 +115,24 @@ int main(int argc, char ** argv) {
     ok &= expect(kvarn.find("#if defined(GGML_CUDA_FA_ALL_QUANTS)") != std::string::npos &&
                  kvarn.find("GGML_CUDA_FA_HALF_QUANTS") == std::string::npos,
         "KVarN fast decode must have only default and ALL build tiers");
-    ok &= expect(cmake.find("GGML_CUDA_KVARN_FAST_DECODE_DEFAULT_PAIR_COUNT EQUAL 15") != std::string::npos &&
+    ok &= expect(cmake.find("option(GGML_CUDA_KVARN ") != std::string::npos &&
+                 cmake.find("option(GGML_CUDA_KVARN ") < cmake.find(" ON)", cmake.find("option(GGML_CUDA_KVARN ")),
+        "GGML_CUDA_KVARN must be the default-on KVarN CUDA compilation gate");
+    ok &= expect(cmake.find("option(GGML_CUDA_KVARN_FA") == std::string::npos &&
+                 cmake.find("option(GGML_CUDA_KVARN_FAST_DECODE_ALL_PAIRS") == std::string::npos &&
+                 cmake.find("unset(GGML_CUDA_KVARN_FA CACHE)") != std::string::npos &&
+                 cmake.find("unset(GGML_CUDA_KVARN_FAST_DECODE_ALL_PAIRS CACHE)") != std::string::npos &&
+                 cuda_cmake.find("GGML_CUDA_KVARN_FA") == std::string::npos &&
+                 cuda_cmake.find("GGML_CUDA_KVARN_FAST_DECODE_ALL_PAIRS") == std::string::npos &&
+                 kvarn.find("GGML_CUDA_KVARN_FA") == std::string::npos &&
+                 kvarn.find("GGML_CUDA_KVARN_FAST_DECODE_ALL_PAIRS") == std::string::npos,
+        "KVarN CUDA compilation must expose only one KVarN option and clear obsolete cache entries");
+    ok &= expect(cmake.find("if (NOT GGML_CUDA_KVARN)") != std::string::npos &&
+                 cmake.find("if (GGML_CUDA_FA_ALL_QUANTS)") != std::string::npos &&
+                 cuda_cmake.find("if (GGML_CUDA_KVARN)") != std::string::npos &&
+                 kvarn.find("#if !defined(GGML_CUDA_KVARN)") != std::string::npos,
+        "GGML_CUDA_KVARN must gate all KVarN CUDA sources while ALL_QUANTS selects the pair matrix");
+    ok &= expect(cmake.find("GGML_CUDA_KVARN_DEFAULT_PAIR_COUNT EQUAL 15") != std::string::npos &&
                  cmake.find("GGML_CUDA_FA_HALF_QUANTS") == std::string::npos,
         "CMake must retain exactly the 15-pair default KVarN fast-decode policy without HALF");
 

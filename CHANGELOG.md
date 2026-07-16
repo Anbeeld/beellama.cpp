@@ -26,7 +26,9 @@
 - Replaced the three-tier FlashAttention quant build policy with a 103-pair
   default standard vector matrix and a 169-pair `GGML_CUDA_FA_ALL_QUANTS` matrix.
   KVarN keeps 15 balanced fast decode pairs by default and 36 with ALL. The
-  obsolete `GGML_CUDA_FA_HALF_QUANTS` option is gone.
+  default-on `GGML_CUDA_KVARN` option is its only CUDA compilation gate; disabling
+  it omits all dedicated KVarN kernels and templates. The obsolete
+  `GGML_CUDA_FA_HALF_QUANTS` option is gone.
 - Added migration errors for the removed `copyspec`, `suffix`, and `recycle`
   speculative type names, pointing users to `draft-dflash` or upstream n-gram
   modes instead of returning a generic unknown-type message.

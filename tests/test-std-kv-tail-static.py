@@ -219,19 +219,38 @@ def main() -> None:
 
     ggml_cmake = (ROOT / "ggml/CMakeLists.txt").read_text(encoding="utf-8")
     cuda_cmake = (ROOT / "ggml/src/ggml-cuda/CMakeLists.txt").read_text(encoding="utf-8")
+    hip_cmake = (ROOT / "ggml/src/ggml-hip/CMakeLists.txt").read_text(encoding="utf-8")
+    musa_cmake = (ROOT / "ggml/src/ggml-musa/CMakeLists.txt").read_text(encoding="utf-8")
+    cuda_backend = (ROOT / "ggml/src/ggml-cuda/ggml-cuda.cu").read_text(encoding="utf-8")
     kvarn_dispatch = (ROOT / "ggml/src/ggml-cuda/fattn-kvarn-dispatch.cu").read_text(encoding="utf-8")
-    matrix_option = "GGML_CUDA_KVARN_FAST_DECODE_ALL_PAIRS"
-    if matrix_option not in ggml_cmake or matrix_option not in cuda_cmake or matrix_option not in kvarn_dispatch:
-        raise AssertionError("standard and KVarN CUDA instance matrices are not independently selectable")
+    kvarn_option = "GGML_CUDA_KVARN"
+    removed_options = ("GGML_CUDA_KVARN_FA", "GGML_CUDA_KVARN_FAST_DECODE_ALL_PAIRS")
+    kvarn_option_line = next((line for line in ggml_cmake.splitlines()
+                              if line.startswith(f"option({kvarn_option} ")), "")
+    if (not kvarn_option_line.endswith(" ON)") or
+            f"if ({kvarn_option})" not in cuda_cmake or
+            f"defined({kvarn_option})" not in kvarn_dispatch):
+        raise AssertionError("CUDA builds must expose one default-on KVarN compilation gate")
+    if any(f"option({option}" in ggml_cmake or option in cuda_cmake + kvarn_dispatch
+            for option in removed_options):
+        raise AssertionError("obsolete KVarN CUDA compilation options must be removed")
+    if any(f"unset({option} CACHE)" not in ggml_cmake for option in removed_options):
+        raise AssertionError("obsolete KVarN CUDA cache entries must be cleared during reconfiguration")
+    if ("if (GGML_CUDA_FA_ALL_QUANTS)" not in ggml_cmake or
+            "#if defined(GGML_CUDA_FA_ALL_QUANTS)" not in kvarn_dispatch):
+        raise AssertionError("ALL_QUANTS alone must select the full KVarN fast-decode matrix")
+    source_filter = 'EXCLUDE REGEX "kvarn(-wht)?[.]cu$"'
+    if any(source_filter not in backend_cmake for backend_cmake in (cuda_cmake, hip_cmake, musa_cmake)):
+        raise AssertionError("disabling KVarN must omit its dedicated store and WHT CUDA sources")
+    if 'list(FILTER _sources EXCLUDE REGEX "fattn-mma-kvarn")' not in ggml_cmake:
+        raise AssertionError("disabling KVarN must omit all KVarN FlashAttention template instances")
+    if ("#if !defined(GGML_CUDA_KVARN) || defined(GGML_USE_MUSA)" not in cuda_backend or
+            "#if defined(GGML_CUDA_KVARN)\n        case GGML_OP_KVARN_WHT:" not in cuda_backend):
+        raise AssertionError("disabled KVarN kernels must not be advertised or dispatched by CUDA")
 
     default_build = (ROOT / "tmp/build-local-3090-cuda13.1-default.ps1").read_text(encoding="utf-8")
-    kvarn_fa_option = "GGML_CUDA_KVARN_FA"
-    if (f"option({kvarn_fa_option} " not in ggml_cmake or
-            f"if ({kvarn_fa_option})" not in cuda_cmake or
-            f"defined({kvarn_fa_option})" not in kvarn_dispatch):
-        raise AssertionError("CUDA build cannot omit every KVarN FlashAttention template instance")
-    if f"-D{kvarn_fa_option}=OFF" not in default_build:
-        raise AssertionError("default standard-quant iteration build must compile zero KVarN FA pairs")
+    if f"-D{kvarn_option}=OFF" not in default_build:
+        raise AssertionError("default standard-quant iteration build must compile no KVarN CUDA kernels")
 
     ggml_header = (ROOT / "ggml/include/ggml.h").read_text(encoding="utf-8")
     cuda_fattn = (ROOT / "ggml/src/ggml-cuda/fattn.cu").read_text(encoding="utf-8")

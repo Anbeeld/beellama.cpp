@@ -121,7 +121,7 @@ void ggml_cuda_kv_memory_transient_stats_record_tail(
     ggml_cuda_atomic_max(g_kv_mem_tail_total, total_bytes);
 }
 
-#if !defined(GGML_CUDA_KVARN_FA)
+#if !defined(GGML_CUDA_KVARN)
 
 bool ggml_cuda_flash_attn_ext_kvarn_uses_views(const ggml_tensor * dst) {
     return ggml_cuda_fattn_kvarn_uses_views(dst);
@@ -322,7 +322,7 @@ void ggml_cuda_fattn_kvarn_init_descs(
 }
 
 static inline bool ggml_cuda_fattn_kvarn_fast_decode_pair_enabled(int k_bits, int v_bits) {
-#if defined(GGML_CUDA_FA_ALL_QUANTS) && defined(GGML_CUDA_KVARN_FAST_DECODE_ALL_PAIRS)
+#if defined(GGML_CUDA_FA_ALL_QUANTS)
     return ggml_cuda_fattn_kvarn_valid_bits(k_bits) && ggml_cuda_fattn_kvarn_valid_bits(v_bits);
 #else
     switch (k_bits) {
@@ -338,7 +338,7 @@ static inline bool ggml_cuda_fattn_kvarn_fast_decode_pair_enabled(int k_bits, in
 }
 
 // Keep template references in sync with the decoder sources selected by CMake.
-#if defined(GGML_CUDA_FA_ALL_QUANTS) && defined(GGML_CUDA_KVARN_FAST_DECODE_ALL_PAIRS)
+#if defined(GGML_CUDA_FA_ALL_QUANTS)
 #define GGML_CUDA_FATTN_KVARN_FAST_DECODE_DISPATCH_K(DISPATCH_PAIR) \
     do { \
         switch (plan.k.bits) { \
@@ -826,4 +826,4 @@ bool ggml_cuda_flash_attn_ext_kvarn(
     return true;
 }
 
-#endif // GGML_CUDA_KVARN_FA
+#endif // GGML_CUDA_KVARN

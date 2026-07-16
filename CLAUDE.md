@@ -37,7 +37,8 @@ CUDA FlashAttention vector cache coverage has two build modes:
 There is no `GGML_CUDA_FA_HALF_QUANTS` tier. KVarN has 15 balanced fast-decode
 pairs by default and all 36 with `GGML_CUDA_FA_ALL_QUANTS=ON`; every valid KVarN
 bit pair remains available through descriptor-native MMA when it is outside the
-fast matrix.
+fast matrix. `GGML_CUDA_KVARN=OFF` omits all dedicated CUDA KVarN kernels and
+templates.
 
 ## Layout
 

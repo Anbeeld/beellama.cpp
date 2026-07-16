@@ -2263,12 +2263,14 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_SOLVE_TRI:
             ggml_cuda_op_solve_tri(ctx, dst);
             break;
+#if defined(GGML_CUDA_KVARN)
         case GGML_OP_KVARN_WHT:
             ggml_cuda_op_kvarn_wht(ctx, dst);
             break;
         case GGML_OP_KVARN_STORE:
             ggml_cuda_op_kvarn_store(ctx, dst);
             break;
+#endif
         case GGML_OP_FILL:
             ggml_cuda_op_fill(ctx, dst);
             break;
@@ -4606,7 +4608,7 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
 }
 
 static bool ggml_backend_cuda_kvarn_native_ops(ggml_backend_dev_t dev) {
-#if defined(GGML_USE_MUSA)
+#if !defined(GGML_CUDA_KVARN) || defined(GGML_USE_MUSA)
     GGML_UNUSED(dev);
     return false;
 #else
@@ -5105,7 +5107,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_KVARN_WHT:
         case GGML_OP_KVARN_STORE:
+#if defined(GGML_CUDA_KVARN)
             return ggml_backend_cuda_kvarn_native_ops(dev);
+#else
+            return false;
+#endif
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:
