@@ -1301,7 +1301,8 @@ static __global__ void kvarn_store_workspace_flush_kernel(
         bool value,
         int stage_groups,
         int tail_groups,
-        bool swa) {
+        bool swa,
+        bool eager_records) {
     extern __shared__ float shared[];
     const int head = blockIdx.x;
     const int active_stream = blockIdx.y / flush_candidates;
@@ -1328,22 +1329,26 @@ static __global__ void kvarn_store_workspace_flush_kernel(
     const int start_local = first_group * KVAR_N_DIM + first_pos;
     const int end_local = start_local + tokens_per_stream;
     const int boundary_group = (start_local + KVAR_N_DIM - 1) / KVAR_N_DIM + candidate;
-    if (boundary_group * KVAR_N_DIM >= end_local || (swa ? boundary_group < tail_groups : boundary_group <= tail_groups)) {
+    if (boundary_group * KVAR_N_DIM >= end_local) {
         return;
     }
 
-    const int flush_group = boundary_group - tail_groups;
-    if (swa ? flush_group < 0 : (flush_group < 1 || flush_group >= groups_per_stream)) {
+    // Delayed stores seal a group when it leaves the transient stage. Exact-tail
+    // stores instead need a compressed copy as soon as the source tile completes,
+    // even while the canonical exact suffix still shadows that record.
+    const int record_group = eager_records ? boundary_group : boundary_group - tail_groups;
+    if (swa ? record_group < 0 : (record_group < 1 || record_group >= groups_per_stream)) {
         return;
     }
     if (swa) {
-        const int next_same_record_boundary_group = flush_group + groups_per_stream + tail_groups;
+        const int next_same_record_boundary_group =
+            record_group + groups_per_stream + (eager_records ? 0 : tail_groups);
         if (next_same_record_boundary_group * KVAR_N_DIM < end_local) {
             return;
         }
     }
 
-    const int flush_start = flush_group * KVAR_N_DIM;
+    const int flush_start = record_group * KVAR_N_DIM;
     const int stage_base = stream * KVAR_N_DIM * stage_groups;
     float * tile = shared;
     for (int i = threadIdx.x; i < KVAR_N_TILE_VALUES; i += blockDim.x) {
@@ -1356,14 +1361,14 @@ static __global__ void kvarn_store_workspace_flush_kernel(
             const int src_token = token_base + local_pos - start_local;
             tile[i] = __half2float(workspace[((int64_t) src_token * n_heads + head) * KVAR_N_DIM + dim]);
         } else {
-            const int stage_slot = swa ? (flush_group % stage_groups) : 1 + ((flush_group - 1) % tail_groups);
+            const int stage_slot = swa ? (record_group % stage_groups) : 1 + ((record_group - 1) % tail_groups);
             const int stage_pos = stage_base + stage_slot * KVAR_N_DIM + token;
             tile[i] = __half2float(stage[(stage_pos * n_heads + head) * KVAR_N_DIM + dim]);
         }
     }
     __syncthreads();
 
-    const int flush_record_group = stream * groups_per_stream + (swa ? flush_group % groups_per_stream : flush_group);
+    const int flush_record_group = stream * groups_per_stream + (swa ? record_group % groups_per_stream : record_group);
     uint8_t * record = records + ((int64_t) flush_record_group * n_heads + head) * record_bytes;
     kvarn_quantize_tile(record, bits, iterations, shared);
 }
@@ -1508,8 +1513,7 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         workspace_hint &&
         active_streams > 0 &&
         active_streams <= n_stream &&
-        grid_fits &&
-        !eager_records;
+        grid_fits;
     const bool use_direct =
         smpbo >= KVAR_N_SHARED_BYTES &&
         head_slices == 1 &&
@@ -1590,7 +1594,8 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             value,
             stage_groups,
             tail_groups,
-            swa);
+            swa,
+            eager_records);
         dim3 blocks_commit(n_heads, active_streams * KVAR_N_DIM * stage_groups, 1);
         kvarn_store_workspace_commit_kernel<<<blocks_commit, KVAR_N_DIM, 0, stream>>>(
             (const int64_t *) indices->data,
@@ -1721,7 +1726,8 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             value,
             stage_groups,
             tail_groups,
-            swa);
+            swa,
+            eager_records);
         dim3 blocks_commit(n_heads, active_streams * KVAR_N_DIM * stage_groups, 1);
         kvarn_store_workspace_commit_kernel<<<blocks_commit, KVAR_N_DIM, 0, stream>>>(
             (const int64_t *) indices->data,

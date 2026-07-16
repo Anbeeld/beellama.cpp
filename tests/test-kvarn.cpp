@@ -1304,7 +1304,9 @@ static std::vector<ggml_fp16_t> test_store_segmented_output(
         int            head_slices,
         int            total_tokens,
         int            segment_tokens,
-        int            stage_groups) {
+        int            stage_groups,
+        bool           eager_records = false,
+        bool           swa = false) {
     require(total_tokens > 0 && segment_tokens > 0 && total_tokens % segment_tokens == 0,
             "segmented store route requires even segments");
     require(n_heads > 0 && n_heads % head_slices == 0,
@@ -1341,6 +1343,8 @@ static std::vector<ggml_fp16_t> test_store_segmented_output(
         stored = ggml_kvarn_store(ctx, current, indices, stored, records, bits, 16, value, stage_groups);
         stored->op_params[3] = segment_tokens;
         stored->op_params[5] = head_slices;
+        stored->op_params[9] = eager_records ? 1 : 0;
+        stored->op_params[4] = swa ? 1 : 0;
     }
 
     ggml_cgraph * graph = ggml_new_graph(ctx);
@@ -1385,7 +1389,7 @@ static std::vector<ggml_fp16_t> test_store_segmented_output(
         full_indices[t] = t;
     }
     std::vector<ggml_fp16_t> output = test_kvarn_reference_decode(
-            records, stored, full_indices, total_tokens, 0, n_stream, bits, value, stage_groups, false, false, head_slices);
+            records, stored, full_indices, total_tokens, 0, n_stream, bits, value, stage_groups, false, swa, head_slices);
 
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
@@ -2722,6 +2726,24 @@ static void test_store_paths_gpu() {
                 gpu_backend, 4, value, 16, 2, 4096, 256, 7);
         require(workspace_output == fallback_output,
                 "KVarN CUDA D256 workspace ubatch store output is not segmentation-independent");
+    }
+
+    for (bool value : { false, true }) {
+        const std::vector<ggml_fp16_t> workspace_output = test_store_segmented_output(
+                gpu_backend, 4, value, 16, 2, 4096, 512, 7, true);
+        const std::vector<ggml_fp16_t> fallback_output = test_store_segmented_output(
+                gpu_backend, 4, value, 16, 2, 4096, 256, 7, true);
+        require(workspace_output == fallback_output,
+                "KVarN CUDA eager workspace store output is not segmentation-independent");
+    }
+
+    for (bool value : { false, true }) {
+        const std::vector<ggml_fp16_t> workspace_output = test_store_segmented_output(
+                gpu_backend, 4, value, 16, 2, 4096, 512, 7, true, true);
+        const std::vector<ggml_fp16_t> fallback_output = test_store_segmented_output(
+                gpu_backend, 4, value, 16, 2, 4096, 256, 7, true, true);
+        require(workspace_output == fallback_output,
+                "KVarN CUDA eager SWA workspace store output is not segmentation-independent");
     }
 
     for (int bits : { 2, 3, 4, 5, 6, 8 }) {
