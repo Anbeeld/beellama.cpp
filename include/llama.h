@@ -395,6 +395,7 @@ extern "C" {
         LLAMA_KV_TAIL_DEGRADED_NONE            = 0,
         LLAMA_KV_TAIL_DEGRADED_BODY_ONLY_STATE = 1 << 0,
         LLAMA_KV_TAIL_DEGRADED_HISTORICAL_OP   = 1 << 1,
+        LLAMA_KV_TAIL_DEGRADED_STATE_RESTORE   = 1 << 2,
     };
 
     struct llama_kv_tail_coverage_info {
@@ -839,6 +840,31 @@ extern "C" {
     // seq_id < 0 : match any sequence
     // p0 < 0     : [0,  p1]
     // p1 < 0     : [p0, inf)
+    LLAMA_API bool llama_memory_can_seq_rm(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                 llama_pos p0,
+                 llama_pos p1);
+
+    // Computes a side-effect-free removable range. The returned range may be a
+    // broader suffix than requested, but is accepted by the complete memory.
+    LLAMA_API bool llama_memory_seq_rm_plan(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                 llama_pos p0,
+                 llama_pos p1,
+                 llama_pos * planned_p0,
+                 llama_pos * planned_p1);
+
+    // Read-only safety preflights for per-sequence state operations.
+    LLAMA_API bool llama_memory_state_seq_can_save(
+            llama_memory_t mem,
+              llama_seq_id seq_id);
+
+    LLAMA_API bool llama_memory_state_seq_can_restore(
+            llama_memory_t mem,
+              llama_seq_id seq_id);
+
     LLAMA_API bool llama_memory_seq_rm(
             llama_memory_t mem,
               llama_seq_id seq_id,

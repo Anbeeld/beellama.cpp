@@ -147,7 +147,40 @@ void llama_memory_recurrent::clear(bool data) {
     std::fill(rs_idx.begin(), rs_idx.end(), 0);
 }
 
+bool llama_memory_recurrent::can_seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+    if (p0 < 0) {
+        p0 = 0;
+    }
+    if (p1 < 0) {
+        p1 = std::numeric_limits<llama_pos>::max();
+    }
+
+    if (seq_id >= int64_t(size)) {
+        return false;
+    }
+    if (seq_id < 0) {
+        // A negative sequence selector can remove either the complete memory
+        // or an empty range, matching seq_rm()'s mutation contract.
+        return p0 == p1 || (p0 == 0 && p1 == std::numeric_limits<llama_pos>::max());
+    }
+
+    const int32_t tail_id = cells[seq_id].tail;
+    if (tail_id < 0) {
+        return true;
+    }
+    const auto & cell = cells[tail_id];
+    if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
+        const llama_pos rollback = cell.pos - (p0 - 1);
+        return rollback >= 1 && rollback <= llama_pos(n_rs_seq);
+    }
+    return true;
+}
+
 bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    if (!can_seq_rm(seq_id, p0, p1)) {
+        return false;
+    }
+
     uint32_t new_head = size;
 
     if (p0 < 0) {

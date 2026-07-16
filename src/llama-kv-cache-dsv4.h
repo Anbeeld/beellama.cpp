@@ -119,6 +119,7 @@ public:
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
+    ggml_type get_kv_tail_type() const override;
     uint32_t get_kv_tail_group_count() const override;
     bool get_kv_tail_coverage(uint32_t group_index, llama_seq_id seq_id,
             llama_kv_tail_coverage_info & out) const override;
@@ -208,7 +209,7 @@ public:
     void set_input_kq_mask_tail(
             ggml_tensor * body, ggml_tensor * exact,
             ggml_tensor * read_idxs, ggml_tensor * body_read_idxs, ggml_tensor * bias_read_idxs,
-            const llama_ubatch * ubatch) const;
+            const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_k_rot(ggml_tensor * dst) const;
 
 private:

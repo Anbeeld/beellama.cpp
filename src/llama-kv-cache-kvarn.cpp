@@ -17,7 +17,37 @@
 
 namespace {
 
-constexpr uint32_t KVAR_N_GROUP = 128;
+using backend_kv_tail_attention_supported_t = bool (*)(
+        ggml_type, ggml_type, ggml_type, ggml_type, int64_t, int64_t);
+
+bool kvarn_backend_supports_native_tail(
+        ggml_backend_dev_t dev, ggml_type exact_type, int64_t d_k, int64_t d_v) {
+    auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    auto * fn = reg ? reinterpret_cast<backend_kv_tail_attention_supported_t>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_kv_tail_attention_supported")) : nullptr;
+    return fn && fn(GGML_TYPE_F16, GGML_TYPE_F16, exact_type, exact_type, d_k, d_v);
+}
+
+bool kvarn_backend_supports_tail_write(
+        ggml_backend_dev_t dev, ggml_type exact_type, int64_t n_embd) {
+    if (!dev) {
+        return false;
+    }
+    ggml_init_params params = {
+        /*.mem_size   =*/ 16*ggml_tensor_overhead() + 4096,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx { ggml_init(params) };
+    if (!ctx) {
+        throw std::runtime_error("failed to create KVarN exact-tail capability context");
+    }
+    auto * dst = ggml_new_tensor_2d(ctx.get(), exact_type, n_embd, 16);
+    auto * src = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_embd, 1);
+    auto * idx = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I64, 1);
+    return ggml_backend_dev_supports_op(dev, ggml_set_rows(ctx.get(), dst, src, idx));
+}
+
 // SWA keeps only local tail groups in F16; older window groups are served from
 // records. Keep this low enough that KVarN remains a KV-memory win over q5_0.
 constexpr uint32_t KVAR_N_SWA_TAIL_GROUPS = 2;
@@ -319,6 +349,10 @@ uint32_t llama_kv_cache_kvarn_context::get_tail_attention_stride(uint32_t n_quer
     return base()->get_tail_attention_stride(n_query_tokens);
 }
 
+llama_kv_tail_route llama_kv_cache_kvarn_context::get_tail_route(int32_t il) const {
+    return cache->get_tail_route(il);
+}
+
 bool llama_kv_cache_kvarn_context::can_pack_tail_body(const llama_ubatch & ubatch) const {
     GGML_UNUSED(ubatch);
     // Structured body tensors are descriptor views, not row-addressable cache
@@ -536,15 +570,15 @@ void llama_kv_cache_kvarn_context::set_input_kq_mask(
 void llama_kv_cache_kvarn_context::set_input_kq_mask_tail(
         ggml_tensor * body, ggml_tensor * exact,
         ggml_tensor * read_idxs, ggml_tensor * body_read_idxs, ggml_tensor * bias_read_idxs,
-        const llama_ubatch * ubatch) const {
+        const llama_ubatch * ubatch, bool causal_attn) const {
     base()->set_input_kq_mask_tail(
-            body, exact, read_idxs, body_read_idxs, bias_read_idxs, ubatch);
+            body, exact, read_idxs, body_read_idxs, bias_read_idxs, ubatch, causal_attn);
 }
 
 void llama_kv_cache_kvarn_context::set_input_tail_body_plan(
         ggml_tensor * query_order, ggml_tensor * run_desc,
-        ggml_tensor * body_mask, const llama_ubatch * ubatch) const {
-    base()->set_input_tail_body_plan(query_order, run_desc, body_mask, ubatch);
+        ggml_tensor * body_mask, const llama_ubatch * ubatch, bool causal_attn) const {
+    base()->set_input_tail_body_plan(query_order, run_desc, body_mask, ubatch, causal_attn);
 }
 
 void llama_kv_cache_kvarn_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
@@ -592,7 +626,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         const layer_filter_cb & filter,
         const layer_reuse_cb & reuse,
         uint32_t tail_tokens,
-        ggml_type tail_type,
+        ggml_type tail_type_requested,
         uint32_t tail_tokens_requested) :
     hparams(hparams),
     params(params),
@@ -612,7 +646,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     // for the tail offset when deciding whether a ring slot is live.
     n_groups_per_stream(kvarn_record_groups_per_stream(kv_size, n_ubatch, n_swa, swa, tail_groups)),
     exact_tail_tokens(tail_tokens),
-    exact_tail_type(tail_type),
+    exact_tail_type(tail_type_requested),
     metadata(std::make_unique<llama_kv_cache>(
         model,
         hparams,
@@ -632,7 +666,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         nullptr,
         n_ubatch,
         tail_tokens,
-        tail_type,
+        tail_type_requested,
         tail_tokens_requested,
         true)) {
     GGML_ASSERT(n_stream > 0);
@@ -640,6 +674,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     GGML_ASSERT(stage_groups >= 2 && "KVarN stage depth must be at least 2");
     GGML_ASSERT(tail_groups >= 1 && tail_groups <= stage_groups &&
         "KVarN tail depth must fit within the F16 stage");
+    exact_tail_type = metadata->get_tail_type();
     if (swa) {
         GGML_ASSERT(n_stream == 1 && "SWA KVarN ring requires a single-stream cache");
         const uint32_t in_flight_groups = std::max<uint32_t>(1u, (n_ubatch + KVAR_N_GROUP - 1u) / KVAR_N_GROUP);
@@ -735,18 +770,13 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         auto * v_records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, v_record_size, n_head_v_sliced, n_record_groups);
         auto * k_stage = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, KVAR_N_GROUP, n_head_k_sliced, n_stage_tokens);
         auto * v_stage = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, KVAR_N_GROUP, n_head_v_sliced, n_stage_tokens);
-        const uint32_t exact_slots = metadata->get_tail_slots();
-        auto * k_tail = exact_slots > 0 ? ggml_new_tensor_2d(
-                ctx, tail_type, uint64_t(head_dim_k)*n_head_kv, exact_slots) : nullptr;
-        auto * v_tail = exact_slots > 0 ? ggml_new_tensor_2d(
-                ctx, tail_type, uint64_t(head_dim_v)*n_head_kv, exact_slots) : nullptr;
+        ggml_tensor * k_tail = nullptr;
+        ggml_tensor * v_tail = nullptr;
 
         ggml_format_name(k_records, "cache_kvarn_k_records_l%d", il);
         ggml_format_name(v_records, "cache_kvarn_v_records_l%d", il);
         ggml_format_name(k_stage, "cache_kvarn_k_stage_l%d", il);
         ggml_format_name(v_stage, "cache_kvarn_v_stage_l%d", il);
-        k_tail && ggml_format_name(k_tail, "cache_kvarn_k_tail_l%d", il);
-        v_tail && ggml_format_name(v_tail, "cache_kvarn_v_tail_l%d", il);
 
         std::vector<ggml_tensor *> k_records_stream;
         std::vector<ggml_tensor *> v_records_stream;
@@ -862,6 +892,154 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
+    const uint32_t exact_slots = metadata->get_tail_slots();
+    std::vector<llama_kv_tail_layer_route> tail_routes;
+    if (exact_slots > 0) {
+        const auto tensor_buft = [](const ggml_tensor * tensor) -> ggml_backend_buffer_type_t {
+            return tensor && tensor->buffer ? ggml_backend_buffer_get_type(tensor->buffer) : nullptr;
+        };
+        const auto buft_is_meta = [](ggml_backend_buffer_type_t buft) {
+            auto * dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
+            return dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_META;
+        };
+
+        // The structured records/stages are the ordinary persistent body. They
+        // must exist before overlay placement is accepted, and a meta-split
+        // body is rejected before any exact-tail tensor or metadata arena.
+        for (const auto & layer : layers) {
+            const auto k_buft = tensor_buft(layer.k_records);
+            const auto v_buft = tensor_buft(layer.v_records);
+            if (!k_buft || !v_buft) {
+                throw std::runtime_error(format("KVarN body layer %u has no realized backend buffer", layer.il));
+            }
+            if (k_buft != v_buft) {
+                throw std::runtime_error(format(
+                        "KVarN body layer %u places K and V records on different owners", layer.il));
+            }
+            if (buft_is_meta(k_buft) || buft_is_meta(v_buft)) {
+                const auto split = llama_meta_device_get_split_state(
+                        layer.k_records, (void *) &model.get_split_state_ud);
+                throw std::runtime_error(format(
+                        "KVarN exact-tail overlay rejected for layer %u: realized body uses a tensor/meta split buffer "
+                        "with split descriptor %s; "
+                        "--split-mode layer is supported, while --split-mode tensor currently requires "
+                        "--kv-tail-tokens 0 or a full-window native-exact representation",
+                        layer.il, ggml_backend_meta_split_axis_name(split.axis)));
+            }
+        }
+
+        for (const auto & [logical_il, layer_index] : map_layer_ids) {
+            const auto & layer = layers.at(layer_index);
+            auto * buft = tensor_buft(layer.k_records);
+            auto * dev = ggml_backend_buft_get_device(buft);
+            const char * backend = dev ? ggml_backend_dev_name(dev) : ggml_backend_buft_name(buft);
+            const bool device_route = dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
+            const auto fail_route = [&](llama_kv_tail_operation operation) {
+                throw std::runtime_error(format(
+                        "KVarN exact-tail route is unsupported for architecture %s group %s layer %u backend %s "
+                        "body f16/f16 exact %s/%s: missing %s",
+                        llm_arch_name(model.arch), swa ? "swa" : "full", uint32_t(logical_il),
+                        backend ? backend : "unknown",
+                        ggml_type_name(exact_tail_type), ggml_type_name(exact_tail_type),
+                        llama_kv_tail_operation_name(operation)));
+            };
+            llama_kv_tail_route tail_route = LLAMA_KV_TAIL_ROUTE_GENERIC;
+            if (device_route) {
+                if (!kvarn_backend_supports_tail_write(
+                            dev, exact_tail_type, uint64_t(layer.head_dim_k)*layer.n_head_kv)) {
+                    fail_route(LLAMA_KV_TAIL_OP_WRITE_K);
+                }
+                if (!kvarn_backend_supports_tail_write(
+                            dev, exact_tail_type, uint64_t(layer.head_dim_v)*layer.n_head_kv)) {
+                    fail_route(LLAMA_KV_TAIL_OP_WRITE_V);
+                }
+                if (!kvarn_backend_supports_native_tail(
+                            dev, exact_tail_type, layer.head_dim_k, layer.head_dim_v)) {
+                    fail_route(LLAMA_KV_TAIL_OP_NATIVE_ATTENTION);
+                }
+                tail_route = LLAMA_KV_TAIL_ROUTE_NATIVE;
+            }
+            tail_routes.push_back({
+                    uint32_t(logical_il), backend ? backend : "unknown",
+                    GGML_TYPE_F16, GGML_TYPE_F16, exact_tail_type, exact_tail_type,
+                    false, hparams.causal_attn, swa, false,
+                    { true, tail_route, LLAMA_KV_TAIL_OP_NONE },
+            });
+        }
+
+        metadata->set_tail_routes(std::move(tail_routes));
+        metadata->finalize_tail_overlay_metadata();
+
+        std::map<ggml_backend_buffer_type_t, ggml_context_ptr, buft_comparator> tail_ctx_map;
+        const auto tail_ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+            const auto it = tail_ctx_map.find(buft);
+            if (it != tail_ctx_map.end()) {
+                return it->second.get();
+            }
+            ggml_init_params ctx_params = {
+                /*.mem_size   =*/ size_t(2u*hparams.n_layer_kv()*ggml_tensor_overhead()),
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            ggml_context_ptr ctx { ggml_init(ctx_params) };
+            if (!ctx) {
+                return nullptr;
+            }
+            auto * result = ctx.get();
+            tail_ctx_map.emplace(buft, std::move(ctx));
+            return result;
+        };
+
+        for (auto & layer : layers) {
+            auto * buft = tensor_buft(layer.k_records);
+            auto * ctx = tail_ctx_for_buft(buft);
+            if (!ctx) {
+                throw std::runtime_error("failed to create KVarN exact-tail tensor context");
+            }
+            layer.k_tail = ggml_new_tensor_2d(
+                    ctx, exact_tail_type, uint64_t(layer.head_dim_k)*layer.n_head_kv, exact_slots);
+            layer.v_tail = ggml_new_tensor_2d(
+                    ctx, exact_tail_type, uint64_t(layer.head_dim_v)*layer.n_head_kv, exact_slots);
+            ggml_format_name(layer.k_tail, "cache_kvarn_k_tail_l%d", layer.il);
+            ggml_format_name(layer.v_tail, "cache_kvarn_v_tail_l%d", layer.il);
+        }
+
+        for (auto & [buft, ctx] : tail_ctx_map) {
+            ggml_backend_buffer_t buf;
+            if (hparams.no_alloc) {
+                buf = ggml_backend_buft_alloc_buffer(buft, 0);
+                for (auto * tensor = ggml_get_first_tensor(ctx.get()); tensor != nullptr; tensor = ggml_get_next_tensor(ctx.get(), tensor)) {
+                    tensor->buffer = buf;
+                }
+            } else {
+                buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+            }
+            if (!buf) {
+                throw std::runtime_error("failed to allocate KVarN exact-tail buffer");
+            }
+            ggml_backend_buffer_clear(buf, 0);
+            total_bytes += ggml_backend_buffer_get_size(buf);
+            LLAMA_LOG_INFO("%s: %10s KVarN tail buffer size = %8.2f MiB\n",
+                    __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+            ctxs_bufs.emplace_back(std::move(ctx), buf);
+        }
+
+        for (const auto & layer : layers) {
+            const uintptr_t owner = reinterpret_cast<uintptr_t>(tensor_buft(layer.k_records));
+            auto ownership = llama_kv_tail_plan_layer_ownership(
+                    layer.il, owner, owner, true, true);
+            ownership.shadow_k_owner = reinterpret_cast<uintptr_t>(tensor_buft(layer.k_tail));
+            ownership.shadow_v_owner = reinterpret_cast<uintptr_t>(tensor_buft(layer.v_tail));
+            const auto error = llama_kv_tail_validate_layer_ownership(ownership);
+            if (error != LLAMA_KV_TAIL_OWNERSHIP_OK) {
+                throw std::runtime_error(format("KVarN exact-tail ownership validation failed for layer %u (error %d)",
+                        layer.il, int(error)));
+            }
+        }
+    } else {
+        metadata->set_tail_routes({});
+    }
+
     LLAMA_LOG_INFO("%s: type = %s, layers = %zu, groups/stream = %u, streams = %u, KVarN = %.2f MiB, equivalent F16 = %.2f MiB\n",
             __func__, llama_kvarn_type_name(this->params.type), layers.size(), n_groups_per_stream, n_stream,
             total_bytes / 1024.0 / 1024.0, raw_bytes / 1024.0 / 1024.0);
@@ -907,6 +1085,7 @@ bool llama_kv_cache_kvarn::get_can_shift() const {
 }
 
 void llama_kv_cache_kvarn::clear(bool data) {
+    pending_stream_copies = {};
     metadata->clear(false);
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
@@ -927,11 +1106,51 @@ bool llama_kv_cache_kvarn::can_remove(llama_seq_id seq_id, llama_pos p0, llama_p
     }
 
     const llama_pos pos_max = metadata->seq_pos_max(seq_id);
-    return llama_kvarn_can_remove_range(pos_max, p0, p1, KVAR_N_GROUP);
+    if (llama_kvarn_can_remove_range(pos_max, p0, p1, KVAR_N_GROUP)) {
+        return true;
+    }
+    if (p0 <= 0 || p1 >= 0) {
+        return false;
+    }
+
+    llama_pos planned_p0 = -1;
+    llama_pos planned_p1 = -1;
+    return llama_kvarn_plan_remove_range(
+            pos_max, p0, p1, KVAR_N_GROUP,
+            stream_is_exclusive_for(seq_id), planned_p0, planned_p1) &&
+           planned_p0 == p0 && planned_p1 == p1;
 }
 
 bool llama_kv_cache_kvarn::can_seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
     return can_remove(seq_id, p0, p1);
+}
+
+bool llama_kv_cache_kvarn::seq_rm_plan(
+        llama_seq_id seq_id, llama_pos p0, llama_pos p1,
+        llama_pos & planned_p0, llama_pos & planned_p1) const {
+    if (seq_id < 0) {
+        if (p0 > 0 || p1 >= 0) {
+            return false;
+        }
+        planned_p0 = p0;
+        planned_p1 = p1;
+        return true;
+    }
+    if (uint32_t(seq_id) >= n_seq_max) {
+        return false;
+    }
+    if (swa || llama_kvarn_can_remove_range(
+            metadata->seq_pos_max(seq_id), p0, p1, KVAR_N_GROUP)) {
+        planned_p0 = p0;
+        planned_p1 = p1;
+        return true;
+    }
+    if (p0 <= 0 || p1 >= 0) {
+        return false;
+    }
+    return llama_kvarn_plan_remove_range(
+            metadata->seq_pos_max(seq_id), p0, p1, KVAR_N_GROUP,
+            stream_is_exclusive_for(seq_id), planned_p0, planned_p1);
 }
 
 bool llama_kv_cache_kvarn::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -939,10 +1158,12 @@ bool llama_kv_cache_kvarn::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p
         LLAMA_LOG_WARN("%s: KVarN can only remove a complete sequence or the current/previous fp16 tail groups\n", __func__);
         return false;
     }
+    apply_pending_stream_copies(nullptr);
     return metadata->seq_rm(seq_id, p0, p1);
 }
 
 bool llama_kv_cache_kvarn::seq_rm_cell(llama_seq_id seq_id, uint32_t cell_idx) {
+    apply_pending_stream_copies(nullptr);
     if (swa) {
         // SWA ring: the metadata cache manages window eviction; records follow the ring.
         return metadata->seq_rm_cell(seq_id, cell_idx);
@@ -962,6 +1183,7 @@ int llama_kv_cache_kvarn::cells_at_pos(llama_seq_id seq_id, llama_pos pos, uint3
 }
 
 void llama_kv_cache_kvarn::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    apply_pending_stream_copies(nullptr);
     const uint32_t stream_src = metadata->get_stream_for_seq(seq_id_src);
     const uint32_t stream_dst = metadata->get_stream_for_seq(seq_id_dst);
 
@@ -990,9 +1212,12 @@ void llama_kv_cache_kvarn::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_d
     pending_stream_copies.tail_dst_slots.insert(
             pending_stream_copies.tail_dst_slots.end(),
             tail_copies.tail_dst_slots.begin(), tail_copies.tail_dst_slots.end());
+    pending_stream_copies.tail_transaction =
+            pending_stream_copies.tail_transaction || tail_copies.tail_transaction;
 }
 
 void llama_kv_cache_kvarn::seq_keep(llama_seq_id seq_id) {
+    apply_pending_stream_copies(nullptr);
     metadata->seq_keep(seq_id);
 }
 
@@ -1027,8 +1252,18 @@ bool llama_kv_cache_kvarn::requires_state_for_partial_restore() const {
     return true;
 }
 
-bool llama_kv_cache_kvarn::state_seq_restore_requires_exclusive_kv_stream() const {
-    return get_kv_n_stream() == 1;
+bool llama_kv_cache_kvarn::stream_is_exclusive_for(llama_seq_id seq_id) const {
+    return llama_kvarn_stream_is_exclusive_for(
+            n_stream, n_seq_max, seq_id,
+            [&](llama_seq_id other) { return metadata->seq_pos_max(other); });
+}
+
+bool llama_kv_cache_kvarn::state_seq_can_save(llama_seq_id seq_id) const {
+    return stream_is_exclusive_for(seq_id);
+}
+
+bool llama_kv_cache_kvarn::state_seq_can_restore(llama_seq_id seq_id) const {
+    return stream_is_exclusive_for(seq_id);
 }
 
 bool llama_kv_cache_kvarn::has_pending_stream_copies() const {
@@ -1056,7 +1291,9 @@ bool llama_kv_cache_kvarn::apply_pending_stream_copies(llama_context * lctx) {
     }
 
     GGML_ASSERT(pending_stream_copies.ssrc.size() == pending_stream_copies.sdst.size());
-    llama_synchronize(lctx);
+    if (lctx) {
+        llama_synchronize(lctx);
+    }
 
     const size_t n_copy = pending_stream_copies.ssrc.size();
     for (size_t i = 0; i < n_copy; ++i) {
@@ -1085,10 +1322,15 @@ bool llama_kv_cache_kvarn::apply_pending_stream_copies(llama_context * lctx) {
         }
     }
 
+    if (pending_stream_copies.tail_transaction) {
+        metadata->commit_pending_tail_copy();
+    }
+
     pending_stream_copies.ssrc.clear();
     pending_stream_copies.sdst.clear();
     pending_stream_copies.tail_src_slots.clear();
     pending_stream_copies.tail_dst_slots.clear();
+    pending_stream_copies.tail_transaction = false;
     return true;
 }
 
@@ -1234,6 +1476,7 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
 }
 
 void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    apply_pending_stream_copies(nullptr);
     metadata->state_read(io, seq_id, flags);
     std::vector<std::vector<int32_t>> exact_destinations = metadata->take_restored_tail_payload_slots();
     const bool on_device = (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) != 0;
@@ -1310,7 +1553,13 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
             saved_exact_tail_tokens != exact_tail_tokens ||
             saved_exact_type != int32_t(exact_tail_type) ||
             n_exact_payloads != exact_destinations.size()) {
-        throw std::runtime_error("KVarN exact-tail state configuration does not match the context");
+        throw std::runtime_error(format(
+                "KVarN exact-tail state configuration does not match the context "
+                "(present %u/%u, tokens %u/%u, type %d/%d, payloads %u/%zu)",
+                has_exact_tail, uint32_t(exact_tail_tokens > 0),
+                saved_exact_tail_tokens, exact_tail_tokens,
+                saved_exact_type, int32_t(exact_tail_type),
+                n_exact_payloads, exact_destinations.size()));
     }
 
     uint32_t n_groups_used;
@@ -1421,6 +1670,10 @@ llama_kv_cache * llama_kv_cache_kvarn::get_metadata_cache() const {
 
 int32_t llama_kv_cache_kvarn::mapped_layer_id(int32_t il) const {
     return map_layer_ids.at(il);
+}
+
+llama_kv_tail_route llama_kv_cache_kvarn::get_tail_route(int32_t il) const {
+    return metadata->get_tail_route(il);
 }
 
 const llama_kv_cache_kvarn::layer & llama_kv_cache_kvarn::layer_for(int32_t il) const {

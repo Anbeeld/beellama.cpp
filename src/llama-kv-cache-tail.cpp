@@ -76,6 +76,132 @@ bool llama_kv_tail_sparse_body_capacity_safe(
     return arena_stride > 0 && physical_stream_rows <= arena_stride;
 }
 
+llama_kv_tail_route_capability llama_kv_tail_select_route(
+        const llama_kv_tail_route_requirements & requirements) {
+    const auto missing_write = [&]() -> llama_kv_tail_operation {
+        if (!requirements.write_k) return LLAMA_KV_TAIL_OP_WRITE_K;
+        if (!requirements.write_v) return LLAMA_KV_TAIL_OP_WRITE_V;
+        return LLAMA_KV_TAIL_OP_NONE;
+    }();
+    if (missing_write != LLAMA_KV_TAIL_OP_NONE) {
+        return { false, LLAMA_KV_TAIL_ROUTE_NONE, missing_write };
+    }
+    if (requirements.native_attention) {
+        return { true, LLAMA_KV_TAIL_ROUTE_NATIVE, LLAMA_KV_TAIL_OP_NONE };
+    }
+    const std::pair<bool, llama_kv_tail_operation> generic[] = {
+        { requirements.gather_k,      LLAMA_KV_TAIL_OP_GATHER_K },
+        { requirements.gather_v,      LLAMA_KV_TAIL_OP_GATHER_V },
+        { requirements.body_score,    LLAMA_KV_TAIL_OP_BODY_SCORE },
+        { requirements.body_value,    LLAMA_KV_TAIL_OP_BODY_VALUE },
+        { requirements.exact_score,   LLAMA_KV_TAIL_OP_EXACT_SCORE },
+        { requirements.exact_value,   LLAMA_KV_TAIL_OP_EXACT_VALUE },
+        { requirements.generic_merge, LLAMA_KV_TAIL_OP_GENERIC_MERGE },
+    };
+    for (const auto & requirement : generic) {
+        if (!requirement.first) {
+            return { false, LLAMA_KV_TAIL_ROUTE_NONE, requirement.second };
+        }
+    }
+    return { true, LLAMA_KV_TAIL_ROUTE_GENERIC, LLAMA_KV_TAIL_OP_NONE };
+}
+
+const char * llama_kv_tail_operation_name(llama_kv_tail_operation operation) {
+    switch (operation) {
+        case LLAMA_KV_TAIL_OP_NONE:             return "none";
+        case LLAMA_KV_TAIL_OP_WRITE_K:          return "K body/exact write";
+        case LLAMA_KV_TAIL_OP_WRITE_V:          return "V body/exact write";
+        case LLAMA_KV_TAIL_OP_GATHER_K:         return "exact K gather";
+        case LLAMA_KV_TAIL_OP_GATHER_V:         return "exact V gather";
+        case LLAMA_KV_TAIL_OP_BODY_SCORE:       return "body K score";
+        case LLAMA_KV_TAIL_OP_BODY_VALUE:       return "body V reduction";
+        case LLAMA_KV_TAIL_OP_EXACT_SCORE:      return "exact K score";
+        case LLAMA_KV_TAIL_OP_EXACT_VALUE:      return "exact V reduction";
+        case LLAMA_KV_TAIL_OP_GENERIC_MERGE:    return "generic softmax merge";
+        case LLAMA_KV_TAIL_OP_NATIVE_ATTENTION: return "native attached-tail attention";
+    }
+    return "unknown";
+}
+
+llama_kv_tail_type_resolution llama_kv_tail_resolve_type(
+        ggml_type requested,
+        ggml_type family_default,
+        const llama_kv_tail_route_capability & bf16,
+        const llama_kv_tail_route_capability & f16) {
+    if (requested != GGML_TYPE_COUNT && requested != GGML_TYPE_BF16 && requested != GGML_TYPE_F16) {
+        throw std::invalid_argument("KV tail type resolution requires F16, BF16, or COUNT");
+    }
+    if (family_default != GGML_TYPE_BF16 && family_default != GGML_TYPE_F16) {
+        throw std::invalid_argument("KV tail family default must be F16 or BF16");
+    }
+
+    const bool automatic = requested == GGML_TYPE_COUNT;
+    const ggml_type preferred = automatic ? family_default : requested;
+    const auto & preferred_capability = preferred == GGML_TYPE_BF16 ? bf16 : f16;
+    if (preferred_capability.supported) {
+        return { true, preferred, false, LLAMA_KV_TAIL_OP_NONE, LLAMA_KV_TAIL_OP_NONE };
+    }
+    if (automatic && preferred == GGML_TYPE_BF16 && f16.supported) {
+        return { true, GGML_TYPE_F16, true,
+                preferred_capability.missing_operation, LLAMA_KV_TAIL_OP_NONE };
+    }
+    return { false, GGML_TYPE_COUNT, false,
+            preferred_capability.missing_operation,
+            automatic && preferred == GGML_TYPE_BF16 ? f16.missing_operation : LLAMA_KV_TAIL_OP_NONE };
+}
+
+llama_kv_tail_ownership_error llama_kv_tail_validate_layer_ownership(
+        const llama_kv_tail_layer_ownership & ownership) {
+    if (ownership.body_k_meta_split) {
+        return LLAMA_KV_TAIL_OWNERSHIP_META_SPLIT_K;
+    }
+    if (ownership.body_v_meta_split) {
+        return LLAMA_KV_TAIL_OWNERSHIP_META_SPLIT_V;
+    }
+    if (ownership.shadow_k_owner != 0 && ownership.shadow_k_owner != ownership.body_k_owner) {
+        return LLAMA_KV_TAIL_OWNERSHIP_SHADOW_K;
+    }
+    if (ownership.shadow_v_owner != 0 && ownership.shadow_v_owner != ownership.body_v_owner) {
+        return LLAMA_KV_TAIL_OWNERSHIP_SHADOW_V;
+    }
+    if (ownership.graph_write_owner != ownership.body_k_owner ||
+            (ownership.body_v_owner != 0 && ownership.graph_write_owner != ownership.body_v_owner)) {
+        return LLAMA_KV_TAIL_OWNERSHIP_GRAPH_WRITE;
+    }
+    if (ownership.graph_read_owner != ownership.body_k_owner ||
+            (ownership.body_v_owner != 0 && ownership.graph_read_owner != ownership.body_v_owner)) {
+        return LLAMA_KV_TAIL_OWNERSHIP_GRAPH_READ;
+    }
+    if (ownership.state_k_owner != ownership.body_k_owner) {
+        return LLAMA_KV_TAIL_OWNERSHIP_STATE_K;
+    }
+    if (ownership.body_v_owner != 0 && ownership.state_v_owner != ownership.body_v_owner) {
+        return LLAMA_KV_TAIL_OWNERSHIP_STATE_V;
+    }
+    return LLAMA_KV_TAIL_OWNERSHIP_OK;
+}
+
+llama_kv_tail_layer_ownership llama_kv_tail_plan_layer_ownership(
+        uint32_t layer_id,
+        uintptr_t body_k_owner,
+        uintptr_t body_v_owner,
+        bool shadow_k,
+        bool shadow_v) {
+    return {
+        layer_id,
+        body_k_owner,
+        body_v_owner,
+        shadow_k ? body_k_owner : 0,
+        shadow_v ? body_v_owner : 0,
+        body_k_owner,
+        body_k_owner,
+        body_k_owner,
+        body_v_owner,
+        false,
+        false,
+    };
+}
+
 llama_kv_tail_storage_plan llama_kv_tail_storage_plan_for(
         const llama_kv_tail_storage_request & request) {
     llama_kv_tail_storage_plan result {
@@ -101,6 +227,8 @@ llama_kv_tail_storage_plan llama_kv_tail_storage_plan_for(
         request.has_owned_body,
         request.has_shared_body,
         false,
+        request.graph_consumes_exact_tail,
+        {},
     };
     result.actual_body_bytes = result.requested_body_bytes;
     if (request.effective_tokens == 0 || request.physical_body_rows == 0 ||
@@ -140,6 +268,21 @@ llama_kv_tail_storage_plan llama_kv_tail_storage_plan_for(
         }
         result.actual_body_bytes = result.requested_body_bytes + result.promotion_increment;
     } else {
+        const std::string architecture = request.architecture ? request.architecture : "unknown";
+        const std::string group = request.group_id ? request.group_id : "unknown";
+        if (!request.graph_consumes_exact_tail) {
+            throw std::invalid_argument(
+                    "standard KV tail overlay is not consumed by architecture " + architecture +
+                    " group " + group + " for requested N=" + std::to_string(request.requested_tokens) +
+                    " (unsupported K-only MLA/DSA composition); use --kv-tail-tokens 0 or a "
+                    "full-window native-exact cache");
+        }
+        if (!request.overlay_placement_supported) {
+            throw std::invalid_argument(
+                    "standard KV tail overlay for architecture " + architecture + " group " + group +
+                    " is unsupported with --split-mode tensor; use --split-mode layer, "
+                    "--kv-tail-tokens 0, or a full-window native-exact cache");
+        }
         result.kind = LLAMA_KV_TAIL_STORAGE_OVERLAY;
         result.shadow_k = request.shadow_k_capable;
         result.shadow_v = request.shadow_v_capable;
@@ -152,6 +295,33 @@ llama_kv_tail_storage_plan llama_kv_tail_storage_plan_for(
         result.shadow_bytes = result.overlay_increment;
     }
     return result;
+}
+
+void llama_kv_tail_select_masked_entries(
+        const std::vector<llama_kv_tail_mask_entry> & entries,
+        const std::vector<uint8_t> & finite,
+        llama_pos query_position,
+        uint32_t retention,
+        bool causal_attn,
+        std::vector<uint32_t> & selected) {
+    if (entries.size() != finite.size()) {
+        throw std::invalid_argument("KV tail candidate and mask sizes differ");
+    }
+
+    selected.clear();
+    selected.reserve(std::min<size_t>(retention, entries.size()));
+    if (retention == 0) {
+        return;
+    }
+
+    for (size_t i = entries.size(); i-- > 0 && selected.size() < retention;) {
+        if (!finite[i] || (causal_attn && entries[i].position > query_position)) {
+            continue;
+        }
+        selected.push_back(uint32_t(i));
+    }
+    std::reverse(selected.begin(), selected.end());
+    assert(selected.size() <= retention);
 }
 
 llama_kv_tail_store::llama_kv_tail_store(uint32_t n_tokens, uint32_t n_seq_max, uint32_t n_slots) :
@@ -182,6 +352,7 @@ llama_kv_tail_store::llama_kv_tail_store(
 }
 
 void llama_kv_tail_store::clear() {
+    cancel_seq_cp();
     for (size_t i = 0; i < sequences.size(); ++i) {
         sequences[i].clear();
         entry_by_cell[i].clear();
@@ -201,9 +372,18 @@ void llama_kv_tail_store::mark_degraded(llama_seq_id seq_id, uint32_t flags) {
             degradation[i] |= flags;
             recovery_commits[i] = 0;
         }
+        if (pending_seq_cp) {
+            pending_seq_cp->degradation_flags |= flags;
+            pending_seq_cp->recovery_commits = 0;
+        }
     } else if (valid_seq(seq_id)) {
-        degradation[size_t(seq_id)] |= flags;
-        recovery_commits[size_t(seq_id)] = 0;
+        if (pending_seq_cp && pending_seq_cp->dst == seq_id) {
+            pending_seq_cp->degradation_flags |= flags;
+            pending_seq_cp->recovery_commits = 0;
+        } else {
+            degradation[size_t(seq_id)] |= flags;
+            recovery_commits[size_t(seq_id)] = 0;
+        }
     }
 }
 
@@ -399,9 +579,24 @@ std::vector<llama_kv_tail_slot_copy> llama_kv_tail_store::seq_cp_remap(
         uint32_t dst_stream,
         llama_pos p0,
         llama_pos p1) {
+    auto result = prepare_seq_cp(src, dst, src_stream, dst_stream, p0, p1);
+    commit_seq_cp();
+    return result;
+}
+
+std::vector<llama_kv_tail_slot_copy> llama_kv_tail_store::prepare_seq_cp(
+        llama_seq_id src,
+        llama_seq_id dst,
+        uint32_t src_stream,
+        uint32_t dst_stream,
+        llama_pos p0,
+        llama_pos p1) {
     std::vector<llama_kv_tail_slot_copy> result;
     if (!valid_seq(src) || !valid_seq(dst) || src == dst) {
         return result;
+    }
+    if (pending_seq_cp) {
+        throw std::logic_error("a KV tail sequence-copy transaction is already pending");
     }
 
     std::vector<exact_entry> source;
@@ -441,26 +636,85 @@ std::vector<llama_kv_tail_slot_copy> llama_kv_tail_store::seq_cp_remap(
             survivor_slots.insert(candidates[i].entry.slot);
         }
     }
+    std::vector<int32_t> reusable_slots;
     for (const auto & old : sequences[size_t(dst)]) {
         if (survivor_slots.find(old.slot) == survivor_slots.end()) {
-            release(dst, old.slot);
+            reusable_slots.push_back(old.slot);
         }
     }
-    auto & destination = sequences[size_t(dst)];
-    destination.clear();
-    for (size_t i = first; i < candidates.size(); ++i) {
-        auto retained = candidates[i];
-        if (retained.copied) {
-            retained.entry.slot = acquire(dst);
-            result.push_back({ retained.src_slot, retained.entry.slot });
+
+    pending_seq_cp_state pending;
+    pending.src = src;
+    pending.dst = dst;
+    pending.destination.reserve(candidates.size() - first);
+    try {
+        for (size_t i = first; i < candidates.size(); ++i) {
+            auto retained = candidates[i];
+            if (retained.copied) {
+                if (!reusable_slots.empty()) {
+                    retained.entry.slot = reusable_slots.back();
+                    reusable_slots.pop_back();
+                } else {
+                    retained.entry.slot = acquire(dst);
+                    pending.acquired_slots.push_back(retained.entry.slot);
+                }
+                result.push_back({ retained.src_slot, retained.entry.slot });
+            }
+            pending.destination.push_back(retained.entry);
         }
-        destination.push_back(retained.entry);
+    } catch (...) {
+        for (int32_t slot : pending.acquired_slots) {
+            release(dst, slot);
+        }
+        throw;
     }
-    rebuild_index(dst);
-    degradation[size_t(dst)] |= degradation[size_t(src)];
-    recovery_commits[size_t(dst)] = degradation[size_t(dst)] == 0 ?
+    pending.copies = result;
+    pending.degradation_flags = degradation[size_t(dst)] | degradation[size_t(src)];
+    pending.recovery_commits = pending.degradation_flags == 0 ?
             std::min(recovery_commits[size_t(dst)], recovery_commits[size_t(src)]) : 0;
+    pending_seq_cp = std::move(pending);
     return result;
+}
+
+void llama_kv_tail_store::commit_seq_cp() {
+    if (!pending_seq_cp) {
+        return;
+    }
+    auto pending = std::move(*pending_seq_cp);
+    pending_seq_cp.reset();
+    std::unordered_set<int32_t> retained_slots;
+    retained_slots.reserve(pending.destination.size());
+    for (const auto & entry : pending.destination) {
+        retained_slots.insert(entry.slot);
+    }
+    for (const auto & old : sequences[size_t(pending.dst)]) {
+        if (retained_slots.find(old.slot) == retained_slots.end()) {
+            release(pending.dst, old.slot);
+        }
+    }
+    auto & destination = sequences[size_t(pending.dst)];
+    destination.clear();
+    for (const auto & entry : pending.destination) {
+        destination.push_back(entry);
+    }
+    rebuild_index(pending.dst);
+    degradation[size_t(pending.dst)] = pending.degradation_flags;
+    recovery_commits[size_t(pending.dst)] = pending.recovery_commits;
+}
+
+void llama_kv_tail_store::cancel_seq_cp() {
+    if (!pending_seq_cp) {
+        return;
+    }
+    const llama_seq_id dst = pending_seq_cp->dst;
+    for (int32_t slot : pending_seq_cp->acquired_slots) {
+        release(dst, slot);
+    }
+    pending_seq_cp.reset();
+}
+
+llama_seq_id llama_kv_tail_store::pending_seq_cp_destination() const {
+    return pending_seq_cp ? pending_seq_cp->dst : -1;
 }
 
 void llama_kv_tail_store::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -511,39 +765,80 @@ void llama_kv_tail_store::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p
     if (!valid_seq(seq_id)) {
         return;
     }
-    auto & entries = sequences[size_t(seq_id)];
-    for (auto it = entries.begin(); it != entries.end();) {
-        if (it->position >= p0 && (p1 < 0 || it->position < p1)) {
-            it->position += shift;
-            if (it->position < 0) {
-                release(seq_id, it->slot);
-                it = entries.erase(it);
+    std::unordered_set<llama_kv_tail_identity, identity_hash> identities;
+    for (const auto & entry : sequences[size_t(seq_id)]) {
+        if (entry.position >= p0 && (p1 < 0 || entry.position < p1)) {
+            identities.insert(entry.identity);
+        }
+    }
+    const bool degrade = shift != 0 && !(p0 <= 0 && p1 < 0);
+    for (llama_seq_id current = 0; size_t(current) < sequences.size(); ++current) {
+        auto & entries = sequences[size_t(current)];
+        bool touched = false;
+        for (auto it = entries.begin(); it != entries.end();) {
+            if (identities.find(it->identity) == identities.end()) {
+                ++it;
                 continue;
             }
+            touched = true;
+            it->position += shift;
+            if (it->position < 0) {
+                release(current, it->slot);
+                it = entries.erase(it);
+            } else {
+                ++it;
+            }
         }
-        ++it;
+        if (!touched) {
+            continue;
+        }
+        entries.sort([](const exact_entry & a, const exact_entry & b) {
+            return a.position < b.position ||
+                    (a.position == b.position && a.insertion_ordinal < b.insertion_ordinal);
+        });
+        trim(current);
+        rebuild_index(current);
+        if (degrade) {
+            degradation[size_t(current)] |= LLAMA_KV_TAIL_DEGRADED_HISTORICAL_OP;
+            recovery_commits[size_t(current)] = 0;
+        }
     }
-    entries.sort([](const exact_entry & a, const exact_entry & b) {
-        return a.position < b.position ||
-                (a.position == b.position && a.insertion_ordinal < b.insertion_ordinal);
-    });
-    trim(seq_id);
 }
 
 void llama_kv_tail_store::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int divisor) {
     if (!valid_seq(seq_id) || divisor == 0) {
         return;
     }
-    for (auto & entry : sequences[size_t(seq_id)]) {
+    std::unordered_set<llama_kv_tail_identity, identity_hash> identities;
+    for (const auto & entry : sequences[size_t(seq_id)]) {
         if (entry.position >= p0 && (p1 < 0 || entry.position < p1)) {
-            entry.position /= divisor;
+            identities.insert(entry.identity);
         }
     }
-    sequences[size_t(seq_id)].sort([](const exact_entry & a, const exact_entry & b) {
-        return a.position < b.position ||
-                (a.position == b.position && a.insertion_ordinal < b.insertion_ordinal);
-    });
-    trim(seq_id);
+    const bool degrade = divisor != 1 && !(p0 <= 0 && p1 < 0);
+    for (llama_seq_id current = 0; size_t(current) < sequences.size(); ++current) {
+        auto & entries = sequences[size_t(current)];
+        bool touched = false;
+        for (auto & entry : entries) {
+            if (identities.find(entry.identity) != identities.end()) {
+                entry.position /= divisor;
+                touched = true;
+            }
+        }
+        if (!touched) {
+            continue;
+        }
+        entries.sort([](const exact_entry & a, const exact_entry & b) {
+            return a.position < b.position ||
+                    (a.position == b.position && a.insertion_ordinal < b.insertion_ordinal);
+        });
+        trim(current);
+        rebuild_index(current);
+        if (degrade) {
+            degradation[size_t(current)] |= LLAMA_KV_TAIL_DEGRADED_HISTORICAL_OP;
+            recovery_commits[size_t(current)] = 0;
+        }
+    }
 }
 
 std::vector<int32_t> llama_kv_tail_store::build_source_plan(
@@ -585,9 +880,12 @@ std::vector<int32_t> llama_kv_tail_store::build_source_plan(
 }
 
 llama_kv_tail_coverage llama_kv_tail_store::coverage(llama_seq_id seq_id, uint32_t available) const {
-    const uint32_t exact = valid_seq(seq_id) ? uint32_t(sequences[size_t(seq_id)].size()) : 0;
+    const bool pending_destination = pending_seq_cp && pending_seq_cp->dst == seq_id;
+    const uint32_t exact = !valid_seq(seq_id) ? 0 : pending_destination ?
+            uint32_t(pending_seq_cp->destination.size()) : uint32_t(sequences[size_t(seq_id)].size());
     const uint32_t requested = std::min(n_tokens, available);
-    const uint32_t flags = valid_seq(seq_id) ? degradation[size_t(seq_id)] : 0;
+    const uint32_t flags = !valid_seq(seq_id) ? 0 : pending_destination ?
+            pending_seq_cp->degradation_flags : degradation[size_t(seq_id)];
     const auto state = exact == 0 ? LLAMA_KV_TAIL_COVERAGE_NONE :
             exact >= requested && flags == 0 ? LLAMA_KV_TAIL_COVERAGE_COMPLETE : LLAMA_KV_TAIL_COVERAGE_PARTIAL;
     return { state, requested, std::min(exact, requested), flags };
@@ -660,6 +958,16 @@ std::vector<llama_kv_tail_snapshot_entry> llama_kv_tail_store::snapshot(llama_se
         if (seq_id >= 0 && current != seq_id) {
             continue;
         }
+        if (pending_seq_cp && pending_seq_cp->dst == current) {
+            const auto & ordered = pending_seq_cp->destination;
+            const size_t first = ordered.size() > n_tokens ? ordered.size() - n_tokens : 0;
+            for (size_t i = first; i < ordered.size(); ++i) {
+                const auto & entry = ordered[i];
+                result.push_back({ current, entry.identity, entry.position,
+                        entry.insertion_ordinal, entry.slot });
+            }
+            continue;
+        }
         const auto & ordered = sequences[size_t(current)];
         const size_t first = ordered.size() > n_tokens ? ordered.size() - n_tokens : 0;
         auto it = ordered.begin();
@@ -671,6 +979,64 @@ std::vector<llama_kv_tail_snapshot_entry> llama_kv_tail_store::snapshot(llama_se
         }
     }
     return result;
+}
+
+std::vector<llama_kv_tail_provenance> llama_kv_tail_store::snapshot_provenance(llama_seq_id seq_id) const {
+    std::vector<llama_kv_tail_provenance> result;
+    if (seq_id >= 0) {
+        if (valid_seq(seq_id)) {
+            const bool pending_destination = pending_seq_cp && pending_seq_cp->dst == seq_id;
+            result.push_back({ seq_id,
+                    pending_destination ? pending_seq_cp->degradation_flags : degradation[size_t(seq_id)],
+                    pending_destination ? pending_seq_cp->recovery_commits : recovery_commits[size_t(seq_id)] });
+        }
+        return result;
+    }
+    result.reserve(sequences.size());
+    for (llama_seq_id current = 0; size_t(current) < sequences.size(); ++current) {
+        const bool pending_destination = pending_seq_cp && pending_seq_cp->dst == current;
+        result.push_back({ current,
+                pending_destination ? pending_seq_cp->degradation_flags : degradation[size_t(current)],
+                pending_destination ? pending_seq_cp->recovery_commits : recovery_commits[size_t(current)] });
+    }
+    return result;
+}
+
+void llama_kv_tail_store::restore_provenance(
+        const std::vector<llama_kv_tail_provenance> & provenance,
+        llama_seq_id dest_seq_id) {
+    constexpr uint32_t known_flags =
+            LLAMA_KV_TAIL_DEGRADED_BODY_ONLY_STATE |
+            LLAMA_KV_TAIL_DEGRADED_HISTORICAL_OP |
+            LLAMA_KV_TAIL_DEGRADED_STATE_RESTORE;
+    std::vector<bool> seen(sequences.size(), false);
+    for (const auto & saved : provenance) {
+        if (!valid_seq(saved.seq_id) || (saved.degradation_flags & ~known_flags) != 0 ||
+                saved.recovery_commits > n_tokens ||
+                (saved.degradation_flags == 0 && saved.recovery_commits != 0)) {
+            throw std::runtime_error("invalid KV tail degradation provenance");
+        }
+        if (seen[size_t(saved.seq_id)]) {
+            throw std::runtime_error("duplicate KV tail degradation provenance");
+        }
+        seen[size_t(saved.seq_id)] = true;
+    }
+
+    if (dest_seq_id >= 0) {
+        if (!valid_seq(dest_seq_id) || provenance.size() != 1) {
+            throw std::runtime_error("invalid per-sequence KV tail degradation provenance");
+        }
+        degradation[size_t(dest_seq_id)] = provenance[0].degradation_flags;
+        recovery_commits[size_t(dest_seq_id)] = provenance[0].recovery_commits;
+        return;
+    }
+
+    std::fill(degradation.begin(), degradation.end(), 0);
+    std::fill(recovery_commits.begin(), recovery_commits.end(), 0);
+    for (const auto & saved : provenance) {
+        degradation[size_t(saved.seq_id)] = saved.degradation_flags;
+        recovery_commits[size_t(saved.seq_id)] = saved.recovery_commits;
+    }
 }
 
 std::vector<float> llama_kv_tail_attention_reference(

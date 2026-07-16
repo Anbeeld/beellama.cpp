@@ -90,6 +90,7 @@ public:
     uint32_t get_tail_tokens() const override;
     uint32_t get_tail_arena_stride() const override;
     uint32_t get_tail_attention_stride(uint32_t n_query_tokens = 0) const override;
+    llama_kv_tail_route get_tail_route(int32_t il) const override;
     bool can_pack_tail_body(const llama_ubatch & ubatch) const override;
     ggml_tensor * get_k_native(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v_native(ggml_context * ctx, int32_t il) const;
@@ -131,10 +132,10 @@ public:
     void set_input_kq_mask_tail(
             ggml_tensor * body, ggml_tensor * exact,
             ggml_tensor * read_idxs, ggml_tensor * body_read_idxs, ggml_tensor * bias_read_idxs,
-            const llama_ubatch * ubatch) const override;
+            const llama_ubatch * ubatch, bool causal_attn) const override;
     void set_input_tail_body_plan(
             ggml_tensor * query_order, ggml_tensor * run_desc,
-            ggml_tensor * body_mask, const llama_ubatch * ubatch) const override;
+            ggml_tensor * body_mask, const llama_ubatch * ubatch, bool causal_attn) const override;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const override;
     void set_input_k_rot(ggml_tensor * dst) const override;
     void set_input_v_rot(ggml_tensor * dst) const override;
@@ -189,6 +190,9 @@ public:
 
     void clear(bool data) override;
     bool can_seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const override;
+    bool seq_rm_plan(
+            llama_seq_id seq_id, llama_pos p0, llama_pos p1,
+            llama_pos & planned_p0, llama_pos & planned_p1) const override;
     bool seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) override;
     bool seq_rm_cell(llama_seq_id seq_id, uint32_t cell_idx) override;
     int cells_at_pos(llama_seq_id seq_id, llama_pos pos, uint32_t * cell_indices, int n_max) override;
@@ -201,6 +205,7 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
     llama_kv_memory_stats kv_memory_stats() const override;
+    ggml_type get_kv_tail_type() const override { return exact_tail_type; }
     uint32_t get_kv_tail_group_count() const override { return 1; }
     bool get_kv_tail_coverage(
             uint32_t group_index,
@@ -210,13 +215,17 @@ public:
     uint64_t get_kv_tail_planner_timing_ns() const override;
 
     bool requires_state_for_partial_restore() const override;
-    bool state_seq_restore_requires_exclusive_kv_stream() const override;
+    bool state_seq_can_save(llama_seq_id seq_id) const override;
+    bool state_seq_can_restore(llama_seq_id seq_id) const override;
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read(llama_io_read_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
     llama_kv_cache * get_metadata_cache() const;
     int32_t mapped_layer_id(int32_t il) const;
+    llama_kv_tail_route get_tail_route(int32_t il) const;
+    ggml_type get_tail_type() const { return exact_tail_type; }
     bool has_pending_stream_copies() const;
+    bool stream_is_exclusive_for(llama_seq_id seq_id) const;
     bool apply_pending_stream_copies(llama_context * lctx);
     bool is_swa() const { return swa; }
 
@@ -289,7 +298,7 @@ private:
     const bool swa;
     const uint32_t n_groups_per_stream;
     const uint32_t exact_tail_tokens;
-    const ggml_type exact_tail_type;
+    ggml_type exact_tail_type;
 
     std::unique_ptr<llama_kv_cache> metadata;
     std::vector<layer> layers;

@@ -195,6 +195,22 @@ const char * llama_kvarn_validate_runtime(
     return nullptr;
 }
 
+llama_kvarn_iswa_policy llama_kvarn_iswa_policy_for(
+        bool enabled,
+        bool has_swa,
+        uint32_t n_seq_max,
+        bool unified,
+        bool fail_if_unsupported) {
+    if (!enabled) {
+        return LLAMA_KVARN_ISWA_DISABLED;
+    }
+    if (!has_swa || n_seq_max <= 1 || unified) {
+        return LLAMA_KVARN_ISWA_ALL_LAYERS;
+    }
+    return fail_if_unsupported ?
+        LLAMA_KVARN_ISWA_UNSUPPORTED : LLAMA_KVARN_ISWA_STANDARD_SWA_FALLBACK;
+}
+
 bool llama_kvarn_can_remove_range(llama_pos pos_max, llama_pos p0, llama_pos p1, uint32_t group) {
     assert(group > 0);
 
@@ -216,6 +232,29 @@ bool llama_kvarn_can_remove_range(llama_pos pos_max, llama_pos p0, llama_pos p1,
     const llama_pos live_group = pos_max / group;
     const llama_pos earliest_exact = std::max<llama_pos>(0, live_group - 1) * group;
     return begin >= earliest_exact;
+}
+
+bool llama_kvarn_plan_remove_range(
+        llama_pos pos_max,
+        llama_pos p0,
+        llama_pos p1,
+        uint32_t group,
+        bool stream_owned,
+        llama_pos & planned_p0,
+        llama_pos & planned_p1) {
+    if (llama_kvarn_can_remove_range(pos_max, p0, p1, group)) {
+        planned_p0 = p0;
+        planned_p1 = p1;
+        return true;
+    }
+
+    if (!stream_owned || p0 <= 0 || p1 >= 0) {
+        return false;
+    }
+
+    planned_p0 = (p0 / llama_pos(group)) * llama_pos(group);
+    planned_p1 = -1;
+    return true;
 }
 
 llama_kvarn_tile_layout llama_kvarn_make_layout(int head_dim, int group, int key_bits, int value_bits) {

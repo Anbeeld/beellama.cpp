@@ -5,6 +5,8 @@
 #include <cstddef>
 #include <cstdint>
 
+constexpr uint32_t KVAR_N_GROUP = 128;
+
 struct llama_kvarn_type_desc {
     llama_kvarn_type type;
     const char * name;
@@ -37,6 +39,20 @@ struct llama_kvarn_runtime_requirements {
     bool kv_unified;
 };
 
+enum llama_kvarn_iswa_policy {
+    LLAMA_KVARN_ISWA_DISABLED,
+    LLAMA_KVARN_ISWA_ALL_LAYERS,
+    LLAMA_KVARN_ISWA_STANDARD_SWA_FALLBACK,
+    LLAMA_KVARN_ISWA_UNSUPPORTED,
+};
+
+llama_kvarn_iswa_policy llama_kvarn_iswa_policy_for(
+        bool enabled,
+        bool has_swa,
+        uint32_t n_seq_max,
+        bool unified,
+        bool fail_if_unsupported);
+
 size_t llama_kvarn_type_count();
 
 const llama_kvarn_type_desc * llama_kvarn_type_desc_from_name(const char * name);
@@ -56,6 +72,34 @@ const char * llama_kvarn_validate_runtime(
         const llama_kvarn_runtime_requirements & requirements);
 
 bool llama_kvarn_can_remove_range(llama_pos pos_max, llama_pos p0, llama_pos p1, uint32_t group);
+bool llama_kvarn_plan_remove_range(
+        llama_pos pos_max,
+        llama_pos p0,
+        llama_pos p1,
+        uint32_t group,
+        bool stream_owned,
+        llama_pos & planned_p0,
+        llama_pos & planned_p1);
+
+template<typename SeqPosMax>
+bool llama_kvarn_stream_is_exclusive_for(
+        uint32_t n_stream,
+        size_t n_seq_max,
+        llama_seq_id seq_id,
+        const SeqPosMax & seq_pos_max) {
+    if (n_stream == 0 || seq_id < 0 || size_t(seq_id) >= n_seq_max) {
+        return false;
+    }
+    if (n_stream > 1) {
+        return true;
+    }
+    for (size_t other = 0; other < n_seq_max; ++other) {
+        if (other != size_t(seq_id) && seq_pos_max(llama_seq_id(other)) >= 0) {
+            return false;
+        }
+    }
+    return true;
+}
 
 void llama_kvarn_hadamard_128(float * values);
 

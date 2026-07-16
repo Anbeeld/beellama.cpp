@@ -2532,6 +2532,9 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
             break;
         case GGML_OP_SET_ROWS:
             {
+                if (op->src[3] != nullptr || op->src[4] != nullptr) {
+                    return false;
+                }
                 if (!ggml_cann_set_rows_shapes_supported(op)) {
                     return false;
                 }

@@ -1000,8 +1000,8 @@ enum common_context_seq_rm_type {
     COMMON_CONTEXT_SEQ_RM_TYPE_RS = 3, // can seq_rm partial sequences, bounded by n_rs_seq
 };
 
-// check if the llama_context can remove sequences
-// note: clears the memory of the context
+// Destructive startup-only capability probe for recurrent/speculative setup.
+// Clears the memory of the context; never use for request-time range planning.
 common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx);
 
 // aborts execution on failure

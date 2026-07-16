@@ -19,6 +19,8 @@ struct ggml_tensor;
 struct llama_cparams;
 struct llama_layer;
 
+enum llama_kv_tail_route : int;
+
 struct llama_memory_context_i;
 
 class llama_kv_cache_context;
@@ -1132,6 +1134,7 @@ struct llm_graph_context {
             ggml_tensor * tail_read_idxs = nullptr,
             ggml_tensor * tail_query_order = nullptr,
             ggml_tensor * tail_run_desc = nullptr,
+            llama_kv_tail_route tail_route = static_cast<llama_kv_tail_route>(0),
             enum ggml_flash_attn_ext_kvarn_domain kvarn_domain =
                 GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO) const;
 

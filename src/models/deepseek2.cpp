@@ -1,5 +1,11 @@
 #include "models.h"
 
+bool llama_model_deepseek2::graph_consumes_exact_kv_tail() const {
+    // The MLA path stores only compressed K and has no standard K/V overlay
+    // merge. Non-MLA variants continue through the ordinary MHA graph.
+    return !hparams.is_mla();
+}
+
 void llama_model_deepseek2::load_arch_hparams(llama_model_loader & ml) {
     uint32_t n_vocab = 0;
     ml.get_key(LLM_KV_VOCAB_SIZE, n_vocab, false) || ml.get_arr_n(LLM_KV_TOKENIZER_LIST, n_vocab, false);

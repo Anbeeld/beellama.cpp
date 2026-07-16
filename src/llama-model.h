@@ -647,6 +647,10 @@ struct llama_model {
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;
 
+    // Static model-graph declaration consumed by KV memory planning. K-only
+    // MLA/DSA graphs do not currently compose the standard exact-tail overlay.
+    virtual bool graph_consumes_exact_kv_tail() const;
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
     // total number of parameters in the model

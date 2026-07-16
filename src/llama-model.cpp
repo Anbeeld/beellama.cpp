@@ -1690,6 +1690,10 @@ llama_split_mode llama_model::split_mode() const {
     return params.split_mode;
 }
 
+bool llama_model::graph_consumes_exact_kv_tail() const {
+    return !hparams.is_mla();
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
@@ -2028,6 +2032,8 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
+    const ggml_type kvarn_tail_type = params.kv_tail_type == GGML_TYPE_COUNT ?
+            GGML_TYPE_F16 : params.kv_tail_type;
 
     switch (arch) {
         // Models that need specific instantiation should be handled in the
@@ -2145,19 +2151,19 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             std::unique_ptr<llama_memory_i> mem_attn;
                             if (params.kv_tail_tokens >= cparams.n_ctx_seq) {
                                 mem_attn = std::make_unique<llama_kv_cache>(
-                                        *this, hparams, params.kv_tail_type, params.kv_tail_type,
+                                        *this, hparams, kvarn_tail_type, kvarn_tail_type,
                                         !cparams.flash_attn, cparams.offload_kqv, cparams.kv_unified,
                                         cparams.n_ctx_seq, cparams.n_seq_max, 1,
                                         hparams.n_swa, hparams.swa_type, nullptr, filter_attn,
                                         nullptr, nullptr, cparams.n_ubatch, 0,
-                                        params.kv_tail_type, 0);
+                                        kvarn_tail_type, 0);
                             } else {
                                 mem_attn = std::make_unique<llama_kv_cache_kvarn>(
                                         *this, hparams, params.kvarn, cparams.offload_kqv,
                                         cparams.kv_unified, cparams.n_ctx_seq, cparams.n_seq_max,
                                         cparams.n_batch, cparams.n_ubatch, 1, hparams.n_swa,
                                         hparams.swa_type, filter_attn, nullptr, params.kv_tail_tokens,
-                                        params.kv_tail_type, params.kv_tail_tokens_requested);
+                                        kvarn_tail_type, params.kv_tail_tokens_requested);
                             }
                             auto mem_recr = std::make_unique<llama_memory_recurrent>(
                                     *this,
@@ -2313,19 +2319,19 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
                             if (params.kv_tail_tokens >= cparams.n_ctx_seq) {
                                 res = new llama_kv_cache(
-                                        *this, hparams, params.kv_tail_type, params.kv_tail_type,
+                                        *this, hparams, kvarn_tail_type, kvarn_tail_type,
                                         !cparams.flash_attn, cparams.offload_kqv, cparams.kv_unified,
                                         cparams.n_ctx_seq, cparams.n_seq_max, 1,
                                         hparams.n_swa, hparams.swa_type, nullptr, filter,
                                         reuse, nullptr, cparams.n_ubatch, 0,
-                                        params.kv_tail_type, 0);
+                                        kvarn_tail_type, 0);
                             } else {
                                 res = new llama_kv_cache_kvarn(
                                         *this, hparams, params.kvarn, cparams.offload_kqv,
                                         cparams.kv_unified, cparams.n_ctx_seq, cparams.n_seq_max,
                                         cparams.n_batch, cparams.n_ubatch, 1, hparams.n_swa,
                                         hparams.swa_type, filter, reuse, params.kv_tail_tokens,
-                                        params.kv_tail_type, params.kv_tail_tokens_requested);
+                                        kvarn_tail_type, params.kv_tail_tokens_requested);
                             }
                         } else {
                             res = new llama_kv_cache(

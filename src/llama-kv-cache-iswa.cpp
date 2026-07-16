@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <stdexcept>
 #include <string>
 
 //
@@ -101,6 +102,12 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     uint32_t size_swa = GGML_PAD(std::min(size_base, hparams.n_swa*(unified ? n_seq_max : 1) + n_ubatch), 256);
 
     const bool use_kvarn = kvarn.type != LLAMA_KVARN_TYPE_DISABLED;
+    if (tail_type == GGML_TYPE_COUNT && use_kvarn) {
+        // KVarN's exact representation is F16 by default. Resolve the cache
+        // family once here so a standard SWA fallback and a structured group
+        // cannot silently allocate different automatic tail types.
+        tail_type = GGML_TYPE_F16;
+    }
     llama_kvarn_params kvarn_swa = kvarn;
     if (use_kvarn && kvarn.swa_key_bits != 0) {
         const std::string swa_type_name =
@@ -122,9 +129,22 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
 
         size_swa = size_base;
     }
-    if (use_kvarn) {
+    const llama_kvarn_iswa_policy kvarn_policy = llama_kvarn_iswa_policy_for(
+            use_kvarn, hparams.n_swa > 0, n_seq_max, unified, kvarn.fail_if_unsupported);
+    if (kvarn_policy == LLAMA_KVARN_ISWA_UNSUPPORTED) {
+        throw std::invalid_argument(
+                "KVarN SWA group is unsupported with " + std::to_string(n_seq_max) +
+                " slots and --no-kv-unified; use --kv-unified or disable fail_if_unsupported");
+    }
+    if (kvarn_policy == LLAMA_KVARN_ISWA_ALL_LAYERS) {
         LLAMA_LOG_INFO("%s: KVarN enabled for all layers (non-SWA %s, SWA %s sliding-window ring)\n",
                 __func__, llama_kvarn_type_name(kvarn.type), llama_kvarn_type_name(kvarn_swa.type));
+    } else if (kvarn_policy == LLAMA_KVARN_ISWA_STANDARD_SWA_FALLBACK) {
+        LLAMA_LOG_WARN(
+                "%s: KVarN enabled for non-SWA layers (%s); SWA layers use standard %s/%s "
+                "because KVarN SWA requires --kv-unified with %u slots\n",
+                __func__, llama_kvarn_type_name(kvarn.type),
+                ggml_type_name(type_k), ggml_type_name(type_v), n_seq_max);
     }
 
     auto make_cache = [&](uint32_t size, uint32_t n_swa, llama_swa_type swa_type,
@@ -132,8 +152,9 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                           const llama_kvarn_params & cache_kvarn) -> std::unique_ptr<llama_memory_i> {
         // A sliding-window KVarN ring uses one stream.  A non-unified cache is
         // still valid when there is only one sequence.
+        const bool is_swa_group = n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE;
         const bool kvarn_ok = cache_kvarn.type != LLAMA_KVARN_TYPE_DISABLED &&
-            !(n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE && n_seq_max > 1 && !unified);
+            (!is_swa_group || kvarn_policy == LLAMA_KVARN_ISWA_ALL_LAYERS);
         if (kvarn_ok) {
             const uint32_t exact_tokens = n_swa > 0 ? tail_tokens_swa : tail_tokens;
             const uint32_t exact_requested = n_swa > 0 ? tail_tokens_swa_requested : tail_tokens_requested;
@@ -193,6 +214,13 @@ void llama_kv_cache_iswa::clear(bool data) {
 bool llama_kv_cache_iswa::can_seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
     return kv_base->can_seq_rm(seq_id, p0, p1) &&
            kv_swa ->can_seq_rm(seq_id, p0, p1);
+}
+
+bool llama_kv_cache_iswa::seq_rm_plan(
+        llama_seq_id seq_id, llama_pos p0, llama_pos p1,
+        llama_pos & planned_p0, llama_pos & planned_p1) const {
+    return llama_memory_seq_rm_plan_all(
+            seq_id, p0, p1, { kv_base.get(), kv_swa.get() }, planned_p0, planned_p1);
 }
 
 bool llama_kv_cache_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -260,6 +288,23 @@ llama_kv_memory_stats llama_kv_cache_iswa::kv_memory_stats() const {
     llama_kv_memory_stats result = kv_base->kv_memory_stats();
     result.add(kv_swa->kv_memory_stats());
     return result;
+}
+
+ggml_type llama_kv_cache_iswa::get_kv_tail_type() const {
+    const ggml_type base = kv_base->get_kv_tail_type();
+    const ggml_type swa  = kv_swa ->get_kv_tail_type();
+    if (base == GGML_TYPE_COUNT) {
+        return swa;
+    }
+    if (swa == GGML_TYPE_COUNT) {
+        return base;
+    }
+    if (base != swa) {
+        throw std::runtime_error(format(
+                "KV tail groups resolved to incompatible storage types %s and %s",
+                ggml_type_name(base), ggml_type_name(swa)));
+    }
+    return base;
 }
 
 uint32_t llama_kv_cache_iswa::get_kv_tail_group_count() const {
@@ -402,9 +447,14 @@ bool llama_kv_cache_iswa::get_can_shift() const {
            kv_base->get_kv_size() == kv_swa->get_kv_size();
 }
 
-bool llama_kv_cache_iswa::state_seq_restore_requires_exclusive_kv_stream() const {
-    return kv_base->state_seq_restore_requires_exclusive_kv_stream() ||
-           kv_swa->state_seq_restore_requires_exclusive_kv_stream();
+bool llama_kv_cache_iswa::state_seq_can_save(llama_seq_id seq_id) const {
+    return kv_base->state_seq_can_save(seq_id) &&
+           kv_swa->state_seq_can_save(seq_id);
+}
+
+bool llama_kv_cache_iswa::state_seq_can_restore(llama_seq_id seq_id) const {
+    return kv_base->state_seq_can_restore(seq_id) &&
+           kv_swa->state_seq_can_restore(seq_id);
 }
 
 void llama_kv_cache_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {

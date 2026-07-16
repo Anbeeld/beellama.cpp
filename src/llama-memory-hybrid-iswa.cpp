@@ -157,6 +157,13 @@ bool llama_memory_hybrid_iswa::can_seq_rm(llama_seq_id seq_id, llama_pos p0, lla
            mem_attn->can_seq_rm(seq_id, p0, p1);
 }
 
+bool llama_memory_hybrid_iswa::seq_rm_plan(
+        llama_seq_id seq_id, llama_pos p0, llama_pos p1,
+        llama_pos & planned_p0, llama_pos & planned_p1) const {
+    return llama_memory_seq_rm_plan_all(
+            seq_id, p0, p1, { mem_attn.get(), mem_recr.get() }, planned_p0, planned_p1);
+}
+
 bool llama_memory_hybrid_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     if (!can_seq_rm(seq_id, p0, p1)) {
         return false;
@@ -218,6 +225,10 @@ llama_kv_memory_stats llama_memory_hybrid_iswa::kv_memory_stats() const {
     return mem_attn->kv_memory_stats();
 }
 
+ggml_type llama_memory_hybrid_iswa::get_kv_tail_type() const {
+    return mem_attn->get_kv_tail_type();
+}
+
 uint32_t llama_memory_hybrid_iswa::get_kv_tail_group_count() const {
     return mem_attn->get_kv_tail_group_count();
 }
@@ -240,9 +251,14 @@ bool llama_memory_hybrid_iswa::requires_state_for_partial_restore() const {
            mem_recr->requires_state_for_partial_restore();
 }
 
-bool llama_memory_hybrid_iswa::state_seq_restore_requires_exclusive_kv_stream() const {
-    return mem_attn->state_seq_restore_requires_exclusive_kv_stream() ||
-           mem_recr->state_seq_restore_requires_exclusive_kv_stream();
+bool llama_memory_hybrid_iswa::state_seq_can_save(llama_seq_id seq_id) const {
+    return mem_attn->state_seq_can_save(seq_id) &&
+           mem_recr->state_seq_can_save(seq_id);
+}
+
+bool llama_memory_hybrid_iswa::state_seq_can_restore(llama_seq_id seq_id) const {
+    return mem_attn->state_seq_can_restore(seq_id) &&
+           mem_recr->state_seq_can_restore(seq_id);
 }
 
 void llama_memory_hybrid_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {

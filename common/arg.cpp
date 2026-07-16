@@ -1284,12 +1284,6 @@ static void common_params_kvarn_normalize(common_params & params) {
     }
 }
 
-static void common_params_kv_tail_type_normalize(common_params & params) {
-    if (params.kv_tail_type == GGML_TYPE_COUNT) {
-        params.kv_tail_type = params.kvarn.type == LLAMA_KVARN_TYPE_DISABLED ? GGML_TYPE_BF16 : GGML_TYPE_F16;
-    }
-}
-
 static common_speculative_dm_controller common_speculative_dm_controller_from_name(const std::string & value) {
     if (value == "off") {
         return COMMON_SPECULATIVE_DM_CONTROLLER_OFF;
@@ -1340,7 +1334,6 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             exit(0);
         }
         common_params_kvarn_normalize(ctx_arg.params);
-        common_params_kv_tail_type_normalize(ctx_arg.params);
         ctx_arg.params.lr.init();
         common_validate_reasoning_loop_guard_params(ctx_arg.params.reasoning_loop_guard);
         ctx_arg.params.sampling.reasoning_budget_tracking =

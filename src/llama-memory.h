@@ -8,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <functional>
+#include <initializer_list>
 #include <vector>
 
 struct llama_ubatch;
@@ -127,6 +128,17 @@ struct llama_memory_i {
         return true;
     }
 
+    virtual bool seq_rm_plan(
+            llama_seq_id seq_id, llama_pos p0, llama_pos p1,
+            llama_pos & planned_p0, llama_pos & planned_p1) const {
+        if (!can_seq_rm(seq_id, p0, p1)) {
+            return false;
+        }
+        planned_p0 = p0;
+        planned_p1 = p1;
+        return true;
+    }
+
     virtual bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) = 0;
     virtual bool seq_rm_cell(llama_seq_id seq_id, uint32_t cell_idx) = 0;
 
@@ -146,6 +158,7 @@ struct llama_memory_i {
 
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
     virtual llama_kv_memory_stats kv_memory_stats() const { return {}; }
+    virtual ggml_type get_kv_tail_type() const { return GGML_TYPE_COUNT; }
 
     virtual uint32_t get_kv_tail_group_count() const { return 0; }
     virtual bool get_kv_tail_coverage(
@@ -164,9 +177,15 @@ struct llama_memory_i {
     // even when LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY is requested.
     virtual bool requires_state_for_partial_restore() const { return false; }
 
-    // Some structured shared-stream memories cannot restore a per-sequence state
-    // without rewriting physical stream data that may also belong to other sequences.
-    virtual bool state_seq_restore_requires_exclusive_kv_stream() const { return false; }
+    // Per-sequence state operations must not snapshot or overwrite physical data
+    // owned by another live logical sequence. Composite memories must forward both
+    // direction-specific queries to every participating child.
+    virtual bool state_seq_can_save(llama_seq_id seq_id) const {
+        return seq_id >= 0;
+    }
+    virtual bool state_seq_can_restore(llama_seq_id seq_id) const {
+        return seq_id >= 0;
+    }
 
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
@@ -177,5 +196,44 @@ struct llama_memory_i {
     virtual uint32_t get_kv_size() const { return 0; }
     virtual llama_memory_context_ptr init_kv_batch(const std::vector<llama_ubatch> & /* ubatches */) { return nullptr; }
 };
+
+inline bool llama_memory_seq_rm_plan_all(
+        llama_seq_id seq_id, llama_pos p0, llama_pos p1,
+        std::initializer_list<const llama_memory_i *> children,
+        llama_pos & planned_p0, llama_pos & planned_p1) {
+    if (children.size() == 0) {
+        return false;
+    }
+
+    llama_pos common_p0 = p0;
+    llama_pos common_p1 = p1;
+    for (const llama_memory_i * child : children) {
+        llama_pos child_p0 = p0;
+        llama_pos child_p1 = p1;
+        if (child == nullptr || !child->seq_rm_plan(seq_id, p0, p1, child_p0, child_p1)) {
+            return false;
+        }
+        if (p1 < 0) {
+            if (child_p1 >= 0) {
+                return false;
+            }
+            if (child_p0 < common_p0) {
+                common_p0 = child_p0;
+            }
+        } else if (child_p0 != p0 || child_p1 != p1) {
+            return false;
+        }
+    }
+
+    for (const llama_memory_i * child : children) {
+        if (!child->can_seq_rm(seq_id, common_p0, common_p1)) {
+            return false;
+        }
+    }
+
+    planned_p0 = common_p0;
+    planned_p1 = common_p1;
+    return true;
+}
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;

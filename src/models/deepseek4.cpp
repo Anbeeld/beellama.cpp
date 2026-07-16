@@ -716,6 +716,13 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     return out;
 }
 
+bool llama_model_deepseek4::graph_consumes_exact_kv_tail() const {
+    // DSA owns a K-only raw cache and final-top-k composition. Standard exact
+    // overlay semantics are intentionally deferred until that path has a
+    // single-softmax model oracle.
+    return false;
+}
+
 ggml_tensor * llama_model_deepseek4::graph::build_raw_tail(
         llm_graph_input_dsv4_raw * inp_attn, int il) const {
     const auto * mctx_raw = inp_attn->mctx;
