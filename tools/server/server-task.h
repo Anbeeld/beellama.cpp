@@ -4,6 +4,7 @@
 #include "llama.h"
 
 #include <string>
+#include <functional>
 #include <unordered_set>
 #include <list>
 #include <map>
@@ -640,6 +641,38 @@ struct server_prompt {
     }
 };
 
+enum server_prompt_state_kind {
+    SERVER_PROMPT_STATE_MAIN,
+    SERVER_PROMPT_STATE_DRAFT,
+};
+
+struct server_prompt_cache_state_io {
+    bool has_draft;
+    std::function<bool(server_prompt_state_kind)> can_restore;
+    std::function<bool(server_prompt_state_kind, const std::vector<uint8_t> &)> restore;
+    std::function<bool(server_prompt_state_kind)> clear;
+};
+
+enum server_seq_rm_result {
+    SERVER_SEQ_RM_APPLIED,
+    SERVER_SEQ_RM_FULL_REPROCESS,
+    SERVER_SEQ_RM_MUTATION_FAILED,
+};
+
+struct server_seq_rm_io {
+    bool has_draft;
+    std::function<bool(server_prompt_state_kind, llama_seq_id, llama_pos, llama_pos,
+                       llama_pos &, llama_pos &)> plan;
+    std::function<bool(server_prompt_state_kind, llama_seq_id, llama_pos, llama_pos)> can_remove;
+    std::function<bool(server_prompt_state_kind, llama_seq_id, llama_pos, llama_pos)> remove;
+};
+
+server_seq_rm_result server_plan_and_remove_suffix(
+        llama_seq_id seq_id,
+        llama_pos requested_p0,
+        const server_seq_rm_io & io,
+        llama_pos & planned_p0);
+
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
@@ -659,6 +692,10 @@ struct server_prompt_cache {
     size_t n_tokens() const;
 
     server_prompt * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+
+    bool erase(const server_prompt * entry);
+
+    bool load(server_prompt & prompt, const server_tokens & tokens_new, const server_prompt_cache_state_io & io);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot);
 

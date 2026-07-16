@@ -1668,6 +1668,56 @@ json server_task_result_apply_lora::to_json() {
 //
 // server_prompt_cache
 //
+server_seq_rm_result server_plan_and_remove_suffix(
+        llama_seq_id seq_id,
+        llama_pos requested_p0,
+        const server_seq_rm_io & io,
+        llama_pos & planned_p0) {
+    const auto clear_complete_sequences = [&]() {
+        const bool clear_main = io.remove(SERVER_PROMPT_STATE_MAIN, seq_id, -1, -1);
+        const bool clear_draft = !io.has_draft ||
+                io.remove(SERVER_PROMPT_STATE_DRAFT, seq_id, -1, -1);
+        if (!clear_main || !clear_draft) {
+            GGML_ABORT("sequence-removal recovery failed to clear a complete slot sequence");
+        }
+        planned_p0 = 0;
+    };
+
+    llama_pos main_p0 = requested_p0;
+    llama_pos main_p1 = -1;
+    llama_pos draft_p0 = requested_p0;
+    llama_pos draft_p1 = -1;
+    const bool main_planned = io.plan(
+            SERVER_PROMPT_STATE_MAIN, seq_id, requested_p0, -1, main_p0, main_p1);
+    const bool draft_planned = !io.has_draft || io.plan(
+            SERVER_PROMPT_STATE_DRAFT, seq_id, requested_p0, -1, draft_p0, draft_p1);
+    if (!main_planned || !draft_planned || main_p1 >= 0 || (io.has_draft && draft_p1 >= 0)) {
+        clear_complete_sequences();
+        return SERVER_SEQ_RM_FULL_REPROCESS;
+    }
+
+    planned_p0 = io.has_draft ? std::min(main_p0, draft_p0) : main_p0;
+    const bool main_accepts = io.can_remove(
+            SERVER_PROMPT_STATE_MAIN, seq_id, planned_p0, -1);
+    const bool draft_accepts = !io.has_draft || io.can_remove(
+            SERVER_PROMPT_STATE_DRAFT, seq_id, planned_p0, -1);
+    if (!main_accepts || !draft_accepts) {
+        clear_complete_sequences();
+        return SERVER_SEQ_RM_FULL_REPROCESS;
+    }
+
+    const bool main_removed = io.remove(
+            SERVER_PROMPT_STATE_MAIN, seq_id, planned_p0, -1);
+    const bool draft_removed = main_removed && (!io.has_draft || io.remove(
+            SERVER_PROMPT_STATE_DRAFT, seq_id, planned_p0, -1));
+    if (!main_removed || !draft_removed) {
+        clear_complete_sequences();
+        return SERVER_SEQ_RM_MUTATION_FAILED;
+    }
+
+    return SERVER_SEQ_RM_APPLIED;
+}
+
 size_t server_prompt_cache::size() const {
     size_t res = 0;
 
@@ -1768,7 +1818,20 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
     return &states.back();
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+bool server_prompt_cache::erase(const server_prompt * entry) {
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        if (&*it == entry) {
+            states.erase(it);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool server_prompt_cache::load(
+        server_prompt & prompt,
+        const server_tokens & tokens_new,
+        const server_prompt_cache_state_io & io) {
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -1801,46 +1864,63 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
 
-        {
-            auto & data = it_best->data.main;
-
-            const size_t size = data.size();
-            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
-            if (n != size) {
-                SRV_ERR("failed to restore state with size %zu\n", size);
-
-                return false;
-            }
-
-            data.clear();
-            data.shrink_to_fit();
-        }
-
-        {
-            auto & data = it_best->data.drft;
-
-            if (!data.empty()) {
-                GGML_ASSERT(ctx_dft);
-
-                const size_t size = data.size();
-                const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
-                if (n != size) {
-                    SRV_WRN("failed to restore state with size %zu\n", size);
-
-                    return false;
-                }
-
-                data.clear();
-                data.shrink_to_fit();
-            }
-        }
-
-        prompt = std::move(*it_best);
-
+        server_prompt selected = std::move(*it_best);
         states.erase(it_best);
+
+        const auto fail_load = [&]() {
+            const bool clear_main = io.clear(SERVER_PROMPT_STATE_MAIN);
+            const bool clear_draft = !io.has_draft || io.clear(SERVER_PROMPT_STATE_DRAFT);
+            if (!clear_main || !clear_draft) {
+                GGML_ABORT("prompt-cache recovery failed to clear a complete slot sequence");
+            }
+            prompt.tokens.clear();
+            prompt.data.main.clear();
+            prompt.data.drft.clear();
+            prompt.checkpoints.clear();
+            return false;
+        };
+
+        if (selected.data.main.empty() ||
+                io.has_draft != !selected.data.drft.empty() ||
+                !io.can_restore(SERVER_PROMPT_STATE_MAIN) ||
+                (io.has_draft && !io.can_restore(SERVER_PROMPT_STATE_DRAFT))) {
+            return fail_load();
+        }
+
+        if (!io.restore(SERVER_PROMPT_STATE_MAIN, selected.data.main) ||
+                (io.has_draft && !io.restore(SERVER_PROMPT_STATE_DRAFT, selected.data.drft))) {
+            return fail_load();
+        }
+
+        selected.data.main.clear();
+        selected.data.main.shrink_to_fit();
+        selected.data.drft.clear();
+        selected.data.drft.shrink_to_fit();
+        prompt = std::move(selected);
     }
 
     return true;
+}
+
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+    server_prompt_cache_state_io io {
+        /*.has_draft =*/ ctx_dft != nullptr,
+        /*.can_restore =*/ [&](server_prompt_state_kind kind) {
+            llama_context * ctx = kind == SERVER_PROMPT_STATE_MAIN ? ctx_tgt : ctx_dft;
+            return ctx != nullptr && llama_memory_state_seq_can_restore(llama_get_memory(ctx), id_slot);
+        },
+        /*.restore =*/ [&](server_prompt_state_kind kind, const std::vector<uint8_t> & data) {
+            llama_context * ctx = kind == SERVER_PROMPT_STATE_MAIN ? ctx_tgt : ctx_dft;
+            return ctx != nullptr &&
+                   llama_state_seq_set_data_ext(ctx, data.data(), data.size(), id_slot, 0) == data.size();
+        },
+        /*.clear =*/ [&](server_prompt_state_kind kind) {
+            llama_context * ctx = kind == SERVER_PROMPT_STATE_MAIN ? ctx_tgt : ctx_dft;
+            return ctx != nullptr && llama_memory_seq_rm(llama_get_memory(ctx), id_slot, -1, -1);
+        },
+    };
+
+    return load(prompt, tokens_new, io);
 }
 
 void server_prompt_cache::update() {
