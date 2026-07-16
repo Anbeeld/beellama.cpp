@@ -1734,16 +1734,16 @@ size_t server_prompt_cache::n_tokens() const {
     size_t res = 0;
 
     for (const auto & state : states) {
-        res += state.n_tokens();
+        res += state.prompt.n_tokens();
     }
 
     return res;
 }
 
-server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
-        const int cur_lcp_len = it->tokens.get_common_prefix(prompt.tokens);
+        const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
         if (cur_lcp_len == (int) prompt.tokens.size()) {
             SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
@@ -1768,9 +1768,9 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
 
     // remove any cached prompts that are fully contained in the current prompt
     for (auto it = states.begin(); it != states.end();) {
-        const int len = it->tokens.get_common_prefix(prompt.tokens);
+        const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
-        if (len == (int) it->tokens.size()) {
+        if (len == (int) it->prompt.tokens.size()) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
             it = states.erase(it);
@@ -1809,18 +1809,20 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
     }
 
     states.push_back({
-        /*.tokens      =*/ prompt.tokens.clone(),
-        /*.data        =*/ {
+        /*.prompt =*/ {
+            /*.tokens      =*/ prompt.tokens.clone(),
+            /*.checkpoints =*/ prompt.checkpoints,
+        },
+        /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
             /*.drft =*/ std::move(state_data_dft),
         },
-        /*.checkpoints =*/ prompt.checkpoints,
     });
 
     return &states.back();
 }
 
-bool server_prompt_cache::erase(const server_prompt * entry) {
+bool server_prompt_cache::erase(const server_prompt_cache_state * entry) {
     for (auto it = states.begin(); it != states.end(); ++it) {
         if (&*it == entry) {
             states.erase(it);
@@ -1845,9 +1847,9 @@ bool server_prompt_cache::load(
 
     // find the most similar cached prompt, that would also preserve the most context
     for (auto it = states.begin(); it != states.end(); ++it) {
-        const int lcp_cur = it->tokens.get_common_prefix(tokens_new);
+        const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
 
-        const float f_keep_cur = float(lcp_cur) / it->tokens.size();
+        const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
         const float sim_cur    = float(lcp_cur) / tokens_new.size();
 
         // don't trash large prompts
@@ -1866,39 +1868,40 @@ bool server_prompt_cache::load(
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
 
-        server_prompt selected = std::move(*it_best);
-        states.erase(it_best);
-
         const auto fail_load = [&]() {
             const bool clear_main = io.clear(SERVER_PROMPT_STATE_MAIN);
             const bool clear_draft = !io.has_draft || io.clear(SERVER_PROMPT_STATE_DRAFT);
             if (!clear_main || !clear_draft) {
                 GGML_ABORT("prompt-cache recovery failed to clear a complete slot sequence");
             }
-            prompt.tokens.clear();
-            prompt.data.main.clear();
-            prompt.data.drft.clear();
-            prompt.checkpoints.clear();
+            prompt.clear();
             return false;
         };
 
-        if (selected.data.main.empty() ||
-                io.has_draft != !selected.data.drft.empty() ||
+        const auto fail_and_evict = [&]() {
+            states.erase(it_best);
+            return fail_load();
+        };
+
+        auto & data = it_best->data;
+        if (data.main.empty() ||
+                io.has_draft != !data.drft.empty() ||
                 !io.can_restore(SERVER_PROMPT_STATE_MAIN) ||
                 (io.has_draft && !io.can_restore(SERVER_PROMPT_STATE_DRAFT))) {
-            return fail_load();
+            return fail_and_evict();
         }
 
-        if (!io.restore(SERVER_PROMPT_STATE_MAIN, selected.data.main) ||
-                (io.has_draft && !io.restore(SERVER_PROMPT_STATE_DRAFT, selected.data.drft))) {
-            return fail_load();
+        if (!io.restore(SERVER_PROMPT_STATE_MAIN, data.main) ||
+                (io.has_draft && !io.restore(SERVER_PROMPT_STATE_DRAFT, data.drft))) {
+            return fail_and_evict();
         }
 
-        selected.data.main.clear();
-        selected.data.main.shrink_to_fit();
-        selected.data.drft.clear();
-        selected.data.drft.shrink_to_fit();
-        prompt = std::move(selected);
+        data.main.clear();
+        data.main.shrink_to_fit();
+        data.drft.clear();
+        data.drft.shrink_to_fit();
+        prompt = std::move(it_best->prompt);
+        states.erase(it_best);
     }
 
     return true;
@@ -1954,6 +1957,6 @@ void server_prompt_cache::update() {
 
     for (const auto & state : states) {
         SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
-                (const void *)&state, state.n_tokens(), state.checkpoints.size(), state.size() / (1024.0 * 1024.0));
+                (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0));
     }
 }

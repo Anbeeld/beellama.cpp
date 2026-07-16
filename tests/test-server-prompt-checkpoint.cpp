@@ -13,13 +13,13 @@ static server_prompt make_prompt(const llama_tokens & tokens) {
 
 static void prompt_cache_load_target_success_draft_failure_is_atomic() {
     server_prompt_cache cache(1, 0);
-    server_prompt saved = make_prompt({1, 2, 3});
+    server_prompt_cache_state saved;
+    saved.prompt = make_prompt({1, 2, 3});
     saved.data.main.resize(16);
     saved.data.drft.resize(8);
     cache.states.push_back(std::move(saved));
 
     server_prompt current = make_prompt({9});
-    current.data.main.resize(4);
     current.checkpoints.emplace_back().data_tgt.resize(4);
     server_tokens requested(llama_tokens {1, 2, 4}, false);
 
@@ -49,7 +49,6 @@ static void prompt_cache_load_target_success_draft_failure_is_atomic() {
     assert(cleared_main && cleared_draft);
     assert(cache.states.empty());
     assert(current.tokens.empty());
-    assert(current.data.size() == 0);
     assert(current.checkpoints.empty());
 }
 
@@ -178,24 +177,29 @@ int main() {
 
     {
         server_prompt prompt = make_prompt({1, 2, 3});
-        prompt.data.main.resize(64);
-        prompt.data.drft.resize(32);
         auto & ckpt = prompt.checkpoints.emplace_back();
         ckpt.n_tokens = 3;
         ckpt.data_tgt.resize(16);
         ckpt.data_dft.resize(8);
-        assert(prompt.size() == 120);
 
         const server_prompt clone = prompt.clone();
         assert(clone.n_tokens() == 3);
-        assert(clone.data.size() == 96);
         assert(clone.checkpoints.size() == 1);
-        assert(clone.size() == prompt.size());
+
+        server_prompt_cache_state state {
+            /*.prompt =*/ std::move(prompt),
+            /*.data =*/ {
+                /*.main =*/ std::vector<uint8_t>(64),
+                /*.drft =*/ std::vector<uint8_t>(32),
+            },
+        };
+        assert(state.size() == 120);
     }
 
     {
         server_prompt_cache cache(1, 0);
-        server_prompt existing = make_prompt({1, 2});
+        server_prompt_cache_state existing;
+        existing.prompt = make_prompt({1, 2});
         existing.data.main.resize(700*KIB);
         cache.states.push_back(std::move(existing));
 
@@ -217,14 +221,15 @@ int main() {
 
         auto * saved = cache.alloc(current, 800*KIB, 0);
         assert(saved != nullptr);
-        assert(saved->checkpoints.size() == 1);
+        assert(saved->prompt.checkpoints.size() == 1);
         assert(saved->size() == 1000*KIB);
         assert(cache.size() == saved->size());
     }
 
     {
         server_prompt_cache cache(1, 0);
-        server_prompt existing = make_prompt({1, 2});
+        server_prompt_cache_state existing;
+        existing.prompt = make_prompt({1, 2});
         existing.data.main.resize(100*KIB);
         cache.states.push_back(std::move(existing));
 

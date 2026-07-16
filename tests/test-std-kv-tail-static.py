@@ -249,8 +249,16 @@ def main() -> None:
         raise AssertionError("disabled KVarN kernels must not be advertised or dispatched by CUDA")
 
     default_build = (ROOT / "tmp/build-local-3090-cuda13.1-default.ps1").read_text(encoding="utf-8")
-    if f"-D{kvarn_option}=OFF" not in default_build:
-        raise AssertionError("default standard-quant iteration build must compile no KVarN CUDA kernels")
+    if default_build.count(f"-D{kvarn_option}=ON") != 1:
+        raise AssertionError("default CUDA build must enable the single KVarN compilation toggle")
+    if default_build.count("-DGGML_CUDA_FA_ALL_QUANTS=OFF") != 1:
+        raise AssertionError("default CUDA build must explicitly select only the default FA pair matrices")
+    if any(option in default_build for option in removed_options):
+        raise AssertionError("default CUDA build must not use obsolete KVarN compilation toggles")
+    default_pairs_block = ggml_cmake.split("set(GGML_CUDA_KVARN_DEFAULT_PAIRS", 1)[1].split(")", 1)[0]
+    default_pairs = default_pairs_block.split()
+    if len(default_pairs) != 15:
+        raise AssertionError("default CUDA build must compile all and only the 15 default KVarN pairs")
 
     ggml_header = (ROOT / "ggml/include/ggml.h").read_text(encoding="utf-8")
     cuda_fattn = (ROOT / "ggml/src/ggml-cuda/fattn.cu").read_text(encoding="utf-8")
