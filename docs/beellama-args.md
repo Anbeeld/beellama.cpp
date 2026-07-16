@@ -30,6 +30,11 @@ contexts remain on standard cache types and do not inherit the target tail.
 | `--kv-tail-tokens SPEC` | `LLAMA_ARG_KV_TAIL_TOKENS` | `0` | For standard caches, `0` keeps the ordinary cache path. For KVarN, omitted or `0` retains the intrinsic 128-token exact suffix. A number applies to every canonical group; KVarN rounds positive values upward to complete 128-token groups. `N0,N1` follows canonical group order, while `full=N,swa=N` accepts unique role aliases or structural IDs such as `full@l0`. Invalid, duplicate, incomplete, or wrong-length specifications resolve additional coverage to zero, while KVarN still retains its intrinsic suffix. `auto` requests 1024 exact tokens per applicable target-cache group, capped by that group's effective context or attention window. |
 | `--kv-tail-type TYPE` | `LLAMA_ARG_KV_TAIL_TYPE` | `bf16` for standard caches; `f16` for KVarN | Selects `f16` or `bf16` exact storage for overlay shadows or a promoted native-exact body. An explicit value overrides the cache-family default in either direction. Other types are rejected. |
 
+An omitted tail type remains automatic until context placement. If the standard
+BF16 default lacks a complete Metal or SYCL route but F16 is complete, automatic
+selection warns and resolves once to F16. Explicit `--kv-tail-type bf16` fails
+instead of changing the requested representation.
+
 Explicit values are capped by the group's effective attention window and context
 capacity. KVarN values are also rounded upward to 128-token groups. Startup logs
 show raw, requested, effective, and window lengths, the structural group ID,
@@ -38,6 +43,20 @@ representation, actual body and shadow types, physical rows, arena and sink
 rows, and memory increments. Only a quantized K side receives an added K
 shadow, and only a quantized V side receives an added V shadow. A native-exact
 group has no shadow or tail planner because its ordinary body is exact.
+
+Standard shadow capacity is
+`round_up(N + n_ubatch, 256) * n_seq_max + sink_slots`; `sink_slots` is
+`n_ubatch` for a multi-sequence context and zero otherwise. The round-up is
+per-sequence arena padding, while sinks are separately reserved. Exact arenas
+remain per logical sequence even with `--kv-unified`. Positive exact overlays
+on K-only MLA or DSA attention are rejected during context creation.
+
+Partial exact overlays are compatible with `--split-mode layer`; every shadow
+stays on the same device as its layer's ordinary K/V body. They are not
+compatible with `--split-mode tensor`, whose meta buffer shards a body tensor
+across devices. That combination fails before tail allocation. Tensor split
+requires `--kv-tail-tokens 0` or a full-window standard native-exact result,
+which has no shadow and uses the ordinary KV split descriptor.
 
 KVarN's physical staging depth is independent of this logical policy. Increasing
 `-ub` may increase transient work but never increases exact coverage. Completed
@@ -66,6 +85,21 @@ independently of ubatch workspace, so state may move between `ub=128` and
 `ub=512`. It rejects version 11 rather than reinterpreting the old
 workspace-dependent layout. Tail length, type, preset, and structural-group
 mismatches also fail closed.
+
+Sequence-state framing version 2 writes the current validated tail manifest and
+supports host or on-device tensor transfer. Tail manifest version 1 remains
+readable but restores conservative degraded provenance. Immediate body
+membership and position changes after sequence copy are preserved; pending
+exact rows materialize as one batch when state data is requested.
+
+Prompt-cache message boundaries do not reset the suffix. Standard unified and
+non-unified slots reuse continuously. KVarN exact-tail divergence trims
+exactly; eligible older divergence reuses from the overlapping 128-token group
+boundary on a non-unified or exclusive unified stream. Unified contention, an
+unsupported recurrent rollback, `cache_prompt=false`, slot eviction, or no
+common target/draft plan produces a safe full reevaluation. Unified KVarN RAM
+save and restore require stream exclusivity; contended save is skipped without
+clearing the slot, and contended restore is a miss.
 
 ## DFlash and adaptive draft depth
 

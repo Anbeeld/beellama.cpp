@@ -170,6 +170,16 @@ FlashAttention normalization metadata; the generic graph gathers only the
 configured compact tail width. Neither overlay route materializes the full
 cache. Native-exact groups use the ordinary body graph and allocate no shadow.
 
+Exact overlays support the normal `--split-mode layer` ownership model: each
+body and its K/V shadows are allocated on that layer's owning device, and graph
+writes, reads, and state payload rows retain the same owner. Tensor/meta split
+shards an individual body tensor, so a mirrored compact shadow would be
+incorrect; partial standard and KVarN overlays therefore fail during context
+creation after the ordinary body placement is known and before any tail arena
+or shadow allocation. With `--split-mode tensor`, use `--kv-tail-tokens 0` or a
+full-window standard native-exact representation. Native-exact has no shadow
+and follows the ordinary KV tensor split when that split descriptor is valid.
+
 KVarN differs from standard caches in three intentional ways. Its exact suffix
 has a non-disableable 128-token floor, positive requests round upward to 128
 tokens, and completed compressed records are written eagerly even while their
@@ -179,12 +189,39 @@ body, and suffix masks therefore contribute each key exactly once. F16/BF16
 canonical K/V rows are stored after RoPE for K and in the original V domain;
 the compressed body retains KVarN's rotated-domain records.
 
+Standard unified and non-unified prompt caches preserve one continuous suffix
+across requests and message boundaries. KVarN trims divergence in its live
+exact suffix exactly. Older KVarN divergence retains all complete groups before
+the overlapping 128-token group only on a non-unified or otherwise exclusive
+unified stream; at most 127 positions before the requested trim are
+reevaluated. Unified contention rejects partial rollback, fully reevaluates the
+requesting slot, and leaves the other slot unchanged. Every hybrid child must
+accept the boundary, so a recurrent component without retained rollback states
+can still require a safe full reevaluation. `cache_prompt=false`, slot eviction,
+or the absence of one common target/draft plan can also force a miss.
+
+Unified KVarN per-sequence RAM save and restore require an exclusive structured
+stream. Contended save creates no cache entry and does not clear the slot;
+contended restore is a cache miss. Non-unified KVarN is the configuration where
+multi-slot RAM caching and group-aligned historical reuse are unconditional.
+For hybrid iSWA with multiple non-unified slots, eligible non-SWA layers keep
+KVarN while SWA layers use a warned standard-cache fallback; a fail-closed
+preset rejects the context instead. Unified or single-slot layouts can retain
+KVarN in both groups when otherwise eligible.
+
 SWA storage remains upstream-aligned at `W + U` physical rows (window plus
 ubatch reserve); this feature does not compact the SWA ring. Sparse packing of
 generic body rows is enabled only when the complete physical stream fits in the
 per-sequence arena, so cached-graph eligibility cannot change with occupancy,
 restore, or coverage degradation. Outside that bound the ordinary body route is
 used.
+
+Standard exact storage allocates
+`round_up(N + n_ubatch, 256) * n_seq_max + sink_slots` rows. The rounded term is
+one active-plus-in-flight arena per logical sequence; `sink_slots` is a separate
+multi-sequence reserve. Unified ordinary body storage does not merge these
+logical exact arenas. Positive K-only MLA and DSA overlays are rejected during
+context creation in this release.
 
 ### When to use it
 
@@ -218,28 +255,34 @@ KVarN-specific workspace, attention, and state decisions are in
 
 For standard caches, the default length is zero and preserves the ordinary
 topology. KVarN always resolves at least its intrinsic 128-token suffix.
+Sequence-state framing version 2 writes a validated KV-tail manifest and can
+transfer tail tensors through host buffers or the on-device tensor protocol.
 Overlay states reject a different structural group, resolved length,
-representation, KVarN preset, or F16/BF16 type. Native-exact state is already
+representation, KVarN preset, or F16/BF16 type before mutation. Manifest
+version 1 remains readable with conservative degraded provenance; it cannot
+upgrade incomplete historical evidence to exact. Native-exact state is already
 present in the ordinary body and has no duplicate shadow section. Standard
 body-only compatibility state and explicit body-only state begin with
 observable degraded coverage and refill from original activations on later
-writes. KVarN state version 12 stores logical compressed records plus exact
-payloads and remaps physical workspace on restore; version 11 is rejected
-because it serialized the old workspace-dependent layout. Dequantized body
-rows are never labeled exact. Server metrics report requested and exact tokens,
-coverage group states, and degraded sequences.
+writes. Sequence copies publish body membership and positions immediately;
+deferred exact rows materialize in one batch when state data or another direct
+consumer needs them. KVarN state version 12 stores logical compressed records
+plus exact payloads and remaps physical workspace on restore; version 11 is
+rejected because it serialized the old workspace-dependent layout. Dequantized
+body rows are never labeled exact. Server metrics report requested and exact
+tokens, coverage group states, and degraded sequences.
 
 ### Backend routes
 
-CUDA supports the generic graph and the attached-tail FlashAttention route.
-CPU and Vulkan support the complete generic standard-quant graph. Metal, HIP,
-SYCL, and generic OpenCL contain the same generic operator families, subject to
-their normal device and toolchain capabilities. OpenCL's Adreno-transformed
-weight layouts are rejected by these row operators; flat standard-cache storage
-uses the generic kernels. CANN does not yet provide native packed standard-quant
-SET_ROWS and OUT_PROD kernels, so such operations are rejected by CANN and may
-be scheduled to another backend. Startup diagnostics name the selected native
-or generic route; generic long-context attention can be substantially slower.
+CUDA's native and generic routes and CPU's generic route are hardware verified.
+Vulkan, Metal, HIP, SYCL, and generic OpenCL contain the required generic
+operator families and are source supported, but are not hardware-verified by
+this release. OpenCL's Adreno-transformed weight layouts are rejected by these
+row operators; flat standard-cache storage uses the generic kernels. CANN
+overlay contexts are rejected at context creation because fused shadow
+`SET_ROWS` is not supported; successful source classification is not an Ascend
+hardware claim. Startup diagnostics name the selected native or generic route;
+generic long-context attention can be substantially slower.
 
 ### Measurement and validation
 

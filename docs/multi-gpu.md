@@ -85,6 +85,17 @@ llama-cli -m model.gguf -sm tensor -ctk f16 -ctv f16
 
 - `--flash-attn off` or (`--flash-attn auto` resolving to `off` when it isn't supported) is a hard error.
 - KV cache types must be non-quantized: `f32`, `f16`, or `bf16`. Support for quantized KV cache is not implemented and trying to use it will result in an error.
+- Bee exact-tail overlays are not mirrored across tensor-parallel shards. With
+  `--kv-tail-tokens` enabled, use `--split-mode layer`, set the request to `0`,
+  or choose a full-window standard request that resolves to native-exact (and
+  therefore allocates no shadow). Partial standard and KVarN overlays fail
+  before tail allocation.
+- Exact-tail layer placement is source-verified by synthetic multi-device
+  ownership tests: body, shadow, graph consumer, and state row select the same
+  realized layer owner. Two-GPU tail hardware was not run for this release and
+  is not claimed as hardware verified. CPU and single-GPU CUDA routes are
+  hardware verified; tensor/meta overlays and CANN overlays are rejected at
+  context creation.
 - Mark this configuration as experimental in your tooling: validate output quality before deploying.
 - `--split-mode tensor`is not implemented for all architectures. The following will fail with *"LLAMA_SPLIT_MODE_TENSOR not implemented for architecture '...'"*:
 
@@ -119,6 +130,7 @@ P2P requires driver support (usually restricted to workstation/datacenter GPUs) 
 |---|---|
 | Startup error *"SPLIT_MODE_TENSOR requires flash_attn to be enabled"* | Add `-fa on` or remove `-fa off`. |
 | Startup error *"simultaneous use of SPLIT_MODE_TENSOR and KV cache quantization not implemented"* | Use `-ctk f16 -ctv f16` (or `bf16`/`f32`) with `--split-mode tensor`. |
+| Startup error *"exact-tail overlay rejected ... tensor/meta split buffer"* | Use `--split-mode layer`, `--kv-tail-tokens 0`, or a full-window standard request that resolves to native-exact. |
 | Startup error *"LLAMA_SPLIT_MODE_TENSOR not implemented for architecture 'X'"* | Architecture not on the TENSOR allow-list. Use `--split-mode layer`. |
 | Warning *"NCCL is unavailable, multi GPU performance will be suboptimal"* | llama.cpp wasn't built with NCCL. Either accept the lower performance or install NCCL and rebuild. |
 | CUDA OOM at startup or during prefill in `--split-mode tensor` | Auto-fit is disabled in this mode, so reduce memory pressure yourself. In order from least to most disruptive: lower `--ctx-size` (`-c`) (KV cache is roughly proportional to `n_ctx`); for `llama-server`, lower `--parallel` (`-np`) (a slot KV cache is allocated per concurrent sequence); as a last resort, reduce `--n-gpu-layers` (`-ngl`) (the remaining layers run on CPU and inference will be much slower). |

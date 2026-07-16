@@ -47,6 +47,13 @@ KVarN attention plus the exact merge. CPU supplies storage/reference oracles.
 Vulkan supports eager storage but fails KVarN context placement closed because
 it does not yet consume native KVarN views in FlashAttention.
 
+Persistent placement is finalized in two phases. KVarN records and F16 stages
+are allocated first; their realized buffer owner is then used for route
+selection and for the exact K/V tensors. A tensor/meta-split record body rejects
+the overlay before exact tensors, the shared tail arena, or generation metadata
+are allocated. Layer split remains supported because each record, stage, exact
+tensor, graph consumer, and state row stays with the owning layer device.
+
 ## Lifecycle and state
 
 Exact rows follow the shared `(stream, cell, generation)` identity model.
@@ -54,12 +61,43 @@ Sequence copy, remove, keep, add/divide, position shift, cache clear, cell reuse
 SWA wrap, and graph reuse update compressed and exact representations together.
 Coverage reports the intrinsic/explicit request and any body-only degradation.
 
+Prompt reuse is continuous across requests and message boundaries. Divergence
+inside the live exact suffix trims exactly. For older compressed history, the
+removal planner rounds the requested suffix start down to the overlapping
+`KVAR_N_GROUP` boundary and retains every earlier complete group only when the
+physical stream is sequence-owned. Non-unified streams are sequence-owned; a
+unified stream qualifies only while every other mapped sequence has no live
+cells. Contention rejects partial rollback, fully reevaluates the requesting
+slot, and preserves the other slot.
+
+Every composite child must accept the same planned boundary. Hybrid Qwen3.6
+models whose recurrent child retains no rollback states (`n_rs_seq == 0`)
+therefore reevaluate a deep historical divergence even though the KVarN
+attention child alone could align it. This is a safe composite miss, not a
+KVarN record-layout failure. Exact-tail divergence and cumulative appends remain
+reusable. Non-recurrent or sufficiently checkpointed composites receive the
+group-aligned benefit and reevaluate at most 127 extra positions.
+
 KVarN state version 12 serializes logical records, exact payloads, membership,
 and structural/type/preset identity. It does not serialize transient workspace
 as precision state, so `ub=128 -> ub=512` and the reverse restore without
 changing logits. Tail length, exact type, KVarN preset, and component mismatch
 fail closed. Version 11 is rejected because its physical stage/tail layout
 cannot be reinterpreted safely under the logical-overlay contract.
+
+Unified per-sequence save and restore both require an exclusive structured
+stream. A contended idle slot is not offloaded to RAM, and a contended restore
+is treated as a cache miss; neither operation may serialize or overwrite the
+other sequence's records. The outer sequence-state framing is version 2 and
+supports host or on-device tensor transfer. The shared exact-tail manifest
+restores metadata-only identities as well as tensor payloads, and version 1
+input retains conservative degraded provenance.
+
+Hybrid iSWA has an additional placement rule. With multiple non-unified slots,
+eligible non-SWA layers use KVarN while SWA layers use a warned standard-cache
+fallback. If the selected preset requires fail-closed behavior, context
+creation fails instead. Unified or single-slot configurations can use KVarN for
+both layer groups when their native route is otherwise eligible.
 
 ## Validation manifest
 

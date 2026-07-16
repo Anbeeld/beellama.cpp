@@ -11,10 +11,11 @@ The applicable standard body registry is `q8_0`, `q6_0`, `q6_1`, `q5_0`,
 `q5_1`, `q4_0`, `q4_1`, `iq4_nl`, `q3_0`, `q3_1`, `q2_0`, and `q2_1`.
 Cache-facing `q2_0` is `GGML_TYPE_Q2_0S`. Ordered K/V pairs, one-sided
 quantized caches, full attention, SWA, hybrid recurrent/attention wrappers,
-layer reuse, K-only MLA, DSV4 raw SWA attention, and context-local shadows over
-a shared body are in scope. DSV4 compressed block caches, recurrent state,
-DSA/DSV4 lightning-indexer state, and other non-attention auxiliary memories
-are not.
+layer reuse, DSV4 raw SWA attention, and context-local shadows over a shared
+body are in scope. Positive K-only MLA and DSA overlays are rejected during
+context creation: this release does not define an exact-tail composition for
+those selectors. DSV4 compressed block caches, recurrent state, DSA/DSV4
+lightning-indexer state, and other non-attention auxiliary memories are not.
 
 The backend completion set frozen from the starting tree is CPU, CUDA,
 HIP/ROCm, Metal, Vulkan, SYCL, and CANN. CPU uses the generic ggml route. CUDA
@@ -26,9 +27,18 @@ context creation rather than ignore a positive tail if neither route can be
 placed.
 
 Local hardware evidence is available for CPU and an RTX 3090 CUDA 13.1 build.
-Metal, Vulkan, SYCL, CANN, and ROCm require their normal backend build packages
-and hardware runs; absence of those devices is a verification gap, not a claim
-that they passed.
+Backend status is evidence-qualified:
+
+| Backend | Standard overlay status | Evidence |
+|---|---|---|
+| CPU | Generic graph | Hardware verified by registry-derived operation and numeric oracles |
+| CUDA | Native attached tail and generic graph | Hardware verified on RTX 3090 / CUDA 13.1 |
+| Vulkan | Generic graph | Source supported; hardware not run in this remediation |
+| HIP/ROCm, Metal, SYCL, OpenCL | Generic route when every required operation is accepted | Source supported; hardware not run |
+| CANN | Rejected at context creation | Fused shadow `SET_ROWS` is rejected; Windows static classification verified, no Ascend hardware claim |
+
+Source support is not a hardware pass. Any backend that rejects a required
+operation fails context construction instead of silently dropping the tail.
 
 Standard and KVarN CUDA FlashAttention instance policies are independently
 selectable. `GGML_CUDA_FA_ALL_QUANTS=ON` continues to enable every ordered
@@ -85,10 +95,21 @@ cross-stream sequence copy remaps identities and copies only live exact rows.
 Cache clearing, removal, keep, add, divide, state restore, cell recycling, and
 RoPE position shift update both representations.
 
-Persistent capacity is `N * n_seq_max + n_ubatch` slots. The first term is
-active per-sequence membership and the second is stable in-flight reserve.
+Body membership and public position queries change immediately after a
+sequence copy. Exact payload copies may remain deferred until a consumer needs
+them; coverage and state-size queries account for pending work without
+synchronizing, while state-data save materializes it with at most one batched
+barrier.
+
+Persistent capacity is
+`round_up(N + n_ubatch, 256) * n_seq_max + sink_slots`, where `N` is the
+resolved standard-tail length and `sink_slots` is `n_ubatch` when more than one
+logical sequence is configured, otherwise zero. `N + n_ubatch` is each
+sequence's active-plus-in-flight arena; rounding it to 256 is allocation
+padding. Sink slots are a separate reserve and are not part of that padding.
 Payload tensors are allocated once for CUDA graph address stability. Only a
-quantized side receives a shadow.
+quantized side receives a shadow, and each logical sequence owns a distinct
+exact arena even when the ordinary body is unified.
 
 The reserve boundary is the physical ubatch, not the logical batch. Prompt
 ubatches execute sequentially, so a completed ubatch is trimmed to N before
@@ -112,23 +133,32 @@ lifecycle tests before it can be enabled.
 ## State format
 
 Length zero retains the preceding unframed body format. A positive tail or an
-explicit body-only export uses a framed standard-memory container with magic,
-version, structural group ID, body and tail byte lengths, resolved length, and
-tail type. The tail section stores body-relative identities, generations,
-sequence membership, insertion order, layer layout, and referenced K/V rows.
-F16 and BF16 are not converted during restore.
+explicit body-only export uses sequence-state framing version 2 and a local
+KV-tail manifest version 2. The manifest validates structural group identity,
+body/tail byte lengths, resolved length, representation, layer layout, payload
+counts, and F16/BF16 type before logical metadata is installed. Tail rows can
+be transferred by the host or `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE` tensor
+protocol; F16 and BF16 are not converted during restore. Metadata-only owners,
+including KVarN-backed components, still restore identities even when they own
+no standard tail tensors.
 
-The reader accepts the preceding unframed body-only payload. Coverage then
-reports none or partial with `LLAMA_KV_TAIL_DEGRADED_BODY_ONLY_STATE` until
-original activations refill the tail. Tail-bearing state rejects a disabled,
-differently sized, differently typed, or structurally different context.
+The reader accepts the preceding unframed body-only payload and framed tail
+manifest version 1. Version 1 has no complete provenance, so it restores with
+conservative degraded coverage and cannot upgrade itself to exact. Body-only
+state likewise reports `LLAMA_KV_TAIL_DEGRADED_BODY_ONLY_STATE` until original
+activations refill the tail. Tail-bearing state rejects a disabled, differently
+sized, differently typed, or structurally different context before mutation.
 
 Coverage is available per sequence and group and as a context aggregate. The
 server exposes requested/exact tokens, complete/partial/none group counts, and
 degraded-sequence counts through its metrics result and Prometheus endpoint.
-The RAM prompt cache retains the framed exact suffix; trimming a reused prompt
-uses ordinary sequence removal and therefore either retains a complete direct
-suffix or exposes historical degradation rather than reconstructing rows.
+The RAM prompt cache retains the framed exact suffix. Standard unified and
+non-unified caches preserve a continuous suffix across requests and message
+boundaries; `cache_prompt=false`, slot eviction, or an incompatible
+target/draft plan forces reevaluation. A unified idle slot is cleared only
+after its complete target and draft state was saved. Failed or unsupported
+save/restore is a cache miss, never permission to discard or overwrite live
+state.
 
 ## Local artifact and benchmark manifest
 
