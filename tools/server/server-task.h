@@ -670,6 +670,7 @@ struct server_seq_rm_io {
 server_seq_rm_result server_plan_and_remove_suffix(
         llama_seq_id seq_id,
         llama_pos requested_p0,
+        const server_tokens & prompt_tokens,
         const server_seq_rm_io & io,
         llama_pos & planned_p0);
 

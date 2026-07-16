@@ -3634,7 +3634,7 @@ private:
                     };
                     llama_pos planned_p0 = p0;
                     const auto seq_rm_result = server_plan_and_remove_suffix(
-                            slot.id, p0, seq_rm_io, planned_p0);
+                            slot.id, p0, slot.prompt.tokens, seq_rm_io, planned_p0);
                     if (seq_rm_result == SERVER_SEQ_RM_MUTATION_FAILED) {
                         slot.prompt_reset_after_memory_clear();
                         send_error(slot, "internal prompt-cache rollback failure", ERROR_TYPE_SERVER);

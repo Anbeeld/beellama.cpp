@@ -1671,6 +1671,7 @@ json server_task_result_apply_lora::to_json() {
 server_seq_rm_result server_plan_and_remove_suffix(
         llama_seq_id seq_id,
         llama_pos requested_p0,
+        const server_tokens & prompt_tokens,
         const server_seq_rm_io & io,
         llama_pos & planned_p0) {
     const auto clear_complete_sequences = [&]() {
@@ -1697,6 +1698,7 @@ server_seq_rm_result server_plan_and_remove_suffix(
     }
 
     planned_p0 = io.has_draft ? std::min(main_p0, draft_p0) : main_p0;
+    planned_p0 = planned_p0 > 0 ? prompt_tokens.pos_next(prompt_tokens.size_up_to_pos(planned_p0)) : planned_p0;
     const bool main_accepts = io.can_remove(
             SERVER_PROMPT_STATE_MAIN, seq_id, planned_p0, -1);
     const bool draft_accepts = !io.has_draft || io.can_remove(

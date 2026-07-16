@@ -54,6 +54,7 @@ static void prompt_cache_load_target_success_draft_failure_is_atomic() {
 }
 
 static void server_unsupported_removal_falls_back_to_full_reprocess() {
+    server_tokens prompt_tokens(llama_tokens(5626, 1), false);
     int partial_removals = 0;
     int full_clears = 0;
     server_seq_rm_io io {
@@ -78,7 +79,7 @@ static void server_unsupported_removal_falls_back_to_full_reprocess() {
         },
     };
     llama_pos planned_p0 = -1;
-    const auto result = server_plan_and_remove_suffix(0, 5626, io, planned_p0);
+    const auto result = server_plan_and_remove_suffix(0, 5626, prompt_tokens, io, planned_p0);
     assert(result == SERVER_SEQ_RM_FULL_REPROCESS);
     assert(planned_p0 == 0);
     assert(partial_removals == 0);
@@ -86,6 +87,7 @@ static void server_unsupported_removal_falls_back_to_full_reprocess() {
 }
 
 static void server_post_preflight_mutation_failure_clears_both_contexts() {
+    server_tokens prompt_tokens(llama_tokens(5626, 1), false);
     bool main_partial = false;
     bool draft_partial = false;
     bool main_cleared = false;
@@ -113,16 +115,49 @@ static void server_post_preflight_mutation_failure_clears_both_contexts() {
         },
     };
     llama_pos planned_p0 = -1;
-    const auto result = server_plan_and_remove_suffix(0, 5626, io, planned_p0);
+    const auto result = server_plan_and_remove_suffix(0, 5626, prompt_tokens, io, planned_p0);
     assert(result == SERVER_SEQ_RM_MUTATION_FAILED);
     assert(main_partial && draft_partial);
     assert(main_cleared && draft_cleared);
+}
+
+static void server_planned_removal_preserves_atomic_media_chunks() {
+    mtmd::input_chunks chunks(mtmd_test_create_input_chunks());
+    server_tokens prompt_tokens(chunks, true);
+
+    const llama_pos requested_p0 = prompt_tokens.pos_next();
+    const llama_pos inside_media = 6;
+    const llama_pos media_end = prompt_tokens.pos_next(prompt_tokens.size_up_to_pos(inside_media));
+    assert(media_end > inside_media);
+
+    llama_pos removed_p0 = -1;
+    server_seq_rm_io io {
+        /*.has_draft =*/ false,
+        /*.plan =*/ [&](server_prompt_state_kind, llama_seq_id, llama_pos, llama_pos,
+                       llama_pos & planned_p0, llama_pos & planned_p1) {
+            planned_p0 = inside_media;
+            planned_p1 = -1;
+            return true;
+        },
+        /*.can_remove =*/ [](server_prompt_state_kind, llama_seq_id, llama_pos, llama_pos) { return true; },
+        /*.remove =*/ [&](server_prompt_state_kind, llama_seq_id, llama_pos p0, llama_pos) {
+            removed_p0 = p0;
+            return true;
+        },
+    };
+
+    llama_pos planned_p0 = -1;
+    const auto result = server_plan_and_remove_suffix(0, requested_p0, prompt_tokens, io, planned_p0);
+    assert(result == SERVER_SEQ_RM_APPLIED);
+    assert(planned_p0 == media_end);
+    assert(removed_p0 == media_end);
 }
 
 int main() {
     prompt_cache_load_target_success_draft_failure_is_atomic();
     server_unsupported_removal_falls_back_to_full_reprocess();
     server_post_preflight_mutation_failure_clears_both_contexts();
+    server_planned_removal_preserves_atomic_media_chunks();
     {
         common_prompt_checkpoint ckpt;
         ckpt.n_tokens = 3;
