@@ -19,6 +19,8 @@ def main() -> None:
             raise AssertionError(f"standard-tail dependency firewall failed: {path} names KVarN")
 
     arg = (ROOT / "common/arg.cpp").read_text(encoding="utf-8")
+    if "common_params_kv_tail_type_normalize" in arg:
+        raise AssertionError("argument parsing must preserve the automatic KV-tail type sentinel")
     registry = arg.split("const std::vector<ggml_type> kv_cache_types = {", 1)[1].split("};", 1)[0]
     registered = set(re.findall(r"GGML_TYPE_[A-Z0-9_]+", registry))
     non_quantized = {"GGML_TYPE_F32", "GGML_TYPE_F16", "GGML_TYPE_BF16"}
@@ -47,6 +49,129 @@ def main() -> None:
     for operation in ("test_get_rows", "test_set_rows_with_shadow", "test_out_prod"):
         if operation not in backend_tests:
             raise AssertionError(f"backend operation matrix lacks {operation}")
+    if "set_rows_with_shadow_fused_operand_classification" not in backend_tests:
+        raise AssertionError("backend operation matrix lacks the fused SET_ROWS operand-classification case")
+    if "selected_cases=" not in backend_tests or "selected_cases == 0" not in backend_tests:
+        raise AssertionError("backend operation filtering must report and reject zero selected cases")
+
+    cann = (ROOT / "ggml/src/ggml-cann/ggml-cann.cpp").read_text(encoding="utf-8")
+    cann_supports_op = cann.split("static bool ggml_backend_cann_supports_op", 1)[1].split(
+        "static void ggml_backend_cann_event_record", 1
+    )[0]
+    cann_set_rows = cann_supports_op.split("case GGML_OP_SET_ROWS:", 1)[1].split("case GGML_OP_CPY:", 1)[0]
+    if not re.search(r"op->src\[3\].*op->src\[4\].*return false", cann_set_rows, re.DOTALL):
+        raise AssertionError("CANN must reject fused SET_ROWS shadow operands before ordinary shape checks")
+
+    memory_header = (ROOT / "src/llama-memory.h").read_text(encoding="utf-8")
+    if "virtual bool seq_rm_plan(" not in memory_header or "llama_memory_seq_rm_plan_all(" not in memory_header:
+        raise AssertionError("memory interface lacks side-effect-free removal planning")
+    for query in ("state_seq_can_save", "state_seq_can_restore"):
+        if f"virtual bool {query}(llama_seq_id seq_id) const" not in memory_header:
+            raise AssertionError(f"memory interface lacks direction-specific {query} preflight")
+    if "state_seq_restore_requires_exclusive_kv_stream" in memory_header:
+        raise AssertionError("legacy directionless sequence-restore exclusivity predicate is still present")
+
+    context_source = (ROOT / "src/llama-context.cpp").read_text(encoding="utf-8")
+    context_state = context_source.split("size_t llama_context::state_seq_get_size", 1)[1].split(
+        "bool llama_context::state_load_file", 1
+    )[0]
+    if context_state.find("state_seq_can_save") > context_state.find("llama_io_write_dummy"):
+        raise AssertionError("sequence-state size must preflight save safety before constructing its writer")
+    if context_state.find("state_seq_can_restore") > context_state.find("llama_io_read_host"):
+        raise AssertionError("sequence-state restore must preflight safety before constructing its reader")
+
+    composite_queries = {
+        "src/llama-kv-cache-iswa.cpp": ("llama_kv_cache_iswa", "kv_base", "kv_swa"),
+        "src/llama-memory-hybrid.cpp": ("llama_memory_hybrid", "mem_attn", "mem_recr"),
+        "src/llama-memory-hybrid-iswa.cpp": ("llama_memory_hybrid_iswa", "mem_attn", "mem_recr"),
+    }
+    for path, (class_name, first_child, second_child) in composite_queries.items():
+        source = (ROOT / path).read_text(encoding="utf-8")
+        planner_signature = f"bool {class_name}::seq_rm_plan("
+        if planner_signature not in source or "llama_memory_seq_rm_plan_all(" not in source.split(planner_signature, 1)[1].split("}", 1)[0]:
+            raise AssertionError(f"{class_name} does not forward sequence-removal planning")
+        for query in ("state_seq_can_save", "state_seq_can_restore"):
+            signature = f"bool {class_name}::{query}(llama_seq_id seq_id) const"
+            if signature not in source:
+                raise AssertionError(f"{class_name} does not override {query}")
+            body = source.split(signature, 1)[1].split("}", 1)[0]
+            if f"{first_child}->{query}(seq_id)" not in body or f"{second_child}->{query}(seq_id)" not in body:
+                raise AssertionError(f"{class_name} does not conjunct every child for {query}")
+
+    kvarn_tests = (ROOT / "tests/test-kvarn.cpp").read_text(encoding="utf-8")
+    for regression in (
+        "kvarn_composite_exclusivity_forwards",
+        "kvarn_composite_removal_plan_forwards",
+        "kvarn_unified_save_requires_exclusive_stream",
+        "kvarn_unified_restore_requires_exclusive_stream",
+        "kvarn_historical_suffix_plans_group_boundary",
+        "kvarn_historical_suffix_rejects_contended_unified_stream",
+        "iswa_nonunified_multislot_kvarn_policy",
+    ):
+        if regression not in kvarn_tests:
+            raise AssertionError(f"test-kvarn lacks the {regression} regression")
+
+    kvarn_cache = (ROOT / "src/llama-kv-cache-kvarn.cpp").read_text(encoding="utf-8")
+    if "bool llama_kv_cache_kvarn::seq_rm_plan(" not in kvarn_cache:
+        raise AssertionError("KVarN cache lacks the historical suffix planner override")
+    exclusivity = kvarn_cache.split(
+        "bool llama_kv_cache_kvarn::stream_is_exclusive_for", 1
+    )[1].split("bool llama_kv_cache_kvarn::state_seq_can_save", 1)[0]
+    if "llama_kvarn_stream_is_exclusive_for" not in exclusivity:
+        raise AssertionError("KVarN state safety does not use the unit-tested stream ownership policy")
+
+    llama_api = (ROOT / "include/llama.h").read_text(encoding="utf-8")
+    for query in ("llama_memory_can_seq_rm", "llama_memory_seq_rm_plan"):
+        if f"LLAMA_API bool {query}(" not in llama_api:
+            raise AssertionError(f"public memory API lacks {query}")
+
+    server_context = (ROOT / "tools/server/server-context.cpp").read_text(encoding="utf-8")
+    suffix_block = server_context.split(
+        "// truncate any tokens that are beyond n_past for this slot", 1
+    )[1].split("// If using an alora", 1)[0]
+    if "server_plan_and_remove_suffix(" not in suffix_block:
+        raise AssertionError("server prompt suffix trimming bypasses the atomic removal transaction")
+    if "common_context_seq_rm" in suffix_block:
+        raise AssertionError("server prompt suffix trimming still uses the aborting removal wrapper")
+
+    server_tests = (ROOT / "tests/test-server-prompt-checkpoint.cpp").read_text(encoding="utf-8")
+    for regression in (
+        "server_unsupported_removal_falls_back_to_full_reprocess",
+        "server_post_preflight_mutation_failure_clears_both_contexts",
+        "prompt_cache_load_target_success_draft_failure_is_atomic",
+    ):
+        if regression not in server_tests:
+            raise AssertionError(f"server checkpoint tests lack {regression}")
+
+    state_cache_source = (ROOT / "src/llama-kv-cache.cpp").read_text(encoding="utf-8")
+    state_tail_reader = state_cache_source.split("void llama_kv_cache::state_read_tail(", 1)[1].split(
+        "bool llama_kv_cache::state_read_meta", 1
+    )[0]
+    if "LLAMA_STATE_SEQ_FLAGS_ON_DEVICE" not in state_tail_reader or "io.read_tensor(" not in state_tail_reader:
+        raise AssertionError("standard exact-tail device restore does not use the device tensor protocol")
+
+    state_v2_installer = state_cache_source.split(
+        "void llama_kv_cache::state_v2_read_payload_and_install(", 1
+    )[1].split("void llama_kv_cache::state_write(", 1)[0]
+    if "if (manifest.body_only)" not in state_v2_installer:
+        raise AssertionError("v2 state restore does not distinguish an explicit body-only frame")
+    if "if (manifest.tail_layers.empty())" in state_v2_installer:
+        raise AssertionError("v2 state restore mistakes metadata-only tail ownership for a body-only frame")
+
+    recurrent_header = (ROOT / "src/llama-memory-recurrent.h").read_text(encoding="utf-8")
+    recurrent_source = (ROOT / "src/llama-memory-recurrent.cpp").read_text(encoding="utf-8")
+    if "bool can_seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const override" not in recurrent_header:
+        raise AssertionError("recurrent memory does not expose its actual rollback capability")
+    recurrent_can_remove = recurrent_source.split(
+        "bool llama_memory_recurrent::can_seq_rm(", 1
+    )[1].split("bool llama_memory_recurrent::seq_rm(", 1)[0]
+    if "rollback <= llama_pos(n_rs_seq)" not in recurrent_can_remove:
+        raise AssertionError("recurrent removal preflight does not enforce the retained rollback-state window")
+    recurrent_remove = recurrent_source.split(
+        "bool llama_memory_recurrent::seq_rm(", 1
+    )[1].split("bool llama_memory_recurrent::seq_cp(", 1)[0]
+    if "if (!can_seq_rm(seq_id, p0, p1))" not in recurrent_remove:
+        raise AssertionError("recurrent removal can mutate after an unsupported rollback preflight")
 
     cmake = (ROOT / "src/CMakeLists.txt").read_text(encoding="utf-8")
     if "llama-kv-cache-tail.cpp" not in cmake:
@@ -56,9 +181,9 @@ def main() -> None:
     constructor = cache_source.split("llama_kv_cache::llama_kv_cache(", 1)[1].split(
         "void llama_kv_cache::clear(bool data)", 1
     )[0]
-    if "const bool shadow_k = tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY" not in cache_source:
+    if "tail_plan.shadow_k &&" not in cache_source:
         raise AssertionError("K shadow allocation must follow the explicit overlay storage plan")
-    if "const bool shadow_v = tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY" not in cache_source:
+    if "tail_plan.shadow_v &&" not in cache_source:
         raise AssertionError("V shadow allocation must follow the explicit overlay storage plan")
     if constructor.find("if (other)") > constructor.find("if (tail_tokens > 0)"):
         raise AssertionError("shared-cache size must resolve before exact-tail generation storage is allocated")
@@ -68,6 +193,16 @@ def main() -> None:
         raise AssertionError("exact-shadow allocation must be guarded by the overlay storage plan")
     if "tail_plan.kind == LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT" not in cache_source:
         raise AssertionError("raw standard cache lacks the native-exact storage route")
+    if "model.split_mode()" in constructor:
+        raise AssertionError("standard overlay placement still uses CLI split mode instead of realized body storage")
+    standard_order = [
+        constructor.find("ggml_backend_alloc_ctx_tensors_from_buft"),
+        constructor.find("realized %s body uses a tensor/meta split buffer"),
+        constructor.find("finalize_tail_overlay_metadata()"),
+        constructor.find('ggml_format_name(layer.k_tail, "cache_k_tail_l%d"'),
+    ]
+    if min(standard_order) < 0 or standard_order != sorted(standard_order):
+        raise AssertionError("standard cache must allocate body, reject meta placement, then allocate tail metadata/tensors")
 
     cache_header = (ROOT / "src/llama-kv-cache.h").read_text(encoding="utf-8")
     get_tail_tokens = cache_header.split("uint32_t get_tail_tokens() const", 1)[1].split("}", 1)[0]
@@ -102,6 +237,22 @@ def main() -> None:
     cuda_fattn = (ROOT / "ggml/src/ggml-cuda/fattn.cu").read_text(encoding="utf-8")
     ggml_core = (ROOT / "ggml/src/ggml.c").read_text(encoding="utf-8")
     graph = (ROOT / "src/llama-graph.cpp").read_text(encoding="utf-8")
+    if "ggml_backend_kv_tail_attention_supported" in graph or "backend_supports_native_kv_tail" in graph:
+        raise AssertionError("decode graph construction must consume the stored route without backend probing")
+    if graph.count("get_tail_route(il)") < 2:
+        raise AssertionError("standard and iSWA graph builders do not consume the stored tail route")
+    if "resolve_native_exact_routes" not in cache_source or "probe_standard_native_exact_route" not in cache_source:
+        raise AssertionError("native-exact storage is allocated without a complete preflight route")
+    if "metadata->set_tail_routes" not in kvarn_cache:
+        raise AssertionError("KVarN does not store its finalized route in the shared tail plan")
+    kvarn_order = [
+        kvarn_cache.find("ggml_backend_alloc_ctx_tensors_from_buft"),
+        kvarn_cache.find("realized body uses a tensor/meta split buffer"),
+        kvarn_cache.find("metadata->finalize_tail_overlay_metadata()"),
+        kvarn_cache.find('ggml_format_name(layer.k_tail, "cache_kvarn_k_tail_l%d"'),
+    ]
+    if min(kvarn_order) < 0 or kvarn_order != sorted(kvarn_order):
+        raise AssertionError("KVarN must allocate body, reject meta placement, then allocate tail metadata/tensors")
     for required in ("ggml_flash_attn_ext_add_kv_tail", "ggml_kv_tail_attention_merge"):
         if required not in ggml_header:
             raise AssertionError(f"ggml tail-attention contract lacks {required}")

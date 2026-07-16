@@ -5,6 +5,7 @@
 
 import subprocess
 import os
+import threading
 
 TMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tmp")
 import re
@@ -80,6 +81,8 @@ class ServerProcess:
     n_slots: int | None = None
     ctk: str | None = None
     ctv: str | None = None
+    kv_tail_tokens: str | int | None = None
+    kv_tail_type: str | None = None
     fa: str | None = None
     server_continuous_batching: bool | None = False
     server_embeddings: bool | None = False
@@ -205,6 +208,10 @@ class ServerProcess:
             server_args.extend(["-ctk", self.ctk])
         if self.ctv:
             server_args.extend(["-ctv", self.ctv])
+        if self.kv_tail_tokens is not None:
+            server_args.extend(["--kv-tail-tokens", self.kv_tail_tokens])
+        if self.kv_tail_type is not None:
+            server_args.extend(["--kv-tail-type", self.kv_tail_type])
         if self.fa is not None:
             server_args.extend(["-fa", self.fa])
         if self.n_predict:
@@ -271,40 +278,52 @@ class ServerProcess:
             flags |= subprocess.CREATE_NO_WINDOW
 
         if self.log_path:
-            self._log = open(self.log_path, "w")
+            self._log = open(self.log_path, "w", encoding="utf-8", errors="replace")
         else:
             self._log = sys.stdout
 
         self.process = subprocess.Popen(
             [str(arg) for arg in [server_path, *server_args]],
             creationflags=flags,
-            stdout=self._log,
-            stderr=self._log if self._log != sys.stdout else sys.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             env=env,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
         )
         server_instances.add(self)
 
         print(f"server pid={self.process.pid}, pytest pid={os.getpid()}")
 
-        # wait for server to start
-        start_time = time.time()
-        while time.time() - start_time < timeout_seconds:
-            try:
-                response = self.make_request("GET", "/health", headers={
-                    "Authorization": f"Bearer {self.api_key}" if self.api_key else None
-                })
-                if response.status_code == 200:
-                    self.ready = True
-                    return  # server is ready
-            except Exception as e:
-                pass
-            # Check if process died
-            if self.process.poll() is not None:
-                raise RuntimeError(f"Server process died with return code {self.process.returncode}")
+        # Consume output continuously and signal readiness from the server's
+        # own listening event. This tracks startup and early exit without
+        # polling either the process or /health.
+        self._ready_event = threading.Event()
+        self._exit_event = threading.Event()
 
-            print(f"Waiting for server to start...")
-            time.sleep(0.5)
-        raise TimeoutError(f"Server did not start within {timeout_seconds} seconds")
+        def pump_output() -> None:
+            assert self.process is not None and self.process.stdout is not None
+            for line in self.process.stdout:
+                try:
+                    self._log.write(line)
+                except UnicodeEncodeError:
+                    encoding = self._log.encoding or "ascii"
+                    self._log.write(line.encode(encoding, errors="backslashreplace").decode(encoding))
+                self._log.flush()
+                if "listening on http://" in line:
+                    self._ready_event.set()
+            self._exit_event.set()
+
+        self._output_thread = threading.Thread(target=pump_output, daemon=True)
+        self._output_thread.start()
+        if not self._ready_event.wait(timeout_seconds):
+            if self._exit_event.is_set():
+                self.process.wait()
+                raise RuntimeError(f"Server process died with return code {self.process.returncode}")
+            raise TimeoutError(f"Server did not start within {timeout_seconds} seconds")
+        self.ready = True
 
     def stop(self) -> None:
         if self.external_server:
@@ -323,6 +342,8 @@ class ServerProcess:
                 self.process.wait(timeout=5)
             except Exception as e:
                 print(f"Error waiting for server: {e}")
+            if hasattr(self, '_output_thread'):
+                self._output_thread.join(timeout=5)
             self.process = None
         if hasattr(self, '_log') and self._log != sys.stdout:
             self._log.close()

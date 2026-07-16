@@ -1,5 +1,6 @@
 #include "llama-kvarn.h"
 #include "llama-kv-cache-kvarn.h"
+#include "llama-memory.h"
 
 #include "ggml-backend.h"
 
@@ -49,6 +50,124 @@ static void test_type_table() {
     }
 
     require(llama_kvarn_type_desc_from_name("kvarn_k7v2_g128") == nullptr, "invalid type parsed");
+}
+
+struct test_state_memory : public llama_memory_i {
+    bool can_save;
+    bool can_restore;
+
+    test_state_memory(bool can_save, bool can_restore) : can_save(can_save), can_restore(can_restore) {}
+
+    llama_memory_context_ptr init_batch(llama_batch_allocr &, uint32_t, bool) override { return nullptr; }
+    llama_memory_context_ptr init_full() override { return nullptr; }
+    llama_memory_context_ptr init_update(llama_context *, bool) override { return nullptr; }
+    bool get_can_shift() const override { return false; }
+    void clear(bool) override {}
+    bool seq_rm(llama_seq_id, llama_pos, llama_pos) override { return true; }
+    bool seq_rm_cell(llama_seq_id, uint32_t) override { return true; }
+    int cells_at_pos(llama_seq_id, llama_pos, uint32_t *, int) override { return 0; }
+    void seq_cp(llama_seq_id, llama_seq_id, llama_pos, llama_pos) override {}
+    void seq_keep(llama_seq_id) override {}
+    void seq_add(llama_seq_id, llama_pos, llama_pos, llama_pos) override {}
+    void seq_div(llama_seq_id, llama_pos, llama_pos, int) override {}
+    llama_pos seq_pos_min(llama_seq_id) const override { return -1; }
+    llama_pos seq_pos_max(llama_seq_id) const override { return -1; }
+    std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override { return {}; }
+    bool state_seq_can_save(llama_seq_id seq_id) const override { return seq_id >= 0 && can_save; }
+    bool state_seq_can_restore(llama_seq_id seq_id) const override { return seq_id >= 0 && can_restore; }
+    void state_write(llama_io_write_i &, llama_seq_id, llama_state_seq_flags) const override {}
+    void state_read(llama_io_read_i &, llama_seq_id, llama_state_seq_flags) override {}
+};
+
+struct test_composite_state_memory : public test_state_memory {
+    const llama_memory_i & first;
+    const llama_memory_i & second;
+
+    test_composite_state_memory(const llama_memory_i & first, const llama_memory_i & second) :
+        test_state_memory(true, true), first(first), second(second) {}
+
+    bool state_seq_can_save(llama_seq_id seq_id) const override {
+        return first.state_seq_can_save(seq_id) && second.state_seq_can_save(seq_id);
+    }
+
+    bool state_seq_can_restore(llama_seq_id seq_id) const override {
+        return first.state_seq_can_restore(seq_id) && second.state_seq_can_restore(seq_id);
+    }
+
+    bool seq_rm_plan(
+            llama_seq_id seq_id, llama_pos p0, llama_pos p1,
+            llama_pos & planned_p0, llama_pos & planned_p1) const override {
+        return llama_memory_seq_rm_plan_all(
+                seq_id, p0, p1, { &first, &second }, planned_p0, planned_p1);
+    }
+};
+
+struct test_planning_memory : public test_state_memory {
+    llama_pos proposal;
+    bool accepts_any_suffix;
+
+    test_planning_memory(llama_pos proposal, bool accepts_any_suffix) :
+        test_state_memory(true, true), proposal(proposal), accepts_any_suffix(accepts_any_suffix) {}
+
+    bool can_seq_rm(llama_seq_id, llama_pos p0, llama_pos p1) const override {
+        return p1 < 0 && (accepts_any_suffix || p0 == proposal);
+    }
+
+    bool seq_rm_plan(
+            llama_seq_id, llama_pos, llama_pos p1,
+            llama_pos & planned_p0, llama_pos & planned_p1) const override {
+        if (p1 >= 0) {
+            return false;
+        }
+        planned_p0 = proposal;
+        planned_p1 = -1;
+        return true;
+    }
+};
+
+static void kvarn_composite_exclusivity_forwards() {
+    const test_state_memory permissive(true, true);
+    const test_state_memory contended_kvarn_like(false, false);
+    const test_composite_state_memory composite(permissive, contended_kvarn_like);
+
+    require(!composite.state_seq_can_save(0),
+            "composite accepted a save rejected by its KVarN-like child");
+    require(!composite.state_seq_can_restore(0),
+            "composite accepted a restore rejected by its KVarN-like child");
+}
+
+static void kvarn_composite_removal_plan_forwards() {
+    const test_planning_memory standard_like(5626, true);
+    const test_planning_memory kvarn_like(5504, false);
+    const test_composite_state_memory composite(standard_like, kvarn_like);
+    llama_pos planned_p0 = -1;
+    llama_pos planned_p1 = 0;
+
+    require(composite.seq_rm_plan(0, 5626, -1, planned_p0, planned_p1),
+            "composite rejected a common suffix removal plan");
+    require(planned_p0 == 5504 && planned_p1 == -1,
+            "composite did not choose the earliest child suffix boundary");
+}
+
+static void kvarn_unified_save_requires_exclusive_stream() {
+    const std::array<llama_pos, 2> pos_max = { 255, 127 };
+    const auto get_pos_max = [&](llama_seq_id seq_id) { return pos_max.at(size_t(seq_id)); };
+    require(!llama_kvarn_stream_is_exclusive_for(1, pos_max.size(), 0, get_pos_max),
+            "unified KVarN save accepted a stream containing another live sequence");
+}
+
+static void kvarn_unified_restore_requires_exclusive_stream() {
+    const std::array<llama_pos, 2> pos_max = { 255, 127 };
+    const auto get_pos_max = [&](llama_seq_id seq_id) { return pos_max.at(size_t(seq_id)); };
+    require(!llama_kvarn_stream_is_exclusive_for(1, pos_max.size(), 1, get_pos_max),
+            "unified KVarN restore accepted a stream containing another live sequence");
+
+    const std::array<llama_pos, 2> exclusive_pos_max = { 255, -1 };
+    const auto get_exclusive_pos_max = [&](llama_seq_id seq_id) { return exclusive_pos_max.at(size_t(seq_id)); };
+    require(llama_kvarn_stream_is_exclusive_for(1, exclusive_pos_max.size(), 0, get_exclusive_pos_max),
+            "unified KVarN restore rejected an exclusively owned stream");
+    require(llama_kvarn_stream_is_exclusive_for(2, pos_max.size(), 1, get_pos_max),
+            "non-unified KVarN restore rejected a sequence-owned stream");
 }
 
 static void test_stage_policy() {
@@ -229,6 +348,53 @@ static void test_remove_policy() {
     require(llama_kvarn_can_remove_range(783, 0, 784, 128), "explicit full sequence range removal rejected");
     require(!llama_kvarn_can_remove_range(783, 0, 640, 128), "old compressed partial removal accepted");
     require(llama_kvarn_can_remove_range(783, 640, -1, 128), "current/previous tail removal rejected");
+}
+
+static void iswa_nonunified_multislot_kvarn_policy() {
+    require(llama_kvarn_iswa_policy_for(true, true, 2, false, false) ==
+                    LLAMA_KVARN_ISWA_STANDARD_SWA_FALLBACK,
+            "non-unified multi-slot iSWA did not select the standard-SWA fallback");
+    require(llama_kvarn_iswa_policy_for(true, true, 2, false, true) ==
+                    LLAMA_KVARN_ISWA_UNSUPPORTED,
+            "fail_if_unsupported did not reject non-unified multi-slot iSWA KVarN");
+    require(llama_kvarn_iswa_policy_for(true, true, 2, true, true) ==
+                    LLAMA_KVARN_ISWA_ALL_LAYERS,
+            "unified multi-slot iSWA KVarN was rejected");
+    require(llama_kvarn_iswa_policy_for(true, true, 1, false, true) ==
+                    LLAMA_KVARN_ISWA_ALL_LAYERS,
+            "single-slot non-unified iSWA KVarN was rejected");
+}
+
+static void kvarn_historical_suffix_plans_group_boundary() {
+    const auto expect_plan = [](llama_pos p0, llama_pos p1, bool owned, bool expected,
+                                llama_pos expected_p0, llama_pos expected_p1) {
+        llama_pos planned_p0 = -99;
+        llama_pos planned_p1 = -99;
+        const bool actual = llama_kvarn_plan_remove_range(
+                6143, p0, p1, KVAR_N_GROUP, owned, planned_p0, planned_p1);
+        require(actual == expected, "KVarN historical suffix planner acceptance mismatch");
+        if (actual) {
+            require(planned_p0 == expected_p0 && planned_p1 == expected_p1,
+                    "KVarN historical suffix planner boundary mismatch");
+        }
+    };
+
+    expect_plan(5626, -1, true,  true, 5504, -1); // issue #67: 122 extra positions
+    expect_plan(5504, -1, true,  true, 5504, -1); // aligned historical boundary
+    expect_plan(5503, -1, true,  true, 5376, -1); // one before the boundary
+    expect_plan(5505, -1, true,  true, 5504, -1); // one after the boundary
+    expect_plan(6000, -1, false, true, 6000, -1); // live exact tail does not require ownership
+    expect_plan(0,    -1, false, true,    0, -1); // complete removal
+    expect_plan(-1,   -1, false, true,   -1, -1); // negative full-range convention
+    expect_plan(5626, 5700, true, false,  -1, -1); // finite middle range is never widened
+}
+
+static void kvarn_historical_suffix_rejects_contended_unified_stream() {
+    llama_pos planned_p0 = -99;
+    llama_pos planned_p1 = -99;
+    require(!llama_kvarn_plan_remove_range(
+                    6143, 5626, -1, KVAR_N_GROUP, false, planned_p0, planned_p1),
+            "contended unified KVarN planned a historical suffix removal");
 }
 
 static void test_pack_roundtrip(int bits) {
@@ -3032,6 +3198,10 @@ static void test_eager_completed_record(enum ggml_backend_dev_type device_type, 
 int main() {
     ggml_backend_load_all();
 
+    kvarn_composite_exclusivity_forwards();
+    kvarn_composite_removal_plan_forwards();
+    kvarn_unified_save_requires_exclusive_stream();
+    kvarn_unified_restore_requires_exclusive_stream();
     test_type_table();
     test_stage_policy();
     test_memory_stats_aggregation();
@@ -3039,7 +3209,10 @@ int main() {
     test_tile_layout();
     test_head_dimension_slicing();
     test_runtime_validation();
+    iswa_nonunified_multislot_kvarn_policy();
     test_remove_policy();
+    kvarn_historical_suffix_rejects_contended_unified_stream();
+    kvarn_historical_suffix_plans_group_boundary();
     test_pack_roundtrip(2);
     test_pack_roundtrip(3);
     test_pack_roundtrip(4);

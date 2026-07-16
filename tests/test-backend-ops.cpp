@@ -2474,12 +2474,14 @@ struct test_set_rows : public test_case {
 struct test_set_rows_with_shadow : public test_case {
     const ggml_type body_type;
     const ggml_type shadow_type;
+    const bool operand_classification;
 
-    test_set_rows_with_shadow(ggml_type body_type, ggml_type shadow_type)
-        : body_type(body_type), shadow_type(shadow_type) {}
+    test_set_rows_with_shadow(ggml_type body_type, ggml_type shadow_type, bool operand_classification = false)
+        : body_type(body_type), shadow_type(shadow_type), operand_classification(operand_classification) {}
 
     std::string vars() override {
-        return std::string(ggml_type_name(body_type)) + "_body," +
+        return std::string(operand_classification ? "set_rows_with_shadow_fused_operand_classification," : "") +
+            ggml_type_name(body_type) + "_body," +
             ggml_type_name(shadow_type) + "_shadow,levels=2";
     }
 
@@ -8102,6 +8104,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_set_rows_with_shadow(body_type, shadow_type));
         }
     }
+    test_cases.emplace_back(new test_set_rows_with_shadow(GGML_TYPE_Q4_0, GGML_TYPE_F16, true));
 
     for (int mode : { GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX, GGML_ROPE_TYPE_MROPE, GGML_ROPE_TYPE_VISION }) {
         for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
@@ -9521,6 +9524,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 4, true, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 2, {2, 1}, 256, 2, true, false, 0, 0,
         GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 4, false, GGML_TYPE_BF16));
+    // Bee standard low-bit KV families: cover every new body type in an
+    // attached-tail CUDA descriptor. Symmetric rows exercise the native route;
+    // the ordered family pairs are the operand shapes used by the capability
+    // test's forced-generic (explicit-bias) route.
+    const std::pair<ggml_type, int64_t> low_bit_native[] = {
+        { GGML_TYPE_Q2_0S, 16 }, { GGML_TYPE_Q2_1,  32 },
+        { GGML_TYPE_Q3_0,  64 }, { GGML_TYPE_Q3_1, 128 },
+        { GGML_TYPE_Q6_0,  16 }, { GGML_TYPE_Q6_1,  32 },
+    };
+    for (const auto & [body_type, n_tail] : low_bit_native) {
+        test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {2, 1}, 256, 2, true, false, 0, 0,
+            GGML_PREC_F32, body_type, body_type, {0, 1, 2, 3}, n_tail, false, GGML_TYPE_F16));
+    }
+    for (const auto & body_types : {
+            std::pair{ GGML_TYPE_Q2_0S, GGML_TYPE_Q2_1 },
+            std::pair{ GGML_TYPE_Q3_0,  GGML_TYPE_Q3_1 },
+            std::pair{ GGML_TYPE_Q6_0,  GGML_TYPE_Q6_1 } }) {
+        test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {2, 1}, 256, 2, true, false, 0, 0,
+            GGML_PREC_F32, body_types.first, body_types.second, {0, 1, 2, 3}, 64, false, GGML_TYPE_BF16));
+    }
     // Qwen3.6 geometry: 24 query heads over 4 KV heads with 256-wide K/V.
     // Cover both the smallest tail and a full query-specific prefill tail.
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 256, 2, true, false, 0, 0,
@@ -10159,6 +10182,7 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
 
         std::atomic<size_t> n_ok = 0;
         std::atomic<size_t> tests_run = 0;
+        std::atomic<size_t> selected_cases = 0;
         std::vector<std::string> failed_tests;
         std::mutex failed_tests_mutex;
 
@@ -10183,7 +10207,11 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
                 for (size_t i = my_begin; i < my_end; ++i) {
                     auto & test = test_cases[i];
                     test_status_t status = test->eval(b, b_cpu, op_names_filter, output_printer);
-                    if (status == test_status_t::SKIPPED || status == test_status_t::NOT_SUPPORTED) {
+                    if (status == test_status_t::SKIPPED) {
+                        continue;
+                    }
+                    selected_cases++;
+                    if (status == test_status_t::NOT_SUPPORTED) {
                         continue;
                     }
                     tests_run++;
@@ -10239,6 +10267,10 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
 
         output_printer->print_summary(test_summary_info(n_ok, tests_run, false));
         output_printer->print_failed_tests(failed_tests);
+        printf("selected_cases=%zu\n", selected_cases.load());
+        if (selected_cases == 0) {
+            return false;
+        }
 
         return n_ok == tests_run;
     }

@@ -364,6 +364,315 @@ static void test_attention_graph(ggml_backend_t backend) {
     ggml_free(ctx);
 }
 
+static void set_matrix_data(
+        ggml_tensor * tensor,
+        const std::vector<float> & values,
+        int64_t rows,
+        int64_t columns) {
+    if (tensor->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_set(tensor, values.data(), 0, values.size()*sizeof(float));
+        return;
+    }
+    if (tensor->type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> converted(values.size());
+        ggml_fp32_to_fp16_row(values.data(), converted.data(), converted.size());
+        ggml_backend_tensor_set(tensor, converted.data(), 0, converted.size()*sizeof(ggml_fp16_t));
+        return;
+    }
+    if (tensor->type == GGML_TYPE_BF16) {
+        std::vector<ggml_bf16_t> converted(values.size());
+        ggml_fp32_to_bf16_row(values.data(), converted.data(), converted.size());
+        ggml_backend_tensor_set(tensor, converted.data(), 0, converted.size()*sizeof(ggml_bf16_t));
+        return;
+    }
+    if (ggml_is_quantized(tensor->type)) {
+        std::vector<uint8_t> converted(ggml_nbytes(tensor));
+        ggml_quantize_chunk(tensor->type, values.data(), converted.data(), 0, rows, columns, nullptr);
+        ggml_backend_tensor_set(tensor, converted.data(), 0, converted.size());
+        return;
+    }
+    fail("unsupported mixed-side test type");
+}
+
+static void test_mixed_side_generic_attention(
+        ggml_backend_t backend,
+        ggml_type body_k_type,
+        ggml_type body_v_type,
+        ggml_type tail_k_type,
+        ggml_type tail_v_type,
+        bool transposed_v) {
+    constexpr int64_t d = 32;
+    constexpr int64_t n_body = 5;
+    constexpr int64_t n_tail = 3;
+    constexpr int64_t n_query = 2;
+    ggml_init_params params = { 8*1024*1024, nullptr, true };
+    ggml_context * ctx = ggml_init(params);
+
+    ggml_tensor * q = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, n_query);
+    ggml_tensor * kb = ggml_new_tensor_2d(ctx, body_k_type, d, n_body);
+    ggml_tensor * kt = ggml_new_tensor_2d(ctx, tail_k_type, d, n_tail);
+    ggml_tensor * vb = transposed_v ?
+            ggml_new_tensor_2d(ctx, body_v_type, n_body, d) :
+            ggml_new_tensor_2d(ctx, body_v_type, d, n_body);
+    ggml_tensor * vt = ggml_new_tensor_2d(ctx, tail_v_type, d, n_tail);
+    ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_body + n_tail, n_query);
+
+    ggml_tensor * scores_body = ggml_mul_mat(ctx, kb, q);
+    ggml_tensor * scores_tail = ggml_mul_mat(ctx, kt, q);
+    ggml_tensor * scores = ggml_concat(ctx, scores_body, scores_tail, 0);
+    scores = ggml_soft_max_ext(ctx, scores, mask, 1.0f, 0.0f);
+    ggml_tensor * weights_body = ggml_view_2d(
+            ctx, scores, n_body, n_query, scores->nb[1], 0);
+    ggml_tensor * weights_tail = ggml_view_2d(
+            ctx, scores, n_tail, n_query, scores->nb[1], n_body*scores->nb[0]);
+    ggml_tensor * body_out = transposed_v ?
+            ggml_mul_mat(ctx, vb, weights_body) :
+            ggml_out_prod(ctx, vb, ggml_transpose(ctx, weights_body));
+    ggml_tensor * tail_out = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, vt)), weights_tail);
+    ggml_tensor * out = ggml_add(ctx, body_out, tail_out);
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, out);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buffer) {
+        fail("mixed-side graph allocation failed");
+    }
+
+    std::vector<float> q_data(d*n_query);
+    std::vector<float> kb_data(d*n_body);
+    std::vector<float> kt_data(d*n_tail);
+    std::vector<float> vb_rows(d*n_body);
+    std::vector<float> vt_data(d*n_tail);
+    for (int64_t iq = 0; iq < n_query; ++iq) {
+        for (int64_t i = 0; i < d; ++i) {
+            q_data[i + d*iq] = 0.01f*float(1 + (i%7) + 3*iq);
+        }
+    }
+    for (int64_t row = 0; row < n_body; ++row) {
+        for (int64_t i = 0; i < d; ++i) {
+            kb_data[i + d*row] = 0.015f*float(1 + (i%5) + 2*row);
+            vb_rows[i + d*row] = 0.02f*float(1 + (i%9) + 3*row);
+        }
+    }
+    for (int64_t row = 0; row < n_tail; ++row) {
+        for (int64_t i = 0; i < d; ++i) {
+            kt_data[i + d*row] = 0.017f*float(1 + (i%6) + 4*row);
+            vt_data[i + d*row] = 0.023f*float(1 + (i%8) + 5*row);
+        }
+    }
+    std::vector<float> vb_data(vb_rows.size());
+    if (transposed_v) {
+        for (int64_t row = 0; row < n_body; ++row) {
+            for (int64_t i = 0; i < d; ++i) {
+                vb_data[row + n_body*i] = vb_rows[i + d*row];
+            }
+        }
+    } else {
+        vb_data = vb_rows;
+    }
+    std::vector<float> mask_data((n_body + n_tail)*n_query, 0.0f);
+    set_matrix_data(q, q_data, n_query, d);
+    set_matrix_data(kb, kb_data, n_body, d);
+    set_matrix_data(kt, kt_data, n_tail, d);
+    set_matrix_data(vb, vb_data, transposed_v ? d : n_body, transposed_v ? n_body : d);
+    set_matrix_data(vt, vt_data, n_tail, d);
+    ggml_backend_tensor_set(mask, mask_data.data(), 0, mask_data.size()*sizeof(float));
+
+    if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+        fail("mixed-side generic graph compute failed");
+    }
+    std::vector<float> got(d*n_query);
+    ggml_backend_tensor_get(out, got.data(), 0, got.size()*sizeof(float));
+    for (int64_t iq = 0; iq < n_query; ++iq) {
+        std::vector<float> logits(n_body + n_tail);
+        float maximum = -INFINITY;
+        for (int64_t row = 0; row < n_body + n_tail; ++row) {
+            float value = 0.0f;
+            const float * key = row < n_body ? kb_data.data() + d*row :
+                    kt_data.data() + d*(row - n_body);
+            for (int64_t i = 0; i < d; ++i) {
+                value += q_data[i + d*iq]*key[i];
+            }
+            logits[row] = value;
+            maximum = std::max(maximum, value);
+        }
+        float norm = 0.0f;
+        for (float & value : logits) {
+            value = std::exp(value - maximum);
+            norm += value;
+        }
+        for (int64_t i = 0; i < d; ++i) {
+            float expected = 0.0f;
+            for (int64_t row = 0; row < n_body + n_tail; ++row) {
+                const float value = row < n_body ? vb_rows[i + d*row] :
+                        vt_data[i + d*(row - n_body)];
+                expected += logits[row]/norm*value;
+            }
+            const float error = std::fabs(got[i + d*iq] - expected);
+            if (error > 0.025f) {
+                std::fprintf(stderr,
+                        "mixed-side mismatch K=%s V=%s tK=%s tV=%s trans=%d q=%lld d=%lld got=%.6f expected=%.6f\n",
+                        ggml_type_name(body_k_type), ggml_type_name(body_v_type),
+                        ggml_type_name(tail_k_type), ggml_type_name(tail_v_type), int(transposed_v),
+                        (long long) iq, (long long) i, got[i + d*iq], expected);
+                std::exit(1);
+            }
+        }
+    }
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+}
+
+static void test_sparse_swa_packed_oracle(ggml_backend_t backend, llama_swa_type swa_type) {
+    constexpr int64_t d = 32;
+    constexpr int64_t n_kv = 12;
+    constexpr int64_t n_tail = 2;
+    constexpr int64_t n_query = 4;
+    constexpr uint32_t n_swa = 4;
+    const llama_pos query_pos[n_query] = { 5, 7, 9, 11 };
+    const uint32_t tail_cells[n_tail] = { 7, 10 };
+
+    std::vector<float> body_mask(n_kv*n_query, -INFINITY);
+    std::vector<float> tail_mask(n_tail*n_query, -INFINITY);
+    for (int64_t iq = 0; iq < n_query; ++iq) {
+        for (int64_t cell = 0; cell < n_kv; ++cell) {
+            const bool visible = cell <= query_pos[iq] &&
+                    !llama_hparams::is_masked_swa(n_swa, swa_type, llama_pos(cell), query_pos[iq]);
+            bool exact = false;
+            for (int64_t it = 0; it < n_tail; ++it) {
+                if (tail_cells[it] == uint32_t(cell)) {
+                    exact = true;
+                    tail_mask[it + n_tail*iq] = visible ? 0.0f : -INFINITY;
+                }
+            }
+            if (visible && !exact) {
+                body_mask[cell + n_kv*iq] = 0.0f;
+            }
+        }
+    }
+
+    std::vector<llama_kv_tail_body_row> packed_rows;
+    std::vector<llama_kv_tail_query_window> queries;
+    for (uint32_t cell = 0; cell < n_kv; ++cell) {
+        packed_rows.push_back({ llama_pos(cell), cell, int32_t(cell) });
+    }
+    for (uint32_t iq = 0; iq < n_query; ++iq) {
+        queries.push_back({ iq, query_pos[iq] });
+    }
+    std::vector<uint8_t> scratch;
+    llama_kv_tail_union_swa_rows(
+            packed_rows, queries, n_swa, swa_type, true,
+            [&](uint32_t iq, uint32_t cell) {
+                return std::isfinite(body_mask[cell + n_kv*iq]);
+            }, scratch);
+    if (packed_rows.size() >= n_kv) {
+        fail("SWA packed oracle did not reduce the physical body");
+    }
+
+    ggml_init_params params = { 16*1024*1024, nullptr, true };
+    ggml_context * ctx = ggml_init(params);
+    ggml_tensor * q = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, n_query);
+    ggml_tensor * k_body = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, n_kv);
+    ggml_tensor * v_body = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, n_kv);
+    ggml_tensor * k_tail = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, n_tail);
+    ggml_tensor * v_tail = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, n_tail);
+    ggml_tensor * packed_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, packed_rows.size());
+    ggml_tensor * mask_full = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_kv + n_tail, n_query);
+    ggml_tensor * mask_packed = ggml_new_tensor_2d(
+            ctx, GGML_TYPE_F32, packed_rows.size() + n_tail, n_query);
+    ggml_tensor * k_packed = ggml_get_rows(ctx, k_body, packed_idxs);
+    ggml_tensor * v_packed = ggml_get_rows(ctx, v_body, packed_idxs);
+
+    const auto build_generic = [&](ggml_tensor * kb, ggml_tensor * vb, ggml_tensor * mask) {
+        const int64_t n_body = kb->ne[1];
+        ggml_tensor * scores = ggml_concat(
+                ctx, ggml_mul_mat(ctx, kb, q), ggml_mul_mat(ctx, k_tail, q), 0);
+        scores = ggml_soft_max_ext(ctx, scores, mask, 1.0f, 0.0f);
+        ggml_tensor * wb = ggml_view_2d(ctx, scores, n_body, n_query, scores->nb[1], 0);
+        ggml_tensor * wt = ggml_view_2d(
+                ctx, scores, n_tail, n_query, scores->nb[1], n_body*scores->nb[0]);
+        ggml_tensor * body_out = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, vb)), wb);
+        ggml_tensor * tail_out = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, v_tail)), wt);
+        return ggml_add(ctx, body_out, tail_out);
+    };
+    ggml_tensor * ordinary = build_generic(k_body, v_body, mask_full);
+    ggml_tensor * packed = build_generic(k_packed, v_packed, mask_packed);
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, ordinary);
+    ggml_build_forward_expand(graph, packed);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buffer) {
+        fail("SWA packed oracle allocation failed");
+    }
+
+    std::vector<float> q_data(d*n_query);
+    std::vector<float> k_data(d*n_kv);
+    std::vector<float> v_data(d*n_kv);
+    for (int64_t iq = 0; iq < n_query; ++iq) {
+        for (int64_t i = 0; i < d; ++i) {
+            q_data[i + d*iq] = 0.006f*float(1 + i%7 + 2*iq);
+        }
+    }
+    for (int64_t cell = 0; cell < n_kv; ++cell) {
+        for (int64_t i = 0; i < d; ++i) {
+            k_data[i + d*cell] = 0.009f*float(1 + i%5 + 3*cell);
+            v_data[i + d*cell] = 0.013f*float(1 + i%11 + 2*cell);
+        }
+    }
+    std::vector<float> kt_data(d*n_tail);
+    std::vector<float> vt_data(d*n_tail);
+    for (int64_t it = 0; it < n_tail; ++it) {
+        std::copy_n(k_data.data() + d*tail_cells[it], d, kt_data.data() + d*it);
+        std::copy_n(v_data.data() + d*tail_cells[it], d, vt_data.data() + d*it);
+    }
+    std::vector<int32_t> idx_data;
+    std::vector<float> packed_mask((packed_rows.size() + n_tail)*n_query, -INFINITY);
+    idx_data.reserve(packed_rows.size());
+    for (const auto & row : packed_rows) {
+        idx_data.push_back(int32_t(row.cell));
+    }
+    std::vector<float> full_mask((n_kv + n_tail)*n_query, -INFINITY);
+    for (int64_t iq = 0; iq < n_query; ++iq) {
+        for (int64_t cell = 0; cell < n_kv; ++cell) {
+            full_mask[cell + (n_kv + n_tail)*iq] = body_mask[cell + n_kv*iq];
+        }
+        for (int64_t it = 0; it < n_tail; ++it) {
+            full_mask[n_kv + it + (n_kv + n_tail)*iq] = tail_mask[it + n_tail*iq];
+            packed_mask[packed_rows.size() + it + (packed_rows.size() + n_tail)*iq] =
+                    tail_mask[it + n_tail*iq];
+        }
+        for (size_t row = 0; row < packed_rows.size(); ++row) {
+            packed_mask[row + (packed_rows.size() + n_tail)*iq] =
+                    body_mask[packed_rows[row].cell + n_kv*iq];
+        }
+    }
+    ggml_backend_tensor_set(q, q_data.data(), 0, q_data.size()*sizeof(float));
+    ggml_backend_tensor_set(k_body, k_data.data(), 0, k_data.size()*sizeof(float));
+    ggml_backend_tensor_set(v_body, v_data.data(), 0, v_data.size()*sizeof(float));
+    ggml_backend_tensor_set(k_tail, kt_data.data(), 0, kt_data.size()*sizeof(float));
+    ggml_backend_tensor_set(v_tail, vt_data.data(), 0, vt_data.size()*sizeof(float));
+    ggml_backend_tensor_set(packed_idxs, idx_data.data(), 0, idx_data.size()*sizeof(int32_t));
+    ggml_backend_tensor_set(mask_full, full_mask.data(), 0, full_mask.size()*sizeof(float));
+    ggml_backend_tensor_set(mask_packed, packed_mask.data(), 0, packed_mask.size()*sizeof(float));
+    if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+        fail("SWA packed oracle compute failed");
+    }
+    std::vector<float> expected(d*n_query);
+    std::vector<float> actual(d*n_query);
+    ggml_backend_tensor_get(ordinary, expected.data(), 0, expected.size()*sizeof(float));
+    ggml_backend_tensor_get(packed, actual.data(), 0, actual.size()*sizeof(float));
+    for (size_t i = 0; i < actual.size(); ++i) {
+        if (std::fabs(actual[i] - expected[i]) > 1e-5f) {
+            std::fprintf(stderr, "packed SWA %d mismatch at %zu: got %.8f expected %.8f\n",
+                    int(swa_type), i, actual[i], expected[i]);
+            std::exit(1);
+        }
+    }
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+}
+
 int main() {
     test_representation_topology();
     ggml_backend_load_all();
@@ -380,6 +689,20 @@ int main() {
         test_shadow_roundtrip(backend);
         test_fully_masked_quant_body(backend, GGML_TYPE_Q4_0);
         test_fully_masked_quant_body(backend, GGML_TYPE_Q8_0);
+        // F32 exact sides always use ordinary SET_ROWS plus the generic merge,
+        // even when FlashAttention was requested for the surrounding graph.
+        test_mixed_side_generic_attention(
+                backend, GGML_TYPE_Q4_0, GGML_TYPE_F32,
+                GGML_TYPE_F16, GGML_TYPE_F32, true);
+        test_mixed_side_generic_attention(
+                backend, GGML_TYPE_F32, GGML_TYPE_Q4_0,
+                GGML_TYPE_F32, GGML_TYPE_BF16, false);
+        // Existing aligned half/bfloat mixed sides remain numerically valid.
+        test_mixed_side_generic_attention(
+                backend, GGML_TYPE_F16, GGML_TYPE_Q4_0,
+                GGML_TYPE_F16, GGML_TYPE_BF16, false);
+        test_sparse_swa_packed_oracle(backend, LLAMA_SWA_TYPE_STANDARD);
+        test_sparse_swa_packed_oracle(backend, LLAMA_SWA_TYPE_CHUNKED);
         ggml_backend_free(backend);
     }
     return 0;

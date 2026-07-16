@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <string>
 #include <stdexcept>
 #include <vector>
 
@@ -22,6 +23,82 @@ static llama_kv_tail_identity id(uint32_t cell, uint64_t generation = 1) {
 }
 
 int main() {
+    // Layer split is an ownership mapping, not a device-zero default. Exercise
+    // two logical owners even on a one-GPU host and include graph and state
+    // consumers in the invariant.
+    auto layer0 = llama_kv_tail_plan_layer_ownership(0, 101, 101, true, true);
+    auto layer1 = llama_kv_tail_plan_layer_ownership(1, 202, 202, true, true);
+    CHECK(llama_kv_tail_validate_layer_ownership(layer0) == LLAMA_KV_TAIL_OWNERSHIP_OK);
+    CHECK(llama_kv_tail_validate_layer_ownership(layer1) == LLAMA_KV_TAIL_OWNERSHIP_OK);
+    CHECK(layer0.graph_write_owner == 101 && layer0.graph_read_owner == 101);
+    CHECK(layer1.graph_write_owner == 202 && layer1.graph_read_owner == 202);
+    CHECK(layer0.state_k_owner == 101 && layer0.state_v_owner == 101);
+    CHECK(layer1.state_k_owner == 202 && layer1.state_v_owner == 202);
+    layer1.state_k_owner = 101;
+    CHECK(llama_kv_tail_validate_layer_ownership(layer1) == LLAMA_KV_TAIL_OWNERSHIP_STATE_K);
+    layer1.state_k_owner = 202;
+    layer1.shadow_v_owner = 101;
+    CHECK(llama_kv_tail_validate_layer_ownership(layer1) == LLAMA_KV_TAIL_OWNERSHIP_SHADOW_V);
+    layer1.shadow_v_owner = 202;
+    layer1.body_k_meta_split = true;
+    CHECK(llama_kv_tail_validate_layer_ownership(layer1) == LLAMA_KV_TAIL_OWNERSHIP_META_SPLIT_K);
+
+    llama_kv_tail_route_requirements route_requirements;
+    route_requirements.native_attention = true;
+    auto route = llama_kv_tail_select_route(route_requirements);
+    CHECK(route.supported && route.route == LLAMA_KV_TAIL_ROUTE_NATIVE);
+
+    // Explicit attention bias disables the native attached-tail operation;
+    // when every primitive remains available the complete route is generic.
+    route_requirements.native_attention = false;
+    route = llama_kv_tail_select_route(route_requirements);
+    CHECK(route.supported && route.route == LLAMA_KV_TAIL_ROUTE_GENERIC);
+
+    // CANN classifies the fused shadow operand as unsupported. A complete
+    // route must reject it rather than scheduling a full-body CPU transfer.
+    route_requirements.write_k = false;
+    route = llama_kv_tail_select_route(route_requirements);
+    CHECK(!route.supported);
+    CHECK(route.missing_operation == LLAMA_KV_TAIL_OP_WRITE_K);
+    route_requirements.write_k = true;
+
+    route_requirements.exact_value = false;
+    route = llama_kv_tail_select_route(route_requirements);
+    CHECK(!route.supported);
+    CHECK(route.missing_operation == LLAMA_KV_TAIL_OP_EXACT_VALUE);
+    route_requirements.exact_value = true;
+
+    const llama_kv_tail_route_capability supported_native {
+        true, LLAMA_KV_TAIL_ROUTE_NATIVE, LLAMA_KV_TAIL_OP_NONE,
+    };
+    const llama_kv_tail_route_capability bf16_missing_write {
+        false, LLAMA_KV_TAIL_ROUTE_NONE, LLAMA_KV_TAIL_OP_WRITE_K,
+    };
+    const llama_kv_tail_route_capability f16_missing_value {
+        false, LLAMA_KV_TAIL_ROUTE_NONE, LLAMA_KV_TAIL_OP_EXACT_VALUE,
+    };
+    auto type_resolution = llama_kv_tail_resolve_type(
+            GGML_TYPE_COUNT, GGML_TYPE_BF16, supported_native, supported_native);
+    CHECK(type_resolution.supported && type_resolution.actual_type == GGML_TYPE_BF16);
+    CHECK(!type_resolution.downgraded);
+    type_resolution = llama_kv_tail_resolve_type(
+            GGML_TYPE_COUNT, GGML_TYPE_BF16, bf16_missing_write, supported_native);
+    CHECK(type_resolution.supported && type_resolution.actual_type == GGML_TYPE_F16);
+    CHECK(type_resolution.downgraded);
+    CHECK(type_resolution.missing_preferred == LLAMA_KV_TAIL_OP_WRITE_K);
+    type_resolution = llama_kv_tail_resolve_type(
+            GGML_TYPE_BF16, GGML_TYPE_BF16, bf16_missing_write, supported_native);
+    CHECK(!type_resolution.supported && type_resolution.actual_type == GGML_TYPE_COUNT);
+    type_resolution = llama_kv_tail_resolve_type(
+            GGML_TYPE_F16, GGML_TYPE_BF16, bf16_missing_write, supported_native);
+    CHECK(type_resolution.supported && type_resolution.actual_type == GGML_TYPE_F16);
+    CHECK(!type_resolution.downgraded);
+    type_resolution = llama_kv_tail_resolve_type(
+            GGML_TYPE_COUNT, GGML_TYPE_BF16, bf16_missing_write, f16_missing_value);
+    CHECK(!type_resolution.supported);
+    CHECK(type_resolution.missing_preferred == LLAMA_KV_TAIL_OP_WRITE_K);
+    CHECK(type_resolution.missing_fallback == LLAMA_KV_TAIL_OP_EXACT_VALUE);
+
     assert(!llama_kv_tail_sparse_body_capacity_safe(0, 0));
     assert(llama_kv_tail_sparse_body_capacity_safe(255, 256));
     assert(llama_kv_tail_sparse_body_capacity_safe(256, 256));
@@ -156,6 +233,55 @@ int main() {
     storage = llama_kv_tail_storage_plan_for(storage_request(1024, 1024, 16384, 10752, 16384));
     CHECK(storage.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY);
 
+    auto graph_rejected = storage_request(512, 1024, 1536, 10752, 16384);
+    graph_rejected.graph_consumes_exact_tail = false;
+    graph_rejected.architecture = "deepseek2";
+    graph_rejected.group_id = "mla@l0";
+    bool graph_rejected_before_allocation = false;
+    try {
+        (void) llama_kv_tail_storage_plan_for(graph_rejected);
+    } catch (const std::invalid_argument & error) {
+        const std::string message = error.what();
+        graph_rejected_before_allocation =
+                message.find("deepseek2") != std::string::npos &&
+                message.find("mla@l0") != std::string::npos &&
+                message.find("requested N=512") != std::string::npos &&
+                message.find("K-only MLA/DSA") != std::string::npos;
+    }
+    CHECK(graph_rejected_before_allocation);
+
+    auto dsa_rejected = graph_rejected;
+    dsa_rejected.architecture = "deepseek4";
+    dsa_rejected.group_id = "dsa-raw@l0";
+    bool dsa_rejected_before_allocation = false;
+    try {
+        (void) llama_kv_tail_storage_plan_for(dsa_rejected);
+    } catch (const std::invalid_argument & error) {
+        const std::string message = error.what();
+        dsa_rejected_before_allocation =
+                message.find("deepseek4") != std::string::npos &&
+                message.find("dsa-raw@l0") != std::string::npos &&
+                message.find("requested N=512") != std::string::npos &&
+                message.find("K-only MLA/DSA") != std::string::npos;
+    }
+    CHECK(dsa_rejected_before_allocation);
+
+    auto placement_rejected = storage_request(512, 1024, 1536, 10752, 16384);
+    placement_rejected.overlay_placement_supported = false;
+    bool placement_rejected_before_allocation = false;
+    try {
+        (void) llama_kv_tail_storage_plan_for(placement_rejected);
+    } catch (const std::invalid_argument &) {
+        placement_rejected_before_allocation = true;
+    }
+    CHECK(placement_rejected_before_allocation);
+
+    auto native_without_overlay_consumer = storage_request(1024, 1024, 1536, 10752, 16384);
+    native_without_overlay_consumer.graph_consumes_exact_tail = false;
+    native_without_overlay_consumer.overlay_placement_supported = false;
+    storage = llama_kv_tail_storage_plan_for(native_without_overlay_consumer);
+    CHECK(storage.kind == LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT);
+
     // A shared quantized source cannot be promoted by the child context.
     storage = llama_kv_tail_storage_plan_for(storage_request(
             1024, 1024, 1536, 10752, 16384, 5632, false, false, false, true));
@@ -178,6 +304,113 @@ int main() {
     CHECK(storage.kind == LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT);
     CHECK(storage.actual_body_type_k == GGML_TYPE_BF16);
     CHECK(storage.actual_body_type_v == GGML_TYPE_F16);
+
+    // An already-exact F32 side remains F32 in a mixed overlay. It is an
+    // aligned shadow, not a reason to leave one half of the exact pair absent.
+    storage = llama_kv_tail_storage_plan_for(storage_request(
+            512, 1024, 1536, 4096, 16384, 12288, true, false, true, false,
+            true, true, GGML_TYPE_Q5_0, GGML_TYPE_F32));
+    CHECK(storage.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY);
+    CHECK(storage.shadow_k && storage.shadow_v);
+    CHECK(storage.shadow_type_k == GGML_TYPE_BF16);
+    CHECK(storage.shadow_type_v == GGML_TYPE_F32);
+
+    storage = llama_kv_tail_storage_plan_for(storage_request(
+            512, 1024, 1536, 4096, 16384, 12288, true, false, true, false,
+            true, true, GGML_TYPE_F32, GGML_TYPE_Q5_0));
+    CHECK(storage.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY);
+    CHECK(storage.shadow_k && storage.shadow_v);
+    CHECK(storage.shadow_type_k == GGML_TYPE_F32);
+    CHECK(storage.shadow_type_v == GGML_TYPE_BF16);
+
+    // Explicit selection never turns an invisible gap into a suffix. Causal
+    // mode also excludes rollback records newer than the query; non-causal
+    // mode may select them when the authoritative mask is finite.
+    const std::vector<llama_kv_tail_mask_entry> mask_entries = {
+        { 0, 10, 10 }, { 1, 11, 11 }, { 2, 12, 12 },
+        { 3, 13, 13 }, { 4, 14, 14 },
+    };
+    const std::vector<uint8_t> finite = { 1, 0, 1, 0, 1 };
+    std::vector<uint32_t> selected;
+    llama_kv_tail_select_masked_entries(mask_entries, finite, 13, 2, true, selected);
+    CHECK(selected == std::vector<uint32_t>({ 0, 2 }));
+    llama_kv_tail_select_masked_entries(mask_entries, finite, 13, 2, false, selected);
+    CHECK(selected == std::vector<uint32_t>({ 2, 4 }));
+    llama_kv_tail_select_masked_entries(mask_entries, finite, 13, 0, false, selected);
+    CHECK(selected.empty());
+
+    const auto make_body_rows = []() {
+        std::vector<llama_kv_tail_body_row> rows;
+        for (uint32_t cell = 0; cell < 16; ++cell) {
+            rows.push_back({ llama_pos(cell), cell, int32_t(cell) });
+        }
+        return rows;
+    };
+    const std::vector<llama_kv_tail_query_window> standard_queries = {
+        { 0, 3 }, { 1, 7 },
+    };
+    auto standard_rows = make_body_rows();
+    std::vector<uint8_t> row_scratch;
+    llama_kv_tail_union_swa_rows(
+            standard_rows, standard_queries, 4, LLAMA_SWA_TYPE_STANDARD, true,
+            [](uint32_t query, uint32_t cell) {
+                return !(query == 0 && cell == 2);
+            }, row_scratch);
+    std::vector<uint32_t> standard_cells;
+    for (const auto & row : standard_rows) {
+        standard_cells.push_back(row.cell);
+    }
+    CHECK(standard_cells == std::vector<uint32_t>({ 0, 1, 3, 4, 5, 6, 7 }));
+
+    const std::vector<llama_kv_tail_query_window> chunked_queries = {
+        { 0, 5 }, { 1, 7 },
+    };
+    auto chunked_rows = make_body_rows();
+    llama_kv_tail_union_swa_rows(
+            chunked_rows, chunked_queries, 4, LLAMA_SWA_TYPE_CHUNKED, true,
+            [](uint32_t, uint32_t) { return true; }, row_scratch);
+    std::vector<uint32_t> chunked_cells;
+    for (const auto & row : chunked_rows) {
+        chunked_cells.push_back(row.cell);
+    }
+    CHECK(chunked_cells == std::vector<uint32_t>({ 4, 5, 6, 7 }));
+
+    auto noncausal_rows = make_body_rows();
+    llama_kv_tail_union_swa_rows(
+            noncausal_rows, { { 0, 3 } }, 4, LLAMA_SWA_TYPE_STANDARD, false,
+            [](uint32_t, uint32_t) { return true; }, row_scratch);
+    CHECK(noncausal_rows.size() == 16);
+
+    // Planning the same query run as one ubatch or two partitions produces the
+    // same packed-row union for both standard and chunked windows.
+    const auto check_partition_invariance = [&](llama_swa_type type,
+                                                 const std::vector<llama_kv_tail_query_window> & queries) {
+        auto combined = make_body_rows();
+        llama_kv_tail_union_swa_rows(combined, queries, 4, type, true,
+                [](uint32_t, uint32_t) { return true; }, row_scratch);
+        std::vector<bool> partition_union(16, false);
+        for (const auto & query : queries) {
+            auto partition = make_body_rows();
+            llama_kv_tail_union_swa_rows(partition, { query }, 4, type, true,
+                    [](uint32_t, uint32_t) { return true; }, row_scratch);
+            for (const auto & row : partition) {
+                partition_union[row.cell] = true;
+            }
+        }
+        std::vector<uint32_t> partition_cells;
+        for (uint32_t cell = 0; cell < partition_union.size(); ++cell) {
+            if (partition_union[cell]) {
+                partition_cells.push_back(cell);
+            }
+        }
+        std::vector<uint32_t> combined_cells;
+        for (const auto & row : combined) {
+            combined_cells.push_back(row.cell);
+        }
+        CHECK(combined_cells == partition_cells);
+    };
+    check_partition_invariance(LLAMA_SWA_TYPE_STANDARD, standard_queries);
+    check_partition_invariance(LLAMA_SWA_TYPE_CHUNKED, chunked_queries);
 
     // A structurally empty group cannot allocate or advertise exact coverage.
     storage = llama_kv_tail_storage_plan_for(storage_request(
@@ -375,6 +608,67 @@ int main() {
     CHECK(degraded_copy.coverage(1).degradation_flags & LLAMA_KV_TAIL_DEGRADED_BODY_ONLY_STATE);
     CHECK(degraded_copy.coverage(1).degradation_flags & LLAMA_KV_TAIL_DEGRADED_HISTORICAL_OP);
 
+    // State v2 must preserve both the degradation cause and partial recovery
+    // progress. Whole restores replace every sequence, while a sequence restore
+    // remaps only the selected provenance entry to its destination.
+    llama_kv_tail_store provenance_source(2, 2, 8);
+    provenance_source.mark_degraded(0, LLAMA_KV_TAIL_DEGRADED_STATE_RESTORE);
+    provenance_source.commit(0, id(6), 6, 6);
+    const auto saved_provenance = provenance_source.snapshot_provenance();
+    CHECK(saved_provenance.size() == 2);
+    CHECK(saved_provenance[0].seq_id == 0);
+    CHECK(saved_provenance[0].degradation_flags == LLAMA_KV_TAIL_DEGRADED_STATE_RESTORE);
+    CHECK(saved_provenance[0].recovery_commits == 1);
+
+    llama_kv_tail_store provenance_restored(2, 2, 8);
+    provenance_restored.mark_degraded(1, LLAMA_KV_TAIL_DEGRADED_BODY_ONLY_STATE);
+    provenance_restored.restore_provenance(saved_provenance);
+    CHECK(provenance_restored.coverage(0).degradation_flags == LLAMA_KV_TAIL_DEGRADED_STATE_RESTORE);
+    CHECK(provenance_restored.coverage(1).degradation_flags == 0);
+    provenance_restored.commit(0, id(7), 7, 7);
+    CHECK(provenance_restored.coverage(0).degradation_flags == 0);
+
+    provenance_restored.mark_degraded(0, LLAMA_KV_TAIL_DEGRADED_HISTORICAL_OP);
+    provenance_restored.restore_provenance(provenance_source.snapshot_provenance(0), 1);
+    CHECK(provenance_restored.coverage(0).degradation_flags == LLAMA_KV_TAIL_DEGRADED_HISTORICAL_OP);
+    CHECK(provenance_restored.coverage(1).degradation_flags == LLAMA_KV_TAIL_DEGRADED_STATE_RESTORE);
+
+    // Deferred copies reserve private destination rows but do not publish
+    // metadata until the payload transaction commits. Coverage and state-size
+    // snapshots still describe the logical post-copy destination.
+    llama_kv_tail_store transactional_copy(2, 2, 8);
+    const int32_t source_slot = transactional_copy.commit(0, id(0), 0, 0);
+    const int32_t old_destination_slot = transactional_copy.commit(1, id(4), 4, 4);
+    const auto prepared = transactional_copy.prepare_seq_cp(0, 1, 0, 0, 0, -1);
+    CHECK(transactional_copy.has_pending_seq_cp());
+    CHECK(prepared.size() == 1 && prepared[0].src_slot == source_slot);
+    CHECK(transactional_copy.build_source_plan(1, { id(4) })[0] == old_destination_slot);
+    CHECK(transactional_copy.build_source_plan(1, { id(0) })[0] == LLAMA_KV_TAIL_BODY_SLOT);
+    CHECK(transactional_copy.coverage(1, 1).exact == 1);
+    const auto pending_snapshot = transactional_copy.snapshot(1);
+    CHECK(pending_snapshot.size() == 1 && pending_snapshot[0].identity == id(0));
+    transactional_copy.commit_seq_cp();
+    CHECK(!transactional_copy.has_pending_seq_cp());
+    CHECK(transactional_copy.build_source_plan(1, { id(0) })[0] == prepared[0].dst_slot);
+
+    (void) transactional_copy.prepare_seq_cp(0, 1, 0, 0, 0, -1);
+    transactional_copy.cancel_seq_cp();
+    CHECK(!transactional_copy.has_pending_seq_cp());
+    CHECK(transactional_copy.build_source_plan(1, { id(0) })[0] == prepared[0].dst_slot);
+
+    llama_kv_tail_store shared_transform(4, 2, 12);
+    const llama_kv_tail_identity shared_id { 0, 5, 9 };
+    shared_transform.commit(0, shared_id, 4, 4);
+    shared_transform.commit(1, shared_id, 4, 4);
+    shared_transform.seq_add(0, 4, 5, 2);
+    CHECK(shared_transform.snapshot(0)[0].position == 6);
+    CHECK(shared_transform.snapshot(1)[0].position == 6);
+    CHECK(shared_transform.coverage(0).degradation_flags & LLAMA_KV_TAIL_DEGRADED_HISTORICAL_OP);
+    CHECK(shared_transform.coverage(1).degradation_flags & LLAMA_KV_TAIL_DEGRADED_HISTORICAL_OP);
+    shared_transform.seq_div(0, 6, 7, 2);
+    CHECK(shared_transform.snapshot(0)[0].position == 3);
+    CHECK(shared_transform.snapshot(1)[0].position == 3);
+
     // The rollback reserve keeps every query-local row in the current physical
     // ubatch until the next ubatch boundary.
     llama_kv_tail_store rollback(2, 1, 5);
@@ -417,7 +711,8 @@ int main() {
     CHECK(ordered_plan[0] >= 0 && ordered_plan[2] >= 0);
     CHECK(ordered_plan[1] == LLAMA_KV_TAIL_BODY_SLOT);
     ordered.seq_div(0, 0, -1, 5);
-    CHECK(ordered.coverage(0).state == LLAMA_KV_TAIL_COVERAGE_COMPLETE);
+    CHECK(ordered.coverage(0).state == LLAMA_KV_TAIL_COVERAGE_PARTIAL);
+    CHECK(ordered.coverage(0).degradation_flags & LLAMA_KV_TAIL_DEGRADED_HISTORICAL_OP);
 
     // Exhaustion fails before publishing an identity or sequence membership.
     llama_kv_tail_store bounded(2, 1, 2);

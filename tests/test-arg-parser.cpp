@@ -253,9 +253,9 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.model.path == "model_file.gguf");
     assert(params.kv_tail_tokens == "0");
-    assert(params.kv_tail_type == GGML_TYPE_BF16);
+    assert(params.kv_tail_type == GGML_TYPE_COUNT);
     assert(common_context_params_to_llama(params).kv_tail_tokens == 0);
-    assert(common_context_params_to_llama(params).kv_tail_type == GGML_TYPE_BF16);
+    assert(common_context_params_to_llama(params).kv_tail_type == GGML_TYPE_COUNT);
 
     const llama_context_params context_defaults = llama_context_default_params();
     assert(context_defaults.kv_tail_type == GGML_TYPE_COUNT);
@@ -273,8 +273,8 @@ static void test(void) {
             "--kv-tail-tokens", "1024"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.kvarn.type == LLAMA_KVARN_K4V4_G128);
-    assert(params.kv_tail_type == GGML_TYPE_F16);
-    assert(common_context_params_to_llama(params).kv_tail_type == GGML_TYPE_F16);
+    assert(params.kv_tail_type == GGML_TYPE_COUNT);
+    assert(common_context_params_to_llama(params).kv_tail_type == GGML_TYPE_COUNT);
 
     params = common_params();
     argv = {"binary_name", "-m", "model_file.gguf", "--cache-type-k", "kvarn4", "--cache-type-v", "kvarn4",

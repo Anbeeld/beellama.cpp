@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstring>
+#include <cstdlib>
 #include <random>
 #include <vector>
 
@@ -214,6 +216,223 @@ static bool test_cross_ubatch_tail_state(
     return true;
 }
 
+static bool test_tail_copy_is_immediately_saveable(
+        llama_model * model, const common_params & params, const llama_tokens & tokens, bool unified) {
+    if (params.kv_tail_tokens.empty() ||
+            !std::all_of(params.kv_tail_tokens.begin(), params.kv_tail_tokens.end(), ::isdigit) ||
+            std::stoul(params.kv_tail_tokens) == 0) {
+        return true;
+    }
+
+    auto context_params = common_context_params_to_llama(params);
+    context_params.n_seq_max = 2;
+    context_params.kv_unified = unified;
+    auto source = llama_context_ptr{llama_init_from_model(model, context_params)};
+    auto restored = llama_context_ptr{llama_init_from_model(model, context_params)};
+    if (!source || !restored) {
+        LOG_ERR("%s: failed to create sequence-copy contexts\n", __func__);
+        return false;
+    }
+
+    int n_past = 0;
+    if (!common_prompt_batch_decode(source.get(), tokens, int(tokens.size()), n_past,
+            context_params.n_batch, {}, false)) {
+        return false;
+    }
+    llama_memory_t memory = llama_get_memory(source.get());
+    llama_memory_seq_cp(memory, 0, 1, 0, -1);
+    if (llama_memory_seq_pos_max(memory, 1) != llama_memory_seq_pos_max(memory, 0)) {
+        LOG_ERR("%s: copied body positions were not immediately observable\n", __func__);
+        return false;
+    }
+    llama_kv_tail_coverage_info source_coverage{};
+    llama_kv_tail_coverage_info pending_coverage{};
+    if (!llama_kv_tail_get_coverage(source.get(), 0, 0, &source_coverage) ||
+            !llama_kv_tail_get_coverage(source.get(), 1, 0, &pending_coverage) ||
+            source_coverage.requested != pending_coverage.requested ||
+            source_coverage.exact != pending_coverage.exact) {
+        LOG_ERR("%s: pending exact coverage did not describe the logical copy "
+                "(source requested=%u exact=%u flags=%u, destination requested=%u exact=%u flags=%u)\n",
+                __func__, source_coverage.requested, source_coverage.exact, source_coverage.degradation_flags,
+                pending_coverage.requested, pending_coverage.exact, pending_coverage.degradation_flags);
+        LOG_ERR("%s: body positions source=%d destination=%d\n", __func__,
+                llama_memory_seq_pos_max(memory, 0), llama_memory_seq_pos_max(memory, 1));
+        return false;
+    }
+
+    const size_t state_size = llama_state_seq_get_size(source.get(), 1);
+    if (state_size == 0 || state_size != llama_state_seq_get_size(source.get(), 1)) {
+        LOG_ERR("%s: pending sequence state sizing was unstable\n", __func__);
+        return false;
+    }
+    std::vector<uint8_t> state(state_size);
+    if (llama_state_seq_get_data(source.get(), state.data(), state.size(), 1) != state.size() ||
+            llama_state_seq_set_data(restored.get(), state.data(), state.size(), 1) != state.size()) {
+        LOG_ERR("%s: immediate copied-sequence save/restore failed\n", __func__);
+        return false;
+    }
+
+    auto corruption_guard = llama_context_ptr{llama_init_from_model(model, context_params)};
+    if (!corruption_guard ||
+            llama_state_seq_set_data(corruption_guard.get(), state.data(), state.size(), 1) != state.size()) {
+        LOG_ERR("%s: failed to initialize corrupt-state destination guard\n", __func__);
+        return false;
+    }
+    auto read_u32 = [&](const std::vector<uint8_t> & bytes, size_t offset) {
+        uint32_t value;
+        if (offset > bytes.size() || bytes.size() - offset < sizeof(value)) {
+            throw std::runtime_error("state parser exceeded the buffer");
+        }
+        std::memcpy(&value, bytes.data() + offset, sizeof(value));
+        return value;
+    };
+    auto write_u32 = [&](std::vector<uint8_t> & bytes, size_t offset, uint32_t value) {
+        if (offset > bytes.size() || bytes.size() - offset < sizeof(value)) {
+            throw std::runtime_error("state mutator exceeded the buffer");
+        }
+        std::memcpy(bytes.data() + offset, &value, sizeof(value));
+    };
+    const uint32_t tail_magic = 0x4c54564b;
+    size_t frame = std::string::npos;
+    for (size_t i = 0; i + sizeof(tail_magic) <= state.size(); ++i) {
+        if (read_u32(state, i) == tail_magic) {
+            frame = i;
+            break;
+        }
+    }
+    if (frame == std::string::npos || read_u32(state, frame + 4) != 2) {
+        LOG_ERR("%s: could not locate standard tail state v2 frame\n", __func__);
+        return false;
+    }
+    const uint32_t group_size = read_u32(state, frame + 20);
+    const size_t manifest = frame + 24 + group_size + 3*sizeof(uint64_t);
+    const uint32_t stream_count = read_u32(state, manifest);
+    const uint32_t n_pos_per_embd = read_u32(state, manifest + 8);
+    const uint32_t saved_n_seq_max = read_u32(state, manifest + 12);
+    const uint32_t body_layer_count = read_u32(state, manifest + 16);
+    size_t cursor = manifest + 20 + size_t(body_layer_count)*36;
+    std::vector<uint32_t> body_cell_counts;
+    for (uint32_t s = 0; s < stream_count; ++s) {
+        const uint32_t cell_count = read_u32(state, cursor);
+        const uint32_t run_count = read_u32(state, cursor + 4);
+        body_cell_counts.push_back(cell_count);
+        cursor += 8 + size_t(run_count)*sizeof(uint32_t);
+        for (uint32_t i = 0; i < cell_count; ++i) {
+            cursor += sizeof(llama_pos);
+            if (n_pos_per_embd > 1) {
+                cursor += sizeof(llama_pos)*2;
+            }
+            const uint32_t seq_count = read_u32(state, cursor);
+            cursor += sizeof(uint32_t) + size_t(seq_count)*sizeof(llama_seq_id);
+        }
+    }
+    const size_t tail_header = cursor;
+    const uint32_t record_count = read_u32(state, tail_header + 8);
+    const uint32_t payload_count = read_u32(state, tail_header + 12);
+    const size_t record_begin = tail_header + 24;
+    const size_t record_size = 36;
+    const size_t tail_layer_begin = record_begin + size_t(record_count)*record_size;
+    if (record_count < 2 || payload_count < 2 || body_cell_counts.empty()) {
+        LOG_ERR("%s: tail state fixture did not contain enough records for corruption tests\n", __func__);
+        return false;
+    }
+
+    const llama_pos guard_pos = llama_memory_seq_pos_max(llama_get_memory(corruption_guard.get()), 1);
+    auto expect_rejected = [&](std::vector<uint8_t> corrupt, size_t supplied_size, const char * name) {
+        if (llama_state_seq_set_data(corruption_guard.get(), corrupt.data(), supplied_size, 1) != 0) {
+            LOG_ERR("%s: corrupt state case '%s' was accepted\n", __func__, name);
+            return false;
+        }
+        if (llama_memory_seq_pos_max(llama_get_memory(corruption_guard.get()), 1) != guard_pos) {
+            LOG_ERR("%s: corrupt state case '%s' changed the live destination\n", __func__, name);
+            return false;
+        }
+        return true;
+    };
+    {
+        auto corrupt = state;
+        write_u32(corrupt, record_begin, saved_n_seq_max);
+        if (!expect_rejected(std::move(corrupt), state.size(), "sequence ID")) return false;
+    }
+    {
+        auto corrupt = state;
+        write_u32(corrupt, record_begin + 4, stream_count);
+        if (!expect_rejected(std::move(corrupt), state.size(), "stream")) return false;
+    }
+    {
+        auto corrupt = state;
+        const uint32_t record_stream = read_u32(corrupt, record_begin + 4);
+        write_u32(corrupt, record_begin + 8, body_cell_counts.at(record_stream));
+        if (!expect_rejected(std::move(corrupt), state.size(), "body ordinal")) return false;
+    }
+    {
+        auto corrupt = state;
+        write_u32(corrupt, record_begin + 32, payload_count);
+        if (!expect_rejected(std::move(corrupt), state.size(), "payload ordinal")) return false;
+    }
+    {
+        auto corrupt = state;
+        std::memcpy(corrupt.data() + record_begin + record_size,
+                corrupt.data() + record_begin, 3*sizeof(uint32_t));
+        if (!expect_rejected(std::move(corrupt), state.size(), "duplicate identity")) return false;
+    }
+    {
+        auto corrupt = state;
+        write_u32(corrupt, record_begin + 32, 1);
+        if (!expect_rejected(std::move(corrupt), state.size(), "unreferenced payload")) return false;
+    }
+    {
+        auto corrupt = state;
+        write_u32(corrupt, tail_layer_begin, read_u32(corrupt, tail_layer_begin) + 1);
+        if (!expect_rejected(std::move(corrupt), state.size(), "layer ID")) return false;
+    }
+    {
+        auto corrupt = state;
+        write_u32(corrupt, tail_header + 12, UINT32_MAX);
+        if (!expect_rejected(std::move(corrupt), state.size(), "slot exhaustion")) return false;
+    }
+    if (!expect_rejected(state, state.size() - 1, "truncated row")) {
+        return false;
+    }
+
+    const llama_token probe = tokens.empty() ? 1 : tokens.back();
+    llama_batch_ptr source_batch(1, 0, 1);
+    llama_batch_ptr restored_batch(1, 0, 1);
+    llama_batch_ptr guard_batch(1, 0, 1);
+    common_batch_add(source_batch.get(), probe, n_past, {0}, true);
+    common_batch_add(restored_batch.get(), probe, n_past, {1}, true);
+    common_batch_add(guard_batch.get(), probe, n_past, {1}, true);
+    if (llama_decode(source.get(), source_batch.get()) || llama_decode(restored.get(), restored_batch.get()) ||
+            llama_decode(corruption_guard.get(), guard_batch.get())) {
+        LOG_ERR("%s: continuation decode failed\n", __func__);
+        return false;
+    }
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const float * expected = llama_get_logits_ith(source.get(), -1);
+    const float * actual = llama_get_logits_ith(restored.get(), -1);
+    const float * guarded = llama_get_logits_ith(corruption_guard.get(), -1);
+    double squared_error = 0.0;
+    double squared_reference = 0.0;
+    double max_abs_error = 0.0;
+    for (int32_t i = 0; i < n_vocab; ++i) {
+        const double diff = double(expected[i]) - double(actual[i]);
+        const double guard_diff = double(expected[i]) - double(guarded[i]);
+        squared_error += diff*diff;
+        squared_error += guard_diff*guard_diff;
+        squared_reference += double(expected[i])*double(expected[i]);
+        max_abs_error = std::max(max_abs_error, std::fabs(diff));
+        max_abs_error = std::max(max_abs_error, std::fabs(guard_diff));
+    }
+    const double nmse = squared_error/std::max(squared_reference, 1e-30);
+    if (!std::isfinite(nmse) || nmse > 1e-10 || max_abs_error > 1e-4) {
+        LOG_ERR("%s: immediate copied-sequence continuation changed logits (nmse=%g max_abs=%g)\n",
+                __func__, nmse, max_abs_error);
+        return false;
+    }
+    LOG("\nPASS: standard tail copy is immediately saveable (%s)\n", unified ? "unified" : "non-unified");
+    return true;
+}
+
 static bool test_kvarn_full_window_native_exact(
         llama_model * model, const common_params & params, const llama_tokens & tokens) {
     if (params.kvarn.type == LLAMA_KVARN_TYPE_DISABLED ||
@@ -275,6 +494,33 @@ static bool test_kvarn_full_window_native_exact(
     return true;
 }
 
+static bool test_tail_state_v1_compatibility(llama_model * model, const common_params & params) {
+    const char * path = std::getenv("KV_TAIL_TEST_V1_STATE");
+    if (!path || !*path || params.kv_tail_tokens.empty() || std::stoul(params.kv_tail_tokens) == 0) {
+        return true;
+    }
+    auto context = llama_context_ptr{llama_init_from_model(model, common_context_params_to_llama(params))};
+    if (!context) {
+        LOG_ERR("%s: failed to create v1 compatibility context\n", __func__);
+        return false;
+    }
+    std::vector<llama_token> saved_tokens(std::max<uint32_t>(params.n_ctx, params.n_batch));
+    size_t token_count = 0;
+    if (!llama_state_load_file(context.get(), path, saved_tokens.data(), saved_tokens.size(), &token_count)) {
+        LOG_ERR("%s: failed to load v1 tail state '%s'\n", __func__, path);
+        return false;
+    }
+    llama_kv_tail_coverage_info coverage{};
+    if (!llama_kv_tail_get_coverage(context.get(), 0, 0, &coverage) || coverage.exact == 0 ||
+            (coverage.degradation_flags & LLAMA_KV_TAIL_DEGRADED_STATE_RESTORE) == 0) {
+        LOG_ERR("%s: v1 state upgraded missing provenance (exact=%u flags=%u)\n",
+                __func__, coverage.exact, coverage.degradation_flags);
+        return false;
+    }
+    LOG("\nPASS: v1 tail state loads with conservative degradation provenance\n");
+    return true;
+}
+
 // Test 1: baseline
 // - decode all but the last token
 // - save state to disk
@@ -282,6 +528,10 @@ static bool test_kvarn_full_window_native_exact(
 // - generate n_predict tokens
 static llama_tokens test_baseline(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens) {
     auto ctx = llama_context_ptr{llama_init_from_model(model, common_context_params_to_llama(params))};
+    if (!ctx) {
+        LOG_ERR("%s: failed to create baseline context\n", __func__);
+        return {};
+    }
 
     auto sparams = llama_sampler_chain_default_params();
     auto smpl = llama_sampler_ptr{llama_sampler_chain_init(sparams)};
@@ -313,6 +563,10 @@ static llama_tokens test_baseline(struct llama_model * model, const struct commo
 // - generate n_predict tokens and compare against expected result
 static bool test_state_load(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens, const llama_tokens & expected_result) {
     auto ctx = llama_context_ptr{llama_init_from_model(model, common_context_params_to_llama(params))};
+    if (!ctx) {
+        LOG_ERR("%s: failed to create state-load context\n", __func__);
+        return false;
+    }
 
     auto sparams = llama_sampler_chain_default_params();
     auto smpl = llama_sampler_ptr{llama_sampler_chain_init(sparams)};
@@ -364,6 +618,10 @@ static bool test_seq_cp_host(struct llama_model * model, const struct common_par
     auto params_ctx = common_context_params_to_llama(params);
     params_ctx.n_seq_max = 2;
     auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
+    if (!ctx) {
+        LOG_ERR("%s: failed to create host sequence-copy context\n", __func__);
+        return false;
+    }
 
     auto sparams = llama_sampler_chain_default_params();
     auto smpl = llama_sampler_ptr{llama_sampler_chain_init(sparams)};
@@ -446,6 +704,10 @@ static bool test_seq_cp_device(struct llama_model * model, const struct common_p
     auto params_ctx = common_context_params_to_llama(params);
     params_ctx.n_seq_max = 2;
     auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
+    if (!ctx) {
+        LOG_ERR("%s: failed to create device sequence-copy context\n", __func__);
+        return false;
+    }
 
     auto sparams = llama_sampler_chain_default_params();
     auto smpl = llama_sampler_ptr{llama_sampler_chain_init(sparams)};
@@ -566,6 +828,10 @@ int main(int argc, char ** argv) {
         LOG_INF("%s: tokenizing prompt '%s'\n", __func__, params.prompt.c_str());
 
         auto ctx = llama_context_ptr{llama_init_from_model(model, common_context_params_to_llama(params))};
+        if (!ctx) {
+            LOG_ERR("%s: failed to create prompt-tokenization context\n", __func__);
+            return 1;
+        }
         tokens = common_tokenize(ctx.get(), params.prompt, true);
     }
 
@@ -582,6 +848,13 @@ int main(int argc, char ** argv) {
     }
     if (!test_cross_ubatch_tail_state(model, params, tokens, 128, 512) ||
             !test_cross_ubatch_tail_state(model, params, tokens, 512, 128)) {
+        return 1;
+    }
+    if (!test_tail_copy_is_immediately_saveable(model, params, tokens, true) ||
+            !test_tail_copy_is_immediately_saveable(model, params, tokens, false)) {
+        return 1;
+    }
+    if (!test_tail_state_v1_compatibility(model, params)) {
         return 1;
     }
     if (!test_kvarn_full_window_native_exact(model, params, tokens)) {

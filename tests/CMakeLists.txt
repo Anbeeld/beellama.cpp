@@ -357,6 +357,31 @@ set_tests_properties(test-recurrent-state-rollback PROPERTIES FIXTURES_REQUIRED 
 llama_build_and_test(test-save-load-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED test-download-model)
 
+# QuantFactory packages the Apache-2.0 SmolLM2 base model at a pinned revision.
+# Its 64-element attention heads are compatible with standard q4_0 KV tails.
+set(TAIL_MODEL_NAME "SmolLM2-135M.Q4_0.gguf")
+set(TAIL_MODEL_DEST "${CMAKE_BINARY_DIR}/kv-tail-fixtures/${TAIL_MODEL_NAME}")
+set(TAIL_MODEL_URL "https://huggingface.co/QuantFactory/SmolLM2-135M-GGUF/resolve/cccdc4886cdd3ff1c4caedb20148dcbf6b547904/SmolLM2-135M.Q4_0.gguf?download=true")
+set(TAIL_MODEL_HASH "SHA256=6f96e054a48f8fcdb5814abc1203ca12c0f9cce2791ca9a5153caad8c3b5479b")
+add_test(NAME test-download-tail-model COMMAND ${CMAKE_COMMAND}
+    -DDEST=${TAIL_MODEL_DEST}
+    -DNAME=${TAIL_MODEL_NAME}
+    -DHASH=${TAIL_MODEL_HASH}
+    -DURL=${TAIL_MODEL_URL}
+    -P ${CMAKE_SOURCE_DIR}/cmake/download-models.cmake
+)
+set_tests_properties(test-download-tail-model PROPERTIES FIXTURES_SETUP test-download-tail-model)
+add_test(NAME test-save-load-state-tail COMMAND test-save-load-state
+    -m "${TAIL_MODEL_DEST}"
+    --kv-tail-tokens 128
+    --cache-type-k q4_0
+    --cache-type-v q4_0
+)
+set_tests_properties(test-save-load-state-tail PROPERTIES
+    LABELS "model"
+    FIXTURES_REQUIRED test-download-tail-model
+)
+
 if (NOT GGML_BACKEND_DL)
     # these tests use the backends directly and cannot be built with dynamic loading
     llama_build_and_test(test-barrier.cpp)
