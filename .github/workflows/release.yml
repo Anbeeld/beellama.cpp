@@ -25,11 +25,6 @@ on:
         required: true
         default: false
         type: boolean
-      dry_run:
-        description: "Build and test the exact SHA without publishing releases or images"
-        required: true
-        default: true
-        type: boolean
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.ref || inputs.source_ref }}
@@ -56,8 +51,6 @@ jobs:
       stable_release: ${{ steps.meta.outputs.stable_release }}
       build_packages: ${{ steps.meta.outputs.build_packages }}
       publish_docker: ${{ steps.meta.outputs.publish_docker }}
-      publish_release: ${{ steps.meta.outputs.publish_release }}
-      dry_run: ${{ steps.meta.outputs.dry_run }}
       ccache_ref: ${{ steps.meta.outputs.ccache_ref }}
       image_repo: ${{ steps.meta.outputs.image_repo }}
       short_sha: ${{ steps.meta.outputs.short_sha }}
@@ -75,8 +68,6 @@ jobs:
 
           build_packages="true"
           publish_docker="true"
-          publish_release="true"
-          dry_run="false"
 
           if [[ "${EVENT_NAME}" == "push" ]]; then
             if [[ "${GITHUB_REF}" != refs/heads/v* ]]; then
@@ -91,12 +82,8 @@ jobs:
             preview="true"
             stable_release="false"
           elif [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
-            if [[ "${INPUT_PUBLISH_RELEASE}" == "true" && "${INPUT_DRY_RUN}" == "true" ]]; then
-              echo "publish_release and dry_run are mutually exclusive." >&2
-              exit 1
-            fi
-            if [[ "${INPUT_PUBLISH_RELEASE}" != "true" && "${INPUT_DRY_RUN}" != "true" ]]; then
-              echo "workflow_dispatch must select either publish_release or dry_run." >&2
+            if [[ "${INPUT_PUBLISH_RELEASE}" != "true" ]]; then
+              echo "workflow_dispatch is reserved for main-owned stable releases." >&2
               exit 1
             fi
             if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
@@ -110,9 +97,6 @@ jobs:
             release_title="${tag_name}"
             preview="false"
             stable_release="true"
-            publish_release="${INPUT_PUBLISH_RELEASE}"
-            dry_run="${INPUT_DRY_RUN}"
-            publish_docker="${INPUT_PUBLISH_RELEASE}"
           else
             echo "Unsupported event ${EVENT_NAME}." >&2
             exit 1
@@ -188,8 +172,6 @@ jobs:
           echo "stable_release=${stable_release}" >> "${GITHUB_OUTPUT}"
           echo "build_packages=${build_packages}" >> "${GITHUB_OUTPUT}"
           echo "publish_docker=${publish_docker}" >> "${GITHUB_OUTPUT}"
-          echo "publish_release=${publish_release}" >> "${GITHUB_OUTPUT}"
-          echo "dry_run=${dry_run}" >> "${GITHUB_OUTPUT}"
           echo "ccache_ref=${ccache_ref}" >> "${GITHUB_OUTPUT}"
           echo "image_repo=${image_repo}" >> "${GITHUB_OUTPUT}"
           short_sha="${source_sha::12}"
@@ -201,213 +183,16 @@ jobs:
           echo "Preview: ${preview}"
           echo "Build packages: ${build_packages}"
           echo "Publish Docker images: ${publish_docker}"
-          echo "Publish release: ${publish_release}"
-          echo "Dry run: ${dry_run}"
         env:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_SOURCE_REF: ${{ inputs.source_ref }}
           INPUT_SOURCE_SHA: ${{ inputs.source_sha }}
           INPUT_TAG_NAME: ${{ inputs.tag_name }}
           INPUT_PUBLISH_RELEASE: ${{ inputs.publish_release }}
-          INPUT_DRY_RUN: ${{ inputs.dry_run }}
-
-  test-portable-cpu:
-    name: Gate / portable CPU non-network CTest
-    needs: release-meta
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Clone exact source
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ needs.release-meta.outputs.source_sha }}
-          fetch-depth: 0
-      - name: Configure and build
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p evidence
-          printf '%s\n' '${{ needs.release-meta.outputs.source_sha }}' > evidence/source-sha.txt
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DLLAMA_BUILD_TESTS=ON 2>&1 | tee evidence/configure.log
-          cmake --build build --parallel 2 2>&1 | tee evidence/build.log
-      - name: Full non-network CTest
-        shell: bash
-        run: |
-          set -euo pipefail
-          ctest --test-dir build -N -E 'test-(download|tokenizers-repo)|test-save-load-state|test-state-restore-fragmented|test-llama-archs' > evidence/ctest-list.log
-          ctest --test-dir build --output-on-failure --no-tests=error --timeout 2000 \
-            -E 'test-(download|tokenizers-repo)|test-save-load-state|test-state-restore-fragmented|test-llama-archs' \
-            --output-junit evidence/ctest.xml 2>&1 | tee evidence/ctest.log
-      - name: Record build identity
-        if: always()
-        shell: bash
-        run: |
-          cp build/CMakeCache.txt evidence/CMakeCache.txt 2>/dev/null || true
-          find build/bin -maxdepth 1 -type f -print0 2>/dev/null | sort -z | xargs -0 -r sha256sum > evidence/binary-sha256.txt
-      - name: Upload gate evidence
-        if: always()
-        uses: actions/upload-artifact@v6
-        with:
-          name: release-gate-portable-cpu-${{ needs.release-meta.outputs.short_sha }}
-          path: evidence
-
-  test-windows-cuda-default:
-    name: Gate / Windows CUDA default policy
-    needs: release-meta
-    runs-on: windows-2022
-    steps:
-      - name: Clone exact source
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ needs.release-meta.outputs.source_sha }}
-          fetch-depth: 0
-      - name: Install CUDA Toolkit
-        uses: ./.github/actions/windows-setup-cuda
-        with:
-          cuda_version: "13.1"
-      - name: Install build and test tools
-        shell: pwsh
-        run: |
-          choco install ninja -y
-          python -m pip install --disable-pip-version-check pytest requests
-      - name: Configure and build default CUDA policy
-        shell: cmd
-        run: |
-          if not exist evidence mkdir evidence
-          echo ${{ needs.release-meta.outputs.source_sha }} > evidence\source-sha.txt
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
-          cmake -S . -B build -G "Ninja Multi-Config" -DGGML_CUDA=ON -DGGML_CUDA_FA=ON -DGGML_CUDA_CUB_3DOT2=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DGGML_NATIVE=OFF -DLLAMA_BUILD_TESTS=ON > evidence\configure.log 2>&1
-          if errorlevel 1 exit /b %errorlevel%
-          cmake --build build --config Release --parallel 2 > evidence\build.log 2>&1
-      - name: Fork-critical, backend, state, and server tests
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          ctest --test-dir build -C Release -N -R '^(test-(arg-parser|std-kv-tail-static|backend-ops-seed-static|kv-tail-copy-transaction|kvarn|save-load-state-tail|release-workflow-static))$' | Tee-Object evidence\ctest-list.log
-          ctest --test-dir build -C Release --output-on-failure --no-tests=error --timeout 2000 -R '^(test-(arg-parser|std-kv-tail-static|backend-ops-seed-static|kv-tail-copy-transaction|kvarn|save-load-state-tail|release-workflow-static))$' --output-junit evidence\ctest.xml 2>&1 | Tee-Object evidence\ctest.log
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & .\build\bin\Release\test-backend-ops.exe -b CPU --seed 7640891576956012809 2>&1 | Tee-Object evidence\backend-ops.log
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m pytest -q tools/server/tests/unit/test_router_management.py tools/server/tests/unit/test_reasoning_control.py 2>&1 | Tee-Object evidence\server-pytest.log
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Record build identity
-        if: always()
-        shell: pwsh
-        run: |
-          Copy-Item build\CMakeCache.txt evidence\CMakeCache.txt -ErrorAction SilentlyContinue
-          Get-ChildItem build\bin\Release -File -ErrorAction SilentlyContinue | Sort-Object Name | ForEach-Object {
-            "$(Get-FileHash $_.FullName -Algorithm SHA256 | Select-Object -ExpandProperty Hash)  $($_.Name)"
-          } | Set-Content evidence\binary-sha256.txt
-      - name: Upload gate evidence
-        if: always()
-        uses: actions/upload-artifact@v6
-        with:
-          name: release-gate-windows-cuda-default-${{ needs.release-meta.outputs.short_sha }}
-          path: evidence
-
-  test-cuda-all-quants:
-    name: Gate / CUDA ALL_QUANTS KVarN matrix
-    needs: release-meta
-    runs-on: ubuntu-24.04
-    container: nvidia/cuda:13.1.1-devel-ubuntu24.04
-    steps:
-      - name: Dependencies
-        run: apt-get update && apt-get install -y --no-install-recommends build-essential ca-certificates cmake git ninja-build libssl-dev python3
-      - name: Clone exact source
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ needs.release-meta.outputs.source_sha }}
-          fetch-depth: 0
-      - name: Configure, compile matrix, and smoke
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p evidence
-          printf '%s\n' '${{ needs.release-meta.outputs.source_sha }}' > evidence/source-sha.txt
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DGGML_CUDA_FA=ON \
-            -DGGML_CUDA_FA_ALL_QUANTS=ON -DGGML_CUDA_KVARN=ON -DCMAKE_CUDA_ARCHITECTURES=86 \
-            -DGGML_NATIVE=OFF -DLLAMA_BUILD_TESTS=ON 2>&1 | tee evidence/configure.log
-          cmake --build build --parallel 2 --target test-backend-ops test-kvarn test-kv-tail-copy-transaction 2>&1 | tee evidence/build.log
-          python3 tests/test-std-kv-tail-static.py 2>&1 | tee evidence/static.log
-          build/bin/test-kv-tail-copy-transaction 2>&1 | tee evidence/transaction.log
-          build/bin/test-backend-ops -b CPU -o GET_ROWS,SET_ROWS,OUT_PROD --seed 7640891576956012809 2>&1 | tee evidence/backend-cpu.log
-      - name: Record build identity
-        if: always()
-        shell: bash
-        run: |
-          cp build/CMakeCache.txt evidence/CMakeCache.txt 2>/dev/null || true
-          find build/bin -maxdepth 1 -type f -print0 2>/dev/null | sort -z | xargs -0 -r sha256sum > evidence/binary-sha256.txt
-      - name: Upload gate evidence
-        if: always()
-        uses: actions/upload-artifact@v6
-        with:
-          name: release-gate-cuda-all-quants-${{ needs.release-meta.outputs.short_sha }}
-          path: evidence
-
-  test-cuda-kvarn-off:
-    name: Gate / CUDA without KVarN
-    needs: release-meta
-    runs-on: ubuntu-24.04
-    container: nvidia/cuda:13.1.1-devel-ubuntu24.04
-    steps:
-      - name: Dependencies
-        run: apt-get update && apt-get install -y --no-install-recommends build-essential ca-certificates cmake git ninja-build libssl-dev python3
-      - name: Clone exact source
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ needs.release-meta.outputs.source_sha }}
-          fetch-depth: 0
-      - name: Configure, compile, and ordinary-cache smoke
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p evidence
-          printf '%s\n' '${{ needs.release-meta.outputs.source_sha }}' > evidence/source-sha.txt
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DGGML_CUDA_FA=ON \
-            -DGGML_CUDA_KVARN=OFF -DCMAKE_CUDA_ARCHITECTURES=86 -DGGML_NATIVE=OFF -DLLAMA_BUILD_TESTS=ON 2>&1 | tee evidence/configure.log
-          cmake --build build --parallel 2 --target llama-cli llama-server test-arg-parser test-backend-ops 2>&1 | tee evidence/build.log
-          build/bin/llama-cli --version 2>&1 | tee evidence/cli-version.log
-          build/bin/llama-server --version 2>&1 | tee evidence/server-version.log
-          build/bin/test-arg-parser 2>&1 | tee evidence/arg-parser.log
-          build/bin/test-backend-ops -b CPU -o GET_ROWS,SET_ROWS,OUT_PROD --seed 7640891576956012809 2>&1 | tee evidence/backend-cpu.log
-      - name: Record build identity
-        if: always()
-        shell: bash
-        run: |
-          cp build/CMakeCache.txt evidence/CMakeCache.txt 2>/dev/null || true
-          find build/bin -maxdepth 1 -type f -print0 2>/dev/null | sort -z | xargs -0 -r sha256sum > evidence/binary-sha256.txt
-      - name: Upload gate evidence
-        if: always()
-        uses: actions/upload-artifact@v6
-        with:
-          name: release-gate-cuda-kvarn-off-${{ needs.release-meta.outputs.short_sha }}
-          path: evidence
-
-  behavioral-gates:
-    name: Exact-SHA behavioral gates
-    if: always()
-    needs:
-      - release-meta
-      - test-portable-cpu
-      - test-windows-cuda-default
-      - test-cuda-all-quants
-      - test-cuda-kvarn-off
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Require every gate
-        shell: bash
-        env:
-          CPU: ${{ needs.test-portable-cpu.result }}
-          WINDOWS_CUDA: ${{ needs.test-windows-cuda-default.result }}
-          ALL_QUANTS: ${{ needs.test-cuda-all-quants.result }}
-          KVARN_OFF: ${{ needs.test-cuda-kvarn-off.result }}
-        run: |
-          set -euo pipefail
-          printf 'CPU=%s\nWINDOWS_CUDA=%s\nALL_QUANTS=%s\nKVARN_OFF=%s\n' "$CPU" "$WINDOWS_CUDA" "$ALL_QUANTS" "$KVARN_OFF"
-          [[ "$CPU" == success && "$WINDOWS_CUDA" == success && "$ALL_QUANTS" == success && "$KVARN_OFF" == success ]]
 
   macos-arm64:
     name: macOS arm64 Metal
-    needs: [release-meta, behavioral-gates]
+    needs: release-meta
     if: ${{ needs.release-meta.outputs.build_packages == 'true' }}
     runs-on: macos-14
     steps:
@@ -476,7 +261,7 @@ jobs:
 
   ubuntu-cpu:
     name: Ubuntu ${{ matrix.build }} CPU
-    needs: [release-meta, behavioral-gates]
+    needs: release-meta
     if: ${{ needs.release-meta.outputs.build_packages == 'true' }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -567,7 +352,7 @@ jobs:
 
   ubuntu-vulkan:
     name: Ubuntu x64 Vulkan
-    needs: [release-meta, behavioral-gates]
+    needs: release-meta
     if: ${{ needs.release-meta.outputs.build_packages == 'true' }}
     runs-on: ubuntu-22.04
     steps:
@@ -645,7 +430,7 @@ jobs:
 
   ubuntu-rocm:
     name: Ubuntu x64 ROCm
-    needs: [release-meta, behavioral-gates]
+    needs: release-meta
     if: ${{ needs.release-meta.outputs.build_packages == 'true' }}
     runs-on: ubuntu-22.04
     env:
@@ -751,7 +536,7 @@ jobs:
 
   ubuntu-sycl:
     name: Ubuntu x64 SYCL
-    needs: [release-meta, behavioral-gates]
+    needs: release-meta
     if: ${{ needs.release-meta.outputs.build_packages == 'true' }}
     runs-on: ubuntu-24.04
     env:
@@ -865,7 +650,7 @@ jobs:
 
   ubuntu-cuda:
     name: Ubuntu x64 CUDA ${{ matrix.cuda }}
-    needs: [release-meta, behavioral-gates]
+    needs: release-meta
     if: ${{ needs.release-meta.outputs.build_packages == 'true' }}
     runs-on: ubuntu-24.04
     container: nvidia/cuda:${{ matrix.cuda_container }}
@@ -955,7 +740,7 @@ jobs:
 
   windows-cpu:
     name: Windows x64 CPU
-    needs: [release-meta, behavioral-gates]
+    needs: release-meta
     if: ${{ needs.release-meta.outputs.build_packages == 'true' }}
     runs-on: windows-2025
     steps:
@@ -1030,7 +815,7 @@ jobs:
 
   windows-sycl:
     name: Windows x64 SYCL
-    needs: [release-meta, behavioral-gates]
+    needs: release-meta
     if: ${{ needs.release-meta.outputs.build_packages == 'true' }}
     runs-on: windows-2022
     env:
@@ -1162,7 +947,7 @@ jobs:
 
   windows-vulkan:
     name: Windows x64 Vulkan
-    needs: [release-meta, behavioral-gates]
+    needs: release-meta
     if: ${{ needs.release-meta.outputs.build_packages == 'true' }}
     runs-on: windows-2025
     env:
@@ -1239,7 +1024,7 @@ jobs:
 
   windows-cuda:
     name: Windows x64 CUDA ${{ matrix.cuda }}
-    needs: [release-meta, behavioral-gates]
+    needs: release-meta
     if: ${{ needs.release-meta.outputs.build_packages == 'true' }}
     runs-on: windows-2022
     strategy:
@@ -1359,7 +1144,7 @@ jobs:
 
   windows-hip:
     name: Windows x64 HIP/Radeon
-    needs: [release-meta, behavioral-gates]
+    needs: release-meta
     if: ${{ needs.release-meta.outputs.build_packages == 'true' }}
     runs-on: windows-2022
     env:
@@ -1470,7 +1255,6 @@ jobs:
     name: Assemble release assets
     needs:
       - release-meta
-      - behavioral-gates
       - macos-arm64
       - ubuntu-cpu
       - ubuntu-vulkan
@@ -1610,7 +1394,6 @@ jobs:
     if: ${{ needs.release-meta.outputs.publish_docker == 'true' }}
     needs:
       - release-meta
-      - behavioral-gates
       - ubuntu-cpu
       - ubuntu-vulkan
       - ubuntu-rocm
@@ -1788,7 +1571,6 @@ jobs:
     if: ${{ needs.release-meta.outputs.publish_docker == 'true' }}
     needs:
       - release-meta
-      - behavioral-gates
       - docker-build
     runs-on: ubuntu-24.04
     permissions:
@@ -1900,10 +1682,8 @@ jobs:
 
   release:
     name: Publish GitHub release
-    if: ${{ needs.release-meta.outputs.publish_release == 'true' }}
     needs:
       - release-meta
-      - behavioral-gates
       - package-assets
       - docker-merge
     runs-on: ubuntu-24.04

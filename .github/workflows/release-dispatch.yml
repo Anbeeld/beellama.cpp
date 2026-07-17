@@ -55,5 +55,4 @@ jobs:
             --field source_ref="${SOURCE_REF}" \
             --field source_sha="${SOURCE_SHA}" \
             --field tag_name="${TAG_NAME}" \
-            --field publish_release="true" \
-            --field dry_run="false"
+            --field publish_release="true"
