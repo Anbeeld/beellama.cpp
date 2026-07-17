@@ -1,6 +1,7 @@
 #include "arg.h"
 #include "common.h"
 #include "fit.h"
+#include "kld-logits.h"
 #include "log.h"
 #include "llama.h"
 
@@ -77,43 +78,6 @@ static int ppl_max_logits_rows(int n_vocab, const common_params & params) {
     return std::max(1, std::min(by_mem, by_ub));
 }
 
-static inline int nearest_int(float fval) {
-    //assert(fval <= 4194303.f);
-    float val = fval + 12582912.f;
-    int i; memcpy(&i, &val, sizeof(int));
-    return (i & 0x007fffff) - 0x00400000;
-}
-
-static double log_softmax(int n_vocab, const float * logits, uint16_t * log_prob, int tok) {
-    float max_logit = logits[0];
-    float min_logit = logits[0];
-    for (int i = 1; i < n_vocab; ++i) {
-        max_logit = std::max(max_logit, logits[i]);
-        min_logit = std::min(min_logit, logits[i]);
-    }
-    min_logit = std::max(min_logit, max_logit - 16);
-    double sum_exp = 0.0;
-    for (int i = 0; i < n_vocab; ++i) {
-        sum_exp += expf(logits[i] - max_logit);
-    }
-    const float log_sum_exp = log(sum_exp);
-    const float min_log_prob = min_logit - max_logit - log_sum_exp;
-    const float scale = (max_logit - min_logit)/65535.f;
-    float * d = (float *)log_prob;
-    d[0] = scale;
-    d[1] = min_log_prob;
-    log_prob += 4;
-    if (scale) {
-        const float inv_scale = 1/scale;
-        for (int i = 0; i < n_vocab; ++i) {
-            log_prob[i] = logits[i] > min_logit ? nearest_int(inv_scale*(logits[i] - min_logit)) : 0;
-        }
-    } else {
-        std::memset(log_prob, 0, n_vocab*sizeof(uint16_t));
-    }
-    return max_logit + log_sum_exp - logits[tok];
-}
-
 static void process_logits(
     int n_vocab, const float * logits, const int * tokens, int n_token, std::vector<std::thread> & workers,
     double & nll, double & nll2, float * logit_history, float * prob_history
@@ -152,7 +116,7 @@ static void process_logits(
 static bool process_logits(std::ostream& out, int n_vocab, const float * logits, const int * tokens, int n_token,
         std::vector<std::thread> & workers, std::vector<uint16_t> & log_probs, double & nll, double & nll2) {
     std::mutex mutex;
-    const int nv = 2*((n_vocab + 1)/2) + 4;
+    const int nv = (int) kld_logits::encoded_row_size(n_vocab);
     int counter = 0;
     auto compute = [&mutex, &counter, &log_probs, &nll, &nll2, n_vocab, logits, tokens, n_token, nv] () {
         double local_nll  = 0;
@@ -165,7 +129,9 @@ static bool process_logits(std::ostream& out, int n_vocab, const float * logits,
                 break;
             }
             lock.unlock();
-            const double v = log_softmax(n_vocab, logits + size_t(i)*n_vocab, log_probs.data() + (size_t)i*nv, tokens[i+1]);
+            const double v = kld_logits::encode_row(
+                    n_vocab, logits + size_t(i)*n_vocab,
+                    log_probs.data() + (size_t)i*nv, tokens[i+1]);
             local_nll += v;
             local_nll2 += v*v;
         }
@@ -211,7 +177,9 @@ struct kl_divergence_result {
     size_t count            = 0.0;
 };
 
-static std::pair<double, float> log_softmax(int n_vocab, const float * logits, const uint16_t * base_log_prob, int tok, kl_divergence_result & kld) {
+static std::pair<double, float> log_softmax(
+        int n_vocab, const float * logits, const uint16_t * base_log_prob,
+        int tok, bool normalized_baseline, kl_divergence_result & kld) {
     float max_logit = logits[0];
     int imax = 0;
     for (int i = 1; i < n_vocab; ++i) {
@@ -225,16 +193,14 @@ static std::pair<double, float> log_softmax(int n_vocab, const float * logits, c
         sum_exp += expf(logits[i] - max_logit);
     }
     const float log_sum_exp = log(sum_exp);
-    const float * d = (const float *)base_log_prob;
-    const float scale = d[0];
-    const float min_log_prob = d[1];
-    base_log_prob += 4;
+    const kld_logits::decoded_row base =
+            kld_logits::decode_row(n_vocab, base_log_prob, normalized_baseline);
 
     const float nll = max_logit + log_sum_exp - logits[tok];
     kld.sum_nll  += nll;
     kld.sum_nll2 += nll*nll;
 
-    const float nll_base = -(scale*base_log_prob[tok] + min_log_prob);
+    const float nll_base = -kld_logits::log_probability(base, tok);
     kld.sum_nll_base  += nll_base;
     kld.sum_nll_base2 += nll_base*nll_base;
 
@@ -245,12 +211,12 @@ static std::pair<double, float> log_softmax(int n_vocab, const float * logits, c
     int imax_base = -1;
     float p_log_base_max = 0;
     for (int i = 0; i < n_vocab; ++i) {
-        const float p_log_base = scale*base_log_prob[i] + min_log_prob;
+        const float p_log_base = kld_logits::log_probability(base, i);
         if (i == 0 || p_log_base > p_log_base_max) {
             p_log_base_max = p_log_base;
             imax_base = i;
         }
-        if (p_log_base > -16.f) {
+        if (normalized_baseline || p_log_base > -16.f) {
             const float p_base = expf(p_log_base);
             sum += p_base * (p_log_base - logits[i] + max_logit);
         }
@@ -276,11 +242,12 @@ static std::pair<double, float> log_softmax(int n_vocab, const float * logits, c
 
 static void process_logits(int n_vocab, const float * logits, const int * tokens, int n_token,
         std::vector<std::thread> & workers, const std::vector<uint16_t> & base_log_probs, kl_divergence_result & kld,
-        float * kld_values, float * p_diff_values) {
+        float * kld_values, float * p_diff_values, bool normalized_baseline) {
     std::mutex mutex;
-    const int nv = 2*((n_vocab + 1)/2) + 4;
+    const int nv = (int) kld_logits::encoded_row_size(n_vocab);
     int counter = 0;
-    auto compute = [&mutex, &counter, &base_log_probs, &kld, n_vocab, logits, tokens, n_token, nv, kld_values, p_diff_values] () {
+    auto compute = [&mutex, &counter, &base_log_probs, &kld, n_vocab, logits, tokens, n_token, nv,
+                    kld_values, p_diff_values, normalized_baseline] () {
         kl_divergence_result local_kld;
         while (true) {
             std::unique_lock<std::mutex> lock(mutex);
@@ -302,7 +269,10 @@ static void process_logits(int n_vocab, const float * logits, const int * tokens
                 break;
             }
             lock.unlock();
-            std::pair<double, float> v = log_softmax(n_vocab, logits + size_t(i)*n_vocab, base_log_probs.data() + (size_t)i*nv, tokens[i+1], local_kld);
+            std::pair<double, float> v = log_softmax(
+                    n_vocab, logits + size_t(i)*n_vocab,
+                    base_log_probs.data() + (size_t)i*nv, tokens[i+1],
+                    normalized_baseline, local_kld);
             kld_values[i]    = (float)v.first;
             p_diff_values[i] = v.second;
         }
@@ -484,7 +454,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
             return {};
         }
         LOG_INF("%s: saving all logits to %s\n", __func__, params.logits_file.c_str());
-        logits_stream.write("_logits_", 8);
+        logits_stream.write(kld_logits::magic_v2, sizeof(kld_logits::magic_v2));
         logits_stream.write(reinterpret_cast<const char *>(&n_ctx), sizeof(n_ctx));
         if (!logits_stream.good()) {
             LOG_ERR("%s: failed writing logits header\n", __func__);
@@ -553,7 +523,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
             std::remove(params.logits_file.c_str());
             return {};
         }
-        const int nv = 2*((n_vocab + 1)/2) + 4;
+        const int nv = (int) kld_logits::encoded_row_size(n_vocab);
         log_probs.resize((size_t)max_logits_rows * nv);
     }
 
@@ -1759,12 +1729,21 @@ static bool kl_divergence(llama_context * ctx, const common_params & params) {
         LOG_ERR("%s: failed to open %s\n", __func__, params.logits_file.c_str());
         return false;
     }
+    bool normalized_baseline = false;
     {
-        char check[9]; check[8] = 0;
-        in.read(check, 8);
-        if (in.fail() || strncmp("_logits_", check, 8) != 0) {
+        char check[8];
+        in.read(check, sizeof(check));
+        normalized_baseline =
+                !in.fail() && std::memcmp(check, kld_logits::magic_v2, sizeof(check)) == 0;
+        const bool legacy_baseline =
+                !in.fail() && std::memcmp(check, kld_logits::magic_v1, sizeof(check)) == 0;
+        if (!normalized_baseline && !legacy_baseline) {
             LOG_ERR("%s: %s does not look like a file containing log-probabilities\n", __func__, params.logits_file.c_str());
             return false;
+        }
+        if (legacy_baseline) {
+            LOG_WRN("%s: %s uses the legacy lossy baseline format; regenerate it to obtain complete-tail PPL and KLD\n",
+                    __func__, params.logits_file.c_str());
         }
     }
 
@@ -1800,7 +1779,7 @@ static bool kl_divergence(llama_context * ctx, const common_params & params) {
     const int n_batch = std::max(1, std::min(n_ctx_i, std::min(params.n_batch, max_logits_rows)));
     const int num_batches = (n_ctx_i + n_batch - 1) / n_batch;
     const int n_seq = 1;
-    const int nv = 2*((n_vocab + 1)/2) + 4;
+    const int nv = (int) kld_logits::encoded_row_size(n_vocab);
     const bool add_bos = llama_vocab_get_add_bos(vocab);
     GGML_ASSERT(!llama_vocab_get_add_eos(vocab));
 
@@ -1888,7 +1867,8 @@ static bool kl_divergence(llama_context * ctx, const common_params & params) {
 
                 const auto * batch_logits = llama_get_logits(ctx);
                 process_logits(n_vocab, batch_logits, tokens.data() + start + logits_first, n_outputs,
-                        workers, log_probs_uint16, kld, kld_ptr, p_diff_ptr);
+                        workers, log_probs_uint16, kld, kld_ptr, p_diff_ptr,
+                        normalized_baseline);
                 p_diff_ptr += n_outputs;
                 kld_ptr    += n_outputs;
             }

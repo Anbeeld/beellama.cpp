@@ -52,6 +52,36 @@ static void test_type_table() {
     require(llama_kvarn_type_desc_from_name("kvarn_k7v2_g128") == nullptr, "invalid type parsed");
 }
 
+static void set_test_env(const char * name, const char * value) {
+#if defined(_WIN32)
+    require(_putenv_s(name, value ? value : "") == 0, "failed to update test environment");
+#else
+    const int rc = value ? setenv(name, value, 1) : unsetenv(name);
+    require(rc == 0, "failed to update test environment");
+#endif
+}
+
+class scoped_test_env {
+public:
+    scoped_test_env(const char * name, const char * value) : name(name) {
+        const char * previous = std::getenv(name);
+        if (previous != nullptr) {
+            had_previous = true;
+            previous_value = previous;
+        }
+        set_test_env(name, value);
+    }
+
+    ~scoped_test_env() {
+        set_test_env(name.c_str(), had_previous ? previous_value.c_str() : nullptr);
+    }
+
+private:
+    std::string name;
+    std::string previous_value;
+    bool had_previous = false;
+};
+
 struct test_state_memory : public llama_memory_i {
     bool can_save;
     bool can_restore;
@@ -1470,7 +1500,8 @@ static std::vector<float> test_native_flash_attention_output(
         bool           swa = false,
         std::vector<float> * body_meta_output = nullptr,
         bool           force_generic = false,
-        int            exact_tail_tokens = 0) {
+        int            exact_tail_tokens = 0,
+        bool           original_value_domain = false) {
     ggml_init_params params = {
         /*.mem_size   =*/ 32 * 1024 * 1024,
         /*.mem_buffer =*/ nullptr,
@@ -1488,7 +1519,7 @@ static std::vector<float> test_native_flash_attention_output(
 
     ggml_tensor * q_in = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_dim, n_q, n_q_heads, n_stream);
     const bool use_q_rot = native_view && rotate_graph;
-    const bool use_output_rot = use_q_rot;
+    const bool use_output_rot = use_q_rot && !original_value_domain;
     ggml_tensor * kvarn_rot = use_q_rot && head_dim == 128 ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 128) : nullptr;
     ggml_tensor * q = use_q_rot ?
         (head_dim == 128 ? apply_hadamard_128(ctx, q_in, kvarn_rot) : apply_kvarn_wht_head(ctx, q_in, head_dim)) :
@@ -1536,8 +1567,10 @@ static std::vector<float> test_native_flash_attention_output(
     ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, mask, 1.0f / std::sqrt(float(head_dim)), 0.0f, 0.0f);
     ggml_flash_attn_ext_add_sinks(out, sinks);
     if (native_view) {
-        out->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN] = rotate_graph ?
-            GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED :
+        out->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN] =
+            rotate_graph ? (original_value_domain ?
+                GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V :
+                GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED) :
             GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ORIGINAL;
     }
     ggml_tensor * body_meta = nullptr;
@@ -2692,6 +2725,32 @@ static void test_native_flash_attention_gpu() {
     ggml_backend_free(gpu_backend);
 }
 
+static void test_native_flash_attention_prefill_route_parity() {
+    ggml_backend_t gpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
+    if (gpu_backend == nullptr) {
+        return;
+    }
+    if (!backend_supports_kvarn_flash_attention_shape(gpu_backend, 256)) {
+        ggml_backend_free(gpu_backend);
+        return;
+    }
+
+    const std::vector<float> windowed = test_native_flash_attention_output(
+            gpu_backend, true, true, 256, 4, 4, 512, 6, 1,
+            512, 3, false, nullptr, false, 128, true);
+    std::vector<float> generic;
+    {
+        scoped_test_env disable_window("GGML_KVARN_WINDOW", "0");
+        generic = test_native_flash_attention_output(
+                gpu_backend, true, true, 256, 4, 4, 512, 6, 1,
+                512, 3, false, nullptr, false, 128, true);
+    }
+    require_close_f32_rmse(generic, windowed, 1e-4f,
+            "generic and windowed KVarN prefill routes disagree with an exact tail");
+
+    ggml_backend_free(gpu_backend);
+}
+
 static void test_store_paths_gpu() {
     ggml_backend_t gpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
     if (gpu_backend == nullptr) {
@@ -3220,6 +3279,12 @@ static void test_eager_completed_record(enum ggml_backend_dev_type device_type, 
 int main() {
     ggml_backend_load_all();
 
+    if (std::getenv("GGML_KVARN_TEST_PREFILL_PARITY_ONLY") != nullptr) {
+        test_native_flash_attention_prefill_route_parity();
+        std::printf("test-kvarn: prefill route parity OK\n");
+        return 0;
+    }
+
     kvarn_composite_exclusivity_forwards();
     kvarn_composite_removal_plan_forwards();
     kvarn_unified_save_requires_exclusive_stream();
@@ -3287,6 +3352,7 @@ int main() {
     test_store_paths_gpu();
     test_native_flash_attention_support_gates();
     test_native_flash_attention_gpu();
+    test_native_flash_attention_prefill_route_parity();
     test_rotated_decode_transform_consistency(GGML_BACKEND_DEVICE_TYPE_CPU, true);
     test_rotated_decode_transform_consistency(GGML_BACKEND_DEVICE_TYPE_GPU, false);
 

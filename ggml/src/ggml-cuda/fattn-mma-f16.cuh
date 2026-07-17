@@ -1377,7 +1377,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 #pragma unroll
         for (int col = 0; col < cols_per_thread; ++col) {
             const int jc = (threadIdx.y/np)*cols_per_warp + (cols_per_warp == 8 ? T_C_KQ::get_j(col) : T_C_KQ::get_i(2*col));
-            const float sink = sinks_f[jc % ncols2];
+            const int c = jc % ncols2;
+            const bool valid_head = ncols2 == 1 || zt_gqa*ncols2 + c < gqa_ratio;
+            if (!valid_head) {
+                KQ_max_scale[col] = 1.0f;
+                continue;
+            }
+            const float sink = sinks_f[c];
 
             const float KQ_max_new = fmaxf(KQ_max[col], sink);
             const float KQ_max_diff = KQ_max[col] - KQ_max_new;

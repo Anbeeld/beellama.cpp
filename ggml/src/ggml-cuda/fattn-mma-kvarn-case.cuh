@@ -89,19 +89,24 @@ static __global__ void ggml_cuda_fattn_kvarn_window_dequant_kernel(
     const bool needs_original = desc.original_domain != 0;
     __syncthreads();
     float * out = row0;
-    if (needs_original) {
-        if (desc.head_slices > 1) {
-            constexpr float inv_sqrt_slices = slices == 1 ? 1.0f : (slices == 2 ? 0.7071067811865475f : 0.5f);
-            for (int d = lane; d < GGML_CUDA_FATTN_KVARN_DIM; d += warp_size) {
-                float x = 0.0f;
+    const bool combine_slices = needs_original && desc.head_slices > 1;
+    if (combine_slices) {
+        constexpr float inv_sqrt_slices = slices == 1 ? 1.0f : (slices == 2 ? 0.7071067811865475f : 0.5f);
+        for (int d = lane; d < GGML_CUDA_FATTN_KVARN_DIM; d += warp_size) {
+            float x = 0.0f;
 #pragma unroll
-                for (int src_slice = 0; src_slice < slices; ++src_slice) {
-                    x += ggml_cuda_fattn_kvarn_hslice_sign(slice, src_slice) *
-                        row_scratch[side][src_slice][0][d];
-                }
-                row1[d] = x * inv_sqrt_slices;
+            for (int src_slice = 0; src_slice < slices; ++src_slice) {
+                x += ggml_cuda_fattn_kvarn_hslice_sign(slice, src_slice) *
+                    row_scratch[side][src_slice][0][d];
             }
-            __syncwarp();
+            row1[d] = x * inv_sqrt_slices;
+        }
+    }
+    // Every combining warp reads row0 from every peer slice above. Keep this
+    // barrier unconditional because K and V may use different domains.
+    __syncthreads();
+    if (needs_original) {
+        if (combine_slices) {
             out = ggml_cuda_fattn_kvarn_inverse_wht_128_warp(row1, row0, lane);
         } else {
             out = ggml_cuda_fattn_kvarn_inverse_wht_128_warp(row0, row1, lane);
