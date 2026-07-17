@@ -2,80 +2,114 @@
 
 ## v0.4.0
 
+All changes below are relative to v0.3.1.
+
 - Merged upstream llama.cpp through merge `827bfda66`, whose upstream parent is
-  `32e789fdf`, and re-based BeeLlama's maintained extensions on its current
-  model, memory, speculative, and server architecture.
-- Replaced the fork DFlash stack with upstream `draft-dflash`. `dflash` remains a
-  warned compatibility alias. Draft GGUFs must use upstream's `dflash`
-  architecture, metadata, and tensor names.
-- Corrected the upstream DFlash draft-context merge so it owns a normal KV cache.
-  Without this, draft graph reservation dereferenced a null memory context and
-  crashed both normal startup and the default memory-fit probe.
+  `32e789fdf`, and based BeeLlama's maintained extensions on its current model,
+  memory, speculative, and server architecture. Notable inherited upstream
+  changes include EAGLE3 speculative decoding with backend sampling (plus
+  Bee-added Minimax2 EAGLE3 support), Gemma 4 MTP including E2B/E4B assistants
+  and unified conversion fixes, Granite 4 Vision, multimodal video input with
+  ffmpeg in the released image, Qwen-VL frame merge support, Cohere2-MoE
+  support, Mistral-Medium-3.5 conversion, the unified LFM2/LFM2.5 tool parser,
+  the router model management API and `-hf` preset rework, optional server
+  prompt logging, the `*/input_tokens` token-counting API, Web UI improvements
+  including PWA support, CUDA 13.3 release images, HIP gfx1152/gfx1153
+  support, and broad backend work across CUDA, Vulkan, SYCL, Metal, WebGPU,
+  OpenCL, OpenVINO, and CPU.
+- Added KVarN target-context KV-cache compression through `--cache-type-k` /
+  `--cache-type-v` pseudo types `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`,
+  `kvarn6`, and `kvarn8`. K and V widths are selected independently across all
+  2/3/4/5/6/8-bit pairs, one-sided KVarN inputs are normalized to a concrete
+  pair, and draft/auxiliary contexts stay on normal cache types. Every KVarN
+  group keeps the exact 128-token sink and newest 128-token suffix around its
+  compressed body.
+- Wired KVarN into Qwen3.6 and Gemma 4 target memory paths, including
+  128/256/512-dimensional K/V heads, unified and non-unified KV storage,
+  SWA-layer coverage for single-stream caches through a sliding-window KVarN
+  ring with explicit `--cache-type-k-swa` / `--cache-type-v-swa` precision
+  overrides, prompt-cache state save/restore with compact group-range
+  serialization, and bit-width-matched fallback cache types for layers that
+  cannot use KVarN records. Unsupported placements fail closed.
+- Added native KVarN runtime support: CPU/CUDA store ops, rotated-domain
+  attention, and CUDA FlashAttention that consumes KVarN views directly —
+  specialized split and SWA-vector decode kernels with descriptor-native MMA
+  fallback, no graph-level F16 materialization — plus bounded windowed
+  prefill, parallel streams, ROCm/HIP and guarded Vulkan store support, and
+  `llama-bench` KVarN cache names, route counters, and opt-in `--kv-memory`
+  accounting.
+- Added new standard quantized KV-cache types `q2_0`, `q2_1`, `q3_0`, `q3_1`,
+  and `q6_1` alongside the existing `q6_0`, with full CPU/CUDA kernel coverage
+  including FlashAttention vector paths. Cache-facing `q2_0` is internally
+  `GGML_TYPE_Q2_0S` to avoid a format collision with upstream's Q2_0 weight
+  type; saved sessions from earlier Bee releases are not compatible with the
+  re-slotted cache type IDs.
+- Added exact tails for quantized caches: `--kv-tail-tokens` and
+  `--kv-tail-type` keep the newest attention-visible entries exact in F16 or
+  BF16 over both standard quantized and KVarN target caches, either as a
+  compact exact overlay or, when a request covers a group's full visibility
+  window, as native exact storage. Mixed-precision tail attention routes are
+  implemented across GGML backends and respect per-layer relative position
+  bias in models such as T5.
+- Made standard and KVarN state restoration transactional: tensor writes and
+  metadata are staged until the complete frame validates, then committed once.
+  Failed deferred exact-tail copies are rolled back and are never observed as
+  successful by save, decode, or server callers.
+- Scoped `--cache-ram` to prompt-cache storage only, so context-checkpoint
+  policy no longer derives from it; prompt-cache saves are byte-counted
+  against the host budget before commit, KV rollback aligns to multimodal
+  chunk boundaries, and MTP prompt-cache reuse works without regular
+  checkpoints.
+- Replaced the fork DFlash stack with upstream `draft-dflash`. `dflash`
+  remains a warned compatibility alias, and draft GGUFs must use upstream's
+  `dflash` architecture, metadata, and tensor names. Corrected the upstream
+  draft-context merge to own a normal KV cache, fixing a null-memory crash
+  during draft graph reservation at startup.
+- The profit-only adaptive draft-depth controller and the server
+  reasoning-loop guard now run on upstream token/sampler and checkpoint
+  behavior. The profit controller bootstraps at the maximum useful depth,
+  settles on the fastest measured depth, and remains default-on. An omitted
+  DFlash `--spec-draft-n-max` uses the drafter's trained block depth
+  (`dflash.block_size - 1`, normally 15) instead of upstream's default 3;
+  explicit values still win.
 - Removed TurboQuant/TCQ cache types, TQ weight formats, DDTree, CopySpec, the
-  old DFlash GPU ring/capture/tape paths, the fringe adaptive controller, and all
-  fork-only DFlash environment variables and arguments.
-- Redirected the removed `turbo2`/`turbo3`/`turbo4` and TCQ cache names to the
-  same-width KVarN presets with warnings. GGUF files marked as the former TQ3/TQ4
-  weight formats now fail early with a re-quantization error instead of being
-  interpreted as re-slotted v0.4.0 types.
-- Kept KVarN and its low-bit standard cache support. CUDA FlashAttention now
-  explicitly dispatches KVarN views to descriptor-native kernels, including clean
-  MMA fallback for valid pairs outside the fast decode matrix.
-- Restored CUDA `SET_ROWS` and `GET_ROWS` support for the standard `q6_1`,
-  `q6_0`, `q3_1`, `q3_0`, `q2_1`, and `q2_0` KV-cache types after the upstream
-  merge dropped their backend dispatch and support declarations.
-- Replaced the three-tier FlashAttention quant build policy with a 103-pair
-  default standard vector matrix and a 169-pair `GGML_CUDA_FA_ALL_QUANTS` matrix.
+  DFlash GPU ring/capture/tape paths, the fringe adaptive controller, and all
+  fork-only DFlash environment variables and arguments. The `turbo2`,
+  `turbo3`, and `turbo4` cache names and their TCQ variants are redirected
+  with warnings to the same-width KVarN presets for target caches or a
+  standard low-bit type for draft caches. GGUF files marked as the former
+  TQ3/TQ4 weight formats fail early with a re-quantization error, and the
+  removed `copyspec`, `suffix`, and `recycle` speculative type names produce
+  migration errors pointing to `draft-dflash` or upstream n-gram modes.
+- Replaced the FlashAttention quant build policy with a 103-pair default
+  standard vector matrix and a 169-pair `GGML_CUDA_FA_ALL_QUANTS` matrix.
   KVarN keeps 15 balanced fast decode pairs by default and 36 with ALL. The
-  default-on `GGML_CUDA_KVARN` option is its only CUDA compilation gate; disabling
-  it omits all dedicated KVarN kernels and templates. The obsolete
-  `GGML_CUDA_FA_HALF_QUANTS` option is gone.
-- Added migration errors for the removed `copyspec`, `suffix`, and `recycle`
-  speculative type names, pointing users to `draft-dflash` or upstream n-gram
-  modes instead of returning a generic unknown-type message.
-- Re-ported the profit-only adaptive DFlash controller and server reasoning-loop
-  guard onto upstream token/sampler and checkpoint behavior.
-- Made an omitted DFlash `--spec-draft-n-max` use the drafter's trained block
-  depth (`dflash.block_size - 1`, normally 15) instead of upstream's default 3.
-  Explicit values still win, and the profit controller remains default-on.
-- Added opted-in realtime reasoning control: a streaming chat completion armed
-  with `reasoning_control` can be moved to its final answer through
-  `/v1/chat/completions/control`. The endpoint reports success only when an
-  active reasoning sampler actually accepts the transition; inactive,
-  completed, and unknown completions report failure.
+  default-on `GGML_CUDA_KVARN` option is KVarN's only CUDA compilation gate;
+  disabling it omits all dedicated KVarN kernels and templates.
+- Hardened realtime reasoning control: `/v1/chat/completions/control` reports
+  success only when an active reasoning sampler actually accepts the
+  transition; inactive, completed, and unknown completions report failure.
 - Hardened router management. `GET /models` is read-only and returns sanitized
   model identity, capability, source, and status data. Refresh is now
   `POST /models/reload`, protected by the normal API-key middleware when keys
   are configured. Hugging Face tokens are removed from child arguments,
   presets, logs, and public responses and reach child processes only through
   the `HF_TOKEN` environment variable.
-- Made standard and KVarN state restoration transactional: tensor writes and
-  metadata are staged until the complete frame validates, then committed once.
-  Deferred exact-tail copies now distinguish no work, success, allocation or
-  transfer preparation failure, and compute failure; failed copies are rolled
-  back and cannot be observed as successful by save, decode, or server callers.
-- Made exact-tail attention routes carry the model-owned per-layer relative-bias
-  contract. Biased models such as T5 cannot select a bias-incompatible native
-  FlashAttention route, and graph construction verifies the recorded contract.
-- Kept KVarN prefill eager at completed 128-token record boundaries while the
-  live exact suffix remains available. This is a store-scheduling rule, not a
-  persistent-layout or state-format change.
-- Renamed Bee's internal Q2 cache enum to `GGML_TYPE_Q2_0S` while keeping `q2_0`
-  at the cache CLI boundary, avoiding a format collision with upstream's Q2_0
-  weight type. Saved sessions from older Bee releases are not compatible with
-  the re-slotted cache type IDs.
-- Rebased Bee's release workflow, package verification, CUDA 12.4/13.1 assets,
-  and container metadata on the new tree. Container descriptions now advertise
-  upstream DFlash and KVarN instead of removed TurboQuant/TCQ support. Release
-  packages and publication now depend on portable CPU, Windows CUDA default,
-  CUDA ALL_QUANTS, and CUDA-without-KVarN behavioral gates at one exact source
-  SHA; a manual dry run builds evidence but cannot publish.
+- Added KLD baseline tooling to `llama-perplexity`: `--save-all-logits` writes
+  a compressed, versioned base-model log-probability file for later
+  `--kl-divergence` runs, measuring KV-cache format quality under matched
+  model, corpus, context, and batching.
+- Updated release packaging: CUDA 12.4/13.1 assets, container metadata
+  advertising upstream DFlash and KVarN, and publication gated on portable
+  CPU, Windows CUDA default, CUDA ALL_QUANTS, and CUDA-without-KVarN
+  behavioral checks at one exact source SHA. Shipped builds add ROCm/HIP
+  shuffle compatibility, Windows CPU OpenMP runtime packaging, and Intel SYCL
+  Docker images on compute runtime 26.18 / IGC v2.34.4.
 - RTX 3090 release validation measured Qwen3.6-27B KVarN4 KLD `0.002400`,
   Gemma-4-31B KVarN4 KLD `0.402575` versus q5_0 `0.415296`, and upstream
-  DFlash at `73.81` median decode tokens/s with `40.1%` draft acceptance.
-  Upstream DFlash was `12.61%` slower than the v0.3.2 legacy DFlash stack in the
-  matched three-prompt server gate, so reduced verification/backend sampling
-  remain the first follow-up upstream contribution track.
+  DFlash at `73.81` median decode tokens/s with `40.1%` draft acceptance —
+  `12.61%` slower than the removed fork DFlash stack in the matched
+  three-prompt server gate.
 
 ## v0.3.2
 
