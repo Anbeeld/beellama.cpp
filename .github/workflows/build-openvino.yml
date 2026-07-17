@@ -4,7 +4,7 @@ on:
   workflow_dispatch: # allows manual triggering
   push:
     branches:
-      - master
+      - main
     paths: [
       '.github/workflows/build-openvino.yml',
       '**/CMakeLists.txt',
@@ -110,7 +110,7 @@ jobs:
           key: openvino-windows-2022
           variant: ccache
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Setup Cache
         uses: actions/cache@v5

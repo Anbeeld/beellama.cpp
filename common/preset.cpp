@@ -42,7 +42,7 @@ std::vector<std::string> common_preset::to_args(const std::string & bin_path) co
     }
 
     for (const auto & [opt, value] : options) {
-        if (opt.is_preset_only) {
+        if (opt.is_preset_only || opt.is_sensitive) {
             continue; // skip preset-only options (they are not CLI args)
         }
 
@@ -83,6 +83,9 @@ std::string common_preset::to_ini() const {
 
     ss << "[" << name << "]\n";
     for (const auto & [opt, value] : options) {
+        if (opt.is_sensitive) {
+            continue;
+        }
         auto espaced_value = value;
         string_replace_all(espaced_value, "\n", "\\\n");
         ss << rm_leading_dashes(opt.args.back()) << " = ";
@@ -117,6 +120,16 @@ void common_preset::unset_option(const std::string & env) {
         if (opt.env && env == opt.env) {
             it = options.erase(it);
             return;
+        } else {
+            ++it;
+        }
+    }
+}
+
+void common_preset::remove_sensitive_options() {
+    for (auto it = options.begin(); it != options.end(); ) {
+        if (it->first.is_sensitive) {
+            it = options.erase(it);
         } else {
             ++it;
         }

@@ -4,7 +4,7 @@ on:
   workflow_dispatch: # allows manual triggering
   push:
     branches:
-      - master
+      - main
     paths: [
       '.github/workflows/hip-quality-check.yml',
       '**/*.cu',
@@ -56,7 +56,7 @@ jobs:
         with:
           key: hip-quality-check-ubuntu-22.04
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Build with Werror
         id: cmake_build

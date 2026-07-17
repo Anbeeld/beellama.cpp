@@ -9,7 +9,7 @@ on:
         type: string
   push:
     branches:
-      - master
+      - main
     paths: [
       '.github/workflows/ui.yml',
       '.github/workflows/ui-build.yml',

@@ -91,6 +91,7 @@ public:
     uint32_t get_tail_arena_stride() const override;
     uint32_t get_tail_attention_stride(uint32_t n_query_tokens = 0) const override;
     llama_kv_tail_route get_tail_route(int32_t il) const override;
+    bool get_tail_explicit_bias(int32_t il) const override;
     bool can_pack_tail_body(const llama_ubatch & ubatch) const override;
     ggml_tensor * get_k_native(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v_native(ggml_context * ctx, int32_t il) const;
@@ -223,6 +224,7 @@ public:
     llama_kv_cache * get_metadata_cache() const;
     int32_t mapped_layer_id(int32_t il) const;
     llama_kv_tail_route get_tail_route(int32_t il) const;
+    bool get_tail_explicit_bias(int32_t il) const;
     ggml_type get_tail_type() const { return exact_tail_type; }
     bool has_pending_stream_copies() const;
     bool stream_is_exclusive_for(llama_seq_id seq_id) const;
@@ -283,9 +285,11 @@ private:
     };
 
     const layer & layer_for(int32_t il) const;
+    std::unique_ptr<llama_kv_cache> make_metadata_cache() const;
     bool can_remove(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
     void copy_kvarn_stream(uint32_t stream_src, uint32_t stream_dst);
 
+    const llama_model & model;
     const llama_hparams & hparams;
     const llama_kvarn_params params;
     const uint32_t n_stream;
@@ -298,6 +302,12 @@ private:
     const bool swa;
     const uint32_t n_groups_per_stream;
     const uint32_t exact_tail_tokens;
+    const uint32_t metadata_n_pad;
+    const uint32_t metadata_n_swa;
+    const llama_swa_type metadata_swa_type;
+    const uint32_t metadata_n_ubatch;
+    const uint32_t exact_tail_tokens_requested;
+    const ggml_type exact_tail_type_requested;
     ggml_type exact_tail_type;
 
     std::unique_ptr<llama_kv_cache> metadata;

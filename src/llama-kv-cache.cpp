@@ -1,4 +1,5 @@
 #include "llama-kv-cache.h"
+#include "llama-kv-cache-update.h"
 
 #include "llama-impl.h"
 #include "llama-io.h"
@@ -37,6 +38,7 @@ struct kv_tail_backend_probe_spec {
     int64_t head_dim_k;
     int64_t head_dim_v;
     bool has_v;
+    bool explicit_bias;
 };
 
 static bool backend_supports_native_kv_tail(
@@ -56,8 +58,7 @@ static llama_kv_tail_route_capability probe_standard_kv_tail_route(
         ggml_type exact_k,
         ggml_type exact_v,
         bool v_transposed,
-        bool flash_attn,
-        bool explicit_bias) {
+        bool flash_attn) {
     if (!spec.has_v) {
         return { false, LLAMA_KV_TAIL_ROUTE_NONE, LLAMA_KV_TAIL_OP_WRITE_V };
     }
@@ -153,14 +154,14 @@ static llama_kv_tail_route_capability probe_standard_kv_tail_route(
 
     auto * scores = ggml_concat(ctx.get(), body_scores, exact_scores, 0);
     auto * mask = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_body + n_tail, 1);
-    if (explicit_bias) {
+    if (spec.explicit_bias) {
         auto * bias = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_body + n_tail, 1);
         scores = ggml_add(ctx.get(), scores, bias);
     }
     auto * normalized = ggml_soft_max_ext(ctx.get(), scores, mask, 1.0f, 0.0f);
     auto * merged = ggml_add(ctx.get(), body_value, exact_value);
     requirements.generic_merge = owner_supports(scores) && owner_supports(normalized) && owner_supports(merged);
-    requirements.native_attention = flash_attn && !explicit_bias &&
+    requirements.native_attention = flash_attn && !spec.explicit_bias &&
             backend_supports_native_kv_tail(spec.buft,
                     spec.body_type_k, spec.body_type_v, exact_k, exact_v,
                     spec.head_dim_k, spec.head_dim_v);
@@ -218,7 +219,7 @@ static llama_kv_tail_route_capability probe_standard_native_exact_route(
         return { false, LLAMA_KV_TAIL_ROUTE_NONE, LLAMA_KV_TAIL_OP_WRITE_V };
     }
 
-    if (flash_attn) {
+    if (flash_attn && !spec.explicit_bias) {
         auto * q = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, spec.head_dim_k, 1, 1, 1);
         auto * k = ggml_reshape_4d(ctx.get(), body_k, spec.head_dim_k, n_body, 1, 1);
         auto * v = ggml_reshape_4d(ctx.get(), body_v, spec.head_dim_v, n_body, 1, 1);
@@ -233,6 +234,13 @@ static llama_kv_tail_route_capability probe_standard_native_exact_route(
     auto * scores = ggml_mul_mat(ctx.get(), body_k, q);
     if (!supports(scores)) {
         return { false, LLAMA_KV_TAIL_ROUTE_NONE, LLAMA_KV_TAIL_OP_BODY_SCORE };
+    }
+    if (spec.explicit_bias) {
+        auto * bias = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_body, 1);
+        scores = ggml_add(ctx.get(), scores, bias);
+        if (!supports(scores)) {
+            return { false, LLAMA_KV_TAIL_ROUTE_NONE, LLAMA_KV_TAIL_OP_BODY_SCORE };
+        }
     }
     auto * mask = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_body, 1);
     if (!supports(ggml_soft_max_ext(ctx.get(), scores, mask, 1.0f, 0.0f))) {
@@ -481,6 +489,7 @@ llama_kv_cache::llama_kv_cache(
                     il, route_buft, actual_type_k, actual_type_v,
                     int64_t(hparams.n_embd_head_k(il)),
                     int64_t(has_v ? hparams.n_embd_head_v(il) : 0), has_v,
+                    model.self_attention_uses_explicit_bias(il),
             });
         }
 
@@ -529,13 +538,13 @@ llama_kv_cache::llama_kv_cache(
             const ggml_type exact_k = ggml_is_quantized(spec.body_type_k) ? candidate : spec.body_type_k;
             const ggml_type exact_v = ggml_is_quantized(spec.body_type_v) ? candidate : spec.body_type_v;
             const auto capability = probe_standard_kv_tail_route(
-                    spec, exact_k, exact_v, v_trans, !v_trans, false);
+                    spec, exact_k, exact_v, v_trans, !v_trans);
             auto * dev = ggml_backend_buft_get_device(spec.buft);
             routes.push_back({
                     spec.layer_id,
                     dev ? ggml_backend_dev_name(dev) : ggml_backend_buft_name(spec.buft),
                     spec.body_type_k, spec.body_type_v, exact_k, exact_v,
-                    v_trans, hparams.causal_attn, n_swa > 0, false, capability,
+                    v_trans, hparams.causal_attn, n_swa > 0, spec.explicit_bias, capability,
             });
             if (!capability.supported && first_failure.supported) {
                 first_failure = capability;
@@ -559,7 +568,7 @@ llama_kv_cache::llama_kv_cache(
                     spec.layer_id,
                     dev ? ggml_backend_dev_name(dev) : ggml_backend_buft_name(spec.buft),
                     actual_k, actual_v, actual_k, actual_v,
-                    v_trans, hparams.causal_attn, n_swa > 0, false, capability,
+                    v_trans, hparams.causal_attn, n_swa > 0, spec.explicit_bias, capability,
             });
             if (!capability.supported && first_failure.supported) {
                 first_failure = capability;
@@ -1864,13 +1873,13 @@ llama_kv_memory_stats llama_kv_cache::kv_memory_stats() const {
     return result;
 }
 
-bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info) {
+llama_memory_status llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
-        return true;
+        return LLAMA_MEMORY_STATUS_NO_UPDATE;
     }
 
-    bool updated = false;
+    llama_memory_status result = LLAMA_MEMORY_STATUS_NO_UPDATE;
 
     auto * sched = lctx->get_sched();
     const auto fail_pending_tail_copy = [&]() {
@@ -1912,6 +1921,7 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
                     ggml_backend_tensor_copy(layer.v_stream[ssrc], layer.v_stream[sdst]);
                 }
             }
+            result = LLAMA_MEMORY_STATUS_SUCCESS;
         }
 
         if (!sc_info.tail_src_slots.empty()) {
@@ -1937,26 +1947,33 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
                     ggml_build_forward_expand(gf, copied);
                 }
             }
-            ggml_backend_sched_reset(sched);
-            if (!ggml_backend_sched_alloc_graph(sched, gf)) {
-                LLAMA_LOG_ERROR("%s: failed to allocate tail row-copy graph\n", __func__);
-                fail_pending_tail_copy();
-                return updated;
-            }
-            ggml_backend_tensor_set(src_idxs, sc_info.tail_src_slots.data(), 0,
-                    n_tail_copy*sizeof(sc_info.tail_src_slots[0]));
             std::vector<int64_t> dst_slots(sc_info.tail_dst_slots.begin(), sc_info.tail_dst_slots.end());
-            ggml_backend_tensor_set(dst_idxs, dst_slots.data(), 0, n_tail_copy*sizeof(dst_slots[0]));
-            if (lctx->graph_compute(gf, false) != GGML_STATUS_SUCCESS) {
-                LLAMA_LOG_ERROR("%s: failed to compute tail row-copy graph\n", __func__);
-                fail_pending_tail_copy();
-                return updated;
+            ggml_backend_sched_reset(sched);
+            const auto copy_status = llama_kv_tail_copy_transaction(
+                    [&] {
+                        return ggml_backend_sched_alloc_graph(sched, gf);
+                    },
+                    [&] {
+                        ggml_backend_tensor_set(src_idxs, sc_info.tail_src_slots.data(), 0,
+                                n_tail_copy*sizeof(sc_info.tail_src_slots[0]));
+                        ggml_backend_tensor_set(dst_idxs, dst_slots.data(), 0,
+                                n_tail_copy*sizeof(dst_slots[0]));
+                        return true;
+                    },
+                    [&] {
+                        return lctx->graph_compute(gf, false) == GGML_STATUS_SUCCESS;
+                    },
+                    fail_pending_tail_copy);
+            if (llama_memory_status_is_fail(copy_status)) {
+                LLAMA_LOG_ERROR("%s: failed to %s tail row-copy graph\n", __func__,
+                        copy_status == LLAMA_MEMORY_STATUS_FAILED_PREPARE ? "prepare" : "compute");
+                return copy_status;
             }
-            updated = true;
+            result = LLAMA_MEMORY_STATUS_SUCCESS;
         }
         if (tail && sc_info.tail_transaction) {
             tail->commit_seq_cp();
-            updated = true;
+            result = LLAMA_MEMORY_STATUS_SUCCESS;
         }
     }
 
@@ -1978,17 +1995,17 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
             auto * gf = build_graph_shift(res, lctx);
             if (!ggml_backend_sched_alloc_graph(sched, gf)) {
                 LLAMA_LOG_ERROR("%s: failed to allocate compute graph for K-shift\n", __func__);
-                return updated;
+                return LLAMA_MEMORY_STATUS_FAILED_PREPARE;
             }
 
             res->set_inputs(nullptr);
 
             if (lctx->graph_compute(gf, false) != GGML_STATUS_SUCCESS) {
                 LLAMA_LOG_ERROR("%s: failed to compute K-shift\n", __func__);
-                return updated;
+                return LLAMA_MEMORY_STATUS_FAILED_COMPUTE;
             }
 
-            updated = true;
+            result = LLAMA_MEMORY_STATUS_SUCCESS;
         }
 
         for (uint32_t s = 0; s < n_stream; ++s) {
@@ -1996,9 +2013,10 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 
             cells.reset_shift();
         }
+        result = LLAMA_MEMORY_STATUS_SUCCESS;
     }
 
-    return updated;
+    return result;
 }
 
 llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch, bool cont) const {
@@ -5259,9 +5277,8 @@ bool llama_kv_cache_context::apply() {
 
     // no ubatches -> this is a KV cache update
     if (ubatches.empty()) {
-        kv->update(lctx, do_shift, sc_info);
-
-        return true;
+        status = kv->update(lctx, do_shift, sc_info);
+        return !llama_memory_status_is_fail(status);
     }
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
@@ -5393,6 +5410,20 @@ llama_kv_tail_route llama_kv_cache::get_tail_route(int32_t il) const {
     return it->capability.route;
 }
 
+bool llama_kv_cache::get_tail_explicit_bias(int32_t il) const {
+    if (tail_plan.kind != LLAMA_KV_TAIL_STORAGE_OVERLAY &&
+            tail_plan.kind != LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT) {
+        return false;
+    }
+    const auto it = std::find_if(tail_plan.layer_routes.begin(), tail_plan.layer_routes.end(),
+            [&](const llama_kv_tail_layer_route & route) { return route.layer_id == uint32_t(il); });
+    return it != tail_plan.layer_routes.end() && it->explicit_bias;
+}
+
+const std::vector<llama_kv_tail_layer_route> & llama_kv_cache::get_tail_layer_routes() const {
+    return tail_plan.layer_routes;
+}
+
 void llama_kv_cache::set_tail_routes(std::vector<llama_kv_tail_layer_route> routes) {
     if (tail_plan.kind != LLAMA_KV_TAIL_STORAGE_OVERLAY) {
         if (!routes.empty()) {
@@ -5462,6 +5493,10 @@ uint32_t llama_kv_cache_context::get_tail_attention_stride(uint32_t n_query_toke
 
 llama_kv_tail_route llama_kv_cache_context::get_tail_route(int32_t il) const {
     return kv->get_tail_route(il);
+}
+
+bool llama_kv_cache_context::get_tail_explicit_bias(int32_t il) const {
+    return kv->get_tail_explicit_bias(il);
 }
 
 bool llama_kv_cache_context::can_pack_tail_body(const llama_ubatch & ubatch) const {

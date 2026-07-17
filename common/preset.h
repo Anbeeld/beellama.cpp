@@ -36,6 +36,9 @@ struct common_preset {
     // unset option by its env variable
     void unset_option(const std::string & env);
 
+    // erase every option classified as secret-bearing by its common_arg definition
+    void remove_sensitive_options();
+
     // get option value by its env variable, return false if not found
     bool get_option(const std::string & env, std::string & value) const;
 

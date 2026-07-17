@@ -4,6 +4,30 @@ find_package(Python3 COMPONENTS Interpreter QUIET)
 
 if (Python3_Interpreter_FOUND)
     add_test(
+        NAME test-paired-wrapper-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-paired-wrapper-static.py)
+    set_property(TEST test-paired-wrapper-static PROPERTY LABELS main)
+
+    add_test(
+        NAME test-release-workflow-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-release-workflow-static.py)
+    set_property(TEST test-release-workflow-static PROPERTY LABELS main)
+
+    add_test(
+        NAME test-backend-ops-seed-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-backend-ops-seed-static.py)
+    set_property(TEST test-backend-ops-seed-static PROPERTY LABELS main)
+
+    add_test(
+        NAME test-cuda-graph-source-properties-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-cuda-graph-source-properties-static.py)
+    set_property(TEST test-cuda-graph-source-properties-static PROPERTY LABELS cuda)
+
+    add_test(
         NAME test-std-kv-tail-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-std-kv-tail-static.py)
@@ -370,6 +394,8 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   llama_build_and_test(test-opt.cpp)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
+llama_build_and_test(test-kv-tail-copy-transaction.cpp)
+target_include_directories(test-kv-tail-copy-transaction PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")

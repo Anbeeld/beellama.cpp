@@ -161,6 +161,12 @@ per query, so a 512-token prefill does not make the same 512 rows exact for
 every query. Body and tail logits share one FP32 softmax; the runtime does not
 normalize two attention results independently.
 
+Route selection also records whether each model layer supplies an explicit
+self-attention bias. That capability is derived from loaded layer tensors, not
+an architecture-name allowlist. A biased layer never selects a native route
+that cannot consume its bias, and graph construction rejects any mismatch
+between the recorded route and the actual bias tensor.
+
 The overlay shadow pool is owned by the standard cache and identifies rows by
 stream, physical cell, and generation. Sequence copies share exact rows within
 one stream and copy them into context-local slots across streams. Position
@@ -271,6 +277,18 @@ plus exact payloads and remaps physical workspace on restore; version 11 is
 rejected because it serialized the old workspace-dependent layout. Dequantized
 body rows are never labeled exact. Server metrics report requested and exact
 tokens, coverage group states, and degraded sequences.
+
+BeeLlama v0.3.x sessions and its v11 KVarN state are intentionally incompatible
+with the v0.4.0 cache type IDs and logical-record format. Restore fails closed;
+there is no compatibility reinterpretation or migration shim.
+
+Restore is transactional for both host and on-device readers. Tensor writes and
+KVarN metadata remain private until the complete frame, dimensions, layer set,
+and payload lengths validate; any error cancels staged work and leaves the live
+destination usable. Deferred standard-tail copy reports allocation/transfer
+preparation and compute failures distinctly. A failed destination may be
+evicted as cleanup, but state save, the next decode, sequence reuse, and server
+handoff cannot observe it as a completed copy.
 
 ### Backend routes
 

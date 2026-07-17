@@ -2,8 +2,10 @@
 #include "common.h"
 #include "download.h"
 #include "gguf.h"
+#include "preset.h"
 
 #include <filesystem>
+#include <algorithm>
 #include <string>
 #include <vector>
 #include <sstream>
@@ -146,6 +148,18 @@ static void test(void) {
     };
 
     std::vector<std::string> argv;
+
+    {
+        const std::string canary = "hf_PRODUCTION_READINESS_SECRET_CANARY_123456789";
+        std::vector<std::string> secret_argv = {"llama-server", "--hf-token", canary};
+        common_preset_context preset_ctx(LLAMA_EXAMPLE_SERVER);
+        common_preset preset = preset_ctx.load_from_args(
+            (int) secret_argv.size(), list_str_to_char(secret_argv).data());
+
+        const std::vector<std::string> rendered = preset.to_args("llama-server");
+        assert(std::find(rendered.begin(), rendered.end(), canary) == rendered.end());
+        assert(preset.to_ini().find(canary) == std::string::npos);
+    }
 
     printf("test-arg-parser: test invalid usage\n\n");
 

@@ -1008,13 +1008,17 @@ llama_memory_t llama_context::get_memory() const {
     return memory.get();
 }
 
-bool llama_context::memory_update(bool optimize) {
+llama_memory_status llama_context::memory_update(bool optimize) {
     if (!memory) {
-        return false;
+        return LLAMA_MEMORY_STATUS_NO_UPDATE;
     }
 
     {
         const auto mctx = memory->init_update(this, optimize);
+        if (!mctx) {
+            LLAMA_LOG_ERROR("%s: failed to initialize memory update\n", __func__);
+            return LLAMA_MEMORY_STATUS_FAILED_PREPARE;
+        }
         switch (mctx->get_status()) {
             case LLAMA_MEMORY_STATUS_SUCCESS:
                 {
@@ -1023,13 +1027,13 @@ bool llama_context::memory_update(bool optimize) {
             case LLAMA_MEMORY_STATUS_NO_UPDATE:
                 {
                     // no updates need to be performed
-                    return false;
+                    return LLAMA_MEMORY_STATUS_NO_UPDATE;
                 }
             case LLAMA_MEMORY_STATUS_FAILED_PREPARE:
             case LLAMA_MEMORY_STATUS_FAILED_COMPUTE:
                 {
                     LLAMA_LOG_ERROR("%s: failed to prepare memory update\n", __func__);
-                    return false;
+                    return mctx->get_status();
                 }
         }
 
@@ -1040,6 +1044,11 @@ bool llama_context::memory_update(bool optimize) {
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
+            const auto status = mctx->get_status();
+            return llama_memory_status_is_fail(status) ? status : LLAMA_MEMORY_STATUS_FAILED_COMPUTE;
+        }
+        if (mctx->get_status() == LLAMA_MEMORY_STATUS_NO_UPDATE) {
+            return LLAMA_MEMORY_STATUS_NO_UPDATE;
         }
     }
 
@@ -1047,7 +1056,8 @@ bool llama_context::memory_update(bool optimize) {
     {
         const auto mctx = memory->init_full();
         if (!mctx) {
-            throw std::runtime_error("failed to initialize memory context");
+            LLAMA_LOG_ERROR("%s: failed to initialize full memory context\n", __func__);
+            return LLAMA_MEMORY_STATUS_FAILED_PREPARE;
         }
 
         const uint32_t n_seqs = cparams.n_seq_max;
@@ -1058,10 +1068,11 @@ bool llama_context::memory_update(bool optimize) {
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_max, mctx.get());
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to reserve graph after the memory update\n", __func__);
+            return LLAMA_MEMORY_STATUS_FAILED_PREPARE;
         }
     }
 
-    return true;
+    return LLAMA_MEMORY_STATUS_SUCCESS;
 }
 
 enum llama_pooling_type llama_context::pooling_type() const {
@@ -2012,7 +2023,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
     bool did_optimize = false;
 
     // handle any pending shifts/copies
-    memory_update(false);
+    if (llama_memory_status_is_fail(memory_update(false))) {
+        LLAMA_LOG_ERROR("%s: failed to apply pending memory update\n", __func__);
+        return -2;
+    }
 
     llama_memory_context_ptr mctx;
 
@@ -2037,7 +2051,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     if (!did_optimize) {
                         did_optimize = true;
 
-                        if (memory_update(true)) {
+                        if (memory_update(true) == LLAMA_MEMORY_STATUS_SUCCESS) {
                             LLAMA_LOG_DEBUG("%s: retrying batch size %d after cache optimization\n", __func__, balloc->get_n_tokens());
 
                             continue;
@@ -2816,10 +2830,7 @@ public:
     llama_io_read_host(const uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
 
     ~llama_io_read_host() {
-        // flush the reads
-        for (const auto & rinfo : rinfos) {
-            ggml_backend_tensor_set(rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
-        }
+        cancel();
     }
 
     void read(void * dst, size_t size) override {
@@ -2837,12 +2848,46 @@ public:
             throw std::runtime_error("unexpectedly reached end of buffer");
         }
 
-        // save for later during destruction
-        rinfos.push_back({tensor, ptr, size, offset});
+        rinfos.push_back({tensor, ptr, {}, size, offset, false});
 
         ptr += size;
         size_read += size;
         buf_size -= size;
+    }
+
+    void stage_tensor_set(ggml_tensor * tensor, const void * src, size_t offset, size_t size) override {
+        read_info info { tensor, nullptr, {}, size, offset, false };
+        info.owned.resize(size);
+        memcpy(info.owned.data(), src, size);
+        rinfos.push_back(std::move(info));
+    }
+
+    void stage_tensor_clear(ggml_tensor * tensor, size_t offset, size_t size) override {
+        rinfos.push_back({ tensor, nullptr, {}, size, offset, true });
+    }
+
+    void on_commit(std::function<void()> callback) override {
+        callbacks.push_back(std::move(callback));
+    }
+
+    void commit() override {
+        for (const auto & rinfo : rinfos) {
+            if (rinfo.clear) {
+                ggml_backend_tensor_memset(rinfo.tensor, 0, rinfo.offset, rinfo.size);
+            } else {
+                const void * src = rinfo.owned.empty() ? rinfo.ptr : rinfo.owned.data();
+                ggml_backend_tensor_set(rinfo.tensor, src, rinfo.offset, rinfo.size);
+            }
+        }
+        for (auto & callback : callbacks) {
+            callback();
+        }
+        cancel();
+    }
+
+    void cancel() override {
+        rinfos.clear();
+        callbacks.clear();
     }
 
     size_t n_bytes() override {
@@ -2857,10 +2902,13 @@ private:
     struct read_info {
         ggml_tensor * tensor;
         const uint8_t * ptr;
+        std::vector<uint8_t> owned;
         size_t size;
         size_t offset;
+        bool clear;
     };
     std::vector<read_info> rinfos;
+    std::vector<std::function<void()>> callbacks;
 };
 
 class llama_io_write_file : public llama_io_write_i {
@@ -2892,15 +2940,54 @@ class llama_io_read_file : public llama_io_read_i {
 public:
     llama_io_read_file(llama_file * f) : file(f) {}
 
+    ~llama_io_read_file() {
+        cancel();
+    }
+
     void read(void * dst, size_t size) override {
         file->read_raw(dst, size);
         size_read += size;
     }
 
     void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
-        temp_buffer.resize(size);
-        read(temp_buffer.data(), size);
-        ggml_backend_tensor_set(tensor, temp_buffer.data(), offset, size);
+        read_info info { tensor, {}, size, offset, false };
+        info.data.resize(size);
+        read(info.data.data(), size);
+        rinfos.push_back(std::move(info));
+    }
+
+    void stage_tensor_set(ggml_tensor * tensor, const void * src, size_t offset, size_t size) override {
+        read_info info { tensor, {}, size, offset, false };
+        info.data.resize(size);
+        memcpy(info.data.data(), src, size);
+        rinfos.push_back(std::move(info));
+    }
+
+    void stage_tensor_clear(ggml_tensor * tensor, size_t offset, size_t size) override {
+        rinfos.push_back({ tensor, {}, size, offset, true });
+    }
+
+    void on_commit(std::function<void()> callback) override {
+        callbacks.push_back(std::move(callback));
+    }
+
+    void commit() override {
+        for (const auto & rinfo : rinfos) {
+            if (rinfo.clear) {
+                ggml_backend_tensor_memset(rinfo.tensor, 0, rinfo.offset, rinfo.size);
+            } else {
+                ggml_backend_tensor_set(rinfo.tensor, rinfo.data.data(), rinfo.offset, rinfo.size);
+            }
+        }
+        for (auto & callback : callbacks) {
+            callback();
+        }
+        cancel();
+    }
+
+    void cancel() override {
+        rinfos.clear();
+        callbacks.clear();
     }
 
     size_t n_bytes() override {
@@ -2910,7 +2997,16 @@ public:
 private:
     llama_file * file;
     size_t size_read = 0;
-    std::vector<uint8_t> temp_buffer;
+
+    struct read_info {
+        ggml_tensor * tensor;
+        std::vector<uint8_t> data;
+        size_t size;
+        size_t offset;
+        bool clear;
+    };
+    std::vector<read_info> rinfos;
+    std::vector<std::function<void()>> callbacks;
 };
 
 class llama_io_write_device : public llama_io_write_i {
@@ -3052,6 +3148,10 @@ public:
     }
 
     ~llama_io_read_device() {
+        cancel();
+    }
+
+    void commit() override {
         llama_memory_buffers mbufs_new;
 
         for (const auto & rinfo : rinfos) {
@@ -3099,6 +3199,18 @@ public:
         }
 
         GGML_ASSERT(buf_size == 0);
+
+        for (const auto & operation : host_operations) {
+            if (operation.clear) {
+                ggml_backend_tensor_memset(operation.tensor, 0, operation.offset, operation.size);
+            } else {
+                ggml_backend_tensor_set(operation.tensor, operation.data.data(), operation.offset, operation.size);
+            }
+        }
+        for (auto & callback : callbacks) {
+            callback();
+        }
+        cancel();
     }
 
     void read(void * dst, size_t size) override {
@@ -3112,8 +3224,28 @@ public:
     }
 
     void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
-        // save for later during destruction
         rinfos.push_back({tensor, ptr, size, offset});
+    }
+
+    void stage_tensor_set(ggml_tensor * tensor, const void * src, size_t offset, size_t size) override {
+        host_operation operation { tensor, {}, size, offset, false };
+        operation.data.resize(size);
+        memcpy(operation.data.data(), src, size);
+        host_operations.push_back(std::move(operation));
+    }
+
+    void stage_tensor_clear(ggml_tensor * tensor, size_t offset, size_t size) override {
+        host_operations.push_back({ tensor, {}, size, offset, true });
+    }
+
+    void on_commit(std::function<void()> callback) override {
+        callbacks.push_back(std::move(callback));
+    }
+
+    void cancel() override {
+        rinfos.clear();
+        host_operations.clear();
+        callbacks.clear();
     }
 
     size_t n_bytes() override {
@@ -3133,6 +3265,16 @@ private:
     };
     std::vector<read_info> rinfos;
 
+    struct host_operation {
+        ggml_tensor * tensor;
+        std::vector<uint8_t> data;
+        size_t size;
+        size_t offset;
+        bool clear;
+    };
+    std::vector<host_operation> host_operations;
+    std::vector<std::function<void()>> callbacks;
+
     const llama_memory_buffers & mbufs;
 };
 
@@ -3151,7 +3293,9 @@ size_t llama_context::state_get_data(uint8_t * dst, size_t size, llama_state_seq
         LLAMA_LOG_ERROR("%s: on-device full-context state is not supported\n", __func__);
         return 0;
     }
-    memory_update(false);
+    if (llama_memory_status_is_fail(memory_update(false))) {
+        return 0;
+    }
     llama_io_write_host io(dst, size);
     try {
         return state_write_data(io, flags);
@@ -3169,7 +3313,9 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size, llama_sta
     GGML_UNUSED(flags);
     llama_io_read_host io(src, size);
     try {
-        return state_read_data(io);
+        const size_t nread = state_read_data(io);
+        io.commit();
+        return nread;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
         return 0;
@@ -3206,7 +3352,9 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
         }
         return 0;
     }
-    memory_update(false);
+    if (llama_memory_status_is_fail(memory_update(false))) {
+        return 0;
+    }
     std::unique_ptr<llama_io_write_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
@@ -3233,28 +3381,27 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
         }
         return 0;
     }
-    std::unique_ptr<llama_io_read_i> io;
-    if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
-        // create a temporary io to read the magic and the src seq_id
-        io = std::make_unique<llama_io_read_host>(src, size);
-
-        uint32_t magic_read;
-        io->read(&magic_read, sizeof(magic_read));
-        if (io_magic != magic_read) {
-            throw std::runtime_error("wrong sequence state magic");
-        }
-
-        llama_seq_id seq_id_read;
-        io->read(&seq_id_read, sizeof(seq_id_read));
-
-        GGML_ASSERT(mem_storage.find(seq_id_read) != mem_storage.end());
-
-        io = std::make_unique<llama_io_read_device>(src, size, mem_storage[seq_id_read]);
-    } else {
-        io = std::make_unique<llama_io_read_host>(src, size);
-    }
-
     try {
+        std::unique_ptr<llama_io_read_i> io;
+        if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+            // Read the host header first to select the matching device storage.
+            llama_io_read_host header(src, size);
+            uint32_t magic_read;
+            header.read(&magic_read, sizeof(magic_read));
+            if (io_magic != magic_read) {
+                throw std::runtime_error("wrong sequence state magic");
+            }
+
+            llama_seq_id seq_id_read;
+            header.read(&seq_id_read, sizeof(seq_id_read));
+            if (mem_storage.find(seq_id_read) == mem_storage.end()) {
+                throw std::runtime_error("missing on-device sequence state storage");
+            }
+            io = std::make_unique<llama_io_read_device>(src, size, mem_storage.at(seq_id_read));
+        } else {
+            io = std::make_unique<llama_io_read_host>(src, size);
+        }
+
         uint32_t magic_read;
         io->read(&magic_read, sizeof(magic_read));
         if (io_magic != magic_read) {
@@ -3264,7 +3411,9 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
         llama_seq_id seq_id_read;
         io->read(&seq_id_read, sizeof(seq_id_read));
 
-        return state_seq_read_data(*io, seq_id, flags);
+        const size_t nread = state_seq_read_data(*io, seq_id, flags);
+        io->commit();
+        return nread;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
         return 0;
@@ -3309,13 +3458,16 @@ bool llama_context::state_load_file(const char * filepath, llama_token * tokens_
             LLAMA_LOG_ERROR("%s: did not read all of the session file data! size %zu, got %zu\n", __func__, n_state_size_cur, n_read);
             return false;
         }
+        io.commit();
     }
 
     return true;
 }
 
 bool llama_context::state_save_file(const char * filepath, const llama_token * tokens, size_t n_token_count) {
-    memory_update(false);
+    if (llama_memory_status_is_fail(memory_update(false))) {
+        return false;
+    }
     llama_file file(filepath, "wb");
 
     file.write_u32(LLAMA_SESSION_MAGIC);
@@ -3370,13 +3522,16 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
         }
         GGML_ASSERT(nread <= state_size);
         GGML_ASSERT(nread + sizeof(uint32_t) * 3 + sizeof(llama_token) * *n_token_count_out == file.tell());
+        io.commit();
     }
 
     return file.tell();
 }
 
 size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * filepath, const llama_token * tokens, size_t n_token_count) {
-    memory_update(false);
+    if (llama_memory_status_is_fail(memory_update(false))) {
+        return 0;
+    }
     llama_file file(filepath, "wb");
 
     file.write_u32(LLAMA_STATE_SEQ_MAGIC);

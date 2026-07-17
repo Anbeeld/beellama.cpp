@@ -2,8 +2,9 @@
 
 ## v0.4.0
 
-- Merged upstream llama.cpp at `049326a00` and re-based BeeLlama's maintained
-  extensions on its current model, memory, speculative, and server architecture.
+- Merged upstream llama.cpp through merge `827bfda66`, whose upstream parent is
+  `32e789fdf`, and re-based BeeLlama's maintained extensions on its current
+  model, memory, speculative, and server architecture.
 - Replaced the fork DFlash stack with upstream `draft-dflash`. `dflash` remains a
   warned compatibility alias. Draft GGUFs must use upstream's `dflash`
   architecture, metadata, and tensor names.
@@ -39,14 +40,36 @@
   Explicit values still win, and the profit controller remains default-on.
 - Added opted-in realtime reasoning control: a streaming chat completion armed
   with `reasoning_control` can be moved to its final answer through
-  `/v1/chat/completions/control`.
+  `/v1/chat/completions/control`. The endpoint reports success only when an
+  active reasoning sampler actually accepts the transition; inactive,
+  completed, and unknown completions report failure.
+- Hardened router management. `GET /models` is read-only and returns sanitized
+  model identity, capability, source, and status data. Refresh is now
+  `POST /models/reload`, protected by the normal API-key middleware when keys
+  are configured. Hugging Face tokens are removed from child arguments,
+  presets, logs, and public responses and reach child processes only through
+  the `HF_TOKEN` environment variable.
+- Made standard and KVarN state restoration transactional: tensor writes and
+  metadata are staged until the complete frame validates, then committed once.
+  Deferred exact-tail copies now distinguish no work, success, allocation or
+  transfer preparation failure, and compute failure; failed copies are rolled
+  back and cannot be observed as successful by save, decode, or server callers.
+- Made exact-tail attention routes carry the model-owned per-layer relative-bias
+  contract. Biased models such as T5 cannot select a bias-incompatible native
+  FlashAttention route, and graph construction verifies the recorded contract.
+- Kept KVarN prefill eager at completed 128-token record boundaries while the
+  live exact suffix remains available. This is a store-scheduling rule, not a
+  persistent-layout or state-format change.
 - Renamed Bee's internal Q2 cache enum to `GGML_TYPE_Q2_0S` while keeping `q2_0`
   at the cache CLI boundary, avoiding a format collision with upstream's Q2_0
   weight type. Saved sessions from older Bee releases are not compatible with
   the re-slotted cache type IDs.
 - Rebased Bee's release workflow, package verification, CUDA 12.4/13.1 assets,
   and container metadata on the new tree. Container descriptions now advertise
-  upstream DFlash and KVarN instead of removed TurboQuant/TCQ support.
+  upstream DFlash and KVarN instead of removed TurboQuant/TCQ support. Release
+  packages and publication now depend on portable CPU, Windows CUDA default,
+  CUDA ALL_QUANTS, and CUDA-without-KVarN behavioral gates at one exact source
+  SHA; a manual dry run builds evidence but cannot publish.
 - RTX 3090 release validation measured Qwen3.6-27B KVarN4 KLD `0.002400`,
   Gemma-4-31B KVarN4 KLD `0.402575` versus q5_0 `0.415296`, and upstream
   DFlash at `73.81` median decode tokens/s with `40.1%` draft acceptance.

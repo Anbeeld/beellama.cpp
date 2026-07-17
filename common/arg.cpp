@@ -111,6 +111,11 @@ common_arg & common_arg::set_preset_only() {
     return *this;
 }
 
+common_arg & common_arg::set_sensitive() {
+    is_sensitive = true;
+    return *this;
+}
+
 bool common_arg::in_example(enum llama_example ex) {
     return examples.find(ex) != examples.end();
 }
@@ -3102,7 +3107,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.hf_token = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_DOWNLOAD, LLAMA_EXAMPLE_TOKENIZE}).set_env("HF_TOKEN"));
+    ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_DOWNLOAD, LLAMA_EXAMPLE_TOKENIZE}).set_env("HF_TOKEN").set_sensitive());
     add_opt(common_arg(
         {"--mtp"},
         "also download the multi-token prediction (MTP) head, if available (default: unused)",

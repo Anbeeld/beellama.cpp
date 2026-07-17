@@ -2580,12 +2580,13 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         ggml_cuda_graph::node_properties prop = {};
         memcpy(&prop.node, cgraph->nodes[i], sizeof(ggml_tensor));
 
-        for (int j = 0; j < GGML_MAX_SRC; ++j) {
-            if (cgraph->nodes[i]->src[j]) {
-                prop.node_src_data_ptrs[j] = cgraph->nodes[i]->src[j]->data;
-                memcpy(prop.node_src_ne[j], cgraph->nodes[i]->src[j]->ne, sizeof(prop.node_src_ne[j]));
-                memcpy(prop.node_src_nb[j], cgraph->nodes[i]->src[j]->nb, sizeof(prop.node_src_nb[j]));
-            }
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                if (cgraph->nodes[i]->src[j]) {
+                    prop.node_src_data_ptrs[j] = cgraph->nodes[i]->src[j]->data;
+                    prop.node_src_types[j] = cgraph->nodes[i]->src[j]->type;
+                    memcpy(prop.node_src_ne[j], cgraph->nodes[i]->src[j]->ne, sizeof(prop.node_src_ne[j]));
+                    memcpy(prop.node_src_nb[j], cgraph->nodes[i]->src[j]->nb, sizeof(prop.node_src_nb[j]));
+                }
         }
 
         if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {

@@ -86,6 +86,11 @@ llama-server -hf user/preset-repository
 Remote presets can select models and server options. Use only repositories you
 trust, and inspect `preset.ini` before deployment.
 
+Do not place `hf-token` in a preset. It is a sensitive option and is omitted
+from preset serialization and public router metadata. Supply `HF_TOKEN` in the
+router environment (or `--hf-token` at startup); child model processes receive
+only the environment value, never a token-bearing argv entry.
+
 ## BeeLlama migration rules
 
 New presets must use `draft-dflash`, standard q cache names, or `kvarnN` target

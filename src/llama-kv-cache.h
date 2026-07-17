@@ -221,6 +221,8 @@ public:
     }
     uint32_t get_tail_attention_stride(uint32_t n_query_tokens = 0) const;
     llama_kv_tail_route get_tail_route(int32_t il) const;
+    bool get_tail_explicit_bias(int32_t il) const;
+    const std::vector<llama_kv_tail_layer_route> & get_tail_layer_routes() const;
     void set_tail_routes(std::vector<llama_kv_tail_layer_route> routes);
     // Structured caches construct their ordinary body before committing any
     // exact-tail metadata. Finalization is idempotent for the owning standard
@@ -252,7 +254,7 @@ public:
     // return empty vector on failure
     slot_info_vec_t prepare(const std::vector<llama_ubatch> & ubatches);
 
-    bool update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info);
+    llama_memory_status update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info);
 
     // find a slot of kv cells that can hold the ubatch
     // if cont == true, then the slot must be continuous
@@ -537,6 +539,7 @@ public:
     virtual uint32_t get_tail_arena_stride() const;
     virtual uint32_t get_tail_attention_stride(uint32_t n_query_tokens = 0) const;
     virtual llama_kv_tail_route get_tail_route(int32_t il) const;
+    virtual bool get_tail_explicit_bias(int32_t il) const;
     virtual bool can_pack_tail_body(const llama_ubatch & ubatch) const;
 
     // store k_cur and v_cur in the cache based on the provided head location

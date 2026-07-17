@@ -1695,6 +1695,16 @@ bool llama_model::graph_consumes_exact_kv_tail() const {
     return !hparams.is_mla();
 }
 
+bool llama_model::self_attention_uses_explicit_bias(uint32_t il) const {
+    if (il >= layers.size()) {
+        return false;
+    }
+    const auto & layer = layers[il];
+    const auto & fallback = layers.front();
+    return layer.attn_rel_b != nullptr || fallback.attn_rel_b != nullptr ||
+           layer.attn_rel_b_enc != nullptr || fallback.attn_rel_b_enc != nullptr;
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {

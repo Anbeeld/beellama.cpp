@@ -2655,8 +2655,10 @@ private:
                             break;
                         }
                         // act on the live slot mid generation, never defer
-                        common_sampler_reasoning_budget_force(slot->smpl.get());
-                        res->success = true;
+                        res->success = common_sampler_reasoning_budget_force(slot->smpl.get());
+                        if (!res->success) {
+                            res->message = "reasoning is not active";
+                        }
                     } else {
                         res->success = false;
                         res->message = "unknown control action";

@@ -212,7 +212,7 @@ bool server_http_context::init(const common_params & params) {
         }
 
         // If path is public or a UI asset, skip validation
-        if (get_public_endpoints.count(req.path)) {
+        if (req.method == "GET" && get_public_endpoints.count(req.path)) {
             return true;
         }
 

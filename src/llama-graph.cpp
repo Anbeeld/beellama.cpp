@@ -3158,6 +3158,10 @@ ggml_tensor * llm_graph_context::build_attn(
     const bool gather_v_tail = v_tail != nullptr;
     ggml_tensor * tail_read_idxs = inp->get_tail_read_idxs();
     const llama_kv_tail_route tail_route = mctx_cur->get_tail_route(il);
+    if (tail_route != LLAMA_KV_TAIL_ROUTE_NONE) {
+        GGML_ASSERT(mctx_cur->get_tail_explicit_bias(il) == (kq_b != nullptr) &&
+                "KV tail route bias contract does not match the model graph");
+    }
     const bool use_indexed_tail = gather_k_tail && gather_v_tail && tail_read_idxs &&
             tail_route == LLAMA_KV_TAIL_ROUTE_NATIVE;
     if (!use_indexed_tail && !use_kvarn && mctx_cur->get_tail_tokens() > 0) {
@@ -3517,6 +3521,10 @@ ggml_tensor * llm_graph_context::build_attn(
     const bool gather_v_tail = v_tail != nullptr;
     ggml_tensor * tail_read_idxs = inp->get_tail_read_idxs(is_swa);
     const llama_kv_tail_route tail_route = mctx_cur->get_tail_route(il);
+    if (tail_route != LLAMA_KV_TAIL_ROUTE_NONE) {
+        GGML_ASSERT(mctx_cur->get_tail_explicit_bias(il) == (kq_b != nullptr) &&
+                "KV tail route bias contract does not match the model graph");
+    }
     const bool use_indexed_tail = gather_k_tail && gather_v_tail && tail_read_idxs &&
             tail_route == LLAMA_KV_TAIL_ROUTE_NATIVE;
     if (!use_indexed_tail && !use_kvarn && mctx_cur->get_tail_tokens() > 0) {

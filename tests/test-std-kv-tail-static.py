@@ -158,6 +158,76 @@ def main() -> None:
     if "if (manifest.tail_layers.empty())" in state_v2_installer:
         raise AssertionError("v2 state restore mistakes metadata-only tail ownership for a body-only frame")
 
+    io_header = (ROOT / "src/llama-io.h").read_text(encoding="utf-8")
+    for operation in ("commit", "cancel", "stage_tensor_set", "stage_tensor_clear", "on_commit"):
+        if f"virtual void {operation}(" not in io_header:
+            raise AssertionError(f"state reader transaction lacks explicit {operation}")
+
+    reader_source = context_source.split("class llama_io_read_host", 1)[0] + "class llama_io_read_host" + context_source.split(
+        "class llama_io_read_host", 1
+    )[1].split("size_t llama_context::state_get_size", 1)[0]
+    for reader in ("llama_io_read_host", "llama_io_read_file", "llama_io_read_device"):
+        body = reader_source.split(f"class {reader}", 1)[1].split("\nclass ", 1)[0]
+        destructor = body.split(f"~{reader}()", 1)[1].split("}", 1)[0]
+        if "cancel()" not in destructor:
+            raise AssertionError(f"{reader} destructor must cancel uncommitted restore writes")
+
+    kvarn_state_reader = kvarn_cache.split(
+        "void llama_kv_cache_kvarn::state_read(", 1
+    )[1].split("llama_kv_cache * llama_kv_cache_kvarn::get_metadata_cache", 1)[0]
+    if "metadata_prepared" not in kvarn_state_reader or "io.on_commit" not in kvarn_state_reader:
+        raise AssertionError("KVarN restore does not prepare metadata and publish it only at transaction commit")
+    if "ggml_backend_tensor_set" in kvarn_state_reader or "ggml_backend_tensor_memset" in kvarn_state_reader:
+        raise AssertionError("KVarN restore directly mutates destination tensors during preparation")
+
+    cache_header_state = (ROOT / "src/llama-kv-cache.h").read_text(encoding="utf-8")
+    if "llama_memory_status update(" not in cache_header_state:
+        raise AssertionError("deferred KV update still overloads a boolean success result")
+    transaction_header_path = ROOT / "src/llama-kv-cache-update.h"
+    if not transaction_header_path.exists():
+        raise AssertionError("deferred KV update lacks a testable transaction boundary")
+    transaction_header = transaction_header_path.read_text(encoding="utf-8")
+    for marker in ("llama_kv_tail_copy_transaction", "allocate", "transfer", "compute", "rollback"):
+        if marker not in transaction_header:
+            raise AssertionError(f"deferred KV update transaction lacks {marker}")
+    context_header = (ROOT / "src/llama-context.h").read_text(encoding="utf-8")
+    if "llama_memory_status memory_update(bool optimize)" not in context_header:
+        raise AssertionError("context memory update cannot distinguish no-work from failure")
+    cache_apply = state_cache_source.split("bool llama_kv_cache_context::apply()", 1)[1].split(
+        "llama_memory_status llama_kv_cache_context::get_status", 1
+    )[0]
+    if "status = kv->update" not in cache_apply or "llama_memory_status_is_fail(status)" not in cache_apply:
+        raise AssertionError("KV update failure is not propagated through memory-context apply")
+    decode_update = context_source.split("// handle any pending shifts/copies", 1)[1].split(
+        "llama_memory_context_ptr mctx", 1
+    )[0]
+    if "llama_memory_status_is_fail" not in decode_update:
+        raise AssertionError("decode ignores a failed deferred memory update")
+    fault_tests_path = ROOT / "tests/test-kv-tail-copy-transaction.cpp"
+    if not fault_tests_path.exists():
+        raise AssertionError("deferred KV update lacks fault-injection tests")
+    fault_tests = fault_tests_path.read_text(encoding="utf-8")
+    for regression in ("tail_copy_allocation_failure", "tail_copy_transfer_failure", "tail_copy_compute_failure"):
+        if regression not in fault_tests:
+            raise AssertionError(f"state tests lack {regression}")
+
+    model_header = (ROOT / "src/llama-model.h").read_text(encoding="utf-8")
+    if "self_attention_uses_explicit_bias(uint32_t il) const" not in model_header:
+        raise AssertionError("model does not expose its per-layer self-attention bias contract")
+    probe_spec = state_cache_source.split("struct kv_tail_backend_probe_spec", 1)[1].split("};", 1)[0]
+    if "bool explicit_bias" not in probe_spec:
+        raise AssertionError("KV-tail backend probe does not carry the model-owned bias contract")
+    route_resolution = state_cache_source.split("const auto resolve_overlay_routes", 1)[1].split(
+        "const auto route_failure", 1
+    )[0]
+    if "spec.explicit_bias" not in route_resolution or re.search(
+            r"hparams\.causal_attn,\s*n_swa\s*>\s*0,\s*false", route_resolution):
+        raise AssertionError("standard KV-tail routes still hardcode explicit_bias=false")
+    graph_bias_source = (ROOT / "src/llama-graph.cpp").read_text(encoding="utf-8")
+    for marker in ("get_tail_explicit_bias(il)", "kq_b != nullptr"):
+        if marker not in graph_bias_source:
+            raise AssertionError("attention graph does not assert the recorded bias contract")
+
     recurrent_header = (ROOT / "src/llama-memory-recurrent.h").read_text(encoding="utf-8")
     recurrent_source = (ROOT / "src/llama-memory-recurrent.cpp").read_text(encoding="utf-8")
     if "bool can_seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const override" not in recurrent_header:

@@ -1626,7 +1626,7 @@ You may also specify default arguments that will be passed to every model instan
 llama-server -ctx 8192 -n 1024 -np 2
 ```
 
-Note: model instances inherit both command line arguments and environment variables from the router server.
+Note: model instances inherit non-sensitive command-line arguments and environment variables from the router server. `--hf-token` is removed from child argv and passed only as `HF_TOKEN`; it is not included in model-list responses or serialized presets.
 
 Alternatively, you can also add GGUF based preset (see next section)
 
@@ -1722,10 +1722,8 @@ Listing all models in cache. The model metadata will also include a field to ind
 {
   "data": [{
     "id": "ggml-org/gemma-3-4b-it-GGUF:Q4_K_M",
-    "path": "/Users/REDACTED/Library/Caches/llama.cpp/ggml-org_gemma-3-4b-it-GGUF_gemma-3-4b-it-Q4_K_M.gguf",
     "status": {
-      "value": "loaded",
-      "args": ["llama-server", "-ctx", "4096"]
+      "value": "loaded"
     },
     "architecture": {
       "input_modalities": [
@@ -1741,11 +1739,15 @@ Listing all models in cache. The model metadata will also include a field to ind
 }
 ```
 
-Note:
-1. Adding `?reload=1` to the query params will refresh the list of models. The behavior is as follow:
-    - If a model is running but updated or removed from the source, it will be unloaded
-    - If a model is not running, it will be added or updated according to the source
-2. When the model is loaded, the info from `/v1/models` is forwarded to router's `/v1/models`. This includes metadata about the model and the runtime instance.
+`GET /models` is read-only. Query parameters cannot refresh, load, unload, or
+autoload models. Its response omits raw presets, filesystem paths, child argv,
+and sensitive options. When a model is loaded, non-conflicting public metadata
+from the child `/v1/models` response may be included.
+
+To rescan model sources, use `POST /models/reload`. This may unload a running
+model whose source was updated or removed and add or update unloaded models.
+The route goes through normal API-key authentication; configure `--api-key` for
+a protected router and send `Authorization: Bearer TOKEN` (or `X-Api-Key`).
 
 The `status` object can be:
 

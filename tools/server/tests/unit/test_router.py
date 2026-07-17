@@ -2,6 +2,8 @@ import threading
 import pytest
 from utils import *
 
+NO_PRELOAD_SERVER_PRESETS = True
+
 server: ServerProcess
 
 @pytest.fixture(autouse=True)
@@ -63,8 +65,8 @@ def test_router_chat_completion_stream(model: str, success: bool):
         assert content == ""
 
 
-def _get_model_ids(is_reload: bool) -> set[str]:
-    res = server.make_request("GET", "/models" + ("?reload=1" if is_reload else ""))
+def _get_model_ids() -> set[str]:
+    res = server.make_request("GET", "/models")
     assert res.status_code == 200
     return {item["id"] for item in res.body.get("data", [])}
 
@@ -215,7 +217,7 @@ def test_router_api_key_required():
 
 
 def test_router_reload_models():
-    """POST /models/reload re-reads the INI preset and updates the model list."""
+    """GET is read-only and authenticated POST reloads the preset exactly once."""
     global server
 
     preset_path = os.path.join(TMP_DIR, "test_reload.ini")
@@ -231,9 +233,12 @@ def test_router_reload_models():
         )
 
     server.models_preset = preset_path
+    server.api_key = "sk-router-reload-secret"
     server.start()
 
-    ids = _get_model_ids(is_reload=False)
+    auth_headers = {"Authorization": f"Bearer {server.api_key}"}
+
+    ids = _get_model_ids()
     assert "model-reload-a" in ids
     assert "model-reload-b" in ids
 
@@ -248,7 +253,24 @@ def test_router_reload_models():
         )
 
     try:
-        ids = _get_model_ids(is_reload=True)
+        get_res = server.make_request("GET", "/models?reload=1")
+        assert get_res.status_code == 200
+        ids = {item["id"] for item in get_res.body.get("data", [])}
+        assert "model-reload-a" in ids, "GET must not mutate the model registry"
+        assert "model-reload-c" not in ids, "GET must not reload the preset"
+
+        unauth = server.make_request("POST", "/models/reload", data={})
+        assert unauth.status_code == 401
+        wrong = server.make_request(
+            "POST", "/models/reload", data={}, headers={"Authorization": "Bearer wrong"}
+        )
+        assert wrong.status_code == 401
+
+        reload_res = server.make_request("POST", "/models/reload", data={}, headers=auth_headers)
+        assert reload_res.status_code == 200
+        assert reload_res.body.get("success") is True
+
+        ids = _get_model_ids()
         assert "model-reload-a" not in ids, "removed model should no longer appear"
         assert "model-reload-b" in ids, "unchanged model should still appear"
         assert "model-reload-c" in ids, "newly added model should appear"
@@ -353,7 +375,7 @@ def test_router_download_model():
     ), "No download_progress events received"
 
     # Model should now appear in GET /models
-    ids = _get_model_ids(is_reload=False)
+    ids = _get_model_ids()
     assert MODEL_DOWNLOAD_ID in ids, f"{MODEL_DOWNLOAD_ID} not found in /models after download"
 
 
@@ -363,7 +385,7 @@ def test_router_delete_model():
     server.start()
 
     # Ensure the model exists (download it if needed)
-    if MODEL_DOWNLOAD_ID not in _get_model_ids(is_reload=False):
+    if MODEL_DOWNLOAD_ID not in _get_model_ids():
         sse_events: list = []
         stop = threading.Event()
         sse_ready = threading.Event()
@@ -387,5 +409,5 @@ def test_router_delete_model():
     assert del_res.body.get("success") is True
 
     # Model should no longer appear in GET /models
-    ids = _get_model_ids(is_reload=False)
+    ids = _get_model_ids()
     assert MODEL_DOWNLOAD_ID not in ids, f"{MODEL_DOWNLOAD_ID} still present after deletion"

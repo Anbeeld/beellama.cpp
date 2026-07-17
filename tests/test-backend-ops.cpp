@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <atomic>
 #include <array>
+#include <cerrno>
 #include <cfloat>
 #include <cinttypes>
 #include <cstdarg>
@@ -52,6 +53,51 @@
 #   define N_THREADS std::thread::hardware_concurrency()
 #endif
 
+static uint64_t g_test_seed = UINT64_C(0x6a09e667f3bcc909);
+static thread_local uint64_t g_test_case_seed = g_test_seed;
+static thread_local uint64_t g_test_stream_index = 0;
+
+static uint64_t mix_test_seed(uint64_t value) {
+    value += UINT64_C(0x9e3779b97f4a7c15);
+    value = (value ^ (value >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+    value = (value ^ (value >> 27)) * UINT64_C(0x94d049bb133111eb);
+    return value ^ (value >> 31);
+}
+
+static uint64_t hash_test_case_identity(const std::string & identity) {
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (const unsigned char byte : identity) {
+        hash ^= byte;
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static void set_test_case_seed(uint64_t run_seed, const std::string & case_identity) {
+    g_test_case_seed = mix_test_seed(run_seed ^ hash_test_case_identity(case_identity));
+    g_test_stream_index = 0;
+}
+
+static uint64_t next_test_stream_seed() {
+    return mix_test_seed(g_test_case_seed ^ mix_test_seed(g_test_stream_index++));
+}
+
+static std::mt19937 make_test_rng_from_seed(uint64_t seed) {
+    std::seed_seq sequence {
+        static_cast<uint32_t>(seed),
+        static_cast<uint32_t>(seed >> 32),
+    };
+    return std::mt19937(sequence);
+}
+
+static std::mt19937 make_test_rng() {
+    return make_test_rng_from_seed(next_test_stream_seed());
+}
+
+static uint32_t test_random_u32() {
+    return static_cast<uint32_t>(next_test_stream_seed());
+}
+
 static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     size_t nels = ggml_nelements(tensor);
     std::vector<float> data(nels);
@@ -59,8 +105,9 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
         // parallel initialization
         static const size_t n_threads = N_THREADS;
 
+        const uint64_t tensor_seed = next_test_stream_seed();
         auto init_thread = [&](size_t start, size_t end) {
-            thread_local std::default_random_engine gen(std::random_device{}());
+            auto gen = make_test_rng_from_seed(mix_test_seed(tensor_seed ^ mix_test_seed(start) ^ mix_test_seed(end)));
             std::uniform_real_distribution<float> distribution(min, max);
             for (size_t i = start; i < end; i++) {
                 data[i] = distribution(gen);
@@ -153,8 +200,7 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
     std::vector<float>       data_f32(ne0*ne1*ne2*ne3);
     std::vector<ggml_fp16_t> data_f16(ne0*ne1*ne2*ne3);
 
-    std::random_device rd;
-    std::mt19937 gen(rd());
+    auto gen = make_test_rng();
     std::uniform_real_distribution<float> dis(min, max);
 
     for (size_t i = 0; i < data_f32.size(); i++) {
@@ -169,12 +215,12 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
     const int n_inf_zero_blocks = 0.2*(ne0*ne1*ne2*ne3)/(blck0*blck1);
 
     for (int b = 0; b < n_inf_zero_blocks; b++) {
-        const int p3 = (rd() % ne3);
-        const int p2 = (rd() % ne2);
-        const int p1 = (rd() % ne1);
-        const int p0 = (rd() % ne0);
+        const int p3 = (gen() % ne3);
+        const int p2 = (gen() % ne2);
+        const int p1 = (gen() % ne1);
+        const int p0 = (gen() % ne0);
 
-        bool inf = rd() & 1;
+        bool inf = gen() & 1;
 
         for (int i1 = 0; i1 < blck1 && p1 + i1 < ne1; i1++) {
             const int idx = p3*ne2*ne1*ne0 + p2*ne1*ne0 + (p1 + i1)*ne0 + p0;
@@ -200,8 +246,7 @@ static void init_tensor_tril(ggml_tensor * tensor, float min = -1.0f, float max 
 
     std::vector<float> data_f32(ne0*ne1*ne2*ne3);
 
-    std::random_device rd;
-    std::mt19937 gen(rd());
+    auto gen = make_test_rng();
     std::uniform_real_distribution<float> dis(min, max);
 
     for (int64_t i3 = 0; i3 < ne3; i3++) {
@@ -2290,7 +2335,7 @@ struct test_get_rows : public test_case {
                 // rows
                 std::vector<int> data(r*be1*be2);
                 for (int i = 0; i < r*be1*be2; i++) {
-                    data[i] = rand() % m;
+                    data[i] = test_random_u32() % m;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, r * be1 * be2 * sizeof(int));
             } else {
@@ -2343,7 +2388,7 @@ struct test_get_rows_back : public test_case {
                 // rows
                 std::vector<int> data(r*b);
                 for (int i = 0; i < r*b; i++) {
-                    data[i] = rand() % m;
+                    data[i] = test_random_u32() % m;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, r * b * sizeof(int));
             } else {
@@ -2354,8 +2399,7 @@ struct test_get_rows_back : public test_case {
 };
 
 static void init_set_rows_row_ids(ggml_tensor * t, int num_rows) {
-    std::random_device rd;
-    std::default_random_engine rng(rd());
+    auto rng = make_test_rng();
     for (int i2 = 0; i2 < t->ne[2]; i2++) {
         for (int i1 = 0; i1 < t->ne[1]; i1++) {
             // generate a shuffled subset of row indices
@@ -2633,7 +2677,7 @@ struct test_rope_set_rows : public test_case {
                 const int num_pos_ids = (mode & GGML_ROPE_TYPE_MROPE) ? ne_a[2] * 4 : ne_a[2];
                 std::vector<int> data(num_pos_ids);
                 for (int i = 0; i < num_pos_ids; i++) {
-                    data[i] = rand() % n_ctx;
+                    data[i] = test_random_u32() % n_ctx;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, num_pos_ids * sizeof(int));
             } else {
@@ -2745,8 +2789,7 @@ struct test_argmax : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        std::random_device rd;
-        std::default_random_engine rng(rd());
+        auto rng = make_test_rng();
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_F32) {
                 // initialize with unique values to avoid ties
@@ -2806,8 +2849,7 @@ struct test_count_equal : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        std::random_device rd;
-        std::default_random_engine rng(rd());
+        auto rng = make_test_rng();
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_F32) {
                 // initialize with unique values to avoid ties
@@ -3309,8 +3351,7 @@ struct test_add_id : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_I32) {
                 if (ggml_is_view_op(t->op)) { continue; }
-                std::random_device rd;
-                std::default_random_engine rng(rd());
+                auto rng = make_test_rng();
                 // ids
                 for (int64_t r = 0; r < ggml_nrows(t); r++) {
                     std::vector<int32_t> data(t->ne[0]);
@@ -3949,8 +3990,7 @@ struct test_ssm_scan : public test_case {
 
     // similar to test_mul_mat_id
     void initialize_tensors(ggml_context * ctx) override {
-        std::random_device rd;
-        std::default_random_engine rng(rd());
+        auto rng = make_test_rng();
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_I32) {
                 if (ggml_is_view_op(t->op)) { continue; }
@@ -4304,8 +4344,7 @@ struct test_mul_mat_hadamard : public test_mul_mat {
 };
 
 static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
-    std::random_device rd;
-    std::default_random_engine rng(rd());
+    auto rng = make_test_rng();
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
         if (t->type == GGML_TYPE_I32) {
             if (ggml_is_view_op(t->op)) { continue; }
@@ -5120,7 +5159,7 @@ struct test_rope : public test_case {
                 const int num_pos_ids = (mode & GGML_ROPE_TYPE_MROPE) ? ne_a[2] * 4 : ne_a[2];
                 std::vector<int> data(num_pos_ids);
                 for (int i = 0; i < num_pos_ids; i++) {
-                    data[i] = rand() % n_ctx;
+                    data[i] = test_random_u32() % n_ctx;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, num_pos_ids * sizeof(int));
             } else {
@@ -5720,14 +5759,13 @@ struct test_argsort : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        std::random_device rd;
-        std::default_random_engine rng(rd());
+        auto rng = make_test_rng();
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_I32) {
                 // indices
                 std::vector<int> data(ggml_nelements(t));
                 for (int i = 0; i < ggml_nelements(t); i++) {
-                    data[i] = rand();
+                    data[i] = static_cast<int>(test_random_u32());
                 }
                 std::shuffle(data.begin(), data.end(), rng);
                 ggml_backend_tensor_set(t, data.data(), 0, ne[0]*ne[1]*ne[2]*ne[3] * sizeof(int));
@@ -5848,8 +5886,7 @@ struct test_top_k : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        std::random_device rd;
-        std::default_random_engine rng(rd());
+        auto rng = make_test_rng();
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             int tie_denom = std::max(1, std::min(10, k / 2));
             for (int64_t r = 0; r < ggml_nrows(t); r++) {
@@ -7550,8 +7587,7 @@ struct test_generic_op : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         ggml_tensor * out = ggml_get_tensor(ctx, "out");
 
-        std::random_device rd;
-        std::default_random_engine rng(rd());
+        auto rng = make_test_rng();
 
         for (size_t i = 0; i < sources.size() && i < GGML_MAX_SRC; i++) {
             ggml_tensor * t = out->src[i];
@@ -7744,7 +7780,7 @@ public:
                 // pos
                 std::vector<int> data(hp.n_tokens);
                 for (int i = 0; i < hp.n_tokens; i++) {
-                    data[i] = rand() % hp.n_ctx;
+                    data[i] = test_random_u32() % hp.n_ctx;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, hp.n_tokens * sizeof(int));
             } else {
@@ -10334,6 +10370,7 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
             while (my_begin < test_cases.size()) {
                 for (size_t i = my_begin; i < my_end; ++i) {
                     auto & test = test_cases[i];
+                    set_test_case_seed(g_test_seed, test->vars());
                     test_status_t status = test->eval(b, b_cpu, op_names_filter, output_printer);
                     if (status == test_status_t::SKIPPED) {
                         continue;
@@ -10412,7 +10449,9 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
         );
 
         size_t n_ok = 0;
-        for (auto & test : test_cases) {
+        for (size_t i = 0; i < test_cases.size(); ++i) {
+            auto & test = test_cases[i];
+            set_test_case_seed(g_test_seed, test->vars());
             if (test->eval_grad(backend, op_names_filter, output_printer)) {
                 n_ok++;
             }
@@ -10423,7 +10462,9 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
     }
 
     if (mode == MODE_PERF) {
-        for (auto & test : test_cases) {
+        for (size_t i = 0; i < test_cases.size(); ++i) {
+            auto & test = test_cases[i];
+            set_test_case_seed(g_test_seed, test->vars());
             test->eval_perf(backend, op_names_filter, output_printer);
         }
         return true;
@@ -10438,7 +10479,9 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
             test_cases.end()
         );
 
-        for (auto & test : test_cases) {
+        for (size_t i = 0; i < test_cases.size(); ++i) {
+            auto & test = test_cases[i];
+            set_test_case_seed(g_test_seed, test->vars());
             test->eval_support(backend, op_names_filter, output_printer);
         }
         return true;
@@ -10548,7 +10591,7 @@ static void show_test_coverage() {
 
 static void usage(char ** argv) {
     printf("Usage: %s [mode] [-o <op,..>] [-b <backend>] [-p <params regex>] [--output <console|sql|csv>] [--list-ops]", argv[0]);
-    printf(" [--show-coverage] [--test-file <path>] [-j <n>]\n");
+    printf(" [--show-coverage] [--test-file <path>] [-j <n>] [--seed <uint64>]\n");
     printf("    valid modes:\n");
     printf("      - test (default, compare with CPU backend for correctness)\n");
     printf("      - grad (compare gradients from backpropagation with method of finite differences)\n");
@@ -10561,6 +10604,7 @@ static void usage(char ** argv) {
     printf("    --show-coverage shows test coverage\n");
     printf("    --test-file reads test operators from a test file generated by test-export-graph-ops\n");
     printf("    -j <n> runs tests using <n> parallel worker threads (default: 1, test mode only)\n");
+    printf("    --seed <uint64> selects reproducible generated inputs (accepts decimal or 0x-prefixed values)\n");
 }
 
 int main(int argc, char ** argv) {
@@ -10636,11 +10680,27 @@ int main(int argc, char ** argv) {
                 usage(argv);
                 return 1;
             }
+        } else if (strcmp(argv[i], "--seed") == 0) {
+            if (i + 1 < argc) {
+                char * end = nullptr;
+                errno = 0;
+                const unsigned long long parsed = strtoull(argv[++i], &end, 0);
+                if (errno != 0 || end == argv[i] || *end != '\0') {
+                    usage(argv);
+                    return 1;
+                }
+                g_test_seed = static_cast<uint64_t>(parsed);
+            } else {
+                usage(argv);
+                return 1;
+            }
         } else {
             usage(argv);
             return 1;
         }
     }
+
+    printf("backend_ops_seed=%" PRIu64 "\n", g_test_seed);
 
     // load and enumerate backends
     ggml_backend_load_all();

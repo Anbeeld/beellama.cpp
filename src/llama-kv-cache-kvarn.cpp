@@ -140,7 +140,7 @@ void read_kvarn_swa_records(
     if (!saved.empty()) {
         io.read(saved.data(), saved.size());
     }
-    ggml_backend_tensor_memset(tensor, 0, 0, ggml_nbytes(tensor));
+    io.stage_tensor_clear(tensor, 0, ggml_nbytes(tensor));
     if (saved_pos_max < llama_pos(KVAR_N_GROUP - 1)) {
         return;
     }
@@ -151,18 +151,19 @@ void read_kvarn_swa_records(
     for (int64_t group = first_current; group <= last_complete; ++group) {
         const uint32_t src = uint32_t(group % saved_groups);
         const uint32_t dst = uint32_t(group % current_groups);
-        ggml_backend_tensor_set(tensor,
+        io.stage_tensor_set(
+                tensor,
                 saved.data() + size_t(src)*group_bytes,
                 size_t(dst)*group_bytes,
                 group_bytes);
     }
 }
 
-void zero_kvarn_tensor_range(ggml_tensor * tensor, size_t offset, size_t size) {
+void zero_kvarn_tensor_range(llama_io_read_i & io, ggml_tensor * tensor, size_t offset, size_t size) {
     if (size == 0) {
         return;
     }
-    ggml_backend_tensor_memset(tensor, 0, offset, size);
+    io.stage_tensor_clear(tensor, offset, size);
 }
 
 int32_t kvarn_contiguous_tokens_per_stream_hint(const llama_kv_cache::slot_info & sinfo) {
@@ -351,6 +352,10 @@ uint32_t llama_kv_cache_kvarn_context::get_tail_attention_stride(uint32_t n_quer
 
 llama_kv_tail_route llama_kv_cache_kvarn_context::get_tail_route(int32_t il) const {
     return cache->get_tail_route(il);
+}
+
+bool llama_kv_cache_kvarn_context::get_tail_explicit_bias(int32_t il) const {
+    return cache->get_tail_explicit_bias(il);
 }
 
 bool llama_kv_cache_kvarn_context::can_pack_tail_body(const llama_ubatch & ubatch) const {
@@ -628,6 +633,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         uint32_t tail_tokens,
         ggml_type tail_type_requested,
         uint32_t tail_tokens_requested) :
+    model(model),
     hparams(hparams),
     params(params),
     n_stream(unified ? 1u : n_seq_max),
@@ -646,6 +652,12 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     // for the tail offset when deciding whether a ring slot is live.
     n_groups_per_stream(kvarn_record_groups_per_stream(kv_size, n_ubatch, n_swa, swa, tail_groups)),
     exact_tail_tokens(tail_tokens),
+    metadata_n_pad(n_pad),
+    metadata_n_swa(n_swa),
+    metadata_swa_type(swa_type),
+    metadata_n_ubatch(n_ubatch),
+    exact_tail_tokens_requested(tail_tokens_requested),
+    exact_tail_type_requested(tail_type_requested),
     exact_tail_type(tail_type_requested),
     metadata(std::make_unique<llama_kv_cache>(
         model,
@@ -668,7 +680,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         tail_tokens,
         tail_type_requested,
         tail_tokens_requested,
-        true)) {
+            true)) {
     GGML_ASSERT(n_stream > 0);
     GGML_ASSERT(swa || kv_size % KVAR_N_GROUP == 0);
     GGML_ASSERT(stage_groups >= 2 && "KVarN stage depth must be at least 2");
@@ -934,6 +946,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
             auto * dev = ggml_backend_buft_get_device(buft);
             const char * backend = dev ? ggml_backend_dev_name(dev) : ggml_backend_buft_name(buft);
             const bool device_route = dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
+            const bool explicit_bias = model.self_attention_uses_explicit_bias(uint32_t(logical_il));
             const auto fail_route = [&](llama_kv_tail_operation operation) {
                 throw std::runtime_error(format(
                         "KVarN exact-tail route is unsupported for architecture %s group %s layer %u backend %s "
@@ -944,7 +957,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
                         llama_kv_tail_operation_name(operation)));
             };
             llama_kv_tail_route tail_route = LLAMA_KV_TAIL_ROUTE_GENERIC;
-            if (device_route) {
+            if (device_route && !explicit_bias) {
                 if (!kvarn_backend_supports_tail_write(
                             dev, exact_tail_type, uint64_t(layer.head_dim_k)*layer.n_head_kv)) {
                     fail_route(LLAMA_KV_TAIL_OP_WRITE_K);
@@ -962,7 +975,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
             tail_routes.push_back({
                     uint32_t(logical_il), backend ? backend : "unknown",
                     GGML_TYPE_F16, GGML_TYPE_F16, exact_tail_type, exact_tail_type,
-                    false, hparams.causal_attn, swa, false,
+                    false, hparams.causal_attn, swa, explicit_bias,
                     { true, tail_route, LLAMA_KV_TAIL_OP_NONE },
             });
         }
@@ -1043,6 +1056,38 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     LLAMA_LOG_INFO("%s: type = %s, layers = %zu, groups/stream = %u, streams = %u, KVarN = %.2f MiB, equivalent F16 = %.2f MiB\n",
             __func__, llama_kvarn_type_name(this->params.type), layers.size(), n_groups_per_stream, n_stream,
             total_bytes / 1024.0 / 1024.0, raw_bytes / 1024.0 / 1024.0);
+}
+
+std::unique_ptr<llama_kv_cache> llama_kv_cache_kvarn::make_metadata_cache() const {
+    auto result = std::make_unique<llama_kv_cache>(
+            model,
+            hparams,
+            GGML_TYPE_F16,
+            GGML_TYPE_F16,
+            false,
+            false,
+            n_stream == 1,
+            kv_size,
+            n_seq_max,
+            metadata_n_pad,
+            metadata_n_swa,
+            metadata_swa_type,
+            nullptr,
+            [](int32_t) { return false; },
+            nullptr,
+            nullptr,
+            metadata_n_ubatch,
+            exact_tail_tokens,
+            exact_tail_type_requested,
+            exact_tail_tokens_requested,
+            true);
+
+    const auto & routes = metadata->get_tail_layer_routes();
+    result->set_tail_routes(std::vector<llama_kv_tail_layer_route>(routes.begin(), routes.end()));
+    if (!routes.empty()) {
+        result->finalize_tail_overlay_metadata();
+    }
+    return result;
 }
 
 llama_memory_context_ptr llama_kv_cache_kvarn::init_batch(
@@ -1476,9 +1521,16 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
 }
 
 void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    apply_pending_stream_copies(nullptr);
-    metadata->state_read(io, seq_id, flags);
-    std::vector<std::vector<int32_t>> exact_destinations = metadata->take_restored_tail_payload_slots();
+    if (has_pending_stream_copies()) {
+        throw std::runtime_error("cannot restore KVarN state while a stream copy is pending");
+    }
+
+    // Parse into a restore-only metadata cache. The live metadata remains
+    // untouched until every KVarN descriptor and payload has validated and the
+    // outer state reader commits its queued tensor writes.
+    auto metadata_prepared = make_metadata_cache();
+    metadata_prepared->state_read(io, seq_id, flags);
+    std::vector<std::vector<int32_t>> exact_destinations = metadata_prepared->take_restored_tail_payload_slots();
     const bool on_device = (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) != 0;
 
     uint32_t magic;
@@ -1570,7 +1622,7 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
     llama_pos saved_pos_max;
     io.read(&saved_pos_max, sizeof(saved_pos_max));
 
-    const uint32_t seq_stream = seq_id == -1 ? 0 : metadata->get_stream_for_seq(seq_id);
+    const uint32_t seq_stream = seq_id == -1 ? 0 : metadata_prepared->get_stream_for_seq(seq_id);
     if (seq_id != -1 && seq_stream >= n_stream) {
         throw std::runtime_error("invalid KVarN sequence stream");
     }
@@ -1609,10 +1661,10 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
                             n_groups_used, n_groups_per_stream, saved_pos_max, on_device);
                 } else {
                     read_kvarn_tensor_slice(io, layer.k_records_stream[stream_dst], 0, k_records_used);
-                    zero_kvarn_tensor_range(layer.k_records_stream[stream_dst], k_records_used, k_records_total - k_records_used);
+                    zero_kvarn_tensor_range(io, layer.k_records_stream[stream_dst], k_records_used, k_records_total - k_records_used);
 
                     read_kvarn_tensor_slice(io, layer.v_records_stream[stream_dst], 0, v_records_used);
-                    zero_kvarn_tensor_range(layer.v_records_stream[stream_dst], v_records_used, v_records_total - v_records_used);
+                    zero_kvarn_tensor_range(io, layer.v_records_stream[stream_dst], v_records_used, v_records_total - v_records_used);
                 }
             }
 
@@ -1642,7 +1694,7 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
                     std::vector<uint8_t> row(k_tail_row);
                     io.read(row.data(), row.size());
                     for (const int32_t slot : exact_destinations[payload]) {
-                        ggml_backend_tensor_set(layer.k_tail, row.data(), size_t(slot)*k_tail_row, k_tail_row);
+                        io.stage_tensor_set(layer.k_tail, row.data(), size_t(slot)*k_tail_row, k_tail_row);
                     }
                 }
             }
@@ -1656,12 +1708,17 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
                     std::vector<uint8_t> row(v_tail_row);
                     io.read(row.data(), row.size());
                     for (const int32_t slot : exact_destinations[payload]) {
-                        ggml_backend_tensor_set(layer.v_tail, row.data(), size_t(slot)*v_tail_row, v_tail_row);
+                        io.stage_tensor_set(layer.v_tail, row.data(), size_t(slot)*v_tail_row, v_tail_row);
                     }
                 }
             }
         }
     }
+
+    auto prepared_owner = std::make_shared<std::unique_ptr<llama_kv_cache>>(std::move(metadata_prepared));
+    io.on_commit([this, prepared_owner]() mutable {
+        metadata.swap(*prepared_owner);
+    });
 }
 
 llama_kv_cache * llama_kv_cache_kvarn::get_metadata_cache() const {
@@ -1674,6 +1731,10 @@ int32_t llama_kv_cache_kvarn::mapped_layer_id(int32_t il) const {
 
 llama_kv_tail_route llama_kv_cache_kvarn::get_tail_route(int32_t il) const {
     return metadata->get_tail_route(il);
+}
+
+bool llama_kv_cache_kvarn::get_tail_explicit_bias(int32_t il) const {
+    return metadata->get_tail_explicit_bias(il);
 }
 
 const llama_kv_cache_kvarn::layer & llama_kv_cache_kvarn::layer_for(int32_t il) const {
