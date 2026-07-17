@@ -4964,7 +4964,7 @@ static void ggml_compute_forward_get_rows_f16(
                 ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03);
         void * dst_row = (char *) dst->data + i10*nb1 + i11*nb2 + i12*nb3;
         if (dst->type == GGML_TYPE_F16) {
-            std::memcpy(dst_row, src_row, nc*sizeof(ggml_fp16_t));
+            memcpy(dst_row, src_row, nc*sizeof(ggml_fp16_t));
         } else if (dst->type == GGML_TYPE_F32) {
             ggml_cpu_fp16_to_fp32(src_row, (float *) dst_row, nc);
         } else {
@@ -5016,7 +5016,7 @@ static void ggml_compute_forward_get_rows_bf16(
                 ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03);
         void * dst_row = (char *) dst->data + i10*nb1 + i11*nb2 + i12*nb3;
         if (dst->type == GGML_TYPE_BF16) {
-            std::memcpy(dst_row, src_row, nc*sizeof(ggml_bf16_t));
+            memcpy(dst_row, src_row, nc*sizeof(ggml_bf16_t));
         } else if (dst->type == GGML_TYPE_F32) {
             ggml_cpu_bf16_to_fp32(src_row, (float *) dst_row, nc);
         } else {
@@ -5099,7 +5099,7 @@ static void ggml_compute_forward_get_rows_i32(
         const int64_t i01 = *(const int32_t *) ((const char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
-        std::memcpy(
+        memcpy(
                 (char *) dst->data + i10*nb1 + i11*nb2 + i12*nb3,
                 (const char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03,
                 ne00*sizeof(int32_t));

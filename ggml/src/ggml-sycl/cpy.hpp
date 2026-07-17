@@ -509,8 +509,8 @@ inline void cpy_blck_f32_q6_1(const char * cxi, char * cdsti) {
     }
     const float d = (vmax - vmin) / 63.0f;
     const float id = d != 0.0f ? 1.0f / d : 0.0f;
-    y->d = d;
-    y->m = vmin;
+    y->dm.x() = d;
+    y->dm.y() = vmin;
     for (int j = 0; j < QK6_1 / 4; ++j) {
         y->qh[j] = 0;
     }
@@ -542,9 +542,11 @@ inline void cpy_blck_f32_planar(const char * cxi, char * cdsti) {
     const float d = affine ? (vmax - vmin) / (levels - 1) : signed_max / -center;
     const float m = affine ? vmin : 0.0f;
     const float id = d != 0.0f ? 1.0f / d : 0.0f;
-    y->d = d;
     if constexpr (affine) {
-        y->m = m;
+        y->dm.x() = d;
+        y->dm.y() = m;
+    } else {
+        y->d = d;
     }
     for (int j = 0; j < qk / 4; ++j) {
         y->qs[j] = 0;
