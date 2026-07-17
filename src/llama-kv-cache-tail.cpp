@@ -340,7 +340,7 @@ llama_kv_tail_store::llama_kv_tail_store(
         uint32_t n_seq_max,
         uint32_t arena_stride,
         uint32_t sink_slots) :
-        n_tokens(n_tokens), arena_stride(arena_stride), sink_slots(sink_slots),
+        n_tokens(n_tokens), arena_stride(arena_stride),
         n_slots(checked_tail_slot_count(arena_stride, n_seq_max, sink_slots)), sequences(n_seq_max),
         entry_by_cell(n_seq_max),
         slot_used(n_seq_max, std::vector<bool>(arena_stride, false)),

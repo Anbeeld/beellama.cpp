@@ -341,7 +341,7 @@ llama_kv_cache::llama_kv_cache(
                      bool   tail_metadata_only) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa),
-    tail_tokens(tail_tokens), tail_metadata_only(tail_metadata_only),
+    tail_tokens(tail_tokens),
     tail_type(tail_type_requested), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
@@ -865,7 +865,8 @@ llama_kv_cache::llama_kv_cache(
         return dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_META;
     };
     const auto validate_meta_body = [&](const kv_layer & layer, const ggml_tensor * tensor, const char * side) {
-        const auto split = llama_meta_device_get_split_state(tensor, (void *) &model.get_split_state_ud);
+        const auto split = llama_meta_device_get_split_state(tensor,
+                const_cast<llama_meta_device_get_split_state_userdata *>(&model.get_split_state_ud));
         if (split.axis != GGML_BACKEND_SPLIT_AXIS_0 || split.n_segments == 0) {
             throw std::runtime_error(format(
                     "standard KV native-exact tensor/meta split is invalid for layer %u %s body; "
@@ -900,7 +901,7 @@ llama_kv_cache::llama_kv_cache(
         if (tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY && (k_meta || v_meta)) {
             const auto * split_tensor = k_meta ? layer.k : layer.v;
             const auto split = llama_meta_device_get_split_state(
-                    split_tensor, (void *) &model.get_split_state_ud);
+                    split_tensor, const_cast<llama_meta_device_get_split_state_userdata *>(&model.get_split_state_ud));
             throw std::runtime_error(format(
                     "standard KV tail overlay rejected for layer %u: realized %s body uses a tensor/meta split buffer "
                     "with split descriptor %s; "

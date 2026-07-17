@@ -804,7 +804,11 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
     this->mctx = mctx;
 
     bool res = true;
-    const auto [q_max, n_active] = tail_query_plan_shape(params.ubatch);
+    // plain locals instead of structured bindings: the lambda below captures
+    // them, which C++17 does not allow for structured bindings
+    const auto tail_shape = tail_query_plan_shape(params.ubatch);
+    const int64_t q_max    = tail_shape.first;
+    const int64_t n_active = tail_shape.second;
     res &= self_tail_query_order == nullptr ||
             (self_tail_query_order->ne[0] == q_max && self_tail_query_order->ne[1] == n_active);
     const auto reuse_tail = [&](const llama_kv_cache_context * group, bool swa) {
@@ -1353,7 +1357,11 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     bool res = true;
 
-    const auto [tail_q_max, tail_n_active] = tail_query_plan_shape(params.ubatch);
+    // plain locals instead of structured bindings: the lambda below captures
+    // them, which C++17 does not allow for structured bindings
+    const auto tail_shape = tail_query_plan_shape(params.ubatch);
+    const int64_t tail_q_max    = tail_shape.first;
+    const int64_t tail_n_active = tail_shape.second;
     res &= inp_attn->self_tail_query_order == nullptr ||
             (inp_attn->self_tail_query_order->ne[0] == tail_q_max &&
              inp_attn->self_tail_query_order->ne[1] == tail_n_active);

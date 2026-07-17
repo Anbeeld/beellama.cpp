@@ -930,7 +930,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
             }
             if (buft_is_meta(k_buft) || buft_is_meta(v_buft)) {
                 const auto split = llama_meta_device_get_split_state(
-                        layer.k_records, (void *) &model.get_split_state_ud);
+                        layer.k_records, const_cast<llama_meta_device_get_split_state_userdata *>(&model.get_split_state_ud));
                 throw std::runtime_error(format(
                         "KVarN exact-tail overlay rejected for layer %u: realized body uses a tensor/meta split buffer "
                         "with split descriptor %s; "
@@ -940,7 +940,11 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
             }
         }
 
-        for (const auto & [logical_il, layer_index] : map_layer_ids) {
+        for (const auto & layer_entry : map_layer_ids) {
+            // plain locals instead of structured bindings: fail_route below
+            // captures logical_il, which C++17 does not allow for structured bindings
+            const auto logical_il  = layer_entry.first;
+            const auto layer_index = layer_entry.second;
             const auto & layer = layers.at(layer_index);
             auto * buft = tensor_buft(layer.k_records);
             auto * dev = ggml_backend_buft_get_device(buft);

@@ -335,7 +335,6 @@ private:
     const uint32_t n_swa = 0;
 
     const uint32_t tail_tokens = 0;
-    const bool tail_metadata_only = false;
     ggml_type tail_type = GGML_TYPE_COUNT;
     llama_kv_tail_storage_plan tail_plan {
         LLAMA_KV_TAIL_STORAGE_DISABLED,

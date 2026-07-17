@@ -268,7 +268,7 @@ struct llama_kv_tail_storage_plan {
     // the model-layer declaration captured before allocation and is retained
     // so coverage cannot claim completeness for an unconsumed payload.
     bool graph_consumes_exact_tail = true;
-    std::vector<llama_kv_tail_layer_route> layer_routes;
+    std::vector<llama_kv_tail_layer_route> layer_routes = {};
 };
 
 llama_kv_tail_storage_plan llama_kv_tail_storage_plan_for(
@@ -462,7 +462,6 @@ private:
 
     const uint32_t n_tokens;
     const uint32_t arena_stride;
-    const uint32_t sink_slots;
     const uint32_t n_slots;
     std::vector<entry_list> sequences;
     // Each sequence can own at most one exact record for a physical KV cell.
