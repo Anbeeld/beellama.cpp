@@ -543,8 +543,12 @@ static void test(void) {
 
     params = common_params();
     argv = {"binary_name", "--spec-type", "dflash"};
-    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
-    assert(params.speculative.types.back() == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH);
+    bool dflash_parsed = true;
+    const std::string dflash_error = capture_stderr([&]() {
+        dflash_parsed = common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER);
+    });
+    assert(false == dflash_parsed);
+    assert(dflash_error.find("unknown speculative type: dflash") != std::string::npos);
 
     for (const std::string & removed : {"copyspec", "suffix", "recycle"}) {
         params = common_params();
@@ -583,7 +587,7 @@ static void test(void) {
     params = common_params();
     argv = {
         "binary_name",
-        "--spec-type", "dflash",
+        "--spec-type", "draft-dflash",
         "--spec-dm-controller", "profit",
         "--spec-dm-profit-min", "0.03",
         "--spec-dm-profit-raise-margin", "0.06",

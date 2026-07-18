@@ -113,7 +113,7 @@ behavior. The `--spec-dm-*` rows are Bee server additions.
 
 | Argument | Env var | Default | Behavior |
 |---|---|---|---|
-| `--spec-type draft-dflash` | `LLAMA_ARG_SPEC_TYPE` | `none` | Enables upstream DFlash. The earlier `dflash` value warns and redirects to `draft-dflash`. |
+| `--spec-type draft-dflash` | `LLAMA_ARG_SPEC_TYPE` | `none` | Enables upstream DFlash. |
 | `--spec-draft-model FNAME`, `-md FNAME` | `LLAMA_ARG_SPEC_DRAFT_MODEL` | Unused | Loads an upstream-format `dflash` draft GGUF. |
 | `--spec-draft-n-max N` | `LLAMA_ARG_SPEC_DRAFT_N_MAX` | Upstream: `3`; omitted DFlash: `dflash.block_size - 1` | Sets the maximum draft depth. An explicit CLI or env value always wins; upstream clamps values above the drafter's trained limit. A block-16 drafter therefore defaults to 15 only when this setting is omitted. |
 | `--spec-draft-n-min N` | `LLAMA_ARG_SPEC_DRAFT_N_MIN` | `0` | Sets the minimum number of draft tokens used by upstream speculation. |
@@ -188,7 +188,7 @@ Use the same corpus, context, logical batch, and physical ubatch for both KLD le
 | Target cache `turbo2`, `turbo3`, `turbo4`, or `_tcq` variants | Warns and redirects by width to `kvarn2`, `kvarn3`, or `kvarn4`. | Use the `kvarnN` name directly. |
 | Draft cache `turbo2`, `turbo3`, `turbo4`, or `_tcq` variants | Warns and redirects by width to `q2_0`, `q3_0`, or `q4_0`. | Use the standard q-cache name directly. |
 | TurboQuant/TCQ GGUF cache formats and TQ3/TQ4 weight formats | Unsupported; legacy TQ file-type ids fail with a re-quantization error. | Re-quantize from source into a retained format. |
-| `--spec-type dflash` | Warns and redirects. | `--spec-type draft-dflash` |
+| `--spec-type dflash` | Rejected as an unknown speculative type. | `--spec-type draft-dflash` |
 | `copyspec`, `suffix`, or `recycle` speculative types | Rejected with a migration error. | Use `draft-dflash` or an upstream n-gram mode. |
 | `--draft`, `--draft-n`, `--draft-max` | Rejected as removed. | `--spec-draft-n-max` or `--spec-ngram-mod-n-max` |
 | `--draft-min`, `--draft-n-min` | Rejected as removed. | `--spec-draft-n-min` or `--spec-ngram-mod-n-min` |

@@ -60,8 +60,8 @@ All changes below are relative to v0.3.1.
   against the host budget before commit, KV rollback aligns to multimodal
   chunk boundaries, and MTP prompt-cache reuse works without regular
   checkpoints.
-- Replaced the fork DFlash stack with upstream `draft-dflash`. `dflash`
-  remains a warned compatibility alias, and draft GGUFs must use upstream's
+- Replaced the fork DFlash stack with upstream `draft-dflash`. The speculative
+  type uses upstream's `draft-dflash` name, and draft GGUFs must use upstream's
   `dflash` architecture, metadata, and tensor names. Corrected the upstream
   draft-context merge to own a normal KV cache, fixing a null-memory crash
   during draft graph reservation at startup.

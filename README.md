@@ -27,7 +27,7 @@ Start with the [BeeLlama feature overview](docs/beellama-features.md),
 
 Breaking changes in v0.4.0: TurboQuant/TCQ, DDTree, CopySpec, the old DFlash
 GPU-ring stack, and `GGML_CUDA_FA_HALF_QUANTS` were removed. Use upstream
-`--spec-type draft-dflash`; the old `dflash` spelling is a warned alias.
+`--spec-type draft-dflash`; the old `dflash` spelling is rejected.
 
 ## Recent API changes
 
