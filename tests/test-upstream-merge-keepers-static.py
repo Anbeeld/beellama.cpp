@@ -142,6 +142,12 @@ def main() -> None:
     if "case LLM_ARCH_DFLASH:" in null_memory_arches:
         raise AssertionError("DFlash requires its own KV cache; routing it to null memory crashes graph reservation")
 
+    dflash = (ROOT / "src/models/dflash.cpp").read_text(encoding="utf-8")
+    if dflash.count("Kcur = llama_mul_mat_hadamard(ctx0, Kcur") != 2:
+        raise AssertionError("DFlash must rotate injected K for both base and ISWA quantized caches")
+    if dflash.count("Vcur = llama_mul_mat_hadamard(ctx0, Vcur") != 2:
+        raise AssertionError("DFlash must rotate injected V for both base and ISWA quantized caches")
+
     server_context = (ROOT / "tools/server/server-context.cpp").read_text(encoding="utf-8")
     load_model = server_context.split("bool load_model(common_params & params)", 1)[1].split("bool init()", 1)[0]
     resolve_pos = load_model.find("common_speculative_resolve_dflash_draft_n_max")
