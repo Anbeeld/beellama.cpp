@@ -24,13 +24,40 @@ v0.4.0 replaced the fork's DFlash implementation in favor of upstream one for ma
 
 ## KV Cache Quantization
 
-K and V cache types are set independently with `--cache-type-k` and `--cache-type-v`. For the preset rationale and benchmark details, see [KV Cache Quantization Benchmarks for Long Context](https://anbeeld.com/articles/kv-cache-quantization-benchmarks-for-long-context).
+K and V cache types are set independently with `--cache-type-k` and `--cache-type-v`. See [KV Cache Quantization Benchmarks for Long Context](https://anbeeld.com/articles/kv-cache-quantization-benchmarks-for-long-context) for the established asymmetric standard-cache ladder, and [KV Cache Precision Tail: Implementation and Benchmarks](https://anbeeld.com/articles/kv-cache-precision-tail-implementation-and-benchmarks) for the current KVarN and precision-tail results.
 
-> KVarN and KV-precision-tail benchmarks are being re-measured for v0.4.0. The standard-type ladder below is unchanged; the KVarN rows will land once the new KLD runs are complete.
+### Qwen 3.6 KVarN And Precision-Tail Starting Points
 
-### Preset Ladder
+The current Qwen 3.6 27B results use median KLD as the primary quality metric. A 1024-token precision tail is the recommended starting point: it captures most of the measured gain while adding 48 MiB to a symmetric KVarN cache or 96 MiB to the tested standard caches at 64K context. Tail-0 standard and KVarN rows provide comparison anchors; bold rows are the recommended starting points.
 
-| K / V | % of bf16 size | 99.9% precision | What it is for |
+| Profile | K / V | Tail | Size vs bf16 | Median KLD |
+| --- | --- | ---: | ---: | ---: |
+| Full baseline | `bf16 / bf16` | 0 | 100.0% | 0.000000 |
+| Standard q8 | `q8_0 / q8_0` | 0 | 53.1% | 0.000909 |
+| KVarN6, no tail | `kvarn6 / kvarn6` | 0 | 41.4% | 0.000889 |
+| **High fidelity** | **`kvarn6 / kvarn6`** | **1024** | **42.6%** | **0.000879** |
+| Standard q6 | `q6_0 / q6_0` | 0 | 40.6% | 0.000960 |
+| KVarN5, no tail | `kvarn5 / kvarn5` | 0 | 35.2% | 0.000927 |
+| **Balanced** | **`kvarn5 / kvarn5`** | **1024** | **36.3%** | **0.000897** |
+| Standard q5 | `q5_0 / q5_0` | 0 | 34.4% | 0.001154 |
+| **Standard q5 + tail** | **`q5_0 / q5_0`** | **1024** | **36.7%** | **0.000938** |
+| KVarN4, no tail | `kvarn4 / kvarn4` | 0 | 28.9% | 0.001111 |
+| **Value** | **`kvarn4 / kvarn4`** | **1024** | **30.1%** | **0.000994** |
+| Standard q4 | `q4_0 / q4_0` | 0 | 28.1% | 0.001846 |
+| **Standard + tail** | **`q4_0 / q4_0`** | **1024** | **30.5%** | **0.001057** |
+| **Compact** | **`kvarn3 / kvarn3`** | **1024** | **23.8%** | **0.001316** |
+
+At tail 0, KVarN preserves the precision-per-VRAM progression established by the earlier benchmarks: KVarN4 approaches standard q5 quality, KVarN5 reaches the q6 tier, and KVarN6 reaches the practical q8 median-KLD floor.
+
+Use 2048 primarily with q2/q3 caches or when the workload specifically needs about 2K recent tokens kept exact. At q5 and above, the Wikitext result mostly saturates after 1024, while larger tails can cost several percent of throughput.
+
+These are Qwen results, not universal presets. Gemma 4's 1024-token sliding window makes a 1024 tail promote its entire SWA ring to BF16/F16, erasing much of the memory advantage; KVarN and precision tails are not recommended as a general Gemma optimization in this release.
+
+*Benchmark basis: Qwen 3.6 27B Q5_K_S, 64K context, Wikitext-2 raw, `-b 2048 -ub 512`, RTX 3090. The [linked article](https://anbeeld.com/articles/kv-cache-precision-tail-implementation-and-benchmarks) contains the exact commands, artifact hashes, mean KLD, percentiles, and full results.*
+
+### Standard-Quant Preset Ladder
+
+| K / V | % of bf16 size | 99.9% exp(-ΔKLD) | What it is for |
 | --- | ---: | ---: | --- |
 | bf16 / bf16 | 100.0 | 100.00% | Preserving full quality |
 | q8_0 / q8_0 | 53.1 | 94.62% | Validation and blame-isolation mode |
@@ -43,14 +70,14 @@ K and V cache types are set independently with `--cache-type-k` and `--cache-typ
 | q5_0 / q4_0 | 31.3 | 91.39% | If q5_0 / q4_1 misses the fit by a narrow margin |
 | q4_0 / q4_0 | 28.1 | 88.87% | Memory saving with visible precision loss |
 
-*99.9% precision = `100 · exp(−(quantKLD − bf16KLD))` at the 99.9% KL-divergence tail.*
+*`exp(-ΔKLD)` is a derived distribution-similarity proxy, not task accuracy. The current KVarN and precision-tail analysis uses median KLD for primary ranking because high-end mean KLD and extreme percentiles are outlier-sensitive.*
 
 ### Type Reference
 
 | Type | Origin | bpv | Diff vs bf16 | Notes |
 | --- | --- | ---: | ---: | --- |
 | q8_0 | upstream | 8.5 | 1.88× | High-fidelity K or V |
-| q6_0 | upstream | 6.5 | 2.46× | Robust type for high-end presets |
+| q6_0 | fork | 6.5 | 2.46× | Robust type for high-end presets |
 | q5_1 | upstream | 6 | 2.67× | Conservative, might be better for V than q5_0 |
 | q5_0 | upstream | 5.5 | 2.91× | Strong K type for VRAM constrained configs |
 | q4_1 | upstream | 5 | 3.2× | Smaller than q5_0, but weaker in the tail. Prefer q5_0 for K |
@@ -152,8 +179,10 @@ Keep the draft context on a standard cache type; KVarN is target-cache only.
 ### KVarN Target Cache
 
 ```sh
+# Qwen 3.6 starting point
 llama-server -m model.gguf --flash-attn on \
-  --cache-type-k kvarn4 --cache-type-v kvarn4 --kv-tail-tokens 512
+  --cache-type-k kvarn4 --cache-type-v kvarn4 \
+  --kv-tail-tokens 1024
 ```
 
 ### Router Mode With Presets
