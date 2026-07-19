@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.4.1
+
+- Reduced KVarN host checkpoint stalls for large exact tails by serializing
+  component-major contiguous slot runs instead of issuing one backend transfer
+  per payload row. KVarN state format v13 preserves all exact-tail bytes,
+  transactional restores, host/on-device sequence state, and v12 host-state
+  compatibility while exposing debug-level transfer-count diagnostics.
+
 ## v0.4.0
 
 - Updated the llama.cpp base through upstream commit `32e789fdf`. This includes

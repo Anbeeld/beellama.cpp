@@ -24,6 +24,36 @@ static uint32_t checked_tail_slot_count(uint32_t arena_stride, uint32_t n_seq_ma
     return uint32_t(total);
 }
 
+std::vector<llama_kv_tail_slot_run> llama_kv_tail_contiguous_slot_runs(
+        const std::vector<int32_t> & slots) {
+    std::vector<llama_kv_tail_slot_run> runs;
+    if (slots.empty()) {
+        return runs;
+    }
+
+    runs.push_back({ 0, slots[0], 1 });
+    for (size_t payload = 1; payload < slots.size(); ++payload) {
+        auto & run = runs.back();
+        if (int64_t(slots[payload]) == int64_t(slots[payload - 1]) + 1) {
+            ++run.length;
+        } else {
+            runs.push_back({ uint32_t(payload), slots[payload], 1 });
+        }
+    }
+
+#ifndef NDEBUG
+    uint64_t n_payloads = 0;
+    for (const auto & run : runs) {
+        assert(run.length > 0);
+        assert(run.payload_begin == n_payloads);
+        n_payloads += run.length;
+    }
+    assert(n_payloads == slots.size());
+#endif
+
+    return runs;
+}
+
 llama_kv_tail_layout llama_kv_tail_layout_for(
         uint32_t n_tokens,
         uint32_t n_seq_max,

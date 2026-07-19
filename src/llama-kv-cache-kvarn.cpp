@@ -52,14 +52,16 @@ bool kvarn_backend_supports_tail_write(
 // records. Keep this low enough that KVarN remains a KV-memory win over q5_0.
 constexpr uint32_t KVAR_N_SWA_TAIL_GROUPS = 2;
 constexpr uint32_t KVAR_N_STATE_MAGIC = 0x4e52564b; // "KVRN"
-// Version 12 stores canonical exact-tail payloads and remaps SWA record rings
-// across physical ubatch layouts. Version 11: tail_groups is explicit and SWA
+// Version 13 stores exact-tail payloads component-major in contiguous physical
+// slot runs. Version 12 stores canonical exact-tail payloads interleaved by row
+// and remaps SWA record rings across physical ubatch layouts. Version 11: tail_groups is explicit and SWA
 // stages no longer allocate a non-existent sink slot. Version 9: D256/D512 records use the full logical-head Hadamard instead of
 // independent 128-wide slice rotations. Version 8: KVarN K/V stage rows and compressed records are all
 // rotated-domain. Older states are rejected because their staged V rows may
 // otherwise be restored in the wrong domain. Version 5 added stage_groups
 // validation. Version 10 rejects states with the pre-dedup SWA record-ring layout.
-constexpr uint32_t KVAR_N_STATE_VERSION = 12;
+constexpr uint32_t KVAR_N_STATE_VERSION_MIN = 12;
+constexpr uint32_t KVAR_N_STATE_VERSION = 13;
 constexpr uint32_t KVAR_N_STATE_RECORDS_FULL = 0;
 constexpr uint32_t KVAR_N_STATE_STAGE_ONLY_PARTIAL = 1;
 
@@ -164,6 +166,159 @@ void zero_kvarn_tensor_range(llama_io_read_i & io, ggml_tensor * tensor, size_t 
         return;
     }
     io.stage_tensor_clear(tensor, offset, size);
+}
+
+struct kvarn_tail_tensor_span {
+    size_t offset;
+    size_t size;
+};
+
+kvarn_tail_tensor_span kvarn_tail_checked_span(
+        ggml_tensor * tensor, int32_t slot_begin, uint32_t length, uint64_t row_size) {
+    if (!tensor || slot_begin < 0 || length == 0 || row_size == 0) {
+        throw std::runtime_error("invalid KVarN exact-tail tensor span");
+    }
+    const uint64_t slot = uint64_t(slot_begin);
+    if (slot > uint64_t(std::numeric_limits<size_t>::max())/row_size ||
+            uint64_t(length) > uint64_t(std::numeric_limits<size_t>::max())/row_size) {
+        throw std::overflow_error("KVarN exact-tail tensor span overflows size_t");
+    }
+    const size_t offset = size_t(slot*row_size);
+    const size_t size = size_t(uint64_t(length)*row_size);
+    if (offset > size_t(ggml_nbytes(tensor)) || size > size_t(ggml_nbytes(tensor)) - offset) {
+        throw std::runtime_error("KVarN exact-tail tensor span exceeds its allocation");
+    }
+    return { offset, size };
+}
+
+uint64_t kvarn_tail_checked_bytes(uint32_t payloads, uint64_t row_size) {
+    if (row_size != 0 && uint64_t(payloads) > std::numeric_limits<uint64_t>::max()/row_size) {
+        throw std::overflow_error("KVarN exact-tail state byte count overflows uint64_t");
+    }
+    return uint64_t(payloads)*row_size;
+}
+
+void kvarn_tail_add_bytes(uint64_t & total, uint64_t bytes) {
+    if (bytes > std::numeric_limits<uint64_t>::max() - total) {
+        throw std::overflow_error("KVarN exact-tail state byte total overflows uint64_t");
+    }
+    total += bytes;
+}
+
+size_t read_kvarn_exact_tail_v12_interleaved(
+        llama_io_read_i & io,
+        ggml_tensor * k_tail,
+        ggml_tensor * v_tail,
+        uint64_t k_tail_row,
+        uint64_t v_tail_row,
+        const std::vector<std::vector<int32_t>> & destinations,
+        bool on_device) {
+    size_t tensor_ops = 0;
+    for (const auto & payload_destinations : destinations) {
+        if (k_tail) {
+            if (on_device) {
+                const auto span = kvarn_tail_checked_span(k_tail, payload_destinations[0], 1, k_tail_row);
+                io.read_tensor(k_tail, span.offset, span.size);
+                ++tensor_ops;
+            } else {
+                std::vector<uint8_t> row(static_cast<size_t>(k_tail_row));
+                io.read(row.data(), row.size());
+                for (const int32_t slot : payload_destinations) {
+                    const auto span = kvarn_tail_checked_span(k_tail, slot, 1, k_tail_row);
+                    io.stage_tensor_set(k_tail, row.data(), span.offset, span.size);
+                    ++tensor_ops;
+                }
+            }
+        }
+        if (v_tail) {
+            if (on_device) {
+                const auto span = kvarn_tail_checked_span(v_tail, payload_destinations[0], 1, v_tail_row);
+                io.read_tensor(v_tail, span.offset, span.size);
+                ++tensor_ops;
+            } else {
+                std::vector<uint8_t> row(static_cast<size_t>(v_tail_row));
+                io.read(row.data(), row.size());
+                for (const int32_t slot : payload_destinations) {
+                    const auto span = kvarn_tail_checked_span(v_tail, slot, 1, v_tail_row);
+                    io.stage_tensor_set(v_tail, row.data(), span.offset, span.size);
+                    ++tensor_ops;
+                }
+            }
+        }
+    }
+    return tensor_ops;
+}
+
+size_t read_kvarn_exact_tail_v13_component(
+        llama_io_read_i & io,
+        ggml_tensor * tensor,
+        uint64_t row_size,
+        const std::vector<std::vector<int32_t>> & destinations,
+        bool on_device) {
+    if (!tensor) {
+        if (row_size != 0) {
+            throw std::runtime_error("KVarN exact-tail state has a row for an absent tensor");
+        }
+        return 0;
+    }
+
+    const uint64_t expected_bytes = kvarn_tail_checked_bytes(uint32_t(destinations.size()), row_size);
+    if (expected_bytes > uint64_t(std::numeric_limits<size_t>::max())) {
+        throw std::overflow_error("KVarN exact-tail component exceeds size_t");
+    }
+    const size_t begin = io.n_bytes();
+    size_t tensor_ops = 0;
+    for (size_t payload = 0; payload < destinations.size();) {
+        if (destinations[payload].size() == 1) {
+            uint32_t length = 1;
+            while (payload + length < destinations.size() &&
+                    destinations[payload + length].size() == 1 &&
+                    int64_t(destinations[payload + length][0]) ==
+                            int64_t(destinations[payload + length - 1][0]) + 1) {
+                ++length;
+            }
+            const auto span = kvarn_tail_checked_span(tensor, destinations[payload][0], length, row_size);
+            io.read_tensor(tensor, span.offset, span.size);
+            ++tensor_ops;
+            payload += length;
+            continue;
+        }
+
+        if (on_device) {
+            throw std::runtime_error("on-device KVarN exact-tail state requires one destination slot per payload");
+        }
+        std::vector<uint8_t> row(static_cast<size_t>(row_size));
+        io.read(row.data(), row.size());
+        for (const int32_t slot : destinations[payload]) {
+            const auto span = kvarn_tail_checked_span(tensor, slot, 1, row_size);
+            io.stage_tensor_set(tensor, row.data(), span.offset, span.size);
+            ++tensor_ops;
+        }
+        ++payload;
+    }
+
+    if (!on_device && (io.n_bytes() < begin || io.n_bytes() - begin != size_t(expected_bytes))) {
+        throw std::runtime_error("KVarN exact-tail component byte count mismatch");
+    }
+    return tensor_ops;
+}
+
+size_t kvarn_exact_tail_destination_runs(
+        const std::vector<std::vector<int32_t>> & destinations) {
+    size_t runs = 0;
+    for (size_t payload = 0; payload < destinations.size();) {
+        if (destinations[payload].size() != 1) {
+            runs += destinations[payload].size();
+            ++payload;
+            continue;
+        }
+        ++runs;
+        do {
+            ++payload;
+        } while (payload < destinations.size() && destinations[payload].size() == 1 &&
+                int64_t(destinations[payload][0]) == int64_t(destinations[payload - 1][0]) + 1);
+    }
+    return runs;
 }
 
 int32_t kvarn_contiguous_tokens_per_stream_hint(const llama_kv_cache::slot_info & sinfo) {
@@ -1458,7 +1613,16 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
     const int32_t state_exact_type = int32_t(exact_tail_type);
     const std::vector<int32_t> exact_payload_slots = has_exact_tail && !body_only ?
         metadata->state_tail_payload_slots(seq_id) : std::vector<int32_t>{};
+    if (exact_payload_slots.size() > std::numeric_limits<uint32_t>::max()) {
+        throw std::overflow_error("KVarN exact-tail payload count overflows uint32_t");
+    }
     const uint32_t n_exact_payloads = uint32_t(exact_payload_slots.size());
+    for (const int32_t slot : exact_payload_slots) {
+        if (slot < 0) {
+            throw std::runtime_error("KVarN exact-tail state contains a negative source slot");
+        }
+    }
+    const auto exact_payload_runs = llama_kv_tail_contiguous_slot_runs(exact_payload_slots);
     io.write(&has_exact_tail, sizeof(has_exact_tail));
     io.write(&exact_tail_tokens, sizeof(exact_tail_tokens));
     io.write(&state_exact_type, sizeof(state_exact_type));
@@ -1494,6 +1658,8 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
     }
     io.write(&saved_pos_max, sizeof(saved_pos_max));
 
+    uint64_t exact_payload_bytes = 0;
+    size_t exact_tensor_ops = 0;
     for (const auto & layer : layers) {
         io.write(&layer.il, sizeof(layer.il));
         for (const uint32_t stream : saved_streams) {
@@ -1512,16 +1678,29 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
         const uint64_t v_tail_row = layer.v_tail ? ggml_row_size(layer.v_tail->type, layer.v_tail->ne[0]) : 0;
         io.write(&k_tail_row, sizeof(k_tail_row));
         io.write(&v_tail_row, sizeof(v_tail_row));
-        for (const int32_t slot : exact_payload_slots) {
-            GGML_ASSERT(slot >= 0);
-            if (layer.k_tail) {
-                io.write_tensor(layer.k_tail, size_t(slot)*k_tail_row, k_tail_row);
+        if (layer.k_tail) {
+            kvarn_tail_add_bytes(exact_payload_bytes, kvarn_tail_checked_bytes(n_exact_payloads, k_tail_row));
+            for (const auto & run : exact_payload_runs) {
+                const auto span = kvarn_tail_checked_span(layer.k_tail, run.slot_begin, run.length, k_tail_row);
+                io.write_tensor(layer.k_tail, span.offset, span.size);
+                ++exact_tensor_ops;
             }
-            if (layer.v_tail) {
-                io.write_tensor(layer.v_tail, size_t(slot)*v_tail_row, v_tail_row);
+        }
+        if (layer.v_tail) {
+            kvarn_tail_add_bytes(exact_payload_bytes, kvarn_tail_checked_bytes(n_exact_payloads, v_tail_row));
+            for (const auto & run : exact_payload_runs) {
+                const auto span = kvarn_tail_checked_span(layer.v_tail, run.slot_begin, run.length, v_tail_row);
+                io.write_tensor(layer.v_tail, span.offset, span.size);
+                ++exact_tensor_ops;
             }
         }
     }
+
+    LLAMA_LOG_DEBUG(
+            "%s: KVarN state save: kind=%s version=%u payloads=%u tail_bytes=%llu runs=%zu tensor_ops=%zu device=%s\n",
+            __func__, partial_state ? "partial" : "full", KVAR_N_STATE_VERSION, n_exact_payloads,
+            (unsigned long long) exact_payload_bytes, exact_payload_runs.size(), exact_tensor_ops,
+            (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) != 0 ? "true" : "false");
 }
 
 void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
@@ -1549,7 +1728,7 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
         type != params.type || n_layers != layers.size()) {
         throw std::runtime_error("incompatible KVarN cache state");
     }
-    if (version < KVAR_N_STATE_VERSION) {
+    if (version < KVAR_N_STATE_VERSION_MIN) {
         throw std::runtime_error(
             "incompatible KVarN cache state version 11: canonical exact-tail payloads are absent; "
             "re-save the prompt cache with this build");
@@ -1617,6 +1796,19 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
                 saved_exact_type, int32_t(exact_tail_type),
                 n_exact_payloads, exact_destinations.size()));
     }
+    for (const auto & destinations : exact_destinations) {
+        if (destinations.empty()) {
+            throw std::runtime_error("KVarN exact-tail state contains an unreferenced payload");
+        }
+        if (on_device && destinations.size() != 1) {
+            throw std::runtime_error("on-device KVarN exact-tail state requires one destination slot per payload");
+        }
+        for (const int32_t slot : destinations) {
+            if (slot < 0) {
+                throw std::runtime_error("KVarN exact-tail state contains a negative destination slot");
+            }
+        }
+    }
 
     uint32_t n_groups_used;
     io.read(&n_groups_used, sizeof(n_groups_used));
@@ -1636,6 +1828,8 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
         }
     }
 
+    uint64_t exact_payload_bytes = 0;
+    size_t exact_tensor_ops = 0;
     for (const auto & layer : layers) {
         uint32_t il;
         io.read(&il, sizeof(il));
@@ -1684,44 +1878,34 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
         if (k_tail_row != expected_k_tail_row || v_tail_row != expected_v_tail_row) {
             throw std::runtime_error("KVarN exact-tail state layer layout mismatch");
         }
-        for (uint32_t payload = 0; payload < n_exact_payloads; ++payload) {
-            if (exact_destinations[payload].empty()) {
-                throw std::runtime_error("KVarN exact-tail state contains an unreferenced payload");
-            }
-            if (layer.k_tail) {
-                if (on_device) {
-                    if (exact_destinations[payload].size() != 1) {
-                        throw std::runtime_error("on-device KVarN exact-tail state requires one destination slot per payload");
-                    }
-                    io.read_tensor(layer.k_tail, size_t(exact_destinations[payload][0])*k_tail_row, k_tail_row);
-                } else {
-                    std::vector<uint8_t> row(k_tail_row);
-                    io.read(row.data(), row.size());
-                    for (const int32_t slot : exact_destinations[payload]) {
-                        io.stage_tensor_set(layer.k_tail, row.data(), size_t(slot)*k_tail_row, k_tail_row);
-                    }
-                }
-            }
-            if (layer.v_tail) {
-                if (on_device) {
-                    if (exact_destinations[payload].size() != 1) {
-                        throw std::runtime_error("on-device KVarN exact-tail state requires one destination slot per payload");
-                    }
-                    io.read_tensor(layer.v_tail, size_t(exact_destinations[payload][0])*v_tail_row, v_tail_row);
-                } else {
-                    std::vector<uint8_t> row(v_tail_row);
-                    io.read(row.data(), row.size());
-                    for (const int32_t slot : exact_destinations[payload]) {
-                        io.stage_tensor_set(layer.v_tail, row.data(), size_t(slot)*v_tail_row, v_tail_row);
-                    }
-                }
-            }
+        kvarn_tail_add_bytes(exact_payload_bytes, kvarn_tail_checked_bytes(n_exact_payloads, k_tail_row));
+        kvarn_tail_add_bytes(exact_payload_bytes, kvarn_tail_checked_bytes(n_exact_payloads, v_tail_row));
+        if (version == 12) {
+            exact_tensor_ops += read_kvarn_exact_tail_v12_interleaved(
+                    io, layer.k_tail, layer.v_tail, k_tail_row, v_tail_row,
+                    exact_destinations, on_device);
+        } else if (version == 13) {
+            exact_tensor_ops += read_kvarn_exact_tail_v13_component(
+                    io, layer.k_tail, k_tail_row, exact_destinations, on_device);
+            exact_tensor_ops += read_kvarn_exact_tail_v13_component(
+                    io, layer.v_tail, v_tail_row, exact_destinations, on_device);
+        } else {
+            throw std::runtime_error("unsupported KVarN exact-tail state layout");
         }
     }
 
     auto prepared_owner = std::make_shared<std::unique_ptr<llama_kv_cache>>(std::move(metadata_prepared));
-    io.on_commit([this, prepared_owner]() mutable {
+    const size_t exact_destination_runs = kvarn_exact_tail_destination_runs(exact_destinations);
+    const char * log_function = __func__;
+    io.on_commit([this, prepared_owner, state_kind, version, n_exact_payloads,
+                  log_function,
+                  exact_payload_bytes, exact_destination_runs, exact_tensor_ops, on_device]() mutable {
         metadata.swap(*prepared_owner);
+        LLAMA_LOG_DEBUG(
+                "%s: KVarN state restore: kind=%s version=%u payloads=%u tail_bytes=%llu runs=%zu tensor_ops=%zu device=%s\n",
+                log_function, state_kind == KVAR_N_STATE_STAGE_ONLY_PARTIAL ? "partial" : "full",
+                version, n_exact_payloads, (unsigned long long) exact_payload_bytes,
+                exact_destination_runs, exact_tensor_ops, on_device ? "true" : "false");
     });
 }
 

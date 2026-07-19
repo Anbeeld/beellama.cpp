@@ -38,6 +38,15 @@ struct llama_kv_tail_slot_copy {
     int32_t dst_slot;
 };
 
+struct llama_kv_tail_slot_run {
+    uint32_t payload_begin;
+    int32_t  slot_begin;
+    uint32_t length;
+};
+
+std::vector<llama_kv_tail_slot_run> llama_kv_tail_contiguous_slot_runs(
+        const std::vector<int32_t> & slots);
+
 struct llama_kv_tail_snapshot_entry {
     llama_seq_id seq_id;
     llama_kv_tail_identity identity;

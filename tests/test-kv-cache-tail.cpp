@@ -23,6 +23,50 @@ static llama_kv_tail_identity id(uint32_t cell, uint64_t generation = 1) {
 }
 
 int main() {
+    const auto empty_slot_runs = llama_kv_tail_contiguous_slot_runs({});
+    CHECK(empty_slot_runs.empty());
+
+    const auto one_slot_run = llama_kv_tail_contiguous_slot_runs({ 3 });
+    CHECK(one_slot_run.size() == 1);
+    CHECK(one_slot_run[0].payload_begin == 0);
+    CHECK(one_slot_run[0].slot_begin == 3);
+    CHECK(one_slot_run[0].length == 1);
+
+    const auto contiguous_slot_runs = llama_kv_tail_contiguous_slot_runs({ 2, 3, 4, 5 });
+    CHECK(contiguous_slot_runs.size() == 1);
+    CHECK(contiguous_slot_runs[0].payload_begin == 0);
+    CHECK(contiguous_slot_runs[0].slot_begin == 2);
+    CHECK(contiguous_slot_runs[0].length == 4);
+
+    const auto wrapped_slot_runs = llama_kv_tail_contiguous_slot_runs({ 6, 7, 0, 1 });
+    CHECK(wrapped_slot_runs.size() == 2);
+    CHECK(wrapped_slot_runs[0].payload_begin == 0);
+    CHECK(wrapped_slot_runs[0].slot_begin == 6);
+    CHECK(wrapped_slot_runs[0].length == 2);
+    CHECK(wrapped_slot_runs[1].payload_begin == 2);
+    CHECK(wrapped_slot_runs[1].slot_begin == 0);
+    CHECK(wrapped_slot_runs[1].length == 2);
+
+    const std::vector<int32_t> fragmented_slots = { 4, 5, 2, 3, 7 };
+    const auto fragmented_slot_runs = llama_kv_tail_contiguous_slot_runs(fragmented_slots);
+    CHECK(fragmented_slot_runs.size() == 3);
+    CHECK(fragmented_slot_runs[0].payload_begin == 0);
+    CHECK(fragmented_slot_runs[0].slot_begin == 4);
+    CHECK(fragmented_slot_runs[0].length == 2);
+    CHECK(fragmented_slot_runs[1].payload_begin == 2);
+    CHECK(fragmented_slot_runs[1].slot_begin == 2);
+    CHECK(fragmented_slot_runs[1].length == 2);
+    CHECK(fragmented_slot_runs[2].payload_begin == 4);
+    CHECK(fragmented_slot_runs[2].slot_begin == 7);
+    CHECK(fragmented_slot_runs[2].length == 1);
+    uint32_t fragmented_payloads = 0;
+    for (const auto & run : fragmented_slot_runs) {
+        CHECK(run.payload_begin == fragmented_payloads);
+        CHECK(run.length > 0);
+        fragmented_payloads += run.length;
+    }
+    CHECK(fragmented_payloads == fragmented_slots.size());
+
     // Layer split is an ownership mapping, not a device-zero default. Exercise
     // two logical owners even on a one-GPU host and include graph and state
     // consumers in the invariant.
