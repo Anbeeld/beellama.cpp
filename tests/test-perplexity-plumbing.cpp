@@ -51,15 +51,14 @@ int main(int argc, char ** argv) {
 
     ok &= expect(perplexity.find("static int ppl_max_logits_rows(int n_vocab, const common_params & params)") != std::string::npos,
         "perplexity must cap full-vocab logits rows to avoid multi-GiB output buffers");
-    ok &= expect(perplexity.find("logits_stream.write(kld_logits::magic_v2") != std::string::npos,
-        "perplexity must write complete-tail v2 logits baselines");
-    ok &= expect(kl.find("kld_logits::magic_v2") != std::string::npos &&
-                 kl.find("kld_logits::magic_v1") != std::string::npos,
-        "perplexity logits reader must distinguish v2 baselines and retain legacy read compatibility");
-    ok &= expect(perplexity.find("min_logit = std::max(min_logit, max_logit - 16)") == std::string::npos,
-        "perplexity must not collapse the baseline probability tail at max-16");
-    ok &= expect(perplexity.find("normalized_baseline || p_log_base > -16.f") != std::string::npos,
-        "KLD must include the complete v2 baseline distribution");
+    ok &= expect(perplexity.find("logits_stream.write(\"_logits_\", 8)") != std::string::npos,
+        "perplexity must write upstream-compatible v1 logits baselines");
+    ok &= expect(perplexity.find("kld_logits::") == std::string::npos,
+        "perplexity must not use the fork-specific v2 logits format");
+    ok &= expect(perplexity.find("min_logit = std::max(min_logit, max_logit - 16)") != std::string::npos,
+        "perplexity must retain the upstream max-16 baseline encoding");
+    ok &= expect(perplexity.find("if (p_log_base > -16.f)") != std::string::npos,
+        "KLD must retain the upstream v1 probability cutoff");
     ok &= expect(perplexity.find("if (!kl_divergence(ctx, params))") != std::string::npos,
         "perplexity KL failures must propagate to a nonzero process exit");
     ok &= expect(kl.find("const int max_logits_rows = ppl_max_logits_rows(n_vocab, params)") != std::string::npos,

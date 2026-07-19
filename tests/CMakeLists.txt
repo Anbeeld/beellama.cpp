@@ -369,7 +369,6 @@ set_property(TEST test-kvarn PROPERTY LABELS main)
 
 llama_build_and_test(test-adaptive-dm.cpp)
 llama_build_and_test(test-perplexity-plumbing.cpp ARGS ${PROJECT_SOURCE_DIR})
-llama_build_and_test(test-kld-logits.cpp)
 llama_build_and_test(test-cuda-fattn-route-policy.cpp ARGS ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-cuda-fattn-vec-policy.cpp ARGS ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-cuda-zero-dim-gemm.cpp ARGS ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda/ggml-cuda.cu)
