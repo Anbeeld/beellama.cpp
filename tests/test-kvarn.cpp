@@ -352,8 +352,14 @@ static void test_runtime_validation() {
 
     requirements = supported;
     requirements.native_backend_supported = false;
-    require(llama_kvarn_validate_runtime(llama_kvarn_params_for_type(LLAMA_KVARN_K4V2_G128), requirements) != nullptr,
-            "backend without native KVarN FA accepted");
+    const char * backend_reason = llama_kvarn_validate_runtime(
+            llama_kvarn_params_for_type(LLAMA_KVARN_K4V2_G128), requirements);
+    require(backend_reason != nullptr, "backend without native KVarN FA accepted");
+    require(std::string(backend_reason) ==
+            "KVarN requires native KVarN FlashAttention on a compatible NVIDIA CUDA device "
+            "(Turing or newer); "
+            "ROCm/HIP, Vulkan, and CPU are not supported",
+            "backend without native KVarN FA returned an inaccurate diagnostic");
 
     requirements = supported;
     requirements.kv_unified = true;

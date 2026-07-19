@@ -2,6 +2,10 @@
 
 ## v0.4.1
 
+- Fixed the static/test source build after the memory interface gained
+  cell-level sequence operations. Unsupported KVarN placement now reports the
+  actual native-attention matrix directly: a compatible NVIDIA CUDA device
+  (Turing or newer); ROCm/HIP, Vulkan, and CPU remain unsupported.
 - Reduced KVarN host checkpoint stalls for large exact tails by serializing
   component-major contiguous slot runs instead of issuing one backend transfer
   per payload row. KVarN state format v13 preserves all exact-tail bytes,

@@ -190,7 +190,9 @@ const char * llama_kvarn_validate_runtime(
         return "KVarN native attention requires KV offload";
     }
     if (!requirements.native_backend_supported) {
-        return "KVarN requires a backend with native KVarN FlashAttention support";
+        return "KVarN requires native KVarN FlashAttention on a compatible NVIDIA CUDA device "
+               "(Turing or newer); "
+               "ROCm/HIP, Vulkan, and CPU are not supported";
     }
     return nullptr;
 }

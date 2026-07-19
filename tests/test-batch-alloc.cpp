@@ -26,6 +26,8 @@ struct mock_memory : public llama_memory_i {
     void clear(bool) override { GGML_ASSERT(false && "not implemented"); }
 
     bool seq_rm  (llama_seq_id, llama_pos, llama_pos) override { GGML_ASSERT(false && "not implemented"); }
+    bool seq_rm_cell(llama_seq_id, uint32_t) override { GGML_ASSERT(false && "not implemented"); }
+    int cells_at_pos(llama_seq_id, llama_pos, uint32_t *, int) override { GGML_ASSERT(false && "not implemented"); }
     void seq_cp  (llama_seq_id, llama_seq_id, llama_pos, llama_pos) override { GGML_ASSERT(false && "not implemented"); }
     void seq_keep(llama_seq_id) override { GGML_ASSERT(false && "not implemented"); }
     void seq_add (llama_seq_id, llama_pos, llama_pos, llama_pos) override { GGML_ASSERT(false && "not implemented"); }
