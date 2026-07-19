@@ -6766,6 +6766,7 @@ struct test_flash_attn_ext : public test_case {
     const bool tail_all_masked;
     const bool canonical_body;
     const bool full_coverage_equivalence;
+    const bool split_equivalence;
 
     std::string vars() override {
         return VARS_TO_STR14(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute) +
@@ -6774,15 +6775,17 @@ struct test_flash_attn_ext : public test_case {
             " tail_interleaved=" + std::to_string(int(tail_interleaved)) +
             " tail_all_masked=" + std::to_string(int(tail_all_masked)) +
             " canonical_body=" + std::to_string(int(canonical_body)) +
-            " full_coverage_equivalence=" + std::to_string(int(full_coverage_equivalence));
+            " full_coverage_equivalence=" + std::to_string(int(full_coverage_equivalence)) +
+            " split_equivalence=" + std::to_string(int(split_equivalence));
     }
 
     std::string op_desc(ggml_tensor * t) override {
-        return full_coverage_equivalence ? "KV_TAIL_EQUIVALENCE" : test_case::op_desc(t);
+        return full_coverage_equivalence ? "KV_TAIL_EQUIVALENCE" :
+            (split_equivalence ? "KV_TAIL_SPLIT_EQUIVALENCE" : test_case::op_desc(t));
     }
 
     bool run_whole_graph() override {
-        return full_coverage_equivalence;
+        return full_coverage_equivalence || split_equivalence;
     }
 
     double max_nmse_err() override {
@@ -6790,12 +6793,17 @@ struct test_flash_attn_ext : public test_case {
     }
 
     double err(const float * a, const float * b, size_t n) override {
-        if (!full_coverage_equivalence) {
+        if (!full_coverage_equivalence && !split_equivalence) {
             return test_case::err(a, b, n);
         }
 
         GGML_ASSERT(n % 2 == 0);
         const size_t half = n/2;
+        if (split_equivalence) {
+            return std::max(
+                    nmse(a, a + half, half),
+                    nmse(b, b + half, half));
+        }
         return std::max({
                 nmse(a,        a + half, half),
                 nmse(b,        b + half, half),
@@ -6815,12 +6823,12 @@ struct test_flash_attn_ext : public test_case {
                         int64_t n_tail = 0, bool tail_only = false, ggml_type type_tail_k = GGML_TYPE_F16,
                         ggml_type type_tail_v = GGML_TYPE_COUNT, bool tail_interleaved = false,
                         bool tail_all_masked = false, bool canonical_body = false,
-                        bool full_coverage_equivalence = false)
+                        bool full_coverage_equivalence = false, bool split_equivalence = false)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
           type_K(type_K), type_V(type_V), permute(permute), n_tail(n_tail), tail_only(tail_only), type_tail_k(type_tail_k),
           type_tail_v(type_tail_v == GGML_TYPE_COUNT ? type_tail_k : type_tail_v), tail_interleaved(tail_interleaved),
           tail_all_masked(tail_all_masked), canonical_body(canonical_body),
-          full_coverage_equivalence(full_coverage_equivalence) {}
+          full_coverage_equivalence(full_coverage_equivalence), split_equivalence(split_equivalence) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -6912,6 +6920,21 @@ struct test_flash_attn_ext : public test_case {
                         ctx, vt, hsv_padded, n_tail, nh, 1,
                         vt->nb[1], vt->nb[2], vt->nb[3], 0);
                 exact = ggml_flash_attn_ext(ctx, q, exact_k, exact_v, mt, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
+            } else if (split_equivalence) {
+                GGML_ASSERT(!tail_only && mask && !tail_interleaved && nr23[1] == 1);
+                GGML_ASSERT(type_K == type_tail_k && type_V == type_tail_v);
+                ggml_tensor * exact_k = ggml_view_4d(
+                        ctx, kt, hsk_padded, n_tail, nh, 1,
+                        kt->nb[1], kt->nb[2], kt->nb[3], 0);
+                ggml_tensor * exact_v = ggml_view_4d(
+                        ctx, vt, hsv_padded, n_tail, nh, 1,
+                        vt->nb[1], vt->nb[2], vt->nb[3], 0);
+                ggml_tensor * combined_k = ggml_concat(ctx, k, exact_k, 1);
+                ggml_tensor * combined_v = ggml_concat(ctx, v, exact_v, 1);
+                ggml_tensor * combined_m = ggml_concat(ctx, m, mt, 0);
+                exact = ggml_flash_attn_ext(
+                        ctx, q, combined_k, combined_v, combined_m,
+                        1.0f/sqrtf(hsk), max_bias, logit_softcap);
             }
         }
         ggml_flash_attn_ext_add_sinks(out, s);
@@ -9750,6 +9773,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {2, 1}, 32, 4, true, false, 0.0f, 0.0f,
         GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 32, true,
         GGML_TYPE_F16, GGML_TYPE_F16, false, false, false, true));
+    // Serving-size exact-tail reductions. With a 512-token ubatch, configured
+    // tails of 1024 and 2048 use union strides of 1536 and 2560 respectively.
+    // A fully covering overlay must still equal one ordinary exact FA pass at
+    // both reduction geometries.
+    for (int64_t tail_stride : { 1536, 2560 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(64, 64, 1, {1, 1}, tail_stride, 512,
+            true, false, 0.0f, 0.0f, GGML_PREC_F32,
+            GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, tail_stride, true,
+            GGML_TYPE_F16, GGML_TYPE_F16, false, false, false, true));
+        test_cases.emplace_back(new test_flash_attn_ext(64, 64, 1, {1, 1}, 4096, 512,
+            true, false, 0.0f, 0.0f, GGML_PREC_F32,
+            GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, tail_stride, false,
+            GGML_TYPE_F16, GGML_TYPE_F16, false, false, false, false, true));
+    }
     for (int hs : { 80, 96, 112 }) {
         test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {2, 1}, 256, 2, true, false, 0, 0,
             GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 16, false, GGML_TYPE_BF16));

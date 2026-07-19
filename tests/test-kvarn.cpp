@@ -2735,18 +2735,32 @@ static void test_native_flash_attention_prefill_route_parity() {
         return;
     }
 
-    const std::vector<float> windowed = test_native_flash_attention_output(
-            gpu_backend, true, true, 256, 4, 4, 512, 6, 1,
-            512, 3, false, nullptr, false, 128, true);
-    std::vector<float> generic;
-    {
-        scoped_test_env disable_window("GGML_KVARN_WINDOW", "0");
-        generic = test_native_flash_attention_output(
-                gpu_backend, true, true, 256, 4, 4, 512, 6, 1,
-                512, 3, false, nullptr, false, 128, true);
-    }
-    require_close_f32_rmse(generic, windowed, 1e-4f,
+    const auto require_route_parity = [&](int bits, int n_kv, int tail_candidates, const char * message) {
+        const std::vector<float> windowed = test_native_flash_attention_output(
+                gpu_backend, true, true, 256, bits, bits, 512, 6, 1,
+                n_kv, 3, false, nullptr, false, tail_candidates, true);
+        std::vector<float> generic;
+        {
+            scoped_test_env disable_window("GGML_KVARN_WINDOW", "0");
+            generic = test_native_flash_attention_output(
+                    gpu_backend, true, true, 256, bits, bits, 512, 6, 1,
+                    n_kv, 3, false, nullptr, false, tail_candidates, true);
+        }
+        require_close_f32_rmse(generic, windowed, 1e-4f, message);
+    };
+
+    require_route_parity(4, 512, 128,
             "generic and windowed KVarN prefill routes disagree with an exact tail");
+    // A 512-token serving ubatch needs the union of the configured exact tail
+    // and its in-flight rows: 1024 -> 1536 candidates, 2048 -> 2560.  These
+    // long-tail geometries exercise the regular two-FA merge omitted by the
+    // original 128-candidate regression for the determinism fix.
+    for (int bits : { 5, 8 }) {
+        require_route_parity(bits, 4096, 1536,
+                "generic and windowed KVarN prefill routes disagree for a 1024-token serving tail");
+        require_route_parity(bits, 4096, 2560,
+                "generic and windowed KVarN prefill routes disagree for a 2048-token serving tail");
+    }
 
     ggml_backend_free(gpu_backend);
 }
