@@ -27,8 +27,8 @@ quality and speed of the exact model and context you plan to serve.
 - [`--cache-type-v`](beellama-args.md#kvarn-cache-types-and-swa-overrides)
 - [`--cache-type-k-swa`](beellama-args.md#kvarn-cache-types-and-swa-overrides)
 - [`--cache-type-v-swa`](beellama-args.md#kvarn-cache-types-and-swa-overrides)
-- [`--kv-tail-tokens`](beellama-args.md#exact-tail-for-quantized-caches)
-- [`--kv-tail-type`](beellama-args.md#exact-tail-for-quantized-caches)
+- [`--kv-tail-tokens`](beellama-args.md#kv-cache-precision-tail-for-quantized-caches)
+- [`--kv-tail-type`](beellama-args.md#kv-cache-precision-tail-for-quantized-caches)
 
 With KVarN, omitted `--kv-tail-tokens` and numeric `0` both retain the
 intrinsic 128-token exact suffix. A positive request enlarges that suffix,
@@ -49,7 +49,7 @@ settings, GPU, and commit with every result.
 
 The CUDA specialized split and SWA-vector decode routes publish the same
 optional FP32 `(maximum, denominator)` metadata as upstream FlashAttention.
-An attached exact tail therefore does not force KVarN through the generic MMA
+An attached precision tail therefore does not force KVarN through the generic MMA
 fallback. `llama-bench` reports requested and effective tail sizes plus split,
 vector, generic, and prefill route counts so this remains observable.
 
@@ -88,7 +88,7 @@ Request-zero is an explicit architectural tradeoff rather than a hidden
 regression: KVarN must retain its intrinsic F16 suffix and compression staging,
 while Q4_0 request-zero has neither an exact overlay nor tail-merge scratch.
 Removing those KVarN allocations merely to beat Q4_0 would violate the quality
-and exact-tail contract. At matched 1024/2048 requests KVarN retains a peak
+and precision-tail contract. At matched 1024/2048 requests KVarN retains a peak
 advantage because its tail-attention transient high-water is smaller. From
 Qwen 16K to 64K, exact and staging residency stay constant, compressed K and V
 each grow by 420 MiB, and transient high-water grows by only 18.14 MiB; no
@@ -144,12 +144,13 @@ The user-facing `q2_0` cache name must not be treated as upstream's Q2_0 weight
 format. A requested CUDA FlashAttention pair must be compiled by the selected
 build tier.
 
-## Exact tails for quantized caches
+## KV cache precision tails for quantized caches
 
 ### What it is
 
-`--kv-tail-tokens` makes the newest attention-visible entries exact in F16 or
-BF16 for standard quantized and KVarN target caches. A partial request overlays
+The KV cache precision tail (KVCPT), set with `--kv-tail-tokens`, makes the newest
+attention-visible entries exact in F16 or BF16 for standard quantized and KVarN
+target caches. A partial request overlays
 a compact exact shadow while retaining the complete selected quantized cache.
 A standard quantized tail defaults to BF16, while a KVarN tail defaults to F16;
 `--kv-tail-type` can explicitly select either representation for either family.
@@ -231,7 +232,7 @@ context creation in this release.
 
 ### When to use it
 
-Use the tail when a quantized cache saves needed context memory but recent-token
+Use the precision tail when a quantized cache saves needed context memory but recent-token
 quantization changes quality. For standard q2 through q8 caches, start with 64,
 128, or 256 tokens. For KVarN, the starting point is its intrinsic 128-token
 suffix; try 512 or 1024 only after measuring the exact model and workload.
@@ -244,18 +245,18 @@ is the quality or performance optimum for a particular model.
 
 ### Key arguments and APIs
 
-- [`--kv-tail-tokens`](beellama-args.md#exact-tail-for-quantized-caches)
-- [`--kv-tail-type`](beellama-args.md#exact-tail-for-quantized-caches)
+- [`--kv-tail-tokens`](beellama-args.md#kv-cache-precision-tail-for-quantized-caches)
+- [`--kv-tail-type`](beellama-args.md#kv-cache-precision-tail-for-quantized-caches)
 - `llama_kv_tail_config_*` for model-bound group discovery and overrides
 - `llama_kv_tail_get_coverage` for per-sequence, per-group coverage
 - `llama_kv_tail_get_coverage_aggregate` for context/server aggregation
 - `LLAMA_STATE_SEQ_FLAGS_BODY_ONLY` for an intentional lower-precision state export
 
 Implementation decisions and non-local hardware verification packages are in
-[`development/std-quant-kv-tail.md`](development/std-quant-kv-tail.md) and
-[`development/std-quant-kv-tail-backend-verification.md`](development/std-quant-kv-tail-backend-verification.md).
+[`development/std-quant-kv-precision-tail.md`](development/std-quant-kv-precision-tail.md) and
+[`development/std-quant-kv-precision-tail-backend-verification.md`](development/std-quant-kv-precision-tail-backend-verification.md).
 KVarN-specific workspace, attention, and state decisions are in
-[`development/kvarn-exact-tail.md`](development/kvarn-exact-tail.md).
+[`development/kvarn-precision-tail.md`](development/kvarn-precision-tail.md).
 
 ### State and compatibility
 

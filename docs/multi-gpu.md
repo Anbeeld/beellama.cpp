@@ -85,7 +85,7 @@ llama-cli -m model.gguf -sm tensor -ctk f16 -ctv f16
 
 - `--flash-attn off` or (`--flash-attn auto` resolving to `off` when it isn't supported) is a hard error.
 - KV cache types must be non-quantized: `f32`, `f16`, or `bf16`. Support for quantized KV cache is not implemented and trying to use it will result in an error.
-- Bee exact-tail overlays are not mirrored across tensor-parallel shards. With
+- Bee precision-tail overlays are not mirrored across tensor-parallel shards. With
   `--kv-tail-tokens` enabled, use `--split-mode layer`, set the request to `0`,
   or choose a full-window standard request that resolves to native-exact (and
   therefore allocates no shadow). Partial standard and KVarN overlays fail

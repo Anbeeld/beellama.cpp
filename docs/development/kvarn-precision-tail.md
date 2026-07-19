@@ -1,7 +1,7 @@
-# KVarN exact-tail architecture and validation record
+# KVarN precision-tail architecture and validation record
 
 This record defines how BeeLlama combines KVarN records with the shared exact
-KV-tail contract. The user-facing behavior is documented in
+precision-tail contract. The user-facing behavior is documented in
 `docs/beellama-features.md`; this page records the invariants, backend behavior,
 state boundary, and reproducible validation evidence.
 
@@ -89,7 +89,7 @@ Unified per-sequence save and restore both require an exclusive structured
 stream. A contended idle slot is not offloaded to RAM, and a contended restore
 is treated as a cache miss; neither operation may serialize or overwrite the
 other sequence's records. The outer sequence-state framing is version 2 and
-supports host or on-device tensor transfer. The shared exact-tail manifest
+supports host or on-device tensor transfer. The shared precision-tail manifest
 restores metadata-only identities as well as tensor payloads, and version 1
 input retains conservative degraded provenance.
 

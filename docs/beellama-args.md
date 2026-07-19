@@ -17,9 +17,9 @@ KVarN values are `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`, `kvarn6`, and
 | `--cache-type-k-swa TYPE` | `LLAMA_ARG_CACHE_TYPE_K_SWA` | Same as `--cache-type-k` | Overrides KVarN K precision for SWA layers. Accepts only the six `kvarnN` values, requires target KVarN, and must be paired with the V override. |
 | `--cache-type-v-swa TYPE` | `LLAMA_ARG_CACHE_TYPE_V_SWA` | Same as `--cache-type-v` | Overrides KVarN V precision for SWA layers. Accepts only the six `kvarnN` values, requires target KVarN, and must be paired with the K override. |
 
-## Exact tail for quantized caches
+## KV cache precision tail for quantized caches
 
-The tail makes the newest attention-visible entries exact in F16 or BF16 for
+The KV cache precision tail (KVCPT) makes the newest attention-visible entries exact in F16 or BF16 for
 standard quantized and KVarN target caches. A partial tail keeps the complete
 quantized body and adds a compact shadow. A full-window request may instead
 promote an owned cache group to one native exact body. Draft and auxiliary
@@ -94,11 +94,11 @@ exact rows materialize as one batch when state data is requested.
 
 Restore publishes no tensor or metadata changes until the complete state frame
 has validated. A truncated, corrupt, mismatched, or failed backend transfer is
-cancelled. Deferred exact-tail copy failures propagate through immediate state
+cancelled. Deferred precision-tail copy failures propagate through immediate state
 save and subsequent decode instead of being reported as successful.
 
 Prompt-cache message boundaries do not reset the suffix. Standard unified and
-non-unified slots reuse continuously. KVarN exact-tail divergence trims
+non-unified slots reuse continuously. KVarN precision-tail divergence trims
 exactly; eligible older divergence reuses from the overlapping 128-token group
 boundary on a non-unified or exclusive unified stream. Unified contention, an
 unsupported recurrent rollback, `cache_prompt=false`, slot eviction, or no

@@ -11,7 +11,8 @@ keeps a small set of maintained extensions:
 - KLD save/load support in `llama-perplexity` for KVarN validation.
 
 The speculative implementation itself is upstream llama.cpp. Use
-`--spec-type draft-dflash`.
+`--spec-type draft-dflash`; the old `--spec-type dflash` alias was removed in
+v0.4.0 and now errors.
 Draft GGUFs must use upstream's `dflash` architecture, metadata, and tensor
 names.
 

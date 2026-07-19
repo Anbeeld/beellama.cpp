@@ -1,4 +1,4 @@
-# Standard KV exact-tail backend verification issue drafts
+# Standard KV precision-tail backend verification issue drafts
 
 These issue bodies are prepared for hardware owners. They are not validation
 claims. Replace only the model path and attach the complete logs; do not change
@@ -21,7 +21,7 @@ memory accounting, and whether any graph node fell back to CPU.
 
 ## ROCm/HIP issue draft
 
-Title: `Verify standard quantized KV exact tail on ROCm/HIP`
+Title: `Verify standard quantized KV precision tail on ROCm/HIP`
 
 ```bash
 cmake -S . -B build -DGGML_HIP=ON -DCMAKE_BUILD_TYPE=Release
@@ -34,7 +34,7 @@ dispatch and graph scheduling.
 
 ## Metal issue draft
 
-Title: `Verify standard quantized KV exact tail on Metal`
+Title: `Verify standard quantized KV precision tail on Metal`
 
 ```bash
 cmake -S . -B build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release
@@ -47,7 +47,7 @@ native quantized value partial.
 
 ## Vulkan issue draft
 
-Title: `Verify standard quantized KV exact tail on Vulkan`
+Title: `Verify standard quantized KV precision tail on Vulkan`
 
 ```bash
 cmake -S . -B build -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
@@ -59,7 +59,7 @@ layer output when available.
 
 ## SYCL issue draft
 
-Title: `Verify standard quantized KV exact tail on SYCL`
+Title: `Verify standard quantized KV precision tail on SYCL`
 
 ```bash
 cmake -S . -B build -DGGML_SYCL=ON -DCMAKE_BUILD_TYPE=Release
@@ -71,7 +71,7 @@ runtime implementation.
 
 ## CANN issue draft
 
-Title: `Verify standard quantized KV exact tail on CANN`
+Title: `Verify standard quantized KV precision tail on CANN`
 
 ```bash
 cmake -S . -B build -DGGML_CANN=ON -DCMAKE_BUILD_TYPE=Release

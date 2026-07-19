@@ -1,7 +1,7 @@
 # 16K KV-cache prefill benchmark — 2026-07-16
 
 This benchmark investigated 16K prompt processing with BF16, Q4_0, and
-KVarN4 KV caches, including exact-tail requests. It identified and fixed a
+KVarN4 KV caches, including precision-tail requests. It identified and fixed a
 KVarN eager-record store regression without changing persistent cache layout,
 decode routing, or quantization.
 
@@ -53,7 +53,7 @@ llama-bench -m <model.gguf> -ngl 999 -p 16384 -n 0 -d 0 \
 
 BF16 and Q4_0 reproduce the pre-fix run within 0.5%, which makes the KVarN
 gains attributable to the store change rather than a global clock shift. Q4_0
-long tails cost 3–6%, matching the expected extra exact-tail work. KVarN4 is
+long tails cost 3–6%, matching the expected extra precision-tail work. KVarN4 is
 now close to BF16 on Qwen and on Gemma with a long tail. Gemma's intrinsic
 128-token tail remains the outlier because its SWA layers still quantize and
 attend the compressed KVarN body; a 1,024-token tail promotes those small
@@ -69,7 +69,7 @@ Before the fix, Gemma KVarN4 tail 0 spent 12.298 s of 28.21 s total GPU time
 was 3.203 ms. Attention dequantization and tail merge kernels were individually
 near 1% or below, ruling them out as the primary regression.
 
-The exact-tail integration requires every completed non-sink record to be
+The precision-tail integration requires every completed non-sink record to be
 committed eagerly. The CUDA dispatch consequently excluded all eager stores
 from the pre-existing staged workspace route. That restored the old serialized
 per-token/head-wide behavior, most visibly across Gemma's many SWA layers.
@@ -123,7 +123,7 @@ The canonical 18-row VRAM run covered Qwen at 16K/64K and Gemma at 16K.
 For all nine KVarN rows, the following deterministic fields were byte-identical
 to baseline:
 
-- K/V and exact-tail resident bytes;
+- K/V and precision-tail resident bytes;
 - staging, metadata, and allocator-padding bytes;
 - transient high-water and KV-related peak bytes;
 - CUDA compute-buffer bytes.

@@ -29,7 +29,8 @@ TurboQuant/TCQ, TQ3_1S/TQ4_1S, DDTree, CopySpec, the fork DFlash ring/tape and
 reduced-verifier paths, the fringe controller, and their arguments and
 environment variables were removed in v0.4.0. Do not reintroduce those systems
 as compatibility code. The old cache names redirect to same-width KVarN presets.
-Use upstream's `draft-dflash` name for the DFlash speculative type.
+Use upstream's `draft-dflash` name for the DFlash speculative type; the bare
+`dflash` alias was removed in v0.4.0 and now errors.
 
 ## Build
 

@@ -1,4 +1,4 @@
-# Standard quantized KV exact-tail decision record
+# Standard quantized KV precision-tail decision record
 
 This record freezes the implementation scope that began at commit
 `db7e2945f90a2e400df1ce5d635507c8063aea1d`. The product contract is in
@@ -13,7 +13,7 @@ Cache-facing `q2_0` is `GGML_TYPE_Q2_0S`. Ordered K/V pairs, one-sided
 quantized caches, full attention, SWA, hybrid recurrent/attention wrappers,
 layer reuse, DSV4 raw SWA attention, and context-local shadows over a shared
 body are in scope. Positive K-only MLA and DSA overlays are rejected during
-context creation: this release does not define an exact-tail composition for
+context creation: this release does not define a precision-tail composition for
 those selectors. DSV4 compressed block caches, recurrent state, DSA/DSV4
 lightning-indexer state, and other non-attention auxiliary memories are not.
 
@@ -134,7 +134,7 @@ lifecycle tests before it can be enabled.
 
 Length zero retains the preceding unframed body format. A positive tail or an
 explicit body-only export uses sequence-state framing version 2 and a local
-KV-tail manifest version 2. The manifest validates structural group identity,
+precision-tail manifest version 2. The manifest validates structural group identity,
 body/tail byte lengths, resolved length, representation, layer layout, payload
 counts, and F16/BF16 type before logical metadata is installed. Tail rows can
 be transferred by the host or `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE` tensor
