@@ -178,7 +178,7 @@ Use the same corpus, context, logical batch, and physical ubatch for both KLD le
 
 | Argument | Env var | Default | Behavior |
 |---|---|---|---|
-| `-DGGML_CUDA_FA_ALL_QUANTS=ON` | — | Off | Expands the CUDA vector matrix from 103 to all 169 standard cache pairs and, when `GGML_CUDA_KVARN=ON`, KVarN fast-decode instances from 15 balanced pairs to all 36 ordered bit pairs. Valid KVarN pairs outside the fast matrix use descriptor-native MMA. |
+| `-DGGML_CUDA_FA_ALL_QUANTS=ON` | — | Off | Expands the CUDA vector matrix from 50 to all 169 standard cache pairs and, when `GGML_CUDA_KVARN=ON`, KVarN fast-decode instances from 15 balanced pairs to all 36 ordered bit pairs. Valid KVarN pairs outside the fast matrix use descriptor-native MMA. |
 | `-DGGML_CUDA_KVARN=ON/OFF` | — | On | Compiles or omits all dedicated CUDA KVarN kernels and template instances. When enabled, `GGML_CUDA_FA_ALL_QUANTS` selects 15 default or all 36 fast-decode pairs. |
 
 ## Migration from earlier versions

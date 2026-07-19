@@ -263,39 +263,95 @@ static ggml_type ggml_cuda_fattn_canonical_kv_type(ggml_type type) {
     return type == GGML_TYPE_F32 ? GGML_TYPE_F16 : type;
 }
 
-static int ggml_cuda_fattn_kv_rank(ggml_type type) {
+static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
     switch (ggml_cuda_fattn_canonical_kv_type(type)) {
-        case GGML_TYPE_F16:   return 0;
-        case GGML_TYPE_BF16:  return 1;
-        case GGML_TYPE_Q8_0:  return 2;
-        case GGML_TYPE_Q6_1:  return 3;
-        case GGML_TYPE_Q6_0:  return 4;
-        case GGML_TYPE_Q5_1:  return 5;
-        case GGML_TYPE_Q5_0:  return 6;
-        case GGML_TYPE_Q4_1:  return 7;
-        case GGML_TYPE_Q4_0:  return 8;
-        case GGML_TYPE_Q3_1:  return 9;
-        case GGML_TYPE_Q3_0:  return 10;
-        case GGML_TYPE_Q2_1:  return 11;
-        case GGML_TYPE_Q2_0S: return 12;
-        default:               return -1;
+        case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q6_1:
+        case GGML_TYPE_Q6_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q3_1:
+        case GGML_TYPE_Q3_0:
+        case GGML_TYPE_Q2_1:
+        case GGML_TYPE_Q2_0S:
+        case GGML_TYPE_IQ4_NL:
+            return true;
+        default:
+            return false;
     }
+}
+
+static int ggml_cuda_fattn_quant_bits(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q8_0:                 return 8;
+        case GGML_TYPE_Q6_1:
+        case GGML_TYPE_Q6_0:                 return 6;
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q5_0:                 return 5;
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q4_0:                 return 4;
+        case GGML_TYPE_Q3_1:
+        case GGML_TYPE_Q3_0:                 return 3;
+        case GGML_TYPE_Q2_1:
+        case GGML_TYPE_Q2_0S:                return 2;
+        default:                              return -1;
+    }
+}
+
+static int ggml_cuda_fattn_quant_variant(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q6_0:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q3_0:
+        case GGML_TYPE_Q2_0S: return 1;
+        default:               return 0;
+    }
+}
+
+static bool ggml_cuda_fattn_default_quant_pair(ggml_type type_K, ggml_type type_V) {
+    const int bits_K = ggml_cuda_fattn_quant_bits(type_K);
+    const int bits_V = ggml_cuda_fattn_quant_bits(type_V);
+    if (bits_K < 0 || bits_V < 0) {
+        return false;
+    }
+
+    bool bit_pair = false;
+    switch (bits_K) {
+        case 8: bit_pair = bits_V == 8 || bits_V == 6 || bits_V == 5; break;
+        case 6: bit_pair = bits_V == 6 || bits_V == 5 || bits_V == 4; break;
+        case 5: bit_pair = bits_V == 5 || bits_V == 4 || bits_V == 3; break;
+        case 4: bit_pair = bits_V == 4 || bits_V == 3 || bits_V == 2; break;
+        case 3: bit_pair = bits_V == 3 || bits_V == 2;                break;
+        case 2: bit_pair = bits_V == 2;                               break;
+        default: break;
+    }
+
+    return bit_pair && (bits_K != bits_V ||
+        ggml_cuda_fattn_quant_variant(type_K) <= ggml_cuda_fattn_quant_variant(type_V));
 }
 
 static bool ggml_cuda_fattn_pair_compiled(ggml_type type_K, ggml_type type_V) {
     type_K = ggml_cuda_fattn_canonical_kv_type(type_K);
     type_V = ggml_cuda_fattn_canonical_kv_type(type_V);
 
-    const int rank_K = ggml_cuda_fattn_kv_rank(type_K);
-    const int rank_V = ggml_cuda_fattn_kv_rank(type_V);
-    if (rank_K < 0 || rank_V < 0) {
+    if (!ggml_cuda_fattn_kv_type_supported(type_K) || !ggml_cuda_fattn_kv_type_supported(type_V) ||
+        type_K == GGML_TYPE_IQ4_NL || type_V == GGML_TYPE_IQ4_NL) {
         return false;
     }
 
 #if defined(GGML_CUDA_FA_ALL_QUANTS)
     return true;
 #else
-    return rank_K <= rank_V || type_K == GGML_TYPE_F16 || type_V == GGML_TYPE_F16;
+    if (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16 ||
+        type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16) {
+        return type_K == type_V;
+    }
+    return ggml_cuda_fattn_default_quant_pair(type_K, type_V);
 #endif
 }
 
@@ -342,10 +398,6 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_WMMA_F16 = 300,
     BEST_FATTN_KERNEL_MMA_F16  = 400,
 };
-
-static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
-    return ggml_cuda_fattn_kv_rank(type) >= 0 || type == GGML_TYPE_IQ4_NL;
-}
 
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE

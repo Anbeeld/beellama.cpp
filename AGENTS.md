@@ -51,8 +51,10 @@ cmake -B build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-The default CUDA FlashAttention build contains 103 standard vector pairs and 15
-balanced KVarN fast-decode pairs. `GGML_CUDA_FA_ALL_QUANTS=ON` expands those to
+The default CUDA FlashAttention build contains 50 standard vector pairs and 15
+balanced KVarN fast-decode pairs. The standard quant matrix follows the same
+bit-pair rules as KVarN and adds homogeneous F16/F16 and BF16/BF16 tail pairs.
+`GGML_CUDA_FA_ALL_QUANTS=ON` expands those to
 169 standard pairs and all 36 ordered KVarN bit pairs.
 `GGML_CUDA_KVARN=OFF` omits all dedicated CUDA KVarN kernels and templates.
 `GGML_CUDA_FA_HALF_QUANTS` no longer exists. Valid KVarN pairs outside the fast

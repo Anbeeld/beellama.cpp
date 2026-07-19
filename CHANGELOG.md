@@ -45,8 +45,10 @@
   type for draft caches. Legacy TQ GGUF type IDs fail with a re-quantization
   error; `copyspec`, `suffix`, and `recycle` fail with migration guidance to
   `draft-dflash` or upstream n-gram modes.
-- Replaced the CUDA FlashAttention quant build policy with 103 standard vector
-  pairs and 15 balanced KVarN fast-decode pairs by default.
+- Replaced the CUDA FlashAttention quant build policy with 50 standard vector
+  pairs and 15 balanced KVarN fast-decode pairs by default. Standard quant
+  pairs follow the KVarN bit-pair rules; homogeneous F16 and BF16 pairs retain
+  native precision-tail support.
   `GGML_CUDA_FA_ALL_QUANTS=ON` expands these to 169 standard pairs and all 36
   ordered KVarN pairs. The default-on `GGML_CUDA_KVARN` option is the single
   KVarN compilation gate for CUDA and HIP; disabling it omits the dedicated

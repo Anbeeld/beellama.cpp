@@ -135,7 +135,7 @@ when a conventional quantized KV layout is easier to compare across backends.
 ### Measurement and validation
 
 Compare cache formats with identical model, context, corpus, `-b`, and `-ub`
-values. A build with the default CUDA policy contains 103 standard vector pairs;
+values. A build with the default CUDA policy contains 50 standard vector pairs;
 the ALL option contains 169.
 
 ### Known limitations

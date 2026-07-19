@@ -12,7 +12,7 @@ cmake -B build -DGGML_CUDA=ON -DGGML_NATIVE=ON -DGGML_CUDA_FA=ON `
 cmake --build build --config Release --parallel 16
 ```
 
-The default build contains 103 standard FlashAttention cache pairs and 15
+The default build contains 50 standard FlashAttention cache pairs and 15
 balanced KVarN fast-decode pairs. Use `-DGGML_CUDA_FA_ALL_QUANTS=ON` only when
 the workload needs all 169 standard pairs and all 36 ordered KVarN pairs.
 

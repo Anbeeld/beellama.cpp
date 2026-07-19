@@ -176,7 +176,7 @@ def main() -> None:
         require(container, "upstream DFlash and KVarN", f"{dockerfile} advertises a stale feature set")
 
     agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
-    require(agents, "103 standard vector pairs", "AGENTS.md does not describe the v0.4.0 CUDA policy")
+    require(agents, "50 standard vector pairs", "AGENTS.md does not describe the v0.4.0 CUDA policy")
     require(agents, "draft-dflash", "AGENTS.md does not describe upstream DFlash")
     if "GPU ring" in agents or "profit and fringe" in agents:
         raise AssertionError("AGENTS.md still describes removed speculative systems")

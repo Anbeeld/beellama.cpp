@@ -267,38 +267,45 @@ function(ggml_cuda_select_kvarn_fast_decode_sources OUT_VAR PREFIX)
 endfunction()
 
 function(ggml_cuda_get_fattn_vec_default_pairs OUT_VAR)
-    # Default vector policy: rank(K) <= rank(V), plus both F16 fallback axes.
-    # The order is high-to-low precision.
-    set(_types
-        f16
-        bf16
-        q8_0
-        q6_1
-        q6_0
-        q5_1
-        q5_0
-        q4_1
-        q4_0
-        q3_1
-        q3_0
-        q2_1
-        q2_0s
-    )
+    set(_types_8 q8_0)
+    set(_types_6 q6_1 q6_0)
+    set(_types_5 q5_1 q5_0)
+    set(_types_4 q4_1 q4_0)
+    set(_types_3 q3_1 q3_0)
+    set(_types_2 q2_1 q2_0s)
 
-    set(_pairs)
-    foreach(K_INDEX RANGE 0 12)
-        list(GET _types ${K_INDEX} K_TYPE)
-        foreach(V_INDEX RANGE 0 12)
-            list(GET _types ${V_INDEX} V_TYPE)
-            if (${K_INDEX} LESS_EQUAL ${V_INDEX} OR K_TYPE STREQUAL "f16" OR V_TYPE STREQUAL "f16")
+    # Homogeneous F16/BF16 pairs cover KVarN and standard precision tails.
+    set(_pairs f16:f16 bf16:bf16)
+    foreach(PAIR ${GGML_CUDA_KVARN_DEFAULT_PAIRS})
+        if (NOT PAIR MATCHES "^k([0-9]+)-v([0-9]+)$")
+            message(FATAL_ERROR "Invalid KVarN default pair: ${PAIR}")
+        endif()
+        set(K_BITS ${CMAKE_MATCH_1})
+        set(V_BITS ${CMAKE_MATCH_2})
+        set(K_TYPES_VAR _types_${K_BITS})
+        set(V_TYPES_VAR _types_${V_BITS})
+        set(K_TYPES ${${K_TYPES_VAR}})
+        set(V_TYPES ${${V_TYPES_VAR}})
+        list(LENGTH K_TYPES K_TYPE_COUNT)
+        list(LENGTH V_TYPES V_TYPE_COUNT)
+        math(EXPR K_TYPE_LAST "${K_TYPE_COUNT} - 1")
+        math(EXPR V_TYPE_LAST "${V_TYPE_COUNT} - 1")
+
+        foreach(K_INDEX RANGE 0 ${K_TYPE_LAST})
+            list(GET K_TYPES ${K_INDEX} K_TYPE)
+            foreach(V_INDEX RANGE 0 ${V_TYPE_LAST})
+                list(GET V_TYPES ${V_INDEX} V_TYPE)
+                if (K_BITS EQUAL V_BITS AND K_INDEX GREATER V_INDEX)
+                    continue()
+                endif()
                 list(APPEND _pairs "${K_TYPE}:${V_TYPE}")
-            endif()
+            endforeach()
         endforeach()
     endforeach()
 
     list(LENGTH _pairs _pair_count)
-    if (NOT _pair_count EQUAL 103)
-        message(FATAL_ERROR "Default CUDA FA vec policy expected 103 pairs, got ${_pair_count}")
+    if (NOT _pair_count EQUAL 50)
+        message(FATAL_ERROR "Default CUDA FA vec policy expected 50 pairs, got ${_pair_count}")
     endif()
 
     set(${OUT_VAR} ${_pairs} PARENT_SCOPE)
