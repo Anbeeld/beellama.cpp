@@ -539,6 +539,81 @@ static bool test_kvarn_partial_checkpoint_history(
         n_past += count;
     }
 
+    {
+        auto device_params = context_params;
+        device_params.n_seq_max = 2;
+        device_params.n_ctx = std::max(device_params.n_ctx, 2*(prefix_tokens + 16));
+        auto device_context = llama_context_ptr{llama_init_from_model(model, device_params)};
+        if (!device_context) {
+            LOG_ERR("%s: failed to create wrapped on-device checkpoint context\n", __func__);
+            return false;
+        }
+
+        int device_past = 0;
+        for (size_t offset = 0; offset < prefix.size();) {
+            const int32_t count = int32_t(std::min<size_t>(device_params.n_batch, prefix.size() - offset));
+            llama_batch_ptr batch(count, 0, 1);
+            for (int32_t i = 0; i < count; ++i) {
+                common_batch_add(batch.get(), prefix[offset + i], device_past + i, { 0 }, false);
+            }
+            if (llama_decode(device_context.get(), batch.get())) {
+                LOG_ERR("%s: failed to decode wrapped on-device prefix chunk\n", __func__);
+                return false;
+            }
+            offset += count;
+            device_past += count;
+        }
+
+        const auto device_flags = llama_state_seq_flags(LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+        std::vector<uint8_t> device_state(llama_state_seq_get_size_ext(
+                device_context.get(), 0, device_flags));
+        if (device_state.empty() || llama_state_seq_get_data_ext(
+                device_context.get(), device_state.data(), device_state.size(), 0, device_flags) != device_state.size()) {
+            LOG_ERR("%s: failed to save wrapped on-device checkpoint\n", __func__);
+            return false;
+        }
+
+        const llama_token device_probe = tokens.empty() ? llama_token(2) : tokens.front();
+        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+        llama_batch_ptr source_probe(1, 0, 1);
+        common_batch_add(source_probe.get(), device_probe, device_past, { 0 }, true);
+        if (llama_decode(device_context.get(), source_probe.get())) {
+            LOG_ERR("%s: failed to decode wrapped on-device source probe\n", __func__);
+            return false;
+        }
+        const float * source_values = llama_get_logits_ith(device_context.get(), -1);
+        std::vector<float> source_logits(source_values, source_values + n_vocab);
+
+        llama_memory_clear(llama_get_memory(device_context.get()), true);
+        if (llama_state_seq_set_data_ext(
+                device_context.get(), device_state.data(), device_state.size(), 1, device_flags) != device_state.size()) {
+            LOG_ERR("%s: failed to restore wrapped on-device checkpoint\n", __func__);
+            return false;
+        }
+        llama_batch_ptr destination_probe(1, 0, 1);
+        common_batch_add(destination_probe.get(), device_probe, device_past, { 1 }, true);
+        if (llama_decode(device_context.get(), destination_probe.get())) {
+            LOG_ERR("%s: failed to decode wrapped on-device destination probe\n", __func__);
+            return false;
+        }
+        const float * destination_logits = llama_get_logits_ith(device_context.get(), -1);
+        double squared_error = 0.0;
+        double squared_reference = 0.0;
+        double max_abs_error = 0.0;
+        for (int32_t i = 0; i < n_vocab; ++i) {
+            const double diff = double(source_logits[i]) - double(destination_logits[i]);
+            squared_error += diff*diff;
+            squared_reference += double(source_logits[i])*double(source_logits[i]);
+            max_abs_error = std::max(max_abs_error, std::fabs(diff));
+        }
+        const double nmse = squared_error/std::max(squared_reference, 1e-30);
+        if (!std::isfinite(nmse) || nmse > 1e-10 || max_abs_error > 1e-4) {
+            LOG_ERR("%s: wrapped on-device continuation changed (nmse=%g max_abs=%g)\n",
+                    __func__, nmse, max_abs_error);
+            return false;
+        }
+    }
+
     const auto partial_flags = llama_state_seq_flags(LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
     std::vector<double> save_times_ms;
     std::vector<double> restore_times_ms;

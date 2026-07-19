@@ -268,6 +268,21 @@ size_t read_kvarn_exact_tail_v13_component(
     }
     const size_t begin = io.n_bytes();
     size_t tensor_ops = 0;
+    if (on_device) {
+        // Device state buffers retain one tensor per write operation. Keep a
+        // canonical row topology so a wrapped source can restore into a
+        // destination with different physical run boundaries.
+        for (const auto & payload_destinations : destinations) {
+            if (payload_destinations.size() != 1) {
+                throw std::runtime_error("on-device KVarN exact-tail state requires one destination slot per payload");
+            }
+            const auto span = kvarn_tail_checked_span(tensor, payload_destinations[0], 1, row_size);
+            io.read_tensor(tensor, span.offset, span.size);
+            ++tensor_ops;
+        }
+        return tensor_ops;
+    }
+
     for (size_t payload = 0; payload < destinations.size();) {
         if (destinations[payload].size() == 1) {
             uint32_t length = 1;
@@ -284,9 +299,6 @@ size_t read_kvarn_exact_tail_v13_component(
             continue;
         }
 
-        if (on_device) {
-            throw std::runtime_error("on-device KVarN exact-tail state requires one destination slot per payload");
-        }
         std::vector<uint8_t> row(static_cast<size_t>(row_size));
         io.read(row.data(), row.size());
         for (const int32_t slot : destinations[payload]) {
@@ -297,7 +309,7 @@ size_t read_kvarn_exact_tail_v13_component(
         ++payload;
     }
 
-    if (!on_device && (io.n_bytes() < begin || io.n_bytes() - begin != size_t(expected_bytes))) {
+    if (io.n_bytes() < begin || io.n_bytes() - begin != size_t(expected_bytes)) {
         throw std::runtime_error("KVarN exact-tail component byte count mismatch");
     }
     return tensor_ops;
@@ -1623,6 +1635,7 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
         }
     }
     const auto exact_payload_runs = llama_kv_tail_contiguous_slot_runs(exact_payload_slots);
+    const bool on_device = (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) != 0;
     io.write(&has_exact_tail, sizeof(has_exact_tail));
     io.write(&exact_tail_tokens, sizeof(exact_tail_tokens));
     io.write(&state_exact_type, sizeof(state_exact_type));
@@ -1680,18 +1693,36 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
         io.write(&v_tail_row, sizeof(v_tail_row));
         if (layer.k_tail) {
             kvarn_tail_add_bytes(exact_payload_bytes, kvarn_tail_checked_bytes(n_exact_payloads, k_tail_row));
-            for (const auto & run : exact_payload_runs) {
-                const auto span = kvarn_tail_checked_span(layer.k_tail, run.slot_begin, run.length, k_tail_row);
-                io.write_tensor(layer.k_tail, span.offset, span.size);
-                ++exact_tensor_ops;
+            if (on_device) {
+                // Match the layout-independent row topology used by the
+                // on-device reader; host checkpoints use the batched runs.
+                for (const int32_t slot : exact_payload_slots) {
+                    const auto span = kvarn_tail_checked_span(layer.k_tail, slot, 1, k_tail_row);
+                    io.write_tensor(layer.k_tail, span.offset, span.size);
+                    ++exact_tensor_ops;
+                }
+            } else {
+                for (const auto & run : exact_payload_runs) {
+                    const auto span = kvarn_tail_checked_span(layer.k_tail, run.slot_begin, run.length, k_tail_row);
+                    io.write_tensor(layer.k_tail, span.offset, span.size);
+                    ++exact_tensor_ops;
+                }
             }
         }
         if (layer.v_tail) {
             kvarn_tail_add_bytes(exact_payload_bytes, kvarn_tail_checked_bytes(n_exact_payloads, v_tail_row));
-            for (const auto & run : exact_payload_runs) {
-                const auto span = kvarn_tail_checked_span(layer.v_tail, run.slot_begin, run.length, v_tail_row);
-                io.write_tensor(layer.v_tail, span.offset, span.size);
-                ++exact_tensor_ops;
+            if (on_device) {
+                for (const int32_t slot : exact_payload_slots) {
+                    const auto span = kvarn_tail_checked_span(layer.v_tail, slot, 1, v_tail_row);
+                    io.write_tensor(layer.v_tail, span.offset, span.size);
+                    ++exact_tensor_ops;
+                }
+            } else {
+                for (const auto & run : exact_payload_runs) {
+                    const auto span = kvarn_tail_checked_span(layer.v_tail, run.slot_begin, run.length, v_tail_row);
+                    io.write_tensor(layer.v_tail, span.offset, span.size);
+                    ++exact_tensor_ops;
+                }
             }
         }
     }
@@ -1700,7 +1731,7 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
             "%s: KVarN state save: kind=%s version=%u payloads=%u tail_bytes=%llu runs=%zu tensor_ops=%zu device=%s\n",
             __func__, partial_state ? "partial" : "full", KVAR_N_STATE_VERSION, n_exact_payloads,
             (unsigned long long) exact_payload_bytes, exact_payload_runs.size(), exact_tensor_ops,
-            (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) != 0 ? "true" : "false");
+            on_device ? "true" : "false");
 }
 
 void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
