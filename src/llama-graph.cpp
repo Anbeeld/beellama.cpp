@@ -25,21 +25,6 @@
 
 // dedup helpers
 
-static enum ggml_flash_attn_ext_kvarn_domain llm_kvarn_attn_domain(
-        const ggml_tensor * q,
-        bool native_attention,
-        bool native_original_v) {
-    if (!native_attention || !native_original_v) {
-        return GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED;
-    }
-    // At this point Q is still in graph-builder layout [head_dim, n_head, n_tokens].
-    // True decode stays entirely in the rotated domain. Multi-row batches rotate
-    // Q/K but reconstruct V in the original domain inside native FlashAttention.
-    return q->ne[2] == 1 ?
-        GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED :
-        GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V;
-}
-
 static void llm_flash_attn_ext_set_kvarn_domain(
         ggml_tensor * cur,
         enum ggml_flash_attn_ext_kvarn_domain domain) {
@@ -3087,9 +3072,11 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto * mctx_cur = inp->mctx;
     const auto * kvarn_ctx = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur);
     const bool use_kvarn = kvarn_ctx != nullptr;
-    const auto kvarn_domain = use_kvarn ? llm_kvarn_attn_domain(
-        q_cur, kvarn_ctx->uses_native_attention(il),
-        kvarn_ctx->native_attention_uses_original_v(il)) :
+    const auto kvarn_domain = use_kvarn ? llama_kvarn_attention_domain(
+        kvarn_ctx->uses_native_attention(il),
+        kvarn_ctx->native_attention_uses_original_v(il),
+        kvarn_ctx->native_rotated_max_query_tokens(il),
+        (uint32_t) q_cur->ne[2]) :
         GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO;
     const bool use_kvarn_rotated_domain = use_kvarn &&
         kvarn_domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED;
@@ -3440,9 +3427,11 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
     const auto * kvarn_ctx = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur);
     const bool use_kvarn = kvarn_ctx != nullptr;
-    const auto kvarn_domain = use_kvarn ? llm_kvarn_attn_domain(
-        q_cur, kvarn_ctx->uses_native_attention(il),
-        kvarn_ctx->native_attention_uses_original_v(il)) :
+    const auto kvarn_domain = use_kvarn ? llama_kvarn_attention_domain(
+        kvarn_ctx->uses_native_attention(il),
+        kvarn_ctx->native_attention_uses_original_v(il),
+        kvarn_ctx->native_rotated_max_query_tokens(il),
+        (uint32_t) q_cur->ne[2]) :
         GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO;
     const bool use_kvarn_rotated_domain = use_kvarn &&
         kvarn_domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED;

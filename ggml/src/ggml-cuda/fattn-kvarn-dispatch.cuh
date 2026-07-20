@@ -27,6 +27,7 @@ struct ggml_cuda_kv_memory_transient_stats {
 
 void ggml_cuda_fattn_kvarn_route_stats_reset();
 void ggml_cuda_fattn_kvarn_route_stats_get(ggml_cuda_fattn_kvarn_route_stats * stats);
+uint32_t ggml_cuda_fattn_kvarn_decode_max_q();
 
 void ggml_cuda_kv_memory_transient_stats_reset();
 void ggml_cuda_kv_memory_transient_stats_get(ggml_cuda_kv_memory_transient_stats * stats);

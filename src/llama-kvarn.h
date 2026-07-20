@@ -62,6 +62,12 @@ llama_kvarn_tile_layout llama_kvarn_make_layout(int head_dim, int group, int key
 int  llama_kvarn_head_slices(int head_dim);
 bool llama_kvarn_head_dim_supported(int head_dim);
 
+enum ggml_flash_attn_ext_kvarn_domain llama_kvarn_attention_domain(
+        bool native_attention,
+        bool native_original_v,
+        uint32_t native_rotated_max_query_tokens,
+        uint32_t n_query_tokens);
+
 size_t  llama_kvarn_packed_bytes(int n_values, int bits);
 void    llama_kvarn_pack_bits(const uint8_t * values, int n_values, int bits, uint8_t * dst);
 uint8_t llama_kvarn_unpack_bits_value(const uint8_t * src, int index, int bits);

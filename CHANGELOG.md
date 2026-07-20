@@ -20,6 +20,15 @@
   exact-tail bytes, transactional restores, host/on-device sequence state, and
   v12 host-state compatibility while exposing debug-level transfer-count
   diagnostics.
+- Kept small speculative verification batches on CUDA's native KVarN split
+  decode path instead of materializing the full active K/V window. CUDA now
+  reports its rotated-query capacity to the model graph, which uses the fast
+  path for batches through 16 tokens and retains original-domain V prefill for
+  larger batches. This applies uniformly to DFlash, MTP, EAGLE3, and n-gram
+  speculation; long-context DFlash decode no longer degrades from repeatedly
+  reconstructing the entire compressed cache. CUDA builds with dedicated
+  KVarN kernels disabled also retain complete false capability stubs and link
+  cleanly.
 
 ## v0.4.0
 

@@ -1,5 +1,7 @@
 #pragma once
 
+constexpr int GGML_CUDA_FATTN_KVARN_DECODE_MAX_Q = 16;
+
 enum ggml_cuda_fattn_kvarn_route {
     GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_SPLIT,
     GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_VECTOR,

@@ -49,6 +49,8 @@ int main(int argc, char ** argv) {
     bool ok = true;
 
     ok &= expect(argc == 2, "expected repo root argument");
+    ok &= expect(GGML_CUDA_FATTN_KVARN_DECODE_MAX_Q == 16,
+        "CUDA KVarN split decode must cover a complete DFlash verification block");
     if (!ok) {
         return 1;
     }
@@ -81,7 +83,7 @@ int main(int argc, char ** argv) {
     expect_route({256, 1, 2, 4, 4, true, false, true, true, false},
         GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_VECTOR,
         "Gemma-like D256 SWA decode did not select vector decode");
-    for (int n_q = 2; n_q <= 8; ++n_q) {
+    for (int n_q = 2; n_q <= GGML_CUDA_FATTN_KVARN_DECODE_MAX_Q; ++n_q) {
         expect_route({256, n_q, 6, 4, 4, false, false, false, true, false},
             GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_SPLIT,
             "supported multi-token verification shape did not select split decode");
@@ -117,6 +119,11 @@ int main(int argc, char ** argv) {
     ok &= expect(kvarn.find("ggml_cuda_flash_attn_ext_mma_kvarn(ctx, dst);") != std::string::npos &&
                  kvarn.find("return true;") != std::string::npos,
         "unsupported KVarN fast-decode pairs must fall through to descriptor-native MMA");
+    const std::string no_kvarn = slice_between(kvarn,
+            "#if !defined(GGML_CUDA_KVARN)",
+            "#else");
+    ok &= expect(no_kvarn.find("ggml_cuda_flash_attn_ext_kvarn_portable_supported") != std::string::npos,
+        "GGML_CUDA_KVARN=OFF must retain a false portable-support stub for generic FlashAttention");
     ok &= expect(kvarn.find("if (dst->src[8] == nullptr)") == std::string::npos,
         "optional body metadata must not disable specialized KVarN decode routes");
     ok &= expect(kvarn.find("args.dst_meta") != std::string::npos,

@@ -4768,6 +4768,16 @@ static bool ggml_backend_cuda_kvarn_native_original_v(ggml_backend_dev_t dev) {
 #endif
 }
 
+static uint32_t ggml_backend_cuda_kvarn_native_rotated_max_query_tokens(ggml_backend_dev_t dev) {
+#if !defined(GGML_CUDA_KVARN) || defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(dev);
+    return 0;
+#else
+    return ggml_backend_cuda_kvarn_native_original_v(dev) ?
+        ggml_cuda_fattn_kvarn_decode_max_q() : 0;
+#endif
+}
+
 static bool ggml_backend_cuda_kvarn_ops(ggml_backend_dev_t dev) {
 #if !defined(GGML_CUDA_KVARN) || defined(GGML_USE_MUSA)
     GGML_UNUSED(dev);
@@ -5493,6 +5503,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_kvarn_native_original_v") == 0) {
         return (void *)ggml_backend_cuda_kvarn_native_original_v;
+    }
+    if (strcmp(name, "ggml_backend_kvarn_native_rotated_max_query_tokens") == 0) {
+        return (void *)ggml_backend_cuda_kvarn_native_rotated_max_query_tokens;
     }
     if (strcmp(name, "ggml_backend_kvarn_ops") == 0) {
         return (void *)ggml_backend_cuda_kvarn_ops;

@@ -105,6 +105,19 @@ bool llama_kvarn_backend_native_attention_uses_original_v(ggml_backend_dev_t dev
     return fn != nullptr && fn(dev);
 }
 
+uint32_t llama_kvarn_backend_native_rotated_max_query_tokens(ggml_backend_dev_t dev) {
+    if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return 0;
+    }
+
+    using ggml_backend_kvarn_native_rotated_max_query_tokens_t = uint32_t (*)(ggml_backend_dev_t dev);
+    auto * reg = ggml_backend_dev_backend_reg(dev);
+    auto * fn = reg ? (ggml_backend_kvarn_native_rotated_max_query_tokens_t)
+        ggml_backend_reg_get_proc_address(
+            reg, "ggml_backend_kvarn_native_rotated_max_query_tokens") : nullptr;
+    return fn != nullptr ? fn(dev) : 0;
+}
+
 bool llama_kvarn_backend_supports_ops(ggml_backend_dev_t dev) {
     if (dev == nullptr) {
         return true; // the built-in CPU backend implements store + materialize
@@ -991,6 +1004,8 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
             llama_kvarn_backend_supports_native_ops(dev) && native_tail;
         const bool native_original_v = native_attention &&
             llama_kvarn_backend_native_attention_uses_original_v(dev);
+        const uint32_t native_rotated_max_query_tokens = native_original_v ?
+            llama_kvarn_backend_native_rotated_max_query_tokens(dev) : 0;
 
         const uint32_t n_head_k_sliced = n_head_kv * (uint32_t) k_slices;
         const uint32_t n_head_v_sliced = n_head_kv * (uint32_t) v_slices;
@@ -1058,6 +1073,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
             (uint32_t) v_slices,
             native_attention,
             native_original_v,
+            native_rotated_max_query_tokens,
             k_records,
             v_records,
             k_stage,
@@ -1795,6 +1811,10 @@ bool llama_kv_cache_kvarn_context::native_attention_uses_original_v(int32_t il) 
     return cache->native_attention_uses_original_v(il);
 }
 
+uint32_t llama_kv_cache_kvarn_context::native_rotated_max_query_tokens(int32_t il) const {
+    return cache->native_rotated_max_query_tokens(il);
+}
+
 void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     if (has_pending_stream_copies()) {
         throw std::runtime_error("cannot restore KVarN state while a stream copy is pending");
@@ -2027,6 +2047,10 @@ bool llama_kv_cache_kvarn::uses_native_attention(int32_t il) const {
 
 bool llama_kv_cache_kvarn::native_attention_uses_original_v(int32_t il) const {
     return layer_for(il).native_original_v;
+}
+
+uint32_t llama_kv_cache_kvarn::native_rotated_max_query_tokens(int32_t il) const {
+    return layer_for(il).native_rotated_max_query_tokens;
 }
 
 ggml_tensor * llama_kv_cache_kvarn::get_tail(

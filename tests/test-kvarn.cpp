@@ -52,6 +52,33 @@ static void test_type_table() {
     require(llama_kvarn_type_desc_from_name("kvarn_k7v2_g128") == nullptr, "invalid type parsed");
 }
 
+static void test_attention_domain_policy() {
+    require(llama_kvarn_attention_domain(false, false, 0, 64) ==
+                GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED,
+            "materialized KVarN attention must remain in the rotated domain");
+    require(llama_kvarn_attention_domain(true, false, 0, 64) ==
+                GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED,
+            "portable native KVarN attention must remain in the rotated domain");
+    require(llama_kvarn_attention_domain(true, true, 16, 1) ==
+                GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED,
+            "single-token optimized KVarN decode must remain in the rotated domain");
+    require(llama_kvarn_attention_domain(true, true, 16, 9) ==
+                GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED,
+            "DFlash verification must use the rotated KVarN decode domain");
+    require(llama_kvarn_attention_domain(true, true, 16, 16) ==
+                GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED,
+            "full DFlash block verification must use the rotated KVarN decode domain");
+    require(llama_kvarn_attention_domain(true, true, 16, 17) ==
+                GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V,
+            "large KVarN batches must retain original-domain V prefill");
+    require(llama_kvarn_attention_domain(true, true, 0, 1) ==
+                GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED,
+            "a backend without an extended capability must retain true decode");
+    require(llama_kvarn_attention_domain(true, true, 0, 2) ==
+                GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V,
+            "a backend without an extended capability must retain multi-row prefill");
+}
+
 static void set_test_env(const char * name, const char * value) {
 #if defined(_WIN32)
     require(_putenv_s(name, value ? value : "") == 0, "failed to update test environment");
@@ -2373,6 +2400,7 @@ struct test_kvarn_route_stats {
 
 using test_kvarn_route_stats_reset_fn = void (*)();
 using test_kvarn_route_stats_get_fn = void (*)(test_kvarn_route_stats *);
+using test_kvarn_rotated_max_query_tokens_fn = uint32_t (*)(ggml_backend_dev_t);
 
 static std::pair<test_kvarn_route_stats_reset_fn, test_kvarn_route_stats_get_fn>
 get_kvarn_route_stats_fns(ggml_backend_t backend) {
@@ -2523,6 +2551,17 @@ static void test_native_flash_attention_gpu() {
     ggml_backend_t cpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_CPU, true);
 
     const auto [route_stats_reset, route_stats_get] = get_kvarn_route_stats_fns(gpu_backend);
+    if (route_stats_reset != nullptr && route_stats_get != nullptr) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(gpu_backend);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        auto rotated_max_query_tokens = reg ? reinterpret_cast<test_kvarn_rotated_max_query_tokens_fn>(
+            ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_kvarn_native_rotated_max_query_tokens")) : nullptr;
+        require(rotated_max_query_tokens != nullptr,
+                "optimized CUDA KVarN backend omitted its rotated query-batch capability");
+        require(rotated_max_query_tokens(dev) >= 16,
+                "optimized CUDA KVarN backend does not cover a complete DFlash verification block");
+    }
     test_native_flash_attention_portable_backend(gpu_backend, cpu_backend, "GPU");
     if (route_stats_reset == nullptr || route_stats_get == nullptr ||
             std::getenv("GGML_KVARN_TEST_FORCE_PORTABLE_FATTN") != nullptr) {
@@ -2535,23 +2574,23 @@ static void test_native_flash_attention_gpu() {
     }
 
     const auto require_metadata_case = [&](int head_dim, int n_q, int n_q_heads,
-                                           int n_kv_heads, bool swa,
+                                           int n_kv_heads, int bits, bool swa,
                                            uint64_t min_split, uint64_t min_vector,
                                            const char * message) {
         std::vector<float> generic_meta;
         std::vector<float> actual_meta;
         const std::vector<float> expected = test_native_flash_attention_output(
-                cpu_backend, false, false, head_dim, 4, 4, n_q, n_q_heads, n_kv_heads,
+                cpu_backend, false, false, head_dim, bits, bits, n_q, n_q_heads, n_kv_heads,
                 1024, 5, swa);
         route_stats_reset();
         const std::vector<float> generic = test_native_flash_attention_output(
-                gpu_backend, true, true, head_dim, 4, 4, n_q, n_q_heads, n_kv_heads,
+                gpu_backend, true, true, head_dim, bits, bits, n_q, n_q_heads, n_kv_heads,
                 1024, 5, swa, &generic_meta, true);
         test_kvarn_route_stats generic_stats = {};
         route_stats_get(&generic_stats);
         route_stats_reset();
         const std::vector<float> actual = test_native_flash_attention_output(
-                gpu_backend, true, true, head_dim, 4, 4, n_q, n_q_heads, n_kv_heads,
+                gpu_backend, true, true, head_dim, bits, bits, n_q, n_q_heads, n_kv_heads,
                 1024, 5, swa, &actual_meta);
         test_kvarn_route_stats stats = {};
         route_stats_get(&stats);
@@ -2578,16 +2617,20 @@ static void test_native_flash_attention_gpu() {
         }
     };
 
-    require_metadata_case(256, 1, 6, 1, false, 1, 0,
+    require_metadata_case(256, 1, 6, 1, 4, false, 1, 0,
             "Qwen-like D256 metadata-capable split output differs from reference");
-    require_metadata_case(512, 1, 16, 1, false, 1, 0,
+    require_metadata_case(512, 1, 16, 1, 4, false, 1, 0,
             "Gemma-like D512 metadata-capable split output differs from reference");
-    require_metadata_case(256, 1, 2, 1, true, 0, 1,
+    require_metadata_case(256, 1, 2, 1, 4, true, 0, 1,
             "Gemma-like D256 SWA metadata-capable vector output differs from reference");
-    for (int n_q = 2; n_q <= 8; ++n_q) {
-        require_metadata_case(256, n_q, 6, 1, false, 1, 0,
+    for (int n_q = 2; n_q <= 16; ++n_q) {
+        require_metadata_case(256, n_q, 6, 1, 4, false, 1, 0,
                 "multi-token metadata-capable split output differs from reference");
     }
+    require_metadata_case(256, 9, 6, 1, 6, false, 1, 0,
+            "KVarN6 DFlash-sized split output differs from reference");
+    require_metadata_case(256, 16, 6, 1, 6, false, 1, 0,
+            "KVarN6 full-block split output differs from reference");
 
     const auto require_exact_tail_case = [&](int head_dim, int n_q, int n_q_heads,
                                               int n_kv_heads, bool swa, int tail_tokens,
@@ -2627,7 +2670,7 @@ static void test_native_flash_attention_gpu() {
             "D512 exact-tail merge differs from generic KVarN reference");
     require_exact_tail_case(256, 1, 2, 1, true, 128, 0, 1,
             "D256 SWA vector exact-tail merge differs from generic KVarN reference");
-    for (int n_q = 2; n_q <= 8; ++n_q) {
+    for (int n_q = 2; n_q <= 16; ++n_q) {
         require_exact_tail_case(256, n_q, 6, 1, false, 128, 1, 0,
                 "speculative exact-tail merge differs from generic KVarN reference");
     }
@@ -3512,6 +3555,7 @@ int main() {
     kvarn_unified_save_requires_exclusive_stream();
     kvarn_unified_restore_requires_exclusive_stream();
     test_type_table();
+    test_attention_domain_policy();
     test_stage_policy();
     test_memory_stats_aggregation();
     test_exact_tail_policy();

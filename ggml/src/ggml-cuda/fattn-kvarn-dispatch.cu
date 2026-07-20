@@ -30,6 +30,10 @@ static std::atomic<uint64_t> g_kv_mem_tail_plan_input{0};
 static std::atomic<uint64_t> g_kv_mem_tail_total{0};
 static std::atomic<bool> g_kv_mem_stats_enabled{false};
 
+uint32_t ggml_cuda_fattn_kvarn_decode_max_q() {
+    return GGML_CUDA_FATTN_KVARN_DECODE_MAX_Q;
+}
+
 static void ggml_cuda_atomic_max(std::atomic<uint64_t> & dst, uint64_t value) {
     uint64_t current = dst.load(std::memory_order_relaxed);
     while (current < value && !dst.compare_exchange_weak(
@@ -129,6 +133,12 @@ bool ggml_cuda_flash_attn_ext_kvarn_uses_views(const ggml_tensor * dst) {
 }
 
 bool ggml_cuda_flash_attn_ext_kvarn_supported(int device, const ggml_tensor * dst) {
+    GGML_UNUSED(device);
+    GGML_UNUSED(dst);
+    return false;
+}
+
+bool ggml_cuda_flash_attn_ext_kvarn_portable_supported(int device, const ggml_tensor * dst) {
     GGML_UNUSED(device);
     GGML_UNUSED(dst);
     return false;
@@ -550,7 +560,7 @@ static bool ggml_cuda_flash_attn_ext_kvarn_decode_supported(
     if (!ggml_cuda_fattn_kvarn_rotated_decode_domain(dst)) {
         return false;
     }
-    if (Q->ne[1] > 8) {
+    if (Q->ne[1] > GGML_CUDA_FATTN_KVARN_DECODE_MAX_Q) {
         return false;
     }
     if (sinks != nullptr || max_bias != 0.0f) {
@@ -824,7 +834,7 @@ bool ggml_cuda_flash_attn_ext_kvarn(
     }
 
     const ggml_tensor * Q = dst->src[0];
-    const bool prompt_prefill = Q->ne[1] > 8;
+    const bool prompt_prefill = Q->ne[1] > GGML_CUDA_FATTN_KVARN_DECODE_MAX_Q;
     const bool vector_eligible = !prompt_prefill && ggml_cuda_flash_attn_ext_kvarn_vec_supported(plan, dst);
     const bool split_eligible = !prompt_prefill && ggml_cuda_flash_attn_ext_kvarn_decode_supported(plan, dst);
     const int gqa = plan.n_kv_heads > 0 && Q->ne[2] % plan.n_kv_heads == 0 ?

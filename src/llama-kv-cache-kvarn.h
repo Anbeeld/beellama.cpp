@@ -98,6 +98,7 @@ public:
     ggml_tensor * get_v_native(ggml_context * ctx, int32_t il) const;
     bool uses_native_attention(int32_t il) const;
     bool native_attention_uses_original_v(int32_t il) const;
+    uint32_t native_rotated_max_query_tokens(int32_t il) const;
 
     // SWA sliding-window ring: per-cell absolute positions for KVarN reads.
     // Built as a graph input sized [n_kv]; set on the host from cells.pos_get(cell).
@@ -235,6 +236,7 @@ public:
     bool is_swa() const { return swa; }
     bool uses_native_attention(int32_t il) const;
     bool native_attention_uses_original_v(int32_t il) const;
+    uint32_t native_rotated_max_query_tokens(int32_t il) const;
 
     // Reference-faithful staging keeps one incomplete 128-token group lossless.
     // Completed records are committed eagerly, so physical ubatch size does not
@@ -287,6 +289,7 @@ private:
         uint32_t v_slices;
         bool native_attention;
         bool native_original_v;
+        uint32_t native_rotated_max_query_tokens;
         ggml_tensor * k_records;
         ggml_tensor * v_records;
         ggml_tensor * k_stage;
