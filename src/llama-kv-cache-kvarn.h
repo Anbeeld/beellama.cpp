@@ -14,6 +14,8 @@ struct llama_model;
 
 bool llama_kvarn_backend_supports_native_ops(ggml_backend_dev_t dev);
 bool llama_kvarn_backend_supports_ops(ggml_backend_dev_t dev);
+bool llama_kvarn_backend_native_attention_uses_original_v(ggml_backend_dev_t dev);
+uint32_t llama_kvarn_backend_native_rotated_max_query_tokens(ggml_backend_dev_t dev);
 
 struct llama_kvarn_tail_policy {
     uint32_t raw_requested_tokens;
