@@ -42,10 +42,11 @@ sink, body, and suffix form one softmax and each physical key contributes once.
 The same generic tail descriptor and lifecycle logic remains KVarN-neutral.
 
 Head dimensions 128, 256, and 512 are handled as one, two, or four KVarN slices.
-The WHT/store paths accept F16 and BF16 canonical inputs. CUDA supports native
-KVarN attention plus the exact merge. CPU supplies storage/reference oracles.
-Vulkan supports eager storage but fails KVarN context placement closed because
-it does not yet consume native KVarN views in FlashAttention.
+The WHT/store paths accept F16 and BF16 canonical inputs. CUDA uses optimized
+native kernels; ROCm/HIP uses the portable direct-record kernel; CPU and Vulkan
+also consume KVarN views directly. All four paths fuse the F16/BF16 exact tail
+into the same softmax. Vulkan native attention requires shader Int64 and
+buffer-device-address support and otherwise declines the native route.
 
 Persistent placement is finalized in two phases. KVarN records and F16 stages
 are allocated first; their realized buffer owner is then used for route

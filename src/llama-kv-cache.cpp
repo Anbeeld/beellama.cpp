@@ -46,7 +46,10 @@ static bool backend_supports_native_kv_tail(
         ggml_type body_k, ggml_type body_v,
         ggml_type tail_k, ggml_type tail_v,
         int64_t d_k, int64_t d_v) {
-    const auto dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
+    auto dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
+    if (!dev) {
+        dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    }
     const auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
     const auto fn = reg ? reinterpret_cast<backend_kv_tail_attention_supported_t>(
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_kv_tail_attention_supported")) : nullptr;
@@ -62,8 +65,11 @@ static llama_kv_tail_route_capability probe_standard_kv_tail_route(
     if (!spec.has_v) {
         return { false, LLAMA_KV_TAIL_ROUTE_NONE, LLAMA_KV_TAIL_OP_WRITE_V };
     }
-    auto * dev = ggml_backend_buft_get_device(spec.buft);
     auto * cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    auto * dev = ggml_backend_buft_get_device(spec.buft);
+    if (!dev) {
+        dev = cpu;
+    }
     if (!dev || !cpu) {
         return { false, LLAMA_KV_TAIL_ROUTE_NONE, LLAMA_KV_TAIL_OP_WRITE_K };
     }
@@ -178,6 +184,9 @@ static llama_kv_tail_route_capability probe_standard_native_exact_route(
         return { false, LLAMA_KV_TAIL_ROUTE_NONE, LLAMA_KV_TAIL_OP_WRITE_V };
     }
     auto * dev = ggml_backend_buft_get_device(spec.buft);
+    if (!dev) {
+        dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    }
     if (!dev) {
         return { false, LLAMA_KV_TAIL_ROUTE_NONE, LLAMA_KV_TAIL_OP_WRITE_K };
     }

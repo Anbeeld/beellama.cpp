@@ -6,6 +6,7 @@
 #include "fattn-mma-kvarn-case-decl.cuh"
 #include "fattn-mma-kvarn-decode-decl.cuh"
 #include "fattn-mma-kvarn.cuh"
+#include "fattn-kvarn-portable.cuh"
 
 #include <cstdio>
 #include <cstdlib>
@@ -779,7 +780,29 @@ bool ggml_cuda_flash_attn_ext_kvarn_supported(
     GGML_UNUSED(dst);
     return false;
 #else
-    return ggml_cuda_fattn_kvarn_supported(device, dst);
+    ggml_cuda_fattn_kvarn_plan plan;
+    if (!ggml_cuda_fattn_kvarn_supported(device, dst, &plan)) {
+        return false;
+    }
+#if defined(GGML_USE_HIP)
+    return ggml_cuda_fattn_kvarn_portable_supported(plan, dst);
+#else
+    return true;
+#endif
+#endif
+}
+
+bool ggml_cuda_flash_attn_ext_kvarn_portable_supported(
+        int device,
+        const ggml_tensor * dst) {
+#ifndef FLASH_ATTN_AVAILABLE
+    GGML_UNUSED(device);
+    GGML_UNUSED(dst);
+    return false;
+#else
+    ggml_cuda_fattn_kvarn_plan plan;
+    return ggml_cuda_fattn_kvarn_supported(device, dst, &plan) &&
+        ggml_cuda_fattn_kvarn_portable_supported(plan, dst);
 #endif
 }
 
@@ -789,6 +812,15 @@ bool ggml_cuda_flash_attn_ext_kvarn(
     ggml_cuda_fattn_kvarn_plan plan;
     if (!ggml_cuda_fattn_kvarn_supported(ctx.device, dst, &plan)) {
         return false;
+    }
+
+#if defined(GGML_USE_HIP)
+    return ggml_cuda_flash_attn_ext_kvarn_portable(ctx, dst, plan);
+#else
+    const char * force_portable = getenv("GGML_KVARN_TEST_FORCE_PORTABLE_FATTN");
+    if (force_portable != nullptr && atoi(force_portable) != 0 &&
+            ggml_cuda_fattn_kvarn_portable_supported(plan, dst)) {
+        return ggml_cuda_flash_attn_ext_kvarn_portable(ctx, dst, plan);
     }
 
     const ggml_tensor * Q = dst->src[0];
@@ -824,6 +856,7 @@ bool ggml_cuda_flash_attn_ext_kvarn(
     }
     ggml_cuda_flash_attn_ext_mma_kvarn(ctx, dst);
     return true;
+#endif
 }
 
 #endif // GGML_CUDA_KVARN

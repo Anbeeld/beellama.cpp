@@ -26,7 +26,12 @@
 // dedup helpers
 
 static enum ggml_flash_attn_ext_kvarn_domain llm_kvarn_attn_domain(
-        const ggml_tensor * q) {
+        const ggml_tensor * q,
+        bool native_attention,
+        bool native_original_v) {
+    if (!native_attention || !native_original_v) {
+        return GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED;
+    }
     // At this point Q is still in graph-builder layout [head_dim, n_head, n_tokens].
     // True decode stays entirely in the rotated domain. Multi-row batches rotate
     // Q/K but reconstruct V in the original domain inside native FlashAttention.
@@ -3082,7 +3087,9 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto * mctx_cur = inp->mctx;
     const auto * kvarn_ctx = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur);
     const bool use_kvarn = kvarn_ctx != nullptr;
-    const auto kvarn_domain = use_kvarn ? llm_kvarn_attn_domain(q_cur) :
+    const auto kvarn_domain = use_kvarn ? llm_kvarn_attn_domain(
+        q_cur, kvarn_ctx->uses_native_attention(il),
+        kvarn_ctx->native_attention_uses_original_v(il)) :
         GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO;
     const bool use_kvarn_rotated_domain = use_kvarn &&
         kvarn_domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED;
@@ -3146,8 +3153,8 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kq_mask = inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = use_kvarn ? kvarn_ctx->get_k_native(ctx0, il) : mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = use_kvarn ? kvarn_ctx->get_v_native(ctx0, il) : mctx_cur->get_v(ctx0, il);
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
     ggml_tensor * kvarn_rot = use_kvarn ? llm_kvarn_rot_for_dim(
             inp->self_kvarn_rot_128, inp->self_kvarn_rot_256,
             inp->self_kvarn_rot_512, q->ne[0]) : nullptr;
@@ -3433,7 +3440,9 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
     const auto * kvarn_ctx = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur);
     const bool use_kvarn = kvarn_ctx != nullptr;
-    const auto kvarn_domain = use_kvarn ? llm_kvarn_attn_domain(q_cur) :
+    const auto kvarn_domain = use_kvarn ? llm_kvarn_attn_domain(
+        q_cur, kvarn_ctx->uses_native_attention(il),
+        kvarn_ctx->native_attention_uses_original_v(il)) :
         GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO;
     const bool use_kvarn_rotated_domain = use_kvarn &&
         kvarn_domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED;
@@ -3511,8 +3520,8 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = use_kvarn ? kvarn_ctx->get_k_native(ctx0, il) : mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = use_kvarn ? kvarn_ctx->get_v_native(ctx0, il) : mctx_cur->get_v(ctx0, il);
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
     ggml_tensor * kvarn_rot = use_kvarn ? llm_kvarn_rot_for_dim(
             inp->self_kvarn_rot_128, inp->self_kvarn_rot_256,
             inp->self_kvarn_rot_512, q->ne[0]) : nullptr;

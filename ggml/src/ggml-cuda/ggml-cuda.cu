@@ -2350,6 +2350,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_KVARN_STORE:
             ggml_cuda_op_kvarn_store(ctx, dst);
             break;
+        case GGML_OP_KVARN_MATERIALIZE:
+            ggml_cuda_op_kvarn_materialize(ctx, dst);
+            break;
 #endif
         case GGML_OP_FILL:
             ggml_cuda_op_fill(ctx, dst);
@@ -4740,14 +4743,43 @@ static bool ggml_backend_cuda_kvarn_native_ops(ggml_backend_dev_t dev) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
     const int device = dev_ctx->device;
     const auto & info = ggml_cuda_info();
-    if (device < 0 || device >= info.device_count || !turing_mma_available(info.devices[device].cc)) {
+    if (device < 0 || device >= info.device_count) {
         return false;
     }
+#if !defined(GGML_USE_HIP)
+    if (!turing_mma_available(info.devices[device].cc)) {
+        return false;
+    }
+#endif
 
     const size_t high_shared = ggml_cuda_kvarn_required_shared_bytes();
     const size_t low_shared = ggml_cuda_kvarn_low_shared_bytes();
     GGML_ASSERT(low_shared <= high_shared);
     return info.devices[device].smpbo >= low_shared;
+#endif
+}
+
+static bool ggml_backend_cuda_kvarn_native_original_v(ggml_backend_dev_t dev) {
+#if !defined(GGML_CUDA_KVARN) || defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(dev);
+    return false;
+#else
+    return ggml_backend_cuda_kvarn_native_ops(dev);
+#endif
+}
+
+static bool ggml_backend_cuda_kvarn_ops(ggml_backend_dev_t dev) {
+#if !defined(GGML_CUDA_KVARN) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(dev);
+    return false;
+#else
+    if (dev == nullptr || dev->context == nullptr) {
+        return false;
+    }
+    const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
+    const auto & info = ggml_cuda_info();
+    return device >= 0 && device < info.device_count &&
+        info.devices[device].smpbo >= ggml_cuda_kvarn_low_shared_bytes();
 #endif
 }
 
@@ -5238,8 +5270,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_KVARN_WHT:
         case GGML_OP_KVARN_STORE:
+        case GGML_OP_KVARN_MATERIALIZE:
 #if defined(GGML_CUDA_KVARN)
-            return ggml_backend_cuda_kvarn_native_ops(dev);
+            return ggml_backend_cuda_kvarn_ops(dev);
 #else
             return false;
 #endif
@@ -5415,6 +5448,26 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+static bool ggml_backend_cuda_kvarn_tail_attention_supported(
+        ggml_backend_dev_t dev,
+        ggml_type body_k,
+        ggml_type body_v,
+        ggml_type tail_k,
+        ggml_type tail_v,
+        int64_t d_k,
+        int64_t d_v) {
+    GGML_UNUSED(dev);
+#if defined(GGML_USE_HIP)
+    return body_k == GGML_TYPE_F16 && body_v == GGML_TYPE_F16 &&
+        (tail_k == GGML_TYPE_F16 || tail_k == GGML_TYPE_BF16) &&
+        (tail_v == GGML_TYPE_F16 || tail_v == GGML_TYPE_BF16) &&
+        d_k == d_v && (d_k == 128 || d_k == 256 || d_k == 512);
+#else
+    return ggml_cuda_flash_attn_ext_tail_supported(
+        body_k, body_v, tail_k, tail_v, d_k, d_v);
+#endif
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -5438,8 +5491,17 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_kvarn_native_ops") == 0) {
         return (void *)ggml_backend_cuda_kvarn_native_ops;
     }
+    if (strcmp(name, "ggml_backend_kvarn_native_original_v") == 0) {
+        return (void *)ggml_backend_cuda_kvarn_native_original_v;
+    }
+    if (strcmp(name, "ggml_backend_kvarn_ops") == 0) {
+        return (void *)ggml_backend_cuda_kvarn_ops;
+    }
     if (strcmp(name, "ggml_backend_kv_tail_attention_supported") == 0) {
         return (void *)ggml_cuda_flash_attn_ext_tail_supported;
+    }
+    if (strcmp(name, "ggml_backend_kvarn_tail_attention_supported") == 0) {
+        return (void *)ggml_backend_cuda_kvarn_tail_attention_supported;
     }
     if (strcmp(name, "ggml_backend_kvarn_route_stats_reset") == 0) {
         return (void *)ggml_cuda_fattn_kvarn_route_stats_reset;

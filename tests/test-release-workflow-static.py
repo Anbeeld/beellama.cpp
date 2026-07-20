@@ -9,7 +9,7 @@ WORKFLOWS = ROOT / ".github/workflows"
 
 EXPECTED_WORKFLOWS = {
     "release-dispatch.yml": "db835825856747ae5cc631f24fb1a84beac685bf22d743e52227456e86f967b0",
-    "release.yml": "73c5ed6a3cd15a451ef8cdd326dc7134d8adfabfe1022f23b60b66afca94a7c4",
+    "release.yml": "3331cedd56a8a86081c93896a217cc5fffe2afe4f908aac6c70ed02a4a78d108",
 }
 
 
@@ -31,7 +31,7 @@ def main() -> None:
         actual_hash = normalized_sha256(WORKFLOWS / name)
         if actual_hash != expected_hash:
             raise AssertionError(
-                f"{name} diverged from v0.3.2 plus the required v0.4.0 release deltas: "
+                f"{name} diverged from v0.3.2 plus the required Bee release deltas: "
                 f"expected {expected_hash}, got {actual_hash}"
             )
 

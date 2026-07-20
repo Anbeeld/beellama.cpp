@@ -184,15 +184,10 @@ const char * llama_kvarn_validate_runtime(
         return "KVarN is not supported by this attention/cache path";
     }
     if (!requirements.head_dims_supported) {
-        return "KVarN native FlashAttention requires 128-, 256-, or 512-dimensional key/value heads";
+        return "KVarN requires 128-, 256-, or 512-dimensional key/value heads";
     }
-    if (!requirements.kv_offload) {
-        return "KVarN native attention requires KV offload";
-    }
-    if (!requirements.native_backend_supported) {
-        return "KVarN requires native KVarN FlashAttention on a compatible NVIDIA CUDA device "
-               "(Turing or newer); "
-               "ROCm/HIP, Vulkan, and CPU are not supported";
+    if (!requirements.backend_ops_supported) {
+        return "KVarN requires a backend with KVarN store and materialization support";
     }
     return nullptr;
 }

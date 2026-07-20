@@ -303,7 +303,7 @@ static void test_head_dimension_slicing() {
     require(llama_kvarn_head_slices(128) == 1, "128-dim head should use one KVarN slice");
     require(llama_kvarn_head_slices(256) == 2, "256-dim head should use two KVarN slices");
     require(llama_kvarn_head_slices(512) == 4, "512-dim head should use four KVarN slices");
-    require(llama_kvarn_head_slices(384) == 0, "384-dim head has no native KVarN FA route");
+    require(llama_kvarn_head_slices(384) == 0, "384-dim head has no KVarN slice route");
     require(llama_kvarn_head_slices(64)  == 0, "64-dim head is not KVarN slice-compatible");
     require(llama_kvarn_head_slices(513) == 0, "non-128-multiple head is not KVarN slice-compatible");
 }
@@ -312,8 +312,7 @@ static void test_runtime_validation() {
     llama_kvarn_runtime_requirements supported = {};
     supported.attention_supported = true;
     supported.head_dims_supported = true;
-    supported.kv_offload = true;
-    supported.native_backend_supported = true;
+    supported.backend_ops_supported = true;
     supported.n_seq_max = 1;
     supported.kv_unified = false;
 
@@ -346,20 +345,13 @@ static void test_runtime_validation() {
             "unsupported head dimension accepted");
 
     requirements = supported;
-    requirements.kv_offload = false;
-    require(llama_kvarn_validate_runtime(llama_kvarn_params_for_type(LLAMA_KVARN_K4V2_G128), requirements) != nullptr,
-            "CPU KV placement accepted");
-
-    requirements = supported;
-    requirements.native_backend_supported = false;
+    requirements.backend_ops_supported = false;
     const char * backend_reason = llama_kvarn_validate_runtime(
             llama_kvarn_params_for_type(LLAMA_KVARN_K4V2_G128), requirements);
-    require(backend_reason != nullptr, "backend without native KVarN FA accepted");
+    require(backend_reason != nullptr, "backend without KVarN store/materialize accepted");
     require(std::string(backend_reason) ==
-            "KVarN requires native KVarN FlashAttention on a compatible NVIDIA CUDA device "
-            "(Turing or newer); "
-            "ROCm/HIP, Vulkan, and CPU are not supported",
-            "backend without native KVarN FA returned an inaccurate diagnostic");
+            "KVarN requires a backend with KVarN store and materialization support",
+            "backend without KVarN store/materialize returned an inaccurate diagnostic");
 
     requirements = supported;
     requirements.kv_unified = true;
@@ -943,7 +935,17 @@ static std::vector<float> test_kvarn_reference_decode_f32(
     return output;
 }
 
-static void test_cache_ops(enum ggml_backend_dev_type device_type, bool required, int bits) {
+static void require_close_f16_rmse(
+        const std::vector<ggml_fp16_t> & actual,
+        const std::vector<ggml_fp16_t> & expected,
+        float                            rmse_limit,
+        const char *                     message);
+
+static void test_cache_ops(
+        enum ggml_backend_dev_type device_type,
+        bool required,
+        int bits,
+        int head_slices = 1) {
     ggml_backend_t backend = init_test_backend(device_type, required);
     if (backend == nullptr) {
         return;
@@ -958,7 +960,7 @@ static void test_cache_ops(enum ggml_backend_dev_type device_type, bool required
     require(ctx != nullptr, "failed to initialize ggml context");
 
     constexpr int n_tokens = 385;
-    constexpr int n_heads = 1;
+    const int n_heads = head_slices;
     const int record_bytes = int(llama_kvarn_packed_bytes(128 * 128, bits) + 3 * 128 * sizeof(ggml_fp16_t));
 
     ggml_tensor * current = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, n_heads, n_tokens);
@@ -967,20 +969,27 @@ static void test_cache_ops(enum ggml_backend_dev_type device_type, bool required
     ggml_tensor * records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, record_bytes, n_heads, 4);
 
     ggml_tensor * stored = ggml_kvarn_store(ctx, current, indices, stage, records, bits, 16, false, 3);
+    stored->op_params[5] = head_slices;
+    ggml_tensor * materialized = ggml_kvarn_materialize(
+            ctx, records, stored, indices, n_tokens, 0, 1, bits, false, 3);
+    materialized->op_params[5] = head_slices;
 
     ggml_cgraph * graph = ggml_new_graph(ctx);
-    ggml_build_forward_expand(graph, stored);
+    ggml_build_forward_expand(graph, materialized);
 
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     require(buffer != nullptr, "failed to allocate KVarN tensors");
 
     std::vector<float> input(128 * n_heads * n_tokens);
     for (int t = 0; t < n_tokens; ++t) {
-        for (int d = 0; d < 128; ++d) {
-            input[t * 128 + d] =
-                std::sin(float(d) * 0.071f) +
-                std::cos(float(t) * 0.037f) +
-                float((d * 13 + t * 17) % 31 - 15) * 0.01f;
+        for (int h = 0; h < n_heads; ++h) {
+            for (int d = 0; d < 128; ++d) {
+                const int full_d = h * 128 + d;
+                input[(t * n_heads + h) * 128 + d] =
+                    std::sin(float(full_d) * 0.071f) +
+                    std::cos(float(t) * 0.037f + float(h) * 0.11f) +
+                    float((full_d * 13 + t * 17) % 31 - 15) * 0.01f;
+            }
         }
     }
     std::vector<int64_t> idx(n_tokens);
@@ -996,7 +1005,27 @@ static void test_cache_ops(enum ggml_backend_dev_type device_type, bool required
 
     require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "KVarN graph compute failed");
 
-    const std::vector<float> output = test_kvarn_reference_decode_f32(records, stored, idx, n_tokens, 0, 1, bits, false, 3);
+    const std::vector<float> output = test_kvarn_reference_decode_f32(
+            records, stored, idx, n_tokens, 0, 1, bits, false, 3, false, false, head_slices);
+    std::vector<ggml_fp16_t> materialized_data(ggml_nelements(materialized));
+    ggml_backend_tensor_get(materialized, materialized_data.data(), 0, ggml_nbytes(materialized));
+    require(materialized_data.size() == output.size(), "materialized KVarN output shape mismatch");
+    float materialize_max_diff = 0.0f;
+    size_t materialize_max_index = 0;
+    for (size_t i = 0; i < materialized_data.size(); ++i) {
+        const float actual = ggml_fp16_to_fp32(materialized_data[i]);
+        const float diff = std::abs(actual - output[i]);
+        if (diff > materialize_max_diff) {
+            materialize_max_diff = diff;
+            materialize_max_index = i;
+        }
+    }
+    if (materialize_max_diff >= 2e-3f) {
+        std::fprintf(stderr, "KVarN materialize mismatch: bits=%d index=%zu max_diff=%g actual=%g expected=%g\n",
+                bits, materialize_max_index, materialize_max_diff,
+                ggml_fp16_to_fp32(materialized_data[materialize_max_index]), output[materialize_max_index]);
+        require(false, "materialized KVarN output mismatch");
+    }
 
     double sink_error = 0.0;
     double compressed_error = 0.0;
@@ -1004,7 +1033,7 @@ static void test_cache_ops(enum ggml_backend_dev_type device_type, bool required
     double live_tail_error = 0.0;
     for (int t = 0; t < n_tokens; ++t) {
         for (int d = 0; d < 128; ++d) {
-            const double diff = double(input[t * 128 + d]) - double(output[t * 128 + d]);
+            const double diff = double(input[t * n_heads * 128 + d]) - double(output[t * n_heads * 128 + d]);
             if (t < 128) {
                 sink_error += diff * diff;
             } else if (t < 256) {
@@ -1063,9 +1092,12 @@ static void test_cache_ops_multi_stream(enum ggml_backend_dev_type device_type, 
     ggml_tensor * records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, record_bytes, n_heads, n_groups_per_stream * n_stream);
 
     ggml_tensor * stored = ggml_kvarn_store(ctx, current, indices, stage, records, bits, 16, false, 3);
+    ggml_tensor * materialized = ggml_kvarn_materialize(
+            ctx, records, stored, indices, n_tokens_per_stream, 0, n_stream, bits, false, 3);
+    materialized->op_params[4] = 1;
 
     ggml_cgraph * graph = ggml_new_graph(ctx);
-    ggml_build_forward_expand(graph, stored);
+    ggml_build_forward_expand(graph, materialized);
 
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     require(buffer != nullptr, "failed to allocate multi-stream KVarN tensors");
@@ -1098,6 +1130,12 @@ static void test_cache_ops_multi_stream(enum ggml_backend_dev_type device_type, 
 
     const std::vector<float> output = test_kvarn_reference_decode_f32(
             records, stored, idx, n_tokens_per_stream, 0, n_stream, bits, false, 3);
+    const std::vector<ggml_fp16_t> rotated_reference = test_kvarn_reference_decode(
+            records, stored, idx, n_tokens_per_stream, 0, n_stream, bits, false, 3, true);
+    std::vector<ggml_fp16_t> rotated_actual(ggml_nelements(materialized));
+    ggml_backend_tensor_get(materialized, rotated_actual.data(), 0, ggml_nbytes(materialized));
+    require_close_f16_rmse(rotated_reference, rotated_actual, 2e-3f,
+            "multi-stream rotated KVarN materialization mismatch");
 
     for (int s = 0; s < n_stream; ++s) {
         double sink_error = 0.0;
@@ -1184,9 +1222,14 @@ static void test_cache_ops_swa(enum ggml_backend_dev_type device_type, bool requ
     ggml_tensor * stored = ggml_kvarn_store(ctx, current, indices, stage, records, bits, 16, false, stage_groups);
     stored->op_params[4] = 1; // SWA ring store
     stored->op_params[8] = tail_groups;
+    ggml_tensor * mat_indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_kv);
+    ggml_tensor * materialized = ggml_kvarn_materialize(
+            ctx, records, stored, mat_indices, n_kv, 0, 1, bits, false, stage_groups);
+    materialized->op_params[6] = 1;
+    materialized->op_params[8] = tail_groups;
 
     ggml_cgraph * graph = ggml_new_graph(ctx);
-    ggml_build_forward_expand(graph, stored);
+    ggml_build_forward_expand(graph, materialized);
 
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     require(buffer != nullptr, "swa: failed to allocate tensors");
@@ -1212,6 +1255,7 @@ static void test_cache_ops_swa(enum ggml_backend_dev_type device_type, bool requ
 
     ggml_backend_tensor_set(current, input.data(), 0, ggml_nbytes(current));
     ggml_backend_tensor_set(indices, idx.data(), 0, ggml_nbytes(indices));
+    ggml_backend_tensor_set(mat_indices, mat_idx.data(), 0, ggml_nbytes(mat_indices));
     ggml_backend_tensor_set(stage, zeros.data(), 0, ggml_nbytes(stage));
     ggml_backend_tensor_set(records, zeros.data(), 0, ggml_nbytes(records));
 
@@ -1219,6 +1263,12 @@ static void test_cache_ops_swa(enum ggml_backend_dev_type device_type, bool requ
 
     const std::vector<float> output = test_kvarn_reference_decode_f32(
             records, stored, mat_idx, n_kv, 0, 1, bits, false, stage_groups, false, true);
+    std::vector<ggml_fp16_t> materialized_data(ggml_nelements(materialized));
+    ggml_backend_tensor_get(materialized, materialized_data.data(), 0, ggml_nbytes(materialized));
+    for (size_t i = 0; i < output.size(); ++i) {
+        require(std::abs(ggml_fp16_to_fp32(materialized_data[i]) - output[i]) < 2e-3f,
+                "SWA KVarN materialization mismatch");
+    }
 
     double sealed_error = 0.0; // tile 5 -> reused ring slot 0
     double live_error = 0.0;   // tiles 6..9 -> fp16 staging
@@ -1507,7 +1557,8 @@ static std::vector<float> test_native_flash_attention_output(
         std::vector<float> * body_meta_output = nullptr,
         bool           force_generic = false,
         int            exact_tail_tokens = 0,
-        bool           original_value_domain = false) {
+        bool           original_value_domain = false,
+        ggml_type      exact_tail_type = GGML_TYPE_F16) {
     ggml_init_params params = {
         /*.mem_size   =*/ 32 * 1024 * 1024,
         /*.mem_buffer =*/ nullptr,
@@ -1526,10 +1577,7 @@ static std::vector<float> test_native_flash_attention_output(
     ggml_tensor * q_in = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_dim, n_q, n_q_heads, n_stream);
     const bool use_q_rot = native_view && rotate_graph;
     const bool use_output_rot = use_q_rot && !original_value_domain;
-    ggml_tensor * kvarn_rot = use_q_rot && head_dim == 128 ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 128) : nullptr;
-    ggml_tensor * q = use_q_rot ?
-        (head_dim == 128 ? apply_hadamard_128(ctx, q_in, kvarn_rot) : apply_kvarn_wht_head(ctx, q_in, head_dim)) :
-        q_in;
+    ggml_tensor * q = use_q_rot ? apply_kvarn_wht_head(ctx, q_in, head_dim) : q_in;
     ggml_tensor * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_kv * n_stream);
     ggml_tensor * current_k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, record_heads, n_kv * n_stream);
     ggml_tensor * current_v = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, record_heads, n_kv * n_stream);
@@ -1593,13 +1641,20 @@ static std::vector<float> test_native_flash_attention_output(
     if (exact_tail_tokens > 0) {
         require(body_meta_output == nullptr,
                 "native FA: exact-tail attention owns the body metadata output");
+        require(exact_tail_type == GGML_TYPE_F16 ||
+                exact_tail_type == GGML_TYPE_BF16,
+                "native FA: unsupported exact-tail test type");
         const int arena_stride = int(GGML_PAD(exact_tail_tokens + n_q, 256));
         k_tail_storage = ggml_new_tensor_4d(
-                ctx, GGML_TYPE_F16, head_dim, n_kv_heads, arena_stride, n_stream);
+                ctx, exact_tail_type, head_dim, n_kv_heads, arena_stride, n_stream);
         v_tail_storage = ggml_new_tensor_4d(
-                ctx, GGML_TYPE_F16, head_dim, n_kv_heads, arena_stride, n_stream);
-        ggml_tensor * k_tail = ggml_permute(ctx, k_tail_storage, 0, 2, 1, 3);
-        ggml_tensor * v_tail = ggml_permute(ctx, v_tail_storage, 0, 2, 1, 3);
+                ctx, exact_tail_type, head_dim, n_kv_heads, arena_stride, n_stream);
+        ggml_tensor * k_tail_source = use_q_rot ?
+            apply_kvarn_wht_head(ctx, k_tail_storage, head_dim) : k_tail_storage;
+        ggml_tensor * v_tail_source = use_output_rot ?
+            apply_kvarn_wht_head(ctx, v_tail_storage, head_dim) : v_tail_storage;
+        ggml_tensor * k_tail = ggml_permute(ctx, k_tail_source, 0, 2, 1, 3);
+        ggml_tensor * v_tail = ggml_permute(ctx, v_tail_source, 0, 2, 1, 3);
         tail_mask = ggml_new_tensor_4d(
                 ctx, GGML_TYPE_F16, exact_tail_tokens, n_q, 1, n_stream);
         query_order = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_q, n_stream);
@@ -1609,8 +1664,7 @@ static std::vector<float> test_native_flash_attention_output(
     }
     ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
     if (use_output_rot) {
-        out = ggml_cont(ctx, out);
-        out = head_dim == 128 ? apply_hadamard_128(ctx, out, kvarn_rot) : apply_kvarn_wht_head(ctx, out, head_dim);
+        out = apply_kvarn_wht_head(ctx, out, head_dim);
     }
 
     ggml_cgraph * store_graph = nullptr;
@@ -1674,11 +1728,6 @@ static std::vector<float> test_native_flash_attention_output(
     std::vector<uint8_t> v_record_zeros(ggml_nbytes(v_records), 0);
 
     ggml_backend_tensor_set(q_in, q_data.data(), 0, ggml_nbytes(q_in));
-    if (kvarn_rot != nullptr) {
-        std::vector<float> rot_data;
-        fill_hadamard_matrix_128(rot_data);
-        ggml_backend_tensor_set(kvarn_rot, rot_data.data(), 0, ggml_nbytes(kvarn_rot));
-    }
     ggml_backend_tensor_set(indices, idx.data(), 0, ggml_nbytes(indices));
     ggml_backend_tensor_set(current_k, k_data.data(), 0, ggml_nbytes(current_k));
     ggml_backend_tensor_set(current_v, v_data.data(), 0, ggml_nbytes(current_v));
@@ -1689,18 +1738,18 @@ static std::vector<float> test_native_flash_attention_output(
     ggml_backend_tensor_set(mask, mask_data.data(), 0, ggml_nbytes(mask));
 
     if (exact_tail_tokens > 0) {
-        std::vector<ggml_fp16_t> k_tail_data(ggml_nelements(k_tail_storage), ggml_fp32_to_fp16(0.0f));
-        std::vector<ggml_fp16_t> v_tail_data(ggml_nelements(v_tail_storage), ggml_fp32_to_fp16(0.0f));
+        std::vector<float> k_tail_data(ggml_nelements(k_tail_storage), 0.0f);
+        std::vector<float> v_tail_data(ggml_nelements(v_tail_storage), 0.0f);
         for (int t = 0; t < exact_tail_tokens; ++t) {
             for (int h = 0; h < n_kv_heads; ++h) {
                 for (int d = 0; d < head_dim; ++d) {
                     const size_t off = ((size_t) t * n_kv_heads + h) * head_dim + d;
-                    k_tail_data[off] = ggml_fp32_to_fp16(
-                            0.67f * std::sin(float(d) * 0.014f + float(t) * 0.023f) +
-                            0.11f * std::cos(float(t) * 0.007f + float(h) * 0.19f));
-                    v_tail_data[off] = ggml_fp32_to_fp16(
-                            0.63f * std::cos(float(d) * 0.018f - float(t) * 0.017f) +
-                            0.09f * std::sin(float(t) * 0.012f + float(h) * 0.29f));
+                    k_tail_data[off] =
+                        0.67f * std::sin(float(d) * 0.014f + float(t) * 0.023f) +
+                        0.11f * std::cos(float(t) * 0.007f + float(h) * 0.19f);
+                    v_tail_data[off] =
+                        0.63f * std::cos(float(d) * 0.018f - float(t) * 0.017f) +
+                        0.09f * std::sin(float(t) * 0.012f + float(h) * 0.29f);
                 }
             }
         }
@@ -1725,8 +1774,25 @@ static std::vector<float> test_native_flash_attention_output(
         for (int t = 0; t < exact_tail_tokens; ++t) {
             run_desc_data[6 + t] = t;
         }
-        ggml_backend_tensor_set(k_tail_storage, k_tail_data.data(), 0, ggml_nbytes(k_tail_storage));
-        ggml_backend_tensor_set(v_tail_storage, v_tail_data.data(), 0, ggml_nbytes(v_tail_storage));
+        const auto upload_tail = [](ggml_tensor * tensor, const std::vector<float> & data) {
+            if (tensor->type == GGML_TYPE_F16) {
+                std::vector<ggml_fp16_t> converted(data.size());
+                for (size_t i = 0; i < data.size(); ++i) {
+                    converted[i] = ggml_fp32_to_fp16(data[i]);
+                }
+                ggml_backend_tensor_set(
+                    tensor, converted.data(), 0, converted.size() * sizeof(converted[0]));
+            } else {
+                std::vector<ggml_bf16_t> converted(data.size());
+                for (size_t i = 0; i < data.size(); ++i) {
+                    converted[i] = ggml_fp32_to_bf16(data[i]);
+                }
+                ggml_backend_tensor_set(
+                    tensor, converted.data(), 0, converted.size() * sizeof(converted[0]));
+            }
+        };
+        upload_tail(k_tail_storage, k_tail_data);
+        upload_tail(v_tail_storage, v_tail_data);
         ggml_backend_tensor_set(tail_mask, tail_mask_data.data(), 0, ggml_nbytes(tail_mask));
         ggml_backend_tensor_set(query_order, query_order_data.data(), 0, ggml_nbytes(query_order));
         ggml_backend_tensor_set(run_desc, run_desc_data.data(), 0, ggml_nbytes(run_desc));
@@ -1736,9 +1802,9 @@ static std::vector<float> test_native_flash_attention_output(
         require(ggml_backend_graph_compute(backend, store_graph) == GGML_STATUS_SUCCESS,
                 "native FA: reference store graph compute failed");
         const std::vector<ggml_fp16_t> k_ref_data = test_kvarn_reference_decode(
-                k_records, stored_k, idx, n_kv, 0, n_stream, bits_k, false, stage_groups, false, false, slices);
+                k_records, stored_k, idx, n_kv, 0, n_stream, bits_k, false, stage_groups, false, swa, slices);
         const std::vector<ggml_fp16_t> v_ref_data = test_kvarn_reference_decode(
-                v_records, stored_v, idx, n_kv, 0, n_stream, bits_v, true, stage_groups, false, false, slices);
+                v_records, stored_v, idx, n_kv, 0, n_stream, bits_v, true, stage_groups, false, swa, slices);
         ggml_backend_tensor_set(k_ref, k_ref_data.data(), 0, ggml_nbytes(k_ref));
         ggml_backend_tensor_set(v_ref, v_ref_data.data(), 0, ggml_nbytes(v_ref));
     }
@@ -2251,6 +2317,8 @@ static bool backend_supports_kvarn_flash_attention_shape(ggml_backend_t backend,
     ggml_tensor * v_records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, record_bytes, record_heads, 1);
     ggml_tensor * stored_k = ggml_kvarn_store(ctx, current, indices, k_stage, k_records, 4, 16, false, stage_groups);
     ggml_tensor * stored_v = ggml_kvarn_store(ctx, current, indices, v_stage, v_records, 4, 16, true,  stage_groups);
+    stored_k->op_params[5] = slices;
+    stored_v->op_params[5] = slices;
     ggml_tensor * k = ggml_kvarn_view(ctx, k_records, stored_k, indices, n_kv, 0, n_stream, 4, false, stage_groups);
     ggml_tensor * v = ggml_kvarn_view(ctx, v_records, stored_v, indices, n_kv, 0, n_stream, 4, true,  stage_groups);
     if (slices > 1) {
@@ -2261,6 +2329,8 @@ static bool backend_supports_kvarn_flash_attention_shape(ggml_backend_t backend,
     v = ggml_permute(ctx, v, 0, 2, 1, 3);
     ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_q, 1, n_stream);
     ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, mask, 1.0f / std::sqrt(float(head_dim)), 0.0f, 0.0f);
+    out->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN] =
+        GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED;
 
     const bool supported = ggml_backend_supports_op(backend, out);
     ggml_free(ctx);
@@ -2317,8 +2387,14 @@ get_kvarn_route_stats_fns(ggml_backend_t backend) {
 
 static void test_native_flash_attention_support_gates() {
     ggml_backend_t cpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_CPU, true);
-    require(!backend_supports_kvarn_flash_attention_shape(cpu_backend, 128),
-            "CPU backend accepted KVarN view FlashAttention as ordinary F16");
+    require( backend_supports_kvarn_flash_attention_shape(cpu_backend, 128),
+            "CPU backend rejected native 128-dim KVarN FlashAttention");
+    require( backend_supports_kvarn_flash_attention_shape(cpu_backend, 256),
+            "CPU backend rejected native 256-dim KVarN FlashAttention");
+    require( backend_supports_kvarn_flash_attention_shape(cpu_backend, 512),
+            "CPU backend rejected native 512-dim KVarN FlashAttention");
+    require(!backend_supports_kvarn_flash_attention_shape(cpu_backend, 384),
+            "CPU backend accepted unsupported 384-dim KVarN FlashAttention");
     ggml_backend_free(cpu_backend);
 
     ggml_backend_t gpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
@@ -2338,6 +2414,100 @@ static void test_native_flash_attention_support_gates() {
     ggml_backend_free(gpu_backend);
 }
 
+static void test_native_flash_attention_portable_backend(
+        ggml_backend_t backend,
+        ggml_backend_t reference_backend,
+        const char * backend_label) {
+    const bool trace = std::getenv("GGML_KVARN_TEST_TRACE_NATIVE") != nullptr;
+    for (int head_dim : { 128, 256, 512 }) {
+        for (int n_q : { 1, 4, 32 }) {
+            if (trace) {
+                std::fprintf(stderr, "native trace: %s D%d nq=%d\n", backend_label, head_dim, n_q);
+                std::fflush(stderr);
+            }
+            const std::vector<float> expected = test_native_flash_attention_output(
+                    reference_backend, false, false, head_dim, 4, 3, n_q,
+                    6, 1, 512, 5);
+            const std::vector<float> actual = test_native_flash_attention_output(
+                    backend, true, true, head_dim, 4, 3, n_q,
+                    6, 1, 512, 5);
+            require_close_f32_rmse(actual, expected, 1e-2f,
+                    "portable native KVarN FlashAttention differs from materialized reference");
+        }
+    }
+
+    for (int bits_k : { 2, 4, 6, 8 }) {
+        for (int bits_v : { 3, 5, 8 }) {
+            if (trace) {
+                std::fprintf(stderr, "native trace: %s D256 k%d/v%d\n", backend_label, bits_k, bits_v);
+                std::fflush(stderr);
+            }
+            const std::vector<float> expected = test_native_flash_attention_output(
+                    reference_backend, false, false, 256, bits_k, bits_v, 1,
+                    6, 1, 1024, 5);
+            const std::vector<float> actual = test_native_flash_attention_output(
+                    backend, true, true, 256, bits_k, bits_v, 1,
+                    6, 1, 1024, 5);
+            require_close_f32_rmse(actual, expected, 1e-2f,
+                    "portable mixed-bit KVarN FlashAttention differs from materialized reference");
+        }
+    }
+
+    {
+        if (trace) {
+            std::fprintf(stderr, "native trace: %s SWA\n", backend_label);
+            std::fflush(stderr);
+        }
+        const std::vector<float> expected = test_native_flash_attention_output(
+                reference_backend, false, false, 256, 4, 4, 4,
+                2, 1, 768, 4, true);
+        const std::vector<float> actual = test_native_flash_attention_output(
+                backend, true, true, 256, 4, 4, 4,
+                2, 1, 768, 4, true);
+        require_close_f32_rmse(actual, expected, 1e-2f,
+                "portable SWA KVarN FlashAttention differs from materialized reference");
+    }
+
+    {
+        if (trace) {
+            std::fprintf(stderr, "native trace: %s sinks\n", backend_label);
+            std::fflush(stderr);
+        }
+        const std::vector<float> expected = test_native_flash_attention_output(
+                reference_backend, false, false, 256, 4, 4, 4,
+                6, 1, 512, 5, false, nullptr, true);
+        const std::vector<float> actual = test_native_flash_attention_output(
+                backend, true, true, 256, 4, 4, 4,
+                6, 1, 512, 5, false, nullptr, true);
+        require_close_f32_rmse(actual, expected, 1e-2f,
+                "portable KVarN FlashAttention with sinks differs from materialized reference");
+    }
+
+    for (ggml_type exact_type : { GGML_TYPE_F16, GGML_TYPE_BF16 }) {
+        if (trace) {
+            std::fprintf(stderr, "native trace: %s exact tail %s\n",
+                    backend_label, ggml_type_name(exact_type));
+            std::fflush(stderr);
+        }
+        const std::vector<float> expected = test_native_flash_attention_output(
+                reference_backend, false, false, 256, 4, 3, 4,
+                6, 1, 512, 5, false, nullptr, false, 128, false, exact_type);
+        const std::vector<float> actual = test_native_flash_attention_output(
+                backend, true, true, 256, 4, 3, 4,
+                6, 1, 512, 5, false, nullptr, false, 128, false, exact_type);
+        require_close_f32_rmse(actual, expected, 1e-2f,
+                "portable KVarN FlashAttention with an exact tail differs from materialized reference");
+    }
+
+    std::printf("test-kvarn: %s direct KVarN FlashAttention parity OK\n", backend_label);
+}
+
+static void test_native_flash_attention_cpu() {
+    ggml_backend_t cpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_CPU, true);
+    test_native_flash_attention_portable_backend(cpu_backend, cpu_backend, "CPU");
+    ggml_backend_free(cpu_backend);
+}
+
 static void test_native_flash_attention_gpu() {
     ggml_backend_t gpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
     if (gpu_backend == nullptr) {
@@ -2353,8 +2523,16 @@ static void test_native_flash_attention_gpu() {
     ggml_backend_t cpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_CPU, true);
 
     const auto [route_stats_reset, route_stats_get] = get_kvarn_route_stats_fns(gpu_backend);
-    require(route_stats_reset != nullptr && route_stats_get != nullptr,
-            "CUDA backend does not expose KVarN route accounting");
+    test_native_flash_attention_portable_backend(gpu_backend, cpu_backend, "GPU");
+    if (route_stats_reset == nullptr || route_stats_get == nullptr ||
+            std::getenv("GGML_KVARN_TEST_FORCE_PORTABLE_FATTN") != nullptr) {
+        // Vulkan and other portable GPU backends intentionally do not expose
+        // CUDA's specialized-route counters. A forced portable CUDA run also
+        // deliberately bypasses those routes.
+        ggml_backend_free(cpu_backend);
+        ggml_backend_free(gpu_backend);
+        return;
+    }
 
     const auto require_metadata_case = [&](int head_dim, int n_q, int n_q_heads,
                                            int n_kv_heads, bool swa,
@@ -2879,9 +3057,12 @@ static void test_rotated_decode_transform_consistency(enum ggml_backend_dev_type
     ggml_tensor * records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, record_bytes, n_heads, n_groups_per_stream * n_stream);
 
     ggml_tensor * stored = ggml_kvarn_store(ctx, current, indices, stage, records, bits, 16, false, 3);
+    ggml_tensor * materialized = ggml_kvarn_materialize(
+            ctx, records, stored, indices, n_tokens, 0, n_stream, bits, false, 3);
+    materialized->op_params[4] = 1;
 
     ggml_cgraph * graph = ggml_new_graph(ctx);
-    ggml_build_forward_expand(graph, stored);
+    ggml_build_forward_expand(graph, materialized);
 
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     require(buffer != nullptr, "rotated parity: failed to allocate tensors");
@@ -2909,8 +3090,8 @@ static void test_rotated_decode_transform_consistency(enum ggml_backend_dev_type
 
     std::vector<ggml_fp16_t> orig_h = test_kvarn_reference_decode(
             records, stored, idx, n_tokens, 0, n_stream, bits, false, 3);
-    std::vector<ggml_fp16_t> rot_h = test_kvarn_reference_decode(
-            records, stored, idx, n_tokens, 0, n_stream, bits, false, 3, true);
+    std::vector<ggml_fp16_t> rot_h(ggml_nelements(materialized));
+    ggml_backend_tensor_get(materialized, rot_h.data(), 0, ggml_nbytes(materialized));
 
     double sum_sq = 0.0;
     double max_diff = 0.0;
@@ -3227,9 +3408,13 @@ static void test_eager_completed_record(enum ggml_backend_dev_type device_type, 
     ggml_tensor * stored = ggml_kvarn_store(
             ctx, suffix, suffix_idxs, stored_prefix, records, bits, 16, false, stage_groups);
     stored->op_params[9] = 1;
+    ggml_tensor * decode_indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 257);
+    ggml_tensor * materialized = ggml_kvarn_materialize(
+            ctx, records, stored, decode_indices, 256, 0, 1, bits, false, stage_groups);
+    materialized->op_params[9] = 1;
 
     ggml_cgraph * graph = ggml_new_graph(ctx);
-    ggml_build_forward_expand(graph, stored);
+    ggml_build_forward_expand(graph, materialized);
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     require(buffer != nullptr, "eager-record: failed to allocate tensors");
 
@@ -3251,10 +3436,15 @@ static void test_eager_completed_record(enum ggml_backend_dev_type device_type, 
     }
     std::vector<uint8_t> zeros_stage(ggml_nbytes(stage), 0);
     std::vector<uint8_t> zeros_records(ggml_nbytes(records), 0);
+    std::vector<int64_t> decode_idxs(257);
+    for (size_t i = 0; i < decode_idxs.size(); ++i) {
+        decode_idxs[i] = int64_t(i);
+    }
     ggml_backend_tensor_set(prefix, prefix_data.data(), 0, ggml_nbytes(prefix));
     ggml_backend_tensor_set(prefix_idxs, prefix_idx.data(), 0, ggml_nbytes(prefix_idxs));
     ggml_backend_tensor_set(suffix, suffix_data.data(), 0, ggml_nbytes(suffix));
     ggml_backend_tensor_set(suffix_idxs, suffix_idx.data(), 0, ggml_nbytes(suffix_idxs));
+    ggml_backend_tensor_set(decode_indices, decode_idxs.data(), 0, ggml_nbytes(decode_indices));
     ggml_backend_tensor_set(stage, zeros_stage.data(), 0, zeros_stage.size());
     ggml_backend_tensor_set(records, zeros_records.data(), 0, zeros_records.size());
 
@@ -3270,13 +3460,12 @@ static void test_eager_completed_record(enum ggml_backend_dev_type device_type, 
 
     // Advance the logical live group in the reference view so group 1 is read
     // from its eagerly committed record instead of the transient stage slot.
-    std::vector<int64_t> decode_idxs(257);
-    for (size_t i = 0; i < decode_idxs.size(); ++i) {
-        decode_idxs[i] = int64_t(i);
-    }
     const std::vector<ggml_fp16_t> decoded = test_kvarn_reference_decode(
             records, stored, decode_idxs, 256, 0, 1, bits, false, stage_groups);
+    std::vector<ggml_fp16_t> materialized_data(ggml_nelements(materialized));
+    ggml_backend_tensor_get(materialized, materialized_data.data(), 0, ggml_nbytes(materialized));
     double eager_record_mse = 0.0;
+    double eager_materialized_mse = 0.0;
     for (int t = 0; t < 128; ++t) {
         for (int d = 0; d < 128; ++d) {
             const float expected = t < prefix_tokens
@@ -3285,11 +3474,16 @@ static void test_eager_completed_record(enum ggml_backend_dev_type device_type, 
             const float actual = ggml_fp16_to_fp32(decoded[(128 + t) * 128 + d]);
             const double diff = double(actual) - double(expected);
             eager_record_mse += diff * diff;
+            const double materialized_diff =
+                double(ggml_fp16_to_fp32(materialized_data[(128 + t) * 128 + d])) - double(expected);
+            eager_materialized_mse += materialized_diff * materialized_diff;
         }
     }
     const double eager_record_rmse = std::sqrt(eager_record_mse / double(128 * 128));
     require(eager_record_rmse < 0.25,
             "eager-record: completed record reconstruction error too high");
+    require(std::sqrt(eager_materialized_mse / double(128 * 128)) < 0.25,
+            "eager-record: materialized completed record reconstruction error too high");
 
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
@@ -3298,6 +3492,14 @@ static void test_eager_completed_record(enum ggml_backend_dev_type device_type, 
 
 int main() {
     ggml_backend_load_all();
+
+    if (std::getenv("GGML_KVARN_TEST_PORTABLE_NATIVE_ONLY") != nullptr) {
+        test_native_flash_attention_support_gates();
+        test_native_flash_attention_cpu();
+        test_native_flash_attention_gpu();
+        std::printf("test-kvarn: portable native attention OK\n");
+        return 0;
+    }
 
     if (std::getenv("GGML_KVARN_TEST_PREFILL_PARITY_ONLY") != nullptr) {
         test_native_flash_attention_prefill_route_parity();
@@ -3348,6 +3550,10 @@ int main() {
         test_cache_ops(GGML_BACKEND_DEVICE_TYPE_CPU, true, bits);
         test_cache_ops(GGML_BACKEND_DEVICE_TYPE_GPU, false, bits);
     }
+    for (int head_slices : { 2, 4 }) {
+        test_cache_ops(GGML_BACKEND_DEVICE_TYPE_CPU, true, 4, head_slices);
+        test_cache_ops(GGML_BACKEND_DEVICE_TYPE_GPU, false, 4, head_slices);
+    }
     // W2 dynamic stage-depth coverage: stage_groups=5 (tail_groups=4).
     test_cache_ops_dynamic_stage(GGML_BACKEND_DEVICE_TYPE_CPU, true, 4);
     test_cache_ops_dynamic_stage(GGML_BACKEND_DEVICE_TYPE_GPU, false, 4);
@@ -3371,6 +3577,7 @@ int main() {
     test_cache_ops_swa(GGML_BACKEND_DEVICE_TYPE_GPU, false); // CUDA SWA ring parity
     test_store_paths_gpu();
     test_native_flash_attention_support_gates();
+    test_native_flash_attention_cpu();
     test_native_flash_attention_gpu();
     test_native_flash_attention_prefill_route_parity();
     test_rotated_decode_transform_consistency(GGML_BACKEND_DEVICE_TYPE_CPU, true);

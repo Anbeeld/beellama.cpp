@@ -3961,7 +3961,7 @@ llama_context * llama_init_from_model(
             params.kvarn = llama_kvarn_default_params();
         } else {
             bool head_dims_supported = true;
-            bool native_backend_supported = params.offload_kqv;
+            bool backend_ops_supported = true;
             for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
                 if (!model->hparams.has_kv(il)) {
                     continue;
@@ -3971,10 +3971,8 @@ llama_context * llama_init_from_model(
                     llama_kvarn_head_dim_supported(model->hparams.n_embd_head_k(il)) &&
                     llama_kvarn_head_dim_supported(model->hparams.n_embd_head_v(il));
 
-                if (params.offload_kqv) {
-                    native_backend_supported = native_backend_supported &&
-                        llama_kvarn_backend_supports_native_ops(model->dev_layer(il));
-                }
+                backend_ops_supported = backend_ops_supported && llama_kvarn_backend_supports_ops(
+                    params.offload_kqv ? model->dev_layer(il) : nullptr);
             }
 
             const bool causal_attn =
@@ -3991,8 +3989,7 @@ llama_context * llama_init_from_model(
             const llama_kvarn_runtime_requirements requirements = {
                 /*.attention_supported      =*/ attention_supported,
                 /*.head_dims_supported      =*/ head_dims_supported,
-                /*.kv_offload               =*/ params.offload_kqv,
-                /*.native_backend_supported =*/ native_backend_supported,
+                /*.backend_ops_supported    =*/ backend_ops_supported,
                 /*.n_seq_max                =*/ std::max(1u, params.n_seq_max),
                 /*.kv_unified               =*/ params.kv_unified,
             };

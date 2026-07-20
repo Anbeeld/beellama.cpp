@@ -10,6 +10,12 @@ limits, and measurement guidance.
 KVarN values are `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`, `kvarn6`, and
 `kvarn8`. K and V may use different bit widths.
 
+CUDA, ROCm/HIP, Vulkan, and CPU consume compressed KVarN records directly in
+native FlashAttention paths. Vulkan requires shader Int64 and
+buffer-device-address support for its direct route. An explicitly supported
+materialization fallback retains compressed persistent storage when a native
+route is unavailable.
+
 | Argument | Env var | Default | Behavior |
 |---|---|---|---|
 | `-ctk TYPE`, `--cache-type-k TYPE` | `LLAMA_ARG_CACHE_TYPE_K` | `f16` | Selects the target K cache. Bee adds the six KVarN values and standard `q6_0`, `q6_1`, `q3_0`, `q3_1`, `q2_0`, and `q2_1`. If only K or V is KVarN, the other side is promoted to the same KVarN width with a warning. |
@@ -179,7 +185,7 @@ Use the same corpus, context, logical batch, and physical ubatch for both KLD le
 | Argument | Env var | Default | Behavior |
 |---|---|---|---|
 | `-DGGML_CUDA_FA_ALL_QUANTS=ON` | — | Off | Expands the CUDA vector matrix from 50 to all 169 standard cache pairs and, when `GGML_CUDA_KVARN=ON`, KVarN fast-decode instances from 15 balanced pairs to all 36 ordered bit pairs. Valid KVarN pairs outside the fast matrix use descriptor-native MMA. |
-| `-DGGML_CUDA_KVARN=ON/OFF` | — | On | Compiles or omits all dedicated CUDA KVarN kernels and template instances. When enabled, `GGML_CUDA_FA_ALL_QUANTS` selects 15 default or all 36 fast-decode pairs. |
+| `-DGGML_CUDA_KVARN=ON/OFF` | — | On | Compiles or omits the shared CUDA/HIP KVarN kernels and CUDA native-attention template instances. When enabled, `GGML_CUDA_FA_ALL_QUANTS` selects 15 default or all 36 CUDA fast-decode pairs. |
 
 ## Migration from earlier versions
 

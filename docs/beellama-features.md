@@ -17,9 +17,10 @@ never enlarges that logical exact suffix.
 
 ### When to use it
 
-Use KVarN when CUDA KV-cache memory is the limiting resource and the model has a
-supported attention layout. Start with `kvarn4` on both sides, then measure the
-quality and speed of the exact model and context you plan to serve.
+Use KVarN when persistent KV-cache memory is the limiting resource and the model
+has a supported attention layout. Start with `kvarn4` on both sides, then
+measure the quality and speed of the exact model, backend, and context you plan
+to serve.
 
 ### Key arguments
 
@@ -101,14 +102,19 @@ allocator reuse/overlap or driver-baseline release rather than negative cache
 ownership. Repeated grouped contexts showed only bounded first-use CUDA
 reservation and zero cumulative per-context growth.
 
-### Known limitations
+### Backend support and limitations
 
-KVarN is target-context-only and v0.4.0 enables native placement only on a CUDA
-device that passes the kernel capability checks. CPU execution is not native.
-Vulkan contains the store operation but deliberately reports native KVarN as
-unsupported until Vulkan FlashAttention consumes KVarN views. Unsupported or
-partially offloaded placements fail closed; draft and auxiliary contexts must
-use standard cache types.
+KVarN is target-context-only. CUDA uses its optimized descriptor-native
+FlashAttention kernels. ROCm/HIP uses a portable direct-record kernel, and CPU
+and Vulkan have backend-native direct-record attention paths. These routes keep
+the query, compressed body, F16/BF16 exact tail, and attention sinks in one
+softmax without materializing the body. Vulkan requires shader Int64 and
+buffer-device-address support. CPU placement is valid with KV offload disabled.
+
+Each selected layer must be owned by a backend that implements KVarN store and
+attention, or an explicitly supported materialization fallback. Unsupported or
+tensor-split placements fail closed; draft and auxiliary contexts use standard
+cache types.
 
 ## Standard low-bit KV caches
 
@@ -293,15 +299,17 @@ handoff cannot observe it as a completed copy.
 
 ### Backend routes
 
-CUDA's native and generic routes and CPU's generic route are hardware verified.
-Vulkan, Metal, HIP, SYCL, and generic OpenCL contain the required generic
-operator families and are source supported, but are not hardware-verified by
-this release. OpenCL's Adreno-transformed weight layouts are rejected by these
-row operators; flat standard-cache storage uses the generic kernels. CANN
-overlay contexts are rejected at context creation because fused shadow
-`SET_ROWS` is not supported; successful source classification is not an Ascend
-hardware claim. Startup diagnostics name the selected native or generic route;
-generic long-context attention can be substantially slower.
+CUDA, CPU, and Vulkan KVarN routes are hardware verified. The portable
+CUDA/HIP implementation is also exercised on CUDA with the optimized paths
+forcibly disabled; AMD execution remains source-verified pending hardware
+reports. Metal, SYCL, and generic OpenCL contain the required generic operator
+families but are not hardware-verified by this release. OpenCL's
+Adreno-transformed weight layouts are rejected by these row operators; flat
+standard-cache storage uses the generic kernels. CANN overlay contexts are
+rejected at context creation because fused shadow `SET_ROWS` is not supported;
+successful source classification is not an Ascend hardware claim. Startup
+diagnostics name the selected native or generic route; generic long-context
+attention can be substantially slower.
 
 ### Measurement and validation
 

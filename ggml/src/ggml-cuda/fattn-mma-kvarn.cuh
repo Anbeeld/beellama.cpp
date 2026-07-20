@@ -238,9 +238,13 @@ static inline bool ggml_cuda_fattn_kvarn_view_supported(
     if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16) {
         return false;
     }
+#if !defined(GGML_USE_HIP)
     if (!turing_mma_available(ggml_cuda_info().devices[device].cc)) {
         return false;
     }
+#else
+    GGML_UNUSED(device);
+#endif
     if (!((Q->ne[0] == 128 && V->ne[0] == 128) ||
           (Q->ne[0] == 256 && V->ne[0] == 256) ||
           (Q->ne[0] == 512 && V->ne[0] == 512))) {

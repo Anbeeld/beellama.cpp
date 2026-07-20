@@ -33,8 +33,7 @@ struct llama_kvarn_tile_layout {
 struct llama_kvarn_runtime_requirements {
     bool attention_supported;
     bool head_dims_supported;
-    bool kv_offload;
-    bool native_backend_supported;
+    bool backend_ops_supported;
     uint32_t n_seq_max;
     bool kv_unified;
 };

@@ -55,16 +55,18 @@ also pass `--spec-dm-controller off`.
 ## 5. Choose and measure the target cache
 
 The command uses conventional q caches. For lower target-cache memory on a
-supported CUDA layout, try:
+supported target-model layout, try:
 
 ```text
 --cache-type-k kvarn4 --cache-type-v kvarn4
 ```
 
 KVarN is target-context-only; keep the DFlash draft cache on a standard type.
-For KLD or cache-quality comparisons, use the intended serving ubatch and keep
-the corpus, context, logical batch, physical ubatch, model files, and commit
-identical between both legs.
+CUDA, ROCm/HIP, Vulkan, and CPU consume compressed records directly in native
+attention paths. Vulkan needs shader Int64 and buffer-device-address support.
+For KLD or cache-quality comparisons, use the intended serving backend and
+ubatch and keep the corpus, context, logical batch, physical ubatch, model
+files, and commit identical between both legs.
 
 ## 6. Optional reasoning controls
 

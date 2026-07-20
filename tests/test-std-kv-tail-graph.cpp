@@ -425,6 +425,9 @@ static void test_mixed_side_generic_attention(
             ctx, scores, n_body, n_query, scores->nb[1], 0);
     ggml_tensor * weights_tail = ggml_view_2d(
             ctx, scores, n_tail, n_query, scores->nb[1], n_body*scores->nb[0]);
+    // Match the production tail merge: Vulkan matmul descriptors require the
+    // sliced tail weights to be copied to an aligned contiguous tensor.
+    weights_tail = ggml_cont(ctx, weights_tail);
     ggml_tensor * body_out = transposed_v ?
             ggml_mul_mat(ctx, vb, weights_body) :
             ggml_out_prod(ctx, vb, ggml_transpose(ctx, weights_body));
@@ -592,6 +595,7 @@ static void test_sparse_swa_packed_oracle(ggml_backend_t backend, llama_swa_type
         ggml_tensor * wb = ggml_view_2d(ctx, scores, n_body, n_query, scores->nb[1], 0);
         ggml_tensor * wt = ggml_view_2d(
                 ctx, scores, n_tail, n_query, scores->nb[1], n_body*scores->nb[0]);
+        wt = ggml_cont(ctx, wt);
         ggml_tensor * body_out = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, vb)), wb);
         ggml_tensor * tail_out = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, v_tail)), wt);
         return ggml_add(ctx, body_out, tail_out);

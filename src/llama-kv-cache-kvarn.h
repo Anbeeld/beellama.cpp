@@ -13,6 +13,7 @@ struct llama_hparams;
 struct llama_model;
 
 bool llama_kvarn_backend_supports_native_ops(ggml_backend_dev_t dev);
+bool llama_kvarn_backend_supports_ops(ggml_backend_dev_t dev);
 
 struct llama_kvarn_tail_policy {
     uint32_t raw_requested_tokens;
@@ -95,8 +96,10 @@ public:
     bool can_pack_tail_body(const llama_ubatch & ubatch) const override;
     ggml_tensor * get_k_native(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v_native(ggml_context * ctx, int32_t il) const;
+    bool uses_native_attention(int32_t il) const;
+    bool native_attention_uses_original_v(int32_t il) const;
 
-    // SWA sliding-window ring: per-cell absolute positions for native KVarN views.
+    // SWA sliding-window ring: per-cell absolute positions for KVarN reads.
     // Built as a graph input sized [n_kv]; set on the host from cells.pos_get(cell).
     ggml_tensor * build_input_kvarn_rot(ggml_context * ctx, int n_rot) const;
     void set_input_kvarn_rot(ggml_tensor * dst) const;
@@ -152,7 +155,7 @@ private:
 
     mutable std::unordered_map<int32_t, ggml_tensor *> stored_k;
     mutable std::unordered_map<int32_t, ggml_tensor *> stored_v;
-    mutable ggml_tensor * mat_idxs = nullptr; // SWA per-cell absolute positions for native KVarN views
+    mutable ggml_tensor * mat_idxs = nullptr; // SWA per-cell absolute positions for views/materialization
 };
 
 class llama_kv_cache_kvarn : public llama_memory_i {
@@ -230,6 +233,8 @@ public:
     bool stream_is_exclusive_for(llama_seq_id seq_id) const;
     bool apply_pending_stream_copies(llama_context * lctx);
     bool is_swa() const { return swa; }
+    bool uses_native_attention(int32_t il) const;
+    bool native_attention_uses_original_v(int32_t il) const;
 
     // Reference-faithful staging keeps one incomplete 128-token group lossless.
     // Completed records are committed eagerly, so physical ubatch size does not
@@ -259,6 +264,14 @@ public:
             const llama_kv_cache::slot_info & sinfo,
             bool value,
             ggml_tensor * mat_idxs = nullptr) const;
+    ggml_tensor * materialize(
+            ggml_context * ctx,
+            ggml_tensor * stored,
+            int32_t il,
+            uint32_t n_kv,
+            const llama_kv_cache::slot_info & sinfo,
+            bool value,
+            ggml_tensor * mat_idxs = nullptr) const;
     ggml_tensor * get_tail(ggml_context * ctx, int32_t il, bool value) const;
     ggml_tensor * store_tail(
             ggml_context * ctx, ggml_tensor * current, ggml_tensor * indices,
@@ -272,6 +285,8 @@ private:
         uint32_t head_dim_v;
         uint32_t k_slices;
         uint32_t v_slices;
+        bool native_attention;
+        bool native_original_v;
         ggml_tensor * k_records;
         ggml_tensor * v_records;
         ggml_tensor * k_stage;

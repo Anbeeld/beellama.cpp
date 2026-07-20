@@ -599,6 +599,7 @@ extern "C" {
         GGML_OP_KVARN_WHT,
         GGML_OP_KVARN_STORE,
         GGML_OP_KVARN_VIEW,
+        GGML_OP_KVARN_MATERIALIZE,
 
         GGML_OP_UNARY,
 
@@ -2666,6 +2667,20 @@ extern "C" {
             int                   stage_groups);
 
     GGML_API struct ggml_tensor * ggml_kvarn_view(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * records,
+            struct ggml_tensor  * stage_after_store,
+            struct ggml_tensor  * indices,
+            int                   n_kv,
+            int                   stream_start,
+            int                   n_stream,
+            int                   bits,
+            bool                  value,
+            int                   stage_groups);
+
+    // Reconstructs a standard F16 tensor from KVarN records and staging. The
+    // result can be consumed by any ordinary attention implementation.
+    GGML_API struct ggml_tensor * ggml_kvarn_materialize(
             struct ggml_context * ctx,
             struct ggml_tensor  * records,
             struct ggml_tensor  * stage_after_store,

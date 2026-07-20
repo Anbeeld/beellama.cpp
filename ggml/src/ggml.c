@@ -1131,6 +1131,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "KVARN_WHT",
     "KVARN_STORE",
     "KVARN_VIEW",
+    "KVARN_MATERIALIZE",
 
     "UNARY",
 
@@ -1148,7 +1149,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1246,6 +1247,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "kvarn_wht(x)",
     "kvarn_store(current, indices, stage, records)",
     "kvarn_view(records, stage, indices)",
+    "kvarn_materialize(records, stage, indices)",
 
     "unary(x)",
 
@@ -1263,7 +1265,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6490,6 +6492,7 @@ enum {
     GGML_KVARN_OP_PARAM_BITS              = 0,
     GGML_KVARN_OP_PARAM_ITERS             = 1,
     GGML_KVARN_OP_PARAM_VIEW_VALUE        = 1,
+    GGML_KVARN_OP_PARAM_MAT_VALUE         = 1,
     GGML_KVARN_OP_PARAM_STORE_VALUE       = 2,
     GGML_KVARN_OP_PARAM_STORE_SWA         = 4,
     GGML_KVARN_OP_PARAM_HEAD_SLICES       = 5,
@@ -6585,6 +6588,53 @@ struct ggml_tensor * ggml_kvarn_view(
         tail_groups = stage_groups - 1;
     }
     ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_TAIL_GROUPS, tail_groups);
+    ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_EAGER_RECORDS,
+            ggml_get_op_params_i32(stage_after_store, GGML_KVARN_OP_PARAM_EAGER_RECORDS));
+    return result;
+}
+
+// ggml_kvarn_materialize
+
+struct ggml_tensor * ggml_kvarn_materialize(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * records,
+        struct ggml_tensor  * stage_after_store,
+        struct ggml_tensor  * indices,
+        int                   n_kv,
+        int                   stream_start,
+        int                   n_stream,
+        int                   bits,
+        bool                  value,
+        int                   stage_groups) {
+    GGML_ASSERT(records->type == GGML_TYPE_I8);
+    GGML_ASSERT(stage_after_store->type == GGML_TYPE_F16);
+    GGML_ASSERT(indices->type == GGML_TYPE_I64);
+    GGML_ASSERT(stage_groups >= 2);
+    GGML_ASSERT(stage_after_store->ne[0] == 128 && stage_after_store->ne[2] % (128 * stage_groups) == 0);
+    GGML_ASSERT(stage_after_store->ne[1] == records->ne[1]);
+    GGML_ASSERT(n_kv > 0 && ggml_kvarn_valid_bits(bits));
+    const int64_t n_total_stream = stage_after_store->ne[2] / (128 * stage_groups);
+    GGML_ASSERT(n_total_stream > 0 && records->ne[2] > 0 && records->ne[2] % n_total_stream == 0);
+    GGML_ASSERT(stream_start >= 0 && n_stream > 0);
+    GGML_ASSERT((int64_t) stream_start + n_stream <= n_total_stream);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(
+            ctx, GGML_TYPE_F16, 128, stage_after_store->ne[1], n_kv, n_stream);
+    result->op = GGML_OP_KVARN_MATERIALIZE;
+    result->src[0] = records;
+    result->src[1] = stage_after_store;
+    result->src[2] = indices;
+    ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_BITS, bits);
+    ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_MAT_VALUE, value ? 1 : 0);
+    ggml_set_op_params_i32(result, 2, stream_start);
+    ggml_set_op_params_i32(result, 3, n_stream);
+    ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_HEAD_SLICES,
+            ggml_get_op_params_i32(stage_after_store, GGML_KVARN_OP_PARAM_HEAD_SLICES) > 0 ?
+            ggml_get_op_params_i32(stage_after_store, GGML_KVARN_OP_PARAM_HEAD_SLICES) : 1);
+    ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_STAGE_GROUPS, stage_groups);
+    int tail_groups = ggml_get_op_params_i32(stage_after_store, GGML_KVARN_OP_PARAM_TAIL_GROUPS);
+    ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_TAIL_GROUPS,
+            tail_groups > 0 ? tail_groups : stage_groups - 1);
     ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_EAGER_RECORDS,
             ggml_get_op_params_i32(stage_after_store, GGML_KVARN_OP_PARAM_EAGER_RECORDS));
     return result;

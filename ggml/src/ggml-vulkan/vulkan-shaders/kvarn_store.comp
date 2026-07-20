@@ -11,6 +11,7 @@ layout(push_constant) uniform parameter {
     uint bits;
     uint iterations;
     uint value;
+    uint head_slices;
     uint swa; // SWA sliding-window ring store (absolute-position indices, no group-0 sink)
     uint stage_groups; // dynamic F16 stage depth
     uint tail_groups;  // lossless tail groups within the stage
@@ -243,7 +244,7 @@ void quantize_stage(uint head, uint stage_base, uint stage_group, uint record_ba
 
 void main() {
     const uint lane = gl_LocalInvocationID.x;
-    const uint head = gl_WorkGroupID.x;
+    const uint head0 = gl_WorkGroupID.x * p.head_slices;
 
     for (uint token = 0; token < p.n_tokens; ++token) {
         const uint idx = read_index_low(token);
@@ -262,23 +263,54 @@ void main() {
             const uint flush_group = group - p.tail_groups;
             const uint flush_ring = p.swa != 0u ? flush_group % p.groups_per_stream : flush_group;
             const uint flush_record_group = stream * p.groups_per_stream + flush_ring;
-            const uint record_base = (flush_record_group * p.n_heads + head) * p.record_words;
-            quantize_stage(head, stage_base, flush_group, record_base, lane);
+            for (uint slice = 0u; slice < p.head_slices; ++slice) {
+                const uint head = head0 + slice;
+                const uint record_base = (flush_record_group * p.n_heads + head) * p.record_words;
+                quantize_stage(head, stage_base, flush_group, record_base, lane);
+            }
         }
 
         // Stage and records are rotated-domain for both K and V.
-        sh_wht[lane] = data_current[(token * p.n_heads + head) * KVAR_N_DIM + lane];
-        wht_stage_row(lane);
-        barrier();
+        float values[4] = float[4](0.0, 0.0, 0.0, 0.0);
+        for (uint slice = 0u; slice < p.head_slices; ++slice) {
+            const uint head = head0 + slice;
+            sh_wht[lane] = data_current[(token * p.n_heads + head) * KVAR_N_DIM + lane];
+            wht_stage_row(lane);
+            values[slice] = sh_wht[lane];
+        }
+        if (p.head_slices == 2u) {
+            const float a = values[0];
+            const float b = values[1];
+            values[0] = (a + b) * 0.7071067811865475;
+            values[1] = (a - b) * 0.7071067811865475;
+        } else if (p.head_slices == 4u) {
+            const float a = values[0];
+            const float b = values[1];
+            const float c = values[2];
+            const float d = values[3];
+            values[0] = (a + b + c + d) * 0.5;
+            values[1] = (a - b + c - d) * 0.5;
+            values[2] = (a + b - c - d) * 0.5;
+            values[3] = (a - b - c + d) * 0.5;
+        }
+
         const uint stage_slot = p.swa != 0u ? (group % p.stage_groups) : (group == 0u ? 0u : 1u + ((group - 1u) % p.tail_groups));
         const uint stage_pos = stage_base + stage_slot * KVAR_N_DIM + pos;
-        store_stage_pair(stage_pos, head, lane);
-        barrier();
+        for (uint slice = 0u; slice < p.head_slices; ++slice) {
+            const uint head = head0 + slice;
+            sh_wht[lane] = values[slice];
+            barrier();
+            store_stage_pair(stage_pos, head, lane);
+            barrier();
+        }
         if (p.eager_records != 0u && pos == KVAR_N_DIM - 1u && (p.swa != 0u || group > 0u)) {
             const uint record_ring = p.swa != 0u ? group % p.groups_per_stream : group;
             const uint record_group = stream * p.groups_per_stream + record_ring;
-            const uint record_base = (record_group * p.n_heads + head) * p.record_words;
-            quantize_stage(head, stage_base, group, record_base, lane);
+            for (uint slice = 0u; slice < p.head_slices; ++slice) {
+                const uint head = head0 + slice;
+                const uint record_base = (record_group * p.n_heads + head) * p.record_words;
+                quantize_stage(head, stage_base, group, record_base, lane);
+            }
         }
     }
 }

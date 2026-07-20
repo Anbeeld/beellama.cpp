@@ -589,10 +589,11 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
 
     if (ggml_cuda_flash_attn_ext_kvarn_uses_views(dst)) {
-        GGML_ASSERT(ggml_cuda_flash_attn_ext_kvarn_supported(device, dst));
         // Descriptor-native KVarN does not need materialized F16 K/V buffers,
         // but the upstream MMA kernels still use the fixup workspace placed
         // after the output tensor when attention spans multiple KV batches.
+        // Allocation planning can run before backend route selection, so it
+        // must be structural and must not assert execution eligibility.
         const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
             ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, false, false);
         return f16_extra.end - (uintptr_t) dst->data;
@@ -713,12 +714,28 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
     const bool has_exact_tail = dst->src[5] != nullptr && dst->src[6] != nullptr && dst->src[7] != nullptr &&
         dst->src[8] != nullptr && dst->src[9] != nullptr;
+    const bool uses_kvarn = ggml_cuda_flash_attn_ext_kvarn_uses_views(dst);
+#if defined(GGML_USE_HIP)
+    const bool portable_kvarn_tail = uses_kvarn && has_exact_tail &&
+        ggml_cuda_flash_attn_ext_kvarn_portable_supported(ctx.device, dst);
+#else
+    const char * force_portable = getenv("GGML_KVARN_TEST_FORCE_PORTABLE_FATTN");
+    const bool portable_kvarn_tail = uses_kvarn && has_exact_tail &&
+        force_portable != nullptr && atoi(force_portable) != 0 &&
+        ggml_cuda_flash_attn_ext_kvarn_portable_supported(ctx.device, dst);
+#endif
+    if (portable_kvarn_tail) {
+        if (!ggml_cuda_flash_attn_ext_kvarn(ctx, dst)) {
+            GGML_ABORT("unsupported portable KVarN exact-tail FlashAttention route");
+        }
+        return;
+    }
     if (has_exact_tail) {
         ggml_cuda_flash_attn_ext_tail(ctx, dst);
         return;
     }
 
-    if (ggml_cuda_flash_attn_ext_kvarn_uses_views(dst)) {
+    if (uses_kvarn) {
         if (!ggml_cuda_flash_attn_ext_kvarn(ctx, dst)) {
             GGML_ABORT("unsupported KVarN CUDA FlashAttention route");
         }
@@ -731,6 +748,19 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     const bool has_exact_tail = dst->src[5] != nullptr && dst->src[6] != nullptr && dst->src[7] != nullptr &&
         dst->src[8] != nullptr && dst->src[9] != nullptr;
+    const bool uses_kvarn = ggml_cuda_flash_attn_ext_kvarn_uses_views(dst);
+#if defined(GGML_USE_HIP)
+    const bool portable_kvarn_tail = uses_kvarn && has_exact_tail &&
+        ggml_cuda_flash_attn_ext_kvarn_portable_supported(device, dst);
+#else
+    const char * force_portable = getenv("GGML_KVARN_TEST_FORCE_PORTABLE_FATTN");
+    const bool portable_kvarn_tail = uses_kvarn && has_exact_tail &&
+        force_portable != nullptr && atoi(force_portable) != 0 &&
+        ggml_cuda_flash_attn_ext_kvarn_portable_supported(device, dst);
+#endif
+    if (portable_kvarn_tail) {
+        return ggml_cuda_flash_attn_ext_kvarn_supported(device, dst);
+    }
     if (has_exact_tail) {
         if (!ggml_cuda_flash_attn_ext_tail_supported(
                     dst->src[1]->type, dst->src[2]->type, dst->src[5]->type, dst->src[6]->type,
@@ -741,7 +771,7 @@ bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
         return true;
     }
 
-    if (ggml_cuda_flash_attn_ext_kvarn_uses_views(dst)) {
+    if (uses_kvarn) {
         return ggml_cuda_flash_attn_ext_kvarn_supported(device, dst);
     }
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;

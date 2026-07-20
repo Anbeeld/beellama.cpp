@@ -82,11 +82,15 @@ Key binaries are `llama-server`, `llama-cli`, `llama-bench`, and
 
 - `src/llama-kvarn.cpp` / `.h` - KVarN descriptors, presets, and validation.
 - `src/llama-kv-cache-kvarn.cpp` / `.h` - KVarN memory and state handling.
-- `ggml/src/ggml-cuda/kvarn.cu` / `.cuh` - CUDA KVarN store operations.
-- `ggml/src/ggml-cuda/fattn-kvarn-dispatch.cu` - isolated KVarN attention
-  dispatch.
-- `ggml/src/ggml-vulkan/vulkan-shaders/kvarn_store.comp` - Vulkan KVarN store
-  shader.
+- `ggml/src/ggml-cuda/kvarn.cu` / `.cuh` - shared CUDA/HIP KVarN store and
+  materialization operations.
+- `ggml/src/ggml-cuda/fattn-kvarn-dispatch.cu` and
+  `fattn-kvarn-portable.cuh` - optimized CUDA and portable CUDA/HIP direct
+  KVarN attention.
+- `ggml/src/ggml-vulkan/vulkan-shaders/kvarn_store.comp` and
+  `kvarn_materialize.comp`, `kvarn_wht.comp`, and `kvarn_flash_attn.comp` -
+  Vulkan KVarN storage, fallback materialization, transforms, and direct
+  attention shaders.
 - `tools/server/server-adaptive-dm.h` - profit adaptive draft-max controller.
 - `tools/server/server-loop-guard.cpp` / `.h` - reasoning loop detection.
 ### Key Docs
@@ -101,6 +105,10 @@ Key binaries are `llama-server`, `llama-cli`, `llama-bench`, and
 
 - KVarN is target-context only. Draft and auxiliary contexts use normal cache
   types.
+- CUDA, CPU, Vulkan, and HIP/ROCm consume KVarN records directly in native
+  attention paths. Vulkan native attention requires shader Int64 and
+  buffer-device-address support. Materialization is an explicit fallback, not
+  the normal route for these backends.
 - Unsupported KVarN placements fail closed or use the explicit
   bit-width-matched fallback path; they must not silently reinterpret records.
 - Custom CUDA helpers are resolved through
