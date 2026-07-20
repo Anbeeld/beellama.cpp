@@ -1,11 +1,8 @@
 name: Build / Release
 
-run-name: ${{ github.event_name == 'push' && format('Build {0} Preview', github.ref_name) || format('Release {0}', inputs.tag_name) }}
+run-name: ${{ inputs.publish_release && format('Release {0}', inputs.tag_name) || format('Build {0} Preview', inputs.source_ref) }}
 
 on:
-  push:
-    branches:
-      - "v*"
   workflow_dispatch:
     inputs:
       source_ref:
@@ -27,8 +24,8 @@ on:
         type: boolean
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.ref || inputs.source_ref }}
-  cancel-in-progress: ${{ github.event_name == 'push' }}
+  group: ${{ github.workflow }}-${{ inputs.source_ref }}
+  cancel-in-progress: ${{ !inputs.publish_release }}
 
 permissions:
   actions: write
@@ -51,10 +48,79 @@ jobs:
       stable_release: ${{ steps.meta.outputs.stable_release }}
       build_packages: ${{ steps.meta.outputs.build_packages }}
       publish_docker: ${{ steps.meta.outputs.publish_docker }}
-      ccache_ref: ${{ steps.meta.outputs.ccache_ref }}
+      cache_channel: ${{ steps.meta.outputs.cache_channel }}
       image_repo: ${{ steps.meta.outputs.image_repo }}
       short_sha: ${{ steps.meta.outputs.short_sha }}
     steps:
+      - name: Prune stale release caches
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const liveBranches = [];
+            const caches = [];
+
+            for (let page = 1; ; page += 1) {
+              const { data } = await github.rest.repos.listBranches({
+                owner,
+                repo,
+                per_page: 100,
+                page,
+              });
+              liveBranches.push(...data
+                .map((branch) => branch.name)
+                .filter((name) => /^v[0-9][0-9A-Za-z._-]*$/.test(name)));
+              if (data.length < 100) {
+                break;
+              }
+            }
+
+            for (let page = 1; ; page += 1) {
+              const { data } = await github.rest.actions.getActionsCacheList({
+                owner,
+                repo,
+                per_page: 100,
+                page,
+              });
+              const pageCaches = data.actions_caches ?? [];
+              caches.push(...pageCaches);
+              if (pageCaches.length < 100) {
+                break;
+              }
+            }
+
+            let deleted = 0;
+            for (const cache of caches) {
+              if (!cache.key.startsWith("release-")) {
+                continue;
+              }
+              const liveChannel = liveBranches.some((branch) => {
+                const prefix = `release-${branch}-`;
+                if (!cache.key.startsWith(prefix)) {
+                  return false;
+                }
+                return /^(macos|ubuntu|windows)-/.test(cache.key.slice(prefix.length));
+              });
+              if (cache.ref === "refs/heads/main" && liveChannel) {
+                continue;
+              }
+              try {
+                await github.rest.actions.deleteActionsCacheById({
+                  owner,
+                  repo,
+                  cache_id: cache.id,
+                });
+                deleted += 1;
+                core.info(`Deleted stale release cache ${cache.key} on ${cache.ref}.`);
+              } catch (error) {
+                if (error.status !== 404) {
+                  throw error;
+                }
+              }
+            }
+            core.info(`Kept release caches for live branches: ${liveBranches.join(", ") || "none"}.`);
+            core.info(`Deleted ${deleted} stale or incorrectly scoped release cache entries.`);
+
       - name: Clone
         uses: actions/checkout@v6
         with:
@@ -69,37 +135,29 @@ jobs:
           build_packages="true"
           publish_docker="true"
 
-          if [[ "${EVENT_NAME}" == "push" ]]; then
-            if [[ "${GITHUB_REF}" != refs/heads/v* ]]; then
-              echo "Unsupported preview ref ${GITHUB_REF}; preview builds require a v* branch." >&2
-              exit 1
-            fi
-            source_ref="${GITHUB_REF_NAME}"
-            source_sha="${GITHUB_SHA}"
-            version_name="${source_ref}"
-            tag_name="preview-${source_ref}"
-            release_title="${source_ref} Preview"
-            preview="true"
-            stable_release="false"
-          elif [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
-            if [[ "${INPUT_PUBLISH_RELEASE}" != "true" ]]; then
-              echo "workflow_dispatch is reserved for main-owned stable releases." >&2
-              exit 1
-            fi
-            if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
-              echo "Stable release workflow_dispatch must run on main, not ${GITHUB_REF}." >&2
-              exit 1
-            fi
-            source_ref="${INPUT_SOURCE_REF}"
-            source_sha="${INPUT_SOURCE_SHA}"
-            tag_name="${INPUT_TAG_NAME}"
+          if [[ "${EVENT_NAME}" != "workflow_dispatch" ]]; then
+            echo "Unsupported event ${EVENT_NAME}; builds must use main-owned workflow_dispatch." >&2
+            exit 1
+          fi
+          if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
+            echo "Build workflow_dispatch must run on main, not ${GITHUB_REF}." >&2
+            exit 1
+          fi
+
+          source_ref="${INPUT_SOURCE_REF}"
+          source_sha="${INPUT_SOURCE_SHA}"
+          tag_name="${INPUT_TAG_NAME}"
+
+          if [[ "${INPUT_PUBLISH_RELEASE}" == "true" ]]; then
             version_name="${tag_name}"
             release_title="${tag_name}"
             preview="false"
             stable_release="true"
           else
-            echo "Unsupported event ${EVENT_NAME}." >&2
-            exit 1
+            version_name="${source_ref}"
+            release_title="${source_ref} Preview"
+            preview="true"
+            stable_release="false"
           fi
 
           if [[ ! "${version_name}" =~ ^v[0-9][0-9A-Za-z._-]*$ ]]; then
@@ -151,13 +209,15 @@ jobs:
               echo "Tag ${tag_name} is not reachable from origin/main; refusing to publish." >&2
               exit 1
             fi
+            git fetch origin +refs/heads/"${source_ref}":refs/remotes/origin/"${source_ref}" --no-tags
+            branch_commit="$(git rev-parse refs/remotes/origin/"${source_ref}")"
+            if ! git merge-base --is-ancestor "${branch_commit}" "${source_sha}"; then
+              echo "Release branch ${source_ref} at ${branch_commit} is not an ancestor of tag ${source_sha}." >&2
+              exit 1
+            fi
           fi
 
-          if [[ "${preview}" == "true" ]]; then
-            ccache_ref="${source_ref}"
-          else
-            ccache_ref="main"
-          fi
+          cache_channel="${source_ref}"
 
           owner="$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
           repo="$(printf '%s' "${GITHUB_REPOSITORY#*/}" | tr '[:upper:]' '[:lower:]')"
@@ -172,7 +232,7 @@ jobs:
           echo "stable_release=${stable_release}" >> "${GITHUB_OUTPUT}"
           echo "build_packages=${build_packages}" >> "${GITHUB_OUTPUT}"
           echo "publish_docker=${publish_docker}" >> "${GITHUB_OUTPUT}"
-          echo "ccache_ref=${ccache_ref}" >> "${GITHUB_OUTPUT}"
+          echo "cache_channel=${cache_channel}" >> "${GITHUB_OUTPUT}"
           echo "image_repo=${image_repo}" >> "${GITHUB_OUTPUT}"
           short_sha="${source_sha::12}"
           echo "short_sha=${short_sha}" >> "${GITHUB_OUTPUT}"
@@ -210,10 +270,7 @@ jobs:
       - name: ccache
         uses: ./.github/actions/setup-ccache
         with:
-          key: release-${{ needs.release-meta.outputs.ccache_ref }}-macos-arm64
-          restore-keys: |
-            release-${{ needs.release-meta.outputs.ccache_ref }}-macos-arm64-
-            release-macos-arm64-
+          key: release-${{ needs.release-meta.outputs.cache_channel }}-macos-arm64
 
       - name: Build
         run: |
@@ -234,11 +291,11 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        if: always()
+        if: ${{ always() && needs.release-meta.outputs.preview == 'true' }}
         uses: ./.github/actions/save-rolling-ccache
         with:
-          key: release-${{ needs.release-meta.outputs.ccache_ref }}-macos-arm64
-          ref: refs/heads/${{ needs.release-meta.outputs.ccache_ref }}
+          key: release-${{ needs.release-meta.outputs.cache_channel }}-macos-arm64
+          ref: refs/heads/main
           evict-old-files: 1d
 
       - name: Smoke package binaries
@@ -287,10 +344,7 @@ jobs:
       - name: ccache
         uses: ./.github/actions/setup-ccache
         with:
-          key: release-${{ needs.release-meta.outputs.ccache_ref }}-${{ matrix.os }}-cpu
-          restore-keys: |
-            release-${{ needs.release-meta.outputs.ccache_ref }}-${{ matrix.os }}-cpu-
-            release-${{ matrix.os }}-cpu-
+          key: release-${{ needs.release-meta.outputs.cache_channel }}-${{ matrix.os }}-cpu
 
       - name: Dependencies
         run: |
@@ -324,11 +378,11 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        if: always()
+        if: ${{ always() && needs.release-meta.outputs.preview == 'true' }}
         uses: ./.github/actions/save-rolling-ccache
         with:
-          key: release-${{ needs.release-meta.outputs.ccache_ref }}-${{ matrix.os }}-cpu
-          ref: refs/heads/${{ needs.release-meta.outputs.ccache_ref }}
+          key: release-${{ needs.release-meta.outputs.cache_channel }}-${{ matrix.os }}-cpu
+          ref: refs/heads/main
           evict-old-files: 1d
 
       - name: Smoke package binaries
@@ -370,10 +424,7 @@ jobs:
       - name: ccache
         uses: ./.github/actions/setup-ccache
         with:
-          key: release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-vulkan-x64
-          restore-keys: |
-            release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-vulkan-x64-
-            release-ubuntu-vulkan-x64-
+          key: release-${{ needs.release-meta.outputs.cache_channel }}-ubuntu-vulkan-x64
 
       - name: Dependencies
         run: |
@@ -403,11 +454,11 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        if: always()
+        if: ${{ always() && needs.release-meta.outputs.preview == 'true' }}
         uses: ./.github/actions/save-rolling-ccache
         with:
-          key: release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-vulkan-x64
-          ref: refs/heads/${{ needs.release-meta.outputs.ccache_ref }}
+          key: release-${{ needs.release-meta.outputs.cache_channel }}-ubuntu-vulkan-x64
+          ref: refs/heads/main
           evict-old-files: 1d
 
       - name: Smoke package binaries
@@ -456,10 +507,7 @@ jobs:
       - name: ccache
         uses: ./.github/actions/setup-ccache
         with:
-          key: release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-rocm-${{ env.ROCM_VERSION }}-x64
-          restore-keys: |
-            release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-rocm-${{ env.ROCM_VERSION }}-x64-
-            release-ubuntu-rocm-${{ env.ROCM_VERSION }}-x64-
+          key: release-${{ needs.release-meta.outputs.cache_channel }}-ubuntu-rocm-${{ env.ROCM_VERSION }}-x64
 
       - name: Dependencies
         run: |
@@ -494,6 +542,7 @@ jobs:
             -DGGML_CPU_ALL_VARIANTS=ON \
             -DGPU_TARGETS="${GPU_TARGETS}" \
             -DGGML_HIP=ON \
+            -DGGML_CUDA_KVARN=ON \
             -DGGML_CUDA_FA=ON \
             -DHIP_PLATFORM=amd \
             -DGGML_HIP_ROCWMMA_FATTN=ON \
@@ -508,11 +557,11 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        if: always()
+        if: ${{ always() && needs.release-meta.outputs.preview == 'true' }}
         uses: ./.github/actions/save-rolling-ccache
         with:
-          key: release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-rocm-${{ env.ROCM_VERSION }}-x64
-          ref: refs/heads/${{ needs.release-meta.outputs.ccache_ref }}
+          key: release-${{ needs.release-meta.outputs.cache_channel }}-ubuntu-rocm-${{ env.ROCM_VERSION }}-x64
+          ref: refs/heads/main
           evict-old-files: 1d
 
       - name: Smoke package binaries
@@ -570,10 +619,7 @@ jobs:
       - name: ccache
         uses: ./.github/actions/setup-ccache
         with:
-          key: release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
-          restore-keys: |
-            release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64-
-            release-ubuntu-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64-
+          key: release-${{ needs.release-meta.outputs.cache_channel }}-ubuntu-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
 
       - name: Dependencies
         run: |
@@ -618,11 +664,11 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        if: always()
+        if: ${{ always() && needs.release-meta.outputs.preview == 'true' }}
         uses: ./.github/actions/save-rolling-ccache
         with:
-          key: release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
-          ref: refs/heads/${{ needs.release-meta.outputs.ccache_ref }}
+          key: release-${{ needs.release-meta.outputs.cache_channel }}-ubuntu-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
+          ref: refs/heads/main
           evict-old-files: 1d
 
       - name: Smoke package binaries
@@ -682,10 +728,7 @@ jobs:
       - name: ccache
         uses: ./.github/actions/setup-ccache
         with:
-          key: release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-cuda-${{ matrix.cuda }}-x64
-          restore-keys: |
-            release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-cuda-${{ matrix.cuda }}-x64-
-            release-ubuntu-cuda-${{ matrix.cuda }}-x64-
+          key: release-${{ needs.release-meta.outputs.cache_channel }}-ubuntu-cuda-${{ matrix.cuda }}-x64
           max-size: 5G
           sloppiness: time_macros
 
@@ -697,6 +740,7 @@ jobs:
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
             -DGGML_NATIVE=OFF \
             -DGGML_CUDA=ON \
+            -DGGML_CUDA_KVARN=ON \
             -DGGML_CUDA_FA=ON \
             -DGGML_BACKEND_DL=ON \
             -DGGML_CPU_ALL_VARIANTS=ON \
@@ -712,11 +756,11 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        if: always()
+        if: ${{ always() && needs.release-meta.outputs.preview == 'true' }}
         uses: ./.github/actions/save-rolling-ccache
         with:
-          key: release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-cuda-${{ matrix.cuda }}-x64
-          ref: refs/heads/${{ needs.release-meta.outputs.ccache_ref }}
+          key: release-${{ needs.release-meta.outputs.cache_channel }}-ubuntu-cuda-${{ matrix.cuda }}-x64
+          ref: refs/heads/main
           evict-old-files: 1d
 
       - name: Smoke package binaries
@@ -758,10 +802,7 @@ jobs:
       - name: ccache
         uses: ./.github/actions/setup-ccache
         with:
-          key: release-${{ needs.release-meta.outputs.ccache_ref }}-windows-cpu-x64
-          restore-keys: |
-            release-${{ needs.release-meta.outputs.ccache_ref }}-windows-cpu-x64-
-            release-windows-cpu-x64-
+          key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-cpu-x64
 
       - name: Install Ninja
         run: choco install ninja -y
@@ -787,11 +828,11 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        if: always()
+        if: ${{ always() && needs.release-meta.outputs.preview == 'true' }}
         uses: ./.github/actions/save-rolling-ccache
         with:
-          key: release-${{ needs.release-meta.outputs.ccache_ref }}-windows-cpu-x64
-          ref: refs/heads/${{ needs.release-meta.outputs.ccache_ref }}
+          key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-cpu-x64
+          ref: refs/heads/main
           evict-old-files: 1d
 
       - name: Pack artifacts
@@ -852,10 +893,7 @@ jobs:
       - name: ccache
         uses: ./.github/actions/setup-ccache
         with:
-          key: release-${{ needs.release-meta.outputs.ccache_ref }}-windows-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
-          restore-keys: |
-            release-${{ needs.release-meta.outputs.ccache_ref }}-windows-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64-
-            release-windows-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64-
+          key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
 
       - name: Install Ninja
         run: choco install ninja -y
@@ -888,11 +926,11 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        if: always()
+        if: ${{ always() && needs.release-meta.outputs.preview == 'true' }}
         uses: ./.github/actions/save-rolling-ccache
         with:
-          key: release-${{ needs.release-meta.outputs.ccache_ref }}-windows-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
-          ref: refs/heads/${{ needs.release-meta.outputs.ccache_ref }}
+          key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
+          ref: refs/heads/main
           evict-old-files: 1d
 
       - name: Pack SYCL backend
@@ -977,10 +1015,7 @@ jobs:
       - name: ccache
         uses: ./.github/actions/setup-ccache
         with:
-          key: release-${{ needs.release-meta.outputs.ccache_ref }}-windows-vulkan-${{ env.VULKAN_VERSION }}-x64
-          restore-keys: |
-            release-${{ needs.release-meta.outputs.ccache_ref }}-windows-vulkan-${{ env.VULKAN_VERSION }}-x64-
-            release-windows-vulkan-${{ env.VULKAN_VERSION }}-x64-
+          key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-vulkan-${{ env.VULKAN_VERSION }}-x64
 
       - name: Install Ninja
         run: choco install ninja -y
@@ -1005,11 +1040,11 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        if: always()
+        if: ${{ always() && needs.release-meta.outputs.preview == 'true' }}
         uses: ./.github/actions/save-rolling-ccache
         with:
-          key: release-${{ needs.release-meta.outputs.ccache_ref }}-windows-vulkan-${{ env.VULKAN_VERSION }}-x64
-          ref: refs/heads/${{ needs.release-meta.outputs.ccache_ref }}
+          key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-vulkan-${{ env.VULKAN_VERSION }}-x64
+          ref: refs/heads/main
           evict-old-files: 1d
 
       - name: Pack Vulkan backend
@@ -1046,10 +1081,7 @@ jobs:
       - name: ccache
         uses: ./.github/actions/setup-ccache
         with:
-          key: release-${{ needs.release-meta.outputs.ccache_ref }}-windows-cuda-${{ matrix.cuda }}
-          restore-keys: |
-            release-${{ needs.release-meta.outputs.ccache_ref }}-windows-cuda-${{ matrix.cuda }}-
-            release-windows-cuda-${{ matrix.cuda }}-
+          key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-cuda-${{ matrix.cuda }}
           max-size: 5G
           sloppiness: time_macros
 
@@ -1090,6 +1122,7 @@ jobs:
             -DGGML_NATIVE=OFF ^
             -DGGML_CPU=OFF ^
             -DGGML_CUDA=ON ^
+            -DGGML_CUDA_KVARN=ON ^
             -DGGML_CUDA_FA=ON ^
             -DLLAMA_BUILD_BORINGSSL=ON ^
             -DCMAKE_C_COMPILER_LAUNCHER=ccache ^
@@ -1104,11 +1137,11 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        if: always()
+        if: ${{ always() && needs.release-meta.outputs.preview == 'true' }}
         uses: ./.github/actions/save-rolling-ccache
         with:
-          key: release-${{ needs.release-meta.outputs.ccache_ref }}-windows-cuda-${{ matrix.cuda }}
-          ref: refs/heads/${{ needs.release-meta.outputs.ccache_ref }}
+          key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-cuda-${{ matrix.cuda }}
+          ref: refs/heads/main
           evict-old-files: 1d
 
       - name: Pack CUDA backend
@@ -1171,10 +1204,7 @@ jobs:
       - name: ccache
         uses: ./.github/actions/setup-ccache
         with:
-          key: release-${{ needs.release-meta.outputs.ccache_ref }}-windows-hip-${{ env.HIPSDK_INSTALLER_VERSION }}-x64
-          restore-keys: |
-            release-${{ needs.release-meta.outputs.ccache_ref }}-windows-hip-${{ env.HIPSDK_INSTALLER_VERSION }}-x64-
-            release-windows-hip-${{ env.HIPSDK_INSTALLER_VERSION }}-x64-
+          key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-hip-${{ env.HIPSDK_INSTALLER_VERSION }}-x64
 
       - name: Install ROCm
         run: |
@@ -1214,6 +1244,7 @@ jobs:
             -DGPU_TARGETS="${env:GPU_TARGETS}" `
             -DGGML_HIP_ROCWMMA_FATTN=ON `
             -DGGML_HIP=ON `
+            -DGGML_CUDA_KVARN=ON `
             -DGGML_CUDA_FA=ON `
             -DCMAKE_C_COMPILER_LAUNCHER=ccache `
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `
@@ -1233,11 +1264,11 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        if: always()
+        if: ${{ always() && needs.release-meta.outputs.preview == 'true' }}
         uses: ./.github/actions/save-rolling-ccache
         with:
-          key: release-${{ needs.release-meta.outputs.ccache_ref }}-windows-hip-${{ env.HIPSDK_INSTALLER_VERSION }}-x64
-          ref: refs/heads/${{ needs.release-meta.outputs.ccache_ref }}
+          key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-hip-${{ env.HIPSDK_INSTALLER_VERSION }}-x64
+          ref: refs/heads/main
           evict-old-files: 1d
 
       - name: Pack artifacts
