@@ -32,6 +32,7 @@ jobs:
             exit 1
           fi
           gh workflow run release.yml \
+            --repo "${GITHUB_REPOSITORY}" \
             --ref main \
             --field source_ref="${SOURCE_REF}" \
             --field source_sha="${SOURCE_SHA}" \
