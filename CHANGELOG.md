@@ -3,14 +3,23 @@
 ## v0.4.1
 
 - Fixed the static/test source build after the memory interface gained
-  cell-level sequence operations. Unsupported KVarN placement now reports the
-  actual native-attention matrix directly: a compatible NVIDIA CUDA device
-  (Turing or newer); ROCm/HIP, Vulkan, and CPU remain unsupported.
+  cell-level sequence operations, including the abstract `mock_memory`
+  regression in `test-batch-alloc`.
+- Extended native KVarN attention beyond the optimized NVIDIA CUDA path. CPU
+  and Vulkan now consume compressed records directly, and CUDA/HIP has a
+  portable direct-record path for devices that cannot use the CUDA MMA
+  implementation. Runtime capability checks select the direct path per layer
+  and retain an explicit materialization fallback for unsupported
+  shapes/features; CPU placement works with KV offload disabled, while Vulkan
+  requires shader Int64 and buffer-device-address support. CUDA and ROCm
+  release builds explicitly enable the shared KVarN kernels.
 - Reduced KVarN host checkpoint stalls for large exact tails by serializing
   component-major contiguous slot runs instead of issuing one backend transfer
-  per payload row. KVarN state format v13 preserves all exact-tail bytes,
-  transactional restores, host/on-device sequence state, and v12 host-state
-  compatibility while exposing debug-level transfer-count diagnostics.
+  per payload row. A normal 4096-token tail now takes 32-64 host tensor
+  operations instead of 131,072. KVarN state format v13 preserves all
+  exact-tail bytes, transactional restores, host/on-device sequence state, and
+  v12 host-state compatibility while exposing debug-level transfer-count
+  diagnostics.
 
 ## v0.4.0
 
