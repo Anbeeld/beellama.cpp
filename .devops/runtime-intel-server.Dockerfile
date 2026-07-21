@@ -33,7 +33,7 @@ RUN mkdir /tmp/neo/ && cd /tmp/neo/ \
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl libgomp1 \
+    && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg libgomp1 \
     && rm -rf /tmp/* /var/tmp/*
 
 WORKDIR /app
