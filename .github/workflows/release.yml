@@ -1443,7 +1443,7 @@ jobs:
             artifact: beellama-bin-ubuntu-x64.tar.gz
             dockerfile: .devops/runtime-server.Dockerfile
             base_image: ubuntu:24.04
-            runtime_packages: ca-certificates curl libgomp1
+            runtime_packages: ca-certificates curl ffmpeg libgomp1
             runs_on: ubuntu-24.04
           - name: cpu-arm64
             display: CPU arm64
@@ -1453,7 +1453,7 @@ jobs:
             artifact: beellama-bin-ubuntu-arm64.tar.gz
             dockerfile: .devops/runtime-server.Dockerfile
             base_image: ubuntu:24.04
-            runtime_packages: ca-certificates curl libgomp1
+            runtime_packages: ca-certificates curl ffmpeg libgomp1
             runs_on: ubuntu-24.04-arm
           - name: cuda12
             display: CUDA 12.4
@@ -1463,7 +1463,7 @@ jobs:
             artifact: beellama-bin-ubuntu-cuda-12.4-x64.tar.gz
             dockerfile: .devops/runtime-server.Dockerfile
             base_image: nvidia/cuda:12.4.1-runtime-ubuntu22.04
-            runtime_packages: ca-certificates curl libgomp1
+            runtime_packages: ca-certificates curl ffmpeg libgomp1
             runs_on: ubuntu-24.04
           - name: cuda13
             display: CUDA 13.1
@@ -1473,7 +1473,7 @@ jobs:
             artifact: beellama-bin-ubuntu-cuda-13.1-x64.tar.gz
             dockerfile: .devops/runtime-server.Dockerfile
             base_image: nvidia/cuda:13.1.1-runtime-ubuntu24.04
-            runtime_packages: ca-certificates curl libgomp1
+            runtime_packages: ca-certificates curl ffmpeg libgomp1
             runs_on: ubuntu-24.04
           - name: rocm
             display: ROCm
@@ -1483,7 +1483,7 @@ jobs:
             artifact: beellama-bin-ubuntu-rocm-7.2-x64.tar.gz
             dockerfile: .devops/runtime-server.Dockerfile
             base_image: rocm/dev-ubuntu-24.04:7.2.1-complete
-            runtime_packages: ca-certificates curl libgomp1
+            runtime_packages: ca-certificates curl ffmpeg libgomp1
             runs_on: ubuntu-24.04
           - name: vulkan
             display: Vulkan
@@ -1493,7 +1493,7 @@ jobs:
             artifact: beellama-bin-ubuntu-vulkan-x64.tar.gz
             dockerfile: .devops/runtime-server.Dockerfile
             base_image: ubuntu:24.04
-            runtime_packages: ca-certificates curl libegl1 libgl1 libgles2 libglvnd0 libglx0 libgomp1 libvulkan1 mesa-vulkan-drivers
+            runtime_packages: ca-certificates curl ffmpeg libegl1 libgl1 libgles2 libglvnd0 libglx0 libgomp1 libvulkan1 mesa-vulkan-drivers
             runs_on: ubuntu-24.04
           - name: sycl
             display: SYCL

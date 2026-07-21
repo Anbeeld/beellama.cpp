@@ -4,7 +4,7 @@ ARG BASE_IMAGE=ubuntu:24.04
 
 FROM ${BASE_IMAGE} AS server
 
-ARG RUNTIME_PACKAGES="ca-certificates curl libgomp1"
+ARG RUNTIME_PACKAGES="ca-certificates curl ffmpeg libgomp1"
 ARG SMOKE_DISABLED_BACKEND=""
 
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
