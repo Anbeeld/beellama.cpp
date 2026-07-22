@@ -735,6 +735,18 @@ static void ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols2(ggml_backend_cuda_c
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
     const int gqa_ratio = Q->ne[2] / K->ne[2];
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if constexpr ((DKQ == 128 && DV == 128) || (DKQ == 256 && DV == 256)) {
+        const bool use_wide_shape = ggml_cuda_fattn_kvarn_use_wide_mma(
+            (int) Q->ne[1], gqa_ratio, true);
+        if (use_gqa_opt && use_wide_shape &&
+            ggml_cuda_fattn_kvarn_wide_mma_supported<DKQ, DV, 16, 8>(ctx, dst)) {
+            ggml_cuda_flash_attn_ext_mma_kvarn_case<DKQ, DV, 16, 8>(ctx, dst);
+            return;
+        }
+    }
+#endif
+
     if (use_gqa_opt && gqa_ratio > 4) {
         ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols1<DKQ, DV, 8>(ctx, dst);
         return;

@@ -50,7 +50,7 @@ int main(int argc, char ** argv) {
 
     ok &= expect(argc == 2, "expected repo root argument");
     ok &= expect(GGML_CUDA_FATTN_KVARN_DECODE_MAX_Q == 16,
-        "CUDA KVarN split decode must cover a complete DFlash verification block");
+        "CUDA KVarN native attention must cover a complete DFlash verification block");
     if (!ok) {
         return 1;
     }
@@ -60,6 +60,8 @@ int main(int argc, char ** argv) {
     const std::string kvarn = read_file(root + "/ggml/src/ggml-cuda/fattn-kvarn-dispatch.cu");
     const std::string cmake = read_file(root + "/ggml/CMakeLists.txt");
     const std::string cuda_cmake = read_file(root + "/ggml/src/ggml-cuda/CMakeLists.txt");
+    const std::string kvarn_mma = read_file(root + "/ggml/src/ggml-cuda/fattn-mma-kvarn-impl.cuh");
+    const std::string kvarn_mma_case = read_file(root + "/ggml/src/ggml-cuda/fattn-mma-kvarn-case.cuh");
     const std::string release = read_file(root + "/.github/workflows/release.yml");
 
     const auto expect_route = [&](const ggml_cuda_fattn_kvarn_route_input & base,
@@ -85,8 +87,8 @@ int main(int argc, char ** argv) {
         "Gemma-like D256 SWA decode did not select vector decode");
     for (int n_q = 2; n_q <= GGML_CUDA_FATTN_KVARN_DECODE_MAX_Q; ++n_q) {
         expect_route({256, n_q, 6, 4, 4, false, false, false, true, false},
-            GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_SPLIT,
-            "supported multi-token verification shape did not select split decode");
+            GGML_CUDA_FATTN_KVARN_ROUTE_GENERIC_MMA,
+            "supported multi-token verification shape did not select tiled native MMA");
     }
     expect_route({384, 1, 6, 4, 4, false, false, false, false, false},
         GGML_CUDA_FATTN_KVARN_ROUTE_GENERIC_MMA,
@@ -94,6 +96,12 @@ int main(int argc, char ** argv) {
     expect_route({256, 64, 6, 4, 4, false, false, false, false, true},
         GGML_CUDA_FATTN_KVARN_ROUTE_PROMPT_PREFILL,
         "prompt/prefill shape did not retain the prompt route");
+    ok &= expect(ggml_cuda_fattn_kvarn_use_wide_mma(16, 6, true),
+        "supported Q16/GQA6 verification did not select the wide MMA tile");
+    ok &= expect(!ggml_cuda_fattn_kvarn_use_wide_mma(8, 6, true) &&
+                 !ggml_cuda_fattn_kvarn_use_wide_mma(16, 4, true) &&
+                 !ggml_cuda_fattn_kvarn_use_wide_mma(16, 6, false),
+        "wide MMA tile must retain shape and device-resource fallbacks");
     const std::string allocation = slice_between(fattn,
             "size_t ggml_cuda_flash_attn_ext_get_alloc_size",
             "void ggml_cuda_flash_attn_ext");
@@ -153,6 +161,23 @@ int main(int argc, char ** argv) {
         "CMake must retain exactly the 15-pair default KVarN fast-decode policy without HALF");
     ok &= expect(count_occurrences(release, "-DGGML_CUDA_KVARN=ON") == 4,
         "all Linux/Windows CUDA and ROCm release builds must explicitly enable KVarN");
+    ok &= expect(count_occurrences(kvarn_mma,
+                 "idx < nbatch_fa * dim2_count_local; idx += nthreads") >= 2,
+        "rotated KVarN record reconstruction must distribute token/dimension pairs across the full CTA");
+    ok &= expect(kvarn_mma.find("desc.value ? 3 * D : 0") != std::string::npos &&
+                 kvarn_mma.find("axis_group_tags[axis_tag] != record_group") != std::string::npos,
+        "rotated KVarN MMA must keep independent K/V record axes in shared memory and reuse them across subtiles");
+    ok &= expect(kvarn_mma.find("const int row_pair_lane") != std::string::npos &&
+                 count_occurrences(kvarn_mma, "ggml_cuda_fattn_kvarn_unpack_record_pair") >= 3,
+        "rotated KVarN key reconstruction must decode adjacent token pairs cooperatively");
+    ok &= expect(kvarn_mma_case.find("6 * std::max(DKQ, DV) * sizeof(half)") != std::string::npos,
+        "rotated KVarN MMA shared memory must reserve all three axes for both K and V records");
+    ok &= expect(kvarn.find("ggml_cuda_fattn_kvarn_wide_mma_supported") != std::string::npos &&
+                 kvarn.find("ggml_cuda_flash_attn_ext_mma_kvarn_case<DKQ, DV, 16, 8>") != std::string::npos,
+        "multi-token GQA verification must use the adaptive wide KVarN MMA tile when the device supports it");
+    ok &= expect(kvarn_mma_case.find("cudaOccupancyMaxActiveBlocksPerMultiprocessor") != std::string::npos &&
+                 kvarn_mma_case.find("smpbo") != std::string::npos,
+        "wide KVarN MMA eligibility must be based on actual device resources and kernel occupancy");
 
     return ok ? 0 : 1;
 }

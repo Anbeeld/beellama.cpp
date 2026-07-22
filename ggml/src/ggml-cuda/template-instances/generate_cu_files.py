@@ -153,6 +153,17 @@ for ncols in [8, 16, 32, 64]:
                 f.write(SOURCE_FATTN_MMA_KVARN_CASE.format(
                     head_size=head_size, ncols1=ncols1, ncols2=ncols2))
 
+with open("fattn-mma-kvarn-instance-ncols1_16-ncols2_8.cu", "w") as f:
+    f.write(SOURCE_FATTN_MMA_KVARN_START)
+    f.write("#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)\n")
+    for head_size in [128, 256]:
+        f.write(SOURCE_FATTN_MMA_KVARN_CASE.format(
+            head_size=head_size, ncols1=16, ncols2=8))
+        f.write(
+            "template bool ggml_cuda_fattn_kvarn_wide_mma_supported<"
+            f"{head_size}, {head_size}, 16, 8>(ggml_backend_cuda_context &, const ggml_tensor *);\n")
+    f.write("#endif\n")
+
 for bits_k in KVARN_DECODE_BITS:
     for bits_v in KVARN_DECODE_BITS:
         cases = "\n".join(

@@ -22,6 +22,33 @@ static __device__ __forceinline__ uint8_t ggml_cuda_fattn_kvarn_unpack_record(
     return (packed >> bit_in_byte) & ((1u << bits) - 1u);
 }
 
+// Decode two consecutive values at an even element index. KVarN value records
+// are row-major and the MMA loader consumes dimensions in pairs, so one packed
+// window and one bit-offset calculation serve both output lanes.
+static __device__ __forceinline__ uint16_t ggml_cuda_fattn_kvarn_unpack_record_pair(
+        const uint8_t * record, const int index, const int bits) {
+    if (bits == 8) {
+        return (uint16_t) record[index] | ((uint16_t) record[index + 1] << 8);
+    }
+    if (bits == 4) {
+        const uint8_t packed = record[index >> 1];
+        return (uint16_t) (packed & 0x0fu) | ((uint16_t) (packed >> 4) << 8);
+    }
+    if (bits == 2) {
+        const uint8_t packed = record[index >> 2];
+        const int shift = (index & 3) << 1;
+        return (uint16_t) ((packed >> shift) & 0x03u) |
+            ((uint16_t) ((packed >> (shift + 2)) & 0x03u) << 8);
+    }
+    const int bit_offset = index * bits;
+    const int byte_offset = bit_offset >> 3;
+    const int bit_in_byte = bit_offset & 7;
+    const uint16_t packed = (uint16_t) record[byte_offset] | ((uint16_t) record[byte_offset + 1] << 8);
+    const uint16_t mask = (1u << bits) - 1u;
+    return (uint16_t) ((packed >> bit_in_byte) & mask) |
+        (uint16_t) (((packed >> (bit_in_byte + bits)) & mask) << 8);
+}
+
 static __device__ __forceinline__ float ggml_cuda_fattn_kvarn_load_stage_rotated(
         const ggml_cuda_fattn_kvarn_desc & desc,
         const int stage_pos,

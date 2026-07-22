@@ -48,11 +48,17 @@ as the intended workload. Keep both `-b` and `-ub` identical between baseline
 and candidate runs. Record the model file, command, prompt or corpus, sampling
 settings, GPU, and commit with every result.
 
-The CUDA specialized split and SWA-vector decode routes publish the same
-optional FP32 `(maximum, denominator)` metadata as upstream FlashAttention.
-An attached precision tail therefore does not force KVarN through the generic MMA
-fallback. `llama-bench` reports requested and effective tail sizes plus split,
-vector, generic, and prefill route counts so this remains observable.
+The CUDA specialized split, SWA-vector, and tiled descriptor-native MMA routes
+publish the same optional FP32 `(maximum, denominator)` metadata as upstream
+FlashAttention. Single-token generation uses split/vector decode, while short
+multi-token verification uses tiled MMA to reuse decoded K/V tiles across query
+rows. Q9-Q16 batches with GQA above four use a fused 128-column tile when the
+concrete kernel fits the device's opt-in shared-memory budget and has nonzero
+measured occupancy; all other devices and shapes retain the regular tile
+matrix. An attached precision tail therefore does not force KVarN away from its
+shape-selected native route. `llama-bench` reports requested and effective
+tail sizes plus split, vector, generic, and prefill route counts so this remains
+observable.
 
 The July 2026 RTX 3090 / CUDA 13.1 recovery run used the Qwen 3.6 27B Q5_K_S
 and Gemma 4 31B Q5_K_S models, `-b 2048 -ub 512`, 128 decode tokens, and five

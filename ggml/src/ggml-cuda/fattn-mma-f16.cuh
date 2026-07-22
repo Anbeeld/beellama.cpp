@@ -61,6 +61,7 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 16, 128, 2,  64,  64,  64,  64, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 32, 128, 2,  64,  64,  64,  64, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 64, 128, 2,  64,  64,  64,  64, 2, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 128, 256, 1,  32,  64,  64,  64, 2, true);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(192, 128,  8,  64, 4,  64,  96,  64,  64, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(192, 128, 16,  64, 4,  32,  96,  64,  64, 2, true);
@@ -71,6 +72,7 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 16,  64, 4,  32, 128, 128, 128, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 2,  32, 128, 128, 128, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 128, 2,  32, 128, 128, 128, 2, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 128, 256, 1,  32, 128, 128, 128, 2, true);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 32, 128, 2,  32, 128, 128, 128, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 64, 256, 1,  32, 128, 128, 128, 1, false);
@@ -612,7 +614,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 if constexpr (ggml_cuda_fattn_kvarn_template_type(type_K)) {
                     constexpr bool kvarn_original_domain = type_K == GGML_CUDA_FATTN_KVARN_ORIGINAL_TYPE;
                     constexpr int nthreads_kvarn = nwarps * ggml_cuda_get_physical_warp_size();
-                    flash_attn_ext_kvarn_load_tile<DKQ, stride_tile_K, nbatch_fa, nthreads_kvarn, oob_check, kvarn_original_domain>
+                    flash_attn_ext_kvarn_load_tile<DKQ, stride_tile_K, nbatch_fa, nthreads_kvarn, oob_check,
+                        kvarn_original_domain, false,
+                        type_K == GGML_CUDA_FATTN_KVARN_TYPE && type_V == GGML_CUDA_FATTN_KVARN_TYPE>
                         ((const char *) K_h2, tile_K, k_VKQ_0, k_VKQ_sup, k0_start, k0_stop - k0_start, kvarn_smem);
                 } else {
                     const int k0_diff = k0_stop - k0_start;
@@ -970,7 +974,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 if constexpr (ggml_cuda_fattn_kvarn_template_type(type_V)) {
                     constexpr bool kvarn_original_domain = type_V == GGML_CUDA_FATTN_KVARN_ORIGINAL_TYPE;
                     constexpr int nthreads_kvarn = nwarps * ggml_cuda_get_physical_warp_size();
-                    flash_attn_ext_kvarn_load_tile<DV, stride_tile_V, nbatch_fa, nthreads_kvarn, oob_check, kvarn_original_domain>
+                    flash_attn_ext_kvarn_load_tile<DV, stride_tile_V, nbatch_fa, nthreads_kvarn, oob_check,
+                        kvarn_original_domain, false,
+                        type_K == GGML_CUDA_FATTN_KVARN_TYPE && type_V == GGML_CUDA_FATTN_KVARN_TYPE>
                         ((const char *) V_h2, tile_V, k_VKQ_0, k_VKQ_sup, i0_start / 2, nbatch_V2, kvarn_smem);
                     __syncthreads();
                 } else {
@@ -1200,6 +1206,20 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     half2 * tile_V    =           nstages > 1 ? tile_K + nbatch_fa * stride_tile_K : tile_K;
     half  * tile_mask = (half *) (nstages > 1 ? tile_V + nbatch_fa * stride_tile_V : tile_V + nbatch_fa * stride_tile_KV_max);
     half * kvarn_smem = tile_mask + ncols1 * (nbatch_fa + 8);
+
+    constexpr bool cache_kvarn_record_axes =
+        type_K == GGML_CUDA_FATTN_KVARN_TYPE && type_V == GGML_CUDA_FATTN_KVARN_TYPE;
+    if constexpr (cache_kvarn_record_axes) {
+        static_assert(DKQ == DV, "rotated KVarN K/V axes require matching attention head dimensions");
+        constexpr int axis_tag_count = 2 * (DKQ / GGML_CUDA_FATTN_KVARN_DIM);
+        int * axis_group_tags = (int *) (kvarn_smem + 6 * DKQ);
+        if (threadIdx.x == 0 && threadIdx.y == 0) {
+            for (int i = 0; i < axis_tag_count; ++i) {
+                axis_group_tags[i] = -1;
+            }
+        }
+        __syncthreads();
+    }
 
     T_B_KQ    Q_B[(Q_in_reg ? DKQ/(2*T_B_KQ::J) : 1)];
 #if defined(TURING_MMA_AVAILABLE)

@@ -2576,6 +2576,7 @@ static void test_native_flash_attention_gpu() {
     const auto require_metadata_case = [&](int head_dim, int n_q, int n_q_heads,
                                            int n_kv_heads, int bits, bool swa,
                                            uint64_t min_split, uint64_t min_vector,
+                                           bool expect_tiled_mma,
                                            const char * message) {
         std::vector<float> generic_meta;
         std::vector<float> actual_meta;
@@ -2604,10 +2605,15 @@ static void test_native_flash_attention_gpu() {
                 "specialized KVarN body metadata differs from generic KVarN reference");
         require(generic_stats.generic_mma > 0 && generic_stats.decode_split == 0 && generic_stats.decode_vector == 0,
                 "neutral-sink metadata reference did not exercise generic KVarN MMA");
-        require(stats.decode_split >= min_split && stats.decode_vector >= min_vector,
-                "metadata-capable KVarN decode did not exercise the required specialized route");
-        require(stats.generic_mma == 0,
-                "eligible metadata-capable KVarN decode fell back to generic MMA");
+        if (expect_tiled_mma) {
+            require(stats.generic_mma > 0 && stats.decode_split == 0 && stats.decode_vector == 0,
+                    "multi-query KVarN decode did not exercise tiled native MMA");
+        } else {
+            require(stats.decode_split >= min_split && stats.decode_vector >= min_vector,
+                    "metadata-capable KVarN decode did not exercise the required specialized route");
+            require(stats.generic_mma == 0,
+                    "eligible single-query KVarN decode fell back to generic MMA");
+        }
         require(actual_meta.size() == size_t(2 * n_q_heads * n_q),
                 "specialized KVarN body metadata has the wrong layout");
         for (size_t i = 0; i < actual_meta.size(); i += 2) {
@@ -2617,24 +2623,25 @@ static void test_native_flash_attention_gpu() {
         }
     };
 
-    require_metadata_case(256, 1, 6, 1, 4, false, 1, 0,
+    require_metadata_case(256, 1, 6, 1, 4, false, 1, 0, false,
             "Qwen-like D256 metadata-capable split output differs from reference");
-    require_metadata_case(512, 1, 16, 1, 4, false, 1, 0,
+    require_metadata_case(512, 1, 16, 1, 4, false, 1, 0, false,
             "Gemma-like D512 metadata-capable split output differs from reference");
-    require_metadata_case(256, 1, 2, 1, 4, true, 0, 1,
+    require_metadata_case(256, 1, 2, 1, 4, true, 0, 1, false,
             "Gemma-like D256 SWA metadata-capable vector output differs from reference");
     for (int n_q = 2; n_q <= 16; ++n_q) {
-        require_metadata_case(256, n_q, 6, 1, 4, false, 1, 0,
-                "multi-token metadata-capable split output differs from reference");
+        require_metadata_case(256, n_q, 6, 1, 4, false, 0, 0, true,
+                "multi-token metadata-capable tiled MMA output differs from reference");
     }
-    require_metadata_case(256, 9, 6, 1, 6, false, 1, 0,
-            "KVarN6 DFlash-sized split output differs from reference");
-    require_metadata_case(256, 16, 6, 1, 6, false, 1, 0,
-            "KVarN6 full-block split output differs from reference");
+    require_metadata_case(256, 9, 6, 1, 6, false, 0, 0, true,
+            "KVarN6 DFlash-sized tiled MMA output differs from reference");
+    require_metadata_case(256, 16, 6, 1, 6, false, 0, 0, true,
+            "KVarN6 full-block tiled MMA output differs from reference");
 
     const auto require_exact_tail_case = [&](int head_dim, int n_q, int n_q_heads,
                                               int n_kv_heads, bool swa, int tail_tokens,
                                               uint64_t min_split, uint64_t min_vector,
+                                              bool expect_tiled_mma,
                                               const char * message) {
         route_stats_reset();
         const std::vector<float> generic = test_native_flash_attention_output(
@@ -2653,26 +2660,31 @@ static void test_native_flash_attention_gpu() {
         require(generic_stats.generic_mma > 0 &&
                 generic_stats.decode_split == 0 && generic_stats.decode_vector == 0,
                 "exact-tail reference did not exercise generic KVarN MMA");
-        require(stats.decode_split >= min_split && stats.decode_vector >= min_vector,
-                "exact-tail KVarN body did not exercise the required specialized route");
-        require(stats.generic_mma == 0,
-                "eligible exact-tail KVarN body fell back to generic MMA");
+        if (expect_tiled_mma) {
+            require(stats.generic_mma > 0 && stats.decode_split == 0 && stats.decode_vector == 0,
+                    "multi-query exact-tail KVarN body did not exercise tiled native MMA");
+        } else {
+            require(stats.decode_split >= min_split && stats.decode_vector >= min_vector,
+                    "exact-tail KVarN body did not exercise the required specialized route");
+            require(stats.generic_mma == 0,
+                    "eligible single-query exact-tail KVarN body fell back to generic MMA");
+        }
     };
 
-    require_exact_tail_case(256, 1, 6, 1, false, 128, 1, 0,
+    require_exact_tail_case(256, 1, 6, 1, false, 128, 1, 0, false,
             "intrinsic-128 exact-tail merge differs from generic KVarN reference");
-    require_exact_tail_case(256, 1, 6, 1, false, 1024, 1, 0,
+    require_exact_tail_case(256, 1, 6, 1, false, 1024, 1, 0, false,
             "requested-1024 exact-tail merge differs from generic KVarN reference");
     // A request of 129 is rounded by policy to this 256-token effective tail.
-    require_exact_tail_case(256, 1, 6, 1, false, 256, 1, 0,
+    require_exact_tail_case(256, 1, 6, 1, false, 256, 1, 0, false,
             "rounded-256 exact-tail merge differs from generic KVarN reference");
-    require_exact_tail_case(512, 1, 16, 1, false, 128, 1, 0,
+    require_exact_tail_case(512, 1, 16, 1, false, 128, 1, 0, false,
             "D512 exact-tail merge differs from generic KVarN reference");
-    require_exact_tail_case(256, 1, 2, 1, true, 128, 0, 1,
+    require_exact_tail_case(256, 1, 2, 1, true, 128, 0, 1, false,
             "D256 SWA vector exact-tail merge differs from generic KVarN reference");
     for (int n_q = 2; n_q <= 16; ++n_q) {
-        require_exact_tail_case(256, n_q, 6, 1, false, 128, 1, 0,
-                "speculative exact-tail merge differs from generic KVarN reference");
+        require_exact_tail_case(256, n_q, 6, 1, false, 128, 0, 0, true,
+                "speculative exact-tail tiled MMA output differs from generic KVarN reference");
     }
 
     for (int head_dim : { 128, 256, 512 }) {
