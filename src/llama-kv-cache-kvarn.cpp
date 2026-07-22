@@ -537,16 +537,26 @@ ggml_type llama_kv_cache_kvarn_context::type_v() const {
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::get_k(ggml_context * ctx, int32_t il) const {
+    return get_k_for_attention(ctx, il, uses_native_attention(il));
+}
+
+ggml_tensor * llama_kv_cache_kvarn_context::get_k_for_attention(
+        ggml_context * ctx, int32_t il, bool native_attention) const {
     const auto it = stored_k.find(cache->mapped_layer_id(il));
     GGML_ASSERT(it != stored_k.end());
-    return uses_native_attention(il) ? get_k_native(ctx, il) :
+    return native_attention ? get_k_native(ctx, il) :
         cache->materialize(ctx, it->second, il, get_n_kv(), current_sinfo(), false, mat_idxs);
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::get_v(ggml_context * ctx, int32_t il) const {
+    return get_v_for_attention(ctx, il, uses_native_attention(il));
+}
+
+ggml_tensor * llama_kv_cache_kvarn_context::get_v_for_attention(
+        ggml_context * ctx, int32_t il, bool native_attention) const {
     const auto it = stored_v.find(cache->mapped_layer_id(il));
     GGML_ASSERT(it != stored_v.end());
-    return uses_native_attention(il) ? get_v_native(ctx, il) :
+    return native_attention ? get_v_native(ctx, il) :
         cache->materialize(ctx, it->second, il, get_n_kv(), current_sinfo(), true, mat_idxs);
 }
 
@@ -1004,7 +1014,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
             llama_kvarn_backend_supports_native_ops(dev) && native_tail;
         const bool native_original_v = native_attention &&
             llama_kvarn_backend_native_attention_uses_original_v(dev);
-        const uint32_t native_rotated_max_query_tokens = native_original_v ?
+        const uint32_t native_rotated_max_query_tokens = native_attention ?
             llama_kvarn_backend_native_rotated_max_query_tokens(dev) : 0;
 
         const uint32_t n_head_k_sliced = n_head_kv * (uint32_t) k_slices;

@@ -98,6 +98,8 @@ public:
     bool can_pack_tail_body(const llama_ubatch & ubatch) const override;
     ggml_tensor * get_k_native(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v_native(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_k_for_attention(ggml_context * ctx, int32_t il, bool native_attention) const;
+    ggml_tensor * get_v_for_attention(ggml_context * ctx, int32_t il, bool native_attention) const;
     bool uses_native_attention(int32_t il) const;
     bool native_attention_uses_original_v(int32_t il) const;
     uint32_t native_rotated_max_query_tokens(int32_t il) const;

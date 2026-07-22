@@ -92,6 +92,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
+#include "fattn-kvarn-route-policy.h"
 
 #include "ggml-vulkan-shaders.hpp"
 
@@ -1329,9 +1330,11 @@ struct vk_op_kvarn_flash_attn_push_constants {
     float scale;
     float max_bias;
     float logit_softcap;
+    uint32_t n_query;
+    uint32_t gqa;
 };
-static_assert(sizeof(vk_op_kvarn_flash_attn_push_constants) <= 128,
-        "sizeof(vk_op_kvarn_flash_attn_push_constants) must be <= 128");
+static_assert(sizeof(vk_op_kvarn_flash_attn_push_constants) == 128,
+        "sizeof(vk_op_kvarn_flash_attn_push_constants) must be 128");
 
 struct vk_op_count_experts_push_constants {
     uint32_t ne00;
@@ -10860,6 +10863,19 @@ static bool ggml_vk_flash_attn_kvarn(
     flags |= has_tail ? 16u : 0u;
     flags |= has_tail && k_tail->type == GGML_TYPE_BF16 ? 32u : 0u;
     flags |= has_tail && v_tail->type == GGML_TYPE_BF16 ? 64u : 0u;
+    flags |= k_side.indices == v_side.indices ? 128u : 0u;
+
+    const uint32_t n_query_heads = uint32_t(q->ne[2]);
+    const uint32_t n_kv_heads = uint32_t(k->ne[2]);
+    const uint32_t gqa = n_query_heads / n_kv_heads;
+    const ggml_vk_fattn_kvarn_plan_result route = ggml_vk_fattn_kvarn_plan({
+        uint32_t(k->ne[1]),
+        uint32_t(q->ne[1]),
+        n_query_heads,
+        n_kv_heads,
+        uint32_t(q->ne[3]),
+        ctx->device->shader_core_count ? ctx->device->shader_core_count : 16u,
+    });
 
     const vk_subbuffer q_buf = ggml_vk_tensor_subbuffer(ctx, q);
     const vk_subbuffer mask_buf = mask ?
@@ -10904,11 +10920,36 @@ static bool ggml_vk_flash_attn_kvarn(
         scale,
         max_bias,
         logit_softcap,
+        uint32_t(q->ne[1]),
+        gqa,
     };
 
     vk_pipeline pipeline = ctx->device->pipeline_kvarn_flash_attn;
     GGML_ASSERT(pipeline != nullptr);
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const uint64_t split_k_size = route.split_k > 1 ?
+        (q->ne[0] * q->ne[1] * sizeof(float) + q->ne[1] * sizeof(float) * 2) *
+            route.split_k * q->ne[2] * q->ne[3] : 0;
+    if (split_k_size > ctx->device->properties.limits.maxStorageBufferRange) {
+        GGML_ABORT("Requested KVarN split-K preallocation size is too large");
+    }
+    if (ctx->prealloc_size_split_k < split_k_size) {
+        ctx->prealloc_size_split_k = split_k_size;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+
+    const vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+    vk_subbuffer attn_dst_buf = dst_buf;
+    if (route.split_k > 1) {
+        ggml_pipeline_request_descriptor_sets(
+            ctx, ctx->device->pipeline_flash_attn_split_k_reduce, 1);
+        if (ctx->prealloc_split_k_need_sync) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+        attn_dst_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
+    }
+
     ggml_vk_dispatch_pipeline(
         ctx, subctx, pipeline,
         {
@@ -10921,12 +10962,30 @@ static bool ggml_vk_flash_attn_kvarn(
             ggml_vk_tensor_subbuffer(ctx, v_side.indices),
             mask_buf,
             sinks_buf,
-            ggml_vk_tensor_subbuffer(ctx, dst),
+            attn_dst_buf,
             k_tail_buf,
             v_tail_buf,
         },
         pc,
-        { uint32_t(q->ne[1]), uint32_t(q->ne[2]), uint32_t(q->ne[3]) });
+        { uint32_t(q->ne[1]) * route.split_k, route.workgroups_y, uint32_t(q->ne[3]) });
+
+    if (route.split_k > 1) {
+        ggml_vk_sync_buffers(ctx, subctx);
+        const vk_op_flash_attn_split_k_reduce_push_constants reduce_pc = {
+            uint32_t(q->ne[0]),
+            uint32_t(q->ne[2]),
+            uint32_t(q->ne[1]),
+            uint32_t(q->ne[3]),
+            route.split_k,
+            sinks != nullptr,
+        };
+        ggml_vk_dispatch_pipeline(
+            ctx, subctx, ctx->device->pipeline_flash_attn_split_k_reduce,
+            { attn_dst_buf, sinks_buf, dst_buf },
+            reduce_pc,
+            { uint32_t(q->ne[2]), uint32_t(q->ne[0]), uint32_t(q->ne[1] * q->ne[3]) });
+        ctx->prealloc_split_k_need_sync = true;
+    }
     return true;
 }
 
@@ -18993,6 +19052,10 @@ static bool ggml_backend_vk_kvarn_tail_attention_supported(
         d_k == d_v && (d_k == 128 || d_k == 256 || d_k == 512);
 }
 
+static uint32_t ggml_backend_vk_kvarn_native_rotated_max_query_tokens(ggml_backend_dev_t dev) {
+    return ggml_backend_vk_kvarn_native_ops(dev) ? 16u : 0u;
+}
+
 static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     UNUSED(reg);
     if (strcmp(name, "ggml_backend_kvarn_native_ops") == 0) {
@@ -19003,6 +19066,9 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     }
     if (strcmp(name, "ggml_backend_kvarn_tail_attention_supported") == 0) {
         return (void *) ggml_backend_vk_kvarn_tail_attention_supported;
+    }
+    if (strcmp(name, "ggml_backend_kvarn_native_rotated_max_query_tokens") == 0) {
+        return (void *) ggml_backend_vk_kvarn_native_rotated_max_query_tokens;
     }
     return nullptr;
 }

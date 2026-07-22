@@ -3,6 +3,7 @@
 #include "llama-memory.h"
 
 #include "ggml-backend.h"
+#include "../ggml/src/ggml-vulkan/fattn-kvarn-route-policy.h"
 
 #include <algorithm>
 #include <array>
@@ -53,6 +54,28 @@ static void test_type_table() {
 }
 
 static void test_attention_domain_policy() {
+    const auto portable_decode = llama_kvarn_plan_attention(true, false, 16, 1);
+    require(portable_decode.native_attention,
+            "portable single-token decode must use native KVarN attention");
+    require(portable_decode.domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED,
+            "portable single-token decode must remain in the rotated domain");
+
+    const auto portable_verification = llama_kvarn_plan_attention(true, false, 16, 16);
+    require(portable_verification.native_attention,
+            "portable verification within the advertised limit must remain native");
+
+    const auto portable_prefill = llama_kvarn_plan_attention(true, false, 16, 17);
+    require(!portable_prefill.native_attention,
+            "portable large-query prefill must materialize for tiled backend attention");
+    require(portable_prefill.domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED,
+            "portable materialized prefill must remain in the rotated domain");
+
+    const auto cuda_prefill = llama_kvarn_plan_attention(true, true, 16, 17);
+    require(cuda_prefill.native_attention,
+            "backends with original-domain V support must retain native prefill");
+    require(cuda_prefill.domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V,
+            "native large-query prefill must use original-domain V");
+
     require(llama_kvarn_attention_domain(false, false, 0, 64) ==
                 GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED,
             "materialized KVarN attention must remain in the rotated domain");
@@ -77,6 +100,32 @@ static void test_attention_domain_policy() {
     require(llama_kvarn_attention_domain(true, true, 0, 2) ==
                 GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V,
             "a backend without an extended capability must retain multi-row prefill");
+}
+
+static void test_vulkan_decode_route_policy() {
+    const auto decode = ggml_vk_fattn_kvarn_plan({
+        16384, 1, 32, 4, 1, 82,
+    });
+    require(decode.gqa_group_size == 4,
+            "Vulkan KVarN decode must reuse each KV reconstruction across GQA heads");
+    require(decode.workgroups_y == 8,
+            "Vulkan KVarN grouped-GQA workgroup count is incorrect");
+    require(decode.split_k > 1,
+            "long-context Vulkan KVarN decode must use split-K occupancy");
+
+    const auto no_gqa = ggml_vk_fattn_kvarn_plan({
+        16384, 1, 8, 8, 1, 16,
+    });
+    require(no_gqa.gqa_group_size == 1 && no_gqa.workgroups_y == 8,
+            "Vulkan KVarN MHA must not group unrelated KV heads");
+    require(no_gqa.split_k > 1,
+            "under-occupied Vulkan KVarN MHA decode must use split-K");
+
+    const auto populated = ggml_vk_fattn_kvarn_plan({
+        2048, 16, 32, 4, 1, 16,
+    });
+    require(populated.split_k == 1,
+            "well-populated Vulkan verification must avoid unnecessary split reduction");
 }
 
 static void set_test_env(const char * name, const char * value) {
@@ -3568,6 +3617,7 @@ int main() {
     kvarn_unified_restore_requires_exclusive_stream();
     test_type_table();
     test_attention_domain_policy();
+    test_vulkan_decode_route_policy();
     test_stage_policy();
     test_memory_stats_aggregation();
     test_exact_tail_policy();

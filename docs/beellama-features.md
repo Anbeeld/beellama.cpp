@@ -114,8 +114,17 @@ KVarN is target-context-only. CUDA uses its optimized descriptor-native
 FlashAttention kernels. ROCm/HIP uses a portable direct-record kernel, and CPU
 and Vulkan have backend-native direct-record attention paths. These routes keep
 the query, compressed body, F16/BF16 exact tail, and attention sinks in one
-softmax without materializing the body. Vulkan requires shader Int64 and
-buffer-device-address support. CPU placement is valid with KV offload disabled.
+softmax without materializing the body for one-row decode and short supported
+query batches. Larger portable-backend query batches explicitly materialize the
+rotated K/V body and use the backend's tiled standard FlashAttention path;
+CUDA retains descriptor-native large-batch prefill. Vulkan requires shader
+Int64 and buffer-device-address support. CPU placement is valid with KV offload
+disabled.
+
+Vulkan direct decode groups up to four GQA query heads per reconstructed K/V
+head and uses split-K when the query/head grid alone cannot occupy the device.
+Its split partials are reduced through the standard Vulkan FlashAttention
+reducer, including attention sinks and exact-tail contributions.
 
 Each selected layer must be owned by a backend that implements KVarN store and
 attention, or an explicitly supported materialization fallback. Unsupported or

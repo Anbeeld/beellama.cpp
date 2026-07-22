@@ -59,21 +59,37 @@ static constexpr std::array<llama_kvarn_type_desc, LLAMA_KVARN_TYPE_COUNT> KVAR_
     LLAMA_KVARN_DESC(8, 8),
 }};
 
-enum ggml_flash_attn_ext_kvarn_domain llama_kvarn_attention_domain(
+llama_kvarn_attention_plan llama_kvarn_plan_attention(
         bool native_attention,
         bool native_original_v,
         uint32_t native_rotated_max_query_tokens,
         uint32_t n_query_tokens) {
-    if (!native_attention || !native_original_v) {
-        return GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED;
+    if (!native_attention) {
+        return { false, GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED };
     }
 
     // A backend that predates the extended capability still supports the
     // established one-row rotated decode contract.
     const uint32_t rotated_limit = std::max(1u, native_rotated_max_query_tokens);
-    return n_query_tokens <= rotated_limit ?
-        GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED :
-        GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V;
+    if (n_query_tokens <= rotated_limit) {
+        return { true, GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED };
+    }
+    if (native_original_v) {
+        return { true, GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V };
+    }
+    return { false, GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED };
+}
+
+enum ggml_flash_attn_ext_kvarn_domain llama_kvarn_attention_domain(
+        bool native_attention,
+        bool native_original_v,
+        uint32_t native_rotated_max_query_tokens,
+        uint32_t n_query_tokens) {
+    return llama_kvarn_plan_attention(
+        native_attention,
+        native_original_v,
+        native_rotated_max_query_tokens,
+        n_query_tokens).domain;
 }
 
 #undef LLAMA_KVARN_DESC

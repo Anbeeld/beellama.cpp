@@ -3072,12 +3072,13 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto * mctx_cur = inp->mctx;
     const auto * kvarn_ctx = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur);
     const bool use_kvarn = kvarn_ctx != nullptr;
-    const auto kvarn_domain = use_kvarn ? llama_kvarn_attention_domain(
+    const auto kvarn_plan = use_kvarn ? llama_kvarn_plan_attention(
         kvarn_ctx->uses_native_attention(il),
         kvarn_ctx->native_attention_uses_original_v(il),
         kvarn_ctx->native_rotated_max_query_tokens(il),
-        (uint32_t) q_cur->ne[2]) :
-        GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO;
+        (uint32_t) q_cur->ne[2]) : llama_kvarn_attention_plan {
+            false, GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO };
+    const auto kvarn_domain = kvarn_plan.domain;
     const bool use_kvarn_rotated_domain = use_kvarn &&
         kvarn_domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED;
     const bool use_kvarn_mixed_domain = use_kvarn &&
@@ -3140,8 +3141,12 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kq_mask = inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    ggml_tensor * k = use_kvarn ?
+        kvarn_ctx->get_k_for_attention(ctx0, il, kvarn_plan.native_attention) :
+        mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = use_kvarn ?
+        kvarn_ctx->get_v_for_attention(ctx0, il, kvarn_plan.native_attention) :
+        mctx_cur->get_v(ctx0, il);
     ggml_tensor * kvarn_rot = use_kvarn ? llm_kvarn_rot_for_dim(
             inp->self_kvarn_rot_128, inp->self_kvarn_rot_256,
             inp->self_kvarn_rot_512, q->ne[0]) : nullptr;
@@ -3159,7 +3164,10 @@ ggml_tensor * llm_graph_context::build_attn(
     const bool gather_k_tail = k_tail != nullptr;
     const bool gather_v_tail = v_tail != nullptr;
     ggml_tensor * tail_read_idxs = inp->get_tail_read_idxs();
-    const llama_kv_tail_route tail_route = mctx_cur->get_tail_route(il);
+    llama_kv_tail_route tail_route = mctx_cur->get_tail_route(il);
+    if (use_kvarn && !kvarn_plan.native_attention && tail_route == LLAMA_KV_TAIL_ROUTE_NATIVE) {
+        tail_route = LLAMA_KV_TAIL_ROUTE_GENERIC;
+    }
     if (tail_route != LLAMA_KV_TAIL_ROUTE_NONE) {
         GGML_ASSERT(mctx_cur->get_tail_explicit_bias(il) == (kq_b != nullptr) &&
                 "KV tail route bias contract does not match the model graph");
@@ -3427,12 +3435,13 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
     const auto * kvarn_ctx = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur);
     const bool use_kvarn = kvarn_ctx != nullptr;
-    const auto kvarn_domain = use_kvarn ? llama_kvarn_attention_domain(
+    const auto kvarn_plan = use_kvarn ? llama_kvarn_plan_attention(
         kvarn_ctx->uses_native_attention(il),
         kvarn_ctx->native_attention_uses_original_v(il),
         kvarn_ctx->native_rotated_max_query_tokens(il),
-        (uint32_t) q_cur->ne[2]) :
-        GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO;
+        (uint32_t) q_cur->ne[2]) : llama_kvarn_attention_plan {
+            false, GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO };
+    const auto kvarn_domain = kvarn_plan.domain;
     const bool use_kvarn_rotated_domain = use_kvarn &&
         kvarn_domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED;
     const bool use_kvarn_mixed_domain = use_kvarn &&
@@ -3509,8 +3518,12 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    ggml_tensor * k = use_kvarn ?
+        kvarn_ctx->get_k_for_attention(ctx0, il, kvarn_plan.native_attention) :
+        mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = use_kvarn ?
+        kvarn_ctx->get_v_for_attention(ctx0, il, kvarn_plan.native_attention) :
+        mctx_cur->get_v(ctx0, il);
     ggml_tensor * kvarn_rot = use_kvarn ? llm_kvarn_rot_for_dim(
             inp->self_kvarn_rot_128, inp->self_kvarn_rot_256,
             inp->self_kvarn_rot_512, q->ne[0]) : nullptr;
@@ -3526,7 +3539,10 @@ ggml_tensor * llm_graph_context::build_attn(
     const bool gather_k_tail = k_tail != nullptr;
     const bool gather_v_tail = v_tail != nullptr;
     ggml_tensor * tail_read_idxs = inp->get_tail_read_idxs(is_swa);
-    const llama_kv_tail_route tail_route = mctx_cur->get_tail_route(il);
+    llama_kv_tail_route tail_route = mctx_cur->get_tail_route(il);
+    if (use_kvarn && !kvarn_plan.native_attention && tail_route == LLAMA_KV_TAIL_ROUTE_NATIVE) {
+        tail_route = LLAMA_KV_TAIL_ROUTE_GENERIC;
+    }
     if (tail_route != LLAMA_KV_TAIL_ROUTE_NONE) {
         GGML_ASSERT(mctx_cur->get_tail_explicit_bias(il) == (kq_b != nullptr) &&
                 "KV tail route bias contract does not match the model graph");
