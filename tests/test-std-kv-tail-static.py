@@ -276,8 +276,8 @@ def main() -> None:
 
     cache_header = (ROOT / "src/llama-kv-cache.h").read_text(encoding="utf-8")
     get_tail_tokens = cache_header.split("uint32_t get_tail_tokens() const", 1)[1].split("}", 1)[0]
-    if "tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY" not in get_tail_tokens:
-        raise AssertionError("tail graph topology must follow the explicit overlay storage plan")
+    if "has_tail_overlay()" not in get_tail_tokens:
+        raise AssertionError("tail graph topology must follow every exact-tail storage representation")
 
     context_source = (ROOT / "src/llama-context.cpp").read_text(encoding="utf-8")
     if "llama_kv_tail_resolve_groups" not in context_source or "config.automatic ? automatic_standard : true" not in context_source:
@@ -359,6 +359,26 @@ def main() -> None:
         raise AssertionError("model graph does not use native tail attention")
     if "ggml_cuda_flash_attn_ext_tail" not in cuda_fattn:
         raise AssertionError("CUDA lacks the native tail-attention dispatch")
+
+    for required in (
+        "ggml_kv_tail_attention_merge_segmented",
+        "ggml_flash_attn_ext_set_kv_tail_bodyless",
+    ):
+        if required not in ggml_header:
+            raise AssertionError(f"ggml compact segmented contract lacks {required}")
+    if not re.search(r"#define\s+GGML_MAX_SRC\s+12\b", ggml_header):
+        raise AssertionError("ggml compact segmented contract requires 12 source operands")
+    if "ggml_kv_tail_attention_merge_segmented" not in graph:
+        raise AssertionError("model graph does not attach graph-local current K/V")
+
+    vulkan = (ROOT / "ggml/src/ggml-vulkan/ggml-vulkan.cpp").read_text(encoding="utf-8")
+    vulkan_fattn_support = vulkan.split("case GGML_OP_FLASH_ATTN_EXT:", 1)[1].split(
+        "case GGML_OP_FLASH_ATTN_EXT_BACK:", 1
+    )[0]
+    if not re.search(
+        r"op->src\[10\].*op->src\[11\].*return false", vulkan_fattn_support, re.DOTALL
+    ):
+        raise AssertionError("Vulkan must reject unimplemented compact current-source operands")
 
     tail_build_calls = re.findall(r"build_attn_inp_tail\((?:(?!\);).)*\);", graph, re.DOTALL)[1:]
     if not tail_build_calls or any(not re.search(r",\s*true\s*\);$", call) for call in tail_build_calls):

@@ -18211,6 +18211,14 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_FLASH_ATTN_EXT:
             {
+                // Compact precision tails attach graph-local current K/V in
+                // sources 10/11. The Vulkan shaders do not consume those
+                // segments yet, so accepting this shape would silently omit
+                // current tokens. Decline it and let graph placement use the
+                // backend-neutral compact materialization route.
+                if (op->src[10] != nullptr || op->src[11] != nullptr) {
+                    return false;
+                }
                 vk_kvarn_attn_side k_side = {};
                 vk_kvarn_attn_side v_side = {};
                 const bool uses_kvarn_k = ggml_backend_vk_kvarn_view_base(op->src[1]) != nullptr;

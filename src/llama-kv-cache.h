@@ -123,7 +123,8 @@ public:
                  uint32_t   tail_tokens = 0,
                 ggml_type   tail_type = GGML_TYPE_F16,
                  uint32_t   tail_tokens_requested = UINT32_MAX,
-                     bool   tail_metadata_only = false);
+                     bool   tail_metadata_only = false,
+                 uint32_t   tail_rollback_tokens = 0);
 
     ~llama_kv_cache() = default;
 
@@ -145,9 +146,14 @@ public:
     llama_memory_context_ptr init_kv_batch(const std::vector<llama_ubatch> & ubatches) override;
 
     bool get_can_shift() const override;
+    seq_rm_capability get_seq_rm_capability() const override;
 
     void clear(bool data) override;
 
+    bool can_seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const override;
+    bool seq_rm_plan(
+            llama_seq_id seq_id, llama_pos p0, llama_pos p1,
+            llama_pos & planned_p0, llama_pos & planned_p1) const override;
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
     bool seq_rm_cell(llama_seq_id seq_id, uint32_t cell_idx) override;
 
@@ -210,14 +216,28 @@ public:
     ggml_tensor * get_k_tail_fallback(ggml_context * ctx, int32_t il, ggml_tensor * body_idxs) const;
     ggml_tensor * get_v_tail_fallback(ggml_context * ctx, int32_t il, ggml_tensor * body_idxs) const;
     uint32_t get_tail_slots() const {
-        return tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY ? tail_plan.layout.total_slots : 0;
+        return has_tail_overlay() ? tail_slots : 0;
     }
     ggml_type get_tail_type() const { return tail_type; }
     uint32_t get_tail_tokens() const {
-        return tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY ? tail_plan.effective_tokens : 0;
+        return has_tail_overlay() ? tail_plan.effective_tokens : 0;
     }
     uint32_t get_tail_arena_stride() const {
-        return tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY ? tail_plan.layout.arena_stride : 0;
+        return has_tail_overlay() ? tail_arena_stride : 0;
+    }
+    uint32_t get_tail_rollback_tokens() const { return tail_plan.compact_layout.rollback_tokens; }
+    llama_kv_tail_storage_kind get_tail_storage_kind() const { return tail_plan.kind; }
+    bool has_kv_body() const {
+        return tail_plan.kind != LLAMA_KV_TAIL_STORAGE_COMPACT_NATIVE_EXACT;
+    }
+    bool has_tail_overlay() const {
+        return tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY ||
+                tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_OVERLAY ||
+                tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_NATIVE_EXACT;
+    }
+    bool has_compact_tail() const {
+        return tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_OVERLAY ||
+                tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_NATIVE_EXACT;
     }
     uint32_t get_tail_attention_stride(uint32_t n_query_tokens = 0) const;
     llama_kv_tail_route get_tail_route(int32_t il) const;
@@ -243,8 +263,13 @@ public:
     ggml_tensor * cpy_v_with_tail(
             ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs,
             ggml_tensor * tail_idxs, int32_t il, const slot_info & sinfo) const;
-    ggml_tensor * cpy_k_tail(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * tail_idxs, int32_t il) const;
-    ggml_tensor * cpy_v_tail(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * tail_idxs, int32_t il) const;
+    ggml_tensor * cpy_k_tail(
+            ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * tail_idxs,
+            int32_t il, ggml_tensor * dependency = nullptr) const;
+    ggml_tensor * cpy_v_tail(
+            ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * tail_idxs,
+            int32_t il, ggml_tensor * dependency = nullptr) const;
+    void finish_tail_batch(bool success, bool payload_may_be_modified);
 
     //
     // preparation API
@@ -306,6 +331,8 @@ public:
     const llama_kv_cells & get_cells(uint32_t stream) const { return v_cells[stream]; }
 
 private:
+    bool seq_rm_unchecked(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
+
     const llama_model & model;
     const llama_hparams & hparams;
 
@@ -335,6 +362,7 @@ private:
     const uint32_t n_swa = 0;
 
     const uint32_t tail_tokens = 0;
+    const uint32_t tail_rollback_tokens = 0;
     ggml_type tail_type = GGML_TYPE_COUNT;
     llama_kv_tail_storage_plan tail_plan {
         LLAMA_KV_TAIL_STORAGE_DISABLED,
@@ -366,11 +394,13 @@ private:
     uint32_t tail_slots = 0;
     std::unique_ptr<llama_kv_tail_store> tail;
     std::vector<std::vector<uint64_t>> tail_generations;
+    std::vector<std::vector<uint64_t>> tail_generations_before_batch;
     uint64_t tail_ordinal = 0;
     std::vector<int64_t> tail_write_slots;
     std::vector<std::vector<int32_t>> restored_tail_payload_slots;
     uint32_t tail_write_levels = 0;
     bool tail_preparing = false;
+    bool tail_graph_started = false;
     bool tail_planner_timing_enabled = false;
     mutable std::atomic<uint64_t> tail_planner_timing_ns { 0 };
 
@@ -511,6 +541,8 @@ public:
 
     bool next()  override;
     bool apply() override;
+    void graph_compute_start() override;
+    void graph_compute_finish(ggml_status status) override;
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
@@ -534,9 +566,14 @@ public:
     virtual ggml_tensor * get_k_tail_fallback(ggml_context * ctx, int32_t il, ggml_tensor * body_idxs) const;
     virtual ggml_tensor * get_v_tail_fallback(ggml_context * ctx, int32_t il, ggml_tensor * body_idxs) const;
     virtual uint32_t get_tail_slots() const;
+    virtual ggml_type get_tail_type() const;
     virtual uint32_t get_tail_tokens() const;
     virtual uint32_t get_tail_arena_stride() const;
     virtual uint32_t get_tail_attention_stride(uint32_t n_query_tokens = 0) const;
+    virtual bool has_compact_tail() const;
+    virtual bool has_kv_body() const;
+    virtual llama_kv_tail_storage_kind get_tail_storage_kind() const;
+    virtual uint32_t get_tail_rollback_tokens() const;
     virtual llama_kv_tail_route get_tail_route(int32_t il) const;
     virtual bool get_tail_explicit_bias(int32_t il) const;
     virtual bool can_pack_tail_body(const llama_ubatch & ubatch) const;
@@ -555,8 +592,12 @@ public:
     virtual ggml_tensor * cpy_v_with_tail(
             ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs,
             ggml_tensor * tail_idxs, int32_t il) const;
-    virtual ggml_tensor * cpy_k_tail(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * tail_idxs, int32_t il) const;
-    virtual ggml_tensor * cpy_v_tail(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * tail_idxs, int32_t il) const;
+    virtual ggml_tensor * cpy_k_tail(
+            ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * tail_idxs,
+            int32_t il, ggml_tensor * dependency = nullptr) const;
+    virtual ggml_tensor * cpy_v_tail(
+            ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * tail_idxs,
+            int32_t il, ggml_tensor * dependency = nullptr) const;
 
     // create destination indices for each head of the current batch for where it would be written in the KV cache
     // the indices address the global KV cache (not per stream) - this is not relevant for the user of this API, but
@@ -616,6 +657,7 @@ private:
     slot_info_vec_t sinfos;
 
     std::vector<llama_ubatch> ubatches;
+    bool graph_started = false;
 
     //
     // data needed for building the compute graph for the current ubatch:

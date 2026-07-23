@@ -1645,8 +1645,11 @@ struct test {
     uint64_t                 kv_k_payload_bytes = 0;
     uint64_t                 kv_v_payload_bytes = 0;
     uint64_t                 kv_exact_tail_bytes = 0;
+    uint64_t                 kv_exact_history_bytes = 0;
     uint64_t                 kv_exact_overlay_bytes = 0;
     uint64_t                 kv_native_exact_bytes = 0;
+    uint64_t                 kv_rollback_reserve_bytes = 0;
+    uint64_t                 kv_transient_estimate_bytes = 0;
     uint64_t                 kv_staging_bytes = 0;
     uint64_t                 kv_metadata_bytes = 0;
     uint64_t                 kv_padding_bytes = 0;
@@ -1799,8 +1802,9 @@ struct test {
             "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
             "type_k",         "type_v",         "kv_tail_tokens", "kv_tail_tokens_effective", "kv_tail_type",
             "kvarn_route_split", "kvarn_route_vector", "kvarn_route_generic", "kvarn_route_prefill",
-            "kv_k_payload_bytes", "kv_v_payload_bytes", "kv_exact_tail_bytes", "kv_exact_overlay_bytes",
-            "kv_native_exact_bytes", "kv_staging_bytes",
+            "kv_k_payload_bytes", "kv_v_payload_bytes", "kv_exact_tail_bytes", "kv_exact_history_bytes",
+            "kv_exact_overlay_bytes", "kv_native_exact_bytes", "kv_rollback_reserve_bytes",
+            "kv_transient_estimate_bytes", "kv_staging_bytes",
             "kv_metadata_bytes", "kv_padding_bytes", "kv_resident_bytes", "kv_global_resident_bytes",
             "kv_swa_resident_bytes", "kv_allocated_capacity_tokens", "kv_live_tokens", "kv_descriptor_bytes",
             "kv_partial_output_bytes", "kv_partial_meta_bytes", "kv_tail_body_meta_bytes", "kv_tail_exact_meta_bytes",
@@ -1910,8 +1914,11 @@ struct test {
                                              std::to_string(kv_k_payload_bytes),
                                              std::to_string(kv_v_payload_bytes),
                                              std::to_string(kv_exact_tail_bytes),
+                                             std::to_string(kv_exact_history_bytes),
                                              std::to_string(kv_exact_overlay_bytes),
                                              std::to_string(kv_native_exact_bytes),
+                                             std::to_string(kv_rollback_reserve_bytes),
+                                             std::to_string(kv_transient_estimate_bytes),
                                              std::to_string(kv_staging_bytes),
                                              std::to_string(kv_metadata_bytes),
                                              std::to_string(kv_padding_bytes),
@@ -2706,8 +2713,11 @@ int llama_bench(int argc, char ** argv) {
             t.kv_k_payload_bytes = kv_stats.k_payload_bytes();
             t.kv_v_payload_bytes = kv_stats.v_payload_bytes();
             t.kv_exact_tail_bytes = kv_stats.exact_tail_bytes();
+            t.kv_exact_history_bytes = kv_stats.exact_history_bytes();
             t.kv_exact_overlay_bytes = kv_stats.exact_overlay_bytes();
             t.kv_native_exact_bytes = kv_stats.native_exact_bytes();
+            t.kv_rollback_reserve_bytes = kv_stats.rollback_reserve_bytes();
+            t.kv_transient_estimate_bytes = kv_stats.transient_estimate_bytes();
             t.kv_staging_bytes = kv_stats.global.staging_bytes + kv_stats.swa.staging_bytes;
             t.kv_metadata_bytes = kv_stats.global.metadata_bytes + kv_stats.swa.metadata_bytes;
             t.kv_padding_bytes = kv_stats.global.padding_bytes + kv_stats.swa.padding_bytes;

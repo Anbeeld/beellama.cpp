@@ -33,7 +33,8 @@ llama_memory_hybrid::llama_memory_hybrid(
                  uint32_t   n_ubatch,
                  uint32_t   tail_tokens,
                 ggml_type   tail_type,
-                 uint32_t   tail_tokens_requested) :
+                 uint32_t   tail_tokens_requested,
+                 uint32_t   tail_rollback_tokens) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache(
         model,
@@ -57,7 +58,9 @@ llama_memory_hybrid::llama_memory_hybrid(
         n_ubatch,
         tail_tokens,
         tail_type,
-        tail_tokens_requested
+        tail_tokens_requested,
+        false,
+        tail_rollback_tokens
     )),
     mem_recr(new llama_memory_recurrent(
         model,
@@ -150,6 +153,10 @@ llama_memory_context_ptr llama_memory_hybrid::init_update(llama_context * lctx, 
 bool llama_memory_hybrid::get_can_shift() const {
     // Shifting is trivially supported for recurrent
     return mem_attn->get_can_shift();
+}
+
+llama_memory_i::seq_rm_capability llama_memory_hybrid::get_seq_rm_capability() const {
+    return llama_memory_seq_rm_capability_all({ mem_attn.get(), mem_recr.get() });
 }
 
 void llama_memory_hybrid::clear(bool data) {
@@ -343,6 +350,16 @@ bool llama_memory_hybrid_context::apply() {
     res = res & ctx_recr->apply();
 
     return res;
+}
+
+void llama_memory_hybrid_context::graph_compute_start() {
+    ctx_attn->graph_compute_start();
+    ctx_recr->graph_compute_start();
+}
+
+void llama_memory_hybrid_context::graph_compute_finish(ggml_status compute_status) {
+    ctx_attn->graph_compute_finish(compute_status);
+    ctx_recr->graph_compute_finish(compute_status);
 }
 
 llama_memory_status llama_memory_hybrid_context::get_status() const {

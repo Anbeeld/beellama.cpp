@@ -655,20 +655,37 @@ static void ggml_cuda_flash_attn_ext_dispatch(ggml_backend_cuda_context & ctx, g
 static bool ggml_cuda_flash_attn_ext_tail_pass_supported(int device, const ggml_tensor * dst) {
     const ggml_tensor * qo = dst->src[8];
     const ggml_tensor * rd = dst->src[9];
+    const ggml_tensor * kt = dst->src[5];
+    const ggml_tensor * vt = dst->src[6];
+    const ggml_tensor * kt_current = dst->src[10];
+    const ggml_tensor * vt_current = dst->src[11];
     const int64_t tail_stride = dst->src[7]->ne[0];
+    const int64_t compute_stride = ggml_cuda_tail_compute_stride(tail_stride);
     const int64_t body_map_offset = 6 + tail_stride;
     if (!qo || !rd || qo->ne[0] <= 0 || qo->ne[1] <= 0 ||
             rd->ne[0] < body_map_offset || rd->ne[1] != qo->ne[1]) {
         return false;
     }
+    if ((kt_current == nullptr) != (vt_current == nullptr)) {
+        return false;
+    }
+    if (kt_current != nullptr &&
+            (kt_current->type != kt->type || vt_current->type != vt->type ||
+             kt_current->ne[0] != kt->ne[0] || vt_current->ne[0] != vt->ne[0] ||
+             kt_current->ne[1] != vt_current->ne[1] ||
+             kt_current->ne[2] != kt->ne[2] || vt_current->ne[2] != vt->ne[2] ||
+             kt_current->ne[3] != 1 || vt_current->ne[3] != 1 ||
+             kt->ne[1] + kt_current->ne[1] < tail_stride)) {
+        return false;
+    }
     ggml_tensor q = *dst->src[0];
     ggml_cuda_tail_make_contiguous(q, q.ne[0], qo->ne[0], q.ne[2], qo->ne[1], sizeof(float));
-    ggml_tensor k = *dst->src[5];
-    ggml_cuda_tail_make_contiguous(k, k.ne[0], dst->src[7]->ne[0], k.ne[2], qo->ne[1], ggml_type_size(k.type));
-    ggml_tensor v = *dst->src[6];
-    ggml_cuda_tail_make_contiguous(v, v.ne[0], dst->src[7]->ne[0], v.ne[2], qo->ne[1], ggml_type_size(v.type));
+    ggml_tensor k = *kt;
+    ggml_cuda_tail_make_contiguous(k, k.ne[0], compute_stride, k.ne[2], qo->ne[1], ggml_type_size(k.type));
+    ggml_tensor v = *vt;
+    ggml_cuda_tail_make_contiguous(v, v.ne[0], compute_stride, v.ne[2], qo->ne[1], ggml_type_size(v.type));
     ggml_tensor mask = *dst->src[7];
-    ggml_cuda_tail_make_contiguous(mask, mask.ne[0], qo->ne[0], 1, qo->ne[1], sizeof(half));
+    ggml_cuda_tail_make_contiguous(mask, compute_stride, qo->ne[0], 1, qo->ne[1], sizeof(half));
     ggml_tensor pass = *dst;
     pass.src[0] = &q;
     pass.src[1] = &k;
@@ -679,11 +696,12 @@ static bool ggml_cuda_flash_attn_ext_tail_pass_supported(int device, const ggml_
         pass.src[i] = nullptr;
     }
     ggml_cuda_tail_make_contiguous(pass, pass.ne[0], pass.ne[1], qo->ne[0], qo->ne[1], sizeof(float));
-    // Tails up to one native KVarN group use the direct indexed-small kernel
+    // Compact decode tails up to two native KVarN groups use the direct
+    // indexed-small kernel
     // below, so they do not need to satisfy the padded upstream FA geometry.
     // This matters for D512, whose generic FA route requires a 256-token KV
     // stride even though the direct exact-tail kernel supports 128 tokens.
-    if (tail_stride > 128 &&
+    if (tail_stride > 256 &&
             ggml_cuda_get_best_fattn_kernel(device, &pass) == BEST_FATTN_KERNEL_NONE) {
         return false;
     }
@@ -716,11 +734,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         dst->src[8] != nullptr && dst->src[9] != nullptr;
     const bool uses_kvarn = ggml_cuda_flash_attn_ext_kvarn_uses_views(dst);
 #if defined(GGML_USE_HIP)
-    const bool portable_kvarn_tail = uses_kvarn && has_exact_tail &&
+    const bool portable_kvarn_tail = uses_kvarn && has_exact_tail && dst->src[10] == nullptr &&
         ggml_cuda_flash_attn_ext_kvarn_portable_supported(ctx.device, dst);
 #else
     const char * force_portable = getenv("GGML_KVARN_TEST_FORCE_PORTABLE_FATTN");
-    const bool portable_kvarn_tail = uses_kvarn && has_exact_tail &&
+    const bool portable_kvarn_tail = uses_kvarn && has_exact_tail && dst->src[10] == nullptr &&
         force_portable != nullptr && atoi(force_portable) != 0 &&
         ggml_cuda_flash_attn_ext_kvarn_portable_supported(ctx.device, dst);
 #endif
@@ -750,11 +768,11 @@ bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
         dst->src[8] != nullptr && dst->src[9] != nullptr;
     const bool uses_kvarn = ggml_cuda_flash_attn_ext_kvarn_uses_views(dst);
 #if defined(GGML_USE_HIP)
-    const bool portable_kvarn_tail = uses_kvarn && has_exact_tail &&
+    const bool portable_kvarn_tail = uses_kvarn && has_exact_tail && dst->src[10] == nullptr &&
         ggml_cuda_flash_attn_ext_kvarn_portable_supported(device, dst);
 #else
     const char * force_portable = getenv("GGML_KVARN_TEST_FORCE_PORTABLE_FATTN");
-    const bool portable_kvarn_tail = uses_kvarn && has_exact_tail &&
+    const bool portable_kvarn_tail = uses_kvarn && has_exact_tail && dst->src[10] == nullptr &&
         force_portable != nullptr && atoi(force_portable) != 0 &&
         ggml_cuda_flash_attn_ext_kvarn_portable_supported(device, dst);
 #endif

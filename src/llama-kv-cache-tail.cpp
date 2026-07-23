@@ -24,6 +24,14 @@ static uint32_t checked_tail_slot_count(uint32_t arena_stride, uint32_t n_seq_ma
     return uint32_t(total);
 }
 
+static uint32_t checked_tail_history_limit(uint32_t n_tokens, uint32_t rollback_tokens) {
+    const uint64_t total = uint64_t(n_tokens) + rollback_tokens;
+    if (total > uint64_t(UINT32_MAX)) {
+        throw std::overflow_error("compact KV tail history capacity overflows uint32_t");
+    }
+    return uint32_t(total);
+}
+
 std::vector<llama_kv_tail_slot_run> llama_kv_tail_contiguous_slot_runs(
         const std::vector<int32_t> & slots) {
     std::vector<llama_kv_tail_slot_run> runs;
@@ -70,6 +78,29 @@ llama_kv_tail_layout llama_kv_tail_layout_for(
         uint32_t(arena_rounded),
         sink_slots,
         checked_tail_slot_count(uint32_t(arena_rounded), n_seq_max, sink_slots),
+    };
+}
+
+llama_kv_tail_compact_layout llama_kv_tail_compact_layout_for(
+        uint32_t n_tokens,
+        uint32_t rollback_tokens,
+        uint32_t n_seq_max,
+        uint32_t n_ubatch) {
+    const uint64_t history_stride = uint64_t(n_tokens) + rollback_tokens;
+    const uint64_t attention_stride = uint64_t(n_tokens) + n_ubatch;
+    if (history_stride > uint64_t(INT32_MAX)) {
+        throw std::overflow_error("compact KV tail history stride overflows int32_t");
+    }
+    if (attention_stride > uint64_t(INT32_MAX)) {
+        throw std::overflow_error("compact KV tail attention stride overflows int32_t");
+    }
+    const uint32_t history_slots =
+            checked_tail_slot_count(uint32_t(history_stride), n_seq_max, 0);
+    return {
+        uint32_t(history_stride),
+        history_slots,
+        rollback_tokens,
+        uint32_t(attention_stride),
     };
 }
 
@@ -272,10 +303,18 @@ llama_kv_tail_storage_plan llama_kv_tail_storage_plan_for(
 
     result.layout = llama_kv_tail_layout_for(
             request.effective_tokens, request.n_seq_max, request.n_ubatch);
+    result.compact_layout = llama_kv_tail_compact_layout_for(
+            request.effective_tokens, request.rollback_tokens,
+            request.n_seq_max, request.n_ubatch);
     result.promotion_increment = checked_tail_bytes(
             request.physical_body_rows, request.promotion_bytes_per_row);
     result.overlay_increment = checked_tail_bytes(
             result.layout.total_slots, request.overlay_bytes_per_row);
+    result.compact_history_bytes = checked_tail_bytes(
+            result.compact_layout.history_slots, request.overlay_bytes_per_row);
+    result.compact_rollback_bytes = checked_tail_bytes(
+            uint64_t(request.rollback_tokens)*request.n_seq_max,
+            request.overlay_bytes_per_row);
 
     const ggml_type promoted_k = ggml_is_quantized(request.requested_body_type_k) ?
             request.exact_type : request.requested_body_type_k;
@@ -283,6 +322,49 @@ llama_kv_tail_storage_plan llama_kv_tail_storage_plan_for(
             request.exact_type : request.requested_body_type_v;
     const bool full_visibility = request.visibility_window > 0 &&
             request.effective_tokens >= request.visibility_window;
+    const bool use_compact = request.compact_history_capable &&
+            request.compact_current_source_capable &&
+            request.compact_ordered_commit_capable;
+
+    if (use_compact) {
+        if (full_visibility && request.full_window_body_can_be_omitted) {
+            result.kind = LLAMA_KV_TAIL_STORAGE_COMPACT_NATIVE_EXACT;
+            result.actual_body_type_k = promoted_k;
+            result.actual_body_type_v = promoted_v;
+            result.body_promoted = promoted_k != request.requested_body_type_k ||
+                    promoted_v != request.requested_body_type_v;
+            result.shadow_k = request.shadow_k_capable;
+            result.shadow_v = request.shadow_v_capable;
+            result.shadow_type_k = result.shadow_k ? promoted_k : GGML_TYPE_COUNT;
+            result.shadow_type_v = result.shadow_v ? promoted_v : GGML_TYPE_COUNT;
+            result.shadow_bytes = result.compact_history_bytes;
+            result.actual_body_bytes = 0;
+            result.has_owned_body = false;
+            result.has_shared_body = false;
+            return result;
+        }
+
+        const std::string architecture = request.architecture ? request.architecture : "unknown";
+        const std::string group = request.group_id ? request.group_id : "unknown";
+        if (!request.graph_consumes_exact_tail) {
+            throw std::invalid_argument(
+                    "compact standard KV tail is not consumed by architecture " + architecture +
+                    " group " + group + " for requested N=" + std::to_string(request.requested_tokens));
+        }
+        if (!request.overlay_placement_supported) {
+            throw std::invalid_argument(
+                    "compact standard KV tail for architecture " + architecture + " group " + group +
+                    " is unsupported with --split-mode tensor");
+        }
+        result.kind = LLAMA_KV_TAIL_STORAGE_COMPACT_OVERLAY;
+        result.shadow_k = request.shadow_k_capable;
+        result.shadow_v = request.shadow_v_capable;
+        result.shadow_type_k = result.shadow_k ? promoted_k : GGML_TYPE_COUNT;
+        result.shadow_type_v = result.shadow_v ? promoted_v : GGML_TYPE_COUNT;
+        result.shadow_bytes = result.compact_history_bytes;
+        return result;
+    }
+
     const bool use_native = request.already_exact ||
             (full_visibility && request.native_capable &&
              result.promotion_increment <= result.overlay_increment);
@@ -370,8 +452,9 @@ llama_kv_tail_store::llama_kv_tail_store(
         uint32_t n_seq_max,
         uint32_t arena_stride,
         uint32_t sink_slots) :
-        n_tokens(n_tokens), arena_stride(arena_stride),
-        n_slots(checked_tail_slot_count(arena_stride, n_seq_max, sink_slots)), sequences(n_seq_max),
+        n_tokens(n_tokens), rollback_tokens(0), history_limit(n_tokens), arena_stride(arena_stride),
+        n_slots(checked_tail_slot_count(arena_stride, n_seq_max, sink_slots)), compact_storage(false),
+        sequences(n_seq_max),
         entry_by_cell(n_seq_max),
         slot_used(n_seq_max, std::vector<bool>(arena_stride, false)),
         write_cursors(n_seq_max, 0), degradation(n_seq_max, 0),
@@ -381,8 +464,28 @@ llama_kv_tail_store::llama_kv_tail_store(
     }
 }
 
+llama_kv_tail_store::llama_kv_tail_store(
+        uint32_t n_tokens,
+        uint32_t rollback_tokens,
+        uint32_t n_seq_max,
+        uint32_t history_stride,
+        uint32_t sink_slots) :
+        n_tokens(n_tokens), rollback_tokens(rollback_tokens),
+        history_limit(checked_tail_history_limit(n_tokens, rollback_tokens)),
+        arena_stride(history_stride),
+        n_slots(checked_tail_slot_count(history_stride, n_seq_max, sink_slots)),
+        compact_storage(true), sequences(n_seq_max), entry_by_cell(n_seq_max),
+        slot_used(n_seq_max, std::vector<bool>(history_stride, false)),
+        write_cursors(n_seq_max, 0), degradation(n_seq_max, 0),
+        recovery_commits(n_seq_max, 0) {
+    if (history_stride < history_limit) {
+        throw std::invalid_argument("compact KV tail arena is smaller than history plus rollback");
+    }
+}
+
 void llama_kv_tail_store::clear() {
     cancel_seq_cp();
+    batch_transaction.reset();
     for (size_t i = 0; i < sequences.size(); ++i) {
         sequences[i].clear();
         entry_by_cell[i].clear();
@@ -440,10 +543,58 @@ void llama_kv_tail_store::invalidate_slots(const std::vector<int32_t> & slots, u
 }
 
 void llama_kv_tail_store::begin_batch() {
+    if (compact_storage) {
+        if (batch_transaction) {
+            throw std::logic_error("a compact KV tail batch transaction is already pending");
+        }
+        batch_transaction_state transaction;
+        transaction.sequences = sequences;
+        transaction.slot_used = slot_used;
+        transaction.write_cursors = write_cursors;
+        transaction.degradation = degradation;
+        transaction.recovery_commits = recovery_commits;
+        transaction.current.resize(sequences.size());
+        transaction.affected.assign(sequences.size(), false);
+        batch_transaction = std::move(transaction);
+    }
     for (llama_seq_id seq_id = 0; size_t(seq_id) < sequences.size(); ++seq_id) {
-        trim(seq_id);
+        trim(seq_id, compact_storage ? history_limit : n_tokens);
     }
     in_batch = true;
+}
+
+void llama_kv_tail_store::finish_batch(bool success, bool payload_may_be_modified) {
+    if (!compact_storage) {
+        in_batch = false;
+        return;
+    }
+    if (!batch_transaction) {
+        return;
+    }
+    if (!success) {
+        auto transaction = std::move(*batch_transaction);
+        sequences = std::move(transaction.sequences);
+        slot_used = std::move(transaction.slot_used);
+        write_cursors = std::move(transaction.write_cursors);
+        degradation = std::move(transaction.degradation);
+        recovery_commits = std::move(transaction.recovery_commits);
+        for (llama_seq_id seq_id = 0; size_t(seq_id) < sequences.size(); ++seq_id) {
+            rebuild_index(seq_id);
+            if (!payload_may_be_modified || !transaction.affected[size_t(seq_id)]) {
+                continue;
+            }
+            auto & entries = sequences[size_t(seq_id)];
+            for (const auto & entry : entries) {
+                release(seq_id, entry.slot);
+            }
+            entries.clear();
+            entry_by_cell[size_t(seq_id)].clear();
+            degradation[size_t(seq_id)] |= LLAMA_KV_TAIL_DEGRADED_PAYLOAD_INVALID;
+            recovery_commits[size_t(seq_id)] = 0;
+        }
+    }
+    batch_transaction.reset();
+    in_batch = false;
 }
 
 bool llama_kv_tail_store::valid_seq(llama_seq_id seq_id) const {
@@ -506,10 +657,10 @@ void llama_kv_tail_store::release(llama_seq_id seq_id, int32_t slot) {
     slot_used[size_t(seq_id)][uint32_t(slot) - base] = false;
 }
 
-void llama_kv_tail_store::trim(llama_seq_id seq_id) {
+void llama_kv_tail_store::trim(llama_seq_id seq_id, uint32_t limit) {
     auto & entries = sequences[size_t(seq_id)];
     auto & index = entry_by_cell[size_t(seq_id)];
-    while (entries.size() > n_tokens) {
+    while (entries.size() > limit) {
         index.erase(cell_key(entries.front().identity.stream, entries.front().identity.cell));
         release(seq_id, entries.front().slot);
         entries.pop_front();
@@ -520,7 +671,8 @@ int32_t llama_kv_tail_store::commit(
         llama_seq_id seq_id,
         llama_kv_tail_identity identity,
         llama_pos position,
-        uint64_t insertion_ordinal) {
+        uint64_t insertion_ordinal,
+        uint32_t current_row) {
     if (!valid_seq(seq_id) || n_tokens == 0) {
         return LLAMA_KV_TAIL_BODY_SLOT;
     }
@@ -535,10 +687,20 @@ int32_t llama_kv_tail_store::commit(
             return a.position < b.position ||
                     (a.position == b.position && a.insertion_ordinal < b.insertion_ordinal);
         });
-        trim(seq_id);
+        trim(seq_id, compact_storage ? history_limit : n_tokens);
         const auto retained = index.find(cell_key(identity.stream, identity.cell));
-        return retained == index.end() || !(retained->second->identity == identity) ?
+        const int32_t result = retained == index.end() || !(retained->second->identity == identity) ?
                 LLAMA_KV_TAIL_BODY_SLOT : retained->second->slot;
+        if (batch_transaction && current_row != UINT32_MAX && result >= 0) {
+            const uint64_t virtual_slot = uint64_t(n_slots) + current_row;
+            if (virtual_slot > uint64_t(INT32_MAX)) {
+                throw std::overflow_error("compact KV tail current source index overflows int32_t");
+            }
+            batch_transaction->current[size_t(seq_id)].push_back(
+                    { identity, position, insertion_ordinal, int32_t(virtual_slot) });
+            batch_transaction->affected[size_t(seq_id)] = true;
+        }
+        return result;
     }
     if (duplicate != index.end()) {
         // A generation change normally arrives through recycle().  Keeping
@@ -547,7 +709,8 @@ int32_t llama_kv_tail_store::commit(
     }
 
     int32_t slot = LLAMA_KV_TAIL_BODY_SLOT;
-    if (!in_batch && entries.size() >= n_tokens && !entries.empty()) {
+    const uint32_t commit_limit = compact_storage ? history_limit : n_tokens;
+    if ((compact_storage || !in_batch) && entries.size() >= commit_limit && !entries.empty()) {
         const auto victim = std::min_element(entries.begin(), entries.end(), [](const exact_entry & a, const exact_entry & b) {
             return a.position < b.position ||
                 (a.position == b.position && a.insertion_ordinal < b.insertion_ordinal);
@@ -576,11 +739,21 @@ int32_t llama_kv_tail_store::commit(
         recovery_commits[size_t(seq_id)] = 0;
     }
     if (!in_batch) {
-        trim(seq_id);
+        trim(seq_id, commit_limit);
     }
     const auto retained = index.find(cell_key(identity.stream, identity.cell));
-    return retained == index.end() || !(retained->second->identity == identity) ?
+    const int32_t result = retained == index.end() || !(retained->second->identity == identity) ?
             LLAMA_KV_TAIL_BODY_SLOT : retained->second->slot;
+    if (batch_transaction && current_row != UINT32_MAX && result >= 0) {
+        const uint64_t virtual_slot = uint64_t(n_slots) + current_row;
+        if (virtual_slot > uint64_t(INT32_MAX)) {
+            throw std::overflow_error("compact KV tail current source index overflows int32_t");
+        }
+        batch_transaction->current[size_t(seq_id)].push_back(
+                { identity, position, insertion_ordinal, int32_t(virtual_slot) });
+        batch_transaction->affected[size_t(seq_id)] = true;
+    }
+    return result;
 }
 
 void llama_kv_tail_store::recycle(uint32_t stream, uint32_t cell, uint64_t next_generation) {
@@ -589,6 +762,9 @@ void llama_kv_tail_store::recycle(uint32_t stream, uint32_t cell, uint64_t next_
         const auto found = index.find(cell_key(stream, cell));
         if (found != index.end() &&
                 found->second->identity.generation != next_generation) {
+            if (batch_transaction) {
+                batch_transaction->affected[size_t(seq_id)] = true;
+            }
             erase_entry(seq_id, found->second);
         }
     }
@@ -659,7 +835,8 @@ std::vector<llama_kv_tail_slot_copy> llama_kv_tail_store::prepare_seq_cp(
         return a.entry.position < b.entry.position ||
                 (a.entry.position == b.entry.position && a.entry.insertion_ordinal < b.entry.insertion_ordinal);
     });
-    const size_t first = candidates.size() > n_tokens ? candidates.size() - n_tokens : 0;
+    const uint32_t retained = compact_storage ? history_limit : n_tokens;
+    const size_t first = candidates.size() > retained ? candidates.size() - retained : 0;
     std::unordered_set<int32_t> survivor_slots;
     for (size_t i = first; i < candidates.size(); ++i) {
         if (!candidates[i].copied) {
@@ -826,7 +1003,7 @@ void llama_kv_tail_store::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p
             return a.position < b.position ||
                     (a.position == b.position && a.insertion_ordinal < b.insertion_ordinal);
         });
-        trim(current);
+        trim(current, compact_storage ? history_limit : n_tokens);
         rebuild_index(current);
         if (degrade) {
             degradation[size_t(current)] |= LLAMA_KV_TAIL_DEGRADED_HISTORICAL_OP;
@@ -862,7 +1039,7 @@ void llama_kv_tail_store::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p
             return a.position < b.position ||
                     (a.position == b.position && a.insertion_ordinal < b.insertion_ordinal);
         });
-        trim(current);
+        trim(current, compact_storage ? history_limit : n_tokens);
         rebuild_index(current);
         if (degrade) {
             degradation[size_t(current)] |= LLAMA_KV_TAIL_DEGRADED_HISTORICAL_OP;
@@ -921,6 +1098,10 @@ llama_kv_tail_coverage llama_kv_tail_store::coverage(llama_seq_id seq_id, uint32
     return { state, requested, std::min(exact, requested), flags };
 }
 
+bool llama_kv_tail_store::supports_suffix_rollback(llama_seq_id seq_id, uint32_t n) const {
+    return compact_storage && valid_seq(seq_id) && n <= rollback_tokens;
+}
+
 std::vector<int32_t> llama_kv_tail_store::body_indices(uint32_t kv_size) const {
     std::vector<int32_t> result(n_slots, 0);
     for (const auto & entries : sequences) {
@@ -951,10 +1132,29 @@ std::vector<llama_kv_tail_snapshot_entry> llama_kv_tail_store::source_candidates
     if (!valid_seq(seq_id)) {
         return result;
     }
-    result.reserve(sequences[size_t(seq_id)].size());
-    for (const auto & entry : sequences[size_t(seq_id)]) {
+    const auto & committed = batch_transaction ?
+            batch_transaction->sequences[size_t(seq_id)] : sequences[size_t(seq_id)];
+    const size_t first = batch_transaction && committed.size() > n_tokens ?
+            committed.size() - n_tokens : 0;
+    const size_t n_current = batch_transaction ?
+            batch_transaction->current[size_t(seq_id)].size() : 0;
+    result.reserve(committed.size() - first + n_current);
+    auto it = committed.begin();
+    std::advance(it, first);
+    for (; it != committed.end(); ++it) {
+        const auto & entry = *it;
         result.push_back({ seq_id, entry.identity, entry.position,
                 entry.insertion_ordinal, entry.slot });
+    }
+    if (batch_transaction) {
+        for (const auto & entry : batch_transaction->current[size_t(seq_id)]) {
+            result.push_back({ seq_id, entry.identity, entry.position,
+                    entry.insertion_ordinal, entry.slot });
+        }
+        std::stable_sort(result.begin(), result.end(), [](const auto & a, const auto & b) {
+            return a.position < b.position ||
+                    (a.position == b.position && a.insertion_ordinal < b.insertion_ordinal);
+        });
     }
     return result;
 }
@@ -990,7 +1190,8 @@ std::vector<llama_kv_tail_snapshot_entry> llama_kv_tail_store::snapshot(llama_se
         }
         if (pending_seq_cp && pending_seq_cp->dst == current) {
             const auto & ordered = pending_seq_cp->destination;
-            const size_t first = ordered.size() > n_tokens ? ordered.size() - n_tokens : 0;
+            const uint32_t retained = compact_storage ? history_limit : n_tokens;
+            const size_t first = ordered.size() > retained ? ordered.size() - retained : 0;
             for (size_t i = first; i < ordered.size(); ++i) {
                 const auto & entry = ordered[i];
                 result.push_back({ current, entry.identity, entry.position,
@@ -999,7 +1200,8 @@ std::vector<llama_kv_tail_snapshot_entry> llama_kv_tail_store::snapshot(llama_se
             continue;
         }
         const auto & ordered = sequences[size_t(current)];
-        const size_t first = ordered.size() > n_tokens ? ordered.size() - n_tokens : 0;
+        const uint32_t retained = compact_storage ? history_limit : n_tokens;
+        const size_t first = ordered.size() > retained ? ordered.size() - retained : 0;
         auto it = ordered.begin();
         std::advance(it, first);
         for (; it != ordered.end(); ++it) {

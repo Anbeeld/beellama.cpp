@@ -604,6 +604,61 @@ static void set_tail_query_plan(
     }
 }
 
+llm_graph_kv_tail_identity llm_graph_kv_tail_identity::capture(
+        const llama_hparams & hparams,
+        const llama_kv_cache_context * mctx) {
+    GGML_ASSERT(mctx != nullptr);
+    llm_graph_kv_tail_identity result;
+    result.storage_kind = uint32_t(mctx->get_tail_storage_kind());
+    result.exact_type = mctx->get_tail_type();
+    result.retention_tokens = mctx->get_tail_tokens();
+    result.rollback_tokens = mctx->get_tail_rollback_tokens();
+    result.arena_stride = mctx->get_tail_arena_stride();
+    result.storage_slots = mctx->get_tail_slots();
+    result.compact = mctx->has_compact_tail();
+    result.has_body = mctx->has_kv_body();
+    result.routes.reserve(hparams.n_layer());
+    result.explicit_bias.reserve(hparams.n_layer());
+    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+        result.routes.push_back(mctx->get_tail_route(int32_t(il)));
+        result.explicit_bias.push_back(mctx->get_tail_explicit_bias(int32_t(il)));
+    }
+    return result;
+}
+
+bool llm_graph_kv_tail_identity::matches(
+        const llama_hparams & hparams,
+        const llama_kv_cache_context * mctx) const {
+    if (mctx == nullptr || storage_kind != uint32_t(mctx->get_tail_storage_kind()) ||
+            exact_type != mctx->get_tail_type() ||
+            retention_tokens != mctx->get_tail_tokens() ||
+            rollback_tokens != mctx->get_tail_rollback_tokens() ||
+            arena_stride != mctx->get_tail_arena_stride() ||
+            storage_slots != mctx->get_tail_slots() ||
+            compact != mctx->has_compact_tail() || has_body != mctx->has_kv_body() ||
+            routes.size() != hparams.n_layer() || explicit_bias.size() != hparams.n_layer()) {
+        return false;
+    }
+    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+        if (routes[il] != mctx->get_tail_route(int32_t(il)) ||
+                explicit_bias[il] != mctx->get_tail_explicit_bias(int32_t(il))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+llm_graph_input_attn_kv_iswa::llm_graph_input_attn_kv_iswa(
+        const llama_hparams & hparams,
+        const llama_cparams & cparams,
+        const llama_kv_cache_iswa_context * mctx) :
+    hparams(hparams),
+    cparams(cparams),
+    mctx(mctx),
+    base_tail_identity(llm_graph_kv_tail_identity::capture(hparams, mctx->get_base())),
+    swa_tail_identity(llm_graph_kv_tail_identity::capture(hparams, mctx->get_swa())) {
+}
+
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
@@ -646,6 +701,7 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     this->mctx = mctx;
 
     bool res = true;
+    res &= tail_identity.matches(hparams, mctx);
     const auto [q_max, n_active] = tail_query_plan_shape(params.ubatch);
     res &= self_tail_query_order == nullptr ||
             (self_tail_query_order->ne[0] == q_max && self_tail_query_order->ne[1] == n_active);
@@ -794,6 +850,8 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
     this->mctx = mctx;
 
     bool res = true;
+    res &= base_tail_identity.matches(hparams, mctx->get_base());
+    res &= swa_tail_identity.matches(hparams, mctx->get_swa());
     // plain locals instead of structured bindings: the lambda below captures
     // them, which C++17 does not allow for structured bindings
     const auto tail_shape = tail_query_plan_shape(params.ubatch);
@@ -2697,7 +2755,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * tail_query_order,
          ggml_tensor * tail_run_desc,
          llama_kv_tail_route tail_route,
-         enum ggml_flash_attn_ext_kvarn_domain kvarn_domain) const {
+         enum ggml_flash_attn_ext_kvarn_domain kvarn_domain,
+         ggml_tensor * k_tail_current,
+         ggml_tensor * v_tail_current,
+                   bool tail_bodyless) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2719,6 +2780,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         GGML_ASSERT(k_tail && v_tail && kq_mask_tail);
         k_tail = ggml_permute(ctx0, k_tail, 0, 2, 1, 3);
         v_tail = ggml_permute(ctx0, v_tail, 0, 2, 1, 3);
+    }
+    if (k_tail_current || v_tail_current) {
+        GGML_ASSERT(k_tail_current && v_tail_current && k_tail);
+        k_tail_current = ggml_permute(ctx0, k_tail_current, 0, 2, 1, 3);
+        v_tail_current = ggml_permute(ctx0, v_tail_current, 0, 2, 1, 3);
     }
 
     ggml_tensor * cur;
@@ -2750,8 +2816,15 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
         if (use_native_tail) {
             GGML_ASSERT(tail_query_order && tail_run_desc);
-            cur = ggml_kv_tail_attention_merge(
-                    ctx0, cur, k_tail, v_tail, kq_mask_tail, tail_query_order, tail_run_desc);
+            cur = k_tail_current ?
+                    ggml_kv_tail_attention_merge_segmented(
+                            ctx0, cur, k_tail, v_tail, k_tail_current, v_tail_current,
+                            kq_mask_tail, tail_query_order, tail_run_desc) :
+                    ggml_kv_tail_attention_merge(
+                            ctx0, cur, k_tail, v_tail, kq_mask_tail, tail_query_order, tail_run_desc);
+            if (tail_bodyless) {
+                ggml_flash_attn_ext_set_kv_tail_bodyless(cur);
+            }
         }
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
@@ -2984,7 +3057,8 @@ static void build_attn_inp_tail(
     GGML_ASSERT(q_max > 0 && n_active > 0);
     const uint32_t arena_stride = mctx->get_tail_arena_stride();
     const uint32_t attention_stride = mctx->get_tail_attention_stride(uint32_t(q_max));
-    GGML_ASSERT(arena_stride >= attention_stride && attention_stride >= mctx->get_tail_tokens());
+    GGML_ASSERT(attention_stride >= mctx->get_tail_tokens());
+    GGML_ASSERT(mctx->has_compact_tail() || arena_stride >= attention_stride);
     tail_read_idxs = ggml_new_tensor_2d(
             ctx0, GGML_TYPE_I32, attention_stride, ubatch.n_tokens);
     tail_body_read_idxs = ggml_new_tensor_2d(
@@ -3010,6 +3084,44 @@ static void build_attn_inp_tail(
         LLAMA_LOG_DEBUG("%s: standard KV tail body route=%s physical-capacity-bound=%u\n",
                 __func__, sparse_body ? "sparse-packed" : "ordinary", arena_stride);
     }
+}
+
+static ggml_tensor * prepare_compact_tail_current(
+        ggml_context * ctx0, ggml_tensor * persistent, ggml_tensor * current) {
+    GGML_ASSERT(persistent && current);
+    GGML_ASSERT(persistent->ne[0] == current->ne[0] &&
+            persistent->ne[1] == current->ne[1] &&
+            persistent->ne[3] == 1 && current->ne[3] == 1);
+    if (current->type != persistent->type) {
+        current = ggml_cast(ctx0, current, persistent->type);
+    }
+    current = ggml_cont(ctx0, current);
+    current = ggml_reshape_4d(ctx0, current,
+            persistent->ne[0], persistent->ne[1], current->ne[2], 1);
+    return current;
+}
+
+static void build_empty_kv_body(
+        ggml_context * ctx0,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+        ggml_tensor * body_mask_template,
+        ggml_tensor * body_bias_template,
+        ggml_tensor *& k,
+        ggml_tensor *& v,
+        ggml_tensor *& body_mask,
+        ggml_tensor *& body_bias) {
+    GGML_ASSERT(k_cur && v_cur && body_mask_template);
+    const int64_t n_stream = body_mask_template->ne[3];
+    k = ggml_fill(ctx0, ggml_new_tensor_4d(
+            ctx0, k_cur->type, k_cur->ne[0], k_cur->ne[1], 1, n_stream), 0.0f);
+    v = ggml_fill(ctx0, ggml_new_tensor_4d(
+            ctx0, v_cur->type, v_cur->ne[0], v_cur->ne[1], 1, n_stream), 0.0f);
+    body_mask = ggml_fill(ctx0, ggml_new_tensor_4d(
+            ctx0, body_mask_template->type, 1, body_mask_template->ne[1], 1, n_stream), -INFINITY);
+    body_bias = body_bias_template ? ggml_fill(ctx0, ggml_new_tensor_4d(
+            ctx0, body_bias_template->type, 1, body_bias_template->ne[1],
+            body_bias_template->ne[2], body_bias_template->ne[3]), 0.0f) : nullptr;
 }
 
 static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
@@ -3112,28 +3224,41 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * k_tail_written = nullptr;
     ggml_tensor * v_tail_written = nullptr;
+    const bool compact_tail = mctx_cur->has_compact_tail();
 
     // store to KV cache
     {
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
 
-        k_tail_written = mctx_cur->cpy_k_with_tail(ctx0, k_cur, k_idxs, inp->self_tail_idxs, il);
-        if (k_tail_written) {
-            ggml_build_forward_expand(gf, k_tail_written);
+        if (compact_tail) {
+            if (ggml_tensor * written = mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il)) {
+                ggml_build_forward_expand(gf, written);
+            }
         } else {
-            ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-            if ((k_tail_written = mctx_cur->cpy_k_tail(ctx0, k_cur, inp->self_tail_idxs, il))) {
+            k_tail_written = mctx_cur->cpy_k_with_tail(ctx0, k_cur, k_idxs, inp->self_tail_idxs, il);
+            if (k_tail_written) {
                 ggml_build_forward_expand(gf, k_tail_written);
+            } else {
+                ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+                if ((k_tail_written = mctx_cur->cpy_k_tail(ctx0, k_cur, inp->self_tail_idxs, il))) {
+                    ggml_build_forward_expand(gf, k_tail_written);
+                }
             }
         }
-        v_tail_written = mctx_cur->cpy_v_with_tail(ctx0, v_cur, v_idxs, inp->self_tail_idxs, il);
-        if (v_tail_written) {
-            ggml_build_forward_expand(gf, v_tail_written);
+        if (compact_tail) {
+            if (ggml_tensor * written = mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il)) {
+                ggml_build_forward_expand(gf, written);
+            }
         } else {
-            ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
-            if ((v_tail_written = mctx_cur->cpy_v_tail(ctx0, v_cur, inp->self_tail_idxs, il))) {
+            v_tail_written = mctx_cur->cpy_v_with_tail(ctx0, v_cur, v_idxs, inp->self_tail_idxs, il);
+            if (v_tail_written) {
                 ggml_build_forward_expand(gf, v_tail_written);
+            } else {
+                ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+                if ((v_tail_written = mctx_cur->cpy_v_tail(ctx0, v_cur, inp->self_tail_idxs, il))) {
+                    ggml_build_forward_expand(gf, v_tail_written);
+                }
             }
         }
     }
@@ -3165,12 +3290,26 @@ ggml_tensor * llm_graph_context::build_attn(
     const bool gather_v_tail = v_tail != nullptr;
     ggml_tensor * tail_read_idxs = inp->get_tail_read_idxs();
     llama_kv_tail_route tail_route = mctx_cur->get_tail_route(il);
-    if (use_kvarn && !kvarn_plan.native_attention && tail_route == LLAMA_KV_TAIL_ROUTE_NATIVE) {
-        tail_route = LLAMA_KV_TAIL_ROUTE_GENERIC;
-    }
+    // The KVarN body and the exact tail have independent execution routes.
+    // A large prefill can materialize the structured body while the exact
+    // history/current segments still use native segmented attention. Falling
+    // the tail back with the body would gather [sources, queries] payloads and
+    // multiply graph workspace by both query count and layer count.
     if (tail_route != LLAMA_KV_TAIL_ROUTE_NONE) {
         GGML_ASSERT(mctx_cur->get_tail_explicit_bias(il) == (kq_b != nullptr) &&
                 "KV tail route bias contract does not match the model graph");
+    }
+    ggml_tensor * k_tail_current = nullptr;
+    ggml_tensor * v_tail_current = nullptr;
+    if (compact_tail) {
+        k_tail_current = prepare_compact_tail_current(ctx0, k_tail, k_cur);
+        v_tail_current = prepare_compact_tail_current(ctx0, v_tail, v_cur);
+        if (tail_route != LLAMA_KV_TAIL_ROUTE_NATIVE) {
+            k_tail = ggml_concat(ctx0, k_tail, k_tail_current, 2);
+            v_tail = ggml_concat(ctx0, v_tail, v_tail_current, 2);
+            k_tail_current = nullptr;
+            v_tail_current = nullptr;
+        }
     }
     const bool use_indexed_tail = gather_k_tail && gather_v_tail && tail_read_idxs &&
             tail_route == LLAMA_KV_TAIL_ROUTE_NATIVE;
@@ -3207,18 +3346,43 @@ ggml_tensor * llm_graph_context::build_attn(
         if (use_kvarn_rotated_domain) {
             v_tail = ggml_kvarn_wht_aux(ctx0, v_tail, kvarn_rot->ne[0]);
         }
+        if (k_tail_current) {
+            k_tail_current = ggml_kvarn_wht_aux(ctx0, k_tail_current, kvarn_rot->ne[0]);
+            if (use_kvarn_rotated_domain) {
+                v_tail_current = ggml_kvarn_wht_aux(ctx0, v_tail_current, kvarn_rot->ne[0]);
+            }
+        }
     }
     ggml_tensor * kq_b_tail = build_attn_bias_tail(
             kq_b, inp->get_tail_bias_read_idxs(), inp->get_kq_mask_tail());
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il,
+    ggml_tensor * body_mask = kq_mask;
+    ggml_tensor * body_bias = kq_b;
+    if (!mctx_cur->has_kv_body()) {
+        GGML_ASSERT(compact_tail && !use_kvarn);
+        build_empty_kv_body(ctx0, k_cur, v_cur, kq_mask, kq_b,
+                k, v, body_mask, body_bias);
+    }
+    ggml_tensor * cur = build_attn_mha(q, k, v, body_bias, body_mask, sinks, v_mla, kq_scale, il,
             k_tail, v_tail, inp->get_kq_mask_tail(), kq_b_tail,
             use_indexed_tail ? tail_read_idxs : nullptr,
             (use_indexed_tail || use_kvarn) ? inp->get_tail_query_order() : nullptr,
             (use_indexed_tail || use_kvarn) ? inp->get_tail_run_desc() : nullptr,
             tail_route,
-            kvarn_domain);
+            kvarn_domain,
+            k_tail_current, v_tail_current,
+            !mctx_cur->has_kv_body());
     if (use_kvarn) {
         llm_flash_attn_ext_set_kvarn_domain(cur, kvarn_domain);
+    }
+    if (compact_tail) {
+        if (ggml_tensor * written = mctx_cur->cpy_k_tail(
+                    ctx0, k_cur, inp->self_tail_idxs, il, cur)) {
+            ggml_build_forward_expand(gf, written);
+        }
+        if (ggml_tensor * written = mctx_cur->cpy_v_tail(
+                    ctx0, v_cur, inp->self_tail_idxs, il, cur)) {
+            ggml_build_forward_expand(gf, written);
+        }
     }
     cb(cur, "kqv_out", il);
 
@@ -3483,19 +3647,26 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * k_tail_written = nullptr;
     ggml_tensor * v_tail_written = nullptr;
+    const bool compact_tail = mctx_cur->has_compact_tail();
 
     // optionally store to KV cache
     if (k_cur) {
         const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
 
-        k_tail_written = mctx_cur->cpy_k_with_tail(
-                ctx0, k_cur, k_idxs, inp->get_tail_idxs(is_swa), il);
-        if (k_tail_written) {
-            ggml_build_forward_expand(gf, k_tail_written);
+        if (compact_tail) {
+            if (ggml_tensor * written = mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il)) {
+                ggml_build_forward_expand(gf, written);
+            }
         } else {
-            ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-            if ((k_tail_written = mctx_cur->cpy_k_tail(ctx0, k_cur, inp->get_tail_idxs(is_swa), il))) {
+            k_tail_written = mctx_cur->cpy_k_with_tail(
+                    ctx0, k_cur, k_idxs, inp->get_tail_idxs(is_swa), il);
+            if (k_tail_written) {
                 ggml_build_forward_expand(gf, k_tail_written);
+            } else {
+                ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+                if ((k_tail_written = mctx_cur->cpy_k_tail(ctx0, k_cur, inp->get_tail_idxs(is_swa), il))) {
+                    ggml_build_forward_expand(gf, k_tail_written);
+                }
             }
         }
     }
@@ -3503,14 +3674,20 @@ ggml_tensor * llm_graph_context::build_attn(
     if (v_cur) {
         const auto & v_idxs = is_swa ? inp->get_v_idxs_swa() : inp->get_v_idxs();
 
-        v_tail_written = mctx_cur->cpy_v_with_tail(
-                ctx0, v_cur, v_idxs, inp->get_tail_idxs(is_swa), il);
-        if (v_tail_written) {
-            ggml_build_forward_expand(gf, v_tail_written);
+        if (compact_tail) {
+            if (ggml_tensor * written = mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il)) {
+                ggml_build_forward_expand(gf, written);
+            }
         } else {
-            ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
-            if ((v_tail_written = mctx_cur->cpy_v_tail(ctx0, v_cur, inp->get_tail_idxs(is_swa), il))) {
+            v_tail_written = mctx_cur->cpy_v_with_tail(
+                    ctx0, v_cur, v_idxs, inp->get_tail_idxs(is_swa), il);
+            if (v_tail_written) {
                 ggml_build_forward_expand(gf, v_tail_written);
+            } else {
+                ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+                if ((v_tail_written = mctx_cur->cpy_v_tail(ctx0, v_cur, inp->get_tail_idxs(is_swa), il))) {
+                    ggml_build_forward_expand(gf, v_tail_written);
+                }
             }
         }
     }
@@ -3540,12 +3717,24 @@ ggml_tensor * llm_graph_context::build_attn(
     const bool gather_v_tail = v_tail != nullptr;
     ggml_tensor * tail_read_idxs = inp->get_tail_read_idxs(is_swa);
     llama_kv_tail_route tail_route = mctx_cur->get_tail_route(il);
-    if (use_kvarn && !kvarn_plan.native_attention && tail_route == LLAMA_KV_TAIL_ROUTE_NATIVE) {
-        tail_route = LLAMA_KV_TAIL_ROUTE_GENERIC;
-    }
+    // The exact tail remains eligible for segmented attention when a KVarN
+    // body is materialized for a large prefill; see the non-iSWA path above.
     if (tail_route != LLAMA_KV_TAIL_ROUTE_NONE) {
         GGML_ASSERT(mctx_cur->get_tail_explicit_bias(il) == (kq_b != nullptr) &&
                 "KV tail route bias contract does not match the model graph");
+    }
+    ggml_tensor * k_tail_current = nullptr;
+    ggml_tensor * v_tail_current = nullptr;
+    if (compact_tail) {
+        GGML_ASSERT(k_cur && v_cur);
+        k_tail_current = prepare_compact_tail_current(ctx0, k_tail, k_cur);
+        v_tail_current = prepare_compact_tail_current(ctx0, v_tail, v_cur);
+        if (tail_route != LLAMA_KV_TAIL_ROUTE_NATIVE) {
+            k_tail = ggml_concat(ctx0, k_tail, k_tail_current, 2);
+            v_tail = ggml_concat(ctx0, v_tail, v_tail_current, 2);
+            k_tail_current = nullptr;
+            v_tail_current = nullptr;
+        }
     }
     const bool use_indexed_tail = gather_k_tail && gather_v_tail && tail_read_idxs &&
             tail_route == LLAMA_KV_TAIL_ROUTE_NATIVE;
@@ -3582,18 +3771,43 @@ ggml_tensor * llm_graph_context::build_attn(
         if (use_kvarn_rotated_domain) {
             v_tail = ggml_kvarn_wht_aux(ctx0, v_tail, kvarn_rot->ne[0]);
         }
+        if (k_tail_current) {
+            k_tail_current = ggml_kvarn_wht_aux(ctx0, k_tail_current, kvarn_rot->ne[0]);
+            if (use_kvarn_rotated_domain) {
+                v_tail_current = ggml_kvarn_wht_aux(ctx0, v_tail_current, kvarn_rot->ne[0]);
+            }
+        }
     }
     ggml_tensor * kq_b_tail = build_attn_bias_tail(
             kq_b, inp->get_tail_bias_read_idxs(is_swa), inp->get_kq_mask_tail(is_swa));
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il,
+    ggml_tensor * body_mask = kq_mask;
+    ggml_tensor * body_bias = kq_b;
+    if (!mctx_cur->has_kv_body()) {
+        GGML_ASSERT(compact_tail && !use_kvarn && is_swa);
+        build_empty_kv_body(ctx0, k_cur, v_cur, kq_mask, kq_b,
+                k, v, body_mask, body_bias);
+    }
+    ggml_tensor * cur = build_attn_mha(q, k, v, body_bias, body_mask, sinks, v_mla, kq_scale, il,
             k_tail, v_tail, inp->get_kq_mask_tail(is_swa), kq_b_tail,
             use_indexed_tail ? tail_read_idxs : nullptr,
             (use_indexed_tail || use_kvarn) ? inp->get_tail_query_order() : nullptr,
             (use_indexed_tail || use_kvarn) ? inp->get_tail_run_desc(is_swa) : nullptr,
             tail_route,
-            kvarn_domain);
+            kvarn_domain,
+            k_tail_current, v_tail_current,
+            !mctx_cur->has_kv_body());
     if (use_kvarn) {
         llm_flash_attn_ext_set_kvarn_domain(cur, kvarn_domain);
+    }
+    if (compact_tail) {
+        if (ggml_tensor * written = mctx_cur->cpy_k_tail(
+                    ctx0, k_cur, inp->get_tail_idxs(is_swa), il, cur)) {
+            ggml_build_forward_expand(gf, written);
+        }
+        if (ggml_tensor * written = mctx_cur->cpy_v_tail(
+                    ctx0, v_cur, inp->get_tail_idxs(is_swa), il, cur)) {
+            ggml_build_forward_expand(gf, written);
+        }
     }
     cb(cur, "kqv_out", il);
 

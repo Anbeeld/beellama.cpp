@@ -1669,40 +1669,29 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
         return COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     }
 
-    common_context_seq_rm_type res = COMMON_CONTEXT_SEQ_RM_TYPE_PART;
-
-    llama_memory_clear(mem, true);
-
-    // eval 2 tokens to check if the context is compatible
-    std::vector<llama_token> tmp;
-    tmp.push_back(0);
-    tmp.push_back(0);
-
-    int ret = llama_decode(ctx, llama_batch_get_one(tmp.data(), tmp.size()));
-    if (ret != 0) {
-        COM_ERR("llama_decode() failed: %d\n", ret);
-        res = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
-        goto done;
+    const auto capability = llama_memory_get_seq_rm_capability(mem);
+    if (capability.arbitrary_ranges) {
+        COM_TRC("%s", "the context supports arbitrary sequence removal\n");
+        return COMMON_CONTEXT_SEQ_RM_TYPE_PART;
     }
-
-    if (llama_n_rs_seq(ctx) > 0) {
+    if (capability.suffix_rollback_tokens > 0) {
         COM_TRC("%s", "the context supports bounded partial sequence removal\n");
-        res = COMMON_CONTEXT_SEQ_RM_TYPE_RS;
-        goto done;
+        return COMMON_CONTEXT_SEQ_RM_TYPE_RS;
     }
-
-    // try to remove the last tokens
-    if (!llama_memory_seq_rm(mem, 0, 1, -1)) {
-        COM_TRC("%s", "the context does not support partial sequence removal\n");
-        res = COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
-        goto done;
+    if (capability.full_clear) {
+        COM_TRC("%s", "the context supports complete sequence removal only\n");
+        return COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
     }
+    return COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+}
 
-done:
-    llama_memory_clear(mem, true);
-    llama_synchronize(ctx);
-
-    return res;
+uint32_t common_context_seq_rm_max_rollback(llama_context * ctx) {
+    auto * mem = llama_get_memory(ctx);
+    if (!mem) {
+        return 0;
+    }
+    const auto capability = llama_memory_get_seq_rm_capability(mem);
+    return capability.arbitrary_ranges ? UINT32_MAX : capability.suffix_rollback_tokens;
 }
 
 void common_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {

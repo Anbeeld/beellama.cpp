@@ -396,6 +396,7 @@ extern "C" {
         LLAMA_KV_TAIL_DEGRADED_BODY_ONLY_STATE = 1 << 0,
         LLAMA_KV_TAIL_DEGRADED_HISTORICAL_OP   = 1 << 1,
         LLAMA_KV_TAIL_DEGRADED_STATE_RESTORE   = 1 << 2,
+        LLAMA_KV_TAIL_DEGRADED_PAYLOAD_INVALID = 1 << 3,
     };
 
     struct llama_kv_tail_coverage_info {
@@ -845,6 +846,15 @@ extern "C" {
               llama_seq_id seq_id,
                  llama_pos p0,
                  llama_pos p1);
+
+    typedef struct llama_memory_seq_rm_capability {
+        bool     full_clear;
+        bool     arbitrary_ranges;
+        uint32_t suffix_rollback_tokens;
+    } llama_memory_seq_rm_capability;
+
+    LLAMA_API llama_memory_seq_rm_capability llama_memory_get_seq_rm_capability(
+            llama_memory_t mem);
 
     // Computes a side-effect-free removable range. The returned range may be a
     // broader suffix than requested, but is accepted by the complete memory.

@@ -1002,7 +1002,8 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     const  layer_reuse_cb & reuse,
                  uint32_t   tail_tokens,
                 ggml_type   tail_type,
-                 uint32_t   tail_tokens_requested) :
+                 uint32_t   tail_tokens_requested,
+                 uint32_t   tail_rollback_tokens) :
     hparams_raw(model.hparams),
     hparams_csa(model.hparams),
     hparams_hca(model.hparams),
@@ -1033,7 +1034,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
             v_trans, offload, swa_full, unified_raw, kv_size, n_seq_max,
             dsv4_physical_ubatch(n_ubatch, n_seq_max), dsv4_physical_ubatch(n_ubatch, n_seq_max), n_pad,
             nullptr, filter_raw, reuse, nullptr, llama_kvarn_default_params(),
-            0, tail_tokens, tail_type, 0, tail_tokens_requested);
+            0, tail_tokens, tail_type, 0, tail_tokens_requested, tail_rollback_tokens);
 
     dsv4_make_k_only(hparams_csa);
     dsv4_make_k_only(hparams_hca);
@@ -1227,6 +1228,12 @@ bool llama_kv_cache_dsv4::get_can_shift() const {
     // Compressed row metadata uses block-derived positions. Keep shifting
     // disabled until DSV4 compressed-cache shift semantics are wired.
     return false;
+}
+
+llama_memory_i::seq_rm_capability llama_kv_cache_dsv4::get_seq_rm_capability() const {
+    return llama_memory_seq_rm_capability_all({
+        kv_raw.get(), kv_csa.get(), kv_hca.get(), kv_lid.get()
+    });
 }
 
 void llama_kv_cache_dsv4::clear(bool data) {
@@ -1590,6 +1597,30 @@ bool llama_kv_cache_dsv4_raw_context::apply() {
     return res;
 }
 
+void llama_kv_cache_dsv4_raw_context::graph_compute_start() {
+    graph_started = true;
+    if (ctx_base_mem) {
+        ctx_base_mem->graph_compute_start();
+    }
+    if (ctx_swa_mem) {
+        ctx_swa_mem->graph_compute_start();
+    }
+}
+
+void llama_kv_cache_dsv4_raw_context::graph_compute_finish(ggml_status compute_status) {
+    if (ctx_base_mem) {
+        ctx_base_mem->graph_compute_finish(compute_status);
+    }
+    if (ctx_swa_mem) {
+        ctx_swa_mem->graph_compute_finish(compute_status);
+    }
+    if (!ubatches_write.empty()) {
+        kv_swa->finish_tail_batch(compute_status == GGML_STATUS_SUCCESS,
+                graph_started && compute_status != GGML_STATUS_SUCCESS);
+    }
+    graph_started = false;
+}
+
 llama_memory_status llama_kv_cache_dsv4_raw_context::get_status() const {
     return status;
 }
@@ -1918,6 +1949,24 @@ bool llama_kv_cache_dsv4_context::apply() {
     }
 
     return res;
+}
+
+void llama_kv_cache_dsv4_context::graph_compute_start() {
+    ctx_raw->graph_compute_start();
+    if (ctx_csa_mem) {
+        ctx_csa_mem->graph_compute_start();
+        ctx_hca_mem->graph_compute_start();
+        ctx_lid_mem->graph_compute_start();
+    }
+}
+
+void llama_kv_cache_dsv4_context::graph_compute_finish(ggml_status compute_status) {
+    ctx_raw->graph_compute_finish(compute_status);
+    if (ctx_csa_mem) {
+        ctx_csa_mem->graph_compute_finish(compute_status);
+        ctx_hca_mem->graph_compute_finish(compute_status);
+        ctx_lid_mem->graph_compute_finish(compute_status);
+    }
 }
 
 llama_memory_status llama_kv_cache_dsv4_context::get_status() const {

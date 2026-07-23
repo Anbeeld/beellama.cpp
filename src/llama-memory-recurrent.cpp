@@ -778,6 +778,14 @@ bool llama_memory_recurrent::get_can_shift() const {
     return true;
 }
 
+llama_memory_i::seq_rm_capability llama_memory_recurrent::get_seq_rm_capability() const {
+    return {
+        /* .full_clear = */ true,
+        /* .arbitrary_ranges = */ false,
+        /* .suffix_rollback_tokens = */ n_rs_seq,
+    };
+}
+
 size_t llama_memory_recurrent::total_size() const {
     size_t size = 0;
     for (const auto & [_, buf] : ctxs_bufs) {

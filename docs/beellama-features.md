@@ -39,7 +39,9 @@ structural group IDs use the same group resolution as standard-cache tails.
 F16 is the paper-faithful KVarN default. Standard quantized tails default to
 BF16. Either cache family accepts an explicit F16 or BF16 override.
 A request covering the whole group uses one native F16/BF16 cache instead of
-allocating compressed records plus a redundant exact overlay.
+allocating compressed records plus a redundant exact overlay. For SWA this is
+a compact `W + R` ring; it does not retain the physical `W + U` execution
+reserve as persistent exact payload.
 
 ### Measurement and validation
 
@@ -74,9 +76,9 @@ BF16 median at the same depth:
 
 No accepted KVarN row used generic MMA fallback. Qwen used split decode;
 Gemma request-zero exercised both D512 split and D256 SWA-vector decode. A
-requested 1024-token tail promotes Gemma's fully covered SWA group to native
-exact storage, explaining why that row can be faster than its request-zero
-mixed compressed/exact route.
+requested 1024-token tail covers Gemma's SWA group with native-exact storage.
+These ratios predate compact current-source storage and are retained as baseline
+evidence, not as a performance claim for the current implementation.
 
 `llama-bench --kv-memory` enables synchronized CUDA checkpoints and cache-owned
 component accounting. It is intentionally opt-in and excluded from speed runs.
@@ -101,7 +103,8 @@ Qwen 16K to 64K, exact and staging residency stay constant, compressed K and V
 each grow by 420 MiB, and transient high-water grows by only 18.14 MiB; no
 full-context exact mirror or unexpected context-sized metadata was found.
 
-Native-exact promotion is reported separately from compact exact-overlay bytes.
+Compact native-exact storage is reported separately from compact exact-overlay
+bytes, including exact-history, rollback-reserve, and transient estimates.
 CUDA allocation remainders are also reported with their sign: positive values
 are non-KV scheduler/graph/backend reservations, while negative values denote
 allocator reuse/overlap or driver-baseline release rather than negative cache
@@ -172,13 +175,13 @@ build tier.
 The KV cache precision tail (KVCPT), set with `--kv-tail-tokens`, makes the newest
 attention-visible entries exact in F16 or BF16 for standard quantized and KVarN
 target caches. A partial request overlays
-a compact exact shadow while retaining the complete selected quantized cache.
+a compact `N + R` exact-history ring while retaining the complete selected
+quantized cache; current-ubatch K/V is a separate graph-local exact source.
 A standard quantized tail defaults to BF16, while a KVarN tail defaults to F16;
 `--kv-tail-type` can explicitly select either representation for either family.
-A request covering a group's full
-visibility window may instead promote its owned body to native F16/BF16 when
-that representation is supported and its memory increment is no greater than
-the overlay. Shared standard bodies are never promoted. Source selection is
+A request covering an SWA group's full visibility window uses a bodyless
+compact-native `W + R` F16/BF16 ring when the segmented route is supported.
+Non-SWA full-context groups keep their established representation. Source selection is
 per query, so a 512-token prefill does not make the same 512 rows exact for
 every query. Body and tail logits share one FP32 softmax; the runtime does not
 normalize two attention results independently.
@@ -189,14 +192,15 @@ an architecture-name allowlist. A biased layer never selects a native route
 that cannot consume its bias, and graph construction rejects any mismatch
 between the recorded route and the actual bias tensor.
 
-The overlay shadow pool is owned by the standard cache and identifies rows by
+The exact-history pool is owned by the standard cache and identifies rows by
 stream, physical cell, and generation. Sequence copies share exact rows within
 one stream and copy them into context-local slots across streams. Position
 shifts rotate exact K rows together with the quantized body. CUDA can read the
-compact pool directly through per-query slot indices and merge against ordinary
-FlashAttention normalization metadata; the generic graph gathers only the
-configured compact tail width. Neither overlay route materializes the full
-cache. Native-exact groups use the ordinary body graph and allocate no shadow.
+compact pool and current K/V directly through per-query descriptors and merge
+against ordinary FlashAttention normalization metadata. The generic graph
+gathers only shared source rows, never a query-duplicated K/V payload. Neither
+route materializes the full cache. Compact-native SWA allocates no compressed
+body.
 
 Exact overlays support the normal `--split-mode layer` ownership model: each
 body and its K/V shadows are allocated on that layer's owning device, and graph
@@ -237,19 +241,12 @@ KVarN while SWA layers use a warned standard-cache fallback; a fail-closed
 preset rejects the context instead. Unified or single-slot layouts can retain
 KVarN in both groups when otherwise eligible.
 
-SWA storage remains upstream-aligned at `W + U` physical rows (window plus
-ubatch reserve); this feature does not compact the SWA ring. Sparse packing of
-generic body rows is enabled only when the complete physical stream fits in the
-per-sequence arena, so cached-graph eligibility cannot change with occupancy,
-restore, or coverage degradation. Outside that bound the ordinary body route is
-used.
-
-Standard exact storage allocates
-`round_up(N + n_ubatch, 256) * n_seq_max + sink_slots` rows. The rounded term is
-one active-plus-in-flight arena per logical sequence; `sink_slots` is a separate
-multi-sequence reserve. Unified ordinary body storage does not merge these
-logical exact arenas. Positive K-only MLA and DSA overlays are rejected during
-context creation in this release.
+Partial SWA storage retains its upstream-aligned compressed `W + U` body, but
+its persistent exact history is `(N + R) * S` rows. Full-window SWA omits that
+body and stores `(W + R) * S` exact rows. `U` controls only graph-local current
+K/V and transient workspace; backend byte alignment does not add logical rows.
+Unified ordinary body storage does not merge these logical exact histories.
+Positive K-only MLA and DSA overlays are rejected during context creation.
 
 ### When to use it
 
@@ -283,19 +280,20 @@ KVarN-specific workspace, attention, and state decisions are in
 
 For standard caches, the default length is zero and preserves the ordinary
 topology. KVarN always resolves at least its intrinsic 128-token suffix.
-Sequence-state framing version 2 writes a validated KV-tail manifest and can
+Sequence state writes validated KV-tail manifest version 3 and can
 transfer tail tensors through host buffers or the on-device tensor protocol.
 Overlay states reject a different structural group, resolved length,
-representation, KVarN preset, or F16/BF16 type before mutation. Manifest
-version 1 remains readable with conservative degraded provenance; it cannot
+representation, rollback horizon, KVarN preset, or F16/BF16 type before
+mutation. Manifest version 2 remains readable for legacy non-compact layouts;
+version 1 remains readable with conservative degraded provenance and cannot
 upgrade incomplete historical evidence to exact. Native-exact state is already
 present in the ordinary body and has no duplicate shadow section. Standard
 body-only compatibility state and explicit body-only state begin with
 observable degraded coverage and refill from original activations on later
 writes. Sequence copies publish body membership and positions immediately;
 deferred exact rows materialize in one batch when state data or another direct
-consumer needs them. KVarN state version 12 stores logical compressed records
-plus exact payloads and remaps physical workspace on restore; version 11 is
+consumer needs them. KVarN state version 13 stores logical compressed records
+plus compact exact payloads and remaps transient workspace on restore; version 11 is
 rejected because it serialized the old workspace-dependent layout. Dequantized
 body rows are never labeled exact. Server metrics report requested and exact
 tokens, coverage group states, and degraded sequences.

@@ -202,6 +202,19 @@ int main() {
     CHECK(multi_layout.sink_slots == 512);
     CHECK(multi_layout.total_slots == 6656);
 
+    // Compact persistent history depends only on logical exact coverage and
+    // the promised rollback horizon. The active ubatch affects descriptor
+    // workspace, not per-layer payload rows.
+    const auto compact_layout_128 = llama_kv_tail_compact_layout_for(128, 8, 4, 128);
+    const auto compact_layout_512 = llama_kv_tail_compact_layout_for(128, 8, 4, 512);
+    CHECK(compact_layout_128.history_stride == 136);
+    CHECK(compact_layout_128.history_slots == 544);
+    CHECK(compact_layout_128.rollback_tokens == 8);
+    CHECK(compact_layout_128.attention_stride == 256);
+    CHECK(compact_layout_512.history_stride == compact_layout_128.history_stride);
+    CHECK(compact_layout_512.history_slots == compact_layout_128.history_slots);
+    CHECK(compact_layout_512.attention_stride == 640);
+
     // Representation is selected from visibility, ownership, and aggregate
     // byte cost rather than from a model or cache-role special case.
     const auto storage_request = [](
@@ -276,6 +289,43 @@ int main() {
     // A full-sized SWA body is eligible by visibility but not by byte cost.
     storage = llama_kv_tail_storage_plan_for(storage_request(1024, 1024, 16384, 10752, 16384));
     CHECK(storage.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY);
+
+    auto compact_partial = storage_request(128, 1024, 1536, 10752, 16384);
+    compact_partial.rollback_tokens = 8;
+    compact_partial.compact_history_capable = true;
+    compact_partial.compact_current_source_capable = true;
+    compact_partial.compact_ordered_commit_capable = true;
+    compact_partial.full_window_body_can_be_omitted = true;
+    storage = llama_kv_tail_storage_plan_for(compact_partial);
+    CHECK(storage.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_OVERLAY);
+    CHECK(storage.compact_layout.history_stride == 136);
+    CHECK(storage.compact_layout.history_slots == 136);
+    CHECK(storage.compact_layout.rollback_tokens == 8);
+    CHECK(storage.compact_history_bytes == uint64_t(136)*16384);
+    CHECK(storage.compact_rollback_bytes == uint64_t(8)*16384);
+    CHECK(storage.physical_body_rows == 1536);
+
+    auto compact_partial_larger_ubatch = compact_partial;
+    compact_partial_larger_ubatch.n_ubatch = 1024;
+    const auto compact_larger_ubatch_plan = llama_kv_tail_storage_plan_for(compact_partial_larger_ubatch);
+    CHECK(compact_larger_ubatch_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_OVERLAY);
+    CHECK(compact_larger_ubatch_plan.compact_layout.history_slots == storage.compact_layout.history_slots);
+    CHECK(compact_larger_ubatch_plan.compact_history_bytes == storage.compact_history_bytes);
+    CHECK(compact_larger_ubatch_plan.compact_layout.attention_stride == 1152);
+
+    auto compact_full = storage_request(1024, 1024, 1536, 10752, 16384);
+    compact_full.rollback_tokens = 8;
+    compact_full.compact_history_capable = true;
+    compact_full.compact_current_source_capable = true;
+    compact_full.compact_ordered_commit_capable = true;
+    compact_full.full_window_body_can_be_omitted = true;
+    storage = llama_kv_tail_storage_plan_for(compact_full);
+    CHECK(storage.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_NATIVE_EXACT);
+    CHECK(storage.compact_layout.history_stride == 1032);
+    CHECK(storage.compact_layout.history_slots == 1032);
+    CHECK(storage.compact_history_bytes == uint64_t(1032)*16384);
+    CHECK(storage.actual_body_bytes == 0);
+    CHECK(!storage.has_owned_body);
 
     auto graph_rejected = storage_request(512, 1024, 1536, 10752, 16384);
     graph_rejected.graph_consumes_exact_tail = false;
@@ -740,6 +790,50 @@ int main() {
     CHECK(late_in_flight[3] >= 0 && late_in_flight[4] >= 0);
     rollback.begin_batch();
     CHECK(rollback.active_slots().size() == 2);
+
+    // Compact history retains N active rows plus exactly R rollback rows. A
+    // suffix removal through R exposes the previous complete exact suffix;
+    // R+1 is rejected before mutation.
+    llama_kv_tail_store compact_rollback(2, 2, 1, 4, 0);
+    compact_rollback.commit(0, id(0), 0, 0);
+    compact_rollback.commit(0, id(1), 1, 1);
+    compact_rollback.commit(0, id(2), 2, 2);
+    compact_rollback.commit(0, id(3), 3, 3);
+    CHECK(compact_rollback.retention() == 2);
+    CHECK(compact_rollback.history_capacity() == 4);
+    CHECK(compact_rollback.rollback_horizon() == 2);
+    CHECK(compact_rollback.supports_suffix_rollback(0, 2));
+    CHECK(!compact_rollback.supports_suffix_rollback(0, 3));
+    compact_rollback.seq_rm(0, 2, -1);
+    const auto compact_rollback_plan =
+            compact_rollback.build_source_plan(0, { id(0), id(1) });
+    CHECK(compact_rollback_plan[0] >= 0 && compact_rollback_plan[1] >= 0);
+    CHECK(compact_rollback.coverage(0, 2).state == LLAMA_KV_TAIL_COVERAGE_COMPLETE);
+
+    // A compact batch exposes the newest committed N rows plus graph-local
+    // current rows, while its destination metadata remains transactional.
+    compact_rollback.begin_batch();
+    compact_rollback.commit(0, id(4), 4, 4, 0);
+    compact_rollback.commit(0, id(5), 5, 5, 1);
+    compact_rollback.commit(0, id(6), 6, 6, 2);
+    const auto mixed_sources = compact_rollback.source_candidates(0);
+    CHECK(mixed_sources.size() == 5);
+    CHECK(mixed_sources[0].identity == id(0));
+    CHECK(mixed_sources[1].identity == id(1));
+    for (size_t i = 2; i < mixed_sources.size(); ++i) {
+        CHECK(mixed_sources[i].identity == id(uint32_t(i + 2)));
+        CHECK(mixed_sources[i].slot >= int32_t(compact_rollback.history_capacity()));
+    }
+    compact_rollback.finish_batch(false, false);
+    CHECK(compact_rollback.snapshot(0).size() == 2);
+    CHECK(compact_rollback.snapshot(0)[0].identity == id(0));
+    CHECK(compact_rollback.snapshot(0)[1].identity == id(1));
+
+    compact_rollback.begin_batch();
+    compact_rollback.commit(0, id(4), 4, 4, 0);
+    compact_rollback.finish_batch(false, true);
+    CHECK(compact_rollback.snapshot(0).empty());
+    CHECK(compact_rollback.coverage(0, 2).state == LLAMA_KV_TAIL_COVERAGE_NONE);
 
     // Recency follows position and insertion ordinal, not physical-cell order.
     llama_kv_tail_store ordered(2, 1, 6);

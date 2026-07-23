@@ -5232,7 +5232,10 @@ static void ggml_compute_forward_set_rows_impl(
 
                 const int64_t i1 = *(idx_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
-                GGML_ASSERT(i1 >= 0 && i1 < ne1);
+                if (i1 < 0) {
+                    continue;
+                }
+                GGML_ASSERT(i1 < ne1);
 
                 if constexpr (std::is_same_v<src_t, float>) {
                     from_float(
@@ -9358,12 +9361,21 @@ static void ggml_compute_forward_flash_attn_ext_tail_ref(
     const ggml_tensor * mt = dst->src[7];
     const ggml_tensor * qo = dst->src[8];
     const ggml_tensor * rd = dst->src[9];
+    const ggml_tensor * kt_current = dst->src[10];
+    const ggml_tensor * vt_current = dst->src[11];
 
     GGML_ASSERT(q && k && v && kt && vt && mt && qo && rd);
+    GGML_ASSERT((kt_current == nullptr) == (vt_current == nullptr));
     GGML_ASSERT(q->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
     GGML_ASSERT(kt->ne[0] == q->ne[0] && vt->ne[0] == v->ne[0]);
     GGML_ASSERT(kt->ne[1] == vt->ne[1] && kt->ne[2] == k->ne[2] && vt->ne[2] == v->ne[2]);
     GGML_ASSERT(kt->ne[3] == 1 && vt->ne[3] == 1);
+    if (kt_current != nullptr) {
+        GGML_ASSERT(kt_current->ne[0] == q->ne[0] && vt_current->ne[0] == v->ne[0]);
+        GGML_ASSERT(kt_current->ne[1] == vt_current->ne[1] &&
+                    kt_current->ne[2] == k->ne[2] && vt_current->ne[2] == v->ne[2]);
+        GGML_ASSERT(kt_current->ne[3] == 1 && vt_current->ne[3] == 1);
+    }
     GGML_ASSERT(qo->type == GGML_TYPE_I32 && rd->type == GGML_TYPE_I32 && rd->ne[0] >= 4);
     GGML_ASSERT(qo->ne[1] == rd->ne[1]);
 
@@ -9387,8 +9399,15 @@ static void ggml_compute_forward_flash_attn_ext_tail_ref(
     const ggml_to_float_t v_to_float = ggml_get_type_traits(v->type)->to_float;
     const ggml_to_float_t kt_to_float = ggml_get_type_traits(kt->type)->to_float;
     const ggml_to_float_t vt_to_float = ggml_get_type_traits(vt->type)->to_float;
+    const ggml_to_float_t kt_current_to_float = kt_current ?
+        ggml_get_type_traits(kt_current->type)->to_float : nullptr;
+    const ggml_to_float_t vt_current_to_float = vt_current ?
+        ggml_get_type_traits(vt_current->type)->to_float : nullptr;
     GGML_ASSERT((k->type == GGML_TYPE_F32 || k_to_float) && (v->type == GGML_TYPE_F32 || v_to_float));
     GGML_ASSERT((kt->type == GGML_TYPE_F32 || kt_to_float) && (vt->type == GGML_TYPE_F32 || vt_to_float));
+    GGML_ASSERT(kt_current == nullptr ||
+        ((kt_current->type == GGML_TYPE_F32 || kt_current_to_float) &&
+         (vt_current->type == GGML_TYPE_F32 || vt_current_to_float)));
 
     auto convert = [](const ggml_tensor * t, const char * row, float * out, int64_t n, ggml_to_float_t fn) {
         if (t->type == GGML_TYPE_F32) {
@@ -9471,10 +9490,16 @@ static void ggml_compute_forward_flash_attn_ext_tail_ref(
             const float mask_value = ggml_fp16_to_fp32(*(const ggml_fp16_t *)
                 ((const char *) mt->data + token*mt->nb[0] + iq*mt->nb[1] + is*mt->nb[3]));
             const int64_t slot = desc[6 + token];
-            GGML_ASSERT(slot >= 0 && slot < kt->ne[1]);
-            consume((const char *) kt->data + slot*kt->nb[1] + ikh*kt->nb[2],
-                    (const char *) vt->data + slot*vt->nb[1] + ikh*vt->nb[2],
-                    mask_value, kt, vt, kt_to_float, vt_to_float);
+            const bool from_current = kt_current != nullptr && slot >= kt->ne[1];
+            const ggml_tensor * ks = from_current ? kt_current : kt;
+            const ggml_tensor * vs = from_current ? vt_current : vt;
+            const int64_t row = from_current ? slot - kt->ne[1] : slot;
+            GGML_ASSERT(row >= 0 && row < ks->ne[1] && row < vs->ne[1]);
+            consume((const char *) ks->data + row*ks->nb[1] + ikh*ks->nb[2],
+                    (const char *) vs->data + row*vs->nb[1] + ikh*vs->nb[2],
+                    mask_value, ks, vs,
+                    from_current ? kt_current_to_float : kt_to_float,
+                    from_current ? vt_current_to_float : vt_to_float);
         }
 
         if (sinks) {
@@ -11996,6 +12021,8 @@ static bool ggml_compute_forward_flash_attn_ext_kvarn(
     const ggml_tensor * tail_mask = dst->src[7];
     const ggml_tensor * query_order = dst->src[8];
     const ggml_tensor * run_desc = dst->src[9];
+    const ggml_tensor * k_tail_current = dst->src[10];
+    const ggml_tensor * v_tail_current = dst->src[11];
     const int64_t head_dim = q->ne[0];
     const int64_t n_query = q->ne[1];
     const int64_t n_query_heads = q->ne[2];
@@ -12009,6 +12036,7 @@ static bool ggml_compute_forward_flash_attn_ext_kvarn(
     GGML_ASSERT((k_tail == nullptr) ==
         (v_tail == nullptr && tail_mask == nullptr &&
          query_order == nullptr && run_desc == nullptr));
+    GGML_ASSERT((k_tail_current == nullptr) == (v_tail_current == nullptr));
     if (k_tail != nullptr) {
         GGML_ASSERT(v_tail != nullptr && tail_mask != nullptr &&
             query_order != nullptr && run_desc != nullptr);
@@ -12021,6 +12049,14 @@ static bool ggml_compute_forward_flash_attn_ext_kvarn(
         GGML_ASSERT(k_tail->ne[2] == n_kv_heads && v_tail->ne[2] == n_kv_heads);
         GGML_ASSERT(query_order->ne[1] == run_desc->ne[1]);
         GGML_ASSERT(run_desc->ne[0] >= 6 + tail_mask->ne[0]);
+        if (k_tail_current != nullptr) {
+            GGML_ASSERT((k_tail_current->type == GGML_TYPE_F16 || k_tail_current->type == GGML_TYPE_BF16) &&
+                (v_tail_current->type == GGML_TYPE_F16 || v_tail_current->type == GGML_TYPE_BF16));
+            GGML_ASSERT(k_tail_current->ne[0] == head_dim && v_tail_current->ne[0] == head_dim);
+            GGML_ASSERT(k_tail_current->ne[1] == v_tail_current->ne[1]);
+            GGML_ASSERT(k_tail_current->ne[2] == n_kv_heads && v_tail_current->ne[2] == n_kv_heads);
+            GGML_ASSERT(k_tail_current->ne[3] == 1 && v_tail_current->ne[3] == 1);
+        }
     }
 
     float scale = 1.0f;
@@ -12139,23 +12175,28 @@ static bool ggml_compute_forward_flash_attn_ext_kvarn(
             };
             for (int64_t token = 0; token < n_tail; ++token) {
                 const int64_t slot = desc[6 + token];
-                GGML_ASSERT(slot >= 0 && slot < k_tail->ne[1] && slot < v_tail->ne[1]);
+                const bool from_current = k_tail_current != nullptr && slot >= k_tail->ne[1];
+                const ggml_tensor * tail_k_source = from_current ? k_tail_current : k_tail;
+                const ggml_tensor * tail_v_source = from_current ? v_tail_current : v_tail;
+                const int64_t source_row = from_current ? slot - k_tail->ne[1] : slot;
+                GGML_ASSERT(source_row >= 0 && source_row < tail_k_source->ne[1] &&
+                        source_row < tail_v_source->ne[1]);
                 const float mask_value = slope * ggml_fp16_to_fp32(
                     *(const ggml_fp16_t *) ((const char *) tail_mask->data +
                         token * tail_mask->nb[0] + query * tail_mask->nb[1] +
                         stream * tail_mask->nb[3]));
                 consume(mask_value,
                     [&](int64_t dim) {
-                        const char * ptr = (const char *) k_tail->data +
-                            dim * k_tail->nb[0] + slot * k_tail->nb[1] +
-                            kv_head * k_tail->nb[2];
-                        return load_tail(k_tail, ptr);
+                        const char * ptr = (const char *) tail_k_source->data +
+                            dim * tail_k_source->nb[0] + source_row * tail_k_source->nb[1] +
+                            kv_head * tail_k_source->nb[2];
+                        return load_tail(tail_k_source, ptr);
                     },
                     [&](int64_t dim) {
-                        const char * ptr = (const char *) v_tail->data +
-                            dim * v_tail->nb[0] + slot * v_tail->nb[1] +
-                            kv_head * v_tail->nb[2];
-                        return load_tail(v_tail, ptr);
+                        const char * ptr = (const char *) tail_v_source->data +
+                            dim * tail_v_source->nb[0] + source_row * tail_v_source->nb[1] +
+                            kv_head * tail_v_source->nb[2];
+                        return load_tail(tail_v_source, ptr);
                     });
             }
         }

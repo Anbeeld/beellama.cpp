@@ -14,6 +14,17 @@
 
 using json = nlohmann::ordered_json;
 
+// A rollback-capable recurrent/compact KV implementation can truncate a
+// speculative suffix in-place up to its advertised reserve.  Beyond that
+// bound the server must preserve a checkpoint before evaluating the draft.
+static inline bool server_speculative_rollback_requires_checkpoint(
+        common_context_seq_rm_type type,
+        uint32_t                   max_rollback,
+        size_t                     proposed_rollback) {
+    return type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+          (type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && proposed_rollback > max_rollback);
+}
+
 enum server_task_type {
     SERVER_TASK_TYPE_COMPLETION,
     SERVER_TASK_TYPE_EMBEDDING,

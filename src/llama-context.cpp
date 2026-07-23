@@ -261,6 +261,7 @@ llama_context::llama_context(
         throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
     }
 
+    cparams.kv_tail_rollback_tokens = params.n_rs_seq;
     cparams.n_rs_seq = params.n_rs_seq;
     if (cparams.n_rs_seq > 0 && !llm_arch_supports_rs_rollback(model.arch)) {
         LLAMA_LOG_DEBUG("%s: n_rs_seq=%u requested but model arch does not support recurrent partial rollback; clamping to 0\n",
@@ -370,6 +371,13 @@ llama_context::llama_context(
                     raw_swa, swa_policy.requested_tokens, swa_policy.effective_tokens, swa_window,
                     swa_policy.native_exact ? "native_exact" : "overlay");
         }
+    }
+    if ((cparams.kv_tail_tokens > 0 || cparams.kv_tail_tokens_swa > 0) &&
+            cparams.kv_tail_rollback_tokens == 0) {
+        // The common capability probe removes one suffix token. Compact
+        // transformer caches retain that row explicitly instead of relying on
+        // the active ubatch as accidental rollback storage.
+        cparams.kv_tail_rollback_tokens = 1;
     }
 
     cparams.ctx_other = nullptr;
@@ -619,6 +627,7 @@ llama_context::llama_context(
             /*.kv_tail_tokens_swa =*/ cparams.kv_tail_tokens_swa,
             /*.kv_tail_tokens_requested =*/ cparams.kv_tail_tokens_requested,
             /*.kv_tail_tokens_swa_requested =*/ cparams.kv_tail_tokens_swa_requested,
+            /*.kv_tail_rollback_tokens =*/ cparams.kv_tail_rollback_tokens,
             /*.kv_tail_type   =*/ cparams.kv_tail_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
         };
@@ -1601,12 +1610,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
             ret = GGML_STATUS_FAILED;
+            if (mctx) {
+                mctx->graph_compute_finish(ret);
+            }
             return nullptr;
         }
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
+            if (mctx) {
+                mctx->graph_compute_finish(ret);
+            }
             return nullptr;
         }
     }
@@ -1621,7 +1636,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    if (mctx) {
+        mctx->graph_compute_start();
+    }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (mctx) {
+        mctx->graph_compute_finish(status);
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -4349,6 +4370,18 @@ bool llama_memory_can_seq_rm(
              llama_pos p0,
              llama_pos p1) {
     return mem == nullptr || mem->can_seq_rm(seq_id, p0, p1);
+}
+
+llama_memory_seq_rm_capability llama_memory_get_seq_rm_capability(llama_memory_t mem) {
+    if (!mem) {
+        return { false, false, 0 };
+    }
+    const auto capability = mem->get_seq_rm_capability();
+    return {
+        capability.full_clear,
+        capability.arbitrary_ranges,
+        capability.suffix_rollback_tokens,
+    };
 }
 
 bool llama_memory_seq_rm_plan(

@@ -5,6 +5,18 @@
 
 static constexpr size_t KIB = 1024;
 
+static void speculative_rollback_checkpoint_boundary() {
+    constexpr uint32_t reserve = 8;
+
+    assert(!server_speculative_rollback_requires_checkpoint(COMMON_CONTEXT_SEQ_RM_TYPE_NO, reserve, reserve + 1));
+    assert(!server_speculative_rollback_requires_checkpoint(COMMON_CONTEXT_SEQ_RM_TYPE_PART, reserve, reserve + 1));
+    assert( server_speculative_rollback_requires_checkpoint(COMMON_CONTEXT_SEQ_RM_TYPE_FULL, reserve, 1));
+    assert(!server_speculative_rollback_requires_checkpoint(COMMON_CONTEXT_SEQ_RM_TYPE_RS, reserve, 1));
+    assert(!server_speculative_rollback_requires_checkpoint(COMMON_CONTEXT_SEQ_RM_TYPE_RS, reserve, reserve));
+    assert( server_speculative_rollback_requires_checkpoint(COMMON_CONTEXT_SEQ_RM_TYPE_RS, reserve, reserve + 1));
+    assert( server_speculative_rollback_requires_checkpoint(COMMON_CONTEXT_SEQ_RM_TYPE_RS, 0, 1));
+}
+
 static server_prompt make_prompt(const llama_tokens & tokens) {
     server_prompt prompt;
     prompt.tokens = server_tokens(tokens, false);
@@ -153,6 +165,7 @@ static void server_planned_removal_preserves_atomic_media_chunks() {
 }
 
 int main() {
+    speculative_rollback_checkpoint_boundary();
     prompt_cache_load_target_success_draft_failure_is_atomic();
     server_unsupported_removal_falls_back_to_full_reprocess();
     server_post_preflight_mutation_failure_clears_both_contexts();

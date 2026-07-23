@@ -45,14 +45,17 @@ static bool backend_supports_native_kv_tail(
         ggml_backend_buffer_type_t buft,
         ggml_type body_k, ggml_type body_v,
         ggml_type tail_k, ggml_type tail_v,
-        int64_t d_k, int64_t d_v) {
+        int64_t d_k, int64_t d_v,
+        bool segmented) {
     auto dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
     if (!dev) {
         dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     }
     const auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
     const auto fn = reg ? reinterpret_cast<backend_kv_tail_attention_supported_t>(
-            ggml_backend_reg_get_proc_address(reg, "ggml_backend_kv_tail_attention_supported")) : nullptr;
+            ggml_backend_reg_get_proc_address(reg, segmented ?
+                    "ggml_backend_kv_tail_segmented_attention_supported" :
+                    "ggml_backend_kv_tail_attention_supported")) : nullptr;
     return fn && fn(body_k, body_v, tail_k, tail_v, d_k, d_v);
 }
 
@@ -61,7 +64,8 @@ static llama_kv_tail_route_capability probe_standard_kv_tail_route(
         ggml_type exact_k,
         ggml_type exact_v,
         bool v_transposed,
-        bool flash_attn) {
+        bool flash_attn,
+        bool segmented) {
     if (!spec.has_v) {
         return { false, LLAMA_KV_TAIL_ROUTE_NONE, LLAMA_KV_TAIL_OP_WRITE_V };
     }
@@ -94,6 +98,7 @@ static llama_kv_tail_route_capability probe_standard_kv_tail_route(
     auto * body_v = ggml_new_tensor_2d(ctx.get(), spec.body_type_v, spec.head_dim_v, n_body);
     auto * tail_k = ggml_new_tensor_2d(ctx.get(), exact_k, spec.head_dim_k, n_tail);
     auto * tail_v = ggml_new_tensor_2d(ctx.get(), exact_v, spec.head_dim_v, n_tail);
+    auto * commit_dependency = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 1);
 
     const auto owner_supports = [&](ggml_tensor * op) {
         return op && ggml_backend_dev_supports_op(dev, op);
@@ -105,7 +110,12 @@ static llama_kv_tail_route_capability probe_standard_kv_tail_route(
     llama_kv_tail_route_requirements requirements;
     const bool fused_k = ggml_is_quantized(spec.body_type_k) &&
             (exact_k == GGML_TYPE_F16 || exact_k == GGML_TYPE_BF16);
-    if (fused_k) {
+    if (segmented) {
+        requirements.write_k = owner_supports(ggml_set_rows(
+                ctx.get(), body_k, src_k, idx64)) &&
+            owner_supports(ggml_set_rows_ordered(
+                ctx.get(), tail_k, src_k, tail_idx64, commit_dependency));
+    } else if (fused_k) {
         requirements.write_k = owner_supports(ggml_set_rows_with_shadow(
                 ctx.get(), body_k, src_k, idx64, tail_k, tail_idx64));
     } else {
@@ -115,7 +125,12 @@ static llama_kv_tail_route_capability probe_standard_kv_tail_route(
 
     const bool fused_v = !v_transposed && ggml_is_quantized(spec.body_type_v) &&
             (exact_v == GGML_TYPE_F16 || exact_v == GGML_TYPE_BF16);
-    if (fused_v) {
+    if (segmented && !v_transposed) {
+        requirements.write_v = owner_supports(ggml_set_rows(
+                ctx.get(), body_v, src_v, idx64)) &&
+            owner_supports(ggml_set_rows_ordered(
+                ctx.get(), tail_v, src_v, tail_idx64, commit_dependency));
+    } else if (fused_v) {
         requirements.write_v = owner_supports(ggml_set_rows_with_shadow(
                 ctx.get(), body_v, src_v, idx64, tail_v, tail_idx64));
     } else if (v_transposed && ggml_is_quantized(spec.body_type_v)) {
@@ -170,7 +185,7 @@ static llama_kv_tail_route_capability probe_standard_kv_tail_route(
     requirements.native_attention = flash_attn && !spec.explicit_bias &&
             backend_supports_native_kv_tail(spec.buft,
                     spec.body_type_k, spec.body_type_v, exact_k, exact_v,
-                    spec.head_dim_k, spec.head_dim_v);
+                    spec.head_dim_k, spec.head_dim_v, segmented);
     return llama_kv_tail_select_route(requirements);
 }
 
@@ -347,10 +362,11 @@ llama_kv_cache::llama_kv_cache(
                  uint32_t   tail_tokens,
                 ggml_type   tail_type_requested,
                  uint32_t   tail_tokens_requested,
-                     bool   tail_metadata_only) :
+                     bool   tail_metadata_only,
+                 uint32_t   tail_rollback_tokens) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa),
-    tail_tokens(tail_tokens),
+    tail_tokens(tail_tokens), tail_rollback_tokens(tail_rollback_tokens),
     tail_type(tail_type_requested), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
@@ -535,6 +551,11 @@ llama_kv_cache::llama_kv_cache(
         true,
         llm_arch_name(model.arch),
         n_swa > 0 ? "swa" : "full",
+        tail_rollback_tokens,
+        true,
+        true,
+        true,
+        n_swa > 0 && !has_shared_layer,
     };
     tail_plan = llama_kv_tail_storage_plan_for(storage_request);
 
@@ -544,15 +565,27 @@ llama_kv_cache::llama_kv_cache(
         routes.clear();
         first_failure = { true, LLAMA_KV_TAIL_ROUTE_NONE, LLAMA_KV_TAIL_OP_NONE };
         for (const auto & spec : route_probe_specs) {
-            const ggml_type exact_k = ggml_is_quantized(spec.body_type_k) ? candidate : spec.body_type_k;
-            const ggml_type exact_v = ggml_is_quantized(spec.body_type_v) ? candidate : spec.body_type_v;
+            auto route_spec = spec;
+            if (tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_NATIVE_EXACT) {
+                // Bodyless compact-native attention uses a one-row masked
+                // F16 body anchor after build_attn_mha's normal F32 cast. The
+                // requested quant types are planner inputs only; probing them
+                // here incorrectly sends CPU-owned layers through the generic
+                // per-query gather path and can move their weights to CUDA.
+                route_spec.body_type_k = GGML_TYPE_F16;
+                route_spec.body_type_v = GGML_TYPE_F16;
+            }
+            const ggml_type exact_k = ggml_is_quantized(route_spec.body_type_k) ? candidate : route_spec.body_type_k;
+            const ggml_type exact_v = ggml_is_quantized(route_spec.body_type_v) ? candidate : route_spec.body_type_v;
             const auto capability = probe_standard_kv_tail_route(
-                    spec, exact_k, exact_v, v_trans, !v_trans);
+                    route_spec, exact_k, exact_v, v_trans, !v_trans,
+                    tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_OVERLAY ||
+                    tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_NATIVE_EXACT);
             auto * dev = ggml_backend_buft_get_device(spec.buft);
             routes.push_back({
                     spec.layer_id,
                     dev ? ggml_backend_dev_name(dev) : ggml_backend_buft_name(spec.buft),
-                    spec.body_type_k, spec.body_type_v, exact_k, exact_v,
+                    route_spec.body_type_k, route_spec.body_type_v, exact_k, exact_v,
                     v_trans, hparams.causal_attn, n_swa > 0, spec.explicit_bias, capability,
             });
             if (!capability.supported && first_failure.supported) {
@@ -661,6 +694,11 @@ llama_kv_cache::llama_kv_cache(
             true,
             llm_arch_name(model.arch),
             n_swa > 0 ? "swa" : "full",
+            tail_rollback_tokens,
+            true,
+            true,
+            true,
+            false,
         });
     }
 
@@ -677,7 +715,9 @@ llama_kv_cache::llama_kv_cache(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t((2u*(1 + n_stream) + (tail ? 2u : 0u))*n_layer_kv*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t((2u*(1 + n_stream) +
+                        (tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_NATIVE_EXACT ? 2u : 0u))*
+                        n_layer_kv*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -794,23 +834,41 @@ llama_kv_cache::llama_kv_cache(
         const bool has_v = !is_mla;
 
         const bool native_exact = tail_plan.kind == LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT;
+        const bool compact_native_exact =
+                tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_NATIVE_EXACT;
         ggml_type layer_type_k = native_exact ? tail_plan.actual_body_type_k : type_k;
         ggml_type layer_type_v = native_exact ? tail_plan.actual_body_type_v : type_v;
 
-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, layer_type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
-        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, layer_type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
-        ggml_tensor * k_tail = nullptr;
-        ggml_tensor * v_tail = nullptr;
+        ggml_tensor * k = has_k && !compact_native_exact ?
+                ggml_new_tensor_3d(ctx, layer_type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
+        ggml_tensor * v = has_v && !compact_native_exact ?
+                ggml_new_tensor_3d(ctx, layer_type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
+        ggml_tensor * k_tail = compact_native_exact ?
+                ggml_new_tensor_2d(ctx, tail_plan.actual_body_type_k, n_embd_k_gqa,
+                        tail_plan.compact_layout.history_slots) : nullptr;
+        ggml_tensor * v_tail = has_v && compact_native_exact ?
+                ggml_new_tensor_2d(ctx, tail_plan.actual_body_type_v, n_embd_v_gqa,
+                        tail_plan.compact_layout.history_slots) : nullptr;
 
-        has_k && ggml_format_name(k, "cache_k_l%d", il);
-        has_v && ggml_format_name(v, "cache_v_l%d", il);
+        if (k) {
+            ggml_format_name(k, "cache_k_l%d", il);
+        }
+        if (v) {
+            ggml_format_name(v, "cache_v_l%d", il);
+        }
+        if (k_tail) {
+            ggml_format_name(k_tail, "cache_k_tail_l%d", il);
+        }
+        if (v_tail) {
+            ggml_format_name(v_tail, "cache_v_tail_l%d", il);
+        }
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
 
         for (uint32_t s = 0; s < n_stream; ++s) {
-            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size, k->nb[1], s*k->nb[2]) : nullptr);
-            v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
+            k_stream.push_back(k ? ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size, k->nb[1], s*k->nb[2]) : nullptr);
+            v_stream.push_back(v ? ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
         }
 
         map_layer_ids[il] = layers.size();
@@ -893,12 +951,16 @@ llama_kv_cache::llama_kv_cache(
             throw std::logic_error("KV tail route references an unallocated body layer");
         }
         const auto & layer = layers.at(mapped->second);
-        const auto k_buft = tensor_buft(layer.k);
-        const auto v_buft = tensor_buft(layer.v);
-        if (!k_buft || (layer.v && !v_buft)) {
-            throw std::runtime_error(format("standard KV body layer %u has no realized backend buffer", spec.layer_id));
+        const bool compact_native_exact =
+                tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_NATIVE_EXACT;
+        const auto * owner_k = compact_native_exact ? layer.k_tail : layer.k;
+        const auto * owner_v = compact_native_exact ? layer.v_tail : layer.v;
+        const auto k_buft = tensor_buft(owner_k);
+        const auto v_buft = tensor_buft(owner_v);
+        if (!k_buft || (owner_v && !v_buft)) {
+            throw std::runtime_error(format("standard KV layer %u has no realized backend buffer", spec.layer_id));
         }
-        if (layer.v && k_buft != v_buft) {
+        if (owner_v && k_buft != v_buft) {
             throw std::runtime_error(format(
                     "standard KV body layer %u places K and V on different owners; exact-tail routing requires one layer owner",
                     spec.layer_id));
@@ -907,8 +969,10 @@ llama_kv_cache::llama_kv_cache(
 
         const bool k_meta = buft_is_meta(k_buft);
         const bool v_meta = buft_is_meta(v_buft);
-        if (tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY && (k_meta || v_meta)) {
-            const auto * split_tensor = k_meta ? layer.k : layer.v;
+        if ((tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY ||
+                tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_OVERLAY ||
+                tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_NATIVE_EXACT) && (k_meta || v_meta)) {
+            const auto * split_tensor = k_meta ? owner_k : owner_v;
             const auto split = llama_meta_device_get_split_state(
                     split_tensor, const_cast<llama_meta_device_get_split_state_userdata *>(&model.get_split_state_ud));
             throw std::runtime_error(format(
@@ -928,7 +992,9 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
-    if (tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY && !route_probe_specs.empty()) {
+    if ((tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY ||
+            tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_OVERLAY ||
+            tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_NATIVE_EXACT) && !route_probe_specs.empty()) {
         llama_kv_tail_route_capability failure;
         if (!resolve_overlay_routes(tail_type, tail_plan.layer_routes, failure)) {
             if (tail_type_auto && tail_type == GGML_TYPE_BF16) {
@@ -957,7 +1023,7 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
-    if (tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY && !tail_metadata_only) {
+    if (has_tail_overlay() && !tail_metadata_only) {
         finalize_tail_overlay_metadata();
 
         std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> tail_ctx_map;
@@ -981,6 +1047,9 @@ llama_kv_cache::llama_kv_cache(
         };
 
         for (auto & layer : layers) {
+            if (tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_NATIVE_EXACT) {
+                continue;
+            }
             const bool layer_has_quant = ggml_is_quantized(layer.k->type) ||
                     (layer.v && ggml_is_quantized(layer.v->type));
             if (!layer_has_quant) {
@@ -1030,8 +1099,12 @@ llama_kv_cache::llama_kv_cache(
         }
 
         for (const auto & layer : layers) {
-            const uintptr_t k_owner = reinterpret_cast<uintptr_t>(tensor_buft(layer.k));
-            const uintptr_t v_owner = reinterpret_cast<uintptr_t>(tensor_buft(layer.v));
+            const bool compact_native_exact =
+                    tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_NATIVE_EXACT;
+            const uintptr_t k_owner = reinterpret_cast<uintptr_t>(
+                    tensor_buft(compact_native_exact ? layer.k_tail : layer.k));
+            const uintptr_t v_owner = reinterpret_cast<uintptr_t>(
+                    tensor_buft(compact_native_exact ? layer.v_tail : layer.v));
             auto ownership = llama_kv_tail_plan_layer_ownership(
                     layer.il, k_owner, v_owner, layer.k_tail != nullptr, layer.v_tail != nullptr);
             ownership.shadow_k_owner = reinterpret_cast<uintptr_t>(tensor_buft(layer.k_tail));
@@ -1045,7 +1118,10 @@ llama_kv_cache::llama_kv_cache(
     }
 
     if (tail_plan.requested_tokens > 0) {
-        const char * storage = tail_plan.kind == LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT ? "native_exact" :
+        const char * storage =
+                tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_NATIVE_EXACT ? "compact_native_exact" :
+                tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_OVERLAY ? "compact_overlay" :
+                tail_plan.kind == LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT ? "native_exact" :
                 tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY ? "overlay" : "disabled";
         LLAMA_LOG_INFO("%s: standard KV tail plan: storage=%s requested=%u effective=%u window=%u body=%s/%s actual=%s/%s physical_rows=%llu arena=%u sink=%u overlay_rows=%u promotion=%.2f MiB overlay=%.2f MiB\n",
                 __func__, storage, tail_plan.requested_tokens, tail_plan.effective_tokens, tail_plan.visibility_window,
@@ -1226,12 +1302,63 @@ void llama_kv_cache::clear(bool data) {
     }
 }
 
+llama_memory_i::seq_rm_capability llama_kv_cache::get_seq_rm_capability() const {
+    if (has_compact_tail()) {
+        return {
+            /* .full_clear = */ true,
+            /* .arbitrary_ranges = */ false,
+            /* .suffix_rollback_tokens = */ tail_rollback_tokens,
+        };
+    }
+    return {};
+}
+
+bool llama_kv_cache::can_seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+    if (!has_compact_tail()) {
+        return true;
+    }
+    if (p0 <= 0 && p1 < 0) {
+        return true;
+    }
+    if (seq_id < 0 || size_t(seq_id) >= seq_to_stream.size() || p0 <= 0 || p1 >= 0) {
+        return false;
+    }
+    const llama_pos pos_max = seq_pos_max(seq_id);
+    if (pos_max < 0) {
+        return true;
+    }
+    const llama_pos rollback = pos_max - (p0 - 1);
+    return rollback >= 1 && rollback <= llama_pos(tail_rollback_tokens);
+}
+
+bool llama_kv_cache::seq_rm_plan(
+        llama_seq_id seq_id, llama_pos p0, llama_pos p1,
+        llama_pos & planned_p0, llama_pos & planned_p1) const {
+    if (!can_seq_rm(seq_id, p0, p1)) {
+        return false;
+    }
+    planned_p0 = p0;
+    planned_p1 = p1;
+    return true;
+}
+
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    if (other) {
+        return true;
+    }
+    if (!can_seq_rm(seq_id, p0, p1)) {
+        LLAMA_LOG_WARN("%s: compact KV tail supports complete clear or at most %u suffix tokens\n",
+                __func__, tail_rollback_tokens);
+        return false;
+    }
+    return seq_rm_unchecked(seq_id, p0, p1);
+}
+
+bool llama_kv_cache::seq_rm_unchecked(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return true;
     }
-
     materialize_pending_copies();
 
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
@@ -1864,11 +1991,35 @@ llama_kv_memory_stats llama_kv_cache::kv_memory_stats() const {
             account(tensor, payload);
         }
     };
+    const auto account_tail = [&](const ggml_tensor * tensor) {
+        if (tensor == nullptr || !seen.insert(tensor).second) {
+            return;
+        }
+        const uint64_t bytes = ggml_nbytes(tensor);
+        if (!has_compact_tail()) {
+            component.exact_tail_bytes += bytes;
+            return;
+        }
+        const uint64_t slots = tail_plan.compact_layout.history_slots;
+        const uint64_t rollback_slots = uint64_t(tail_plan.compact_layout.rollback_tokens)*n_seq_max;
+        GGML_ASSERT(slots > 0 && rollback_slots <= slots && bytes % slots == 0);
+        const uint64_t row_bytes = bytes/slots;
+        const uint64_t rollback_bytes = row_bytes*rollback_slots;
+        const uint64_t history_bytes = bytes - rollback_bytes;
+        if (tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_NATIVE_EXACT) {
+            component.native_exact_bytes += history_bytes;
+        } else {
+            component.exact_tail_bytes += history_bytes;
+        }
+        component.rollback_reserve_bytes += rollback_bytes;
+        const uint32_t current_capacity = tail_plan.compact_layout.attention_stride - tail_plan.effective_tokens;
+        component.transient_estimate_bytes += row_bytes*current_capacity;
+    };
     for (const auto & layer : layers) {
         account_payload(layer.k, component.k_payload_bytes, component.native_exact_bytes);
         account_payload(layer.v, component.v_payload_bytes, component.native_exact_bytes);
-        account(layer.k_tail, component.exact_tail_bytes);
-        account(layer.v_tail, component.exact_tail_bytes);
+        account_tail(layer.k_tail);
+        account_tail(layer.v_tail);
     }
 
     uint64_t allocated = 0;
@@ -1877,9 +2028,11 @@ llama_kv_memory_stats llama_kv_cache::kv_memory_stats() const {
         allocated += size;
     }
     const uint64_t accounted = component.k_payload_bytes + component.v_payload_bytes +
-            component.exact_tail_bytes + component.native_exact_bytes;
+            component.exact_tail_bytes + component.native_exact_bytes + component.rollback_reserve_bytes;
     component.padding_bytes = allocated > accounted ? allocated - accounted : 0;
-    component.allocated_capacity_tokens = get_size();
+    component.allocated_capacity_tokens =
+            tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_NATIVE_EXACT ?
+                tail_plan.compact_layout.history_stride : get_size();
     return result;
 }
 
@@ -2246,6 +2399,10 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     assert(ubatch.n_tokens == sinfo.n_stream()*sinfo.size());
 
     if (tail && !tail_preparing) {
+        if (has_compact_tail()) {
+            tail_generations_before_batch = tail_generations;
+            tail_graph_started = false;
+        }
         tail->begin_batch();
         tail_write_levels = 0;
         for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
@@ -2295,7 +2452,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
                     const int32_t slot = tail->commit(
                             ubatch.seq_id[i][iseq],
                             { uint32_t(sinfo.strm[s]), idx, tail_generations[sinfo.strm[s]][idx] },
-                            ubatch.pos[i], tail_ordinal++);
+                            ubatch.pos[i], tail_ordinal++, has_compact_tail() ? i : UINT32_MAX);
                     tail_write_slots[uint64_t(iseq)*ubatch.n_tokens + i] = slot;
                 }
             }
@@ -2308,11 +2465,12 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
         for (uint32_t level = 0; level < tail_write_levels; ++level) {
             for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
                 int64_t & slot = tail_write_slots[uint64_t(level)*ubatch.n_tokens + i];
-                if (slot == LLAMA_KV_TAIL_BODY_SLOT) {
+                if (slot == LLAMA_KV_TAIL_BODY_SLOT && !has_compact_tail()) {
                     GGML_ASSERT(i < tail_sink_slots);
                     slot = int64_t(sink_base + i);
                 }
-                GGML_ASSERT(slot >= 0 && uint64_t(slot) < tail_slots);
+                GGML_ASSERT((has_compact_tail() && slot == LLAMA_KV_TAIL_BODY_SLOT) ||
+                        (slot >= 0 && uint64_t(slot) < tail_slots));
             }
         }
     }
@@ -2333,7 +2491,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             LLAMA_LOG_DEBUG("%s: purging positions [%d, %d] of sequence %d from KV cache\n",
                     __func__, cells.seq_pos_min(s), seq_pos_max_rm[s], s);
 
-            seq_rm(s, cells.seq_pos_min(s), seq_pos_max_rm[s] + 1);
+            seq_rm_unchecked(s, cells.seq_pos_min(s), seq_pos_max_rm[s] + 1);
         }
     }
 
@@ -2343,6 +2501,18 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
         head = sinfo.idxs[s].back() + 1;
     }
+}
+
+void llama_kv_cache::finish_tail_batch(bool success, bool payload_may_be_modified) {
+    if (!tail || tail_preparing) {
+        return;
+    }
+    tail->finish_batch(success, payload_may_be_modified);
+    if (!success && has_compact_tail() && !tail_generations_before_batch.empty()) {
+        tail_generations = tail_generations_before_batch;
+    }
+    tail_generations_before_batch.clear();
+    tail_graph_started = false;
 }
 
 bool llama_kv_cache::get_can_shift() const {
@@ -2389,11 +2559,11 @@ bool llama_kv_cache::get_has_shift() const {
 }
 
 ggml_type llama_kv_cache::type_k() const {
-    return layers[0].k->type;
+    return layers[0].k ? layers[0].k->type : layers[0].k_tail->type;
 }
 
 ggml_type llama_kv_cache::type_v() const {
-    return layers[0].v->type;
+    return layers[0].v ? layers[0].v->type : layers[0].v_tail->type;
 }
 
 std::vector<uint32_t> llama_kv_cache::get_layer_ids() const {
@@ -2433,6 +2603,9 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * k = layers[ikv].k;
+    if (!k) {
+        return nullptr;
+    }
 
     const uint64_t kv_size      = get_size();
     const uint64_t n_embd_k_gqa = k->ne[0];
@@ -2456,6 +2629,9 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * v = layers[ikv].v;
+    if (!v) {
+        return nullptr;
+    }
 
     const uint64_t kv_size      = get_size();
     const uint64_t n_embd_v_gqa = v->ne[0];
@@ -2494,6 +2670,9 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     const int32_t ikv = map_layer_ids.at(il);
 
     ggml_tensor * k = layers[ikv].k;
+    if (!k) {
+        return nullptr;
+    }
 
     const int64_t n_embd_head = k_cur->ne[0];
     const int64_t n_head      = k_cur->ne[1];
@@ -2530,6 +2709,9 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * v = layers[ikv].v;
+    if (!v) {
+        return nullptr;
+    }
 
     const int64_t n_embd_head = v_cur->ne[0];
     const int64_t n_head      = v_cur->ne[1];
@@ -2590,7 +2772,7 @@ ggml_tensor * llama_kv_cache::cpy_k_with_tail(
     const int32_t ikv = map_layer_ids.at(il);
     ggml_tensor * body = layers[ikv].k;
     ggml_tensor * shadow = layers[ikv].k_tail;
-    if (!shadow || !tail_idxs || !ggml_is_quantized(body->type) ||
+    if (has_compact_tail() || !shadow || !tail_idxs || !ggml_is_quantized(body->type) ||
             (shadow->type != GGML_TYPE_F16 && shadow->type != GGML_TYPE_BF16) || k_cur->type != GGML_TYPE_F32 ||
             k_idxs->type != GGML_TYPE_I64 || tail_idxs->type != GGML_TYPE_I64) {
         return nullptr;
@@ -2621,7 +2803,7 @@ ggml_tensor * llama_kv_cache::cpy_v_with_tail(
     const int32_t ikv = map_layer_ids.at(il);
     ggml_tensor * body = layers[ikv].v;
     ggml_tensor * shadow = layers[ikv].v_tail;
-    if (v_trans || !shadow || !tail_idxs || !ggml_is_quantized(body->type) ||
+    if (has_compact_tail() || v_trans || !shadow || !tail_idxs || !ggml_is_quantized(body->type) ||
             (shadow->type != GGML_TYPE_F16 && shadow->type != GGML_TYPE_BF16) || v_cur->type != GGML_TYPE_F32 ||
             v_idxs->type != GGML_TYPE_I64 || tail_idxs->type != GGML_TYPE_I64) {
         return nullptr;
@@ -2726,7 +2908,8 @@ ggml_tensor * llama_kv_cache::get_v_tail_fallback(
 }
 
 ggml_tensor * llama_kv_cache::cpy_k_tail(
-        ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * tail_idxs, int32_t il) const {
+        ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * tail_idxs,
+        int32_t il, ggml_tensor * dependency) const {
     const int32_t ikv = map_layer_ids.at(il);
     ggml_tensor * dst = layers[ikv].k_tail;
     if (!dst || !tail_idxs) {
@@ -2740,14 +2923,16 @@ ggml_tensor * llama_kv_cache::cpy_k_tail(
     ggml_tensor * written = dst;
     for (int64_t level = 0; level < tail_idxs->ne[1]; ++level) {
         ggml_tensor * level_idxs = ggml_view_1d(ctx, tail_idxs, n_tokens, level*tail_idxs->nb[1]);
-        written = ggml_set_rows(ctx, written, k_cur, level_idxs);
+        written = ggml_set_rows_ordered(ctx, written, k_cur, level_idxs, dependency);
+        dependency = written;
     }
     return ggml_reshape_4d(ctx, written,
             hparams.n_embd_head_k(il), hparams.n_head_kv(il), tail_slots, 1);
 }
 
 ggml_tensor * llama_kv_cache::cpy_v_tail(
-        ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * tail_idxs, int32_t il) const {
+        ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * tail_idxs,
+        int32_t il, ggml_tensor * dependency) const {
     const int32_t ikv = map_layer_ids.at(il);
     ggml_tensor * dst = layers[ikv].v_tail;
     if (!dst || !tail_idxs) {
@@ -2764,7 +2949,8 @@ ggml_tensor * llama_kv_cache::cpy_v_tail(
     ggml_tensor * written = dst;
     for (int64_t level = 0; level < tail_idxs->ne[1]; ++level) {
         ggml_tensor * level_idxs = ggml_view_1d(ctx, tail_idxs, n_tokens, level*tail_idxs->nb[1]);
-        written = ggml_set_rows(ctx, written, v_cur, level_idxs);
+        written = ggml_set_rows_ordered(ctx, written, v_cur, level_idxs, dependency);
+        dependency = written;
     }
     return ggml_reshape_4d(ctx, written,
             hparams.n_embd_head_v(il), hparams.n_head_kv(il), tail_slots, 1);
@@ -3305,7 +3491,7 @@ size_t llama_kv_cache::size_k_bytes() const {
     size_t size_k_bytes = 0;
 
     for (const auto & layer : layers) {
-        size_k_bytes += ggml_nbytes(layer.k);
+        size_k_bytes += layer.k ? ggml_nbytes(layer.k) : 0;
     }
 
     return size_k_bytes;
@@ -3441,6 +3627,19 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 
         ggml_tensor * rope_factors = model.get_rope_factors(cparams, il);
 
+        if (!layer.k) {
+            GGML_ASSERT(layer.k_tail);
+            ggml_tensor * k_tail = ggml_view_3d(ctx, layer.k_tail,
+                    n_rot, n_head_kv, tail_slots,
+                    ggml_row_size(layer.k_tail->type, n_embd_head_k),
+                    ggml_row_size(layer.k_tail->type, n_embd_k_gqa),
+                    ggml_row_size(layer.k_tail->type, n_embd_nope));
+            ggml_tensor * tail_cur = build_rope_shift(cparams, ctx, k_tail, inp->k_shift_tail,
+                    inp->k_rot, rope_factors, freq_base_l, freq_scale_l, il);
+            ggml_build_forward_expand(gf, tail_cur);
+            continue;
+        }
+
         ggml_tensor * k =
             ggml_view_3d(ctx, layer.k,
                 n_rot, n_head_kv, get_size()*n_stream,
@@ -3473,7 +3672,8 @@ namespace {
 
 constexpr uint32_t LLAMA_KV_TAIL_STATE_MAGIC = 0x4c54564b; // KVTL
 constexpr uint32_t LLAMA_KV_TAIL_STATE_VERSION_V1 = 1;
-constexpr uint32_t LLAMA_KV_TAIL_STATE_VERSION = 2;
+constexpr uint32_t LLAMA_KV_TAIL_STATE_VERSION_V2 = 2;
+constexpr uint32_t LLAMA_KV_TAIL_STATE_VERSION = 3;
 constexpr uint32_t LLAMA_KV_TAIL_STATE_BODY_ONLY = 1;
 
 class llama_io_write_counter final : public llama_io_write_i {
@@ -3589,25 +3789,27 @@ llama_kv_cache::state_v2_manifest llama_kv_cache::state_v2_collect(
         }
     }
 
-    result.body_layers.reserve(layers.size());
-    for (const auto & layer : layers) {
-        const auto * k = layer.k_stream[0];
-        const auto * v = layer.v_stream[0];
-        state_v2_manifest::body_layer saved;
-        saved.il = layer.il;
-        saved.k_type = int32_t(k->type);
-        saved.k_row = ggml_row_size(k->type, hparams.n_embd_k_gqa(layer.il));
-        saved.has_v = v ? 1u : 0u;
-        if (v) {
-            saved.v_type = int32_t(v->type);
-            saved.v_unit = v_trans ? ggml_type_size(v->type) :
-                    ggml_row_size(v->type, hparams.n_embd_v_gqa(layer.il));
-            saved.v_embd = v_trans ? hparams.n_embd_v_gqa(layer.il) : 0;
+    if (has_kv_body()) {
+        result.body_layers.reserve(layers.size());
+        for (const auto & layer : layers) {
+            const auto * k = layer.k_stream[0];
+            const auto * v = layer.v_stream[0];
+            state_v2_manifest::body_layer saved;
+            saved.il = layer.il;
+            saved.k_type = int32_t(k->type);
+            saved.k_row = ggml_row_size(k->type, hparams.n_embd_k_gqa(layer.il));
+            saved.has_v = v ? 1u : 0u;
+            if (v) {
+                saved.v_type = int32_t(v->type);
+                saved.v_unit = v_trans ? ggml_type_size(v->type) :
+                        ggml_row_size(v->type, hparams.n_embd_v_gqa(layer.il));
+                saved.v_embd = v_trans ? hparams.n_embd_v_gqa(layer.il) : 0;
+            }
+            result.body_layers.push_back(saved);
         }
-        result.body_layers.push_back(saved);
     }
 
-    if (body_only || tail_plan.kind != LLAMA_KV_TAIL_STORAGE_OVERLAY) {
+    if (body_only || !has_tail_overlay()) {
         return result;
     }
 
@@ -3737,7 +3939,8 @@ llama_kv_cache::state_v2_manifest llama_kv_cache::state_v2_read_manifest(
     io.read(&result.n_pos_per_embd, sizeof(result.n_pos_per_embd));
     io.read(&result.saved_n_seq_max, sizeof(result.saved_n_seq_max));
     io.read(&layer_count, sizeof(layer_count));
-    if (stream_count != n_stream || layer_count != layers.size() ||
+    const uint32_t expected_body_layer_count = has_kv_body() ? uint32_t(layers.size()) : 0u;
+    if (stream_count != n_stream || layer_count != expected_body_layer_count ||
             result.v_trans != uint32_t(v_trans) || result.n_pos_per_embd != hparams.n_pos_per_embd()) {
         throw std::runtime_error("KV tail state body layout does not match the context");
     }
@@ -3869,9 +4072,14 @@ llama_kv_cache::state_v2_manifest llama_kv_cache::state_v2_read_manifest(
             throw std::runtime_error("KV tail state exact record does not belong to its body cell");
         }
         const llama_seq_id dst_seq = seq_id == -1 ? record.seq_id : seq_id;
-        if (!unique_identity.emplace(dst_seq, record.stream, record.body_ordinal).second ||
-                ++records_per_destination[size_t(dst_seq)] > tail->retention()) {
-            throw std::runtime_error("duplicate or over-capacity KV tail state identity");
+        if (!unique_identity.emplace(dst_seq, record.stream, record.body_ordinal).second) {
+            throw std::runtime_error("duplicate KV tail state identity");
+        }
+        // Compact state includes the rollback reserve as persistent history.
+        // It is not visible to ordinary attention, but it must survive a
+        // checkpoint so suffix rollback remains valid after restore.
+        if (++records_per_destination[size_t(dst_seq)] > tail->history_capacity()) {
+            throw std::runtime_error("over-capacity KV tail state identity");
         }
         payload_referenced[record.payload] = true;
     }
@@ -3930,7 +4138,7 @@ void llama_kv_cache::state_v2_write_body_payload(
         llama_io_write_i & io, const state_v2_manifest & manifest) const {
     for (uint32_t s = 0; s < manifest.streams.size(); ++s) {
         const auto & stream = manifest.streams[s];
-        for (uint32_t l = 0; l < layers.size(); ++l) {
+        for (uint32_t l = 0; l < manifest.body_layers.size(); ++l) {
             auto * k = layers[l].k_stream[s];
             const uint64_t row = manifest.body_layers[l].k_row;
             size_t ordinal = 0;
@@ -3940,7 +4148,7 @@ void llama_kv_cache::state_v2_write_body_payload(
             }
         }
         if (!v_trans) {
-            for (uint32_t l = 0; l < layers.size(); ++l) {
+            for (uint32_t l = 0; l < manifest.body_layers.size(); ++l) {
                 auto * v = layers[l].v_stream[s];
                 if (!v) {
                     continue;
@@ -3954,7 +4162,7 @@ void llama_kv_cache::state_v2_write_body_payload(
             }
         } else {
             const uint32_t kv_size = v_cells[s].size();
-            for (uint32_t l = 0; l < layers.size(); ++l) {
+            for (uint32_t l = 0; l < manifest.body_layers.size(); ++l) {
                 auto * v = layers[l].v_stream[s];
                 if (!v) {
                     continue;
@@ -4291,8 +4499,12 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         return;
     }
 
-    const bool body_only = (flags & LLAMA_STATE_SEQ_FLAGS_BODY_ONLY) != 0;
-    if (tail_plan.kind != LLAMA_KV_TAIL_STORAGE_OVERLAY && !body_only) {
+    const bool requested_body_only = (flags & LLAMA_STATE_SEQ_FLAGS_BODY_ONLY) != 0;
+    // A compact-native cache has no lower-fidelity body to serialize. Preserve
+    // the logical cache state (including exact K/V) even when a caller asks for
+    // a body-only snapshot.
+    const bool body_only = requested_body_only && has_kv_body();
+    if (!has_tail_overlay() && !body_only) {
         state_write_body(io, seq_id);
         return;
     }
@@ -4309,6 +4521,8 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 
     const uint32_t state_flags = body_only ? LLAMA_KV_TAIL_STATE_BODY_ONLY : 0;
     const int32_t state_tail_type = int32_t(tail_type);
+    const uint32_t state_storage_kind = uint32_t(tail_plan.kind);
+    const uint32_t state_rollback_tokens = tail_plan.compact_layout.rollback_tokens;
     uint32_t lowest_layer = UINT32_MAX;
     for (const auto & layer : layers) {
         lowest_layer = std::min(lowest_layer, uint32_t(layer.il));
@@ -4323,6 +4537,8 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
     io.write(&state_flags, sizeof(state_flags));
     io.write(&tail_plan.effective_tokens, sizeof(tail_plan.effective_tokens));
     io.write(&state_tail_type, sizeof(state_tail_type));
+    io.write(&state_storage_kind, sizeof(state_storage_kind));
+    io.write(&state_rollback_tokens, sizeof(state_rollback_tokens));
     io.write_string(group_id);
     io.write(&manifest_size, sizeof(manifest_size));
     io.write(&body_payload_size, sizeof(body_payload_size));
@@ -4354,8 +4570,13 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
     uint32_t marker;
     io.read(&marker, sizeof(marker));
     if (marker != LLAMA_KV_TAIL_STATE_MAGIC) {
+        if (tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_OVERLAY ||
+                tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_NATIVE_EXACT) {
+            throw std::runtime_error(
+                    "legacy KV state lacks compact-tail representation metadata");
+        }
         state_read_body(io, seq_id, marker);
-        if (tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY) {
+        if (has_tail_overlay()) {
             if (seq_id == -1) {
                 tail->clear();
             } else {
@@ -4371,15 +4592,23 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
     uint32_t state_flags;
     uint32_t state_tail_tokens;
     int32_t state_tail_type;
+    uint32_t state_storage_kind = uint32_t(LLAMA_KV_TAIL_STORAGE_DISABLED);
+    uint32_t state_rollback_tokens = 0;
     std::string state_group_id;
     io.read(&version, sizeof(version));
+    if (version != LLAMA_KV_TAIL_STATE_VERSION_V1 &&
+            version != LLAMA_KV_TAIL_STATE_VERSION_V2 &&
+            version != LLAMA_KV_TAIL_STATE_VERSION) {
+        throw std::runtime_error("unsupported KV tail state version");
+    }
     io.read(&state_flags, sizeof(state_flags));
     io.read(&state_tail_tokens, sizeof(state_tail_tokens));
     io.read(&state_tail_type, sizeof(state_tail_type));
-    io.read_string(state_group_id);
-    if (version != LLAMA_KV_TAIL_STATE_VERSION_V1 && version != LLAMA_KV_TAIL_STATE_VERSION) {
-        throw std::runtime_error("unsupported KV tail state version");
+    if (version >= LLAMA_KV_TAIL_STATE_VERSION) {
+        io.read(&state_storage_kind, sizeof(state_storage_kind));
+        io.read(&state_rollback_tokens, sizeof(state_rollback_tokens));
     }
+    io.read_string(state_group_id);
     uint32_t lowest_layer = UINT32_MAX;
     for (const auto & layer : layers) {
         lowest_layer = std::min(lowest_layer, uint32_t(layer.il));
@@ -4390,12 +4619,33 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
         throw std::runtime_error("KV tail state cache-group ID does not match the context");
     }
     const bool body_only = (state_flags & LLAMA_KV_TAIL_STATE_BODY_ONLY) != 0;
-    if (!body_only && (tail_plan.kind != LLAMA_KV_TAIL_STORAGE_OVERLAY ||
-            state_tail_tokens != tail_plan.effective_tokens || state_tail_type != int32_t(tail_type))) {
+    const bool compact_context =
+            tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_OVERLAY ||
+            tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_NATIVE_EXACT;
+    if (version < LLAMA_KV_TAIL_STATE_VERSION && compact_context) {
+        throw std::runtime_error(
+                "KV tail state version predates compact representation metadata");
+    }
+    if (version >= LLAMA_KV_TAIL_STATE_VERSION &&
+            (state_storage_kind != uint32_t(tail_plan.kind) ||
+             state_rollback_tokens != tail_plan.compact_layout.rollback_tokens)) {
+        throw std::runtime_error(
+                "KV tail state representation does not match the context: state kind=" +
+                std::to_string(state_storage_kind) + " rollback=" +
+                std::to_string(state_rollback_tokens) + ", context kind=" +
+                std::to_string(uint32_t(tail_plan.kind)) + " rollback=" +
+                std::to_string(tail_plan.compact_layout.rollback_tokens));
+    }
+    if (body_only && !has_kv_body()) {
+        throw std::runtime_error("body-only KV tail state cannot restore into a bodyless context");
+    }
+    if (!body_only && (!has_tail_overlay() ||
+            state_tail_tokens != tail_plan.effective_tokens ||
+            state_tail_type != int32_t(tail_type))) {
         throw std::runtime_error("KV tail state configuration does not match the context");
     }
 
-    if (version == LLAMA_KV_TAIL_STATE_VERSION) {
+    if (version >= LLAMA_KV_TAIL_STATE_VERSION_V2) {
         uint64_t manifest_size;
         uint64_t body_payload_size;
         uint64_t tail_payload_size;
@@ -4430,7 +4680,7 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
         state_read_tail(io, seq_id, restored_cells, flags);
         tail->mark_degraded(seq_id, LLAMA_KV_TAIL_DEGRADED_STATE_RESTORE);
         LLAMA_LOG_WARN("%s: loaded KV tail state v1 without coverage provenance; exact coverage is conservatively degraded until refilled\n", __func__);
-    } else if (tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY) {
+    } else if (has_tail_overlay()) {
         if (seq_id == -1) {
             tail->clear();
         } else {
@@ -5297,6 +5547,18 @@ bool llama_kv_cache_context::apply() {
     return true;
 }
 
+void llama_kv_cache_context::graph_compute_start() {
+    graph_started = true;
+}
+
+void llama_kv_cache_context::graph_compute_finish(ggml_status compute_status) {
+    if (!ubatches.empty()) {
+        kv->finish_tail_batch(compute_status == GGML_STATUS_SUCCESS,
+                graph_started && compute_status != GGML_STATUS_SUCCESS);
+    }
+    graph_started = false;
+}
+
 llama_memory_status llama_kv_cache_context::get_status() const {
     return status;
 }
@@ -5375,6 +5637,10 @@ uint32_t llama_kv_cache_context::get_tail_slots() const {
     return kv->get_tail_slots();
 }
 
+ggml_type llama_kv_cache_context::get_tail_type() const {
+    return kv->get_tail_type();
+}
+
 uint32_t llama_kv_cache_context::get_tail_tokens() const {
     return kv->get_tail_tokens();
 }
@@ -5383,9 +5649,33 @@ uint32_t llama_kv_cache_context::get_tail_arena_stride() const {
     return kv->get_tail_arena_stride();
 }
 
+bool llama_kv_cache_context::has_compact_tail() const {
+    return kv->has_compact_tail();
+}
+
+bool llama_kv_cache_context::has_kv_body() const {
+    return kv->has_kv_body();
+}
+
+llama_kv_tail_storage_kind llama_kv_cache_context::get_tail_storage_kind() const {
+    return kv->get_tail_storage_kind();
+}
+
+uint32_t llama_kv_cache_context::get_tail_rollback_tokens() const {
+    return kv->get_tail_rollback_tokens();
+}
+
 uint32_t llama_kv_cache::get_tail_attention_stride(uint32_t n_query_tokens) const {
-    if (tail_plan.kind != LLAMA_KV_TAIL_STORAGE_OVERLAY) {
+    if (!has_tail_overlay()) {
         return 0;
+    }
+    if (has_compact_tail()) {
+        if (n_query_tokens == 0) {
+            return tail_attention_stride;
+        }
+        const uint64_t required = uint64_t(tail_tokens) + n_query_tokens;
+        GGML_ASSERT(required <= uint64_t(INT32_MAX));
+        return uint32_t(required);
     }
     if (n_query_tokens == 0) {
         return tail_attention_stride;
@@ -5408,7 +5698,7 @@ uint32_t llama_kv_cache::get_tail_attention_stride(uint32_t n_query_tokens) cons
 }
 
 llama_kv_tail_route llama_kv_cache::get_tail_route(int32_t il) const {
-    if (tail_plan.kind != LLAMA_KV_TAIL_STORAGE_OVERLAY) {
+    if (!has_tail_overlay()) {
         return LLAMA_KV_TAIL_ROUTE_NONE;
     }
     const auto it = std::find_if(tail_plan.layer_routes.begin(), tail_plan.layer_routes.end(),
@@ -5421,8 +5711,7 @@ llama_kv_tail_route llama_kv_cache::get_tail_route(int32_t il) const {
 }
 
 bool llama_kv_cache::get_tail_explicit_bias(int32_t il) const {
-    if (tail_plan.kind != LLAMA_KV_TAIL_STORAGE_OVERLAY &&
-            tail_plan.kind != LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT) {
+    if (!has_tail_overlay() && tail_plan.kind != LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT) {
         return false;
     }
     const auto it = std::find_if(tail_plan.layer_routes.begin(), tail_plan.layer_routes.end(),
@@ -5435,7 +5724,7 @@ const std::vector<llama_kv_tail_layer_route> & llama_kv_cache::get_tail_layer_ro
 }
 
 void llama_kv_cache::set_tail_routes(std::vector<llama_kv_tail_layer_route> routes) {
-    if (tail_plan.kind != LLAMA_KV_TAIL_STORAGE_OVERLAY) {
+    if (!has_tail_overlay()) {
         if (!routes.empty()) {
             throw std::invalid_argument("cannot attach routes to a non-overlay KV tail plan");
         }
@@ -5453,7 +5742,7 @@ void llama_kv_cache::set_tail_routes(std::vector<llama_kv_tail_layer_route> rout
 }
 
 void llama_kv_cache::finalize_tail_overlay_metadata() {
-    if (tail_plan.kind != LLAMA_KV_TAIL_STORAGE_OVERLAY || tail) {
+    if (!has_tail_overlay() || tail) {
         return;
     }
     if (tail_plan.layer_routes.empty()) {
@@ -5465,12 +5754,22 @@ void llama_kv_cache::finalize_tail_overlay_metadata() {
         }
     }
 
-    tail_arena_stride = tail_plan.layout.arena_stride;
-    tail_attention_stride = tail_plan.effective_tokens;
-    tail_sink_slots = tail_plan.layout.sink_slots;
-    tail_slots = tail_plan.layout.total_slots;
-    tail = std::make_unique<llama_kv_tail_store>(
-            tail_plan.effective_tokens, n_seq_max, tail_arena_stride, tail_sink_slots);
+    if (has_compact_tail()) {
+        tail_arena_stride = tail_plan.compact_layout.history_stride;
+        tail_attention_stride = tail_plan.compact_layout.attention_stride;
+        tail_sink_slots = 0;
+        tail_slots = tail_plan.compact_layout.history_slots;
+        tail = std::make_unique<llama_kv_tail_store>(
+                tail_plan.effective_tokens, tail_plan.compact_layout.rollback_tokens,
+                n_seq_max, tail_arena_stride, 0);
+    } else {
+        tail_arena_stride = tail_plan.layout.arena_stride;
+        tail_attention_stride = tail_plan.effective_tokens;
+        tail_sink_slots = tail_plan.layout.sink_slots;
+        tail_slots = tail_plan.layout.total_slots;
+        tail = std::make_unique<llama_kv_tail_store>(
+                tail_plan.effective_tokens, n_seq_max, tail_arena_stride, tail_sink_slots);
+    }
     const char * timing = std::getenv("LLAMA_KV_TAIL_PLANNER_TIMING");
     tail_planner_timing_enabled = timing && std::strcmp(timing, "1") == 0;
     tail_generations.assign(n_stream, std::vector<uint64_t>(get_size(), 0));
@@ -5698,8 +5997,17 @@ void llama_kv_cache::set_input_kq_mask_tail(
     GGML_ASSERT(!body_read_idxs || !body_read_idxs->buffer || ggml_backend_buffer_is_host(body_read_idxs->buffer));
     GGML_ASSERT(!bias_read_idxs || !bias_read_idxs->buffer || ggml_backend_buffer_is_host(bias_read_idxs->buffer));
     const uint32_t attention_stride = uint32_t(exact->ne[0]);
-    GGML_ASSERT(body->type == exact->type && attention_stride >= tail_attention_stride &&
-            attention_stride <= tail_arena_stride);
+    GGML_ASSERT(body->type == exact->type);
+    if (has_compact_tail()) {
+        // Compact graphs size the exact input to N + the largest active query
+        // cohort.  That runtime extent can exceed the persistent N + R arena,
+        // but may not exceed the graph's reserved N + U extent.
+        GGML_ASSERT(attention_stride >= tail->retention() &&
+                attention_stride <= tail_attention_stride);
+    } else {
+        GGML_ASSERT(attention_stride >= tail_attention_stride &&
+                attention_stride <= tail_arena_stride);
+    }
     GGML_ASSERT(!read_idxs ||
             (read_idxs->type == GGML_TYPE_I32 && read_idxs->ne[0] == attention_stride));
     GGML_ASSERT(!body_read_idxs ||
@@ -5726,7 +6034,8 @@ void llama_kv_cache::set_input_kq_mask_tail(
 }
 
 bool llama_kv_cache::can_pack_tail_body(const llama_ubatch & ubatch) const {
-    if (!tail || tail_arena_stride == 0 || ubatch.n_seq_id == nullptr || ubatch.seq_id == nullptr) {
+    if (!has_kv_body() || !tail || tail_arena_stride == 0 ||
+            ubatch.n_seq_id == nullptr || ubatch.seq_id == nullptr) {
         return false;
     }
 
@@ -5886,13 +6195,15 @@ void llama_kv_cache::set_input_tail_body_plan(
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_k_tail(
-        ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * tail_idxs, int32_t il) const {
-    return kv->cpy_k_tail(ctx, k_cur, tail_idxs, il);
+        ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * tail_idxs,
+        int32_t il, ggml_tensor * dependency) const {
+    return kv->cpy_k_tail(ctx, k_cur, tail_idxs, il, dependency);
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_v_tail(
-        ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * tail_idxs, int32_t il) const {
-    return kv->cpy_v_tail(ctx, v_cur, tail_idxs, il);
+        ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * tail_idxs,
+        int32_t il, ggml_tensor * dependency) const {
+    return kv->cpy_v_tail(ctx, v_cur, tail_idxs, il, dependency);
 }
 
 ggml_tensor * llama_kv_cache_context::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {

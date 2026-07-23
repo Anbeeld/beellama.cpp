@@ -307,12 +307,12 @@ static bool test_tail_copy_is_immediately_saveable(
             break;
         }
     }
-    if (frame == std::string::npos || read_u32(state, frame + 4) != 2) {
-        LOG_ERR("%s: could not locate standard tail state v2 frame\n", __func__);
+    if (frame == std::string::npos || read_u32(state, frame + 4) != 3) {
+        LOG_ERR("%s: could not locate standard tail state v3 frame\n", __func__);
         return false;
     }
-    const uint32_t group_size = read_u32(state, frame + 20);
-    const size_t manifest = frame + 24 + group_size + 3*sizeof(uint64_t);
+    const uint32_t group_size = read_u32(state, frame + 28);
+    const size_t manifest = frame + 32 + group_size + 3*sizeof(uint64_t);
     const uint32_t stream_count = read_u32(state, manifest);
     const uint32_t n_pos_per_embd = read_u32(state, manifest + 8);
     const uint32_t saved_n_seq_max = read_u32(state, manifest + 12);

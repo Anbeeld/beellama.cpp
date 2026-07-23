@@ -291,6 +291,8 @@ static void test_memory_stats_aggregation() {
     first.global.v_payload_bytes = 20;
     first.global.exact_tail_bytes = 30;
     first.global.native_exact_bytes = 7;
+    first.global.rollback_reserve_bytes = 9;
+    first.global.transient_estimate_bytes = 11;
     first.global.staging_bytes = 40;
     first.global.metadata_bytes = 50;
     first.global.padding_bytes = 60;
@@ -301,6 +303,8 @@ static void test_memory_stats_aggregation() {
     second.swa.v_payload_bytes = 2;
     second.swa.exact_tail_bytes = 3;
     second.swa.native_exact_bytes = 8;
+    second.swa.rollback_reserve_bytes = 2;
+    second.swa.transient_estimate_bytes = 3;
     second.swa.staging_bytes = 4;
     second.swa.metadata_bytes = 5;
     second.swa.padding_bytes = 6;
@@ -310,9 +314,11 @@ static void test_memory_stats_aggregation() {
     require(first.k_payload_bytes() == 11 && first.v_payload_bytes() == 22,
             "KV memory payload aggregation mismatch");
     require(first.exact_overlay_bytes() == 33 && first.native_exact_bytes() == 15 &&
-            first.exact_tail_bytes() == 48 && first.persistent_overhead_bytes() == 165,
+            first.exact_history_bytes() == 48 && first.rollback_reserve_bytes() == 11 &&
+            first.exact_tail_bytes() == 59 && first.transient_estimate_bytes() == 14 &&
+            first.persistent_overhead_bytes() == 165,
             "KV memory overhead aggregation mismatch");
-    require(first.resident_bytes() == 246,
+    require(first.resident_bytes() == 257,
             "KV memory resident total does not reconcile");
     require(first.allocated_capacity_tokens() == 4096,
             "KV memory capacity must report the largest attention domain, not their sum");

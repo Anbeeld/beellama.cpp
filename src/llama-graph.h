@@ -313,6 +313,26 @@ public:
     const llama_cparams cparams;
 };
 
+struct llm_graph_kv_tail_identity {
+    uint32_t storage_kind = 0;
+    ggml_type exact_type = GGML_TYPE_COUNT;
+    uint32_t retention_tokens = 0;
+    uint32_t rollback_tokens = 0;
+    uint32_t arena_stride = 0;
+    uint32_t storage_slots = 0;
+    bool compact = false;
+    bool has_body = true;
+    std::vector<llama_kv_tail_route> routes;
+    std::vector<bool> explicit_bias;
+
+    static llm_graph_kv_tail_identity capture(
+            const llama_hparams & hparams,
+            const llama_kv_cache_context * mctx);
+    bool matches(
+            const llama_hparams & hparams,
+            const llama_kv_cache_context * mctx) const;
+};
+
 class llm_graph_input_attn_kv : public llm_graph_input_i {
 public:
     llm_graph_input_attn_kv(
@@ -321,7 +341,8 @@ public:
             const llama_kv_cache_context * mctx) :
         hparams(hparams),
         cparams(cparams),
-        mctx(mctx) {
+        mctx(mctx),
+        tail_identity(llm_graph_kv_tail_identity::capture(hparams, mctx)) {
     }
     ~llm_graph_input_attn_kv() = default;
 
@@ -368,6 +389,7 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_context * mctx;
+    const llm_graph_kv_tail_identity tail_identity;
 };
 
 // V-less input for the KV cache
@@ -446,11 +468,7 @@ public:
     llm_graph_input_attn_kv_iswa(
             const llama_hparams & hparams,
             const llama_cparams & cparams,
-            const llama_kv_cache_iswa_context * mctx) :
-        hparams(hparams),
-        cparams(cparams),
-        mctx(mctx) {
-    }
+            const llama_kv_cache_iswa_context * mctx);
     ~llm_graph_input_attn_kv_iswa() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
@@ -511,6 +529,8 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_iswa_context * mctx;
+    const llm_graph_kv_tail_identity base_tail_identity;
+    const llm_graph_kv_tail_identity swa_tail_identity;
 };
 
 // DSV4 raw graph inputs are SWA-only, but their mask may be stream-shaped
@@ -1137,7 +1157,10 @@ struct llm_graph_context {
             ggml_tensor * tail_run_desc = nullptr,
             llama_kv_tail_route tail_route = static_cast<llama_kv_tail_route>(0),
             enum ggml_flash_attn_ext_kvarn_domain kvarn_domain =
-                GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO) const;
+                GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO,
+            ggml_tensor * k_tail_current = nullptr,
+            ggml_tensor * v_tail_current = nullptr,
+                      bool tail_bodyless = false) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

@@ -5478,6 +5478,27 @@ static bool ggml_backend_cuda_kvarn_tail_attention_supported(
 #endif
 }
 
+static bool ggml_backend_cuda_kv_tail_segmented_attention_supported(
+        ggml_type body_k,
+        ggml_type body_v,
+        ggml_type tail_k,
+        ggml_type tail_v,
+        int64_t d_k,
+        int64_t d_v) {
+#if defined(GGML_USE_HIP)
+    GGML_UNUSED(body_k);
+    GGML_UNUSED(body_v);
+    GGML_UNUSED(tail_k);
+    GGML_UNUSED(tail_v);
+    GGML_UNUSED(d_k);
+    GGML_UNUSED(d_v);
+    return false;
+#else
+    return ggml_cuda_flash_attn_ext_tail_supported(
+            body_k, body_v, tail_k, tail_v, d_k, d_v);
+#endif
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -5512,6 +5533,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_kv_tail_attention_supported") == 0) {
         return (void *)ggml_cuda_flash_attn_ext_tail_supported;
+    }
+    if (strcmp(name, "ggml_backend_kv_tail_segmented_attention_supported") == 0) {
+        return (void *)ggml_backend_cuda_kv_tail_segmented_attention_supported;
     }
     if (strcmp(name, "ggml_backend_kvarn_tail_attention_supported") == 0) {
         return (void *)ggml_backend_cuda_kvarn_tail_attention_supported;
