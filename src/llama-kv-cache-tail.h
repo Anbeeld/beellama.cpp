@@ -98,6 +98,15 @@ llama_kv_tail_compact_layout llama_kv_tail_compact_layout_for(
         uint32_t n_seq_max,
         uint32_t n_ubatch);
 
+// Compact-tail suffix removal is an operation contract, not a report of how
+// many cells changed. A suffix beginning beyond the current end is therefore
+// an accepted idempotent no-op.
+bool llama_kv_tail_can_remove_suffix(
+        llama_pos pos_max,
+        llama_pos p0,
+        llama_pos p1,
+        uint32_t rollback_tokens);
+
 enum llama_kv_tail_storage_kind {
     LLAMA_KV_TAIL_STORAGE_DISABLED,
     LLAMA_KV_TAIL_STORAGE_OVERLAY,

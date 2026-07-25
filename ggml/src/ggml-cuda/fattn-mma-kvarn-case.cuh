@@ -420,7 +420,7 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
         return false;
     }
 
-#if !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
+#if !defined(GGML_USE_MUSA)
     CUDA_CHECK(cudaFuncSetAttribute(
         reinterpret_cast<ggml_cuda_fattn_kernel_attr_ptr_t>(
             ggml_cuda_fattn_kvarn_window_f16_partial_kernel<DKQ, DV, ncols1, ncols2, use_logit_softcap>),
@@ -534,7 +534,7 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
             v_win.nb[3] = (int64_t) plan.n_kv_heads * chunk_len * DV * (int64_t) sizeof(half);
 
             fattn_kernel_t f16_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, false>;
-#if !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
+#if !defined(GGML_USE_MUSA)
             CUDA_CHECK(cudaFuncSetAttribute(
                 reinterpret_cast<ggml_cuda_fattn_kernel_attr_ptr_t>(f16_kernel),
                 cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
@@ -680,7 +680,7 @@ static size_t ggml_cuda_fattn_kvarn_mma_shared_bytes(
                  nbytes_shared_Q + nbytes_shared_KV_mask_kvarn);
 }
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if !defined(GGML_USE_MUSA)
 template <int DKQ, int DV, int ncols1, int ncols2>
 bool ggml_cuda_fattn_kvarn_wide_mma_supported(
         ggml_backend_cuda_context & ctx,
@@ -808,12 +808,12 @@ void ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, gg
         k_original_domain, v_original_domain);
     if (logit_softcap == 0.0f) {
         fattn_kernel = fattn_kernel_no_softcap;
-#if !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
+#if !defined(GGML_USE_MUSA)
         CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
 #endif
     } else {
         fattn_kernel = fattn_kernel_softcap;
-#if !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
+#if !defined(GGML_USE_MUSA)
         CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
 #endif
     }

@@ -427,7 +427,16 @@ def main() -> None:
     )[1].split("\n}\n", 1)[0]
     if "GGML_USE_HIP" in tail_support or "return false" in tail_support:
         raise AssertionError("HIP must use the shared segmented-current capability path")
-    if "dst->src[10] == nullptr" not in cuda_fattn or "ggml_cuda_flash_attn_ext_tail(ctx, dst)" not in cuda_fattn:
+    direct_tail_support = kvarn_dispatch.split(
+        "bool ggml_cuda_flash_attn_ext_kvarn_direct_tail_supported(", 2
+    )[2].split("\n}\n", 1)[0]
+    if (
+        cuda_fattn.count("ggml_cuda_flash_attn_ext_kvarn_direct_tail_supported") != 2
+        or "dst->src[10] == nullptr" not in direct_tail_support
+        or "GGML_KVARN_TEST_FORCE_PORTABLE_FATTN" not in direct_tail_support
+        or "ggml_cuda_flash_attn_ext_kvarn_portable_supported" not in direct_tail_support
+        or "ggml_cuda_flash_attn_ext_tail(ctx, dst)" not in cuda_fattn
+    ):
         raise AssertionError("HIP KVarN current segments lack the shared bounded tail fallback")
     cuda_tail = (ROOT / "ggml/src/ggml-cuda/fattn-tail.cuh").read_text(encoding="utf-8")
     if "k_flash_attn_ext_tail_merge" in cuda_tail:

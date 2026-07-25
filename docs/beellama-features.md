@@ -114,15 +114,26 @@ reservation and zero cumulative per-context growth.
 ### Backend support and limitations
 
 KVarN is target-context-only. CUDA uses its optimized descriptor-native
-FlashAttention kernels. ROCm/HIP uses a portable direct-record kernel, and CPU
+FlashAttention kernels. ROCm/HIP selects between record-tiled split decode,
+generic descriptor-native WMMA/MFMA, and a portable direct-record kernel. CPU
 and Vulkan have backend-native direct-record attention paths. These routes keep
 the query, compressed body, F16/BF16 exact tail, and attention sinks in one
 softmax without materializing the body for one-row decode and short supported
-query batches. Larger portable-backend query batches explicitly materialize the
-rotated K/V body and use the backend's tiled standard FlashAttention path;
-CUDA retains descriptor-native large-batch prefill. Vulkan requires shader
+query batches. Matrix-capable HIP and CUDA retain descriptor-native large-batch
+prefill. Larger portable-only query batches explicitly materialize the rotated
+K/V body and use the backend's tiled standard FlashAttention path. Vulkan requires shader
 Int64 and buffer-device-address support. CPU placement is valid with KV offload
 disabled.
+
+| HIP architecture | Physical wave | Native KVarN route |
+|---|---:|---|
+| RDNA3, RDNA3.5, RDNA4 | 32 | WMMA generic/prefill and occupancy-selected split decode |
+| CDNA1-CDNA4 | 64 | MFMA generic/prefill and physical-wave split decode |
+| Older GCN, RDNA1, RDNA2 | device default | Portable direct-record attention |
+
+CDNA fast routing is compiled and selected by capability but remains
+experimental until hardware parity and performance results are published.
+MUSA explicitly remains on the portable route.
 
 Vulkan direct decode groups up to four GQA query heads per reconstructed K/V
 head and uses split-K when the query/head grid alone cannot occupy the device.
@@ -326,8 +337,10 @@ handoff cannot observe it as a completed copy.
 
 CUDA, CPU, and Vulkan KVarN routes are hardware verified. The portable
 CUDA/HIP implementation is also exercised on CUDA with the optimized paths
-forcibly disabled; AMD execution remains source-verified pending hardware
-reports. Metal, SYCL, and generic OpenCL contain the required generic operator
+forcibly disabled. AMD WMMA/MFMA routing, physical-wave decode, and wave-aware
+WHT are source-policy verified pending the configured ROCm CI build and AMD
+hardware reports; no ROCm performance claim is made from CUDA results. Metal,
+SYCL, and generic OpenCL contain the required generic operator
 families but are not hardware-verified by this release. OpenCL's
 Adreno-transformed weight layouts are rejected by these row operators; flat
 standard-cache storage uses the generic kernels. CANN overlay contexts are

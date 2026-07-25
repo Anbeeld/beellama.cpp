@@ -44,6 +44,7 @@ struct ggml_cuda_fattn_kvarn_decode_args {
     int n_splits;
     int split_tokens;
     int nwarps;
+    int wave_size;
     cudaStream_t stream;
 };
 

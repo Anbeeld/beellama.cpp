@@ -1534,11 +1534,11 @@ bool llama_kv_cache_kvarn::seq_rm_plan(
 }
 
 bool llama_kv_cache_kvarn::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    apply_pending_stream_copies(nullptr);
     if (!can_seq_rm(seq_id, p0, p1)) {
         LLAMA_LOG_WARN("%s: KVarN can only remove a complete sequence or the current/previous fp16 tail groups\n", __func__);
         return false;
     }
-    apply_pending_stream_copies(nullptr);
     return metadata->seq_rm(seq_id, p0, p1);
 }
 

@@ -364,6 +364,29 @@ You can download it from your Linux distro's package manager or from here: [ROCm
 
   Note: `GPU_TARGETS` is optional, omitting it will build the code for all GPUs in the current system.
 
+  KVarN is enabled in HIP builds by default. For a release build targeting
+  RDNA3.5 or CDNA3 explicitly:
+
+  ```bash
+  HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -R)" \
+      cmake -S . -B build-hip \
+        -DGGML_HIP=ON -DGGML_CUDA_KVARN=ON -DGGML_CUDA_FA=ON \
+        -DGPU_TARGETS=gfx1150 -DCMAKE_BUILD_TYPE=Release \
+      && cmake --build build-hip --parallel 16
+  ```
+
+  Replace `gfx1150` with `gfx942` for a CDNA3-only build. The default KVarN
+  decode matrix contains 15 balanced K/V bit pairs; add
+  `-DGGML_CUDA_FA_ALL_QUANTS=ON` to compile all 36 ordered pairs. Valid pairs
+  outside the default matrix use descriptor-native generic MMA. Set
+  `-DGGML_CUDA_KVARN=OFF` to omit all KVarN HIP kernels and instances.
+
+  HIP route selection is capability driven. RDNA3/3.5/4 use physical wave32
+  WMMA routes, CDNA uses physical wave64 MFMA routes, and older AMD targets
+  retain the portable direct-record route. `GGML_KVARN_DEBUG_ROUTES=1` prints
+  the selected route, wave size, shape, entry path, and fallback reason.
+  `GGML_KVARN_TEST_FORCE_PORTABLE_FATTN=1` is intended for parity testing.
+
   To enhance flash attention performance on RDNA3+ or CDNA architectures, you can utilize the rocWMMA library by enabling the `-DGGML_HIP_ROCWMMA_FATTN=ON` option. This requires rocWMMA headers to be installed on the build system.
 
   The rocWMMA library is included by default when installing the ROCm SDK using the `rocm` meta package provided by AMD. Alternatively, if you are not using the meta package, you can install the library using the `rocwmma-dev` or `rocwmma-devel` package, depending on your system's package manager.

@@ -155,7 +155,7 @@ for ncols in [8, 16, 32, 64]:
 
 with open("fattn-mma-kvarn-instance-ncols1_16-ncols2_8.cu", "w") as f:
     f.write(SOURCE_FATTN_MMA_KVARN_START)
-    f.write("#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)\n")
+    f.write("#if !defined(GGML_USE_MUSA)\n")
     for head_size in [128, 256]:
         f.write(SOURCE_FATTN_MMA_KVARN_CASE.format(
             head_size=head_size, ncols1=16, ncols2=8))

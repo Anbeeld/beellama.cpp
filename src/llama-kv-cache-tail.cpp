@@ -104,6 +104,25 @@ llama_kv_tail_compact_layout llama_kv_tail_compact_layout_for(
     };
 }
 
+bool llama_kv_tail_can_remove_suffix(
+        llama_pos pos_max,
+        llama_pos p0,
+        llama_pos p1,
+        uint32_t rollback_tokens) {
+    if (p0 <= 0 && p1 < 0) {
+        return true;
+    }
+    if (p0 <= 0 || p1 >= 0) {
+        return false;
+    }
+    if (pos_max < p0) {
+        return true;
+    }
+
+    const llama_pos rollback = pos_max - (p0 - 1);
+    return rollback >= 1 && rollback <= llama_pos(rollback_tokens);
+}
+
 static uint64_t checked_tail_bytes(uint64_t rows, uint64_t bytes_per_row) {
     if (bytes_per_row != 0 && rows > std::numeric_limits<uint64_t>::max()/bytes_per_row) {
         throw std::overflow_error("standard KV tail byte count overflows uint64_t");

@@ -4,11 +4,30 @@
 
 #include <cstdint>
 
+constexpr uint32_t GGML_CUDA_FATTN_KVARN_ROUTE_STATS_ABI_VERSION = 1;
+
 struct ggml_cuda_fattn_kvarn_route_stats {
+    uint32_t struct_size;
+    uint32_t abi_version;
+    uint32_t route_families;
+    uint32_t reserved;
     uint64_t decode_split;
     uint64_t decode_vector;
     uint64_t generic_mma;
     uint64_t prompt_prefill;
+    uint64_t portable_native;
+    uint64_t amd_generic_mma;
+    uint64_t amd_decode_split;
+    uint64_t amd_decode_vector;
+    uint64_t materialize_fallback;
+    uint64_t split_reduce;
+    uint64_t direct_entry;
+    uint64_t compact_tail_entry;
+};
+
+enum ggml_cuda_fattn_kvarn_entry_path {
+    GGML_CUDA_FATTN_KVARN_ENTRY_DIRECT,
+    GGML_CUDA_FATTN_KVARN_ENTRY_COMPACT_TAIL,
 };
 
 struct ggml_cuda_kv_memory_transient_stats {
@@ -56,6 +75,11 @@ bool ggml_cuda_flash_attn_ext_kvarn_portable_supported(
         int device,
         const ggml_tensor * dst);
 
+bool ggml_cuda_flash_attn_ext_kvarn_direct_tail_supported(
+        int device,
+        const ggml_tensor * dst);
+
 bool ggml_cuda_flash_attn_ext_kvarn(
         ggml_backend_cuda_context & ctx,
-        ggml_tensor * dst);
+        ggml_tensor * dst,
+        ggml_cuda_fattn_kvarn_entry_path entry_path = GGML_CUDA_FATTN_KVARN_ENTRY_DIRECT);

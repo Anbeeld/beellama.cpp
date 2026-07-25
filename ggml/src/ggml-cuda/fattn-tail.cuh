@@ -695,7 +695,8 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
             tail_pack_bytes + body_alloc.actual_size;
     if (!tail_bodyless) {
         if (ggml_cuda_flash_attn_ext_kvarn_uses_views(&body_pass)) {
-            if (!ggml_cuda_flash_attn_ext_kvarn(ctx, &body_pass)) {
+            if (!ggml_cuda_flash_attn_ext_kvarn(
+                    ctx, &body_pass, GGML_CUDA_FATTN_KVARN_ENTRY_COMPACT_TAIL)) {
                 GGML_ABORT("unsupported structured body in exact-tail attention");
             }
         } else {

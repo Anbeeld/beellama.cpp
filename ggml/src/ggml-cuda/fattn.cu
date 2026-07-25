@@ -738,15 +738,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const bool has_exact_tail = dst->src[5] != nullptr && dst->src[6] != nullptr && dst->src[7] != nullptr &&
         dst->src[8] != nullptr && dst->src[9] != nullptr;
     const bool uses_kvarn = ggml_cuda_flash_attn_ext_kvarn_uses_views(dst);
-#if defined(GGML_USE_HIP)
-    const bool portable_kvarn_tail = uses_kvarn && has_exact_tail && dst->src[10] == nullptr &&
-        ggml_cuda_flash_attn_ext_kvarn_portable_supported(ctx.device, dst);
-#else
-    const char * force_portable = getenv("GGML_KVARN_TEST_FORCE_PORTABLE_FATTN");
-    const bool portable_kvarn_tail = uses_kvarn && has_exact_tail && dst->src[10] == nullptr &&
-        force_portable != nullptr && atoi(force_portable) != 0 &&
-        ggml_cuda_flash_attn_ext_kvarn_portable_supported(ctx.device, dst);
-#endif
+    const bool portable_kvarn_tail = uses_kvarn && has_exact_tail &&
+        ggml_cuda_flash_attn_ext_kvarn_direct_tail_supported(ctx.device, dst);
     if (portable_kvarn_tail) {
         if (!ggml_cuda_flash_attn_ext_kvarn(ctx, dst)) {
             GGML_ABORT("unsupported portable KVarN exact-tail FlashAttention route");
@@ -772,15 +765,8 @@ bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     const bool has_exact_tail = dst->src[5] != nullptr && dst->src[6] != nullptr && dst->src[7] != nullptr &&
         dst->src[8] != nullptr && dst->src[9] != nullptr;
     const bool uses_kvarn = ggml_cuda_flash_attn_ext_kvarn_uses_views(dst);
-#if defined(GGML_USE_HIP)
-    const bool portable_kvarn_tail = uses_kvarn && has_exact_tail && dst->src[10] == nullptr &&
-        ggml_cuda_flash_attn_ext_kvarn_portable_supported(device, dst);
-#else
-    const char * force_portable = getenv("GGML_KVARN_TEST_FORCE_PORTABLE_FATTN");
-    const bool portable_kvarn_tail = uses_kvarn && has_exact_tail && dst->src[10] == nullptr &&
-        force_portable != nullptr && atoi(force_portable) != 0 &&
-        ggml_cuda_flash_attn_ext_kvarn_portable_supported(device, dst);
-#endif
+    const bool portable_kvarn_tail = uses_kvarn && has_exact_tail &&
+        ggml_cuda_flash_attn_ext_kvarn_direct_tail_supported(device, dst);
     if (portable_kvarn_tail) {
         return ggml_cuda_flash_attn_ext_kvarn_supported(device, dst);
     }

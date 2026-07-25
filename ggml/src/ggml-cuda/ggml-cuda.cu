@@ -4760,20 +4760,29 @@ static bool ggml_backend_cuda_kvarn_native_ops(ggml_backend_dev_t dev) {
 }
 
 static bool ggml_backend_cuda_kvarn_native_original_v(ggml_backend_dev_t dev) {
-#if !defined(GGML_CUDA_KVARN) || defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+#if !defined(GGML_CUDA_KVARN) || defined(GGML_USE_MUSA)
     GGML_UNUSED(dev);
     return false;
 #else
+#if defined(GGML_USE_HIP)
+    if (!ggml_backend_cuda_kvarn_native_ops(dev)) {
+        return false;
+    }
+    const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
+    const int cc = ggml_cuda_info().devices[device].cc;
+    return amd_wmma_available(cc) || amd_mfma_available(cc);
+#else
     return ggml_backend_cuda_kvarn_native_ops(dev);
+#endif
 #endif
 }
 
 static uint32_t ggml_backend_cuda_kvarn_native_rotated_max_query_tokens(ggml_backend_dev_t dev) {
-#if !defined(GGML_CUDA_KVARN) || defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+#if !defined(GGML_CUDA_KVARN) || defined(GGML_USE_MUSA)
     GGML_UNUSED(dev);
     return 0;
 #else
-    return ggml_backend_cuda_kvarn_native_original_v(dev) ?
+    return ggml_backend_cuda_kvarn_native_ops(dev) ?
         ggml_cuda_fattn_kvarn_decode_max_q() : 0;
 #endif
 }
@@ -5545,6 +5554,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_kvarn_route_stats_get") == 0) {
         return (void *)ggml_cuda_fattn_kvarn_route_stats_get;
+    }
+    if (strcmp(name, "ggml_backend_kvarn_store_route_stats_reset") == 0) {
+        return (void *)ggml_cuda_kvarn_store_route_stats_reset;
+    }
+    if (strcmp(name, "ggml_backend_kvarn_store_route_stats_get") == 0) {
+        return (void *)ggml_cuda_kvarn_store_route_stats_get;
     }
     if (strcmp(name, "ggml_backend_kv_memory_transient_stats_reset") == 0) {
         return (void *)ggml_cuda_kv_memory_transient_stats_reset;

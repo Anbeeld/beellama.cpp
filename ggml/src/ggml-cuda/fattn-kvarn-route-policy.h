@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 constexpr int GGML_CUDA_FATTN_KVARN_DECODE_MAX_Q = 16;
 
 enum ggml_cuda_fattn_kvarn_route {
@@ -8,6 +10,68 @@ enum ggml_cuda_fattn_kvarn_route {
     GGML_CUDA_FATTN_KVARN_ROUTE_GENERIC_MMA,
     GGML_CUDA_FATTN_KVARN_ROUTE_PROMPT_PREFILL,
 };
+
+enum ggml_cuda_fattn_kvarn_backend {
+    GGML_CUDA_FATTN_KVARN_BACKEND_CUDA,
+    GGML_CUDA_FATTN_KVARN_BACKEND_HIP,
+    GGML_CUDA_FATTN_KVARN_BACKEND_MUSA,
+};
+
+enum ggml_cuda_fattn_kvarn_route_family : uint32_t {
+    GGML_CUDA_FATTN_KVARN_FAMILY_PORTABLE_NATIVE = 1u << 0,
+    GGML_CUDA_FATTN_KVARN_FAMILY_GENERIC_MMA     = 1u << 1,
+    GGML_CUDA_FATTN_KVARN_FAMILY_DECODE_SPLIT    = 1u << 2,
+    GGML_CUDA_FATTN_KVARN_FAMILY_DECODE_VECTOR   = 1u << 3,
+};
+
+struct ggml_cuda_fattn_kvarn_capability_input {
+    ggml_cuda_fattn_kvarn_backend backend;
+    int  physical_wave_size;
+    bool matrix_mma;
+    bool fast_decode_instances;
+};
+
+struct ggml_cuda_fattn_kvarn_capabilities {
+    bool generic_mma;
+    bool decode_split;
+    bool decode_vector;
+    bool portable_native;
+    bool specialized_routes;
+    uint32_t route_families;
+};
+
+inline ggml_cuda_fattn_kvarn_capabilities ggml_cuda_fattn_kvarn_select_capabilities(
+        const ggml_cuda_fattn_kvarn_capability_input & input) {
+    const bool physical_wave_supported =
+        input.physical_wave_size == 32 || input.physical_wave_size == 64;
+
+    ggml_cuda_fattn_kvarn_capabilities result = {};
+    result.portable_native = input.fast_decode_instances;
+    if (input.backend == GGML_CUDA_FATTN_KVARN_BACKEND_CUDA) {
+        result.generic_mma = input.matrix_mma && input.fast_decode_instances;
+        result.decode_split = input.matrix_mma && input.fast_decode_instances;
+        result.decode_vector = input.matrix_mma && input.fast_decode_instances;
+    } else if (input.backend == GGML_CUDA_FATTN_KVARN_BACKEND_HIP) {
+        result.generic_mma =
+            input.matrix_mma && input.fast_decode_instances && physical_wave_supported;
+        result.decode_split = result.generic_mma && input.fast_decode_instances;
+        // The SWA vector kernel is still CUDA-warp tuned. HIP uses split decode
+        // or generic MMA until a physical-wave vector route proves worthwhile.
+        result.decode_vector = false;
+    }
+    // MUSA intentionally remains portable-native. Its compiler consumes these
+    // shared sources, but it does not provide the AMD/NVIDIA MMA contracts used
+    // by the KVarN matrix loaders.
+
+    result.specialized_routes =
+        result.generic_mma || result.decode_split || result.decode_vector;
+    result.route_families =
+        (result.portable_native ? GGML_CUDA_FATTN_KVARN_FAMILY_PORTABLE_NATIVE : 0u) |
+        (result.generic_mma ? GGML_CUDA_FATTN_KVARN_FAMILY_GENERIC_MMA : 0u) |
+        (result.decode_split ? GGML_CUDA_FATTN_KVARN_FAMILY_DECODE_SPLIT : 0u) |
+        (result.decode_vector ? GGML_CUDA_FATTN_KVARN_FAMILY_DECODE_VECTOR : 0u);
+    return result;
+}
 
 struct ggml_cuda_fattn_kvarn_route_input {
     int  head_dim;

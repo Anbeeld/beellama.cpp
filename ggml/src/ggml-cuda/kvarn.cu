@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
@@ -32,6 +33,38 @@ static constexpr int KVAR_N_OP_PARAM_STAGE_GROUPS = 7;  // dynamic F16 stage dep
 static constexpr int KVAR_N_OP_PARAM_TAIL_GROUPS = 8;   // lossless tail groups within the stage
 static constexpr int KVAR_N_OP_PARAM_EAGER_RECORDS = 9; // materialize a record when its closing token is stored
 
+static std::atomic<uint64_t> g_kvarn_store_headwide_workspace{0};
+static std::atomic<uint64_t> g_kvarn_store_headwide_monolithic{0};
+static std::atomic<uint64_t> g_kvarn_store_single_slice_workspace{0};
+static std::atomic<uint64_t> g_kvarn_store_direct_store{0};
+static std::atomic<uint64_t> g_kvarn_store_high_shared_fallback{0};
+static std::atomic<uint64_t> g_kvarn_store_low_shared_store{0};
+
+void ggml_cuda_kvarn_store_route_stats_reset() {
+    g_kvarn_store_headwide_workspace.store(0, std::memory_order_relaxed);
+    g_kvarn_store_headwide_monolithic.store(0, std::memory_order_relaxed);
+    g_kvarn_store_single_slice_workspace.store(0, std::memory_order_relaxed);
+    g_kvarn_store_direct_store.store(0, std::memory_order_relaxed);
+    g_kvarn_store_high_shared_fallback.store(0, std::memory_order_relaxed);
+    g_kvarn_store_low_shared_store.store(0, std::memory_order_relaxed);
+}
+
+void ggml_cuda_kvarn_store_route_stats_get(ggml_cuda_kvarn_store_route_stats * stats) {
+    if (stats == nullptr ||
+            stats->struct_size < sizeof(ggml_cuda_kvarn_store_route_stats) ||
+            stats->abi_version != GGML_CUDA_KVARN_STORE_ROUTE_STATS_ABI_VERSION) {
+        return;
+    }
+    stats->struct_size = sizeof(*stats);
+    stats->abi_version = GGML_CUDA_KVARN_STORE_ROUTE_STATS_ABI_VERSION;
+    stats->headwide_workspace = g_kvarn_store_headwide_workspace.load(std::memory_order_relaxed);
+    stats->headwide_monolithic = g_kvarn_store_headwide_monolithic.load(std::memory_order_relaxed);
+    stats->single_slice_workspace = g_kvarn_store_single_slice_workspace.load(std::memory_order_relaxed);
+    stats->direct_store = g_kvarn_store_direct_store.load(std::memory_order_relaxed);
+    stats->high_shared_fallback = g_kvarn_store_high_shared_fallback.load(std::memory_order_relaxed);
+    stats->low_shared_store = g_kvarn_store_low_shared_store.load(std::memory_order_relaxed);
+}
+
 // Resolve stage_groups from op_params[7]. Constructors set this explicitly;
 // backends assert it before deriving stream counts.
 static int kvarn_resolve_stage_groups(const ggml_tensor * dst) {
@@ -50,11 +83,13 @@ enum class kvarn_prof_kind : uint8_t {
 };
 
 static bool kvarn_profile_enabled() {
-    return false;
+    const char * value = std::getenv("GGML_KVARN_PROFILE");
+    return value != nullptr && std::atoi(value) != 0;
 }
 
 static int kvarn_profile_dump_every() {
-    return 0;
+    const char * value = std::getenv("GGML_KVARN_PROFILE_DUMP_EVERY");
+    return value != nullptr ? std::max(0, std::atoi(value)) : 0;
 }
 
 static bool kvarn_profile_cuda_graphs_disabled() {
@@ -1574,6 +1609,7 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         n_tokens <= 65535 &&
         !eager_records;
     if (head_slices > 1 && use_workspace) {
+        g_kvarn_store_headwide_workspace.fetch_add(1, std::memory_order_relaxed);
 #if defined(GGML_USE_HIP)
         CUDA_CHECK(hipFuncSetAttribute(
             reinterpret_cast<const void *>(&kvarn_store_workspace_flush_kernel),
@@ -1684,6 +1720,7 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         return;
     }
     if (head_slices > 1 && smpbo >= KVAR_N_SHARED_BYTES) {
+        g_kvarn_store_headwide_monolithic.fetch_add(1, std::memory_order_relaxed);
 #if defined(GGML_USE_HIP)
         CUDA_CHECK(hipFuncSetAttribute(
             reinterpret_cast<const void *>(&kvarn_store_kernel_headwide),
@@ -1720,6 +1757,7 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     }
 
     if (use_workspace) {
+        g_kvarn_store_single_slice_workspace.fetch_add(1, std::memory_order_relaxed);
 #if defined(GGML_USE_HIP)
         CUDA_CHECK(hipFuncSetAttribute(
             reinterpret_cast<const void *>(&kvarn_store_workspace_flush_kernel),
@@ -1816,6 +1854,7 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     }
 
     if (use_direct) {
+        g_kvarn_store_direct_store.fetch_add(1, std::memory_order_relaxed);
 #if defined(GGML_USE_HIP)
         CUDA_CHECK(hipFuncSetAttribute(
             reinterpret_cast<const void *>(&kvarn_store_direct_flush_kernel),
@@ -1862,6 +1901,7 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     }
 
     if (smpbo >= KVAR_N_SHARED_BYTES) {
+        g_kvarn_store_high_shared_fallback.fetch_add(1, std::memory_order_relaxed);
 #if defined(GGML_USE_HIP)
         CUDA_CHECK(hipFuncSetAttribute(
             reinterpret_cast<const void *>(&kvarn_store_kernel_hishmem),
@@ -1896,6 +1936,7 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             nullptr);
         kvarn_prof_end(prof, stream);
     } else {
+        g_kvarn_store_low_shared_store.fetch_add(1, std::memory_order_relaxed);
         GGML_ASSERT(smpbo >= KVAR_N_LOWSHMEM_BYTES);
         auto prof = kvarn_prof_begin(ctx, stream, kvarn_prof_kind::STORE_LOW, value, bits, (int) current->ne[2], staged_bytes);
         kvarn_store_kernel_lowshmem<<<n_heads / head_slices, KVAR_N_DIM, KVAR_N_LOWSHMEM_BYTES, stream>>>(

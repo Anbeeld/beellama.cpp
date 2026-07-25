@@ -100,7 +100,7 @@ DECL_FATTN_MMA_KVARN_CASE_ALL_NCOLS2(512, 512, 16)
 DECL_FATTN_MMA_KVARN_CASE_ALL_NCOLS2(512, 512, 32)
 DECL_FATTN_MMA_KVARN_CASE_ALL_NCOLS2(512, 512, 64)
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if !defined(GGML_USE_MUSA)
 DECL_FATTN_MMA_KVARN_CASE_EXTERN(128, 128, 16, 8);
 DECL_FATTN_MMA_KVARN_CASE_EXTERN(256, 256, 16, 8);
 
@@ -115,7 +115,7 @@ extern template bool ggml_cuda_fattn_kvarn_wide_mma_supported<128, 128, 16, 8>(
 extern template bool ggml_cuda_fattn_kvarn_wide_mma_supported<256, 256, 16, 8>(
         ggml_backend_cuda_context & ctx,
         const ggml_tensor * dst);
-#endif
+#endif // !defined(GGML_USE_MUSA)
 
 #undef DECL_FATTN_MMA_KVARN_CASE_ALL_NCOLS2
 #undef DECL_FATTN_MMA_KVARN_CASE_EXTERN

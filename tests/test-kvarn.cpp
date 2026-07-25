@@ -2447,15 +2447,55 @@ static void require_attention_meta_close(
 }
 
 struct test_kvarn_route_stats {
+    uint32_t struct_size;
+    uint32_t abi_version;
+    uint32_t route_families;
+    uint32_t reserved;
     uint64_t decode_split;
     uint64_t decode_vector;
     uint64_t generic_mma;
     uint64_t prompt_prefill;
+    uint64_t portable_native;
+    uint64_t amd_generic_mma;
+    uint64_t amd_decode_split;
+    uint64_t amd_decode_vector;
+    uint64_t materialize_fallback;
+    uint64_t split_reduce;
+    uint64_t direct_entry;
+    uint64_t compact_tail_entry;
 };
+
+static test_kvarn_route_stats make_test_kvarn_route_stats() {
+    test_kvarn_route_stats stats = {};
+    stats.struct_size = sizeof(stats);
+    stats.abi_version = 1;
+    return stats;
+}
 
 using test_kvarn_route_stats_reset_fn = void (*)();
 using test_kvarn_route_stats_get_fn = void (*)(test_kvarn_route_stats *);
 using test_kvarn_rotated_max_query_tokens_fn = uint32_t (*)(ggml_backend_dev_t);
+
+struct test_kvarn_store_route_stats {
+    uint32_t struct_size;
+    uint32_t abi_version;
+    uint64_t headwide_workspace;
+    uint64_t headwide_monolithic;
+    uint64_t single_slice_workspace;
+    uint64_t direct_store;
+    uint64_t high_shared_fallback;
+    uint64_t low_shared_store;
+};
+
+static test_kvarn_store_route_stats make_test_kvarn_store_route_stats() {
+    test_kvarn_store_route_stats stats = {};
+    stats.struct_size = sizeof(stats);
+    stats.abi_version = 1;
+    return stats;
+}
+
+using test_kvarn_store_route_stats_reset_fn = void (*)();
+using test_kvarn_store_route_stats_get_fn = void (*)(test_kvarn_store_route_stats *);
 
 static std::pair<test_kvarn_route_stats_reset_fn, test_kvarn_route_stats_get_fn>
 get_kvarn_route_stats_fns(ggml_backend_t backend) {
@@ -2465,6 +2505,17 @@ get_kvarn_route_stats_fns(ggml_backend_t backend) {
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_kvarn_route_stats_reset")) : nullptr;
     auto get = reg ? reinterpret_cast<test_kvarn_route_stats_get_fn>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_kvarn_route_stats_get")) : nullptr;
+    return { reset, get };
+}
+
+static std::pair<test_kvarn_store_route_stats_reset_fn, test_kvarn_store_route_stats_get_fn>
+get_kvarn_store_route_stats_fns(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    auto reset = reg ? reinterpret_cast<test_kvarn_store_route_stats_reset_fn>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_kvarn_store_route_stats_reset")) : nullptr;
+    auto get = reg ? reinterpret_cast<test_kvarn_store_route_stats_get_fn>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_kvarn_store_route_stats_get")) : nullptr;
     return { reset, get };
 }
 
@@ -2627,6 +2678,22 @@ static void test_native_flash_attention_gpu() {
         ggml_backend_free(gpu_backend);
         return;
     }
+    test_kvarn_route_stats route_capabilities = make_test_kvarn_route_stats();
+    route_stats_get(&route_capabilities);
+    require(route_capabilities.direct_entry > 0,
+            "KVarN route telemetry did not observe the direct attention entry");
+    require(route_capabilities.compact_tail_entry > 0,
+            "KVarN route telemetry did not observe the exact/compact-tail body entry");
+    constexpr uint32_t specialized_route_families = (1u << 1) | (1u << 2) | (1u << 3);
+    if ((route_capabilities.route_families & specialized_route_families) == 0) {
+        // Portable-only HIP/MUSA devices expose counters for diagnostics, but
+        // must not be asserted against CUDA/AMD matrix-route expectations.
+        require(route_capabilities.portable_native > 0,
+                "portable-only KVarN backend did not report its native route");
+        ggml_backend_free(cpu_backend);
+        ggml_backend_free(gpu_backend);
+        return;
+    }
 
     const auto require_metadata_case = [&](int head_dim, int n_q, int n_q_heads,
                                            int n_kv_heads, int bits, bool swa,
@@ -2642,13 +2709,13 @@ static void test_native_flash_attention_gpu() {
         const std::vector<float> generic = test_native_flash_attention_output(
                 gpu_backend, true, true, head_dim, bits, bits, n_q, n_q_heads, n_kv_heads,
                 1024, 5, swa, &generic_meta, true);
-        test_kvarn_route_stats generic_stats = {};
+        test_kvarn_route_stats generic_stats = make_test_kvarn_route_stats();
         route_stats_get(&generic_stats);
         route_stats_reset();
         const std::vector<float> actual = test_native_flash_attention_output(
                 gpu_backend, true, true, head_dim, bits, bits, n_q, n_q_heads, n_kv_heads,
                 1024, 5, swa, &actual_meta);
-        test_kvarn_route_stats stats = {};
+        test_kvarn_route_stats stats = make_test_kvarn_route_stats();
         route_stats_get(&stats);
 
         if (!swa) {
@@ -2702,13 +2769,13 @@ static void test_native_flash_attention_gpu() {
         const std::vector<float> generic = test_native_flash_attention_output(
                 gpu_backend, true, true, head_dim, 4, 4, n_q, n_q_heads, n_kv_heads,
                 1024, 5, swa, nullptr, true, tail_tokens);
-        test_kvarn_route_stats generic_stats = {};
+        test_kvarn_route_stats generic_stats = make_test_kvarn_route_stats();
         route_stats_get(&generic_stats);
         route_stats_reset();
         const std::vector<float> actual = test_native_flash_attention_output(
                 gpu_backend, true, true, head_dim, 4, 4, n_q, n_q_heads, n_kv_heads,
                 1024, 5, swa, nullptr, false, tail_tokens);
-        test_kvarn_route_stats stats = {};
+        test_kvarn_route_stats stats = make_test_kvarn_route_stats();
         route_stats_get(&stats);
 
         require_close_f32_rmse(actual, generic, 1e-4f, message);
@@ -3065,6 +3132,10 @@ static void test_store_paths_gpu() {
         return;
     }
     ggml_backend_t cpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_CPU, true);
+    const auto [store_stats_reset, store_stats_get] = get_kvarn_store_route_stats_fns(gpu_backend);
+    if (store_stats_reset != nullptr) {
+        store_stats_reset();
+    }
 
     for (int bits : { 2, 3, 4, 5, 6, 8 }) {
         for (bool value : { false, true }) {
@@ -3074,6 +3145,25 @@ static void test_store_paths_gpu() {
                     cpu_backend, bits, value, 2, 2, 385, 64);
             require_close_f16_rmse(cuda_output, cpu_output, 1e-1f, "KVarN CUDA store output differs from CPU reference");
         }
+    }
+
+    {
+        const std::vector<ggml_fp16_t> cuda_output = test_store_reference_output(
+                gpu_backend, 4, false, 1, 2, 65, 63);
+        const std::vector<ggml_fp16_t> cpu_output = test_store_reference_output(
+                cpu_backend, 4, false, 1, 2, 65, 63);
+        require_close_f16_rmse(cuda_output, cpu_output, 1e-1f,
+                "KVarN CUDA high-shared fallback output differs from CPU reference");
+    }
+
+    {
+        scoped_test_env force_low_shared("GGML_KVARN_TEST_FORCE_LOWSHMEM", "1");
+        const std::vector<ggml_fp16_t> cuda_output = test_store_reference_output(
+                gpu_backend, 4, false, 1, 2, 65, 63);
+        const std::vector<ggml_fp16_t> cpu_output = test_store_reference_output(
+                cpu_backend, 4, false, 1, 2, 65, 63);
+        require_close_f16_rmse(cuda_output, cpu_output, 1e-1f,
+                "KVarN CUDA low-shared fallback output differs from CPU reference");
     }
 
     for (int bits : { 2, 3, 4, 5, 6, 8 }) {
@@ -3116,9 +3206,9 @@ static void test_store_paths_gpu() {
     for (int bits : { 2, 3, 4, 5, 6, 8 }) {
         for (bool value : { false, true }) {
             const std::vector<ggml_fp16_t> cuda_output = test_store_reference_output(
-                    gpu_backend, bits, value, 1, 2, 16, 504);
+                    gpu_backend, bits, value, 1, 2, 16, 504, false, true, 4);
             const std::vector<ggml_fp16_t> cpu_output = test_store_reference_output(
-                    cpu_backend, bits, value, 1, 2, 16, 504);
+                    cpu_backend, bits, value, 1, 2, 16, 504, false, true, 4);
             require_close_f16_rmse(cuda_output, cpu_output, 1e-1f, "KVarN CUDA direct-flush store output differs from CPU reference");
         }
     }
@@ -3129,6 +3219,21 @@ static void test_store_paths_gpu() {
         const std::vector<ggml_fp16_t> cpu_output = test_store_reference_output(
                 cpu_backend, 4, value, 1, 2, 385, 64, true, false);
         require_close_f16_rmse(cuda_output, cpu_output, 1e-1f, "KVarN CUDA stale workspace hint fallback output differs from CPU reference");
+    }
+
+    if (store_stats_get != nullptr) {
+        test_kvarn_store_route_stats stats = make_test_kvarn_store_route_stats();
+        store_stats_get(&stats);
+        require(stats.headwide_workspace + stats.headwide_monolithic > 0,
+                "KVarN GPU store tests did not exercise a head-wide store route");
+        require(stats.single_slice_workspace > 0,
+                "KVarN GPU store tests did not exercise the single-slice workspace route");
+        require(stats.direct_store > 0,
+                "KVarN GPU store tests did not exercise the direct store route");
+        require(stats.high_shared_fallback > 0,
+                "KVarN GPU store tests did not exercise the high-shared fallback route");
+        require(stats.low_shared_store > 0,
+                "KVarN GPU store tests did not exercise the low-shared fallback route");
     }
 
     ggml_backend_free(cpu_backend);

@@ -46,10 +46,18 @@ The same generic tail descriptor and lifecycle logic remains KVarN-neutral.
 
 Head dimensions 128, 256, and 512 are handled as one, two, or four KVarN slices.
 The WHT/store paths accept F16 and BF16 canonical inputs. CUDA uses optimized
-native kernels; ROCm/HIP uses the portable direct-record kernel; CPU and Vulkan
-also consume KVarN views directly. All four paths fuse the F16/BF16 exact tail
+native kernels; ROCm/HIP selects physical-wave split decode or generic
+WMMA/MFMA on matrix-capable devices and retains the portable direct-record
+kernel elsewhere. CPU and Vulkan also consume KVarN views directly. All four
+paths fuse the F16/BF16 exact tail
 into the same softmax. Vulkan native attention requires shader Int64 and
 buffer-device-address support and otherwise declines the native route.
+
+The direct and compact segmented-tail entry paths share one route selector.
+Compact tails invoke the KVarN body with an explicit compact-tail entry tag
+before the exact contribution is merged. Forced-portable tests without current
+segments may enter KVarN directly. Versioned route counters distinguish both
+entries without changing the persistent tail or record ABI.
 
 Persistent placement is finalized in two phases. KVarN records and F16 stages
 are allocated first; their realized buffer owner is then used for route

@@ -1345,18 +1345,17 @@ bool llama_kv_cache::can_seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1)
     if (!has_compact_tail()) {
         return true;
     }
+    if (seq_id < 0 || size_t(seq_id) >= seq_to_stream.size()) {
+        return p0 <= 0 && p1 < 0;
+    }
     if (p0 <= 0 && p1 < 0) {
         return true;
     }
-    if (seq_id < 0 || size_t(seq_id) >= seq_to_stream.size() || p0 <= 0 || p1 >= 0) {
+    if (p0 <= 0 || p1 >= 0) {
         return false;
     }
-    const llama_pos pos_max = seq_pos_max(seq_id);
-    if (pos_max < 0) {
-        return true;
-    }
-    const llama_pos rollback = pos_max - (p0 - 1);
-    return rollback >= 1 && rollback <= llama_pos(tail_rollback_tokens);
+    return llama_kv_tail_can_remove_suffix(
+            seq_pos_max(seq_id), p0, p1, tail_rollback_tokens);
 }
 
 bool llama_kv_cache::seq_rm_plan(

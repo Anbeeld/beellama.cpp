@@ -219,6 +219,13 @@ int main() {
     CHECK(compact_layout_512.history_slots == compact_layout_128.history_slots);
     CHECK(compact_layout_512.attention_stride == 640);
 
+    CHECK(llama_kv_tail_can_remove_suffix(-1, 0, -1, 8));
+    CHECK(llama_kv_tail_can_remove_suffix(6, 7, -1, 8));
+    CHECK(llama_kv_tail_can_remove_suffix(6, 6, -1, 8));
+    CHECK(llama_kv_tail_can_remove_suffix(6, 0, -1, 8));
+    CHECK(!llama_kv_tail_can_remove_suffix(15, 6, -1, 8));
+    CHECK(!llama_kv_tail_can_remove_suffix(6, 6, 7, 8));
+
     // Representation is selected from visibility, ownership, and aggregate
     // byte cost rather than from a model or cache-role special case.
     const auto storage_request = [](
