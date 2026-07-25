@@ -47,7 +47,10 @@ capacity. KVarN values are also rounded upward to 128-token groups. Startup logs
 show raw, requested, effective, and window lengths, the structural group ID,
 participating layers, selected compact-overlay or compact-native-exact
 representation, actual body and exact types, logical history rows, rollback
-rows, transient estimate, and memory increments.
+rows, graph-local body execution rows, owner backend, current-segment
+presence, transient estimate, and memory increments. Native routes are checked
+again against the final constructed operation. A mismatch fails context/graph
+construction instead of allowing the scheduler to move that layer silently.
 
 Let `N` be the resolved exact length, `U` the physical ubatch limit, `R` the
 advertised suffix-rollback horizon, and `S` the number of exact streams. Compact
@@ -82,6 +85,17 @@ older visible rows still use it. Full-window compact-native SWA has no body and
 stores exactly `W + R` persistent rows. In both cases current K/V is consumed
 directly by the same attention softmax before an explicitly ordered history
 commit.
+
+`llama-bench --kv-memory` reports cache-owned bytes directly. The
+`kv_k_payload_bytes`, `kv_v_payload_bytes`, `kv_exact_history_bytes`,
+`kv_rollback_reserve_bytes`, `kv_staging_bytes`, `kv_padding_bytes`, and
+`kv_resident_bytes` fields describe persistent ownership.
+`kv_transient_bytes` is the observed reusable CUDA-pool high water and
+`kv_peak_bytes` is resident plus transient. The per-route layer counters show
+native bodyless, native mixed, planned device-fallback, and CPU layers. These
+fields are more precise than deriving cache memory from whole-process VRAM;
+the separate CUDA/WDDM fields remain useful for reconciliation and spill
+detection.
 
 Overlay state uses a framed standard-memory section. Exact restore requires the
 same structural group, resolved length, representation, and exact type. Native

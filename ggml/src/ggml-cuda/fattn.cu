@@ -361,15 +361,6 @@ bool ggml_cuda_fa_pair_compiled(ggml_type type_K, ggml_type type_V) {
 
 bool ggml_cuda_flash_attn_ext_tail_supported(
         ggml_type body_k, ggml_type body_v, ggml_type tail_k, ggml_type tail_v, int64_t d_k, int64_t d_v) {
-#if defined(GGML_USE_HIP)
-    GGML_UNUSED(body_k);
-    GGML_UNUSED(body_v);
-    GGML_UNUSED(tail_k);
-    GGML_UNUSED(tail_v);
-    GGML_UNUSED(d_k);
-    GGML_UNUSED(d_v);
-    return false;
-#else
     const bool body_supported = ggml_cuda_fattn_pair_compiled(body_k, body_v) ||
         (body_k == GGML_TYPE_IQ4_NL && body_v == GGML_TYPE_IQ4_NL);
     return body_supported &&
@@ -377,7 +368,6 @@ bool ggml_cuda_flash_attn_ext_tail_supported(
         (tail_v == GGML_TYPE_F16 || tail_v == GGML_TYPE_BF16) &&
         ggml_cuda_fattn_pair_compiled(tail_k, tail_v) &&
         d_k > 0 && d_k <= 512 && d_v > 0 && d_v <= 512;
-#endif
 }
 
 static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -398,6 +388,14 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_WMMA_F16 = 300,
     BEST_FATTN_KERNEL_MMA_F16  = 400,
 };
+
+// Internal hint used by the compact exact-tail pass. On pre-Ada tensor-core
+// GPUs, q=1 BF16 attention otherwise converts the complete K/V source to F16
+// on every token even though the compiled vector kernel consumes BF16
+// directly. The hint is applied only after the tail wrapper has produced an
+// aligned, contiguous pass that satisfies the ordinary vector eligibility
+// contract below.
+static constexpr int GGML_CUDA_FATTN_OP_PARAM_FORCE_VEC = 7;
 
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
@@ -497,6 +495,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         ggml_cuda_fattn_pair_compiled(K->type, V->type) &&
         Q->ne[0] <= 512 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 &&
         K->ne[1] % FATTN_KQ_STRIDE == 0;
+
+    const bool force_vector_kernel =
+        ggml_get_op_params_i32(KQV, GGML_CUDA_FATTN_OP_PARAM_FORCE_VEC) != 0;
+    if (force_vector_kernel && turing_mma_available(cc) &&
+            can_use_vector_kernel && Q->ne[1] == 1 && Q->ne[3] == 1) {
+        return BEST_FATTN_KERNEL_VEC;
+    }
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {

@@ -363,6 +363,8 @@ llama_context::llama_context(
         cparams.kv_tail_tokens_swa = swa_policy.effective_tokens;
         cparams.kv_tail_tokens_requested = full_policy.requested_tokens;
         cparams.kv_tail_tokens_swa_requested = swa_policy.requested_tokens;
+        cparams.kv_tail_native_exact = full_policy.native_exact;
+        cparams.kv_tail_native_exact_swa = swa_policy.native_exact;
         LLAMA_LOG_INFO("KVarN exact tail: group=full raw=%u requested=%u effective=%u window=%u representation=%s\n",
                 raw_full, full_policy.requested_tokens, full_policy.effective_tokens, full_window,
                 full_policy.native_exact ? "native_exact" : "overlay");
@@ -627,6 +629,8 @@ llama_context::llama_context(
             /*.kv_tail_tokens_swa =*/ cparams.kv_tail_tokens_swa,
             /*.kv_tail_tokens_requested =*/ cparams.kv_tail_tokens_requested,
             /*.kv_tail_tokens_swa_requested =*/ cparams.kv_tail_tokens_swa_requested,
+            /*.kv_tail_native_exact =*/ cparams.kv_tail_native_exact,
+            /*.kv_tail_native_exact_swa =*/ cparams.kv_tail_native_exact_swa,
             /*.kv_tail_rollback_tokens =*/ cparams.kv_tail_rollback_tokens,
             /*.kv_tail_type   =*/ cparams.kv_tail_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),

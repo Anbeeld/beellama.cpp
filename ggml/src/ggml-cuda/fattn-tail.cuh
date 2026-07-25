@@ -193,7 +193,7 @@ static __global__ void k_flash_attn_ext_tail_indexed_small(
         size_t ktc_nb0, size_t ktc_nb1, size_t ktc_nb2,
         size_t vtc_nb0, size_t vtc_nb1, size_t vtc_nb2,
         size_t mt_nb1, size_t mt_nb3,
-        bool body_packed,
+        bool tail_bodyless, bool body_packed,
         size_t body_nb1, size_t body_nb2, size_t body_nb3,
         size_t dst_nb1, size_t dst_nb2, size_t dst_nb3) {
     const int iq_packed = blockIdx.x;
@@ -261,7 +261,11 @@ static __global__ void k_flash_attn_ext_tail_indexed_small(
     }
     __syncthreads();
 
-    reduction[tid] = tid < n_tail ? scores[tid] : -INFINITY;
+    float local_max = -INFINITY;
+    for (int token = tid; token < n_tail; token += blockDim.x) {
+        local_max = fmaxf(local_max, scores[token]);
+    }
+    reduction[tid] = local_max;
     __syncthreads();
     for (int width = 128; width > 0; width >>= 1) {
         if (tid < width) {
@@ -275,11 +279,11 @@ static __global__ void k_flash_attn_ext_tail_indexed_small(
     __syncthreads();
 
     float weight = 0.0f;
-    if (tid < n_tail && isfinite(scores[tid]) && isfinite(tail_max_shared)) {
-        weight = expf(scores[tid] - tail_max_shared);
-        scores[tid] = weight;
-    } else if (tid < n_tail) {
-        scores[tid] = 0.0f;
+    for (int token = tid; token < n_tail; token += blockDim.x) {
+        const float token_weight = isfinite(scores[token]) && isfinite(tail_max_shared) ?
+                expf(scores[token] - tail_max_shared) : 0.0f;
+        scores[token] = token_weight;
+        weight += token_weight;
     }
     reduction[tid] = weight;
     __syncthreads();
@@ -297,7 +301,7 @@ static __global__ void k_flash_attn_ext_tail_indexed_small(
     const size_t body_row_index = body_packed ?
             (size_t(ia)*q_max + iq_packed)*n_head + ih :
             (size_t(is)*n_query + iq)*n_head + ih;
-    const float2 bm = body_meta[body_row_index];
+    const float2 bm = tail_bodyless ? make_float2(0.0f, 0.0f) : body_meta[body_row_index];
     const bool bv = bm.y > 0.0f && isfinite(bm.x) && isfinite(bm.y);
     const bool tv = tail_sum_shared > 0.0f && isfinite(tail_max_shared);
     const float global_max = bv && tv ? fmaxf(bm.x, tail_max_shared) :
@@ -305,7 +309,7 @@ static __global__ void k_flash_attn_ext_tail_indexed_small(
     const float wb = bv ? bm.y*expf(bm.x - global_max) : 0.0f;
     const float wt = tv ? expf(tail_max_shared - global_max) : 0.0f;
     const float denom = wb + tail_sum_shared*wt;
-    const char * brow = reinterpret_cast<const char *>(body) + size_t(ih)*body_nb1 +
+    const char * brow = tail_bodyless ? nullptr : reinterpret_cast<const char *>(body) + size_t(ih)*body_nb1 +
             size_t(body_packed ? iq_packed : iq)*body_nb2 + size_t(body_packed ? ia : is)*body_nb3;
     char * drow = reinterpret_cast<char *>(dst) + size_t(ih)*dst_nb1 +
             size_t(iq)*dst_nb2 + size_t(is)*dst_nb3;
@@ -361,7 +365,6 @@ static __global__ void k_flash_attn_ext_tail_partials_merge(
     const float wb = bv ? bm.y*expf(bm.x - m) : 0.0f;
     const float wt = tv ? tm.y*expf(tm.x - m) : 0.0f;
     const float denom = wb + wt;
-
     const char * brow = reinterpret_cast<const char *>(body) +
         size_t(ih)*body_nb1 +
         size_t(body_packed ? iq_packed : iq)*body_nb2 +
@@ -485,16 +488,17 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
     const bool body_packed = rd->ne[0] > body_map_offset;
     const int desc_stride = int(rd->ne[0]);
     const int body_stride = body_packed ? desc_stride - body_map_offset : 0;
+    const int configured_history_slots = ggml_get_op_params_i32(
+            dst, GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_HISTORY_SLOTS);
+    const int history_slots = configured_history_slots > 0 ?
+            configured_history_slots : int(kt->ne[1]);
+    GGML_ASSERT(history_slots > 0 && history_slots <= kt->ne[1] && vt->ne[1] == kt->ne[1]);
     const bool tail_bodyless = ggml_get_op_params_i32(
             dst, GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_BODYLESS) != 0;
+    const bool indexed_small = tail_stride <= 256;
     const int compute_stride = tail_bodyless ?
             int(GGML_PAD(tail_stride, FATTN_KQ_STRIDE)) :
             int(ggml_cuda_tail_compute_stride(tail_stride));
-    // A bodyless compact tail is the complete attention source. Packing it
-    // once and dispatching the regular optimized FA kernel is substantially
-    // faster than the indexed kernel's serial V reduction at decode cadence.
-    const bool indexed_small = tail_stride <= 256 && !tail_bodyless;
-    const int history_slots = int(kt->ne[1]);
     const size_t n_tail_rows = size_t(q_max)*n_head*n_active;
     const size_t n_body_rows = body_packed ? n_tail_rows : size_t(n_query)*n_head*n_stream;
 
@@ -519,10 +523,14 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
             kb_row_bytes*body_stride*kb->ne[2]*n_active : 1;
     const size_t vb_packed_bytes = body_packed && !tail_bodyless ?
             vb_row_bytes*body_stride*vb->ne[2]*n_active : 1;
-    ggml_cuda_pool_alloc<uint8_t> kt_alloc(pool, indexed_small ? 1 : kt_elements*ggml_type_size(kt->type));
-    ggml_cuda_pool_alloc<uint8_t> vt_alloc(pool, indexed_small ? 1 : vt_elements*ggml_type_size(vt->type));
-    ggml_cuda_pool_alloc<float> q_alloc(pool, indexed_small && !body_packed ? 1 : q_elements);
-    ggml_cuda_pool_alloc<half> mask_alloc(pool, indexed_small && !body_packed ? 1 : mask_elements);
+    ggml_cuda_pool_alloc<uint8_t> kt_alloc(pool,
+            indexed_small ? 1 : kt_elements*ggml_type_size(kt->type));
+    ggml_cuda_pool_alloc<uint8_t> vt_alloc(pool,
+            indexed_small ? 1 : vt_elements*ggml_type_size(vt->type));
+    ggml_cuda_pool_alloc<float> q_alloc(pool,
+            indexed_small && !body_packed ? 1 : q_elements);
+    ggml_cuda_pool_alloc<half> mask_alloc(pool,
+            indexed_small && !body_packed ? 1 : mask_elements);
     ggml_cuda_pool_alloc<uint8_t> kb_alloc(pool);
     ggml_cuda_pool_alloc<uint8_t> vb_alloc(pool);
     ggml_cuda_pool_alloc<half> body_mask_alloc(pool);
@@ -680,8 +688,11 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
             q_alloc.actual_size + mask_alloc.actual_size + kb_alloc.actual_size +
             vb_alloc.actual_size + body_mask_alloc.actual_size;
     const uint64_t tail_plan_input_bytes = ggml_nbytes(mt) + ggml_nbytes(qo) + ggml_nbytes(rd);
+    // mt/qo/rd are scheduler-owned graph tensors and are already included in
+    // the reported CUDA compute buffer. Keep their footprint visible as a
+    // diagnostic, but do not double-count it as CUDA-pool high water.
     const uint64_t tail_base_bytes = body_meta_alloc.actual_size + tail_meta_alloc.actual_size +
-            tail_pack_bytes + body_alloc.actual_size + tail_plan_input_bytes;
+            tail_pack_bytes + body_alloc.actual_size;
     if (!tail_bodyless) {
         if (ggml_cuda_flash_attn_ext_kvarn_uses_views(&body_pass)) {
             if (!ggml_cuda_flash_attn_ext_kvarn(ctx, &body_pass)) {
@@ -700,8 +711,8 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
         memcpy(&max_bias, dst->op_params + 1*sizeof(float), sizeof(float));
         memcpy(&logit_softcap, dst->op_params + 2*sizeof(float), sizeof(float));
         const dim3 grid(q_max, n_head, n_active);
-#define GGML_CUDA_LAUNCH_INDEXED_SMALL(TK, TV) \
-        k_flash_attn_ext_tail_indexed_small<TK, TV, 256><<<grid, 256, 0, ctx.stream()>>>( \
+#define GGML_CUDA_LAUNCH_INDEXED(TK, TV, MAX_TAIL) \
+        k_flash_attn_ext_tail_indexed_small<TK, TV, MAX_TAIL><<<grid, 256, 0, ctx.stream()>>>( \
             (const float *) q->data, (const char *) kt->data, (const char *) vt->data, \
             kt_current ? (const char *) kt_current->data : nullptr, \
             vt_current ? (const char *) vt_current->data : nullptr, (const half *) mt->data, \
@@ -713,19 +724,19 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
             kt_current ? kt_current->nb[0] : 0, kt_current ? kt_current->nb[1] : 0, kt_current ? kt_current->nb[2] : 0, \
             vt_current ? vt_current->nb[0] : 0, vt_current ? vt_current->nb[1] : 0, vt_current ? vt_current->nb[2] : 0, \
             mt->nb[1], mt->nb[3], \
-            body_packed, body_pass.nb[1], body_pass.nb[2], body_pass.nb[3], \
+            tail_bodyless, body_packed, body_pass.nb[1], body_pass.nb[2], body_pass.nb[3], \
             dst->nb[1], dst->nb[2], dst->nb[3])
         if (kt->type == GGML_TYPE_F16 && vt->type == GGML_TYPE_F16) {
-            GGML_CUDA_LAUNCH_INDEXED_SMALL(half, half);
+            GGML_CUDA_LAUNCH_INDEXED(half, half, 256);
         } else if (kt->type == GGML_TYPE_F16 && vt->type == GGML_TYPE_BF16) {
-            GGML_CUDA_LAUNCH_INDEXED_SMALL(half, nv_bfloat16);
+            GGML_CUDA_LAUNCH_INDEXED(half, nv_bfloat16, 256);
         } else if (kt->type == GGML_TYPE_BF16 && vt->type == GGML_TYPE_F16) {
-            GGML_CUDA_LAUNCH_INDEXED_SMALL(nv_bfloat16, half);
+            GGML_CUDA_LAUNCH_INDEXED(nv_bfloat16, half, 256);
         } else {
             GGML_ASSERT(kt->type == GGML_TYPE_BF16 && vt->type == GGML_TYPE_BF16);
-            GGML_CUDA_LAUNCH_INDEXED_SMALL(nv_bfloat16, nv_bfloat16);
+            GGML_CUDA_LAUNCH_INDEXED(nv_bfloat16, nv_bfloat16, 256);
         }
-#undef GGML_CUDA_LAUNCH_INDEXED_SMALL
+#undef GGML_CUDA_LAUNCH_INDEXED
         CUDA_CHECK(cudaGetLastError());
         ggml_cuda_kv_memory_transient_stats_record_tail(
                 body_meta_alloc.actual_size,
@@ -756,6 +767,10 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
     }
     tail_pass.src[8] = tail_bodyless ? nullptr : &tail_meta;
     ggml_cuda_tail_make_contiguous(tail_pass, d_v, n_head, q_max, n_active, sizeof(float));
+    if (q_max == 1 && n_active == 1 &&
+            kt->type == GGML_TYPE_BF16 && vt->type == GGML_TYPE_BF16) {
+        ggml_set_op_params_i32(&tail_pass, GGML_CUDA_FATTN_OP_PARAM_FORCE_VEC, 1);
+    }
     const size_t tail_alloc_size = ggml_cuda_tail_pass_alloc_size(ctx, tail_pass);
     ggml_cuda_pool_alloc<uint8_t> tail_alloc(pool, tail_alloc_size);
     tail_pass.data = tail_alloc.get();

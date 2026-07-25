@@ -321,7 +321,9 @@ struct llm_graph_kv_tail_identity {
     uint32_t arena_stride = 0;
     uint32_t storage_slots = 0;
     bool compact = false;
-    bool has_body = true;
+    std::vector<bool> has_body;
+    std::vector<bool> has_current;
+    std::vector<uint32_t> body_execution_rows;
     std::vector<llama_kv_tail_route> routes;
     std::vector<bool> explicit_bias;
 
@@ -487,7 +489,9 @@ public:
     ggml_tensor * get_tail_body_read_idxs(bool swa) const { return swa ? self_tail_body_read_idxs_swa : self_tail_body_read_idxs; }
     ggml_tensor * get_tail_bias_read_idxs(bool swa) const { return swa ? self_tail_bias_read_idxs_swa : self_tail_bias_read_idxs; }
     ggml_tensor * get_kq_mask_tail(bool swa) const { return swa ? self_kq_mask_tail_swa : self_kq_mask_tail; }
-    ggml_tensor * get_tail_query_order() const { return self_tail_query_order; }
+    ggml_tensor * get_tail_query_order(bool swa) const {
+        return swa ? self_tail_query_order_swa : self_tail_query_order;
+    }
     ggml_tensor * get_tail_run_desc(bool swa) const { return swa ? self_tail_run_desc_swa : self_tail_run_desc; }
 
     ggml_tensor * self_k_idxs     = nullptr; // I64 [n_batch]
@@ -511,7 +515,8 @@ public:
     ggml_tensor * self_tail_body_read_idxs_swa = nullptr; // I32 [tail_tokens, n_batch]
     ggml_tensor * self_tail_bias_read_idxs_swa = nullptr; // I32 [tail_tokens, n_batch]
     ggml_tensor * self_kq_mask_tail_swa = nullptr; // F32/F16 [tail_tokens, n_batch/n_stream, 1, n_stream]
-    ggml_tensor * self_tail_query_order = nullptr; // shared by full/SWA groups
+    ggml_tensor * self_tail_query_order = nullptr;
+    ggml_tensor * self_tail_query_order_swa = nullptr;
     ggml_tensor * self_tail_run_desc = nullptr;
     ggml_tensor * self_tail_run_desc_swa = nullptr;
 
@@ -1160,7 +1165,9 @@ struct llm_graph_context {
                 GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO,
             ggml_tensor * k_tail_current = nullptr,
             ggml_tensor * v_tail_current = nullptr,
-                      bool tail_bodyless = false) const;
+                 uint32_t tail_history_slots = 0,
+                     bool tail_bodyless = false,
+            ggml_tensor ** final_attn_op = nullptr) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

@@ -148,6 +148,10 @@ int main() {
     assert(llama_kv_tail_sparse_body_capacity_safe(256, 256));
     assert(!llama_kv_tail_sparse_body_capacity_safe(257, 256));
 
+    CHECK(llama_kv_tail_packed_body_stride(0, 256) == 0);
+    CHECK(llama_kv_tail_packed_body_stride(33, 256) == 256);
+    CHECK(llama_kv_tail_packed_body_stride(256, 256) == 256);
+    CHECK(llama_kv_tail_packed_body_stride(257, 256) == 512);
     // Automatic resolution is architecture-agnostic for standard KV groups:
     // every applicable group requests 1024 and is capped by its own window.
     std::vector<llama_kv_tail_group_request> group_requests = {

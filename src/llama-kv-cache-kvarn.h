@@ -96,11 +96,17 @@ public:
     uint32_t get_tail_tokens() const override;
     uint32_t get_tail_arena_stride() const override;
     uint32_t get_tail_attention_stride(uint32_t n_query_tokens = 0) const override;
+    uint32_t get_tail_body_execution_stride() const override;
+    uint32_t get_tail_body_execution_rows(int32_t il) const override;
     bool has_compact_tail() const override;
     bool has_kv_body() const override;
+    bool has_kv_body(int32_t il) const override;
+    bool has_tail_current(int32_t il) const override;
+    ggml_backend_dev_t get_tail_backend(int32_t il) const override;
     llama_kv_tail_storage_kind get_tail_storage_kind() const override;
     uint32_t get_tail_rollback_tokens() const override;
     llama_kv_tail_route get_tail_route(int32_t il) const override;
+    const llama_kv_tail_layer_route * get_tail_layer_route(int32_t il) const override;
     bool get_tail_explicit_bias(int32_t il) const override;
     bool can_pack_tail_body(const llama_ubatch & ubatch) const override;
     ggml_tensor * get_k_native(ggml_context * ctx, int32_t il) const;

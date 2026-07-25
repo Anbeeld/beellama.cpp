@@ -1657,6 +1657,10 @@ struct test {
     uint64_t                 kv_global_resident_bytes = 0;
     uint64_t                 kv_swa_resident_bytes = 0;
     uint64_t                 kv_allocated_capacity_tokens = 0;
+    uint64_t                 kv_tail_native_bodyless_layers = 0;
+    uint64_t                 kv_tail_native_mixed_layers = 0;
+    uint64_t                 kv_tail_device_fallback_layers = 0;
+    uint64_t                 kv_tail_cpu_layers = 0;
     uint64_t                 kv_live_tokens = 0;
     uint64_t                 kv_descriptor_bytes = 0;
     uint64_t                 kv_partial_output_bytes = 0;
@@ -1807,6 +1811,8 @@ struct test {
             "kv_transient_estimate_bytes", "kv_staging_bytes",
             "kv_metadata_bytes", "kv_padding_bytes", "kv_resident_bytes", "kv_global_resident_bytes",
             "kv_swa_resident_bytes", "kv_allocated_capacity_tokens", "kv_live_tokens", "kv_descriptor_bytes",
+            "kv_tail_native_bodyless_layers", "kv_tail_native_mixed_layers",
+            "kv_tail_device_fallback_layers", "kv_tail_cpu_layers",
             "kv_partial_output_bytes", "kv_partial_meta_bytes", "kv_tail_body_meta_bytes", "kv_tail_exact_meta_bytes",
             "kv_tail_pack_bytes", "kv_tail_body_output_bytes", "kv_tail_exact_output_bytes", "kv_tail_plan_input_bytes",
             "kv_transient_bytes", "kv_peak_bytes", "cuda_used_model_bytes", "cuda_used_context_bytes",
@@ -1837,7 +1843,9 @@ struct test {
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
             field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn" || field == "kv_tail_tokens" ||
             field == "kv_tail_tokens_effective" || field == "kvarn_route_split" || field == "kvarn_route_vector" ||
-            field == "kvarn_route_generic" || field == "kvarn_route_prefill") {
+            field == "kvarn_route_generic" || field == "kvarn_route_prefill" ||
+            field == "kv_tail_native_bodyless_layers" || field == "kv_tail_native_mixed_layers" ||
+            field == "kv_tail_device_fallback_layers" || field == "kv_tail_cpu_layers") {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" ||
@@ -1928,6 +1936,10 @@ struct test {
                                              std::to_string(kv_allocated_capacity_tokens),
                                              std::to_string(kv_live_tokens),
                                              std::to_string(kv_descriptor_bytes),
+                                             std::to_string(kv_tail_native_bodyless_layers),
+                                             std::to_string(kv_tail_native_mixed_layers),
+                                             std::to_string(kv_tail_device_fallback_layers),
+                                             std::to_string(kv_tail_cpu_layers),
                                              std::to_string(kv_partial_output_bytes),
                                              std::to_string(kv_partial_meta_bytes),
                                              std::to_string(kv_tail_body_meta_bytes),
@@ -2725,6 +2737,10 @@ int llama_bench(int argc, char ** argv) {
             t.kv_global_resident_bytes = kv_stats.global.resident_bytes();
             t.kv_swa_resident_bytes = kv_stats.swa.resident_bytes();
             t.kv_allocated_capacity_tokens = kv_stats.allocated_capacity_tokens();
+            t.kv_tail_native_bodyless_layers = kv_stats.tail_native_bodyless_layers();
+            t.kv_tail_native_mixed_layers = kv_stats.tail_native_mixed_layers();
+            t.kv_tail_device_fallback_layers = kv_stats.tail_device_fallback_layers();
+            t.kv_tail_cpu_layers = kv_stats.tail_cpu_layers();
             t.cuda_used_model_bytes = cuda_used_model;
             t.cuda_total_bytes = cuda_total;
 

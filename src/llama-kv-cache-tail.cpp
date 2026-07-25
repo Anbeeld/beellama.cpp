@@ -137,6 +137,20 @@ bool llama_kv_tail_sparse_body_capacity_safe(
     return arena_stride > 0 && physical_stream_rows <= arena_stride;
 }
 
+uint32_t llama_kv_tail_packed_body_stride(uint64_t logical_rows, uint32_t alignment) {
+    if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
+        throw std::invalid_argument("packed KV body alignment must be a non-zero power of two");
+    }
+    if (logical_rows > UINT64_MAX - (alignment - 1)) {
+        throw std::overflow_error("packed KV body stride overflows uint64_t");
+    }
+    const uint64_t aligned = (logical_rows + alignment - 1)/alignment*alignment;
+    if (aligned > uint64_t(UINT32_MAX)) {
+        throw std::overflow_error("packed KV body stride overflows uint32_t");
+    }
+    return uint32_t(aligned);
+}
+
 llama_kv_tail_route_capability llama_kv_tail_select_route(
         const llama_kv_tail_route_requirements & requirements) {
     const auto missing_write = [&]() -> llama_kv_tail_operation {
@@ -711,10 +725,10 @@ int32_t llama_kv_tail_store::commit(
     int32_t slot = LLAMA_KV_TAIL_BODY_SLOT;
     const uint32_t commit_limit = compact_storage ? history_limit : n_tokens;
     if ((compact_storage || !in_batch) && entries.size() >= commit_limit && !entries.empty()) {
-        const auto victim = std::min_element(entries.begin(), entries.end(), [](const exact_entry & a, const exact_entry & b) {
-            return a.position < b.position ||
-                (a.position == b.position && a.insertion_ordinal < b.insertion_ordinal);
-        });
+        // Entries are kept in (position, insertion_ordinal) order by every
+        // insertion and mutation path, so the first entry is the eviction
+        // victim. Avoid rescanning the entire retained tail on every token.
+        const auto victim = entries.begin();
         slot = victim->slot;
         erase_entry(seq_id, victim, false);
     } else {

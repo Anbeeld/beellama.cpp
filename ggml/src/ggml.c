@@ -5600,6 +5600,16 @@ void ggml_flash_attn_ext_set_kv_tail_bodyless(struct ggml_tensor * a) {
     ggml_set_op_params_i32(a, GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_BODYLESS, 1);
 }
 
+void ggml_flash_attn_ext_set_kv_tail_history_slots(
+        struct ggml_tensor * a,
+        int32_t              history_slots) {
+    GGML_ASSERT(a != NULL && a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[5] != NULL && a->src[6] != NULL && a->src[10] != NULL && a->src[11] != NULL);
+    GGML_ASSERT(history_slots > 0 && history_slots <= a->src[5]->ne[1] &&
+            history_slots <= a->src[6]->ne[1]);
+    ggml_set_op_params_i32(a, GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_HISTORY_SLOTS, history_slots);
+}
+
 struct ggml_tensor * ggml_kv_tail_attention_merge(
         struct ggml_context * ctx,
         struct ggml_tensor  * body_attn,

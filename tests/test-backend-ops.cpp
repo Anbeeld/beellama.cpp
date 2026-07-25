@@ -1262,6 +1262,7 @@ struct test_case {
     }
 
     virtual bool run_whole_graph() { return false; }
+    virtual bool requires_backend_support() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     virtual bool use_weight_context() { return false; }
 
@@ -1412,7 +1413,7 @@ struct test_case {
 
             print_test_result_locked(output_printer, result);
 
-            return test_status_t::NOT_SUPPORTED;
+            return requires_backend_support() ? test_status_t::FAIL : test_status_t::NOT_SUPPORTED;
         }
 
         // post-graph sentinel
@@ -6783,6 +6784,9 @@ struct test_flash_attn_ext : public test_case {
     const bool split_equivalence;
     const int64_t n_tail_current;
     const bool segmented_equivalence;
+    const float scale;
+    const int64_t n_tail_active;
+    const int64_t n_tail_history_slots;
 
     std::string vars() override {
         return VARS_TO_STR14(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute) +
@@ -6794,7 +6798,10 @@ struct test_flash_attn_ext : public test_case {
             " full_coverage_equivalence=" + std::to_string(int(full_coverage_equivalence)) +
             " split_equivalence=" + std::to_string(int(split_equivalence)) +
             " n_tail_current=" + std::to_string(n_tail_current) +
-            " segmented_equivalence=" + std::to_string(int(segmented_equivalence));
+            " segmented_equivalence=" + std::to_string(int(segmented_equivalence)) +
+            " scale=" + std::to_string(scale) +
+            " n_tail_active=" + std::to_string(n_tail_active) +
+            " n_tail_history_slots=" + std::to_string(n_tail_history_slots);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -6805,6 +6812,16 @@ struct test_flash_attn_ext : public test_case {
 
     bool run_whole_graph() override {
         return full_coverage_equivalence || split_equivalence || segmented_equivalence;
+    }
+
+    bool requires_backend_support() override {
+        // This is the exact mixed Gemma global-layer regression.  It is not
+        // optional coverage: planning advertises the composite as executable,
+        // so silently reporting NOT_SUPPORTED would recreate a scheduler CPU
+        // fallback in the model graph.
+        return hsk == 512 && hsv == 512 && nr23[0] == 8 &&
+            type_K == GGML_TYPE_Q4_0 && type_V == GGML_TYPE_Q4_0 &&
+            canonical_body && n_tail_current > 0;
     }
 
     double max_nmse_err() override {
@@ -6843,13 +6860,16 @@ struct test_flash_attn_ext : public test_case {
                         ggml_type type_tail_v = GGML_TYPE_COUNT, bool tail_interleaved = false,
                         bool tail_all_masked = false, bool canonical_body = false,
                         bool full_coverage_equivalence = false, bool split_equivalence = false,
-                        int64_t n_tail_current = 0, bool segmented_equivalence = false)
+                        int64_t n_tail_current = 0, bool segmented_equivalence = false,
+                        float scale = 0.0f, int64_t n_tail_active = -1,
+                        int64_t n_tail_history_slots = 0)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
           type_K(type_K), type_V(type_V), permute(permute), n_tail(n_tail), tail_only(tail_only), type_tail_k(type_tail_k),
           type_tail_v(type_tail_v == GGML_TYPE_COUNT ? type_tail_k : type_tail_v), tail_interleaved(tail_interleaved),
           tail_all_masked(tail_all_masked), canonical_body(canonical_body),
           full_coverage_equivalence(full_coverage_equivalence), split_equivalence(split_equivalence),
-          n_tail_current(n_tail_current), segmented_equivalence(segmented_equivalence) {}
+          n_tail_current(n_tail_current), segmented_equivalence(segmented_equivalence), scale(scale),
+          n_tail_active(n_tail_active), n_tail_history_slots(n_tail_history_slots) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -6907,13 +6927,18 @@ struct test_flash_attn_ext : public test_case {
             ggml_set_name(s, "s");
         }
 
-        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
+        const float attn_scale = scale > 0.0f ? scale : 1.0f/sqrtf(hsk);
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, attn_scale, max_bias, logit_softcap);
         ggml_tensor * exact = nullptr;
         if (n_tail > 0) {
+            const int64_t n_tail_used = n_tail_active >= 0 ? n_tail_active : n_tail;
             GGML_ASSERT(!tail_interleaved || (nr23[1] == 1 && nb == 4));
-            GGML_ASSERT(n_tail_current >= 0 && n_tail_current <= n_tail);
+            GGML_ASSERT(n_tail_used >= 0 && n_tail_used <= n_tail);
+            GGML_ASSERT(n_tail_current >= 0 && n_tail_current <= n_tail_used);
             GGML_ASSERT(!segmented_equivalence || (n_tail_current > 0 && !tail_interleaved && nr23[1] == 1));
-            const int64_t n_tail_history = n_tail - n_tail_current;
+            const int64_t n_tail_history = n_tail_used - n_tail_current;
+            const int64_t history_slots = n_tail_history_slots > 0 ?
+                    n_tail_history_slots : n_tail_history;
             const int64_t arena_stride = GGML_PAD(n_tail + nb, 256);
             const int64_t attention_stride = n_tail;
             const int64_t n_active = tail_interleaved ? 2 : nr23[1];
@@ -6936,13 +6961,22 @@ struct test_flash_attn_ext : public test_case {
             ggml_set_name(rd, "rd");
             ggml_tensor * kt_current = nullptr;
             ggml_tensor * vt_current = nullptr;
-            if (segmented_equivalence) {
-                kt_current = ggml_new_tensor_4d(ctx, type_tail_k, hsk_padded, n_tail_current, nh, 1);
-                vt_current = ggml_new_tensor_4d(ctx, type_tail_v, hsv_padded, n_tail_current, nh, 1);
+            if (n_tail_current > 0) {
+                kt_current = create_permuted(
+                        type_tail_k, hsk_padded, n_tail_current, nh, 1, false);
+                vt_current = create_permuted(
+                        type_tail_v, hsv_padded, n_tail_current, nh, 1, false);
                 ggml_set_name(kt_current, "kt_current");
                 ggml_set_name(vt_current, "vt_current");
                 out = ggml_kv_tail_attention_merge_segmented(
                     ctx, out, kt, vt, kt_current, vt_current, mt, qo, rd);
+                if (segmented_equivalence) {
+                    // Match compact-cache execution: the persistent tensor may
+                    // expose padded scratch rows, while virtual current indices
+                    // start immediately after the logical N+R history.
+                    ggml_flash_attn_ext_set_kv_tail_history_slots(
+                            out, int32_t(history_slots));
+                }
             } else {
                 out = ggml_kv_tail_attention_merge(ctx, out, kt, vt, mt, qo, rd);
             }
@@ -6957,7 +6991,7 @@ struct test_flash_attn_ext : public test_case {
                 ggml_tensor * exact_v = ggml_view_4d(
                         ctx, vt, hsv_padded, n_tail, nh, 1,
                         vt->nb[1], vt->nb[2], vt->nb[3], 0);
-                exact = ggml_flash_attn_ext(ctx, q, exact_k, exact_v, mt, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
+                exact = ggml_flash_attn_ext(ctx, q, exact_k, exact_v, mt, attn_scale, max_bias, logit_softcap);
             } else if (split_equivalence) {
                 GGML_ASSERT(!tail_only && mask && !tail_interleaved && nr23[1] == 1);
                 GGML_ASSERT(type_K == type_tail_k && type_V == type_tail_v);
@@ -6972,36 +7006,48 @@ struct test_flash_attn_ext : public test_case {
                 ggml_tensor * combined_m = ggml_concat(ctx, m, mt, 0);
                 exact = ggml_flash_attn_ext(
                         ctx, q, combined_k, combined_v, combined_m,
-                        1.0f/sqrtf(hsk), max_bias, logit_softcap);
+                        attn_scale, max_bias, logit_softcap);
             } else if (segmented_equivalence) {
-                GGML_ASSERT(tail_only && mask && nr23[1] == 1);
-                ggml_tensor * history_k = ggml_view_4d(
-                        ctx, kt, hsk_padded, n_tail_history, nh, 1,
-                        kt->nb[1], kt->nb[2], kt->nb[3], 0);
-                ggml_tensor * history_v = ggml_view_4d(
-                        ctx, vt, hsv_padded, n_tail_history, nh, 1,
-                        vt->nb[1], vt->nb[2], vt->nb[3], 0);
-                ggml_tensor * combined_k = ggml_concat(ctx, history_k, kt_current, 1);
-                ggml_tensor * combined_v = ggml_concat(ctx, history_v, vt_current, 1);
+                GGML_ASSERT(mask && nr23[1] == 1);
+                GGML_ASSERT(tail_only || (type_K == type_tail_k && type_V == type_tail_v));
+                ggml_tensor * combined_k = kt_current;
+                ggml_tensor * combined_v = vt_current;
+                if (n_tail_history > 0) {
+                    ggml_tensor * history_k = ggml_view_4d(
+                            ctx, kt, hsk_padded, n_tail_history, nh, 1,
+                            kt->nb[1], kt->nb[2], kt->nb[3], 0);
+                    ggml_tensor * history_v = ggml_view_4d(
+                            ctx, vt, hsv_padded, n_tail_history, nh, 1,
+                            vt->nb[1], vt->nb[2], vt->nb[3], 0);
+                    combined_k = ggml_concat(ctx, history_k, kt_current, 1);
+                    combined_v = ggml_concat(ctx, history_v, vt_current, 1);
+                }
                 ggml_tensor * combined_m = mt;
                 const int64_t padded_tail = GGML_PAD(n_tail, 256);
-                if (padded_tail > n_tail) {
+                if (padded_tail > n_tail_used) {
                     ggml_tensor * k_padding = ggml_new_tensor_4d(
-                            ctx, type_tail_k, hsk_padded, padded_tail - n_tail, nh, 1);
+                            ctx, type_tail_k, hsk_padded, padded_tail - n_tail_used, nh, 1);
                     ggml_tensor * v_padding = ggml_new_tensor_4d(
-                            ctx, type_tail_v, hsv_padded, padded_tail - n_tail, nh, 1);
+                            ctx, type_tail_v, hsv_padded, padded_tail - n_tail_used, nh, 1);
                     ggml_set_name(k_padding, "kt_padding");
                     ggml_set_name(v_padding, "vt_padding");
                     combined_k = ggml_concat(ctx, combined_k, k_padding, 1);
                     combined_v = ggml_concat(ctx, combined_v, v_padding, 1);
+                }
+                if (padded_tail > n_tail) {
                     ggml_tensor * mask_padding = ggml_new_tensor_4d(
                             ctx, GGML_TYPE_F16, padded_tail - n_tail, nb, 1, 1);
                     ggml_set_name(mask_padding, "mt_padding");
                     combined_m = ggml_concat(ctx, mt, mask_padding, 0);
                 }
+                if (!tail_only) {
+                    combined_k = ggml_concat(ctx, k, combined_k, 1);
+                    combined_v = ggml_concat(ctx, v, combined_v, 1);
+                    combined_m = ggml_concat(ctx, m, combined_m, 0);
+                }
                 exact = ggml_flash_attn_ext(
                         ctx, q, combined_k, combined_v, combined_m,
-                        1.0f/sqrtf(hsk), max_bias, logit_softcap);
+                        attn_scale, max_bias, logit_softcap);
             }
         }
         ggml_flash_attn_ext_add_sinks(out, s);
@@ -7030,13 +7076,14 @@ struct test_flash_attn_ext : public test_case {
                 }
             } else if (strcmp(t->name, "mt") == 0) {
                 std::vector<ggml_fp16_t> values(ggml_nelements(t));
-                const int64_t n_tail_history = n_tail - n_tail_current;
+                const int64_t n_tail_used = n_tail_active >= 0 ? n_tail_active : n_tail;
+                const int64_t n_tail_history = n_tail_used - n_tail_current;
                 for (int64_t is = 0; is < t->ne[3]; ++is) {
                     for (int64_t iq = 0; iq < t->ne[1]; ++iq) {
                         for (int64_t token = 0; token < t->ne[0]; ++token) {
                             values[(is*t->ne[1] + iq)*t->ne[0] + token] = ggml_fp32_to_fp16(
-                                !tail_all_masked && token < n_tail &&
-                                (segmented_equivalence ? token < n_tail_history + iq + 1 : token <= iq) ?
+                                !tail_all_masked && token < n_tail_used &&
+                            (n_tail_current > 0 ? token < n_tail_history + iq + 1 : token <= iq) ?
                                     0.0f : -INFINITY);
                         }
                     }
@@ -7069,17 +7116,21 @@ struct test_flash_attn_ext : public test_case {
                     desc[1] = int32_t(is*(tail_interleaved ? 2 : nb));
                     desc[2] = int32_t(tail_interleaved ? 2 : nb);
                     desc[3] = int32_t(tail_interleaved ? 1 : t->ne[1] - is);
-                    desc[4] = int32_t(n_tail);
+                    const int64_t n_tail_used = n_tail_active >= 0 ? n_tail_active : n_tail;
+                    const int64_t n_tail_history = n_tail_used - n_tail_current;
+                    const int64_t history_slots = n_tail_history_slots > 0 ?
+                            n_tail_history_slots : n_tail_history;
+                    desc[4] = int32_t(n_tail_used);
                     desc[5] = canonical_body ? int32_t(kv) : -1;
                     const int64_t attention_stride = n_tail;
                     const int64_t arena_stride = GGML_PAD(n_tail + nb, 256);
                     const int64_t n_arenas = tail_interleaved ? 3 : nr23[1];
                     const int64_t n_tail_slots = arena_stride*n_arenas;
                     const int64_t physical_arena = tail_interleaved ? 2*is : is;
-                    for (int64_t token = 0; token < n_tail; ++token) {
-                        const int64_t n_tail_history = n_tail - n_tail_current;
-                        desc[6 + token] = segmented_equivalence && token >= n_tail_history ?
-                            int32_t(n_tail_slots + token - n_tail_history) :
+                    for (int64_t token = 0; token < n_tail_used; ++token) {
+                        desc[6 + token] = n_tail_current > 0 && token >= n_tail_history ?
+                            int32_t((segmented_equivalence ? history_slots : n_tail_slots) +
+                                    token - n_tail_history) :
                             int32_t(physical_arena*arena_stride + token);
                     }
                     if (canonical_body) {
@@ -9815,6 +9866,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // 128-token tail because the generic D512 FA route requires KV padding to 256.
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {8, 1}, 4096, 1, true, false, 0, 0,
         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, 128, false, GGML_TYPE_F16));
+    // Mixed Gemma global layers retain a quantized D512 body, pack its body
+    // map to the 256-row CUDA FA execution stride, and attach graph-local
+    // current K/V.  Cover decode and a multi-query cohort; both must be
+    // supported and numerically agree with the CPU composite oracle.
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {8, 1}, 256, 1, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 33, false,
+        GGML_TYPE_F16, GGML_TYPE_F16, false, false, true, false, false, 1, false));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {8, 1}, 256, 8, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 40, false,
+        GGML_TYPE_F16, GGML_TYPE_F16, false, false, true, false, false, 8, false));
     // Exact-tail composite contract: every ordered F16/BF16 K/V pair.
     for (const auto tail_types : {
             std::pair{ GGML_TYPE_F16,  GGML_TYPE_F16  },
@@ -9868,11 +9929,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, 132, true,
         GGML_TYPE_F16, GGML_TYPE_F16, false, false, false, false, false, 4, true));
     // A full-window Gemma decode is bodyless even when its effective context
-    // is only 256 tokens. This is the latency-critical route: it must use one
-    // packed ordinary FA pass, not the serial indexed-small V reduction.
+    // is only 256 tokens. This is the latency-critical direct indexed route.
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {8, 1}, 256, 1, true, false, 0.0f, 0.0f,
         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, 256, true,
         GGML_TYPE_F16, GGML_TYPE_F16, false, false, false, false, false, 1, true));
+    // The masked body anchor must use the same BF16 type as the exact source;
+    // requiring a fictitious F16/BF16 pair rejects the standard Q4 full-SWA
+    // representation even though the body contributes no rows.
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {8, 1}, 256, 1, true, false, 0.0f, 0.0f,
+        GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16, {0, 1, 2, 3}, 33, true,
+        GGML_TYPE_BF16, GGML_TYPE_BF16, false, false, false, false, false, 1, true));
     // Gemma-style D512 attention can have an unaligned compact N+U source
     // (1024 persistent rows plus a 100-token current ubatch). CUDA pads only
     // the graph-local FA workspace; the segmented source itself remains 1124
@@ -9880,9 +9946,41 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {8, 1}, 1280, 100, true, false, 0.0f, 0.0f,
         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, 1124, true,
         GGML_TYPE_F16, GGML_TYPE_F16, false, false, false, false, false, 100, true));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {8, 1}, 1280, 100, true, false, 0.0f, 0.0f,
+        GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16, {0, 1, 2, 3}, 1124, true,
+        GGML_TYPE_BF16, GGML_TYPE_BF16, false, false, false, false, false, 100, true));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {8, 1}, 2048, 512, true, false, 0.0f, 0.0f,
+        GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16, {0, 1, 2, 3}, 1536, true,
+        GGML_TYPE_BF16, GGML_TYPE_BF16, false, false, false, false, false, 512, true));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {8, 1}, 2048, 512, true, false, 0.0f, 0.0f,
+        GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16, {0, 2, 1, 3}, 1536, true,
+        GGML_TYPE_BF16, GGML_TYPE_BF16, false, false, false, false, false, 512, true));
+    // Gemma 4 SWA layers use D256 with 32 query heads over 16 KV heads.  A
+    // full-window native-exact prefill keeps 1024 persistent rows and presents
+    // the current 512 rows as a graph-local segment.
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 16, {2, 1}, 2048, 512, true, false, 0.0f, 0.0f,
+        GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16, {0, 1, 2, 3}, 1536, true,
+        GGML_TYPE_BF16, GGML_TYPE_BF16, false, false, false, false, false, 512, true));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 16, {2, 1}, 2048, 512, true, false, 0.0f, 0.0f,
+        GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16, {0, 2, 1, 3}, 1536, true,
+        GGML_TYPE_BF16, GGML_TYPE_BF16, false, false, false, false, false, 512, true, 1.0f));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 16, {2, 1}, 1024, 512, true, false, 0.0f, 0.0f,
+        GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16, {0, 2, 1, 3}, 1024, true,
+        GGML_TYPE_BF16, GGML_TYPE_BF16, false, false, false, false, false, 512, true,
+        1.0f, 512, 513));
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {8, 1}, 1280, 1, true, false, 0.0f, 0.0f,
         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, 1025, true,
         GGML_TYPE_F16, GGML_TYPE_F16, false, false, false, false, false, 1, true));
+    // A single-stream bodyless prefill with an already aligned union can feed
+    // its original Q/mask and final output directly through ordinary FA.
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {2, 1}, 256, 16, true, false, 0.0f, 0.0f,
+        GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, 256, true,
+        GGML_TYPE_F16, GGML_TYPE_F16, false, false, false, false, false, 16, true));
+    // The same aligned single-stream inputs can be consumed directly when a
+    // packed quantized body still requires a separate partial and merge.
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {2, 1}, 256, 16, true, false, 0.0f, 0.0f,
+        GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, 256, false,
+        GGML_TYPE_F16, GGML_TYPE_F16, false, false, true, false, false, 16, true));
     // Serving-size exact-tail reductions. With a 512-token ubatch, configured
     // tails of 1024 and 2048 use union strides of 1536 and 2560 respectively.
     // A fully covering overlay must still equal one ordinary exact FA pass at

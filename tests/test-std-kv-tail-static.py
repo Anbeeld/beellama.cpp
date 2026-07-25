@@ -334,6 +334,22 @@ def main() -> None:
     cuda_fattn = (ROOT / "ggml/src/ggml-cuda/fattn.cu").read_text(encoding="utf-8")
     ggml_core = (ROOT / "ggml/src/ggml.c").read_text(encoding="utf-8")
     graph = (ROOT / "src/llama-graph.cpp").read_text(encoding="utf-8")
+    cache_header = (ROOT / "src/llama-kv-cache.h").read_text(encoding="utf-8")
+    route_header = (ROOT / "src/llama-kv-cache-tail.h").read_text(encoding="utf-8")
+    if "bool has_body;" not in route_header:
+        raise AssertionError("per-layer KV-tail execution descriptor does not own body presence")
+    if "uint32_t body_execution_rows;" not in route_header:
+        raise AssertionError("per-layer KV-tail execution descriptor does not own packed-body extent")
+    if "bool has_current;" not in route_header:
+        raise AssertionError("per-layer KV-tail execution descriptor does not own current-segment presence")
+    if "virtual bool has_kv_body(int32_t il) const" not in cache_header:
+        raise AssertionError("KV-cache graph interface exposes only component-wide body presence")
+    if graph.count("has_kv_body(il)") < 4:
+        raise AssertionError("standard and iSWA graph builders do not consume per-layer body presence")
+    if "get_tail_body_execution_stride()" not in graph:
+        raise AssertionError("attention input planning still derives packed-body extent from persistent rows")
+    if "ggml_backend_dev_supports_op" not in graph:
+        raise AssertionError("native KV-tail planning is not validated against the final fused operation")
     if "ggml_backend_kv_tail_attention_supported" in graph or "backend_supports_native_kv_tail" in graph:
         raise AssertionError("decode graph construction must consume the stored route without backend probing")
     if graph.count("get_tail_route(il)") < 2:
@@ -378,7 +394,15 @@ def main() -> None:
     if not re.search(
         r"op->src\[10\].*op->src\[11\].*return false", vulkan_fattn_support, re.DOTALL
     ):
-        raise AssertionError("Vulkan must reject unimplemented compact current-source operands")
+        raise AssertionError("Vulkan final-node support must reject native current operands")
+    vulkan_proc = vulkan.split("static void * ggml_backend_vk_reg_get_proc_address", 1)[1]
+    if "ggml_backend_kv_tail_segmented_attention_supported" in vulkan_proc:
+        raise AssertionError("Vulkan must not advertise native segmented attention before shader support exists")
+    if '"src10", "src11"' not in vulkan:
+        raise AssertionError("Vulkan graph debugging does not cover the retained 12-source tensor contract")
+    if graph.count("if (tail_route == LLAMA_KV_TAIL_ROUTE_NATIVE)") < 2 or graph.count(
+            "ggml_concat(ctx0, k_tail, k_tail_current, 2)") < 2:
+        raise AssertionError("non-native backends lack the bounded history/current composition route")
 
     tail_build_calls = re.findall(r"build_attn_inp_tail\((?:(?!\);).)*\);", graph, re.DOTALL)[1:]
     if not tail_build_calls or any(not re.search(r",\s*true\s*\);$", call) for call in tail_build_calls):
@@ -401,8 +425,10 @@ def main() -> None:
     tail_support = cuda_fattn.split(
         "bool ggml_cuda_flash_attn_ext_tail_supported(", 1
     )[1].split("\n}\n", 1)[0]
-    if "GGML_USE_HIP" not in tail_support:
-        raise AssertionError("unverified HIP tail acceleration must fail closed")
+    if "GGML_USE_HIP" in tail_support or "return false" in tail_support:
+        raise AssertionError("HIP must use the shared segmented-current capability path")
+    if "dst->src[10] == nullptr" not in cuda_fattn or "ggml_cuda_flash_attn_ext_tail(ctx, dst)" not in cuda_fattn:
+        raise AssertionError("HIP KVarN current segments lack the shared bounded tail fallback")
     cuda_tail = (ROOT / "ggml/src/ggml-cuda/fattn-tail.cuh").read_text(encoding="utf-8")
     if "k_flash_attn_ext_tail_merge" in cuda_tail:
         raise AssertionError("serialized indexed tail merge kernel is still present")
@@ -410,6 +436,10 @@ def main() -> None:
     graph_header = (ROOT / "src/llama-graph.h").read_text(encoding="utf-8")
     if "self_tail_bias_read_idxs" not in graph_header or "build_attn_bias_tail" not in graph:
         raise AssertionError("query-specific tails must gather matching body attention bias rows")
+    if graph.count("storage_kind == LLAMA_KV_TAIL_STORAGE_DISABLED") < 2:
+        raise AssertionError(
+            "tail identity must skip per-layer graph-reuse work when tail storage is disabled"
+        )
 
     q_tail_layout = re.compile(
         r"q_tail_batched\s*=\s*k_tail\s*&&\s*!tail_read_idxs\s*\?\s*ggml_reshape_4d\([^;]+;.{0,500}?"
@@ -434,6 +464,28 @@ def main() -> None:
 
     if "k_tail_written ? k_tail_written" not in graph or "v_tail_written ? v_tail_written" not in graph:
         raise AssertionError("same-graph tail reads must depend on the exact-shadow SET_ROWS results")
+
+    model = (ROOT / "src/llama-model.cpp").read_text(encoding="utf-8")
+    if model.count("if (params.kv_tail_native_exact)") < 2:
+        raise AssertionError("full-window KVarN selection must use the logical native-exact policy")
+    if model.count("params.kv_tail_native_exact ? cparams.n_ctx : 0") < 2:
+        raise AssertionError("full-window KVarN storage must retain the logical visibility window")
+    cache = (ROOT / "src/llama-kv-cache.cpp").read_text(encoding="utf-8")
+    if cache.count("route_spec.body_type_k = candidate") != 1 or cache.count(
+            "route_spec.body_type_v = candidate") != 1:
+        raise AssertionError("bodyless standard-tail anchors must match the realized exact type")
+    empty_body = graph.split("static void build_empty_kv_body", 1)[1].split(
+        "static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl", 1)[0]
+    if "first_row_anchor(body_mask_template)" not in empty_body:
+        raise AssertionError(
+            "bodyless standard-tail masks must retain a graph dependency on the authoritative planner mask")
+    if "body_bias_template" not in empty_body or "first_row_anchor(body_bias_template)" not in empty_body:
+        raise AssertionError(
+            "bodyless standard-tail biases must retain a graph dependency on the authoritative planner bias")
+    if "self_tail_query_order_swa" not in (ROOT / "src/llama-graph.h").read_text(encoding="utf-8"):
+        raise AssertionError("full and SWA cache groups must own independent exact-tail query-order inputs")
+    if "set_tail_query_plan(self_tail_query_order_swa, self_tail_run_desc_swa" not in graph:
+        raise AssertionError("the SWA exact-tail planner must populate its own query-order input")
 
     hybrid_setter = graph.split("void llm_graph_input_mem_hybrid::set_input", 1)[1].split(
         "bool llm_graph_input_mem_hybrid::can_reuse", 1)[0]

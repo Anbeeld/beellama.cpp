@@ -36,6 +36,8 @@ struct llama_memory_params {
     uint32_t  kv_tail_tokens_swa;
     uint32_t  kv_tail_tokens_requested;
     uint32_t  kv_tail_tokens_swa_requested;
+    bool      kv_tail_native_exact;
+    bool      kv_tail_native_exact_swa;
     uint32_t  kv_tail_rollback_tokens;
     ggml_type kv_tail_type;
 

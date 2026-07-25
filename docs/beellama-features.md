@@ -198,9 +198,21 @@ one stream and copy them into context-local slots across streams. Position
 shifts rotate exact K rows together with the quantized body. CUDA can read the
 compact pool and current K/V directly through per-query descriptors and merge
 against ordinary FlashAttention normalization metadata. The generic graph
-gathers only shared source rows, never a query-duplicated K/V payload. Neither
-route materializes the full cache. Compact-native SWA allocates no compressed
-body.
+composes persistent history and current K/V on the owning device, then gathers
+the bounded per-query source union needed by the ordinary attention operators.
+That fallback can duplicate graph-local source rows across a physical ubatch,
+but never changes persistent capacity or materializes the full context.
+Compact-native SWA allocates no compressed body.
+
+Allocation, graph construction, graph identity, backend validation, and memory
+telemetry consume one per-layer execution descriptor. It records the realized
+body and exact types, body/bodyless representation, graph-local current
+segment, padded body execution extent, explicit-bias requirement, owner device,
+and selected route. A native route is checked against
+`ggml_backend_dev_supports_op()` on the final fused operation, after all
+descriptors and current sources are attached. Unsupported native shapes fail
+closed before scheduling rather than appearing later as CPU/CUDA split
+boundaries.
 
 Exact overlays support the normal `--split-mode layer` ownership model: each
 body and its K/V shadows are allocated on that layer's owning device, and graph
@@ -323,6 +335,52 @@ rejected at context creation because fused shadow `SET_ROWS` is not supported;
 successful source classification is not an Ascend hardware claim. Startup
 diagnostics name the selected native or generic route; generic long-context
 attention can be substantially slower.
+
+For compact current sources, CUDA and HIP share the segmented history/current
+implementation. CPU has the dense one-softmax reference route. Vulkan rejects
+the unimplemented 12-source native form and uses the planned device-resident
+concat/gather composition instead, so it cannot ignore current rows or rely on
+an accidental scheduler fallback. Vulkan and HIP behavior in this completion
+was source/compile-path verified; no new AMD or Vulkan hardware-performance
+claim is made.
+
+### July 2026 compact-tail correction
+
+The completion run used Gemma 4 31B Q5_K_S at context 16384, `-b 2048
+-ub 512`, the persisted BF16 KLD baseline, and one repetition per requested
+row. The GPU was concurrently occupied, so throughput was deliberately
+excluded. Quality below is compared with the historical gain-curve article:
+
+| Cache / tail | Result | Median KLD | Mean KLD | P99 KLD | P99.9 KLD | Maximum KLD | Same top |
+|---|---|---:|---:|---:|---:|---:|---:|
+| q5_0 / 0 | historical | 0.061747 | 0.626347 | 9.084101 | 18.731647 | 36.826859 | 76.802% |
+| q5_0 / 0 | corrected | 0.061747 | 0.626347 | 9.084101 | 18.731647 | 36.826859 | 76.802% |
+| q5_0 / 1024 | historical | 0.038569 | 0.469998 | 7.542499 | 16.978937 | 39.990627 | 79.989% |
+| q5_0 / 1024 | corrected | 0.038596 | 0.462000 | 7.410694 | 16.760483 | 40.052086 | 80.185% |
+| kvarn5 / 0 | historical | 0.041262 | 0.483087 | 7.594825 | 16.600363 | 33.928799 | 79.609% |
+| kvarn5 / 0 | corrected | 0.041221 | 0.483046 | 7.608277 | 16.575455 | 33.928799 | 79.592% |
+| kvarn5 / 1024 | historical | 0.036261 | 0.444201 | 7.325125 | 16.381313 | 38.840488 | 80.622% |
+| kvarn5 / 1024 | corrected | 0.035761 | 0.445017 | 7.212839 | 16.502676 | 36.113117 | 80.590% |
+
+The same corrected binary was measured in fresh processes with
+`llama-bench --kv-memory --no-warmup -d 16384 -n 1`. These are cache-owned
+bytes, not total-VRAM differences:
+
+| Cache / tail | Persistent KV | Exact history + reserve | Staging | Persistent padding | Reusable transient high water | KV-related peak |
+|---|---:|---:|---:|---:|---:|---:|
+| q5_0 / 0 | 859.38 MiB | 0 | 0 | 0 | 0 | 859.38 MiB |
+| q5_0 / 1024 | 1327.73 MiB | 880.86 MiB | 0 | 0 | 249.75 MiB | 1577.49 MiB |
+| kvarn5 / 0 | 1170.70 MiB | 110.86 MiB | 220.00 MiB | 0 | 119.32 MiB | 1290.02 MiB |
+| kvarn5 / 1024 | 1337.58 MiB | 880.86 MiB | 20.00 MiB | 0 | 126.06 MiB | 1463.64 MiB |
+
+Gemma has 50 SWA and 10 global attention layers. At tail 1024, telemetry
+records 50 native bodyless routes and 10 native mixed routes, with zero device
+fallback and zero CPU layers. The q5_0 exact payload replaces 412.50 MiB of
+SWA quantized body with 800 MiB of native-exact SWA rows and adds 80 MiB of
+global exact overlay plus 0.86 MiB of rollback reserve. The resulting
+468.36 MiB persistent delta is therefore fully reconciled. The previous
+workspace-dependent persistent padding is zero; physical ubatch contributes
+only to graph-local and reusable transient memory.
 
 ### Measurement and validation
 

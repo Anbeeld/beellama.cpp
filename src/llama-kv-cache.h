@@ -124,7 +124,8 @@ public:
                 ggml_type   tail_type = GGML_TYPE_F16,
                  uint32_t   tail_tokens_requested = UINT32_MAX,
                      bool   tail_metadata_only = false,
-                 uint32_t   tail_rollback_tokens = 0);
+                 uint32_t   tail_rollback_tokens = 0,
+                 uint32_t   tail_visibility_window = 0);
 
     ~llama_kv_cache() = default;
 
@@ -230,6 +231,9 @@ public:
     bool has_kv_body() const {
         return tail_plan.kind != LLAMA_KV_TAIL_STORAGE_COMPACT_NATIVE_EXACT;
     }
+    bool has_kv_body(int32_t il) const;
+    bool has_tail_current(int32_t il) const;
+    ggml_backend_dev_t get_tail_backend(int32_t il) const;
     bool has_tail_overlay() const {
         return tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY ||
                 tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_OVERLAY ||
@@ -240,7 +244,10 @@ public:
                 tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_NATIVE_EXACT;
     }
     uint32_t get_tail_attention_stride(uint32_t n_query_tokens = 0) const;
+    uint32_t get_tail_body_execution_stride() const;
+    uint32_t get_tail_body_execution_rows(int32_t il) const;
     llama_kv_tail_route get_tail_route(int32_t il) const;
+    const llama_kv_tail_layer_route * get_tail_layer_route(int32_t il) const;
     bool get_tail_explicit_bias(int32_t il) const;
     const std::vector<llama_kv_tail_layer_route> & get_tail_layer_routes() const;
     void set_tail_routes(std::vector<llama_kv_tail_layer_route> routes);
@@ -570,11 +577,17 @@ public:
     virtual uint32_t get_tail_tokens() const;
     virtual uint32_t get_tail_arena_stride() const;
     virtual uint32_t get_tail_attention_stride(uint32_t n_query_tokens = 0) const;
+    virtual uint32_t get_tail_body_execution_stride() const;
+    virtual uint32_t get_tail_body_execution_rows(int32_t il) const;
     virtual bool has_compact_tail() const;
     virtual bool has_kv_body() const;
+    virtual bool has_kv_body(int32_t il) const;
+    virtual bool has_tail_current(int32_t il) const;
+    virtual ggml_backend_dev_t get_tail_backend(int32_t il) const;
     virtual llama_kv_tail_storage_kind get_tail_storage_kind() const;
     virtual uint32_t get_tail_rollback_tokens() const;
     virtual llama_kv_tail_route get_tail_route(int32_t il) const;
+    virtual const llama_kv_tail_layer_route * get_tail_layer_route(int32_t il) const;
     virtual bool get_tail_explicit_bias(int32_t il) const;
     virtual bool can_pack_tail_body(const llama_ubatch & ubatch) const;
 

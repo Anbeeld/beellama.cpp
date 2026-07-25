@@ -13,6 +13,10 @@ struct llama_kv_memory_component_stats {
     uint64_t metadata_bytes = 0;
     uint64_t padding_bytes = 0;
     uint64_t allocated_capacity_tokens = 0;
+    uint64_t tail_native_bodyless_layers = 0;
+    uint64_t tail_native_mixed_layers = 0;
+    uint64_t tail_device_fallback_layers = 0;
+    uint64_t tail_cpu_layers = 0;
 
     uint64_t persistent_overhead_bytes() const {
         return staging_bytes + metadata_bytes + padding_bytes;
@@ -34,6 +38,10 @@ struct llama_kv_memory_component_stats {
         staging_bytes += other.staging_bytes;
         metadata_bytes += other.metadata_bytes;
         padding_bytes += other.padding_bytes;
+        tail_native_bodyless_layers += other.tail_native_bodyless_layers;
+        tail_native_mixed_layers += other.tail_native_mixed_layers;
+        tail_device_fallback_layers += other.tail_device_fallback_layers;
+        tail_cpu_layers += other.tail_cpu_layers;
         allocated_capacity_tokens = allocated_capacity_tokens > other.allocated_capacity_tokens ?
                 allocated_capacity_tokens : other.allocated_capacity_tokens;
     }
@@ -91,5 +99,21 @@ struct llama_kv_memory_stats {
     uint64_t allocated_capacity_tokens() const {
         return global.allocated_capacity_tokens > swa.allocated_capacity_tokens ?
                 global.allocated_capacity_tokens : swa.allocated_capacity_tokens;
+    }
+
+    uint64_t tail_native_bodyless_layers() const {
+        return global.tail_native_bodyless_layers + swa.tail_native_bodyless_layers;
+    }
+
+    uint64_t tail_native_mixed_layers() const {
+        return global.tail_native_mixed_layers + swa.tail_native_mixed_layers;
+    }
+
+    uint64_t tail_device_fallback_layers() const {
+        return global.tail_device_fallback_layers + swa.tail_device_fallback_layers;
+    }
+
+    uint64_t tail_cpu_layers() const {
+        return global.tail_cpu_layers + swa.tail_cpu_layers;
     }
 };

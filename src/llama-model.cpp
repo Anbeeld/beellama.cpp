@@ -2158,18 +2158,20 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* tail_type         */ params.kv_tail_type,
                             /* tail requested    */ params.kv_tail_tokens_requested,
                             /* SWA requested     */ params.kv_tail_tokens_swa_requested,
-                            /* rollback reserve  */ params.kv_tail_rollback_tokens);
+                            /* rollback reserve  */ params.kv_tail_rollback_tokens,
+                            /* SWA native exact  */ params.kv_tail_native_exact_swa);
                     } else {
                         if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
                             std::unique_ptr<llama_memory_i> mem_attn;
-                            if (params.kv_tail_tokens >= cparams.n_ctx_seq) {
+                            if (params.kv_tail_native_exact) {
                                 mem_attn = std::make_unique<llama_kv_cache>(
                                         *this, hparams, kvarn_tail_type, kvarn_tail_type,
                                         !cparams.flash_attn, cparams.offload_kqv, cparams.kv_unified,
                                         cparams.n_ctx_seq, cparams.n_seq_max, 1,
                                         hparams.n_swa, hparams.swa_type, nullptr, filter_attn,
                                         nullptr, nullptr, cparams.n_ubatch, 0,
-                                        kvarn_tail_type, 0, false, params.kv_tail_rollback_tokens);
+                                        kvarn_tail_type, 0, false, params.kv_tail_rollback_tokens,
+                                        params.kv_tail_native_exact ? cparams.n_ctx : 0);
                             } else {
                                 mem_attn = std::make_unique<llama_kv_cache_kvarn>(
                                         *this, hparams, params.kvarn, cparams.offload_kqv,
@@ -2304,7 +2306,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     params.kv_tail_type,
                                     params.kv_tail_tokens_requested,
                                     params.kv_tail_tokens_swa_requested,
-                                    params.kv_tail_rollback_tokens);
+                                    params.kv_tail_rollback_tokens,
+                                    params.kv_tail_native_exact_swa);
                         } else {
                             res = new llama_kv_cache_iswa(
                                     *this,
@@ -2329,20 +2332,22 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     params.kv_tail_type,
                                     params.kv_tail_tokens_requested,
                                     params.kv_tail_tokens_swa_requested,
-                                    params.kv_tail_rollback_tokens);
+                                    params.kv_tail_rollback_tokens,
+                                    params.kv_tail_native_exact_swa);
                         }
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
                         if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
-                            if (params.kv_tail_tokens >= cparams.n_ctx_seq) {
+                            if (params.kv_tail_native_exact) {
                                 res = new llama_kv_cache(
                                         *this, hparams, kvarn_tail_type, kvarn_tail_type,
                                         !cparams.flash_attn, cparams.offload_kqv, cparams.kv_unified,
                                         cparams.n_ctx_seq, cparams.n_seq_max, 1,
                                         hparams.n_swa, hparams.swa_type, nullptr, filter,
                                         reuse, nullptr, cparams.n_ubatch, 0,
-                                        kvarn_tail_type, 0, false, params.kv_tail_rollback_tokens);
+                                        kvarn_tail_type, 0, false, params.kv_tail_rollback_tokens,
+                                        params.kv_tail_native_exact ? cparams.n_ctx : 0);
                             } else {
                                 res = new llama_kv_cache_kvarn(
                                         *this, hparams, params.kvarn, cparams.offload_kqv,

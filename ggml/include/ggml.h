@@ -453,6 +453,7 @@ extern "C" {
         GGML_FLASH_ATTN_EXT_OP_PARAM_PREC         = 3,
         GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN = 4,
         GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_BODYLESS = 5,
+        GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_HISTORY_SLOTS = 6,
     };
 
     enum ggml_flash_attn_ext_kvarn_domain {
@@ -2507,6 +2508,12 @@ extern "C" {
     // source as one ordinary FlashAttention pass.
     GGML_API void ggml_flash_attn_ext_set_kv_tail_bodyless(
             struct ggml_tensor * a);
+
+    // Set the logical persistent-history boundary for segmented exact tails.
+    // The physical tensor may include backend execution padding beyond it.
+    GGML_API void ggml_flash_attn_ext_set_kv_tail_history_slots(
+            struct ggml_tensor * a,
+            int32_t              history_slots);
 
     GGML_API struct ggml_tensor * ggml_kv_tail_attention_merge(
             struct ggml_context * ctx,

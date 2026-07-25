@@ -38,7 +38,8 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
                 ggml_type tail_type,
                  uint32_t tail_tokens_requested,
                  uint32_t tail_tokens_swa_requested,
-                 uint32_t tail_rollback_tokens) :
+                 uint32_t tail_rollback_tokens,
+                     bool tail_native_exact_swa) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache_iswa(
         model,
@@ -65,7 +66,8 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         tail_type,
         tail_tokens_requested,
         tail_tokens_swa_requested,
-        tail_rollback_tokens
+        tail_rollback_tokens,
+        tail_native_exact_swa
     )),
     mem_recr(new llama_memory_recurrent(
         model,

@@ -37,14 +37,16 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                 ggml_type tail_type,
                  uint32_t tail_tokens_requested,
                  uint32_t tail_tokens_swa_requested,
-                 uint32_t tail_rollback_tokens) :
+                 uint32_t tail_rollback_tokens,
+                     bool tail_native_exact_swa) :
     llama_kv_cache_iswa(
             model, model.hparams,
             type_k, type_v,
             v_trans, offload, swa_full, unified,
             kv_size, n_seq_max, n_batch, n_ubatch, n_pad,
             mem_other, filter, reuse, share, kvarn, tail_tokens, tail_tokens_swa, tail_type,
-            tail_tokens_requested, tail_tokens_swa_requested, tail_rollback_tokens) {
+            tail_tokens_requested, tail_tokens_swa_requested, tail_rollback_tokens,
+            tail_native_exact_swa) {
 }
 
 llama_kv_cache_iswa::llama_kv_cache_iswa(
@@ -71,7 +73,8 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                 ggml_type tail_type,
                  uint32_t tail_tokens_requested,
                  uint32_t tail_tokens_swa_requested,
-                 uint32_t tail_rollback_tokens) : unified(unified) {
+                 uint32_t tail_rollback_tokens,
+                     bool tail_native_exact_swa) : unified(unified) {
 
     if (tail_tokens_requested == UINT32_MAX) {
         tail_tokens_requested = tail_tokens;
@@ -161,7 +164,8 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
             const uint32_t exact_tokens = n_swa > 0 ? tail_tokens_swa : tail_tokens;
             const uint32_t exact_requested = n_swa > 0 ? tail_tokens_swa_requested : tail_tokens_requested;
             const uint32_t visibility_window = n_swa > 0 ? std::min(size, n_swa) : size;
-            if (exact_tokens >= visibility_window) {
+            if ((is_swa_group && tail_native_exact_swa) ||
+                    (!is_swa_group && exact_tokens >= visibility_window)) {
                 // A fully covered SWA group is a compact exact ring. Keep the
                 // requested body types only as planner inputs: the standard
                 // component omits them physically and allocates W + R exact
@@ -171,7 +175,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                         v_trans, offload, unified, size, n_seq_max, n_pad,
                         n_swa, swa_type, nullptr, layer_filter, reuse, nullptr,
                         n_ubatch, exact_tokens, tail_type, exact_requested,
-                        false, tail_rollback_tokens);
+                        false, tail_rollback_tokens, exact_tokens);
             }
             // Structured KVarN records do not participate in cross-context
             // sharing, so cache_mem_other and share are intentionally omitted.

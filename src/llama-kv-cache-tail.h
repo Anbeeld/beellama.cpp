@@ -2,6 +2,7 @@
 
 #include "llama.h"
 #include "llama-hparams.h"
+#include "ggml-backend.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -174,6 +175,10 @@ struct llama_kv_tail_layer_route {
     bool causal_attn;
     bool swa;
     bool explicit_bias;
+    bool has_body;
+    bool has_current;
+    uint32_t body_execution_rows;
+    ggml_backend_dev_t owner;
     llama_kv_tail_route_capability capability;
 };
 
@@ -242,6 +247,12 @@ llama_kv_tail_group_resolution llama_kv_tail_resolve_groups(
 bool llama_kv_tail_sparse_body_capacity_safe(
         uint32_t physical_stream_rows,
         uint32_t arena_stride);
+
+// The packed body is graph-local and may be padded to a backend execution
+// alignment without changing the persistent compact-history capacity.
+uint32_t llama_kv_tail_packed_body_stride(
+        uint64_t logical_rows,
+        uint32_t alignment);
 
 struct llama_kv_tail_storage_request {
     ggml_type requested_body_type_k;

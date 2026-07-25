@@ -46,8 +46,9 @@ public:
                  uint32_t   tail_tokens_swa = 0,
                 ggml_type   tail_type = GGML_TYPE_F16,
                  uint32_t   tail_tokens_requested = UINT32_MAX,
-                 uint32_t   tail_tokens_swa_requested = UINT32_MAX,
-                 uint32_t   tail_rollback_tokens = 0);
+                     uint32_t   tail_tokens_swa_requested = UINT32_MAX,
+                     uint32_t   tail_rollback_tokens = 0,
+                         bool   tail_native_exact_swa = false);
 
     ~llama_memory_hybrid_iswa() = default;
 

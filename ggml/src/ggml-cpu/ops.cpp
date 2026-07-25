@@ -9378,6 +9378,11 @@ static void ggml_compute_forward_flash_attn_ext_tail_ref(
     }
     GGML_ASSERT(qo->type == GGML_TYPE_I32 && rd->type == GGML_TYPE_I32 && rd->ne[0] >= 4);
     GGML_ASSERT(qo->ne[1] == rd->ne[1]);
+    const int32_t configured_history_slots = ggml_get_op_params_i32(
+            dst, GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_HISTORY_SLOTS);
+    const int64_t history_slots = configured_history_slots > 0 ?
+            configured_history_slots : kt->ne[1];
+    GGML_ASSERT(history_slots > 0 && history_slots <= kt->ne[1]);
 
     float scale = 1.0f, max_bias = 0.0f, logit_softcap = 0.0f;
     memcpy(&scale,         (const float *) dst->op_params + 0, sizeof(float));
@@ -9490,10 +9495,10 @@ static void ggml_compute_forward_flash_attn_ext_tail_ref(
             const float mask_value = ggml_fp16_to_fp32(*(const ggml_fp16_t *)
                 ((const char *) mt->data + token*mt->nb[0] + iq*mt->nb[1] + is*mt->nb[3]));
             const int64_t slot = desc[6 + token];
-            const bool from_current = kt_current != nullptr && slot >= kt->ne[1];
+            const bool from_current = kt_current != nullptr && slot >= history_slots;
             const ggml_tensor * ks = from_current ? kt_current : kt;
             const ggml_tensor * vs = from_current ? vt_current : vt;
-            const int64_t row = from_current ? slot - kt->ne[1] : slot;
+            const int64_t row = from_current ? slot - history_slots : slot;
             GGML_ASSERT(row >= 0 && row < ks->ne[1] && row < vs->ne[1]);
             consume((const char *) ks->data + row*ks->nb[1] + ikh*ks->nb[2],
                     (const char *) vs->data + row*vs->nb[1] + ikh*vs->nb[2],
