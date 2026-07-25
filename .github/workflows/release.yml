@@ -1311,6 +1311,9 @@ jobs:
           pattern: beellama-bin-*
           path: ./artifact
           merge-multiple: true
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ github.run_id }}
+          repository: ${{ github.repository }}
 
       - name: Download CUDA runtime artifacts
         uses: actions/download-artifact@v7
@@ -1318,6 +1321,9 @@ jobs:
           pattern: cudart-beellama-*
           path: ./artifact
           merge-multiple: true
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ github.run_id }}
+          repository: ${{ github.repository }}
 
       - name: Prepare release assets
         shell: bash
