@@ -3812,6 +3812,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET_GRACE_TOKENS"));
     add_opt(common_arg(
+        {"--reasoning-budget-soft-grace-tokens"}, "N",
+        "soft warning: wait up to N tokens for a newline before forcing the soft message anyway; use for models that reason in prose without line breaks (default: 0 = wait indefinitely, newline-gated)",
+        [](common_params & params, int value) {
+            params.sampling.reasoning_budget_soft_grace_tokens = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET_SOFT_GRACE_TOKENS"));
+    add_opt(common_arg(
         {"--reasoning-preserve"},
         {"--no-reasoning-preserve"},
         "preserve reasoning trace in the full history, not just the last assistant message (default: template default)\n"

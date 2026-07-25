@@ -300,6 +300,7 @@ struct common_params_sampling {
         "I'll keep this reasoning under {budget} tokens, so I'll stay focused and efficient. ";
 
     int32_t                  reasoning_budget_grace_tokens = 0;    // <= 0 = force immediately, N>0 = wait up to N tokens for a paragraph break
+    int32_t                  reasoning_budget_soft_grace_tokens = 0; // soft warning: <= 0 = wait indefinitely for a newline (default), N>0 = force soft anyway after N tokens without one
 
     bool backend_sampling = false;
 

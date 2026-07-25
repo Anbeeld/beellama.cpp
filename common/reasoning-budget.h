@@ -56,6 +56,7 @@ enum common_reasoning_budget_state {
 //   budget             - max tokens allowed in the reasoning block
 //   soft_ratio         - fraction of budget consumed at which to trigger the soft warning (<= 0 disables it)
 //   grace_tokens       - max tokens to wait for a paragraph boundary after the budget expires (<= 0 = force immediately, no wait)
+//   soft_grace_tokens  - max tokens to wait for a newline before forcing the soft warning anyway (<= 0 = wait indefinitely, newline-gated)
 //   initial_state      - initial state
 //
 struct llama_sampler * common_reasoning_budget_init(
@@ -68,6 +69,7 @@ struct llama_sampler * common_reasoning_budget_init(
         int32_t                          budget,
         float                             soft_ratio = -1.0f,
         int32_t                           grace_tokens = 0,
+        int32_t                           soft_grace_tokens = 0,
         common_reasoning_budget_state    initial_state = REASONING_BUDGET_IDLE);
 
 common_reasoning_budget_state common_reasoning_budget_get_state(const struct llama_sampler * smpl);

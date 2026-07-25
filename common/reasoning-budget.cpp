@@ -58,6 +58,8 @@ struct common_reasoning_budget_ctx {
     int32_t soft_threshold;   // trigger soft warning once remaining <= this
     bool    soft_triggered;   // soft warning already fired for this reasoning block
     size_t  soft_force_pos;   // next position in soft_forced_tokens to force
+    int32_t soft_grace_tokens;    // max tokens to wait for a newline before forcing soft anyway (<= 0 = wait indefinitely)
+    int32_t soft_grace_remaining; // tokens left in the current soft-grace wait
 
     // intro announcement
     std::vector<llama_token> intro_forced_tokens;
@@ -109,6 +111,14 @@ static void common_reasoning_budget_enter_hard_exhausted(common_reasoning_budget
 
     common_reasoning_budget_begin_forcing(ctx, token);
     COM_TRC("%s", "budget exhausted, forcing end sequence\n");
+}
+
+// Starts forcing the soft warning message (from a newline boundary or, if a soft
+// grace period is configured, once it expires without one).
+static void common_reasoning_budget_begin_soft_forcing(common_reasoning_budget_ctx * ctx) {
+    ctx->state = REASONING_BUDGET_SOFT_FORCING;
+    ctx->soft_force_pos = 0;
+    ctx->soft_triggered = true;
 }
 
 // Called whenever a start tag is (re-)matched, to (re-)activate the reasoning
@@ -172,6 +182,7 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
 
             if (ctx->soft_enabled && !ctx->soft_triggered && ctx->remaining <= ctx->soft_threshold) {
                 ctx->state = REASONING_BUDGET_SOFT_PENDING;
+                ctx->soft_grace_remaining = ctx->soft_grace_tokens;
                 COM_TRC("soft threshold reached, remaining=%d, waiting for newline\n", ctx->remaining);
             }
             break;
@@ -192,14 +203,19 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
                 break;
             }
 
+            ctx->soft_grace_remaining--;
             if (ctx->vocab != nullptr) {
                 const std::string piece = common_token_to_piece(ctx->vocab, token, false);
                 if (piece.find('\n') != std::string::npos) {
-                    ctx->state = REASONING_BUDGET_SOFT_FORCING;
-                    ctx->soft_force_pos = 0;
-                    ctx->soft_triggered = true;
+                    common_reasoning_budget_begin_soft_forcing(ctx);
                     COM_TRC("%s", "newline boundary found, forcing soft warning\n");
+                    break;
                 }
+            }
+            // grace fallback: no newline arrived, but the soft-grace window expired
+            if (ctx->soft_grace_tokens > 0 && ctx->soft_grace_remaining <= 0) {
+                common_reasoning_budget_begin_soft_forcing(ctx);
+                COM_TRC("%s", "soft grace expired, forcing soft warning without newline\n");
             }
             break;
         }
@@ -309,6 +325,7 @@ static void common_reasoning_budget_reset(struct llama_sampler * smpl) {
     ctx->force_pos = 0;
     ctx->soft_triggered = false;
     ctx->soft_force_pos = 0;
+    ctx->soft_grace_remaining = ctx->soft_grace_tokens;
     ctx->intro_force_pos = 0;
     ctx->grace_remaining = ctx->grace_tokens;
     ctx->hard_pending_prev_nl = false;
@@ -318,7 +335,7 @@ static struct llama_sampler * common_reasoning_budget_init_state(
         const struct llama_vocab * vocab, const std::vector<llama_token> & start_tokens,
         const std::vector<llama_token> & end_tokens, const std::vector<llama_token> & forced_tokens,
         const std::vector<llama_token> & soft_forced_tokens, const std::vector<llama_token> & intro_forced_tokens,
-        int32_t budget, float soft_ratio, int32_t grace_tokens, common_reasoning_budget_state initial_state);
+        int32_t budget, float soft_ratio, int32_t grace_tokens, int32_t soft_grace_tokens, common_reasoning_budget_state initial_state);
 
 static struct llama_sampler * common_reasoning_budget_clone(const struct llama_sampler * smpl);
 
@@ -358,6 +375,7 @@ static struct llama_sampler * common_reasoning_budget_init_state(
         int32_t                                budget,
         float                                   soft_ratio,
         int32_t                                grace_tokens,
+        int32_t                                soft_grace_tokens,
         common_reasoning_budget_state          initial_state) {
     // promote COUNTING with budget <= 0 to FORCING
     if (initial_state == REASONING_BUDGET_COUNTING && budget <= 0) {
@@ -387,6 +405,8 @@ static struct llama_sampler * common_reasoning_budget_init_state(
             /* .soft_threshold       = */ soft_threshold,
             /* .soft_triggered       = */ false,
             /* .soft_force_pos       = */ 0,
+            /* .soft_grace_tokens    = */ soft_grace_tokens,
+            /* .soft_grace_remaining = */ soft_grace_tokens,
             /* .intro_forced_tokens  = */ intro_forced_tokens,
             /* .intro_force_pos      = */ 0,
             /* .grace_tokens         = */ grace_tokens,
@@ -406,8 +426,9 @@ struct llama_sampler * common_reasoning_budget_init(
         int32_t                          budget,
         float                             soft_ratio,
         int32_t                           grace_tokens,
+        int32_t                           soft_grace_tokens,
         common_reasoning_budget_state    initial_state) {
-    return common_reasoning_budget_init_state(vocab, start_tokens, end_tokens, forced_tokens, soft_forced_tokens, intro_forced_tokens, budget, soft_ratio, grace_tokens, initial_state);
+    return common_reasoning_budget_init_state(vocab, start_tokens, end_tokens, forced_tokens, soft_forced_tokens, intro_forced_tokens, budget, soft_ratio, grace_tokens, soft_grace_tokens, initial_state);
 }
 
 common_reasoning_budget_state common_reasoning_budget_get_state(const struct llama_sampler * smpl) {
