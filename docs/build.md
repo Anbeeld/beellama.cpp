@@ -295,7 +295,7 @@ The following compilation options are also available to tweak performance:
 | GGML_CUDA_FORCE_CUBLAS        | Boolean                | false   | Force the use of FP16 cuBLAS instead of custom matrix multiplication kernels for quantized models. There may be issues with numerical overflows (except for V100, CDNA and RDNA4 which use FP32 compute type by default) and memory use will be higher. Prompt processing may become faster on recent datacenter GPUs (the custom kernels were tuned primarily for RTX 3000/4000).   |
 | GGML_CUDA_PEER_MAX_BATCH_SIZE | Positive integer       | 128     | Maximum batch size for which to enable peer access between multiple GPUs. Peer access requires either Linux or NVLink. When using NVLink enabling peer access for larger batch sizes is potentially beneficial.                                                                                                                                                                  |
 | GGML_CUDA_FA_ALL_QUANTS       | Boolean                | false   | Compile all 169 ordered CUDA FlashAttention vector pairs for the 13 retained standard cache types, plus all 36 KVarN fast-decode pairs when `GGML_CUDA_KVARN` is enabled. Use this for broad asymmetric-cache experiments. |
-| GGML_CUDA_KVARN               | Boolean                | true    | Compile dedicated CUDA KVarN kernels and template instances. Disable to omit KVarN from the CUDA build. |
+| GGML_CUDA_KVARN               | Boolean                | true    | Compile shared CUDA/HIP KVarN kernels and CUDA native-attention template instances. Disable to omit them from CUDA or HIP builds. |
 
 With no quant-matrix flag, CUDA FlashAttention compiles 50 vector pairs over `f16`, `bf16`, `q8_0`, `q6_1`, `q6_0`, `q5_1`, `q5_0`, `q4_1`, `q4_0`, `q3_1`, `q3_0`, `q2_1`, and the fork's internal q2 fallback type. The 48 quantized pairs are derived from the 15 balanced KVarN bit-pair rules; same-bit pairs retain `_1:_1`, `_1:_0`, and `_0:_0` variants. Homogeneous `f16:f16` and `bf16:bf16` pairs cover KVarN and standard precision tails. Mixed float/quant and mixed F16/BF16 pairs use the normal CUDA FlashAttention fallback instead of a compiled vector case. When enabled, KVarN keeps 15 balanced fast-decode pairs by default and all 36 with `GGML_CUDA_FA_ALL_QUANTS=ON`; every valid KVarN bit pair remains supported through descriptor-native MMA when it is outside the fast matrix. `GGML_CUDA_FA_HALF_QUANTS` has been removed.
 
@@ -363,6 +363,29 @@ You can download it from your Linux distro's package manager or from here: [ROCm
   ```
 
   Note: `GPU_TARGETS` is optional, omitting it will build the code for all GPUs in the current system.
+
+  KVarN is enabled in HIP builds by default. For a release build targeting
+  RDNA3.5 or CDNA3 explicitly:
+
+  ```bash
+  HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -R)" \
+      cmake -S . -B build-hip \
+        -DGGML_HIP=ON -DGGML_CUDA_KVARN=ON -DGGML_CUDA_FA=ON \
+        -DGPU_TARGETS=gfx1150 -DCMAKE_BUILD_TYPE=Release \
+      && cmake --build build-hip --parallel 16
+  ```
+
+  Replace `gfx1150` with `gfx942` for a CDNA3-only build. The default KVarN
+  decode matrix contains 15 balanced K/V bit pairs; add
+  `-DGGML_CUDA_FA_ALL_QUANTS=ON` to compile all 36 ordered pairs. Valid pairs
+  outside the default matrix use descriptor-native generic MMA. Set
+  `-DGGML_CUDA_KVARN=OFF` to omit all KVarN HIP kernels and instances.
+
+  HIP route selection is capability driven. RDNA3/3.5/4 use physical wave32
+  WMMA routes, CDNA uses physical wave64 MFMA routes, and older AMD targets
+  retain the portable direct-record route. `GGML_KVARN_DEBUG_ROUTES=1` prints
+  the selected route, wave size, shape, entry path, and fallback reason.
+  `GGML_KVARN_TEST_FORCE_PORTABLE_FATTN=1` is intended for parity testing.
 
   To enhance flash attention performance on RDNA3+ or CDNA architectures, you can utilize the rocWMMA library by enabling the `-DGGML_HIP_ROCWMMA_FATTN=ON` option. This requires rocWMMA headers to be installed on the build system.
 

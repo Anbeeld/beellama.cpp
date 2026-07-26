@@ -36,14 +36,17 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                  uint32_t tail_tokens_swa,
                 ggml_type tail_type,
                  uint32_t tail_tokens_requested,
-                 uint32_t tail_tokens_swa_requested) :
+                 uint32_t tail_tokens_swa_requested,
+                 uint32_t tail_rollback_tokens,
+                     bool tail_native_exact_swa) :
     llama_kv_cache_iswa(
             model, model.hparams,
             type_k, type_v,
             v_trans, offload, swa_full, unified,
             kv_size, n_seq_max, n_batch, n_ubatch, n_pad,
             mem_other, filter, reuse, share, kvarn, tail_tokens, tail_tokens_swa, tail_type,
-            tail_tokens_requested, tail_tokens_swa_requested) {
+            tail_tokens_requested, tail_tokens_swa_requested, tail_rollback_tokens,
+            tail_native_exact_swa) {
 }
 
 llama_kv_cache_iswa::llama_kv_cache_iswa(
@@ -69,7 +72,9 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                  uint32_t tail_tokens_swa,
                 ggml_type tail_type,
                  uint32_t tail_tokens_requested,
-                 uint32_t tail_tokens_swa_requested) : unified(unified) {
+                 uint32_t tail_tokens_swa_requested,
+                 uint32_t tail_rollback_tokens,
+                     bool tail_native_exact_swa) : unified(unified) {
 
     if (tail_tokens_requested == UINT32_MAX) {
         tail_tokens_requested = tail_tokens;
@@ -159,16 +164,18 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
             const uint32_t exact_tokens = n_swa > 0 ? tail_tokens_swa : tail_tokens;
             const uint32_t exact_requested = n_swa > 0 ? tail_tokens_swa_requested : tail_tokens_requested;
             const uint32_t visibility_window = n_swa > 0 ? std::min(size, n_swa) : size;
-            if (exact_tokens >= visibility_window) {
-                // Full-window precision has one native exact representation;
-                // do not allocate structured records that would never be read.
-                // The requested tail type becomes the native cache type; an
-                // additional overlay would duplicate every visible token.
+            if ((is_swa_group && tail_native_exact_swa) ||
+                    (!is_swa_group && exact_tokens >= visibility_window)) {
+                // A fully covered SWA group is a compact exact ring. Keep the
+                // requested body types only as planner inputs: the standard
+                // component omits them physically and allocates W + R exact
+                // rows, so no KVarN records or stage storage survive.
                 return std::make_unique<llama_kv_cache>(
-                        model, hparams, tail_type, tail_type,
+                        model, hparams, type_k, type_v,
                         v_trans, offload, unified, size, n_seq_max, n_pad,
                         n_swa, swa_type, nullptr, layer_filter, reuse, nullptr,
-                        n_ubatch, 0, tail_type, 0);
+                        n_ubatch, exact_tokens, tail_type, exact_requested,
+                        false, tail_rollback_tokens, exact_tokens);
             }
             // Structured KVarN records do not participate in cross-context
             // sharing, so cache_mem_other and share are intentionally omitted.
@@ -176,7 +183,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                     model, hparams, cache_kvarn, offload, unified,
                     size, n_seq_max, n_batch, n_ubatch, n_pad,
                     n_swa, swa_type, layer_filter, reuse,
-                    exact_tokens, tail_type, exact_requested);
+                    exact_tokens, tail_type, exact_requested, tail_rollback_tokens);
         }
 
         return std::make_unique<llama_kv_cache>(
@@ -184,7 +191,8 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                 v_trans, offload, unified, size, n_seq_max, n_pad,
                 n_swa, swa_type, cache_mem_other, layer_filter, reuse, share,
                 n_ubatch, n_swa > 0 ? tail_tokens_swa : tail_tokens, tail_type,
-                n_swa > 0 ? tail_tokens_swa_requested : tail_tokens_requested);
+                n_swa > 0 ? tail_tokens_swa_requested : tail_tokens_requested,
+                false, tail_rollback_tokens);
     };
 
     LLAMA_LOG_INFO("%s: creating non-SWA KV cache, size = %u cells\n", __func__, size_base);
@@ -447,6 +455,10 @@ bool llama_kv_cache_iswa::get_can_shift() const {
            kv_base->get_kv_size() == kv_swa->get_kv_size();
 }
 
+llama_memory_i::seq_rm_capability llama_kv_cache_iswa::get_seq_rm_capability() const {
+    return llama_memory_seq_rm_capability_all({ kv_base.get(), kv_swa.get() });
+}
+
 bool llama_kv_cache_iswa::state_seq_can_save(llama_seq_id seq_id) const {
     return kv_base->state_seq_can_save(seq_id) &&
            kv_swa->state_seq_can_save(seq_id);
@@ -541,6 +553,16 @@ bool llama_kv_cache_iswa_context::apply() {
     res = res & ctx_swa ->apply();
 
     return res;
+}
+
+void llama_kv_cache_iswa_context::graph_compute_start() {
+    ctx_base->graph_compute_start();
+    ctx_swa->graph_compute_start();
+}
+
+void llama_kv_cache_iswa_context::graph_compute_finish(ggml_status compute_status) {
+    ctx_base->graph_compute_finish(compute_status);
+    ctx_swa->graph_compute_finish(compute_status);
 }
 
 llama_memory_status llama_kv_cache_iswa_context::get_status() const {

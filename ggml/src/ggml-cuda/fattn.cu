@@ -361,15 +361,6 @@ bool ggml_cuda_fa_pair_compiled(ggml_type type_K, ggml_type type_V) {
 
 bool ggml_cuda_flash_attn_ext_tail_supported(
         ggml_type body_k, ggml_type body_v, ggml_type tail_k, ggml_type tail_v, int64_t d_k, int64_t d_v) {
-#if defined(GGML_USE_HIP)
-    GGML_UNUSED(body_k);
-    GGML_UNUSED(body_v);
-    GGML_UNUSED(tail_k);
-    GGML_UNUSED(tail_v);
-    GGML_UNUSED(d_k);
-    GGML_UNUSED(d_v);
-    return false;
-#else
     const bool body_supported = ggml_cuda_fattn_pair_compiled(body_k, body_v) ||
         (body_k == GGML_TYPE_IQ4_NL && body_v == GGML_TYPE_IQ4_NL);
     return body_supported &&
@@ -377,7 +368,6 @@ bool ggml_cuda_flash_attn_ext_tail_supported(
         (tail_v == GGML_TYPE_F16 || tail_v == GGML_TYPE_BF16) &&
         ggml_cuda_fattn_pair_compiled(tail_k, tail_v) &&
         d_k > 0 && d_k <= 512 && d_v > 0 && d_v <= 512;
-#endif
 }
 
 static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -398,6 +388,14 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_WMMA_F16 = 300,
     BEST_FATTN_KERNEL_MMA_F16  = 400,
 };
+
+// Internal hint used by the compact exact-tail pass. On pre-Ada tensor-core
+// GPUs, q=1 BF16 attention otherwise converts the complete K/V source to F16
+// on every token even though the compiled vector kernel consumes BF16
+// directly. The hint is applied only after the tail wrapper has produced an
+// aligned, contiguous pass that satisfies the ordinary vector eligibility
+// contract below.
+static constexpr int GGML_CUDA_FATTN_OP_PARAM_FORCE_VEC = 7;
 
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
@@ -498,6 +496,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         Q->ne[0] <= 512 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 &&
         K->ne[1] % FATTN_KQ_STRIDE == 0;
 
+    const bool force_vector_kernel =
+        ggml_get_op_params_i32(KQV, GGML_CUDA_FATTN_OP_PARAM_FORCE_VEC) != 0;
+    if (force_vector_kernel && turing_mma_available(cc) &&
+            can_use_vector_kernel && Q->ne[1] == 1 && Q->ne[3] == 1) {
+        return BEST_FATTN_KERNEL_VEC;
+    }
+
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
         if (can_use_vector_kernel) {
@@ -589,10 +594,11 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
 
     if (ggml_cuda_flash_attn_ext_kvarn_uses_views(dst)) {
-        GGML_ASSERT(ggml_cuda_flash_attn_ext_kvarn_supported(device, dst));
         // Descriptor-native KVarN does not need materialized F16 K/V buffers,
         // but the upstream MMA kernels still use the fixup workspace placed
         // after the output tensor when attention spans multiple KV batches.
+        // Allocation planning can run before backend route selection, so it
+        // must be structural and must not assert execution eligibility.
         const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
             ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, false, false);
         return f16_extra.end - (uintptr_t) dst->data;
@@ -654,20 +660,37 @@ static void ggml_cuda_flash_attn_ext_dispatch(ggml_backend_cuda_context & ctx, g
 static bool ggml_cuda_flash_attn_ext_tail_pass_supported(int device, const ggml_tensor * dst) {
     const ggml_tensor * qo = dst->src[8];
     const ggml_tensor * rd = dst->src[9];
+    const ggml_tensor * kt = dst->src[5];
+    const ggml_tensor * vt = dst->src[6];
+    const ggml_tensor * kt_current = dst->src[10];
+    const ggml_tensor * vt_current = dst->src[11];
     const int64_t tail_stride = dst->src[7]->ne[0];
+    const int64_t compute_stride = ggml_cuda_tail_compute_stride(tail_stride);
     const int64_t body_map_offset = 6 + tail_stride;
     if (!qo || !rd || qo->ne[0] <= 0 || qo->ne[1] <= 0 ||
             rd->ne[0] < body_map_offset || rd->ne[1] != qo->ne[1]) {
         return false;
     }
+    if ((kt_current == nullptr) != (vt_current == nullptr)) {
+        return false;
+    }
+    if (kt_current != nullptr &&
+            (kt_current->type != kt->type || vt_current->type != vt->type ||
+             kt_current->ne[0] != kt->ne[0] || vt_current->ne[0] != vt->ne[0] ||
+             kt_current->ne[1] != vt_current->ne[1] ||
+             kt_current->ne[2] != kt->ne[2] || vt_current->ne[2] != vt->ne[2] ||
+             kt_current->ne[3] != 1 || vt_current->ne[3] != 1 ||
+             kt->ne[1] + kt_current->ne[1] < tail_stride)) {
+        return false;
+    }
     ggml_tensor q = *dst->src[0];
     ggml_cuda_tail_make_contiguous(q, q.ne[0], qo->ne[0], q.ne[2], qo->ne[1], sizeof(float));
-    ggml_tensor k = *dst->src[5];
-    ggml_cuda_tail_make_contiguous(k, k.ne[0], dst->src[7]->ne[0], k.ne[2], qo->ne[1], ggml_type_size(k.type));
-    ggml_tensor v = *dst->src[6];
-    ggml_cuda_tail_make_contiguous(v, v.ne[0], dst->src[7]->ne[0], v.ne[2], qo->ne[1], ggml_type_size(v.type));
+    ggml_tensor k = *kt;
+    ggml_cuda_tail_make_contiguous(k, k.ne[0], compute_stride, k.ne[2], qo->ne[1], ggml_type_size(k.type));
+    ggml_tensor v = *vt;
+    ggml_cuda_tail_make_contiguous(v, v.ne[0], compute_stride, v.ne[2], qo->ne[1], ggml_type_size(v.type));
     ggml_tensor mask = *dst->src[7];
-    ggml_cuda_tail_make_contiguous(mask, mask.ne[0], qo->ne[0], 1, qo->ne[1], sizeof(half));
+    ggml_cuda_tail_make_contiguous(mask, compute_stride, qo->ne[0], 1, qo->ne[1], sizeof(half));
     ggml_tensor pass = *dst;
     pass.src[0] = &q;
     pass.src[1] = &k;
@@ -678,11 +701,12 @@ static bool ggml_cuda_flash_attn_ext_tail_pass_supported(int device, const ggml_
         pass.src[i] = nullptr;
     }
     ggml_cuda_tail_make_contiguous(pass, pass.ne[0], pass.ne[1], qo->ne[0], qo->ne[1], sizeof(float));
-    // Tails up to one native KVarN group use the direct indexed-small kernel
+    // Compact decode tails up to two native KVarN groups use the direct
+    // indexed-small kernel
     // below, so they do not need to satisfy the padded upstream FA geometry.
     // This matters for D512, whose generic FA route requires a 256-token KV
     // stride even though the direct exact-tail kernel supports 128 tokens.
-    if (tail_stride > 128 &&
+    if (tail_stride > 256 &&
             ggml_cuda_get_best_fattn_kernel(device, &pass) == BEST_FATTN_KERNEL_NONE) {
         return false;
     }
@@ -713,12 +737,21 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
     const bool has_exact_tail = dst->src[5] != nullptr && dst->src[6] != nullptr && dst->src[7] != nullptr &&
         dst->src[8] != nullptr && dst->src[9] != nullptr;
+    const bool uses_kvarn = ggml_cuda_flash_attn_ext_kvarn_uses_views(dst);
+    const bool portable_kvarn_tail = uses_kvarn && has_exact_tail &&
+        ggml_cuda_flash_attn_ext_kvarn_direct_tail_supported(ctx.device, dst);
+    if (portable_kvarn_tail) {
+        if (!ggml_cuda_flash_attn_ext_kvarn(ctx, dst)) {
+            GGML_ABORT("unsupported portable KVarN exact-tail FlashAttention route");
+        }
+        return;
+    }
     if (has_exact_tail) {
         ggml_cuda_flash_attn_ext_tail(ctx, dst);
         return;
     }
 
-    if (ggml_cuda_flash_attn_ext_kvarn_uses_views(dst)) {
+    if (uses_kvarn) {
         if (!ggml_cuda_flash_attn_ext_kvarn(ctx, dst)) {
             GGML_ABORT("unsupported KVarN CUDA FlashAttention route");
         }
@@ -731,6 +764,12 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     const bool has_exact_tail = dst->src[5] != nullptr && dst->src[6] != nullptr && dst->src[7] != nullptr &&
         dst->src[8] != nullptr && dst->src[9] != nullptr;
+    const bool uses_kvarn = ggml_cuda_flash_attn_ext_kvarn_uses_views(dst);
+    const bool portable_kvarn_tail = uses_kvarn && has_exact_tail &&
+        ggml_cuda_flash_attn_ext_kvarn_direct_tail_supported(device, dst);
+    if (portable_kvarn_tail) {
+        return ggml_cuda_flash_attn_ext_kvarn_supported(device, dst);
+    }
     if (has_exact_tail) {
         if (!ggml_cuda_flash_attn_ext_tail_supported(
                     dst->src[1]->type, dst->src[2]->type, dst->src[5]->type, dst->src[6]->type,
@@ -741,7 +780,7 @@ bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
         return true;
     }
 
-    if (ggml_cuda_flash_attn_ext_kvarn_uses_views(dst)) {
+    if (uses_kvarn) {
         return ggml_cuda_flash_attn_ext_kvarn_supported(device, dst);
     }
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;

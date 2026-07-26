@@ -1,68 +1,28 @@
 # Changelog
 
+## v0.4.1
+
+- Extended native KVarN attention beyond the optimized NVIDIA CUDA path. CPU and Vulkan consume compressed records directly for advertised shapes, while HIP/ROCm uses capability-driven routing across native generic MMA, physical-wave split/vector decode, and portable direct-record attention. HIP selects wave32 or wave64 kernels for WHT, store, and attention, includes explicit RDNA/CDNA wide-MMA configurations and a CDNA-safe softmax fallback, and retains materialization for unsupported shapes or features. CPU placement works with KV offload disabled; Vulkan native attention requires shader Int64 and buffer-device-address support. CUDA and ROCm release builds explicitly enable the shared KVarN kernels, while KVarN-off builds retain link-safe false capability stubs and do not export unavailable store telemetry. The backend-query declarations, static checks, and memory mocks were updated for fatal-warning and test builds. Adding `GGML_OP_KVARN_MATERIALIZE` advances the RPC protocol patch version to 4.0.4.
+- Reduced KVarN host checkpoint stalls for large exact tails by serializing component-major contiguous slot runs instead of issuing one backend transfer per payload row. A normal 4096-token tail now takes 32-64 host tensor operations instead of 131,072. KVarN state format v13 preserves all exact-tail bytes and supports transactional host/on-device state, including wrapped on-device restores, plus compatible v12 reads while exposing debug-level transfer-count diagnostics.
+- Kept small speculative verification batches on CUDA's native KVarN attention path instead of materializing the full active K/V window. CUDA now reports its rotated-query capacity to the model graph through 16 tokens. Single-token generation retains the split/vector decode kernels, while multi-token verification uses tiled descriptor-native MMA so each decoded K/V tile is reused across query rows and does not create the split kernel's context-sized per-query partial output. Rotated-record loads now distribute reconstruction across the full CTA, cache K/V axes per record, decode packed value and key pairs cooperatively, and use an adaptive 128-column tile for Q9-Q16/GQA>4 when the device's opt-in shared-memory limit and measured kernel occupancy allow it; unsupported devices retain the 64-column fallback. Larger batches retain the native prefill route. This applies uniformly to DFlash, MTP, EAGLE3, and n-gram speculation. CUDA builds with dedicated KVarN kernels disabled also retain complete false capability stubs and link cleanly.
+- Fixed portable-backend KVarN prompt processing and Vulkan long-context decode. CPU, HIP, and Vulkan now materialize large query batches into their tiled standard FlashAttention path instead of running prompt prefill through the scalar direct-record shader; one-row decode and Vulkan batches through 16 rows remain native, while CUDA retains its descriptor-native prefill route. Vulkan direct decode now reuses each K/V reconstruction across groups of up to four GQA heads, applies split-K when the query/head grid under-occupies the device, reuses shared K/V indices, and uses subgroup reductions.
+- Reworked Vulkan KVarN execution around explicit backend-native routes. Compact bodyless F16/BF16 tails use validated native attention for supported head dimensions and short query batches; mixed compressed-body plus exact-tail inputs use explicit materialization followed by standard tiled FlashAttention. Large dense prefill stores validate and quantize records in parallel using reusable cache workspace, D256/D512 transforms use full-head workgroups when the device permits them, and materialization resolves each stream's live descriptor once per dispatch instead of once per output workgroup. Route counters, bounded diagnostics, synchronized Vulkan timestamp profiling, and backend-private transient-memory accounting make native, materialized, and fail-closed outcomes observable without changing CUDA/HIP routing. `llama-bench --kv-memory` selects telemetry from the benchmark device, consumes the complete versioned route ABI, and takes synchronized Vulkan allocation checkpoints; Vulkan memory-budget queries saturate safely when driver-reported heap usage temporarily exceeds its budget.
+- Reduced KV precision-tail memory and made routing authoritative per layer. Persistent exact storage is `N + rollback` rows, or `W + rollback` rows with no compressed body when an exact tail fully covers its SWA window, instead of a ubatch-sized arena rounded to a FlashAttention tile. Current K/V rows and execution alignment now use graph-local workspaces. One execution descriptor drives allocation, graph construction, graph identity, backend validation, and telemetry, so the final fused attention operation must support its planned native route or fail closed instead of moving silently to CPU. `llama-bench --kv-memory` reports exact-history, rollback-reserve, persistent, transient, and peak bytes together with native-bodyless, native-mixed, device-fallback, and CPU layer counts.
+- Made compact-tail updates and speculative rollback transactional. Memory implementations now advertise full-clear, arbitrary-range, and bounded suffix-removal capabilities through `llama_memory_get_seq_rm_capability`; the common layer no longer probes support by decoding and clearing dummy tokens, and the server chooses checkpoints when a speculative rollback exceeds the advertised reserve. Graph completion commits or invalidates pending compact-tail metadata, negative indexed writes are ignored consistently across backends, and bodyless full-SWA attention preserves independent planner masks and full/SWA query order. Sequence-state precision-tail manifest v3 records the compact representation and rollback horizon, rejects incompatible or corrupt payloads before mutation, and exposes degraded invalid-payload coverage; older compatible precision-tail manifests remain readable.
+- Added ffmpeg and ffprobe to every released server runtime image, including CPU, CUDA, ROCm, Vulkan, and SYCL variants, so builds produced with `MTMD_VIDEO=ON` can process MP4/WebM uploads instead of failing after still-image decoding succeeds.
+
 ## v0.4.0
 
-- Updated the llama.cpp base through upstream commit `32e789fdf`. This includes
-  EAGLE3 and expanded MTP support; new multimodal models and video input;
-  LFM2/LFM2.5 tool parsing; router, API, and Web UI updates; the ET-SOC backend;
-  and updates across the existing compute backends.
-- Added KVarN target-context KV-cache compression through `--cache-type-k` and
-  `--cache-type-v` values `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`, `kvarn6`,
-  and `kvarn8`. It supports independent K/V widths, Qwen3.6 and Gemma 4,
-  unified and non-unified caches, separate SWA cache types, CPU/CUDA stores,
-  and native CUDA FlashAttention. Draft and auxiliary contexts continue to use
-  standard cache types; unsupported placements fail closed or use an explicit
-  bit-width-matched fallback.
-- The standard KV-cache surface now includes `q2_0`, `q2_1`, `q3_0`, `q3_1`,
-  and `q6_1` alongside `q6_0`, with CPU/CUDA quantization,
-  `SET_ROWS`/`GET_ROWS`, CUDA MMQ/vec-dot, and FlashAttention vector coverage.
-  Cache-facing `q2_0` uses `GGML_TYPE_Q2_0S`, keeping it distinct from
-  upstream's serialized Q2_0 weight format.
-- New KV cache precision tail (KVCPT) controls `--kv-tail-tokens` and `--kv-tail-type` keep the newest
-  attention-visible entries exact in F16 or BF16 for standard quantized and
-  KVarN target caches. Partial tails use compact overlays and fully covered
-  groups can use native exact storage. Tail routing respects attention bias and
-  cache placement, while state save/restore, prompt-cache reuse, sequence
-  operations, and server handoff preserve the same model. Restores are
-  transactional, and incompatible v0.3.1 sessions fail closed.
-- Scoped `--cache-ram` to prompt-cache storage instead of active context
-  checkpoint policy. Prompt-cache saves are byte-counted against the host
-  budget before commit, KV rollback aligns to multimodal chunk boundaries,
-  text-only slot save/restore works when an mtmd projector is loaded, and MTP
-  prompt-cache reuse no longer requires regular checkpoints.
-- Replaced the fork DFlash implementation with upstream `draft-dflash`.
-  The speculative type uses upstream's `draft-dflash` name, and draft GGUFs
-  must use upstream's `dflash` architecture, metadata keys, tensor names, and
-  tokenizer contract. Bee retains a default-on profit-based draft-depth
-  controller and reasoning-loop guard while using upstream token, sampler, and
-  checkpoint behavior. Without `--spec-draft-n-max`, the draft limit comes
-  from `dflash.block_size - 1`; an explicit value takes precedence.
-- Removed TurboQuant/TCQ cache formats, TQ3/TQ4 weight formats, DDTree,
-  CopySpec, the fork DFlash ring/capture/tape and reduced-verifier paths, the
-  fringe controller, and their private arguments and environment variables.
-  The `turbo2`, `turbo3`, and `turbo4` cache names, including TCQ variants,
-  warn and redirect by width to KVarN for target caches or a standard low-bit
-  type for draft caches. Legacy TQ GGUF type IDs fail with a re-quantization
-  error; `copyspec`, `suffix`, and `recycle` fail with migration guidance to
-  `draft-dflash` or upstream n-gram modes.
-- Replaced the CUDA FlashAttention quant build policy with 50 standard vector
-  pairs and 15 balanced KVarN fast-decode pairs by default. Standard quant
-  pairs follow the KVarN bit-pair rules; homogeneous F16 and BF16 pairs retain
-  native precision-tail support.
-  `GGML_CUDA_FA_ALL_QUANTS=ON` expands these to 169 standard pairs and all 36
-  ordered KVarN pairs. The default-on `GGML_CUDA_KVARN` option is the single
-  KVarN compilation gate for CUDA and HIP; disabling it omits the dedicated
-  kernels and template instances.
-- Hardened server control and router APIs. `/v1/chat/completions/control`
-  reports success only when an active reasoning sampler accepts the transition.
-  `GET /models` is read-only and sanitized; authenticated refresh uses
-  `POST /models/reload`. Hugging Face tokens reach child processes only through
-  `HF_TOKEN` and are excluded from arguments, presets, logs, and responses.
-- Updated release packaging with CUDA 12.4/13.1 assets, upstream-DFlash and
-  KVarN container metadata, ROCm/HIP shuffle compatibility, Windows CPU OpenMP
-  runtime packaging, and updated Intel SYCL images. Every platform build,
-  package, container, and publication step uses the same resolved source SHA;
-  publication stops if the selected branch or tag moves.
+- Updated the llama.cpp base through upstream commit `32e789fdf`. This includes EAGLE3 and expanded MTP support; new multimodal models and video input; LFM2/LFM2.5 tool parsing; router, API, and Web UI updates; the ET-SOC backend; and updates across the existing compute backends.
+- Added KVarN target-context KV-cache compression through `--cache-type-k` and `--cache-type-v` values `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`, `kvarn6`, and `kvarn8`. It supports independent K/V widths, Qwen3.6 and Gemma 4, unified and non-unified caches, separate SWA cache types, CPU/CUDA stores, and native CUDA FlashAttention. Draft and auxiliary contexts continue to use standard cache types; unsupported placements fail closed or use an explicit bit-width-matched fallback.
+- The standard KV-cache surface now includes `q2_0`, `q2_1`, `q3_0`, `q3_1`, and `q6_1` alongside `q6_0`, with CPU/CUDA quantization, `SET_ROWS`/`GET_ROWS`, CUDA MMQ/vec-dot, and FlashAttention vector coverage. Cache-facing `q2_0` uses `GGML_TYPE_Q2_0S`, keeping it distinct from upstream's serialized Q2_0 weight format.
+- New KV cache precision tail (KVCPT) controls `--kv-tail-tokens` and `--kv-tail-type` keep the newest attention-visible entries exact in F16 or BF16 for standard quantized and KVarN target caches. Partial tails use compact overlays and fully covered groups can use native exact storage. Tail routing respects attention bias and cache placement, while state save/restore, prompt-cache reuse, sequence operations, and server handoff preserve the same model. Restores are transactional, and incompatible v0.3.1 sessions fail closed.
+- Scoped `--cache-ram` to prompt-cache storage instead of active context checkpoint policy. Prompt-cache saves are byte-counted against the host budget before commit, KV rollback aligns to multimodal chunk boundaries, text-only slot save/restore works when an mtmd projector is loaded, and MTP prompt-cache reuse no longer requires regular checkpoints.
+- Replaced the fork DFlash implementation with upstream `draft-dflash`. The speculative type uses upstream's `draft-dflash` name, and draft GGUFs must use upstream's `dflash` architecture, metadata keys, tensor names, and tokenizer contract. Bee retains a default-on profit-based draft-depth controller and reasoning-loop guard while using upstream token, sampler, and checkpoint behavior. Without `--spec-draft-n-max`, the draft limit comes from `dflash.block_size - 1`; an explicit value takes precedence.
+- Removed TurboQuant/TCQ cache formats, TQ3/TQ4 weight formats, DDTree, CopySpec, the fork DFlash ring/capture/tape and reduced-verifier paths, the fringe controller, and their private arguments and environment variables. The `turbo2`, `turbo3`, and `turbo4` cache names, including TCQ variants, warn and redirect by width to KVarN for target caches or a standard low-bit type for draft caches. Legacy TQ GGUF type IDs fail with a re-quantization error; `copyspec`, `suffix`, and `recycle` fail with migration guidance to `draft-dflash` or upstream n-gram modes.
+- Replaced the CUDA FlashAttention quant build policy with 50 standard vector pairs and 15 balanced KVarN fast-decode pairs by default. Standard quant pairs follow the KVarN bit-pair rules; homogeneous F16 and BF16 pairs retain native precision-tail support. `GGML_CUDA_FA_ALL_QUANTS=ON` expands these to 169 standard pairs and all 36 ordered KVarN pairs. The default-on `GGML_CUDA_KVARN` option is the single KVarN compilation gate for CUDA and HIP; disabling it omits the dedicated kernels and template instances.
+- Hardened server control and router APIs. `/v1/chat/completions/control` reports success only when an active reasoning sampler accepts the transition. `GET /models` is read-only and sanitized; authenticated refresh uses `POST /models/reload`. Hugging Face tokens reach child processes only through `HF_TOKEN` and are excluded from arguments, presets, logs, and responses.
+- Updated release packaging with CUDA 12.4/13.1 assets, upstream-DFlash and KVarN container metadata, ROCm/HIP shuffle compatibility, Windows CPU OpenMP runtime packaging, and updated Intel SYCL images. Every platform build, package, container, and publication step uses the same resolved source SHA; publication stops if the selected branch or tag moves.
 
 ## v0.3.2
 

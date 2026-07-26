@@ -47,15 +47,18 @@ fast-decode pairs in the standard build and all 36 ordered pairs when
 
 ## Attention decision
 
-The implementation uses body/tail partials with one global softmax. Each query
-uploads up to `N` physical shadow indices. The generic route gathers those
-rows, masks the corresponding quantized body rows, concatenates logits, runs
-one FP32 softmax, and then combines body and tail V products.
+The implementation uses body/history/current partials with one global softmax.
+Each query uploads up to `N` committed exact-history indices plus its causal
+current-ubatch rows. The generic route gathers the shared history payload,
+masks the corresponding quantized body rows, concatenates logits, runs one
+FP32 softmax, and combines the V products. It never creates a separate
+`[heads, sources, queries]` K/V payload.
 
 CUDA avoids graph-level query-by-query K/V materialization. Ordinary
 FlashAttention writes its final `(row max, denominator)` metadata, and a fused
-indexed tail kernel reads the persistent compact K/V pool plus the per-query
-slot map. It accumulates the exact BF16 or F16 contribution into the same FP32
+segmented tail kernel reads the persistent compact K/V pool and graph-local
+current K/V plus the per-query descriptor. It accumulates both exact segments
+into the same FP32
 normalization state. Tail work and scratch therefore scale with `N`, not the
 64K body, query count times pool payload, or unused capacity. IQ4_NL uses the
 MMA body route and a view-aware non-contiguous IQ4-to-F16 converter; it does not
@@ -87,10 +90,12 @@ oracles cover this boundary.
 
 ## Ownership and lifecycle
 
-The quantized body is written eagerly for every token. Exact payload slots use
-`(stream, cell, generation)` identities, per-sequence recent membership, and
-reference counts. Current-ubatch entries remain available as rollback reserve;
-the next preparation trims committed history to the configured length. A
+The quantized body is written through its existing safe path. Exact payload
+slots use `(stream, cell, generation)` identities, per-sequence recent
+membership, and reference counts. Current-ubatch K/V remains graph-local until
+attention has consumed the old history, then an ordered node commits it to the
+ring. A successful graph commits prepared host metadata; a failure after a
+possible compact write invalidates every affected stream. A
 cross-stream sequence copy remaps identities and copies only live exact rows.
 Cache clearing, removal, keep, add, divide, state restore, cell recycling, and
 RoPE position shift update both representations.
@@ -101,23 +106,17 @@ them; coverage and state-size queries account for pending work without
 synchronizing, while state-data save materializes it with at most one batched
 barrier.
 
-Persistent capacity is
-`round_up(N + n_ubatch, 256) * n_seq_max + sink_slots`, where `N` is the
-resolved standard-tail length and `sink_slots` is `n_ubatch` when more than one
-logical sequence is configured, otherwise zero. `N + n_ubatch` is each
-sequence's active-plus-in-flight arena; rounding it to 256 is allocation
-padding. Sink slots are a separate reserve and are not part of that padding.
-Payload tensors are allocated once for CUDA graph address stability. Only a
-quantized side receives a shadow, and each logical sequence owns a distinct
-exact arena even when the ordinary body is unified.
+Compact persistent capacity is `(N + R) * n_seq_max`, where `N` is the resolved
+tail and `R` is the promised suffix-rollback horizon. The physical ubatch `U`
+sizes only the graph-local current segment and transient attention workspace.
+Payload tensors remain address-stable for CUDA graphs, but neither `U` nor
+256-row logical padding is multiplied across layers. Each logical sequence owns
+a distinct exact history even when the ordinary body is unified.
 
-The reserve boundary is the physical ubatch, not the logical batch. Prompt
-ubatches execute sequentially, so a completed ubatch is trimmed to N before
-the next graph; speculative verification and its rollback snapshots remain in
-one scheduler ubatch. DSV4 sizes this bound for its maximum coupled-sequence
-raw-row fanout. Retaining `n_batch` rows was rejected because it adds a large,
-N-independent persistent allocation without extending the supported rollback
-contract.
+Partial SWA retains its compressed `W + U` body and adds `N + R` exact rows.
+Full-window SWA instead owns a bodyless `W + R` exact ring. Rollback through
+`R` is exact; a larger suffix removal is rejected before mutation so the caller
+can restore a checkpoint. `R` is never inferred from `U`.
 
 Cell-local removal updates only that sequence's membership, preserving shared
 exact rows for other sequences. Range copies/removals and partial position
@@ -133,17 +132,18 @@ lifecycle tests before it can be enabled.
 ## State format
 
 Length zero retains the preceding unframed body format. A positive tail or an
-explicit body-only export uses sequence-state framing version 2 and a local
-precision-tail manifest version 2. The manifest validates structural group identity,
-body/tail byte lengths, resolved length, representation, layer layout, payload
-counts, and F16/BF16 type before logical metadata is installed. Tail rows can
+explicit body-only export uses a local precision-tail manifest version 3. The
+manifest validates structural group identity, body/tail byte lengths, resolved
+length, compact representation, rollback horizon, layer layout, payload counts,
+and F16/BF16 type before logical metadata is installed. Tail rows can
 be transferred by the host or `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE` tensor
 protocol; F16 and BF16 are not converted during restore. Metadata-only owners,
 including KVarN-backed components, still restore identities even when they own
 no standard tail tensors.
 
-The reader accepts the preceding unframed body-only payload and framed tail
-manifest version 1. Version 1 has no complete provenance, so it restores with
+The reader accepts the preceding unframed body-only payload. Manifest version 2
+remains valid for legacy non-compact representations; compact contexts require
+version 3 metadata. Version 1 has no complete provenance, so it restores with
 conservative degraded coverage and cannot upgrade itself to exact. Body-only
 state likewise reports `LLAMA_KV_TAIL_DEGRADED_BODY_ONLY_STATE` until original
 activations refill the tail. Tail-bearing state rejects a disabled, differently

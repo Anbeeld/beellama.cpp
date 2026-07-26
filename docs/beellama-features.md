@@ -17,9 +17,10 @@ never enlarges that logical exact suffix.
 
 ### When to use it
 
-Use KVarN when CUDA KV-cache memory is the limiting resource and the model has a
-supported attention layout. Start with `kvarn4` on both sides, then measure the
-quality and speed of the exact model and context you plan to serve.
+Use KVarN when persistent KV-cache memory is the limiting resource and the model
+has a supported attention layout. Start with `kvarn4` on both sides, then
+measure the quality and speed of the exact model, backend, and context you plan
+to serve.
 
 ### Key arguments
 
@@ -38,7 +39,9 @@ structural group IDs use the same group resolution as standard-cache tails.
 F16 is the paper-faithful KVarN default. Standard quantized tails default to
 BF16. Either cache family accepts an explicit F16 or BF16 override.
 A request covering the whole group uses one native F16/BF16 cache instead of
-allocating compressed records plus a redundant exact overlay.
+allocating compressed records plus a redundant exact overlay. For SWA this is
+a compact `W + R` ring; it does not retain the physical `W + U` execution
+reserve as persistent exact payload.
 
 ### Measurement and validation
 
@@ -47,11 +50,17 @@ as the intended workload. Keep both `-b` and `-ub` identical between baseline
 and candidate runs. Record the model file, command, prompt or corpus, sampling
 settings, GPU, and commit with every result.
 
-The CUDA specialized split and SWA-vector decode routes publish the same
-optional FP32 `(maximum, denominator)` metadata as upstream FlashAttention.
-An attached precision tail therefore does not force KVarN through the generic MMA
-fallback. `llama-bench` reports requested and effective tail sizes plus split,
-vector, generic, and prefill route counts so this remains observable.
+The CUDA specialized split, SWA-vector, and tiled descriptor-native MMA routes
+publish the same optional FP32 `(maximum, denominator)` metadata as upstream
+FlashAttention. Single-token generation uses split/vector decode, while short
+multi-token verification uses tiled MMA to reuse decoded K/V tiles across query
+rows. Q9-Q16 batches with GQA above four use a fused 128-column tile when the
+concrete kernel fits the device's opt-in shared-memory budget and has nonzero
+measured occupancy; all other devices and shapes retain the regular tile
+matrix. An attached precision tail therefore does not force KVarN away from its
+shape-selected native route. `llama-bench` reports requested and effective
+tail sizes plus split, vector, generic, and prefill route counts so this remains
+observable.
 
 The July 2026 RTX 3090 / CUDA 13.1 recovery run used the Qwen 3.6 27B Q5_K_S
 and Gemma 4 31B Q5_K_S models, `-b 2048 -ub 512`, 128 decode tokens, and five
@@ -67,9 +76,9 @@ BF16 median at the same depth:
 
 No accepted KVarN row used generic MMA fallback. Qwen used split decode;
 Gemma request-zero exercised both D512 split and D256 SWA-vector decode. A
-requested 1024-token tail promotes Gemma's fully covered SWA group to native
-exact storage, explaining why that row can be faster than its request-zero
-mixed compressed/exact route.
+requested 1024-token tail covers Gemma's SWA group with native-exact storage.
+These ratios predate compact current-source storage and are retained as baseline
+evidence, not as a performance claim for the current implementation.
 
 `llama-bench --kv-memory` enables synchronized CUDA checkpoints and cache-owned
 component accounting. It is intentionally opt-in and excluded from speed runs.
@@ -94,21 +103,75 @@ Qwen 16K to 64K, exact and staging residency stay constant, compressed K and V
 each grow by 420 MiB, and transient high-water grows by only 18.14 MiB; no
 full-context exact mirror or unexpected context-sized metadata was found.
 
-Native-exact promotion is reported separately from compact exact-overlay bytes.
+Compact native-exact storage is reported separately from compact exact-overlay
+bytes, including exact-history, rollback-reserve, and transient estimates.
 CUDA allocation remainders are also reported with their sign: positive values
 are non-KV scheduler/graph/backend reservations, while negative values denote
 allocator reuse/overlap or driver-baseline release rather than negative cache
 ownership. Repeated grouped contexts showed only bounded first-use CUDA
 reservation and zero cumulative per-context growth.
 
-### Known limitations
+### Backend support and limitations
 
-KVarN is target-context-only and v0.4.0 enables native placement only on a CUDA
-device that passes the kernel capability checks. CPU execution is not native.
-Vulkan contains the store operation but deliberately reports native KVarN as
-unsupported until Vulkan FlashAttention consumes KVarN views. Unsupported or
-partially offloaded placements fail closed; draft and auxiliary contexts must
-use standard cache types.
+KVarN is target-context-only. CUDA uses its optimized descriptor-native
+FlashAttention kernels. ROCm/HIP selects between record-tiled split decode,
+generic descriptor-native WMMA/MFMA, and a portable direct-record kernel. CPU
+has a backend-native direct-record attention path. Vulkan directly consumes
+compressed records for body-only inputs and consumes compact bodyless
+F16/BF16 tails for head dimensions 128, 256, and 512 with query batches through
+16 rows. A Vulkan layer with both a compressed body and an exact tail instead
+materializes the body and uses the backend's standard tiled FlashAttention
+path. That policy is intentional: hardware measurements found the mixed direct
+shader slower than the materialized upstream-style route. Matrix-capable HIP
+and CUDA retain descriptor-native large-batch prefill. Larger portable-only
+query batches likewise materialize the rotated K/V body. Vulkan requires
+shader Int64 and buffer-device-address support. CPU placement is valid with KV
+offload disabled.
+
+| HIP architecture | Physical wave | Native KVarN route |
+|---|---:|---|
+| RDNA3, RDNA3.5, RDNA4 | 32 | WMMA generic/prefill and occupancy-selected split decode |
+| CDNA1-CDNA4 | 64 | MFMA generic/prefill and physical-wave split decode |
+| Older GCN, RDNA1, RDNA2 | device default | Portable direct-record attention |
+
+CDNA fast routing is compiled and selected by capability but remains
+experimental until hardware parity and performance results are published.
+MUSA explicitly remains on the portable route.
+
+Vulkan direct decode groups up to four GQA query heads per reconstructed K/V
+head and uses split-K when the query/head grid alone cannot occupy the device.
+Its split partials are reduced through the standard Vulkan FlashAttention
+reducer, including attention sinks and exact-tail contributions.
+
+For large dense prompt blocks, Vulkan validates per-stream record ownership on
+the device and performs WHT, quantization, and record commit in parallel. The
+route starts at 384 tokens per stream and reuses the cache conversion workspace
+rather than adding a new peak allocation. Invalid or non-dense layouts use the
+monolithic store fallback. Devices that permit 256- or 512-thread workgroups
+use a full-head WHT shader; other devices keep the portable 128-thread path.
+Both paths use physical subgroup operations and support subgroup widths 32 and
+64. Vulkan materialization prepares the live history/current descriptor once
+per stream before expanding output rows.
+
+Set `GGML_KVARN_DEBUG_ROUTES=1` for bounded route diagnostics and
+`GGML_VK_PERF_LOGGER=1` for synchronized per-operator Vulkan timestamps.
+The route telemetry distinguishes native attention, explicit materialization,
+parallel and monolithic stores, and rejected shapes.
+
+`llama-bench --kv-memory` resolves route and transient-memory telemetry from the
+configured benchmark device rather than the first loaded backend. Its JSONL
+output includes the complete versioned route counters and synchronized device
+allocation checkpoints. The historical `cuda_used_*` field names remain for
+harness compatibility, but contain the selected device's values on Vulkan.
+Vulkan reports backend-private KVarN workspace separately from graph-planned
+transient bytes and clamps `VK_EXT_memory_budget` availability to the physical
+heap, including the valid high-pressure case where reported usage exceeds the
+current budget.
+
+Each selected layer must be owned by a backend that implements KVarN store and
+attention, or an explicitly supported materialization fallback. Unsupported or
+tensor-split placements fail closed; draft and auxiliary contexts use standard
+cache types.
 
 ## Standard low-bit KV caches
 
@@ -151,13 +214,13 @@ build tier.
 The KV cache precision tail (KVCPT), set with `--kv-tail-tokens`, makes the newest
 attention-visible entries exact in F16 or BF16 for standard quantized and KVarN
 target caches. A partial request overlays
-a compact exact shadow while retaining the complete selected quantized cache.
+a compact `N + R` exact-history ring while retaining the complete selected
+quantized cache; current-ubatch K/V is a separate graph-local exact source.
 A standard quantized tail defaults to BF16, while a KVarN tail defaults to F16;
 `--kv-tail-type` can explicitly select either representation for either family.
-A request covering a group's full
-visibility window may instead promote its owned body to native F16/BF16 when
-that representation is supported and its memory increment is no greater than
-the overlay. Shared standard bodies are never promoted. Source selection is
+A request covering an SWA group's full visibility window uses a bodyless
+compact-native `W + R` F16/BF16 ring when the segmented route is supported.
+Non-SWA full-context groups keep their established representation. Source selection is
 per query, so a 512-token prefill does not make the same 512 rows exact for
 every query. Body and tail logits share one FP32 softmax; the runtime does not
 normalize two attention results independently.
@@ -168,14 +231,27 @@ an architecture-name allowlist. A biased layer never selects a native route
 that cannot consume its bias, and graph construction rejects any mismatch
 between the recorded route and the actual bias tensor.
 
-The overlay shadow pool is owned by the standard cache and identifies rows by
+The exact-history pool is owned by the standard cache and identifies rows by
 stream, physical cell, and generation. Sequence copies share exact rows within
 one stream and copy them into context-local slots across streams. Position
 shifts rotate exact K rows together with the quantized body. CUDA can read the
-compact pool directly through per-query slot indices and merge against ordinary
-FlashAttention normalization metadata; the generic graph gathers only the
-configured compact tail width. Neither overlay route materializes the full
-cache. Native-exact groups use the ordinary body graph and allocate no shadow.
+compact pool and current K/V directly through per-query descriptors and merge
+against ordinary FlashAttention normalization metadata. The generic graph
+composes persistent history and current K/V on the owning device, then gathers
+the bounded per-query source union needed by the ordinary attention operators.
+That fallback can duplicate graph-local source rows across a physical ubatch,
+but never changes persistent capacity or materializes the full context.
+Compact-native SWA allocates no compressed body.
+
+Allocation, graph construction, graph identity, backend validation, and memory
+telemetry consume one per-layer execution descriptor. It records the realized
+body and exact types, body/bodyless representation, graph-local current
+segment, padded body execution extent, explicit-bias requirement, owner device,
+and selected route. A native route is checked against
+`ggml_backend_dev_supports_op()` on the final fused operation, after all
+descriptors and current sources are attached. Unsupported native shapes fail
+closed before scheduling rather than appearing later as CPU/CUDA split
+boundaries.
 
 Exact overlays support the normal `--split-mode layer` ownership model: each
 body and its K/V shadows are allocated on that layer's owning device, and graph
@@ -216,19 +292,12 @@ KVarN while SWA layers use a warned standard-cache fallback; a fail-closed
 preset rejects the context instead. Unified or single-slot layouts can retain
 KVarN in both groups when otherwise eligible.
 
-SWA storage remains upstream-aligned at `W + U` physical rows (window plus
-ubatch reserve); this feature does not compact the SWA ring. Sparse packing of
-generic body rows is enabled only when the complete physical stream fits in the
-per-sequence arena, so cached-graph eligibility cannot change with occupancy,
-restore, or coverage degradation. Outside that bound the ordinary body route is
-used.
-
-Standard exact storage allocates
-`round_up(N + n_ubatch, 256) * n_seq_max + sink_slots` rows. The rounded term is
-one active-plus-in-flight arena per logical sequence; `sink_slots` is a separate
-multi-sequence reserve. Unified ordinary body storage does not merge these
-logical exact arenas. Positive K-only MLA and DSA overlays are rejected during
-context creation in this release.
+Partial SWA storage retains its upstream-aligned compressed `W + U` body, but
+its persistent exact history is `(N + R) * S` rows. Full-window SWA omits that
+body and stores `(W + R) * S` exact rows. `U` controls only graph-local current
+K/V and transient workspace; backend byte alignment does not add logical rows.
+Unified ordinary body storage does not merge these logical exact histories.
+Positive K-only MLA and DSA overlays are rejected during context creation.
 
 ### When to use it
 
@@ -262,19 +331,20 @@ KVarN-specific workspace, attention, and state decisions are in
 
 For standard caches, the default length is zero and preserves the ordinary
 topology. KVarN always resolves at least its intrinsic 128-token suffix.
-Sequence-state framing version 2 writes a validated KV-tail manifest and can
+Sequence state writes validated KV-tail manifest version 3 and can
 transfer tail tensors through host buffers or the on-device tensor protocol.
 Overlay states reject a different structural group, resolved length,
-representation, KVarN preset, or F16/BF16 type before mutation. Manifest
-version 1 remains readable with conservative degraded provenance; it cannot
+representation, rollback horizon, KVarN preset, or F16/BF16 type before
+mutation. Manifest version 2 remains readable for legacy non-compact layouts;
+version 1 remains readable with conservative degraded provenance and cannot
 upgrade incomplete historical evidence to exact. Native-exact state is already
 present in the ordinary body and has no duplicate shadow section. Standard
 body-only compatibility state and explicit body-only state begin with
 observable degraded coverage and refill from original activations on later
 writes. Sequence copies publish body membership and positions immediately;
 deferred exact rows materialize in one batch when state data or another direct
-consumer needs them. KVarN state version 12 stores logical compressed records
-plus exact payloads and remaps physical workspace on restore; version 11 is
+consumer needs them. KVarN state version 13 stores logical compressed records
+plus compact exact payloads and remaps transient workspace on restore; version 11 is
 rejected because it serialized the old workspace-dependent layout. Dequantized
 body rows are never labeled exact. Server metrics report requested and exact
 tokens, coverage group states, and degraded sequences.
@@ -293,15 +363,66 @@ handoff cannot observe it as a completed copy.
 
 ### Backend routes
 
-CUDA's native and generic routes and CPU's generic route are hardware verified.
-Vulkan, Metal, HIP, SYCL, and generic OpenCL contain the required generic
-operator families and are source supported, but are not hardware-verified by
-this release. OpenCL's Adreno-transformed weight layouts are rejected by these
-row operators; flat standard-cache storage uses the generic kernels. CANN
-overlay contexts are rejected at context creation because fused shadow
-`SET_ROWS` is not supported; successful source classification is not an Ascend
-hardware claim. Startup diagnostics name the selected native or generic route;
-generic long-context attention can be substantially slower.
+CUDA, CPU, and Vulkan KVarN routes are hardware verified. The portable
+CUDA/HIP implementation is also exercised on CUDA with the optimized paths
+forcibly disabled. AMD WMMA/MFMA routing, physical-wave decode, and wave-aware
+WHT are source-policy verified pending the configured ROCm CI build and AMD
+hardware reports; no ROCm performance claim is made from CUDA results. Metal,
+SYCL, and generic OpenCL contain the required generic operator
+families but are not hardware-verified by this release. OpenCL's
+Adreno-transformed weight layouts are rejected by these row operators; flat
+standard-cache storage uses the generic kernels. CANN overlay contexts are
+rejected at context creation because fused shadow `SET_ROWS` is not supported;
+successful source classification is not an Ascend hardware claim. Startup
+diagnostics name the selected native or generic route; generic long-context
+attention can be substantially slower.
+
+For compact current sources, CUDA and HIP share the segmented history/current
+implementation. CPU has the dense one-softmax reference route. Vulkan consumes
+the compact history/current buffers through buffer device addresses and
+validates every source before native dispatch. Supported bodyless exact tails
+remain native; mixed compressed/exact layers use explicit device
+materialization and standard FlashAttention. Unsupported shapes or source
+layouts fail closed instead of ignoring current rows or relying on an
+accidental scheduler fallback.
+
+### July 2026 compact-tail correction
+
+The completion run used Gemma 4 31B Q5_K_S at context 16384, `-b 2048
+-ub 512`, the persisted BF16 KLD baseline, and one repetition per requested
+row. The GPU was concurrently occupied, so throughput was deliberately
+excluded. Quality below is compared with the historical gain-curve article:
+
+| Cache / tail | Result | Median KLD | Mean KLD | P99 KLD | P99.9 KLD | Maximum KLD | Same top |
+|---|---|---:|---:|---:|---:|---:|---:|
+| q5_0 / 0 | historical | 0.061747 | 0.626347 | 9.084101 | 18.731647 | 36.826859 | 76.802% |
+| q5_0 / 0 | corrected | 0.061747 | 0.626347 | 9.084101 | 18.731647 | 36.826859 | 76.802% |
+| q5_0 / 1024 | historical | 0.038569 | 0.469998 | 7.542499 | 16.978937 | 39.990627 | 79.989% |
+| q5_0 / 1024 | corrected | 0.038596 | 0.462000 | 7.410694 | 16.760483 | 40.052086 | 80.185% |
+| kvarn5 / 0 | historical | 0.041262 | 0.483087 | 7.594825 | 16.600363 | 33.928799 | 79.609% |
+| kvarn5 / 0 | corrected | 0.041221 | 0.483046 | 7.608277 | 16.575455 | 33.928799 | 79.592% |
+| kvarn5 / 1024 | historical | 0.036261 | 0.444201 | 7.325125 | 16.381313 | 38.840488 | 80.622% |
+| kvarn5 / 1024 | corrected | 0.035761 | 0.445017 | 7.212839 | 16.502676 | 36.113117 | 80.590% |
+
+The same corrected binary was measured in fresh processes with
+`llama-bench --kv-memory --no-warmup -d 16384 -n 1`. These are cache-owned
+bytes, not total-VRAM differences:
+
+| Cache / tail | Persistent KV | Exact history + reserve | Staging | Persistent padding | Reusable transient high water | KV-related peak |
+|---|---:|---:|---:|---:|---:|---:|
+| q5_0 / 0 | 859.38 MiB | 0 | 0 | 0 | 0 | 859.38 MiB |
+| q5_0 / 1024 | 1327.73 MiB | 880.86 MiB | 0 | 0 | 249.75 MiB | 1577.49 MiB |
+| kvarn5 / 0 | 1170.70 MiB | 110.86 MiB | 220.00 MiB | 0 | 119.32 MiB | 1290.02 MiB |
+| kvarn5 / 1024 | 1337.58 MiB | 880.86 MiB | 20.00 MiB | 0 | 126.06 MiB | 1463.64 MiB |
+
+Gemma has 50 SWA and 10 global attention layers. At tail 1024, telemetry
+records 50 native bodyless routes and 10 native mixed routes, with zero device
+fallback and zero CPU layers. The q5_0 exact payload replaces 412.50 MiB of
+SWA quantized body with 800 MiB of native-exact SWA rows and adds 80 MiB of
+global exact overlay plus 0.86 MiB of rollback reserve. The resulting
+468.36 MiB persistent delta is therefore fully reconciled. The previous
+workspace-dependent persistent padding is zero; physical ubatch contributes
+only to graph-local and reusable transient memory.
 
 ### Measurement and validation
 

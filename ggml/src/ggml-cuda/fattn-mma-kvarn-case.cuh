@@ -4,6 +4,8 @@
 #include "fattn-mma-kvarn-case-decl.cuh"
 #include "fattn-mma-kvarn-impl.cuh"
 
+#include <atomic>
+
 #if defined(GGML_USE_HIP)
 using ggml_cuda_fattn_kernel_attr_ptr_t = const void *;
 #else
@@ -418,7 +420,7 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
         return false;
     }
 
-#if !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
+#if !defined(GGML_USE_MUSA)
     CUDA_CHECK(cudaFuncSetAttribute(
         reinterpret_cast<ggml_cuda_fattn_kernel_attr_ptr_t>(
             ggml_cuda_fattn_kvarn_window_f16_partial_kernel<DKQ, DV, ncols1, ncols2, use_logit_softcap>),
@@ -532,7 +534,7 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
             v_win.nb[3] = (int64_t) plan.n_kv_heads * chunk_len * DV * (int64_t) sizeof(half);
 
             fattn_kernel_t f16_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, false>;
-#if !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
+#if !defined(GGML_USE_MUSA)
             CUDA_CHECK(cudaFuncSetAttribute(
                 reinterpret_cast<ggml_cuda_fattn_kernel_attr_ptr_t>(f16_kernel),
                 cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
@@ -646,6 +648,88 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case(
 }
 
 template <int DKQ, int DV, int ncols1, int ncols2>
+static size_t ggml_cuda_fattn_kvarn_mma_shared_bytes(
+        int cc,
+        int warp_size_host,
+        bool has_original_domain) {
+    constexpr int ncols = ncols1 * ncols2;
+    const int nthreads       = ggml_cuda_fattn_mma_get_nthreads      (DKQ, DV, ncols, cc);
+    const int nbatch_fa      = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols, cc);
+    const int nbatch_K2      = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols, cc);
+    const int nbatch_V2      = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols, cc);
+    const int nbatch_combine = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols, cc);
+    const bool Q_in_reg      = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols, cc);
+    const int nwarps         = nthreads / warp_size_host;
+    const int cols_per_warp  = std::min(ncols, get_cols_per_warp(cc));
+
+    const size_t nbytes_shared_KV = nbatch_fa * std::max(nbatch_K2 + 4, nbatch_V2 + 4) * sizeof(half2);
+    const size_t nbytes_shared_Q = ncols * (DKQ/2 + 4) * sizeof(half2);
+    const size_t nbytes_shared_mask = ncols1 * (nbatch_fa/2 + 4) * sizeof(half2);
+    const size_t nbytes_shared_combine = nwarps * cols_per_warp * (nbatch_combine + 4) * sizeof(half2);
+    const size_t nbytes_shared_kvarn_rotated =
+        6 * std::max(DKQ, DV) * sizeof(half) +
+        2 * (std::max(DKQ, DV) / GGML_CUDA_FATTN_KVARN_DIM) * sizeof(int);
+    const size_t nbytes_shared_kvarn_original =
+        3 * GGML_CUDA_FATTN_KVARN_DIM * sizeof(half) +
+        2 * nwarps * GGML_CUDA_FATTN_KVARN_DIM * sizeof(float);
+    const size_t nbytes_shared_kvarn = has_original_domain ?
+        nbytes_shared_kvarn_original : nbytes_shared_kvarn_rotated;
+    const size_t nbytes_shared_KV_mask_kvarn = nbytes_shared_KV + nbytes_shared_mask + nbytes_shared_kvarn;
+    return std::max(nbytes_shared_combine, Q_in_reg ?
+        std::max(nbytes_shared_Q, nbytes_shared_KV_mask_kvarn) :
+                 nbytes_shared_Q + nbytes_shared_KV_mask_kvarn);
+}
+
+#if !defined(GGML_USE_MUSA)
+template <int DKQ, int DV, int ncols1, int ncols2>
+bool ggml_cuda_fattn_kvarn_wide_mma_supported(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * dst) {
+    const int device = ctx.device;
+    GGML_ASSERT(device >= 0 && device < GGML_CUDA_MAX_DEVICES);
+
+    float logit_softcap;
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    const bool k_original_domain = ggml_cuda_fattn_kvarn_k_original_domain(dst);
+    const bool v_original_domain = ggml_cuda_fattn_kvarn_v_original_domain(dst);
+    const int cache_key = 4 * (int) k_original_domain + 2 * (int) v_original_domain + (logit_softcap != 0.0f);
+    static std::atomic<int> cached_active_blocks[GGML_CUDA_MAX_DEVICES][8] = {};
+    const int cached = cached_active_blocks[device][cache_key].load(std::memory_order_relaxed);
+    if (cached != 0) {
+        return cached > 0;
+    }
+
+    const auto & device_info = ggml_cuda_info().devices[device];
+    const size_t nbytes_shared_total = ggml_cuda_fattn_kvarn_mma_shared_bytes<DKQ, DV, ncols1, ncols2>(
+        device_info.cc, device_info.warp_size, k_original_domain || v_original_domain);
+    if (nbytes_shared_total > device_info.smpbo) {
+        cached_active_blocks[device][cache_key].store(-1, std::memory_order_relaxed);
+        return false;
+    }
+
+    fattn_kernel_t fattn_kernel = logit_softcap == 0.0f ?
+        ggml_cuda_flash_attn_ext_mma_kvarn_select_kernel<DKQ, DV, ncols1, ncols2, false>(
+            k_original_domain, v_original_domain) :
+        ggml_cuda_flash_attn_ext_mma_kvarn_select_kernel<DKQ, DV, ncols1, ncols2, true>(
+            k_original_domain, v_original_domain);
+    CUDA_CHECK(cudaFuncSetAttribute(
+        reinterpret_cast<ggml_cuda_fattn_kernel_attr_ptr_t>(fattn_kernel),
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        nbytes_shared_total));
+
+    const int nthreads = ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols1 * ncols2, device_info.cc);
+    int active_blocks = 0;
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &active_blocks,
+        reinterpret_cast<ggml_cuda_fattn_kernel_attr_ptr_t>(fattn_kernel),
+        nthreads,
+        nbytes_shared_total));
+    cached_active_blocks[device][cache_key].store(active_blocks > 0 ? active_blocks : -1, std::memory_order_relaxed);
+    return active_blocks > 0;
+}
+#endif
+
+template <int DKQ, int DV, int ncols1, int ncols2>
 void ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_fattn_kvarn_plan plan;
     GGML_ASSERT(ggml_cuda_fattn_kvarn_view_supported(ctx.device, dst, &plan));
@@ -672,17 +756,8 @@ void ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, gg
     const size_t nbytes_shared_Q = ncols * (DKQ/2 + 4) * sizeof(half2);
     const size_t nbytes_shared_mask = ncols1 * (nbatch_fa/2 + 4) * sizeof(half2);
     const size_t nbytes_shared_combine = nwarps * cols_per_warp * (nbatch_combine + 4) * sizeof(half2);
-    const size_t nbytes_shared_kvarn_rotated =
-        2 * GGML_CUDA_FATTN_KVARN_DIM * sizeof(half);
-    const size_t nbytes_shared_kvarn_original =
-        3 * GGML_CUDA_FATTN_KVARN_DIM * sizeof(half) +
-        2 * nwarps * GGML_CUDA_FATTN_KVARN_DIM * sizeof(float);
-    const size_t nbytes_shared_kvarn = has_original_domain ?
-        nbytes_shared_kvarn_original : nbytes_shared_kvarn_rotated;
-    const size_t nbytes_shared_KV_mask_kvarn = nbytes_shared_KV + nbytes_shared_mask + nbytes_shared_kvarn;
-    const size_t nbytes_shared_total = std::max(nbytes_shared_combine, Q_in_reg ?
-        std::max(nbytes_shared_Q, nbytes_shared_KV_mask_kvarn) :
-                 nbytes_shared_Q + nbytes_shared_KV_mask_kvarn);
+    const size_t nbytes_shared_total = ggml_cuda_fattn_kvarn_mma_shared_bytes<DKQ, DV, ncols1, ncols2>(
+        cc, warp_size_host, has_original_domain);
     const int nstages = ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, cc);
     const size_t nbytes_shared_KV_f16_1stage = nbatch_fa * std::max(nbatch_K2 + 4, nbatch_V2 + 4) * sizeof(half2);
     const size_t nbytes_shared_KV_f16_2stage = nbatch_fa * (nbatch_K2 + 4 + nbatch_V2 + 4) * sizeof(half2);
@@ -733,12 +808,12 @@ void ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, gg
         k_original_domain, v_original_domain);
     if (logit_softcap == 0.0f) {
         fattn_kernel = fattn_kernel_no_softcap;
-#if !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
+#if !defined(GGML_USE_MUSA)
         CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
 #endif
     } else {
         fattn_kernel = fattn_kernel_softcap;
-#if !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
+#if !defined(GGML_USE_MUSA)
         CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
 #endif
     }

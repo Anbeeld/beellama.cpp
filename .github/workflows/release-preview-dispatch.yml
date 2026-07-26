@@ -1,0 +1,40 @@
+name: Dispatch Preview Build
+
+run-name: Dispatch preview ${{ github.ref_name }}
+
+on:
+  push:
+    branches:
+      - "v*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  dispatch:
+    name: Dispatch main-owned preview workflow
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Dispatch main-owned preview workflow
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_REF: ${{ github.ref_name }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" != refs/heads/v* ]]; then
+            echo "Unsupported ref ${GITHUB_REF}; preview dispatch requires a v* branch." >&2
+            exit 1
+          fi
+          gh workflow run release.yml \
+            --repo "${GITHUB_REPOSITORY}" \
+            --ref main \
+            --field source_ref="${SOURCE_REF}" \
+            --field source_sha="${SOURCE_SHA}" \
+            --field tag_name="preview-${SOURCE_REF}" \
+            --field publish_release="false"

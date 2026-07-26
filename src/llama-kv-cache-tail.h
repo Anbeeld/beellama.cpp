@@ -2,6 +2,7 @@
 
 #include "llama.h"
 #include "llama-hparams.h"
+#include "ggml-backend.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -38,6 +39,15 @@ struct llama_kv_tail_slot_copy {
     int32_t dst_slot;
 };
 
+struct llama_kv_tail_slot_run {
+    uint32_t payload_begin;
+    int32_t  slot_begin;
+    uint32_t length;
+};
+
+std::vector<llama_kv_tail_slot_run> llama_kv_tail_contiguous_slot_runs(
+        const std::vector<int32_t> & slots);
+
 struct llama_kv_tail_snapshot_entry {
     llama_seq_id seq_id;
     llama_kv_tail_identity identity;
@@ -65,6 +75,13 @@ struct llama_kv_tail_layout {
     uint32_t total_slots;
 };
 
+struct llama_kv_tail_compact_layout {
+    uint32_t history_stride;
+    uint32_t history_slots;
+    uint32_t rollback_tokens;
+    uint32_t attention_stride;
+};
+
 // Reserve a discard sink only when a batch can contain ragged sequence
 // memberships. With one sequence every write has exactly one arena target.
 llama_kv_tail_layout llama_kv_tail_layout_for(
@@ -72,10 +89,30 @@ llama_kv_tail_layout llama_kv_tail_layout_for(
         uint32_t n_seq_max,
         uint32_t n_ubatch);
 
+// Persistent compact history contains only the active exact suffix and the
+// explicitly promised rollback reserve. Current-ubatch rows are graph inputs,
+// so they affect descriptor workspace but never persistent payload capacity.
+llama_kv_tail_compact_layout llama_kv_tail_compact_layout_for(
+        uint32_t n_tokens,
+        uint32_t rollback_tokens,
+        uint32_t n_seq_max,
+        uint32_t n_ubatch);
+
+// Compact-tail suffix removal is an operation contract, not a report of how
+// many cells changed. A suffix beginning beyond the current end is therefore
+// an accepted idempotent no-op.
+bool llama_kv_tail_can_remove_suffix(
+        llama_pos pos_max,
+        llama_pos p0,
+        llama_pos p1,
+        uint32_t rollback_tokens);
+
 enum llama_kv_tail_storage_kind {
     LLAMA_KV_TAIL_STORAGE_DISABLED,
     LLAMA_KV_TAIL_STORAGE_OVERLAY,
     LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT,
+    LLAMA_KV_TAIL_STORAGE_COMPACT_OVERLAY,
+    LLAMA_KV_TAIL_STORAGE_COMPACT_NATIVE_EXACT,
 };
 
 enum llama_kv_tail_route : int {
@@ -147,6 +184,10 @@ struct llama_kv_tail_layer_route {
     bool causal_attn;
     bool swa;
     bool explicit_bias;
+    bool has_body;
+    bool has_current;
+    uint32_t body_execution_rows;
+    ggml_backend_dev_t owner;
     llama_kv_tail_route_capability capability;
 };
 
@@ -216,6 +257,12 @@ bool llama_kv_tail_sparse_body_capacity_safe(
         uint32_t physical_stream_rows,
         uint32_t arena_stride);
 
+// The packed body is graph-local and may be padded to a backend execution
+// alignment without changing the persistent compact-history capacity.
+uint32_t llama_kv_tail_packed_body_stride(
+        uint64_t logical_rows,
+        uint32_t alignment);
+
 struct llama_kv_tail_storage_request {
     ggml_type requested_body_type_k;
     ggml_type requested_body_type_v;
@@ -239,6 +286,11 @@ struct llama_kv_tail_storage_request {
     bool overlay_placement_supported = true;
     const char * architecture = nullptr;
     const char * group_id = nullptr;
+    uint32_t rollback_tokens = 0;
+    bool compact_history_capable = false;
+    bool compact_current_source_capable = false;
+    bool compact_ordered_commit_capable = false;
+    bool full_window_body_can_be_omitted = false;
 };
 
 struct llama_kv_tail_storage_plan {
@@ -269,6 +321,9 @@ struct llama_kv_tail_storage_plan {
     // so coverage cannot claim completeness for an unconsumed payload.
     bool graph_consumes_exact_tail = true;
     std::vector<llama_kv_tail_layer_route> layer_routes = {};
+    llama_kv_tail_compact_layout compact_layout = { 0, 0, 0, 0 };
+    uint64_t compact_history_bytes = 0;
+    uint64_t compact_rollback_bytes = 0;
 };
 
 llama_kv_tail_storage_plan llama_kv_tail_storage_plan_for(
@@ -384,14 +439,23 @@ public:
             uint32_t n_seq_max,
             uint32_t arena_stride,
             uint32_t sink_slots);
+    llama_kv_tail_store(
+            uint32_t n_tokens,
+            uint32_t rollback_tokens,
+            uint32_t n_seq_max,
+            uint32_t history_stride,
+            uint32_t sink_slots);
 
     int32_t commit(
             llama_seq_id seq_id,
             llama_kv_tail_identity identity,
             llama_pos position,
-            uint64_t insertion_ordinal);
+            uint64_t insertion_ordinal,
+            uint32_t current_row = UINT32_MAX);
 
     void begin_batch();
+    void finish_batch(bool success, bool payload_may_be_modified);
+    bool has_batch_transaction() const { return batch_transaction.has_value(); }
     void recycle(uint32_t stream, uint32_t cell, uint64_t next_generation);
     void clear();
     void mark_degraded(llama_seq_id seq_id, uint32_t flags);
@@ -431,6 +495,9 @@ public:
     std::vector<llama_kv_tail_snapshot_entry> source_candidates(llama_seq_id seq_id) const;
     std::vector<llama_kv_tail_source_run> source_runs(llama_seq_id seq_id) const;
     uint32_t retention() const { return n_tokens; }
+    uint32_t history_capacity() const { return history_limit; }
+    uint32_t rollback_horizon() const { return rollback_tokens; }
+    bool supports_suffix_rollback(llama_seq_id seq_id, uint32_t n) const;
     std::vector<llama_kv_tail_snapshot_entry> snapshot(llama_seq_id seq_id = -1) const;
     std::vector<llama_kv_tail_provenance> snapshot_provenance(llama_seq_id seq_id = -1) const;
     void restore_provenance(
@@ -460,9 +527,22 @@ private:
         uint32_t recovery_commits;
     };
 
+    struct batch_transaction_state {
+        std::vector<entry_list> sequences;
+        std::vector<std::vector<bool>> slot_used;
+        std::vector<uint32_t> write_cursors;
+        std::vector<uint32_t> degradation;
+        std::vector<uint32_t> recovery_commits;
+        std::vector<entry_list> current;
+        std::vector<bool> affected;
+    };
+
     const uint32_t n_tokens;
+    const uint32_t rollback_tokens;
+    const uint32_t history_limit;
     const uint32_t arena_stride;
     const uint32_t n_slots;
+    const bool compact_storage;
     std::vector<entry_list> sequences;
     // Each sequence can own at most one exact record for a physical KV cell.
     // Keep that identity lookup incremental so a token commit/recycle does not
@@ -473,6 +553,7 @@ private:
     std::vector<uint32_t> degradation;
     std::vector<uint32_t> recovery_commits;
     std::optional<pending_seq_cp_state> pending_seq_cp;
+    std::optional<batch_transaction_state> batch_transaction;
     bool in_batch = false;
 
     bool valid_seq(llama_seq_id seq_id) const;
@@ -481,7 +562,7 @@ private:
     void erase_entry(llama_seq_id seq_id, entry_list::iterator entry, bool release_slot = true);
     int32_t acquire(llama_seq_id seq_id);
     void release(llama_seq_id seq_id, int32_t slot);
-    void trim(llama_seq_id seq_id);
+    void trim(llama_seq_id seq_id, uint32_t limit);
 };
 
 std::vector<float> llama_kv_tail_attention_reference(

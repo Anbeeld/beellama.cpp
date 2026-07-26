@@ -5,10 +5,12 @@
 
 #include <clocale>
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
+#include <fstream>
 #include <random>
 #include <vector>
 
@@ -218,7 +220,7 @@ static bool test_cross_ubatch_tail_state(
 
 static bool test_tail_copy_is_immediately_saveable(
         llama_model * model, const common_params & params, const llama_tokens & tokens, bool unified) {
-    if (params.kv_tail_tokens.empty() ||
+    if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED || params.kv_tail_tokens.empty() ||
             !std::all_of(params.kv_tail_tokens.begin(), params.kv_tail_tokens.end(), ::isdigit) ||
             std::stoul(params.kv_tail_tokens) == 0) {
         return true;
@@ -232,6 +234,11 @@ static bool test_tail_copy_is_immediately_saveable(
     if (!source || !restored) {
         LOG_ERR("%s: failed to create sequence-copy contexts\n", __func__);
         return false;
+    }
+    if (!unified && std::stoul(params.kv_tail_tokens) >= llama_n_ctx_seq(source.get())) {
+        // A tail that covers the complete rounded per-sequence window is
+        // promoted to native exact storage and has no overlay frame to copy.
+        return true;
     }
 
     int n_past = 0;
@@ -300,12 +307,12 @@ static bool test_tail_copy_is_immediately_saveable(
             break;
         }
     }
-    if (frame == std::string::npos || read_u32(state, frame + 4) != 2) {
-        LOG_ERR("%s: could not locate standard tail state v2 frame\n", __func__);
+    if (frame == std::string::npos || read_u32(state, frame + 4) != 3) {
+        LOG_ERR("%s: could not locate standard tail state v3 frame\n", __func__);
         return false;
     }
-    const uint32_t group_size = read_u32(state, frame + 20);
-    const size_t manifest = frame + 24 + group_size + 3*sizeof(uint64_t);
+    const uint32_t group_size = read_u32(state, frame + 28);
+    const size_t manifest = frame + 32 + group_size + 3*sizeof(uint64_t);
     const uint32_t stream_count = read_u32(state, manifest);
     const uint32_t n_pos_per_embd = read_u32(state, manifest + 8);
     const uint32_t saved_n_seq_max = read_u32(state, manifest + 12);
@@ -494,6 +501,320 @@ static bool test_kvarn_full_window_native_exact(
     return true;
 }
 
+static bool test_kvarn_partial_checkpoint_history(
+        llama_model * model, const common_params & params, const llama_tokens & tokens) {
+    if (params.kvarn.type == LLAMA_KVARN_TYPE_DISABLED || params.kv_tail_tokens.empty() ||
+            !std::all_of(params.kv_tail_tokens.begin(), params.kv_tail_tokens.end(), ::isdigit) ||
+            std::stoul(params.kv_tail_tokens) == 0) {
+        return true;
+    }
+
+    auto context_params = common_context_params_to_llama(params);
+    context_params.n_seq_max = 1;
+    const uint32_t prefix_tokens = context_params.kv_tail_tokens + context_params.n_ubatch + 1;
+    context_params.n_ctx = std::max(context_params.n_ctx, prefix_tokens + 16);
+    auto context = llama_context_ptr{llama_init_from_model(model, context_params)};
+    if (!context) {
+        LOG_ERR("%s: failed to create KVarN checkpoint context\n", __func__);
+        return false;
+    }
+
+    llama_tokens prefix;
+    prefix.reserve(prefix_tokens);
+    for (uint32_t i = 0; i < prefix_tokens; ++i) {
+        prefix.push_back(tokens.empty() ? llama_token(1) : tokens[i % tokens.size()]);
+    }
+    int n_past = 0;
+    for (size_t offset = 0; offset < prefix.size();) {
+        const int32_t count = int32_t(std::min<size_t>(context_params.n_batch, prefix.size() - offset));
+        llama_batch_ptr batch(count, 0, 1);
+        for (int32_t i = 0; i < count; ++i) {
+            common_batch_add(batch.get(), prefix[offset + i], n_past + i, { 0 }, false);
+        }
+        if (llama_decode(context.get(), batch.get())) {
+            LOG_ERR("%s: failed to decode wrapped-tail prefix chunk\n", __func__);
+            return false;
+        }
+        offset += count;
+        n_past += count;
+    }
+
+    {
+        auto device_params = context_params;
+        device_params.n_seq_max = 2;
+        device_params.n_ctx = std::max(device_params.n_ctx, 2*(prefix_tokens + 16));
+        auto device_context = llama_context_ptr{llama_init_from_model(model, device_params)};
+        if (!device_context) {
+            LOG_ERR("%s: failed to create wrapped on-device checkpoint context\n", __func__);
+            return false;
+        }
+
+        int device_past = 0;
+        for (size_t offset = 0; offset < prefix.size();) {
+            const int32_t count = int32_t(std::min<size_t>(device_params.n_batch, prefix.size() - offset));
+            llama_batch_ptr batch(count, 0, 1);
+            for (int32_t i = 0; i < count; ++i) {
+                common_batch_add(batch.get(), prefix[offset + i], device_past + i, { 0 }, false);
+            }
+            if (llama_decode(device_context.get(), batch.get())) {
+                LOG_ERR("%s: failed to decode wrapped on-device prefix chunk\n", __func__);
+                return false;
+            }
+            offset += count;
+            device_past += count;
+        }
+
+        const auto device_flags = llama_state_seq_flags(LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+        std::vector<uint8_t> device_state(llama_state_seq_get_size_ext(
+                device_context.get(), 0, device_flags));
+        if (device_state.empty() || llama_state_seq_get_data_ext(
+                device_context.get(), device_state.data(), device_state.size(), 0, device_flags) != device_state.size()) {
+            LOG_ERR("%s: failed to save wrapped on-device checkpoint\n", __func__);
+            return false;
+        }
+
+        const llama_token device_probe = tokens.empty() ? llama_token(2) : tokens.front();
+        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+        llama_batch_ptr source_probe(1, 0, 1);
+        common_batch_add(source_probe.get(), device_probe, device_past, { 0 }, true);
+        if (llama_decode(device_context.get(), source_probe.get())) {
+            LOG_ERR("%s: failed to decode wrapped on-device source probe\n", __func__);
+            return false;
+        }
+        const float * source_values = llama_get_logits_ith(device_context.get(), -1);
+        std::vector<float> source_logits(source_values, source_values + n_vocab);
+
+        llama_memory_clear(llama_get_memory(device_context.get()), true);
+        if (llama_state_seq_set_data_ext(
+                device_context.get(), device_state.data(), device_state.size(), 1, device_flags) != device_state.size()) {
+            LOG_ERR("%s: failed to restore wrapped on-device checkpoint\n", __func__);
+            return false;
+        }
+        llama_batch_ptr destination_probe(1, 0, 1);
+        common_batch_add(destination_probe.get(), device_probe, device_past, { 1 }, true);
+        if (llama_decode(device_context.get(), destination_probe.get())) {
+            LOG_ERR("%s: failed to decode wrapped on-device destination probe\n", __func__);
+            return false;
+        }
+        const float * destination_logits = llama_get_logits_ith(device_context.get(), -1);
+        double squared_error = 0.0;
+        double squared_reference = 0.0;
+        double max_abs_error = 0.0;
+        for (int32_t i = 0; i < n_vocab; ++i) {
+            const double diff = double(source_logits[i]) - double(destination_logits[i]);
+            squared_error += diff*diff;
+            squared_reference += double(source_logits[i])*double(source_logits[i]);
+            max_abs_error = std::max(max_abs_error, std::fabs(diff));
+        }
+        const double nmse = squared_error/std::max(squared_reference, 1e-30);
+        if (!std::isfinite(nmse) || nmse > 1e-10 || max_abs_error > 1e-4) {
+            LOG_ERR("%s: wrapped on-device continuation changed (nmse=%g max_abs=%g)\n",
+                    __func__, nmse, max_abs_error);
+            return false;
+        }
+    }
+
+    const auto partial_flags = llama_state_seq_flags(LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    std::vector<double> save_times_ms;
+    std::vector<double> restore_times_ms;
+    const auto save_partial = [&](std::vector<uint8_t> & state) {
+        const auto start = std::chrono::steady_clock::now();
+        state.resize(llama_state_seq_get_size_ext(context.get(), 0, partial_flags));
+        const bool result = !state.empty() && llama_state_seq_get_data_ext(
+                context.get(), state.data(), state.size(), 0, partial_flags) == state.size();
+        save_times_ms.push_back(std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start).count());
+        return result;
+    };
+    const auto restore_partial = [&](const std::vector<uint8_t> & state) {
+        const auto start = std::chrono::steady_clock::now();
+        const bool result = llama_state_seq_set_data_ext(
+                context.get(), state.data(), state.size(), 0, partial_flags) == state.size();
+        restore_times_ms.push_back(std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start).count());
+        return result;
+    };
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const auto decode_probe = [&](llama_token token, int position, std::vector<float> & logits) {
+        llama_batch_ptr batch(1, 0, 1);
+        common_batch_add(batch.get(), token, position, { 0 }, true);
+        if (llama_decode(context.get(), batch.get())) {
+            return false;
+        }
+        const float * values = llama_get_logits_ith(context.get(), -1);
+        logits.assign(values, values + n_vocab);
+        return true;
+    };
+    const auto logits_match = [&](const std::vector<float> & expected, const std::vector<float> & actual) {
+        double squared_error = 0.0;
+        double squared_reference = 0.0;
+        double max_abs_error = 0.0;
+        for (int32_t i = 0; i < n_vocab; ++i) {
+            const double diff = double(expected[i]) - double(actual[i]);
+            squared_error += diff*diff;
+            squared_reference += double(expected[i])*double(expected[i]);
+            max_abs_error = std::max(max_abs_error, std::fabs(diff));
+        }
+        const double nmse = squared_error/std::max(squared_reference, 1e-30);
+        return std::isfinite(nmse) && nmse <= 1e-10 && max_abs_error <= 1e-4;
+    };
+    const llama_token probe_a = tokens.empty() ? llama_token(2) : tokens.front();
+    const llama_token probe_b = tokens.size() < 2 ? llama_token(3) : tokens[1];
+    const llama_token extension = tokens.size() < 3 ? llama_token(4) : tokens[2];
+
+    std::vector<uint8_t> checkpoint_a;
+    if (!save_partial(checkpoint_a)) {
+        LOG_ERR("%s: failed to save checkpoint A\n", __func__);
+        return false;
+    }
+    std::vector<float> oracle_a;
+    if (!decode_probe(probe_a, n_past, oracle_a) || !restore_partial(checkpoint_a)) {
+        LOG_ERR("%s: failed to establish checkpoint A oracle\n", __func__);
+        return false;
+    }
+
+    llama_batch_ptr extension_batch(3, 0, 1);
+    for (int i = 0; i < 3; ++i) {
+        common_batch_add(extension_batch.get(), extension, n_past + i, { 0 }, i == 2);
+    }
+    if (llama_decode(context.get(), extension_batch.get())) {
+        LOG_ERR("%s: failed to advance from checkpoint A to B\n", __func__);
+        return false;
+    }
+    const int checkpoint_b_past = n_past + 3;
+    std::vector<uint8_t> checkpoint_b;
+    if (!save_partial(checkpoint_b)) {
+        LOG_ERR("%s: failed to save checkpoint B\n", __func__);
+        return false;
+    }
+    std::vector<float> oracle_b;
+    if (!decode_probe(probe_b, checkpoint_b_past, oracle_b) || !restore_partial(checkpoint_b)) {
+        LOG_ERR("%s: failed to establish checkpoint B oracle\n", __func__);
+        return false;
+    }
+
+    llama_batch_ptr mutation_batch(2, 0, 1);
+    common_batch_add(mutation_batch.get(), extension, checkpoint_b_past, { 0 }, false);
+    common_batch_add(mutation_batch.get(), extension, checkpoint_b_past + 1, { 0 }, true);
+    if (llama_decode(context.get(), mutation_batch.get())) {
+        LOG_ERR("%s: failed to mutate live checkpoint state\n", __func__);
+        return false;
+    }
+    const int live_past = checkpoint_b_past + 2;
+    std::vector<uint8_t> live_state;
+    if (!save_partial(live_state)) {
+        LOG_ERR("%s: failed to save live corruption guard\n", __func__);
+        return false;
+    }
+    std::vector<float> live_oracle;
+    if (!decode_probe(probe_a, live_past, live_oracle) || !restore_partial(live_state)) {
+        LOG_ERR("%s: failed to establish live corruption oracle\n", __func__);
+        return false;
+    }
+
+    const uint32_t kvarn_magic = 0x4e52564b;
+    size_t kvarn_frame = std::string::npos;
+    for (size_t i = 0; i + 2*sizeof(uint32_t) <= checkpoint_b.size(); ++i) {
+        uint32_t value;
+        std::memcpy(&value, checkpoint_b.data() + i, sizeof(value));
+        if (value == kvarn_magic) {
+            kvarn_frame = i;
+            break;
+        }
+    }
+    uint32_t version = 0;
+    if (kvarn_frame != std::string::npos) {
+        std::memcpy(&version, checkpoint_b.data() + kvarn_frame + sizeof(uint32_t), sizeof(version));
+    }
+    if (kvarn_frame == std::string::npos || version != 13) {
+        LOG_ERR("%s: expected KVarN partial checkpoint format v13, found v%u\n", __func__, version);
+        return false;
+    }
+
+    auto corrupt = checkpoint_b;
+    const uint32_t unsupported_version = 14;
+    std::memcpy(corrupt.data() + kvarn_frame + sizeof(uint32_t), &unsupported_version, sizeof(unsupported_version));
+    if (llama_state_seq_set_data_ext(
+            context.get(), corrupt.data(), corrupt.size(), 0, partial_flags) != 0) {
+        LOG_ERR("%s: corrupt KVarN v13 frame was accepted\n", __func__);
+        return false;
+    }
+    if (llama_memory_seq_pos_max(llama_get_memory(context.get()), 0) != live_past - 1) {
+        LOG_ERR("%s: rejected KVarN frame changed live metadata\n", __func__);
+        return false;
+    }
+    std::vector<float> live_after_reject;
+    if (!decode_probe(probe_a, live_past, live_after_reject) ||
+            !logits_match(live_oracle, live_after_reject)) {
+        LOG_ERR("%s: rejected KVarN frame changed live tensor state\n", __func__);
+        return false;
+    }
+
+    if (const char * path = std::getenv("KVARN_TEST_V12_STATE")) {
+        std::ifstream input(path, std::ios::binary | std::ios::ate);
+        std::streamsize size = -1;
+        if (input) {
+            size = static_cast<std::streamsize>(input.tellg());
+        }
+        if (size <= 0) {
+            LOG_ERR("%s: failed to open v12 compatibility fixture '%s'\n", __func__, path);
+            return false;
+        }
+        input.seekg(0);
+        std::vector<uint8_t> v12_state(static_cast<size_t>(size));
+        input.read(reinterpret_cast<char *>(v12_state.data()), size);
+        std::vector<float> restored_v12;
+        if (!input || !restore_partial(v12_state) ||
+                !decode_probe(probe_b, checkpoint_b_past, restored_v12) ||
+                !logits_match(oracle_b, restored_v12)) {
+            LOG_ERR("%s: v12 partial checkpoint continuation changed\n", __func__);
+            return false;
+        }
+
+        auto mismatch_params = context_params;
+        ++mismatch_params.kv_tail_tokens;
+        auto mismatch = llama_context_ptr{llama_init_from_model(model, mismatch_params)};
+        if (!mismatch || llama_state_seq_set_data_ext(
+                mismatch.get(), v12_state.data(), v12_state.size(), 0, partial_flags) != 0) {
+            LOG_ERR("%s: mismatched KVarN context accepted the v12 checkpoint\n", __func__);
+            return false;
+        }
+        llama_batch_ptr mismatch_probe(1, 0, 1);
+        common_batch_add(mismatch_probe.get(), probe_a, 0, { 0 }, true);
+        if (llama_decode(mismatch.get(), mismatch_probe.get())) {
+            LOG_ERR("%s: rejected v12 checkpoint left its destination unusable\n", __func__);
+            return false;
+        }
+    }
+
+    std::vector<float> restored_a;
+    if (!restore_partial(checkpoint_a) || !decode_probe(probe_a, n_past, restored_a) ||
+            !logits_match(oracle_a, restored_a)) {
+        LOG_ERR("%s: historical checkpoint A continuation changed\n", __func__);
+        return false;
+    }
+    std::vector<float> restored_b;
+    if (!restore_partial(checkpoint_b) || !decode_probe(probe_b, checkpoint_b_past, restored_b) ||
+            !logits_match(oracle_b, restored_b)) {
+        LOG_ERR("%s: historical checkpoint B continuation changed\n", __func__);
+        return false;
+    }
+
+    LOG("\nKVarN partial checkpoint bytes: A=%zu B=%zu live=%zu\n",
+            checkpoint_a.size(), checkpoint_b.size(), live_state.size());
+    LOG("KVarN partial checkpoint save ms:");
+    for (const double time_ms : save_times_ms) {
+        LOG(" %.3f", time_ms);
+    }
+    LOG("\nKVarN partial checkpoint restore ms:");
+    for (const double time_ms : restore_times_ms) {
+        LOG(" %.3f", time_ms);
+    }
+    LOG("\n");
+    LOG("\nPASS: KVarN v13 host partial checkpoints are independent and transactional\n");
+    return true;
+}
+
 static bool test_tail_state_v1_compatibility(llama_model * model, const common_params & params) {
     const char * path = std::getenv("KV_TAIL_TEST_V1_STATE");
     if (!path || !*path || params.kv_tail_tokens.empty() || std::stoul(params.kv_tail_tokens) == 0) {
@@ -564,6 +885,9 @@ static bool test_seq_rm_isolated(
         struct llama_model         * model,
         const struct common_params & params,
         const llama_tokens         & tokens) {
+    if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
+        return true;
+    }
     auto params_ctx = common_context_params_to_llama(params);
     params_ctx.n_ctx      = 256;
     params_ctx.n_seq_max  = 2;
@@ -919,6 +1243,9 @@ int main(int argc, char ** argv) {
     if (result_baseline.empty()) {
         return 1;
     }
+    if (!test_kvarn_partial_checkpoint_history(model, params, tokens)) {
+        return 1;
+    }
 
     if (!test_tail_state_contract(model, params, tokens)) {
         return 1;
@@ -937,7 +1264,6 @@ int main(int argc, char ** argv) {
     if (!test_kvarn_full_window_native_exact(model, params, tokens)) {
         return 1;
     }
-
     // Test 2: sequence removal isolation
     if (!test_seq_rm_isolated(model, params, tokens)) {
         return 1;

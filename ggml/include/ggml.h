@@ -221,7 +221,7 @@
 
 #define GGML_MAX_DIMS           4
 #define GGML_MAX_PARAMS         2048
-#define GGML_MAX_SRC            10
+#define GGML_MAX_SRC            12
 #define GGML_MAX_N_THREADS      512
 #define GGML_MAX_OP_PARAMS      64
 
@@ -452,6 +452,8 @@ extern "C" {
     enum ggml_flash_attn_ext_op_param {
         GGML_FLASH_ATTN_EXT_OP_PARAM_PREC         = 3,
         GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN = 4,
+        GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_BODYLESS = 5,
+        GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_HISTORY_SLOTS = 6,
     };
 
     enum ggml_flash_attn_ext_kvarn_domain {
@@ -599,6 +601,7 @@ extern "C" {
         GGML_OP_KVARN_WHT,
         GGML_OP_KVARN_STORE,
         GGML_OP_KVARN_VIEW,
+        GGML_OP_KVARN_MATERIALIZE,
 
         GGML_OP_UNARY,
 
@@ -1727,6 +1730,16 @@ extern "C" {
             struct ggml_tensor  * b,  // source
             struct ggml_tensor  * c); // row indices
 
+    // As ggml_set_rows(), with an explicit graph dependency. Negative row
+    // indices are ignored, allowing ragged updates without persistent sink
+    // rows. The dependency affects ordering only and is not read by backends.
+    GGML_API struct ggml_tensor * ggml_set_rows_ordered(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * dependency);
+
     // Stores the same source rows into a body destination and an exact shadow
     // destination in one backend operation. The result aliases shadow.
     GGML_API struct ggml_tensor * ggml_set_rows_with_shadow(
@@ -2490,11 +2503,37 @@ extern "C" {
             struct ggml_tensor * query_order,
             struct ggml_tensor * run_desc);
 
+    // Declare that the attached exact tail is the complete attention source.
+    // Backends may skip the masked dummy body and execute the packed exact
+    // source as one ordinary FlashAttention pass.
+    GGML_API void ggml_flash_attn_ext_set_kv_tail_bodyless(
+            struct ggml_tensor * a);
+
+    // Set the logical persistent-history boundary for segmented exact tails.
+    // The physical tensor may include backend execution padding beyond it.
+    GGML_API void ggml_flash_attn_ext_set_kv_tail_history_slots(
+            struct ggml_tensor * a,
+            int32_t              history_slots);
+
     GGML_API struct ggml_tensor * ggml_kv_tail_attention_merge(
             struct ggml_context * ctx,
             struct ggml_tensor  * body_attn,
             struct ggml_tensor  * k_tail,
             struct ggml_tensor  * v_tail,
+            struct ggml_tensor  * mask_tail,
+            struct ggml_tensor  * query_order,
+            struct ggml_tensor  * run_desc);
+
+    // Attach a compact exact source without materializing history and current
+    // rows into one tensor. Tail indices address history first and then the
+    // graph-local current rows.
+    GGML_API struct ggml_tensor * ggml_kv_tail_attention_merge_segmented(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * body_attn,
+            struct ggml_tensor  * k_history,
+            struct ggml_tensor  * v_history,
+            struct ggml_tensor  * k_current,
+            struct ggml_tensor  * v_current,
             struct ggml_tensor  * mask_tail,
             struct ggml_tensor  * query_order,
             struct ggml_tensor  * run_desc);
@@ -2666,6 +2705,20 @@ extern "C" {
             int                   stage_groups);
 
     GGML_API struct ggml_tensor * ggml_kvarn_view(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * records,
+            struct ggml_tensor  * stage_after_store,
+            struct ggml_tensor  * indices,
+            int                   n_kv,
+            int                   stream_start,
+            int                   n_stream,
+            int                   bits,
+            bool                  value,
+            int                   stage_groups);
+
+    // Reconstructs a standard F16 tensor from KVarN records and staging. The
+    // result can be consumed by any ordinary attention implementation.
+    GGML_API struct ggml_tensor * ggml_kvarn_materialize(
             struct ggml_context * ctx,
             struct ggml_tensor  * records,
             struct ggml_tensor  * stage_after_store,

@@ -20,8 +20,9 @@ effective = max(intrinsic, explicit)
 An omitted request and numeric zero therefore preserve the paper-faithful
 128-token suffix. Positive numeric, positional, named, structural-ID, and
 `auto` requests enlarge it. The physical ubatch does not participate in this
-formula. When `effective == effective_window`, the component becomes one native
-F16/BF16 cache and allocates neither KVarN records nor an exact overlay.
+formula. When an SWA group has `effective == effective_window`, it becomes a
+compact native-exact F16/BF16 ring with `W + R` rows and allocates neither
+KVarN records nor stage tensors.
 
 ## Storage and attention
 
@@ -31,8 +32,10 @@ implementation, including when its rows remain in the exact suffix. This makes
 record validity independent of future ubatch segmentation or exact-row
 eviction.
 
-The overlay stores canonical post-RoPE K and canonical V in the selected F16 or
-BF16 type. KVarN records retain their rotated K domain and original V domain.
+The compact overlay stores `N + R` rows of canonical post-RoPE K and canonical
+V in the selected F16 or BF16 type. The active ubatch is a separate graph-local
+canonical segment and is committed only after attention. KVarN records retain
+their rotated K domain and original V domain.
 KVarN defaults to the paper-faithful F16 representation; an explicit BF16
 request remains supported and takes precedence over that default.
 Each query receives exact source indices for its own logical suffix. The body
@@ -42,10 +45,19 @@ sink, body, and suffix form one softmax and each physical key contributes once.
 The same generic tail descriptor and lifecycle logic remains KVarN-neutral.
 
 Head dimensions 128, 256, and 512 are handled as one, two, or four KVarN slices.
-The WHT/store paths accept F16 and BF16 canonical inputs. CUDA supports native
-KVarN attention plus the exact merge. CPU supplies storage/reference oracles.
-Vulkan supports eager storage but fails KVarN context placement closed because
-it does not yet consume native KVarN views in FlashAttention.
+The WHT/store paths accept F16 and BF16 canonical inputs. CUDA uses optimized
+native kernels; ROCm/HIP selects physical-wave split decode or generic
+WMMA/MFMA on matrix-capable devices and retains the portable direct-record
+kernel elsewhere. CPU and Vulkan also consume KVarN views directly. All four
+paths fuse the F16/BF16 exact tail
+into the same softmax. Vulkan native attention requires shader Int64 and
+buffer-device-address support and otherwise declines the native route.
+
+The direct and compact segmented-tail entry paths share one route selector.
+Compact tails invoke the KVarN body with an explicit compact-tail entry tag
+before the exact contribution is merged. Forced-portable tests without current
+segments may enter KVarN directly. Versioned route counters distinguish both
+entries without changing the persistent tail or record ABI.
 
 Persistent placement is finalized in two phases. KVarN records and F16 stages
 are allocated first; their realized buffer owner is then used for route
@@ -78,20 +90,21 @@ KVarN record-layout failure. Exact-tail divergence and cumulative appends remain
 reusable. Non-recurrent or sufficiently checkpointed composites receive the
 group-aligned benefit and reevaluate at most 127 extra positions.
 
-KVarN state version 12 serializes logical records, exact payloads, membership,
+KVarN state version 13 serializes logical records, compact exact payloads, membership,
 and structural/type/preset identity. It does not serialize transient workspace
 as precision state, so `ub=128 -> ub=512` and the reverse restore without
-changing logits. Tail length, exact type, KVarN preset, and component mismatch
-fail closed. Version 11 is rejected because its physical stage/tail layout
-cannot be reinterpreted safely under the logical-overlay contract.
+changing logits. Tail length, rollback horizon, exact type, KVarN preset,
+representation, and component mismatch fail closed. Version 12 remains readable
+when its logical representation is compatible. Version 11 is rejected because
+its physical stage/tail layout cannot be reinterpreted safely.
 
 Unified per-sequence save and restore both require an exclusive structured
 stream. A contended idle slot is not offloaded to RAM, and a contended restore
 is treated as a cache miss; neither operation may serialize or overwrite the
-other sequence's records. The outer sequence-state framing is version 2 and
-supports host or on-device tensor transfer. The shared precision-tail manifest
-restores metadata-only identities as well as tensor payloads, and version 1
-input retains conservative degraded provenance.
+other sequence's records. The shared precision-tail manifest is version 3 and
+supports host or on-device tensor transfer. It restores metadata-only identities
+as well as tensor payloads; version 2 remains valid for legacy non-compact
+layouts, and version 1 input retains conservative degraded provenance.
 
 Hybrid iSWA has an additional placement rule. With multiple non-unified slots,
 eligible non-SWA layers use KVarN while SWA layers use a warned standard-cache

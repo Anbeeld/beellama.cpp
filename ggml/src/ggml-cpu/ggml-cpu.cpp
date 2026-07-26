@@ -426,7 +426,15 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     const struct ggml_tensor * src2 = op->src[2];
 
     const auto kvarn_view_base = [](const struct ggml_tensor * t) {
-        while (t != nullptr && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE)) {
+        if (t == nullptr || t->op != GGML_OP_PERMUTE ||
+                ggml_get_op_params_i32(t, 0) != 0 ||
+                ggml_get_op_params_i32(t, 1) != 2 ||
+                ggml_get_op_params_i32(t, 2) != 1 ||
+                ggml_get_op_params_i32(t, 3) != 3) {
+            return (const struct ggml_tensor *) nullptr;
+        }
+        t = t->src[0];
+        if (t != nullptr && t->op == GGML_OP_RESHAPE) {
             t = t->src[0];
         }
         return t != nullptr && t->op == GGML_OP_KVARN_VIEW ? t : nullptr;
@@ -457,6 +465,9 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 op->type != GGML_TYPE_IQ2_S   &&
                 op->type != GGML_TYPE_IQ1_S   &&
                 op->type != GGML_TYPE_IQ1_M; // missing type_traits.from_float
+        case GGML_OP_KVARN_STORE:
+        case GGML_OP_KVARN_MATERIALIZE:
+            return true;
         case GGML_OP_MUL_MAT:
             return src1->type == GGML_TYPE_F32 || src1->type == ggml_get_type_traits_cpu(src0->type)->vec_dot_type;
         case GGML_OP_SOFT_MAX_BACK: {
@@ -479,8 +490,31 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             if (src0 == nullptr || src1 == nullptr || src2 == nullptr) {
                 return false;
             }
-            if (kvarn_view_base(src1) != nullptr || kvarn_view_base(src2) != nullptr) {
-                return false;
+            const bool kvarn_k = kvarn_view_base(src1) != nullptr;
+            const bool kvarn_v = kvarn_view_base(src2) != nullptr;
+            if (kvarn_k || kvarn_v) {
+                const int domain = ggml_get_op_params_i32(
+                    op, GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN);
+                const bool rotated = domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED ||
+                    (domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO && src0->ne[1] == 1);
+                const bool tail_ok = op->src[5] == nullptr ||
+                    (op->src[6] != nullptr && op->src[7] != nullptr &&
+                     op->src[8] != nullptr && op->src[9] != nullptr &&
+                     (op->src[5]->type == GGML_TYPE_F16 || op->src[5]->type == GGML_TYPE_BF16) &&
+                     (op->src[6]->type == GGML_TYPE_F16 || op->src[6]->type == GGML_TYPE_BF16) &&
+                     op->src[7]->type == GGML_TYPE_F16 &&
+                     op->src[8]->type == GGML_TYPE_I32 &&
+                     op->src[9]->type == GGML_TYPE_I32);
+                return kvarn_k && kvarn_v && rotated &&
+                    tail_ok &&
+                    (src0->ne[0] == 128 || src0->ne[0] == 256 || src0->ne[0] == 512) &&
+                    src0->ne[0] == src1->ne[0] && src0->ne[0] == src2->ne[0] &&
+                    src0->type == GGML_TYPE_F32 &&
+                    src1->type == GGML_TYPE_F16 &&
+                    src2->type == GGML_TYPE_F16 &&
+                    op->type == GGML_TYPE_F32 &&
+                    (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F16) &&
+                    (op->src[4] == nullptr || op->src[4]->type == GGML_TYPE_F32);
             }
 
             ggml_type         const k_vec_dot_type = ggml_get_type_traits_cpu(src1->type)->vec_dot_type;
@@ -669,6 +703,51 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
 }
 
 static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_kvarn_ops") == 0) {
+        return (void *) +[](ggml_backend_dev_t) { return true; };
+    }
+    if (strcmp(name, "ggml_backend_kvarn_native_ops") == 0) {
+        return (void *) +[](ggml_backend_dev_t) { return true; };
+    }
+    if (strcmp(name, "ggml_backend_kvarn_native_rotated_max_query_tokens") == 0) {
+        return (void *) +[](ggml_backend_dev_t) { return UINT32_MAX; };
+    }
+    if (strcmp(name, "ggml_backend_kvarn_tail_attention_supported") == 0) {
+        return (void *) +[](ggml_backend_dev_t,
+                            ggml_type body_k, ggml_type body_v,
+                            ggml_type tail_k, ggml_type tail_v,
+                            int64_t d_k, int64_t d_v) {
+            const bool body_ok = body_k == GGML_TYPE_F16 && body_v == GGML_TYPE_F16;
+            const bool tail_ok =
+                (tail_k == GGML_TYPE_F16 || tail_k == GGML_TYPE_BF16) &&
+                (tail_v == GGML_TYPE_F16 || tail_v == GGML_TYPE_BF16);
+            const bool dims_ok = d_k == d_v &&
+                (d_k == 128 || d_k == 256 || d_k == 512);
+            return body_ok && tail_ok && dims_ok;
+        };
+    }
+    if (strcmp(name, "ggml_backend_kv_tail_attention_supported") == 0 ||
+            strcmp(name, "ggml_backend_kv_tail_segmented_attention_supported") == 0) {
+        return (void *) +[](ggml_type body_k, ggml_type body_v,
+                            ggml_type tail_k, ggml_type tail_v,
+                            int64_t d_k, int64_t d_v) {
+            const auto row_convertible = [](ggml_type type) {
+                return type == GGML_TYPE_F32 || ggml_get_type_traits(type)->to_float != nullptr;
+            };
+            // The CPU attached-tail reference consumes body rows through the
+            // ordinary type-trait converter, including standard quantized KV
+            // formats. Advertising only F16 forced an enormous
+            // [sources,queries] graph gather despite the direct path already
+            // supporting the stored body representation.
+            const bool body_ok = row_convertible(body_k) && row_convertible(body_v);
+            const bool tail_ok =
+                (tail_k == GGML_TYPE_F16 || tail_k == GGML_TYPE_BF16) &&
+                (tail_v == GGML_TYPE_F16 || tail_v == GGML_TYPE_BF16);
+            const bool dims_ok = d_k == d_v &&
+                (d_k == 128 || d_k == 256 || d_k == 512);
+            return body_ok && tail_ok && dims_ok;
+        };
+    }
     if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
         ggml_backend_set_n_threads_t fct = ggml_backend_cpu_set_n_threads;
         return (void *)fct;

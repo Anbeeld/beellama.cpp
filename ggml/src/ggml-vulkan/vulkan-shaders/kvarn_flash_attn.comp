@@ -1,0 +1,599 @@
+#version 450
+
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint n_heads;
+    uint n_kv;
+    uint stream_group_packed;
+    uint bits_packed;
+    uint n_indices;
+    uint kvarn_shape_packed;
+    uint flags;
+    uint mask_query_packed;
+    uint tail_stride;
+    uint query_order_nelements;
+    uint run_desc_ne0;
+    uint k_tail_nb1;
+    uint k_tail_nb2;
+    uint v_tail_nb1;
+    uint v_tail_nb2;
+    uint64_t tail_mask_addr;
+    uint64_t query_order_addr;
+    uint64_t run_desc_addr;
+    uint64_t k_tail_current_addr;
+    uint64_t v_tail_current_addr;
+    float scale;
+    float max_bias;
+    float logit_softcap;
+    uint query_shape_packed;
+    uint q_nb1;
+    uint q_nb2;
+} p;
+
+layout(binding = 0, std430) readonly buffer Q       { uint data_q[]; };
+layout(binding = 1, std430) readonly buffer KRecord { uint data_krecord[]; };
+layout(binding = 2, std430) readonly buffer KStage  { uint data_kstage[]; };
+layout(binding = 3, std430) readonly buffer KIndex  { uint data_kindex[]; };
+layout(binding = 4, std430) readonly buffer VRecord { uint data_vrecord[]; };
+layout(binding = 5, std430) readonly buffer VStage  { uint data_vstage[]; };
+layout(binding = 6, std430) readonly buffer VIndex  { uint data_vindex[]; };
+layout(binding = 7, std430) readonly buffer Mask    { uint data_mask[]; };
+layout(binding = 8, std430) readonly buffer Sinks   { uint data_sinks[]; };
+layout(binding = 9, std430) buffer Dst              { uint data_dst[]; };
+layout(binding = 10, std430) readonly buffer KTail  { uint data_ktail[]; };
+layout(binding = 11, std430) readonly buffer VTail  { uint data_vtail[]; };
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer TailMaskRef {
+    uint data[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer QueryOrderRef {
+    int data[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer RunDescRef {
+    int data[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer TailCurrentRef {
+    uint data[];
+};
+
+const uint KVAR_N_DIM = 128u;
+const uint FLAG_SWA = 1u;
+const uint FLAG_EAGER = 2u;
+const uint FLAG_MASK = 4u;
+const uint FLAG_SINKS = 8u;
+const uint FLAG_TAIL = 16u;
+const uint FLAG_K_TAIL_BF16 = 32u;
+const uint FLAG_V_TAIL_BF16 = 64u;
+const uint FLAG_SHARED_INDICES = 128u;
+const uint FLAG_TAIL_CURRENT = 256u;
+const uint FLAG_TAIL_BODYLESS = 512u;
+const uint FLAG_TAIL_HISTORY_SHIFT = 10u;
+const uint GQA_GROUP_MAX = 4u;
+
+uint k_bits() {
+    return p.bits_packed & 0xffffu;
+}
+
+uint v_bits() {
+    return p.bits_packed >> 16u;
+}
+
+uint head_slices() {
+    return p.kvarn_shape_packed & 0xffu;
+}
+
+uint stage_groups() {
+    return (p.kvarn_shape_packed >> 8u) & 0xffu;
+}
+
+uint tail_groups() {
+    return (p.kvarn_shape_packed >> 16u) & 0xffu;
+}
+
+uint mask_ne3() {
+    return p.mask_query_packed & 0xffffu;
+}
+
+uint query_order_ne0() {
+    return p.mask_query_packed >> 16u;
+}
+
+uint n_query() {
+    return p.query_shape_packed & 0xffffu;
+}
+
+uint gqa() {
+    return p.query_shape_packed >> 16u;
+}
+
+uint q_nb1() {
+    return p.q_nb1;
+}
+
+uint q_nb2() {
+    return p.q_nb2;
+}
+
+uint stream_start() {
+    return p.stream_group_packed & 0xffffu;
+}
+
+uint groups_per_stream() {
+    return p.stream_group_packed >> 16u;
+}
+
+shared float sh_reduce[128];
+shared uint sh_live_group[128];
+shared uint sh_live_pos[128];
+shared float sh_maximum[GQA_GROUP_MAX];
+shared float sh_denominator[GQA_GROUP_MAX];
+shared float sh_old_scale[GQA_GROUP_MAX];
+shared float sh_weight[GQA_GROUP_MAX];
+shared int sh_active;
+
+uint read_index_low(bool value, uint token) {
+    return value && (p.flags & FLAG_SHARED_INDICES) == 0u ?
+        data_vindex[2u * token] : data_kindex[2u * token];
+}
+
+float load_stage(bool value, uint stage_pos, uint head, uint dim) {
+    const uint index = (stage_pos * p.n_heads + head) * 64u + (dim >> 1u);
+    const vec2 pair = unpackHalf2x16(value ? data_vstage[index] : data_kstage[index]);
+    return (dim & 1u) == 0u ? pair.x : pair.y;
+}
+
+uint load_record_word(bool value, uint index) {
+    return value ? data_vrecord[index] : data_krecord[index];
+}
+
+uint unpack_record(bool value, uint record_base, uint index, uint bits) {
+    const uint bit_offset = index * bits;
+    const uint word_index = bit_offset >> 5u;
+    const uint bit = bit_offset & 31u;
+    uint result = load_record_word(value, record_base + word_index) >> bit;
+    if (bit + bits > 32u) {
+        result |= load_record_word(value, record_base + word_index + 1u) << (32u - bit);
+    }
+    return result & ((1u << bits) - 1u);
+}
+
+float load_axis(
+        bool value,
+        uint record_base,
+        uint payload_words,
+        uint axis,
+        uint index) {
+    const vec2 pair = unpackHalf2x16(load_record_word(
+        value, record_base + payload_words + axis * 64u + (index >> 1u)));
+    return (index & 1u) == 0u ? pair.x : pair.y;
+}
+
+void compute_live(
+        bool value,
+        uint stream,
+        uint lane,
+        out uint live_group,
+        out uint live_pos) {
+    uint group_best = 0u;
+    uint pos_best = 0u;
+    for (uint i = lane; i < p.n_indices; i += KVAR_N_DIM) {
+        const int index = int(read_index_low(value, i));
+        if (index < 0) {
+            continue;
+        }
+        const uint global_group = uint(index) / KVAR_N_DIM;
+        const uint index_stream = (p.flags & FLAG_SWA) != 0u ?
+            stream : global_group / groups_per_stream();
+        if (index_stream != stream) {
+            continue;
+        }
+        const uint group = (p.flags & FLAG_SWA) != 0u ?
+            global_group : global_group - stream * groups_per_stream();
+        const uint pos = uint(index) % KVAR_N_DIM;
+        if (group > group_best || (group == group_best && pos > pos_best)) {
+            group_best = group;
+            pos_best = pos;
+        }
+    }
+    sh_live_group[lane] = group_best;
+    sh_live_pos[lane] = pos_best;
+    barrier();
+    for (uint stride = 64u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            const uint other_group = sh_live_group[lane + stride];
+            const uint other_pos = sh_live_pos[lane + stride];
+            if (other_group > sh_live_group[lane] ||
+                    (other_group == sh_live_group[lane] &&
+                     other_pos > sh_live_pos[lane])) {
+                sh_live_group[lane] = other_group;
+                sh_live_pos[lane] = other_pos;
+            }
+        }
+        barrier();
+    }
+    live_group = sh_live_group[0];
+    live_pos = sh_live_pos[0];
+}
+
+float load_kvarn(
+        bool value,
+        uint logical_head,
+        uint token,
+        uint stream,
+        uint live_group,
+        uint live_pos,
+        uint slice,
+        uint dim) {
+    const bool swa = (p.flags & FLAG_SWA) != 0u;
+    const int absolute_pos = swa ? int(read_index_low(value, token)) : int(token);
+    if (absolute_pos < 0) {
+        return 0.0;
+    }
+
+    const uint group = uint(absolute_pos) / KVAR_N_DIM;
+    const uint pos = uint(absolute_pos) % KVAR_N_DIM;
+    bool from_stage = false;
+    bool from_record = false;
+    if ((p.flags & FLAG_EAGER) != 0u) {
+        from_stage = (!swa && group == 0u) ||
+            (group == live_group && live_pos < 127u);
+        const bool completed = group < live_group ||
+            (group == live_group && live_pos == 127u);
+        from_record = !from_stage && completed && (swa ?
+            (group <= live_group && live_group - group < groups_per_stream()) :
+            (group > 0u && group < groups_per_stream()));
+    } else if (swa) {
+        const uint stage_begin = live_group >= tail_groups() - 1u ?
+            live_group - (tail_groups() - 1u) : 0u;
+        from_stage = group >= stage_begin && group <= live_group;
+        from_record = !from_stage && group < stage_begin &&
+            live_group - group < groups_per_stream() + tail_groups();
+    } else {
+        from_stage = group == 0u ||
+            (group > 0u && group <= live_group &&
+             group + (tail_groups() - 1u) >= live_group);
+        from_record = !from_stage && group < live_group &&
+            group < groups_per_stream();
+    }
+
+    const uint head = logical_head * head_slices() + slice;
+    if (from_stage) {
+        const uint stage_slot = swa ? group % stage_groups() :
+            (group == 0u ? 0u : 1u + ((group - 1u) % tail_groups()));
+        const uint stage_pos = stream * KVAR_N_DIM * stage_groups() +
+            stage_slot * KVAR_N_DIM + pos;
+        return load_stage(value, stage_pos, head, dim);
+    }
+    if (from_record) {
+        const uint ring = swa ? group % groups_per_stream() : group;
+        const uint bits = value ? v_bits() : k_bits();
+        const uint record_words = bits * 512u + 192u;
+        const uint record_base =
+            ((stream * groups_per_stream() + ring) * p.n_heads + head) *
+            record_words;
+        const uint row = value ? pos : dim;
+        const uint col = value ? dim : pos;
+        const uint payload_words = bits * 512u;
+        const uint quant = unpack_record(
+            value, record_base, row * KVAR_N_DIM + col, bits);
+        const float scale = load_axis(value, record_base, payload_words, 0u, row);
+        const float zero = load_axis(value, record_base, payload_words, 1u, row);
+        const float other = load_axis(value, record_base, payload_words, 2u, col);
+        return (float(quant) * scale + zero) * other;
+    }
+    return 0.0;
+}
+
+float load_mask(uint token, uint query, uint stream) {
+    const uint half_index = token + query * p.n_kv +
+        (stream % mask_ne3()) * p.n_kv * n_query();
+    const vec2 pair = unpackHalf2x16(data_mask[half_index >> 1u]);
+    return (half_index & 1u) == 0u ? pair.x : pair.y;
+}
+
+float load_u16_word(uint word, uint half_index, bool bf16) {
+    const uint bits = (word >> ((half_index & 1u) * 16u)) & 0xffffu;
+    if (bf16) {
+        return uintBitsToFloat(bits << 16u);
+    }
+    const vec2 pair = unpackHalf2x16(word);
+    return (half_index & 1u) == 0u ? pair.x : pair.y;
+}
+
+float load_tail(bool value, uint slot, uint head, uint dim) {
+    const uint history_slots = p.flags >> FLAG_TAIL_HISTORY_SHIFT;
+    const bool from_current =
+        (p.flags & FLAG_TAIL_CURRENT) != 0u && slot >= history_slots;
+    const uint source_slot = from_current ? slot - history_slots : slot;
+    const uint half_index = value ?
+        source_slot * p.v_tail_nb1 + head * p.v_tail_nb2 + dim :
+        source_slot * p.k_tail_nb1 + head * p.k_tail_nb2 + dim;
+    uint word;
+    if (from_current) {
+        TailCurrentRef current = TailCurrentRef(
+            value ? p.v_tail_current_addr : p.k_tail_current_addr);
+        word = current.data[half_index >> 1u];
+    } else {
+        word = value ? data_vtail[half_index >> 1u] : data_ktail[half_index >> 1u];
+    }
+    const bool bf16 = value ?
+        (p.flags & FLAG_V_TAIL_BF16) != 0u :
+        (p.flags & FLAG_K_TAIL_BF16) != 0u;
+    return load_u16_word(word, half_index, bf16);
+}
+
+float load_tail_mask(uint token, uint query, uint stream) {
+    const uint half_index = token + query * p.tail_stride +
+        stream * p.tail_stride * n_query();
+    TailMaskRef tail_mask = TailMaskRef(p.tail_mask_addr);
+    return load_u16_word(
+        tail_mask.data[half_index >> 1u], half_index, false);
+}
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+    const uint split_k = gl_NumWorkGroups.x / n_query();
+    const uint split_index = gl_WorkGroupID.x % split_k;
+    const uint query = gl_WorkGroupID.x / split_k;
+    const uint out_stream = gl_WorkGroupID.z;
+    const uint stream = stream_start() + out_stream;
+    const uint n_kv_heads = p.n_heads / head_slices();
+    const uint n_query_heads = n_kv_heads * gqa();
+    const uint gqa_group_size = min(gqa(), GQA_GROUP_MAX);
+    const uint gqa_groups = (gqa() + gqa_group_size - 1u) / gqa_group_size;
+    const uint logical_head = gl_WorkGroupID.y / gqa_groups;
+    const uint gqa_group = gl_WorkGroupID.y % gqa_groups;
+    const uint query_head_first = logical_head * gqa() + gqa_group * gqa_group_size;
+    const uint active_heads = min(
+        gqa_group_size, gqa() - gqa_group * gqa_group_size);
+    const bool has_tail = (p.flags & FLAG_TAIL) != 0u;
+    const bool bodyless = (p.flags & FLAG_TAIL_BODYLESS) != 0u;
+    const bool process_tail = has_tail && split_index + 1u == split_k;
+
+    if (lane == 0u) {
+        sh_active = -1;
+        if (has_tail) {
+            QueryOrderRef query_order = QueryOrderRef(p.query_order_addr);
+            const int query_id = int(out_stream * n_query() + query);
+            for (uint packed = 0u; packed < p.query_order_nelements; ++packed) {
+                if (query_order.data[packed] == query_id) {
+                    sh_active = int(packed / query_order_ne0());
+                    break;
+                }
+            }
+        }
+    }
+    barrier();
+    if (has_tail && sh_active < 0) {
+        return;
+    }
+
+    uint k_live_group = 0u;
+    uint k_live_pos = 0u;
+    uint v_live_group = 0u;
+    uint v_live_pos = 0u;
+    if (!bodyless) {
+        compute_live(false, stream, lane, k_live_group, k_live_pos);
+        if ((p.flags & FLAG_SHARED_INDICES) != 0u) {
+            v_live_group = k_live_group;
+            v_live_pos = k_live_pos;
+        } else {
+            compute_live(true, stream, lane, v_live_group, v_live_pos);
+        }
+    }
+
+    float accumulator[GQA_GROUP_MAX * 4u];
+    for (uint i = 0u; i < GQA_GROUP_MAX * 4u; ++i) {
+        accumulator[i] = 0.0;
+    }
+    if (lane == 0u) {
+        for (uint gi = 0u; gi < active_heads; ++gi) {
+            sh_maximum[gi] = -3.402823466e38;
+            sh_denominator[gi] = 0.0;
+        }
+    }
+    barrier();
+
+    uint n_head_log2 = 1u;
+    while ((n_head_log2 << 1u) <= n_query_heads) {
+        n_head_log2 <<= 1u;
+    }
+    const float m0 = exp2(-p.max_bias / float(n_head_log2));
+    const float m1 = exp2(-(p.max_bias / 2.0) / float(n_head_log2));
+    const uint head_dim = head_slices() * KVAR_N_DIM;
+    float slopes[GQA_GROUP_MAX];
+    uint q_bases[GQA_GROUP_MAX];
+    for (uint gi = 0u; gi < active_heads; ++gi) {
+        const uint query_head = query_head_first + gi;
+        slopes[gi] = p.max_bias > 0.0 ?
+            (query_head < n_head_log2 ?
+                pow(m0, float(query_head + 1u)) :
+                pow(m1, float(2u * (query_head - n_head_log2) + 1u))) : 1.0;
+        q_bases[gi] = query * q_nb1() +
+            query_head * q_nb2() +
+            out_stream * head_dim * n_query() * n_query_heads;
+    }
+
+    const uint body_tokens = bodyless ? 0u : p.n_kv;
+    const uint token_begin = body_tokens * split_index / split_k;
+    const uint token_end = body_tokens * (split_index + 1u) / split_k;
+
+    for (uint token = token_begin; token < token_end; ++token) {
+        float k_values[4];
+        float v_values[4];
+        for (uint slice = 0u; slice < head_slices(); ++slice) {
+            const uint dim = slice * KVAR_N_DIM + lane;
+            k_values[slice] = load_kvarn(false, logical_head, token, stream,
+                k_live_group, k_live_pos, slice, lane);
+            v_values[slice] = load_kvarn(true, logical_head, token, stream,
+                v_live_group, v_live_pos, slice, lane);
+        }
+
+        for (uint gi = 0u; gi < active_heads; ++gi) {
+            float partial = 0.0;
+            for (uint slice = 0u; slice < head_slices(); ++slice) {
+                const uint dim = slice * KVAR_N_DIM + lane;
+                partial += uintBitsToFloat(data_q[q_bases[gi] + dim]) * k_values[slice];
+            }
+            partial = subgroupAdd(partial);
+            if (gl_SubgroupInvocationID == 0u) {
+                sh_reduce[gl_SubgroupID] = partial;
+            }
+            barrier();
+            if (lane == 0u) {
+                float total = 0.0;
+                for (uint subgroup = 0u; subgroup < gl_NumSubgroups; ++subgroup) {
+                    total += sh_reduce[subgroup];
+                }
+                const float mask_value = (p.flags & FLAG_MASK) != 0u ?
+                    slopes[gi] * load_mask(token, query, out_stream) : 0.0;
+                float score = total * p.scale;
+                if (p.logit_softcap != 0.0) {
+                    score = p.logit_softcap * tanh(score);
+                }
+                score += mask_value;
+                if (isinf(mask_value) && mask_value < 0.0) {
+                    sh_old_scale[gi] = 1.0;
+                    sh_weight[gi] = 0.0;
+                } else {
+                    const float next_maximum = max(sh_maximum[gi], score);
+                    const float old_scale = sh_maximum[gi] < -3.0e38 ?
+                        0.0 : exp(sh_maximum[gi] - next_maximum);
+                    const float weight = exp(score - next_maximum);
+                    sh_maximum[gi] = next_maximum;
+                    sh_denominator[gi] = sh_denominator[gi] * old_scale + weight;
+                    sh_old_scale[gi] = old_scale;
+                    sh_weight[gi] = weight;
+                }
+            }
+            barrier();
+
+            for (uint slice = 0u; slice < head_slices(); ++slice) {
+                const uint acc = gi * 4u + slice;
+                accumulator[acc] = accumulator[acc] * sh_old_scale[gi] +
+                    v_values[slice] * sh_weight[gi];
+            }
+        }
+    }
+
+    if (process_tail) {
+        RunDescRef run_desc = RunDescRef(p.run_desc_addr);
+        const uint desc_base = uint(sh_active) * p.run_desc_ne0;
+        const uint n_tail = uint(max(run_desc.data[desc_base + 4u], 0));
+        for (uint token = 0u; token < n_tail; ++token) {
+            const uint slot = uint(run_desc.data[desc_base + 6u + token]);
+            float k_values[4];
+            float v_values[4];
+            for (uint slice = 0u; slice < head_slices(); ++slice) {
+                const uint dim = slice * KVAR_N_DIM + lane;
+                k_values[slice] = load_tail(false, slot, logical_head, dim);
+                v_values[slice] = load_tail(true, slot, logical_head, dim);
+            }
+
+            for (uint gi = 0u; gi < active_heads; ++gi) {
+                float partial = 0.0;
+                for (uint slice = 0u; slice < head_slices(); ++slice) {
+                    const uint dim = slice * KVAR_N_DIM + lane;
+                    partial += uintBitsToFloat(data_q[q_bases[gi] + dim]) * k_values[slice];
+                }
+                partial = subgroupAdd(partial);
+                if (gl_SubgroupInvocationID == 0u) {
+                    sh_reduce[gl_SubgroupID] = partial;
+                }
+                barrier();
+                if (lane == 0u) {
+                    float total = 0.0;
+                    for (uint subgroup = 0u; subgroup < gl_NumSubgroups; ++subgroup) {
+                        total += sh_reduce[subgroup];
+                    }
+                    const float mask_value =
+                        slopes[gi] * load_tail_mask(token, query, out_stream);
+                    float score = total * p.scale;
+                    if (p.logit_softcap != 0.0) {
+                        score = p.logit_softcap * tanh(score);
+                    }
+                    score += mask_value;
+                    if (isinf(mask_value) && mask_value < 0.0) {
+                        sh_old_scale[gi] = 1.0;
+                        sh_weight[gi] = 0.0;
+                    } else {
+                        const float next_maximum = max(sh_maximum[gi], score);
+                        const float old_scale = sh_maximum[gi] < -3.0e38 ?
+                            0.0 : exp(sh_maximum[gi] - next_maximum);
+                        const float weight = exp(score - next_maximum);
+                        sh_maximum[gi] = next_maximum;
+                        sh_denominator[gi] = sh_denominator[gi] * old_scale + weight;
+                        sh_old_scale[gi] = old_scale;
+                        sh_weight[gi] = weight;
+                    }
+                }
+                barrier();
+
+                for (uint slice = 0u; slice < head_slices(); ++slice) {
+                    const uint acc = gi * 4u + slice;
+                    accumulator[acc] = accumulator[acc] * sh_old_scale[gi] +
+                        v_values[slice] * sh_weight[gi];
+                }
+            }
+        }
+    }
+
+    if (split_k > 1u) {
+        const uint matrix_values = head_dim * n_query() * n_query_heads *
+            gl_NumWorkGroups.z * split_k;
+        for (uint gi = 0u; gi < active_heads; ++gi) {
+            const uint query_head = query_head_first + gi;
+            const uint matrix_base = head_dim * n_query_heads *
+                (split_index + split_k * (query + n_query() * out_stream)) +
+                head_dim * query_head;
+            for (uint slice = 0u; slice < head_slices(); ++slice) {
+                const uint dim = slice * KVAR_N_DIM + lane;
+                data_dst[matrix_base + dim] = floatBitsToUint(accumulator[gi * 4u + slice]);
+            }
+            if (lane == 0u) {
+                const uint lm_base = matrix_values + n_query_heads * 2u *
+                    (split_index + split_k * (query + n_query() * out_stream));
+                data_dst[lm_base + query_head] = floatBitsToUint(sh_denominator[gi]);
+                data_dst[lm_base + n_query_heads + query_head] = floatBitsToUint(sh_maximum[gi]);
+            }
+        }
+        return;
+    }
+
+    if (lane == 0u) {
+        for (uint gi = 0u; gi < active_heads; ++gi) {
+            const uint query_head = query_head_first + gi;
+            if ((p.flags & FLAG_SINKS) != 0u) {
+                const float score = uintBitsToFloat(data_sinks[query_head]);
+                const float next_maximum = max(sh_maximum[gi], score);
+                sh_old_scale[gi] = sh_maximum[gi] < -3.0e38 ?
+                    0.0 : exp(sh_maximum[gi] - next_maximum);
+                sh_denominator[gi] = sh_denominator[gi] * sh_old_scale[gi] +
+                    exp(score - next_maximum);
+                sh_maximum[gi] = next_maximum;
+            } else {
+                sh_old_scale[gi] = 1.0;
+            }
+            sh_weight[gi] = sh_denominator[gi] > 0.0 ? 1.0 / sh_denominator[gi] : 0.0;
+        }
+    }
+    barrier();
+
+    for (uint gi = 0u; gi < active_heads; ++gi) {
+        const uint query_head = query_head_first + gi;
+        const uint dst_base = query_head * head_dim +
+            query * head_dim * n_query_heads +
+            out_stream * head_dim * n_query_heads * n_query();
+        for (uint slice = 0u; slice < head_slices(); ++slice) {
+            const uint dim = slice * KVAR_N_DIM + lane;
+            data_dst[dst_base + dim] = floatBitsToUint(
+                accumulator[gi * 4u + slice] * sh_old_scale[gi] * sh_weight[gi]);
+        }
+    }
+}

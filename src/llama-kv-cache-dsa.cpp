@@ -27,7 +27,8 @@ llama_kv_cache_dsa::llama_kv_cache_dsa(
     const  layer_reuse_cb & reuse,
                  uint32_t   n_ubatch,
                  uint32_t   tail_tokens,
-                ggml_type   tail_type) :
+                ggml_type   tail_type,
+                 uint32_t   tail_rollback_tokens) :
     hparams_lid(model.hparams), n_stream(unified ? 1 : n_seq_max) {
 
     LLAMA_LOG_INFO("%s: creating main KV cache, size = %u cells\n", __func__, kv_size);
@@ -36,7 +37,7 @@ llama_kv_cache_dsa::llama_kv_cache_dsa(
             model, model.hparams, type_k, type_v,
             v_trans, offload, unified, kv_size, n_seq_max, n_pad,
             n_swa, swa_type, nullptr, filter, reuse, nullptr,
-            n_ubatch, tail_tokens, tail_type);
+            n_ubatch, tail_tokens, tail_type, UINT32_MAX, false, tail_rollback_tokens);
 
     // we use llama_kv_cache for caching indexer keys
     // by hand-tweaking some hparams we fool it to create
@@ -206,6 +207,10 @@ bool llama_kv_cache_dsa::get_can_shift() const {
            kv_mla->get_size() == kv_lid->get_size();
 }
 
+llama_memory_i::seq_rm_capability llama_kv_cache_dsa::get_seq_rm_capability() const {
+    return llama_memory_seq_rm_capability_all({ kv_mla.get(), kv_lid.get() });
+}
+
 void llama_kv_cache_dsa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     kv_mla->state_write(io, seq_id, flags);
     kv_lid->state_write(io, seq_id, flags);
@@ -282,6 +287,16 @@ bool llama_kv_cache_dsa_context::apply() {
     res = res & ctx_lid->apply();
 
     return res;
+}
+
+void llama_kv_cache_dsa_context::graph_compute_start() {
+    ctx_mla->graph_compute_start();
+    ctx_lid->graph_compute_start();
+}
+
+void llama_kv_cache_dsa_context::graph_compute_finish(ggml_status compute_status) {
+    ctx_mla->graph_compute_finish(compute_status);
+    ctx_lid->graph_compute_finish(compute_status);
 }
 
 llama_memory_status llama_kv_cache_dsa_context::get_status() const {

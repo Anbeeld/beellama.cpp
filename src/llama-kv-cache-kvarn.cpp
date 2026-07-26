@@ -19,12 +19,33 @@ namespace {
 
 using backend_kv_tail_attention_supported_t = bool (*)(
         ggml_type, ggml_type, ggml_type, ggml_type, int64_t, int64_t);
+using backend_kvarn_tail_attention_supported_t = bool (*)(
+        ggml_backend_dev_t,
+        ggml_type, ggml_type, ggml_type, ggml_type, int64_t, int64_t);
 
 bool kvarn_backend_supports_native_tail(
         ggml_backend_dev_t dev, ggml_type exact_type, int64_t d_k, int64_t d_v) {
+    if (dev == nullptr) {
+        dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    }
     auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    auto * segmented_fn = reg ? reinterpret_cast<backend_kv_tail_attention_supported_t>(
+            ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_kv_tail_segmented_attention_supported")) : nullptr;
+    if (!segmented_fn || !segmented_fn(
+            GGML_TYPE_F16, GGML_TYPE_F16, exact_type, exact_type, d_k, d_v)) {
+        return false;
+    }
+    auto * kvarn_fn = reg ? reinterpret_cast<backend_kvarn_tail_attention_supported_t>(
+            ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_kvarn_tail_attention_supported")) : nullptr;
+    if (kvarn_fn) {
+        return kvarn_fn(dev, GGML_TYPE_F16, GGML_TYPE_F16,
+            exact_type, exact_type, d_k, d_v);
+    }
     auto * fn = reg ? reinterpret_cast<backend_kv_tail_attention_supported_t>(
-            ggml_backend_reg_get_proc_address(reg, "ggml_backend_kv_tail_attention_supported")) : nullptr;
+            ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_kv_tail_attention_supported")) : nullptr;
     return fn && fn(GGML_TYPE_F16, GGML_TYPE_F16, exact_type, exact_type, d_k, d_v);
 }
 
@@ -52,14 +73,16 @@ bool kvarn_backend_supports_tail_write(
 // records. Keep this low enough that KVarN remains a KV-memory win over q5_0.
 constexpr uint32_t KVAR_N_SWA_TAIL_GROUPS = 2;
 constexpr uint32_t KVAR_N_STATE_MAGIC = 0x4e52564b; // "KVRN"
-// Version 12 stores canonical exact-tail payloads and remaps SWA record rings
-// across physical ubatch layouts. Version 11: tail_groups is explicit and SWA
+// Version 13 stores exact-tail payloads component-major in contiguous physical
+// slot runs. Version 12 stores canonical exact-tail payloads interleaved by row
+// and remaps SWA record rings across physical ubatch layouts. Version 11: tail_groups is explicit and SWA
 // stages no longer allocate a non-existent sink slot. Version 9: D256/D512 records use the full logical-head Hadamard instead of
 // independent 128-wide slice rotations. Version 8: KVarN K/V stage rows and compressed records are all
 // rotated-domain. Older states are rejected because their staged V rows may
 // otherwise be restored in the wrong domain. Version 5 added stage_groups
 // validation. Version 10 rejects states with the pre-dedup SWA record-ring layout.
-constexpr uint32_t KVAR_N_STATE_VERSION = 12;
+constexpr uint32_t KVAR_N_STATE_VERSION_MIN = 12;
+constexpr uint32_t KVAR_N_STATE_VERSION = 13;
 constexpr uint32_t KVAR_N_STATE_RECORDS_FULL = 0;
 constexpr uint32_t KVAR_N_STATE_STAGE_ONLY_PARTIAL = 1;
 
@@ -67,13 +90,64 @@ constexpr uint32_t KVAR_N_STATE_STAGE_ONLY_PARTIAL = 1;
 
 bool llama_kvarn_backend_supports_native_ops(ggml_backend_dev_t dev) {
     if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
-        return false;
+        return true; // the built-in CPU backend consumes KVarN views directly
     }
 
     using ggml_backend_kvarn_native_ops_t = bool (*)(ggml_backend_dev_t dev);
     auto * reg = ggml_backend_dev_backend_reg(dev);
     auto * fn = reg ? (ggml_backend_kvarn_native_ops_t) ggml_backend_reg_get_proc_address(
             reg, "ggml_backend_kvarn_native_ops") : nullptr;
+    return fn != nullptr && fn(dev);
+}
+
+bool llama_kvarn_backend_native_attention_uses_original_v(ggml_backend_dev_t dev) {
+    if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return false;
+    }
+
+    using ggml_backend_kvarn_native_original_v_t = bool (*)(ggml_backend_dev_t dev);
+    auto * reg = ggml_backend_dev_backend_reg(dev);
+    auto * fn = reg ? (ggml_backend_kvarn_native_original_v_t) ggml_backend_reg_get_proc_address(
+            reg, "ggml_backend_kvarn_native_original_v") : nullptr;
+    return fn != nullptr && fn(dev);
+}
+
+uint32_t llama_kvarn_backend_native_rotated_max_query_tokens(ggml_backend_dev_t dev) {
+    if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return 0;
+    }
+
+    using ggml_backend_kvarn_native_rotated_max_query_tokens_t = uint32_t (*)(ggml_backend_dev_t dev);
+    auto * reg = ggml_backend_dev_backend_reg(dev);
+    auto * fn = reg ? (ggml_backend_kvarn_native_rotated_max_query_tokens_t)
+        ggml_backend_reg_get_proc_address(
+            reg, "ggml_backend_kvarn_native_rotated_max_query_tokens") : nullptr;
+    return fn != nullptr ? fn(dev) : 0;
+}
+
+bool llama_kvarn_backend_mixed_tail_native_preferred(ggml_backend_dev_t dev) {
+    if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return true;
+    }
+
+    using ggml_backend_kvarn_mixed_tail_native_preferred_t = bool (*)(
+        ggml_backend_dev_t dev);
+    auto * reg = ggml_backend_dev_backend_reg(dev);
+    auto * fn = reg ? (ggml_backend_kvarn_mixed_tail_native_preferred_t)
+        ggml_backend_reg_get_proc_address(
+            reg, "ggml_backend_kvarn_mixed_tail_native_preferred") : nullptr;
+    return fn == nullptr || fn(dev);
+}
+
+bool llama_kvarn_backend_supports_ops(ggml_backend_dev_t dev) {
+    if (dev == nullptr) {
+        return true; // the built-in CPU backend implements store + materialize
+    }
+
+    using ggml_backend_kvarn_ops_t = bool (*)(ggml_backend_dev_t dev);
+    auto * reg = ggml_backend_dev_backend_reg(dev);
+    auto * fn = reg ? (ggml_backend_kvarn_ops_t) ggml_backend_reg_get_proc_address(
+            reg, "ggml_backend_kvarn_ops") : nullptr;
     return fn != nullptr && fn(dev);
 }
 
@@ -164,6 +238,171 @@ void zero_kvarn_tensor_range(llama_io_read_i & io, ggml_tensor * tensor, size_t 
         return;
     }
     io.stage_tensor_clear(tensor, offset, size);
+}
+
+struct kvarn_tail_tensor_span {
+    size_t offset;
+    size_t size;
+};
+
+kvarn_tail_tensor_span kvarn_tail_checked_span(
+        ggml_tensor * tensor, int32_t slot_begin, uint32_t length, uint64_t row_size) {
+    if (!tensor || slot_begin < 0 || length == 0 || row_size == 0) {
+        throw std::runtime_error("invalid KVarN exact-tail tensor span");
+    }
+    const uint64_t slot = uint64_t(slot_begin);
+    if (slot > uint64_t(std::numeric_limits<size_t>::max())/row_size ||
+            uint64_t(length) > uint64_t(std::numeric_limits<size_t>::max())/row_size) {
+        throw std::overflow_error("KVarN exact-tail tensor span overflows size_t");
+    }
+    const size_t offset = size_t(slot*row_size);
+    const size_t size = size_t(uint64_t(length)*row_size);
+    if (offset > size_t(ggml_nbytes(tensor)) || size > size_t(ggml_nbytes(tensor)) - offset) {
+        throw std::runtime_error("KVarN exact-tail tensor span exceeds its allocation");
+    }
+    return { offset, size };
+}
+
+uint64_t kvarn_tail_checked_bytes(uint32_t payloads, uint64_t row_size) {
+    if (row_size != 0 && uint64_t(payloads) > std::numeric_limits<uint64_t>::max()/row_size) {
+        throw std::overflow_error("KVarN exact-tail state byte count overflows uint64_t");
+    }
+    return uint64_t(payloads)*row_size;
+}
+
+void kvarn_tail_add_bytes(uint64_t & total, uint64_t bytes) {
+    if (bytes > std::numeric_limits<uint64_t>::max() - total) {
+        throw std::overflow_error("KVarN exact-tail state byte total overflows uint64_t");
+    }
+    total += bytes;
+}
+
+size_t read_kvarn_exact_tail_v12_interleaved(
+        llama_io_read_i & io,
+        ggml_tensor * k_tail,
+        ggml_tensor * v_tail,
+        uint64_t k_tail_row,
+        uint64_t v_tail_row,
+        const std::vector<std::vector<int32_t>> & destinations,
+        bool on_device) {
+    size_t tensor_ops = 0;
+    for (const auto & payload_destinations : destinations) {
+        if (k_tail) {
+            if (on_device) {
+                const auto span = kvarn_tail_checked_span(k_tail, payload_destinations[0], 1, k_tail_row);
+                io.read_tensor(k_tail, span.offset, span.size);
+                ++tensor_ops;
+            } else {
+                std::vector<uint8_t> row(static_cast<size_t>(k_tail_row));
+                io.read(row.data(), row.size());
+                for (const int32_t slot : payload_destinations) {
+                    const auto span = kvarn_tail_checked_span(k_tail, slot, 1, k_tail_row);
+                    io.stage_tensor_set(k_tail, row.data(), span.offset, span.size);
+                    ++tensor_ops;
+                }
+            }
+        }
+        if (v_tail) {
+            if (on_device) {
+                const auto span = kvarn_tail_checked_span(v_tail, payload_destinations[0], 1, v_tail_row);
+                io.read_tensor(v_tail, span.offset, span.size);
+                ++tensor_ops;
+            } else {
+                std::vector<uint8_t> row(static_cast<size_t>(v_tail_row));
+                io.read(row.data(), row.size());
+                for (const int32_t slot : payload_destinations) {
+                    const auto span = kvarn_tail_checked_span(v_tail, slot, 1, v_tail_row);
+                    io.stage_tensor_set(v_tail, row.data(), span.offset, span.size);
+                    ++tensor_ops;
+                }
+            }
+        }
+    }
+    return tensor_ops;
+}
+
+size_t read_kvarn_exact_tail_v13_component(
+        llama_io_read_i & io,
+        ggml_tensor * tensor,
+        uint64_t row_size,
+        const std::vector<std::vector<int32_t>> & destinations,
+        bool on_device) {
+    if (!tensor) {
+        if (row_size != 0) {
+            throw std::runtime_error("KVarN exact-tail state has a row for an absent tensor");
+        }
+        return 0;
+    }
+
+    const uint64_t expected_bytes = kvarn_tail_checked_bytes(uint32_t(destinations.size()), row_size);
+    if (expected_bytes > uint64_t(std::numeric_limits<size_t>::max())) {
+        throw std::overflow_error("KVarN exact-tail component exceeds size_t");
+    }
+    const size_t begin = io.n_bytes();
+    size_t tensor_ops = 0;
+    if (on_device) {
+        // Device state buffers retain one tensor per write operation. Keep a
+        // canonical row topology so a wrapped source can restore into a
+        // destination with different physical run boundaries.
+        for (const auto & payload_destinations : destinations) {
+            if (payload_destinations.size() != 1) {
+                throw std::runtime_error("on-device KVarN exact-tail state requires one destination slot per payload");
+            }
+            const auto span = kvarn_tail_checked_span(tensor, payload_destinations[0], 1, row_size);
+            io.read_tensor(tensor, span.offset, span.size);
+            ++tensor_ops;
+        }
+        return tensor_ops;
+    }
+
+    for (size_t payload = 0; payload < destinations.size();) {
+        if (destinations[payload].size() == 1) {
+            uint32_t length = 1;
+            while (payload + length < destinations.size() &&
+                    destinations[payload + length].size() == 1 &&
+                    int64_t(destinations[payload + length][0]) ==
+                            int64_t(destinations[payload + length - 1][0]) + 1) {
+                ++length;
+            }
+            const auto span = kvarn_tail_checked_span(tensor, destinations[payload][0], length, row_size);
+            io.read_tensor(tensor, span.offset, span.size);
+            ++tensor_ops;
+            payload += length;
+            continue;
+        }
+
+        std::vector<uint8_t> row(static_cast<size_t>(row_size));
+        io.read(row.data(), row.size());
+        for (const int32_t slot : destinations[payload]) {
+            const auto span = kvarn_tail_checked_span(tensor, slot, 1, row_size);
+            io.stage_tensor_set(tensor, row.data(), span.offset, span.size);
+            ++tensor_ops;
+        }
+        ++payload;
+    }
+
+    if (io.n_bytes() < begin || io.n_bytes() - begin != size_t(expected_bytes)) {
+        throw std::runtime_error("KVarN exact-tail component byte count mismatch");
+    }
+    return tensor_ops;
+}
+
+size_t kvarn_exact_tail_destination_runs(
+        const std::vector<std::vector<int32_t>> & destinations) {
+    size_t runs = 0;
+    for (size_t payload = 0; payload < destinations.size();) {
+        if (destinations[payload].size() != 1) {
+            runs += destinations[payload].size();
+            ++payload;
+            continue;
+        }
+        ++runs;
+        do {
+            ++payload;
+        } while (payload < destinations.size() && destinations[payload].size() == 1 &&
+                int64_t(destinations[payload][0]) == int64_t(destinations[payload - 1][0]) + 1);
+    }
+    return runs;
 }
 
 int32_t kvarn_contiguous_tokens_per_stream_hint(const llama_kv_cache::slot_info & sinfo) {
@@ -286,6 +525,14 @@ bool llama_kv_cache_kvarn_context::apply() {
     return !update_lctx || cache->apply_pending_stream_copies(update_lctx);
 }
 
+void llama_kv_cache_kvarn_context::graph_compute_start() {
+    base()->graph_compute_start();
+}
+
+void llama_kv_cache_kvarn_context::graph_compute_finish(ggml_status compute_status) {
+    base()->graph_compute_finish(compute_status);
+}
+
 llama_memory_status llama_kv_cache_kvarn_context::get_status() const {
     const auto status = base_ctx ? base_ctx->get_status() : LLAMA_MEMORY_STATUS_FAILED_PREPARE;
     if (status == LLAMA_MEMORY_STATUS_NO_UPDATE && cache->has_pending_stream_copies()) {
@@ -319,11 +566,27 @@ ggml_type llama_kv_cache_kvarn_context::type_v() const {
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::get_k(ggml_context * ctx, int32_t il) const {
-    return get_k_native(ctx, il);
+    return get_k_for_attention(ctx, il, uses_native_attention(il));
+}
+
+ggml_tensor * llama_kv_cache_kvarn_context::get_k_for_attention(
+        ggml_context * ctx, int32_t il, bool native_attention) const {
+    const auto it = stored_k.find(cache->mapped_layer_id(il));
+    GGML_ASSERT(it != stored_k.end());
+    return native_attention ? get_k_native(ctx, il) :
+        cache->materialize(ctx, it->second, il, get_n_kv(), current_sinfo(), false, mat_idxs);
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::get_v(ggml_context * ctx, int32_t il) const {
-    return get_v_native(ctx, il);
+    return get_v_for_attention(ctx, il, uses_native_attention(il));
+}
+
+ggml_tensor * llama_kv_cache_kvarn_context::get_v_for_attention(
+        ggml_context * ctx, int32_t il, bool native_attention) const {
+    const auto it = stored_v.find(cache->mapped_layer_id(il));
+    GGML_ASSERT(it != stored_v.end());
+    return native_attention ? get_v_native(ctx, il) :
+        cache->materialize(ctx, it->second, il, get_n_kv(), current_sinfo(), true, mat_idxs);
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::get_k_tail(ggml_context * ctx, int32_t il) const {
@@ -338,6 +601,10 @@ uint32_t llama_kv_cache_kvarn_context::get_tail_slots() const {
     return base()->get_tail_slots();
 }
 
+ggml_type llama_kv_cache_kvarn_context::get_tail_type() const {
+    return base()->get_tail_type();
+}
+
 uint32_t llama_kv_cache_kvarn_context::get_tail_tokens() const {
     return base()->get_tail_tokens();
 }
@@ -350,8 +617,48 @@ uint32_t llama_kv_cache_kvarn_context::get_tail_attention_stride(uint32_t n_quer
     return base()->get_tail_attention_stride(n_query_tokens);
 }
 
+uint32_t llama_kv_cache_kvarn_context::get_tail_body_execution_stride() const {
+    return cache->get_metadata_cache()->get_tail_body_execution_stride();
+}
+
+uint32_t llama_kv_cache_kvarn_context::get_tail_body_execution_rows(int32_t il) const {
+    return cache->get_metadata_cache()->get_tail_body_execution_rows(il);
+}
+
+bool llama_kv_cache_kvarn_context::has_compact_tail() const {
+    return base()->has_compact_tail();
+}
+
+bool llama_kv_cache_kvarn_context::has_kv_body() const {
+    return base()->has_kv_body();
+}
+
+bool llama_kv_cache_kvarn_context::has_kv_body(int32_t il) const {
+    return cache->get_metadata_cache()->has_kv_body(il);
+}
+
+bool llama_kv_cache_kvarn_context::has_tail_current(int32_t il) const {
+    return cache->get_metadata_cache()->has_tail_current(il);
+}
+
+ggml_backend_dev_t llama_kv_cache_kvarn_context::get_tail_backend(int32_t il) const {
+    return cache->get_metadata_cache()->get_tail_backend(il);
+}
+
+llama_kv_tail_storage_kind llama_kv_cache_kvarn_context::get_tail_storage_kind() const {
+    return base()->get_tail_storage_kind();
+}
+
+uint32_t llama_kv_cache_kvarn_context::get_tail_rollback_tokens() const {
+    return base()->get_tail_rollback_tokens();
+}
+
 llama_kv_tail_route llama_kv_cache_kvarn_context::get_tail_route(int32_t il) const {
     return cache->get_tail_route(il);
+}
+
+const llama_kv_tail_layer_route * llama_kv_cache_kvarn_context::get_tail_layer_route(int32_t il) const {
+    return cache->get_metadata_cache()->get_tail_layer_route(il);
 }
 
 bool llama_kv_cache_kvarn_context::get_tail_explicit_bias(int32_t il) const {
@@ -360,8 +667,8 @@ bool llama_kv_cache_kvarn_context::get_tail_explicit_bias(int32_t il) const {
 
 bool llama_kv_cache_kvarn_context::can_pack_tail_body(const llama_ubatch & ubatch) const {
     GGML_UNUSED(ubatch);
-    // Structured body tensors are descriptor views, not row-addressable cache
-    // payloads. The body remains native and only the exact overlay is packed.
+    // Structured persistent records are not row-addressable cache payloads,
+    // even when a backend materializes them for attention.
     return false;
 }
 
@@ -416,13 +723,15 @@ ggml_tensor * llama_kv_cache_kvarn_context::cpy_v_with_tail(
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::cpy_k_tail(
-        ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * tail_idxs, int32_t il) const {
-    return cache->store_tail(ctx, k_cur, tail_idxs, il, false);
+        ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * tail_idxs,
+        int32_t il, ggml_tensor * dependency) const {
+    return cache->store_tail(ctx, k_cur, tail_idxs, il, false, dependency);
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::cpy_v_tail(
-        ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * tail_idxs, int32_t il) const {
-    return cache->store_tail(ctx, v_cur, tail_idxs, il, true);
+        ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * tail_idxs,
+        int32_t il, ggml_tensor * dependency) const {
+    return cache->store_tail(ctx, v_cur, tail_idxs, il, true, dependency);
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
@@ -451,7 +760,7 @@ ggml_tensor * llama_kv_cache_kvarn_context::build_input_v_rot(ggml_context * ctx
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::build_input_kvarn_mat_idxs(ggml_context * ctx) const {
-    // SWA ring view: one absolute token position per output cache cell.
+    // SWA ring read: one absolute token position per output cache cell.
     // Sized to the padded n_kv so the graph is reusable across batches; empty
     // window cells are marked with idx < 0 and produce zero output.
     const uint32_t n_kv = get_n_kv();
@@ -632,7 +941,8 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         const layer_reuse_cb & reuse,
         uint32_t tail_tokens,
         ggml_type tail_type_requested,
-        uint32_t tail_tokens_requested) :
+        uint32_t tail_tokens_requested,
+        uint32_t tail_rollback_tokens) :
     model(model),
     hparams(hparams),
     params(params),
@@ -680,7 +990,8 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         tail_tokens,
         tail_type_requested,
         tail_tokens_requested,
-            true)) {
+            true,
+        tail_rollback_tokens)) {
     GGML_ASSERT(n_stream > 0);
     GGML_ASSERT(swa || kv_size % KVAR_N_GROUP == 0);
     GGML_ASSERT(stage_groups >= 2 && "KVarN stage depth must be at least 2");
@@ -751,14 +1062,11 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         }
 
         auto * dev = offload ? model.dev_layer(il) : nullptr;
-        if (offload && !llama_kvarn_backend_supports_native_ops(dev)) {
+        if (!llama_kvarn_backend_supports_ops(dev)) {
             throw std::runtime_error(format(
-                "KVarN cache layer %u is assigned to backend %s, which has no native KVarN operations "
-                "or does not meet KVarN kernel limits; use a backend with native KVarN support, "
-                "disable KV offload, or enable KVarN CPU fallback",
+                "KVarN cache layer %u is assigned to backend %s, which cannot store and materialize KVarN records",
                 il, dev ? ggml_backend_dev_name(dev) : "unknown"));
         }
-
         auto * buft = offload ? ggml_backend_dev_buffer_type(dev) : ggml_backend_cpu_buffer_type();
         auto * ctx = ctx_for_buft(buft);
         if (!ctx) {
@@ -775,6 +1083,18 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
                 "KVarN cache layer %u has unsupported K/V head dimensions %u/%u",
                 il, head_dim_k, head_dim_v));
         }
+        const bool explicit_bias = model.self_attention_uses_explicit_bias(il);
+        const bool native_tail = exact_tail_tokens == 0 ||
+            (!explicit_bias && kvarn_backend_supports_native_tail(
+                dev, exact_tail_type, head_dim_k, head_dim_v));
+        const bool native_attention =
+            llama_kvarn_backend_supports_native_ops(dev) && native_tail;
+        const bool mixed_tail_native = native_attention &&
+            llama_kvarn_backend_mixed_tail_native_preferred(dev);
+        const bool native_original_v = native_attention &&
+            llama_kvarn_backend_native_attention_uses_original_v(dev);
+        const uint32_t native_rotated_max_query_tokens = native_attention ?
+            llama_kvarn_backend_native_rotated_max_query_tokens(dev) : 0;
 
         const uint32_t n_head_k_sliced = n_head_kv * (uint32_t) k_slices;
         const uint32_t n_head_v_sliced = n_head_kv * (uint32_t) v_slices;
@@ -840,6 +1160,10 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
             head_dim_v,
             (uint32_t) k_slices,
             (uint32_t) v_slices,
+            native_attention,
+            mixed_tail_native,
+            native_original_v,
+            native_rotated_max_query_tokens,
             k_records,
             v_records,
             k_stage,
@@ -904,9 +1228,9 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
-    const uint32_t exact_slots = metadata->get_tail_slots();
+    uint32_t exact_slots = 0;
     std::vector<llama_kv_tail_layer_route> tail_routes;
-    if (exact_slots > 0) {
+    if (exact_tail_tokens > 0) {
         const auto tensor_buft = [](const ggml_tensor * tensor) -> ggml_backend_buffer_type_t {
             return tensor && tensor->buffer ? ggml_backend_buffer_get_type(tensor->buffer) : nullptr;
         };
@@ -961,7 +1285,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
                         llama_kv_tail_operation_name(operation)));
             };
             llama_kv_tail_route tail_route = LLAMA_KV_TAIL_ROUTE_GENERIC;
-            if (device_route && !explicit_bias) {
+            if (device_route) {
                 if (!kvarn_backend_supports_tail_write(
                             dev, exact_tail_type, uint64_t(layer.head_dim_k)*layer.n_head_kv)) {
                     fail_route(LLAMA_KV_TAIL_OP_WRITE_K);
@@ -970,6 +1294,8 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
                             dev, exact_tail_type, uint64_t(layer.head_dim_v)*layer.n_head_kv)) {
                     fail_route(LLAMA_KV_TAIL_OP_WRITE_V);
                 }
+            }
+            if (layer.native_attention && !explicit_bias) {
                 if (!kvarn_backend_supports_native_tail(
                             dev, exact_tail_type, layer.head_dim_k, layer.head_dim_v)) {
                     fail_route(LLAMA_KV_TAIL_OP_NATIVE_ATTENTION);
@@ -979,13 +1305,30 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
             tail_routes.push_back({
                     uint32_t(logical_il), backend ? backend : "unknown",
                     GGML_TYPE_F16, GGML_TYPE_F16, exact_tail_type, exact_tail_type,
-                    false, hparams.causal_attn, swa, explicit_bias,
+                    false, hparams.causal_attn, swa, explicit_bias, true,
+                    tail_route == LLAMA_KV_TAIL_ROUTE_NATIVE,
+                    llama_kv_tail_packed_body_stride(
+                            uint64_t(exact_tail_tokens) + metadata->get_tail_rollback_tokens(), 256),
+                    dev ? dev : ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU),
                     { true, tail_route, LLAMA_KV_TAIL_OP_NONE },
             });
         }
 
+        for (const auto & route : tail_routes) {
+            LLAMA_LOG_INFO("KV tail: group=%s layer=%u dev=%s route=%s body=kvarn/%s exact=%s/%s "
+                    "presence=%s current=%s execution_rows=%u requested=%u effective=%u\n",
+                    swa ? "swa" : "full", route.layer_id, route.backend.c_str(),
+                    route.capability.route == LLAMA_KV_TAIL_ROUTE_NATIVE ? "native" : "generic",
+                    "kvarn", ggml_type_name(route.exact_type_k), ggml_type_name(route.exact_type_v),
+                    route.has_body ? "body" : "bodyless", route.has_current ? "current" : "no-current",
+                    route.body_execution_rows, exact_tail_tokens_requested, exact_tail_tokens);
+        }
         metadata->set_tail_routes(std::move(tail_routes));
         metadata->finalize_tail_overlay_metadata();
+        exact_slots = metadata->get_tail_slots();
+        if (exact_slots == 0) {
+            throw std::logic_error("KVarN exact-tail metadata finalized without storage slots");
+        }
 
         std::map<ggml_backend_buffer_type_t, ggml_context_ptr, buft_comparator> tail_ctx_map;
         const auto tail_ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
@@ -1084,7 +1427,8 @@ std::unique_ptr<llama_kv_cache> llama_kv_cache_kvarn::make_metadata_cache() cons
             exact_tail_tokens,
             exact_tail_type_requested,
             exact_tail_tokens_requested,
-            true);
+            true,
+            metadata->get_tail_rollback_tokens());
 
     const auto & routes = metadata->get_tail_layer_routes();
     result->set_tail_routes(std::vector<llama_kv_tail_layer_route>(routes.begin(), routes.end()));
@@ -1131,6 +1475,10 @@ llama_memory_context_ptr llama_kv_cache_kvarn::init_kv_batch(const std::vector<l
 
 bool llama_kv_cache_kvarn::get_can_shift() const {
     return false;
+}
+
+llama_memory_i::seq_rm_capability llama_kv_cache_kvarn::get_seq_rm_capability() const {
+    return metadata->get_seq_rm_capability();
 }
 
 void llama_kv_cache_kvarn::clear(bool data) {
@@ -1203,11 +1551,11 @@ bool llama_kv_cache_kvarn::seq_rm_plan(
 }
 
 bool llama_kv_cache_kvarn::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    apply_pending_stream_copies(nullptr);
     if (!can_seq_rm(seq_id, p0, p1)) {
         LLAMA_LOG_WARN("%s: KVarN can only remove a complete sequence or the current/previous fp16 tail groups\n", __func__);
         return false;
     }
-    apply_pending_stream_copies(nullptr);
     return metadata->seq_rm(seq_id, p0, p1);
 }
 
@@ -1386,13 +1734,44 @@ bool llama_kv_cache_kvarn::apply_pending_stream_copies(llama_context * lctx) {
 llama_kv_memory_stats llama_kv_cache_kvarn::kv_memory_stats() const {
     llama_kv_memory_stats result;
     llama_kv_memory_component_stats & component = swa ? result.swa : result.global;
+    for (const auto & route : metadata->get_tail_layer_routes()) {
+        const bool cpu = !route.owner || ggml_backend_dev_type(route.owner) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        if (cpu) {
+            component.tail_cpu_layers++;
+        } else if (route.capability.route != LLAMA_KV_TAIL_ROUTE_NATIVE) {
+            component.tail_device_fallback_layers++;
+        } else if (route.has_body) {
+            component.tail_native_mixed_layers++;
+        } else {
+            component.tail_native_bodyless_layers++;
+        }
+    }
 
+    const uint64_t active_slots = uint64_t(exact_tail_tokens)*n_seq_max;
+    const uint64_t rollback_slots = uint64_t(metadata->get_tail_rollback_tokens())*n_seq_max;
+    const uint64_t total_tail_slots = active_slots + rollback_slots;
+    const auto account_tail = [&](const ggml_tensor * tensor) {
+        if (!tensor) {
+            return;
+        }
+        const uint64_t bytes = ggml_nbytes(tensor);
+        if (total_tail_slots == 0) {
+            component.exact_tail_bytes += bytes;
+            return;
+        }
+        GGML_ASSERT(uint64_t(tensor->ne[1]) >= total_tail_slots);
+        const uint64_t row_bytes = tensor->nb[1];
+        GGML_ASSERT(row_bytes*uint64_t(tensor->ne[1]) <= bytes);
+        component.exact_tail_bytes += row_bytes*active_slots;
+        component.rollback_reserve_bytes += row_bytes*rollback_slots;
+        component.transient_estimate_bytes += row_bytes*metadata_n_ubatch;
+    };
     for (const auto & layer : layers) {
         component.k_payload_bytes += ggml_nbytes(layer.k_records);
         component.v_payload_bytes += ggml_nbytes(layer.v_records);
         component.staging_bytes += ggml_nbytes(layer.k_stage) + ggml_nbytes(layer.v_stage);
-        component.exact_tail_bytes += layer.k_tail ? ggml_nbytes(layer.k_tail) : 0;
-        component.exact_tail_bytes += layer.v_tail ? ggml_nbytes(layer.v_tail) : 0;
+        account_tail(layer.k_tail);
+        account_tail(layer.v_tail);
     }
 
     uint64_t allocated = 0;
@@ -1401,7 +1780,7 @@ llama_kv_memory_stats llama_kv_cache_kvarn::kv_memory_stats() const {
         allocated += size;
     }
     const uint64_t accounted = component.k_payload_bytes + component.v_payload_bytes +
-            component.exact_tail_bytes + component.staging_bytes;
+            component.exact_tail_bytes + component.rollback_reserve_bytes + component.staging_bytes;
     component.padding_bytes = allocated > accounted ? allocated - accounted : 0;
     component.allocated_capacity_tokens = kv_size;
     return result;
@@ -1458,7 +1837,17 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
     const int32_t state_exact_type = int32_t(exact_tail_type);
     const std::vector<int32_t> exact_payload_slots = has_exact_tail && !body_only ?
         metadata->state_tail_payload_slots(seq_id) : std::vector<int32_t>{};
+    if (exact_payload_slots.size() > std::numeric_limits<uint32_t>::max()) {
+        throw std::overflow_error("KVarN exact-tail payload count overflows uint32_t");
+    }
     const uint32_t n_exact_payloads = uint32_t(exact_payload_slots.size());
+    for (const int32_t slot : exact_payload_slots) {
+        if (slot < 0) {
+            throw std::runtime_error("KVarN exact-tail state contains a negative source slot");
+        }
+    }
+    const auto exact_payload_runs = llama_kv_tail_contiguous_slot_runs(exact_payload_slots);
+    const bool on_device = (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) != 0;
     io.write(&has_exact_tail, sizeof(has_exact_tail));
     io.write(&exact_tail_tokens, sizeof(exact_tail_tokens));
     io.write(&state_exact_type, sizeof(state_exact_type));
@@ -1494,6 +1883,8 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
     }
     io.write(&saved_pos_max, sizeof(saved_pos_max));
 
+    uint64_t exact_payload_bytes = 0;
+    size_t exact_tensor_ops = 0;
     for (const auto & layer : layers) {
         io.write(&layer.il, sizeof(layer.il));
         for (const uint32_t stream : saved_streams) {
@@ -1512,16 +1903,63 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
         const uint64_t v_tail_row = layer.v_tail ? ggml_row_size(layer.v_tail->type, layer.v_tail->ne[0]) : 0;
         io.write(&k_tail_row, sizeof(k_tail_row));
         io.write(&v_tail_row, sizeof(v_tail_row));
-        for (const int32_t slot : exact_payload_slots) {
-            GGML_ASSERT(slot >= 0);
-            if (layer.k_tail) {
-                io.write_tensor(layer.k_tail, size_t(slot)*k_tail_row, k_tail_row);
+        if (layer.k_tail) {
+            kvarn_tail_add_bytes(exact_payload_bytes, kvarn_tail_checked_bytes(n_exact_payloads, k_tail_row));
+            if (on_device) {
+                // Match the layout-independent row topology used by the
+                // on-device reader; host checkpoints use the batched runs.
+                for (const int32_t slot : exact_payload_slots) {
+                    const auto span = kvarn_tail_checked_span(layer.k_tail, slot, 1, k_tail_row);
+                    io.write_tensor(layer.k_tail, span.offset, span.size);
+                    ++exact_tensor_ops;
+                }
+            } else {
+                for (const auto & run : exact_payload_runs) {
+                    const auto span = kvarn_tail_checked_span(layer.k_tail, run.slot_begin, run.length, k_tail_row);
+                    io.write_tensor(layer.k_tail, span.offset, span.size);
+                    ++exact_tensor_ops;
+                }
             }
-            if (layer.v_tail) {
-                io.write_tensor(layer.v_tail, size_t(slot)*v_tail_row, v_tail_row);
+        }
+        if (layer.v_tail) {
+            kvarn_tail_add_bytes(exact_payload_bytes, kvarn_tail_checked_bytes(n_exact_payloads, v_tail_row));
+            if (on_device) {
+                for (const int32_t slot : exact_payload_slots) {
+                    const auto span = kvarn_tail_checked_span(layer.v_tail, slot, 1, v_tail_row);
+                    io.write_tensor(layer.v_tail, span.offset, span.size);
+                    ++exact_tensor_ops;
+                }
+            } else {
+                for (const auto & run : exact_payload_runs) {
+                    const auto span = kvarn_tail_checked_span(layer.v_tail, run.slot_begin, run.length, v_tail_row);
+                    io.write_tensor(layer.v_tail, span.offset, span.size);
+                    ++exact_tensor_ops;
+                }
             }
         }
     }
+
+    LLAMA_LOG_DEBUG(
+            "%s: KVarN state save: kind=%s version=%u payloads=%u tail_bytes=%llu runs=%zu tensor_ops=%zu device=%s\n",
+            __func__, partial_state ? "partial" : "full", KVAR_N_STATE_VERSION, n_exact_payloads,
+            (unsigned long long) exact_payload_bytes, exact_payload_runs.size(), exact_tensor_ops,
+            on_device ? "true" : "false");
+}
+
+bool llama_kv_cache_kvarn_context::uses_native_attention(int32_t il) const {
+    return cache->uses_native_attention(il);
+}
+
+bool llama_kv_cache_kvarn_context::mixed_tail_native_preferred(int32_t il) const {
+    return cache->mixed_tail_native_preferred(il);
+}
+
+bool llama_kv_cache_kvarn_context::native_attention_uses_original_v(int32_t il) const {
+    return cache->native_attention_uses_original_v(il);
+}
+
+uint32_t llama_kv_cache_kvarn_context::native_rotated_max_query_tokens(int32_t il) const {
+    return cache->native_rotated_max_query_tokens(il);
 }
 
 void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
@@ -1549,7 +1987,7 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
         type != params.type || n_layers != layers.size()) {
         throw std::runtime_error("incompatible KVarN cache state");
     }
-    if (version < KVAR_N_STATE_VERSION) {
+    if (version < KVAR_N_STATE_VERSION_MIN) {
         throw std::runtime_error(
             "incompatible KVarN cache state version 11: canonical exact-tail payloads are absent; "
             "re-save the prompt cache with this build");
@@ -1617,6 +2055,19 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
                 saved_exact_type, int32_t(exact_tail_type),
                 n_exact_payloads, exact_destinations.size()));
     }
+    for (const auto & destinations : exact_destinations) {
+        if (destinations.empty()) {
+            throw std::runtime_error("KVarN exact-tail state contains an unreferenced payload");
+        }
+        if (on_device && destinations.size() != 1) {
+            throw std::runtime_error("on-device KVarN exact-tail state requires one destination slot per payload");
+        }
+        for (const int32_t slot : destinations) {
+            if (slot < 0) {
+                throw std::runtime_error("KVarN exact-tail state contains a negative destination slot");
+            }
+        }
+    }
 
     uint32_t n_groups_used;
     io.read(&n_groups_used, sizeof(n_groups_used));
@@ -1636,6 +2087,8 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
         }
     }
 
+    uint64_t exact_payload_bytes = 0;
+    size_t exact_tensor_ops = 0;
     for (const auto & layer : layers) {
         uint32_t il;
         io.read(&il, sizeof(il));
@@ -1684,44 +2137,34 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
         if (k_tail_row != expected_k_tail_row || v_tail_row != expected_v_tail_row) {
             throw std::runtime_error("KVarN exact-tail state layer layout mismatch");
         }
-        for (uint32_t payload = 0; payload < n_exact_payloads; ++payload) {
-            if (exact_destinations[payload].empty()) {
-                throw std::runtime_error("KVarN exact-tail state contains an unreferenced payload");
-            }
-            if (layer.k_tail) {
-                if (on_device) {
-                    if (exact_destinations[payload].size() != 1) {
-                        throw std::runtime_error("on-device KVarN exact-tail state requires one destination slot per payload");
-                    }
-                    io.read_tensor(layer.k_tail, size_t(exact_destinations[payload][0])*k_tail_row, k_tail_row);
-                } else {
-                    std::vector<uint8_t> row(k_tail_row);
-                    io.read(row.data(), row.size());
-                    for (const int32_t slot : exact_destinations[payload]) {
-                        io.stage_tensor_set(layer.k_tail, row.data(), size_t(slot)*k_tail_row, k_tail_row);
-                    }
-                }
-            }
-            if (layer.v_tail) {
-                if (on_device) {
-                    if (exact_destinations[payload].size() != 1) {
-                        throw std::runtime_error("on-device KVarN exact-tail state requires one destination slot per payload");
-                    }
-                    io.read_tensor(layer.v_tail, size_t(exact_destinations[payload][0])*v_tail_row, v_tail_row);
-                } else {
-                    std::vector<uint8_t> row(v_tail_row);
-                    io.read(row.data(), row.size());
-                    for (const int32_t slot : exact_destinations[payload]) {
-                        io.stage_tensor_set(layer.v_tail, row.data(), size_t(slot)*v_tail_row, v_tail_row);
-                    }
-                }
-            }
+        kvarn_tail_add_bytes(exact_payload_bytes, kvarn_tail_checked_bytes(n_exact_payloads, k_tail_row));
+        kvarn_tail_add_bytes(exact_payload_bytes, kvarn_tail_checked_bytes(n_exact_payloads, v_tail_row));
+        if (version == 12) {
+            exact_tensor_ops += read_kvarn_exact_tail_v12_interleaved(
+                    io, layer.k_tail, layer.v_tail, k_tail_row, v_tail_row,
+                    exact_destinations, on_device);
+        } else if (version == 13) {
+            exact_tensor_ops += read_kvarn_exact_tail_v13_component(
+                    io, layer.k_tail, k_tail_row, exact_destinations, on_device);
+            exact_tensor_ops += read_kvarn_exact_tail_v13_component(
+                    io, layer.v_tail, v_tail_row, exact_destinations, on_device);
+        } else {
+            throw std::runtime_error("unsupported KVarN exact-tail state layout");
         }
     }
 
     auto prepared_owner = std::make_shared<std::unique_ptr<llama_kv_cache>>(std::move(metadata_prepared));
-    io.on_commit([this, prepared_owner]() mutable {
+    const size_t exact_destination_runs = kvarn_exact_tail_destination_runs(exact_destinations);
+    const char * log_function = __func__;
+    io.on_commit([this, prepared_owner, state_kind, version, n_exact_payloads,
+                  log_function,
+                  exact_payload_bytes, exact_destination_runs, exact_tensor_ops, on_device]() mutable {
         metadata.swap(*prepared_owner);
+        LLAMA_LOG_DEBUG(
+                "%s: KVarN state restore: kind=%s version=%u payloads=%u tail_bytes=%llu runs=%zu tensor_ops=%zu device=%s\n",
+                log_function, state_kind == KVAR_N_STATE_STAGE_ONLY_PARTIAL ? "partial" : "full",
+                version, n_exact_payloads, (unsigned long long) exact_payload_bytes,
+                exact_destination_runs, exact_tensor_ops, on_device ? "true" : "false");
     });
 }
 
@@ -1745,6 +2188,22 @@ const llama_kv_cache_kvarn::layer & llama_kv_cache_kvarn::layer_for(int32_t il) 
     return layers.at(map_layer_ids.at(il));
 }
 
+bool llama_kv_cache_kvarn::uses_native_attention(int32_t il) const {
+    return layer_for(il).native_attention;
+}
+
+bool llama_kv_cache_kvarn::mixed_tail_native_preferred(int32_t il) const {
+    return layer_for(il).mixed_tail_native;
+}
+
+bool llama_kv_cache_kvarn::native_attention_uses_original_v(int32_t il) const {
+    return layer_for(il).native_original_v;
+}
+
+uint32_t llama_kv_cache_kvarn::native_rotated_max_query_tokens(int32_t il) const {
+    return layer_for(il).native_rotated_max_query_tokens;
+}
+
 ggml_tensor * llama_kv_cache_kvarn::get_tail(
         ggml_context * ctx, int32_t il, bool value) const {
     const auto & layer = layer_for(il);
@@ -1760,7 +2219,7 @@ ggml_tensor * llama_kv_cache_kvarn::get_tail(
 
 ggml_tensor * llama_kv_cache_kvarn::store_tail(
         ggml_context * ctx, ggml_tensor * current, ggml_tensor * indices,
-        int32_t il, bool value) const {
+        int32_t il, bool value, ggml_tensor * dependency) const {
     const auto & layer = layer_for(il);
     ggml_tensor * dst = value ? layer.v_tail : layer.k_tail;
     if (!dst || !indices) {
@@ -1772,14 +2231,20 @@ ggml_tensor * llama_kv_cache_kvarn::store_tail(
     GGML_ASSERT(current->type == GGML_TYPE_F32 && current->ne[0] == head_dim &&
             current->ne[1] == layer.n_head_kv && dst->ne[0] == n_embd);
     GGML_ASSERT(indices->type == GGML_TYPE_I64 && indices->ne[0] == n_tokens);
-    current = ggml_cont_2d(ctx, current, n_embd, n_tokens);
+    current = ggml_is_contiguous(current)
+        ? ggml_reshape_2d(ctx, current, n_embd, n_tokens)
+        : ggml_cont_2d(ctx, current, n_embd, n_tokens);
     ggml_tensor * written = dst;
     for (int64_t level = 0; level < indices->ne[1]; ++level) {
-        ggml_tensor * level_idxs = ggml_view_1d(ctx, indices, n_tokens, level*indices->nb[1]);
-        written = ggml_set_rows(ctx, written, current, level_idxs);
+        ggml_tensor * level_idxs = indices->ne[1] == 1
+            ? indices
+            : ggml_view_1d(ctx, indices, n_tokens, level*indices->nb[1]);
+        written = ggml_set_rows_ordered(ctx, written, current, level_idxs, dependency);
+        dependency = written;
     }
-    return ggml_reshape_4d(ctx, written,
-            head_dim, layer.n_head_kv, metadata->get_tail_slots(), 1);
+    return ggml_view_4d(ctx, written,
+            head_dim, layer.n_head_kv, metadata->get_tail_slots(), 1,
+            ggml_row_size(written->type, head_dim), written->nb[1], written->nb[2], 0);
 }
 
 ggml_tensor * llama_kv_cache_kvarn::store(
@@ -1858,5 +2323,50 @@ ggml_tensor * llama_kv_cache_kvarn::view(
                 stream_count);
     }
 
+    return result;
+}
+
+ggml_tensor * llama_kv_cache_kvarn::materialize(
+        ggml_context * ctx,
+        ggml_tensor * stored,
+        int32_t il,
+        uint32_t n_kv,
+        const llama_kv_cache::slot_info & sinfo,
+        bool value,
+        ggml_tensor * mat_idxs) const {
+    const auto & layer = layer_for(il);
+    const uint32_t stream_start = sinfo.s0;
+    const uint32_t stream_count = sinfo.s1 - sinfo.s0 + 1;
+    ggml_tensor * indices = swa ? mat_idxs : stored->src[1];
+    GGML_ASSERT(indices != nullptr);
+
+    ggml_tensor * result = ggml_kvarn_materialize(
+        ctx,
+        value ? layer.v_records : layer.k_records,
+        stored,
+        indices,
+        n_kv,
+        stream_start,
+        stream_count,
+        value ? params.value_bits : params.key_bits,
+        value,
+        int32_t(stage_groups));
+    // Materialized fallback attention stays in the same rotated domain as the
+    // persistent KVarN body. This avoids a full inverse transform per layer.
+    result->op_params[4] = 1;
+    result->op_params[5] = int32_t(value ? layer.v_slices : layer.k_slices);
+    result->op_params[6] = swa ? 1 : 0;
+    result->op_params[8] = int32_t(tail_groups);
+    result->op_params[9] = 1;
+    const uint32_t slices = value ? layer.v_slices : layer.k_slices;
+    if (slices > 1) {
+        result = ggml_reshape_4d(
+                ctx,
+                result,
+                value ? layer.head_dim_v : layer.head_dim_k,
+                layer.n_head_kv,
+                n_kv,
+                stream_count);
+    }
     return result;
 }

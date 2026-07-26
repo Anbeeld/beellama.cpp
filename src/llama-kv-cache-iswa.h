@@ -35,7 +35,9 @@ public:
                      uint32_t   tail_tokens_swa = 0,
                     ggml_type   tail_type = GGML_TYPE_F16,
                      uint32_t   tail_tokens_requested = UINT32_MAX,
-                     uint32_t   tail_tokens_swa_requested = UINT32_MAX);
+                     uint32_t   tail_tokens_swa_requested = UINT32_MAX,
+                     uint32_t   tail_rollback_tokens = 0,
+                         bool   tail_native_exact_swa = false);
 
     // DSV4 uses a projected hparams view for its raw iSWA cache.  Keep this
     // explicit overload so KVarN support does not erase that upstream need.
@@ -62,7 +64,9 @@ public:
                      uint32_t   tail_tokens_swa = 0,
                     ggml_type   tail_type = GGML_TYPE_F16,
                      uint32_t   tail_tokens_requested = UINT32_MAX,
-                     uint32_t   tail_tokens_swa_requested = UINT32_MAX);
+                     uint32_t   tail_tokens_swa_requested = UINT32_MAX,
+                     uint32_t   tail_rollback_tokens = 0,
+                         bool   tail_native_exact_swa = false);
 
     ~llama_kv_cache_iswa() = default;
 
@@ -83,6 +87,7 @@ public:
     llama_memory_context_ptr init_kv_batch(const std::vector<llama_ubatch> & ubatches) override;
 
     bool get_can_shift() const override;
+    seq_rm_capability get_seq_rm_capability() const override;
 
     void clear(bool data) override;
 
@@ -165,6 +170,8 @@ public:
 
     bool next()  override;
     bool apply() override;
+    void graph_compute_start() override;
+    void graph_compute_finish(ggml_status status) override;
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;

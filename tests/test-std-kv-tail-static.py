@@ -276,8 +276,8 @@ def main() -> None:
 
     cache_header = (ROOT / "src/llama-kv-cache.h").read_text(encoding="utf-8")
     get_tail_tokens = cache_header.split("uint32_t get_tail_tokens() const", 1)[1].split("}", 1)[0]
-    if "tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY" not in get_tail_tokens:
-        raise AssertionError("tail graph topology must follow the explicit overlay storage plan")
+    if "has_tail_overlay()" not in get_tail_tokens:
+        raise AssertionError("tail graph topology must follow every exact-tail storage representation")
 
     context_source = (ROOT / "src/llama-context.cpp").read_text(encoding="utf-8")
     if "llama_kv_tail_resolve_groups" not in context_source or "config.automatic ? automatic_standard : true" not in context_source:
@@ -317,6 +317,15 @@ def main() -> None:
     if ("#if !defined(GGML_CUDA_KVARN) || defined(GGML_USE_MUSA)" not in cuda_backend or
             "#if defined(GGML_CUDA_KVARN)\n        case GGML_OP_KVARN_WHT:" not in cuda_backend):
         raise AssertionError("disabled KVarN kernels must not be advertised or dispatched by CUDA")
+    if not re.search(
+        r"#if defined\(GGML_CUDA_KVARN\)\s+"
+        r'if \(strcmp\(name, "ggml_backend_kvarn_store_route_stats_reset"\).*?'
+        r'if \(strcmp\(name, "ggml_backend_kvarn_store_route_stats_get"\).*?'
+        r"#endif",
+        cuda_backend,
+        re.DOTALL,
+    ):
+        raise AssertionError("KVarN-off builds must not link store-route telemetry from the excluded kvarn.cu")
 
     default_build = (ROOT / "tmp/build-local-3090-cuda13.1-default.ps1").read_text(encoding="utf-8")
     if default_build.count(f"-D{kvarn_option}=ON") != 1:
@@ -334,6 +343,28 @@ def main() -> None:
     cuda_fattn = (ROOT / "ggml/src/ggml-cuda/fattn.cu").read_text(encoding="utf-8")
     ggml_core = (ROOT / "ggml/src/ggml.c").read_text(encoding="utf-8")
     graph = (ROOT / "src/llama-graph.cpp").read_text(encoding="utf-8")
+    cache_header = (ROOT / "src/llama-kv-cache.h").read_text(encoding="utf-8")
+    route_header = (ROOT / "src/llama-kv-cache-tail.h").read_text(encoding="utf-8")
+    if "bool has_body;" not in route_header:
+        raise AssertionError("per-layer KV-tail execution descriptor does not own body presence")
+    if "uint32_t body_execution_rows;" not in route_header:
+        raise AssertionError("per-layer KV-tail execution descriptor does not own packed-body extent")
+    if "bool has_current;" not in route_header:
+        raise AssertionError("per-layer KV-tail execution descriptor does not own current-segment presence")
+    if "virtual bool has_kv_body(int32_t il) const" not in cache_header:
+        raise AssertionError("KV-cache graph interface exposes only component-wide body presence")
+    if graph.count("has_kv_body(il)") < 4:
+        raise AssertionError("standard and iSWA graph builders do not consume per-layer body presence")
+    if graph.count("mixed_tail_native_preferred(il)") != 2:
+        raise AssertionError(
+            "KVarN full/iSWA graph builders do not honor the backend's mixed-tail route preference")
+    if graph.count("!mctx_cur->has_kv_body(il)") < 4:
+        raise AssertionError(
+            "KVarN full/iSWA graph builders do not distinguish bodyless native tails")
+    if "get_tail_body_execution_stride()" not in graph:
+        raise AssertionError("attention input planning still derives packed-body extent from persistent rows")
+    if "ggml_backend_dev_supports_op" not in graph:
+        raise AssertionError("native KV-tail planning is not validated against the final fused operation")
     if "ggml_backend_kv_tail_attention_supported" in graph or "backend_supports_native_kv_tail" in graph:
         raise AssertionError("decode graph construction must consume the stored route without backend probing")
     if graph.count("get_tail_route(il)") < 2:
@@ -360,6 +391,81 @@ def main() -> None:
     if "ggml_cuda_flash_attn_ext_tail" not in cuda_fattn:
         raise AssertionError("CUDA lacks the native tail-attention dispatch")
 
+    for required in (
+        "ggml_kv_tail_attention_merge_segmented",
+        "ggml_flash_attn_ext_set_kv_tail_bodyless",
+    ):
+        if required not in ggml_header:
+            raise AssertionError(f"ggml compact segmented contract lacks {required}")
+    if not re.search(r"#define\s+GGML_MAX_SRC\s+12\b", ggml_header):
+        raise AssertionError("ggml compact segmented contract requires 12 source operands")
+    if "ggml_kv_tail_attention_merge_segmented" not in graph:
+        raise AssertionError("model graph does not attach graph-local current K/V")
+
+    vulkan = (ROOT / "ggml/src/ggml-vulkan/ggml-vulkan.cpp").read_text(encoding="utf-8")
+    vulkan_fattn_support = vulkan.split("case GGML_OP_FLASH_ATTN_EXT:", 1)[1].split(
+        "case GGML_OP_FLASH_ATTN_EXT_BACK:", 1
+    )[0]
+    if "ggml_vk_kvarn_attn_tail_sources_supported(op)" not in vulkan_fattn_support:
+        raise AssertionError("Vulkan KVarN final-node support does not validate compact current operands")
+    if not re.search(
+        r"if \(op->src\[10\] != nullptr \|\| op->src\[11\] != nullptr\).*"
+        r"Standard compact-tail attention remains.*return false",
+        vulkan_fattn_support,
+        re.DOTALL,
+    ):
+        raise AssertionError("Vulkan standard attention no longer fails closed for compact current operands")
+    vulkan_proc = vulkan.split("static void * ggml_backend_vk_reg_get_proc_address", 1)[1]
+    if "ggml_backend_kv_tail_segmented_attention_supported" not in vulkan_proc:
+        raise AssertionError("Vulkan does not advertise its implemented segmented KVarN attention matrix")
+    vulkan_shader = (
+        ROOT / "ggml/src/ggml-vulkan/vulkan-shaders/kvarn_flash_attn.comp"
+    ).read_text(encoding="utf-8")
+    for required in (
+        "k_tail_current_addr",
+        "v_tail_current_addr",
+        "FLAG_TAIL_HISTORY_SHIFT",
+        "TailCurrentRef",
+        "if (!bodyless)",
+    ):
+        if required not in vulkan_shader:
+            raise AssertionError(f"Vulkan segmented KVarN shader lacks {required}")
+    vulkan_materialize_shader = (
+        ROOT / "ggml/src/ggml-vulkan/vulkan-shaders/kvarn_materialize.comp"
+    ).read_text(encoding="utf-8")
+    for required in (
+        "MODE_PREPARE_LIVE",
+        "binding = 4",
+        "data_live",
+    ):
+        if required not in vulkan_materialize_shader:
+            raise AssertionError(
+                f"Vulkan KVarN materialization must prepare live state once: missing {required}"
+            )
+    materialize_dispatch = vulkan.split(
+        "static void ggml_vk_kvarn_materialize(", 1
+    )[1].split("static void ggml_vk_mul_mat(", 1)[0]
+    for required in (
+        "ggml_pipeline_request_descriptor_sets(ctx, pipeline, 2)",
+        "ggml_vk_sync_buffers(ctx, subctx)",
+        "ctx->prealloc_y_need_sync = true",
+    ):
+        if required not in materialize_dispatch:
+            raise AssertionError(
+                f"Vulkan KVarN materialization live descriptor dispatch lacks {required}"
+            )
+    if '"src10", "src11"' not in vulkan:
+        raise AssertionError("Vulkan graph debugging does not cover the retained 12-source tensor contract")
+    if graph.count("if (tail_route == LLAMA_KV_TAIL_ROUTE_NATIVE)") < 2 or graph.count(
+            "ggml_concat(ctx0, k_tail, k_tail_current, 2)") < 2:
+        raise AssertionError("non-native backends lack the bounded history/current composition route")
+    if graph.count(
+            "tail_route == LLAMA_KV_TAIL_ROUTE_NATIVE &&\n"
+            "            !kvarn_plan.native_attention") != 2:
+        raise AssertionError(
+            "KVarN full/iSWA graphs do not fail closed to the generic tail oracle "
+            "outside the backend's bounded native query matrix")
+
     tail_build_calls = re.findall(r"build_attn_inp_tail\((?:(?!\);).)*\);", graph, re.DOTALL)[1:]
     if not tail_build_calls or any(not re.search(r",\s*true\s*\);$", call) for call in tail_build_calls):
         raise AssertionError("every standard-cache wrapper must select sparse-body packing by the shared capacity invariant")
@@ -381,8 +487,19 @@ def main() -> None:
     tail_support = cuda_fattn.split(
         "bool ggml_cuda_flash_attn_ext_tail_supported(", 1
     )[1].split("\n}\n", 1)[0]
-    if "GGML_USE_HIP" not in tail_support:
-        raise AssertionError("unverified HIP tail acceleration must fail closed")
+    if "GGML_USE_HIP" in tail_support or "return false" in tail_support:
+        raise AssertionError("HIP must use the shared segmented-current capability path")
+    direct_tail_support = kvarn_dispatch.split(
+        "bool ggml_cuda_flash_attn_ext_kvarn_direct_tail_supported(", 2
+    )[2].split("\n}\n", 1)[0]
+    if (
+        cuda_fattn.count("ggml_cuda_flash_attn_ext_kvarn_direct_tail_supported") != 2
+        or "dst->src[10] == nullptr" not in direct_tail_support
+        or "GGML_KVARN_TEST_FORCE_PORTABLE_FATTN" not in direct_tail_support
+        or "ggml_cuda_flash_attn_ext_kvarn_portable_supported" not in direct_tail_support
+        or "ggml_cuda_flash_attn_ext_tail(ctx, dst)" not in cuda_fattn
+    ):
+        raise AssertionError("HIP KVarN current segments lack the shared bounded tail fallback")
     cuda_tail = (ROOT / "ggml/src/ggml-cuda/fattn-tail.cuh").read_text(encoding="utf-8")
     if "k_flash_attn_ext_tail_merge" in cuda_tail:
         raise AssertionError("serialized indexed tail merge kernel is still present")
@@ -390,6 +507,10 @@ def main() -> None:
     graph_header = (ROOT / "src/llama-graph.h").read_text(encoding="utf-8")
     if "self_tail_bias_read_idxs" not in graph_header or "build_attn_bias_tail" not in graph:
         raise AssertionError("query-specific tails must gather matching body attention bias rows")
+    if graph.count("storage_kind == LLAMA_KV_TAIL_STORAGE_DISABLED") < 2:
+        raise AssertionError(
+            "tail identity must skip per-layer graph-reuse work when tail storage is disabled"
+        )
 
     q_tail_layout = re.compile(
         r"q_tail_batched\s*=\s*k_tail\s*&&\s*!tail_read_idxs\s*\?\s*ggml_reshape_4d\([^;]+;.{0,500}?"
@@ -415,10 +536,79 @@ def main() -> None:
     if "k_tail_written ? k_tail_written" not in graph or "v_tail_written ? v_tail_written" not in graph:
         raise AssertionError("same-graph tail reads must depend on the exact-shadow SET_ROWS results")
 
+    model = (ROOT / "src/llama-model.cpp").read_text(encoding="utf-8")
+    if model.count("if (params.kv_tail_native_exact)") < 2:
+        raise AssertionError("full-window KVarN selection must use the logical native-exact policy")
+    if model.count("params.kv_tail_native_exact ? cparams.n_ctx : 0") < 2:
+        raise AssertionError("full-window KVarN storage must retain the logical visibility window")
+    cache = (ROOT / "src/llama-kv-cache.cpp").read_text(encoding="utf-8")
+    if cache.count("route_spec.body_type_k = candidate") != 1 or cache.count(
+            "route_spec.body_type_v = candidate") != 1:
+        raise AssertionError("bodyless standard-tail anchors must match the realized exact type")
+    empty_body = graph.split("static void build_empty_kv_body", 1)[1].split(
+        "static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl", 1)[0]
+    if "first_row_anchor(body_mask_template)" not in empty_body:
+        raise AssertionError(
+            "bodyless standard-tail masks must retain a graph dependency on the authoritative planner mask")
+    if "body_bias_template" not in empty_body or "first_row_anchor(body_bias_template)" not in empty_body:
+        raise AssertionError(
+            "bodyless standard-tail biases must retain a graph dependency on the authoritative planner bias")
+    if "self_tail_query_order_swa" not in (ROOT / "src/llama-graph.h").read_text(encoding="utf-8"):
+        raise AssertionError("full and SWA cache groups must own independent exact-tail query-order inputs")
+    if "set_tail_query_plan(self_tail_query_order_swa, self_tail_run_desc_swa" not in graph:
+        raise AssertionError("the SWA exact-tail planner must populate its own query-order input")
+
     hybrid_setter = graph.split("void llm_graph_input_mem_hybrid::set_input", 1)[1].split(
         "bool llm_graph_input_mem_hybrid::can_reuse", 1)[0]
     if "inp_attn->set_input(ubatch)" not in hybrid_setter:
         raise AssertionError("hybrid attention wrapper must delegate every input, including exact tails")
+
+    bench = (ROOT / "tools/llama-bench/llama-bench.cpp").read_text(encoding="utf-8")
+    if "bench_device_memory_checkpoint" not in bench or "ggml_backend_dev_memory" not in bench:
+        raise AssertionError("--kv-memory must use a backend-generic device memory checkpoint")
+    if "bench_memory_device" not in bench or "inst.devices" not in bench:
+        raise AssertionError("--kv-memory must checkpoint the explicitly selected benchmark device")
+    if "CUDA KV memory telemetry is unavailable" in bench:
+        raise AssertionError("--kv-memory must not reject non-CUDA backends with memory telemetry")
+    if "cuda_memory_checkpoint != nullptr" not in bench:
+        raise AssertionError("the CUDA checkpoint must remain the preferred synchronized CUDA route")
+    for required in (
+        "struct_size = sizeof(stats)",
+        "abi_version = 1",
+        "ggml_backend_dev_backend_reg(memory_dev)",
+        '"kvarn_route_portable"',
+        '"kvarn_route_materialize"',
+        '"kvarn_route_compact_tail"',
+        "ggml_backend_kv_memory_transient_stats_reset",
+        "ggml_backend_kv_memory_transient_stats_get",
+    ):
+        if required not in bench:
+            raise AssertionError(
+                f"llama-bench backend telemetry is not device-matched and ABI-v1 safe: missing {required}"
+            )
+    for required in (
+        "struct ggml_vk_kv_memory_transient_stats",
+        "ggml_backend_vk_kv_memory_transient_stats_reset",
+        "ggml_backend_vk_kv_memory_transient_stats_get",
+        '"ggml_backend_kv_memory_transient_stats_reset"',
+        '"ggml_backend_kv_memory_transient_stats_get"',
+        "ggml_vk_kv_memory_transient_stats_record_kvarn",
+    ):
+        if required not in vulkan:
+            raise AssertionError(
+                f"Vulkan does not account backend-private KVarN transient memory: missing {required}"
+            )
+    vulkan_memory = vulkan.split(
+        "void ggml_backend_vk_get_device_memory(", 1
+    )[1].split("static vk::PhysicalDeviceType", 1)[0]
+    if "budget > usage ? budget - usage : 0" not in vulkan_memory:
+        raise AssertionError(
+            "Vulkan memory-budget accounting can underflow when driver heap usage exceeds budget"
+        )
+    if "std::min<vk::DeviceSize>(available, heap.size)" not in vulkan_memory:
+        raise AssertionError(
+            "Vulkan memory-budget accounting can report more free memory than the physical heap"
+        )
 
 
 if __name__ == "__main__":

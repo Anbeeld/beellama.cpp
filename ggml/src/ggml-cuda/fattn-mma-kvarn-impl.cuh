@@ -209,7 +209,8 @@ static __device__ __forceinline__ float * ggml_cuda_fattn_kvarn_inverse_wht_128_
     return src;
 }
 
-template<int D, int stride_tile, int nbatch_fa, int nthreads, bool oob_check, bool original_domain, bool dim_major_K>
+template<int D, int stride_tile, int nbatch_fa, int nthreads, bool oob_check,
+    bool original_domain, bool dim_major_K, bool cache_record_axes>
 static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
         const char * __restrict__ desc_raw,
         half2      * __restrict__ tile_KV,
@@ -407,15 +408,44 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
             zp_axis    = scale_axis + GGML_CUDA_FATTN_KVARN_DIM;
             other_axis = zp_axis + GGML_CUDA_FATTN_KVARN_DIM;
             if constexpr (!dim_major_K) {
-                for (int i = tid; i < GGML_CUDA_FATTN_KVARN_DIM; i += nthreads) {
+                if constexpr (cache_record_axes) {
+                    constexpr int slices = D / GGML_CUDA_FATTN_KVARN_DIM;
+                    half * axis_smem = scale_smem +
+                        (desc.value ? 3 * D : 0) + slice * 3 * GGML_CUDA_FATTN_KVARN_DIM;
+                    int * axis_group_tags = (int *) (scale_smem + 6 * D);
+                    const int axis_tag = (desc.value ? slices : 0) + slice;
+                    const bool load_axes = axis_group_tags[axis_tag] != record_group;
+                    if (load_axes) {
+                        for (int i = tid; i < GGML_CUDA_FATTN_KVARN_DIM; i += nthreads) {
+                            axis_smem[i] = scale_axis[i];
+                            axis_smem[GGML_CUDA_FATTN_KVARN_DIM + i] = zp_axis[i];
+                            axis_smem[2 * GGML_CUDA_FATTN_KVARN_DIM + i] = other_axis[i];
+                        }
+                        __syncthreads();
+                        if (tid == 0) {
+                            axis_group_tags[axis_tag] = record_group;
+                        }
+                    }
+                    scale_axis = axis_smem;
+                    zp_axis    = axis_smem + GGML_CUDA_FATTN_KVARN_DIM;
+                    other_axis = zp_axis + GGML_CUDA_FATTN_KVARN_DIM;
+                } else {
+                    for (int i = tid; i < GGML_CUDA_FATTN_KVARN_DIM; i += nthreads) {
+                        if (desc.value) {
+                            scale_smem[i] = other_axis[i];
+                        } else {
+                            scale_smem[i] = scale_axis[i];
+                            scale_smem[GGML_CUDA_FATTN_KVARN_DIM + i] = zp_axis[i];
+                        }
+                    }
+                    __syncthreads();
                     if (desc.value) {
-                        scale_smem[i] = other_axis[i];
+                        other_axis = scale_smem;
                     } else {
-                        scale_smem[i] = scale_axis[i];
-                        scale_smem[GGML_CUDA_FATTN_KVARN_DIM + i] = zp_axis[i];
+                        scale_axis = scale_smem;
+                        zp_axis = scale_smem + GGML_CUDA_FATTN_KVARN_DIM;
                     }
                 }
-                __syncthreads();
             }
         }
 
@@ -467,12 +497,99 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
                 GGML_UNUSED(scale_smem);
             }
         } else {
-            for (int row = tid; row < nbatch_fa; row += nthreads) {
+            const int dim2_count_local = out_dim2_end - out_dim2_start;
+            if constexpr (cache_record_axes) {
+                if (stream_record && nthreads % dim2_count_local == 0) {
+                    const int dim2_lane = tid % dim2_count_local;
+                    const int row_lane = tid / dim2_count_local;
+                    const int row_stride = nthreads / dim2_count_local;
+                    const int global_b = out_dim2_start + dim2_lane;
+                    const int dim = 2 * (global_b - slice_dim2_start);
+
+                    if (desc.value) {
+                        const float2 other = __half22float2(*(const half2 *) (other_axis + dim));
+                        for (int row = row_lane; row < nbatch_fa; row += row_stride) {
+                            const bool valid_row = !oob_check || row < i_sup;
+                            if (!valid_row) {
+                                tile_KV[row * stride_tile + global_b - dim2_start] = make_half2(0.0f, 0.0f);
+                                continue;
+                            }
+                            const int pos = tile.pos_begin + row;
+                            const float token_scale = __half2float(scale_axis[pos]);
+                            const float token_zp = __half2float(zp_axis[pos]);
+                            const uint16_t q01 = ggml_cuda_fattn_kvarn_unpack_record_pair(
+                                record, pos * GGML_CUDA_FATTN_KVARN_DIM + dim, desc.bits);
+                            const float x0 = (float(q01 & 0xffu) * token_scale + token_zp) * other.x;
+                            const float x1 = (float(q01 >> 8) * token_scale + token_zp) * other.y;
+                            tile_KV[row * stride_tile + global_b - dim2_start] = make_half2(x0, x1);
+                        }
+                    } else {
+                        const float2 dim_scale = __half22float2(*(const half2 *) (scale_axis + dim));
+                        const float2 dim_zp = __half22float2(*(const half2 *) (zp_axis + dim));
+                        if ((tile.pos_begin & 1) == 0) {
+                            // Key records are dimension-major, so adjacent tokens share a
+                            // packed bit window. Pair them while keeping a dimension pair
+                            // stationary in each thread; this halves address/bit extraction
+                            // work without changing reconstruction arithmetic.
+                            const int row_pair_lane = row_lane;
+                            const int row_pair_stride = row_stride;
+                            for (int row_pair = row_pair_lane; row_pair < (nbatch_fa + 1) / 2; row_pair += row_pair_stride) {
+                                const int row0 = 2 * row_pair;
+                                const int row1 = row0 + 1;
+                                const bool valid0 = !oob_check || row0 < i_sup;
+                                const bool valid1 = row1 < nbatch_fa && (!oob_check || row1 < i_sup);
+                                const int pos0 = tile.pos_begin + row0;
+                                const uint16_t q0_pair = ggml_cuda_fattn_kvarn_unpack_record_pair(
+                                    record, (dim + 0) * GGML_CUDA_FATTN_KVARN_DIM + pos0, desc.bits);
+                                const uint16_t q1_pair = ggml_cuda_fattn_kvarn_unpack_record_pair(
+                                    record, (dim + 1) * GGML_CUDA_FATTN_KVARN_DIM + pos0, desc.bits);
+                                const float2 token_other = __half22float2(*(const half2 *) (other_axis + pos0));
+                                if (valid0) {
+                                    const float x0 = (float(q0_pair & 0xffu) * dim_scale.x + dim_zp.x) * token_other.x;
+                                    const float x1 = (float(q1_pair & 0xffu) * dim_scale.y + dim_zp.y) * token_other.x;
+                                    tile_KV[row0 * stride_tile + global_b - dim2_start] = make_half2(x0, x1);
+                                } else {
+                                    tile_KV[row0 * stride_tile + global_b - dim2_start] = make_half2(0.0f, 0.0f);
+                                }
+                                if (row1 < nbatch_fa) {
+                                    if (valid1) {
+                                        const float x0 = (float(q0_pair >> 8) * dim_scale.x + dim_zp.x) * token_other.y;
+                                        const float x1 = (float(q1_pair >> 8) * dim_scale.y + dim_zp.y) * token_other.y;
+                                        tile_KV[row1 * stride_tile + global_b - dim2_start] = make_half2(x0, x1);
+                                    } else {
+                                        tile_KV[row1 * stride_tile + global_b - dim2_start] = make_half2(0.0f, 0.0f);
+                                    }
+                                }
+                            }
+                        } else {
+                            for (int row = row_lane; row < nbatch_fa; row += row_stride) {
+                                const bool valid_row = !oob_check || row < i_sup;
+                                if (!valid_row) {
+                                    tile_KV[row * stride_tile + global_b - dim2_start] = make_half2(0.0f, 0.0f);
+                                    continue;
+                                }
+                                const int pos = tile.pos_begin + row;
+                                const float token_other = __half2float(other_axis[pos]);
+                                const uint8_t q0 = ggml_cuda_fattn_kvarn_unpack_record(
+                                    record, (dim + 0) * GGML_CUDA_FATTN_KVARN_DIM + pos, desc.bits);
+                                const uint8_t q1 = ggml_cuda_fattn_kvarn_unpack_record(
+                                    record, (dim + 1) * GGML_CUDA_FATTN_KVARN_DIM + pos, desc.bits);
+                                const float x0 = (float(q0) * dim_scale.x + dim_zp.x) * token_other;
+                                const float x1 = (float(q1) * dim_scale.y + dim_zp.y) * token_other;
+                                tile_KV[row * stride_tile + global_b - dim2_start] = make_half2(x0, x1);
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            for (int idx = tid; idx < nbatch_fa * dim2_count_local; idx += nthreads) {
+                const int row = idx / dim2_count_local;
+                const int global_b = out_dim2_start + idx - row * dim2_count_local;
                 const bool valid_row = !oob_check || row < i_sup;
                 if (!valid_row) {
-                    for (int global_b = out_dim2_start; global_b < out_dim2_end; ++global_b) {
-                        tile_KV[row * stride_tile + global_b - dim2_start] = make_half2(0.0f, 0.0f);
-                    }
+                    tile_KV[row * stride_tile + global_b - dim2_start] = make_half2(0.0f, 0.0f);
                     continue;
                 }
 
@@ -482,34 +599,33 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
                 const float token_scale = stream_record && desc.value ? __half2float(scale_axis[pos]) : 0.0f;
                 const float token_zp    = stream_record && desc.value ? __half2float(zp_axis[pos])    : 0.0f;
                 const float token_other = stream_record && !desc.value ? __half2float(other_axis[pos]) : 0.0f;
-                for (int global_b = out_dim2_start; global_b < out_dim2_end; ++global_b) {
-                    const int dim = 2 * (global_b - slice_dim2_start);
-                    if (stream_record) {
-                        if (desc.value) {
-                            const uint8_t q0 = ggml_cuda_fattn_kvarn_unpack_record(record, pos * GGML_CUDA_FATTN_KVARN_DIM + dim + 0, desc.bits);
-                            const uint8_t q1 = ggml_cuda_fattn_kvarn_unpack_record(record, pos * GGML_CUDA_FATTN_KVARN_DIM + dim + 1, desc.bits);
-                            const float x0 = (float(q0) * token_scale + token_zp) * __half2float(scale_smem[dim + 0]);
-                            const float x1 = (float(q1) * token_scale + token_zp) * __half2float(scale_smem[dim + 1]);
-                            tile_KV[row * stride_tile + global_b - dim2_start] = make_half2(x0, x1);
-                        } else {
-                            const uint8_t q0 = ggml_cuda_fattn_kvarn_unpack_record(record, (dim + 0) * GGML_CUDA_FATTN_KVARN_DIM + pos, desc.bits);
-                            const uint8_t q1 = ggml_cuda_fattn_kvarn_unpack_record(record, (dim + 1) * GGML_CUDA_FATTN_KVARN_DIM + pos, desc.bits);
-                            const float x0 = (float(q0) * __half2float(scale_smem[dim + 0]) +
-                                    __half2float(scale_smem[GGML_CUDA_FATTN_KVARN_DIM + dim + 0])) * token_other;
-                            const float x1 = (float(q1) * __half2float(scale_smem[dim + 1]) +
-                                    __half2float(scale_smem[GGML_CUDA_FATTN_KVARN_DIM + dim + 1])) * token_other;
-                            tile_KV[row * stride_tile + global_b - dim2_start] = make_half2(x0, x1);
-                        }
+                const int dim = 2 * (global_b - slice_dim2_start);
+                if (stream_record) {
+                    if (desc.value) {
+                        const uint16_t q01 = ggml_cuda_fattn_kvarn_unpack_record_pair(
+                            record, pos * GGML_CUDA_FATTN_KVARN_DIM + dim, desc.bits);
+                        const float2 other = __half22float2(*(const half2 *) (other_axis + dim));
+                        const float x0 = (float(q01 & 0xffu) * token_scale + token_zp) * other.x;
+                        const float x1 = (float(q01 >> 8) * token_scale + token_zp) * other.y;
+                        tile_KV[row * stride_tile + global_b - dim2_start] = make_half2(x0, x1);
                     } else {
-                        const float x0 = ggml_cuda_fattn_kvarn_load_rotated(desc, token, slice, dim + 0);
-                        const float x1 = ggml_cuda_fattn_kvarn_load_rotated(desc, token, slice, dim + 1);
+                        const uint8_t q0 = ggml_cuda_fattn_kvarn_unpack_record(record, (dim + 0) * GGML_CUDA_FATTN_KVARN_DIM + pos, desc.bits);
+                        const uint8_t q1 = ggml_cuda_fattn_kvarn_unpack_record(record, (dim + 1) * GGML_CUDA_FATTN_KVARN_DIM + pos, desc.bits);
+                        const float2 dim_scale = __half22float2(*(const half2 *) (scale_axis + dim));
+                        const float2 dim_zp = __half22float2(*(const half2 *) (zp_axis + dim));
+                        const float x0 = (float(q0) * dim_scale.x + dim_zp.x) * token_other;
+                        const float x1 = (float(q1) * dim_scale.y + dim_zp.y) * token_other;
                         tile_KV[row * stride_tile + global_b - dim2_start] = make_half2(x0, x1);
                     }
+                } else {
+                    const float x0 = ggml_cuda_fattn_kvarn_load_rotated(desc, token, slice, dim + 0);
+                    const float x1 = ggml_cuda_fattn_kvarn_load_rotated(desc, token, slice, dim + 1);
+                    tile_KV[row * stride_tile + global_b - dim2_start] = make_half2(x0, x1);
                 }
             }
         }
 
-        if (stream_record) {
+        if (stream_record && !cache_record_axes) {
             __syncthreads();
         }
     }

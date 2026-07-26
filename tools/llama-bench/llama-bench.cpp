@@ -460,7 +460,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --list-devices                              list available devices and exit\n");
     printf("  -v, --verbose                               verbose output\n");
     printf("  --progress                                  print test progress indicators\n");
-    printf("  --kv-memory                                capture synchronized KV component and CUDA allocation checkpoints\n");
+    printf("  --kv-memory                                capture synchronized KV component and device allocation checkpoints\n");
     printf("  --no-warmup                                 skip warmup runs before benchmarking\n");
     printf("  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)\n");
     printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 4096)\n");
@@ -1642,11 +1642,23 @@ struct test {
     uint64_t                 kvarn_route_vector = 0;
     uint64_t                 kvarn_route_generic = 0;
     uint64_t                 kvarn_route_prefill = 0;
+    uint32_t                 kvarn_route_families = 0;
+    uint64_t                 kvarn_route_portable = 0;
+    uint64_t                 kvarn_route_amd_generic = 0;
+    uint64_t                 kvarn_route_amd_split = 0;
+    uint64_t                 kvarn_route_amd_vector = 0;
+    uint64_t                 kvarn_route_materialize = 0;
+    uint64_t                 kvarn_route_split_reduce = 0;
+    uint64_t                 kvarn_route_direct = 0;
+    uint64_t                 kvarn_route_compact_tail = 0;
     uint64_t                 kv_k_payload_bytes = 0;
     uint64_t                 kv_v_payload_bytes = 0;
     uint64_t                 kv_exact_tail_bytes = 0;
+    uint64_t                 kv_exact_history_bytes = 0;
     uint64_t                 kv_exact_overlay_bytes = 0;
     uint64_t                 kv_native_exact_bytes = 0;
+    uint64_t                 kv_rollback_reserve_bytes = 0;
+    uint64_t                 kv_transient_estimate_bytes = 0;
     uint64_t                 kv_staging_bytes = 0;
     uint64_t                 kv_metadata_bytes = 0;
     uint64_t                 kv_padding_bytes = 0;
@@ -1654,6 +1666,10 @@ struct test {
     uint64_t                 kv_global_resident_bytes = 0;
     uint64_t                 kv_swa_resident_bytes = 0;
     uint64_t                 kv_allocated_capacity_tokens = 0;
+    uint64_t                 kv_tail_native_bodyless_layers = 0;
+    uint64_t                 kv_tail_native_mixed_layers = 0;
+    uint64_t                 kv_tail_device_fallback_layers = 0;
+    uint64_t                 kv_tail_cpu_layers = 0;
     uint64_t                 kv_live_tokens = 0;
     uint64_t                 kv_descriptor_bytes = 0;
     uint64_t                 kv_partial_output_bytes = 0;
@@ -1799,10 +1815,16 @@ struct test {
             "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
             "type_k",         "type_v",         "kv_tail_tokens", "kv_tail_tokens_effective", "kv_tail_type",
             "kvarn_route_split", "kvarn_route_vector", "kvarn_route_generic", "kvarn_route_prefill",
-            "kv_k_payload_bytes", "kv_v_payload_bytes", "kv_exact_tail_bytes", "kv_exact_overlay_bytes",
-            "kv_native_exact_bytes", "kv_staging_bytes",
+            "kvarn_route_families", "kvarn_route_portable", "kvarn_route_amd_generic",
+            "kvarn_route_amd_split", "kvarn_route_amd_vector", "kvarn_route_materialize",
+            "kvarn_route_split_reduce", "kvarn_route_direct", "kvarn_route_compact_tail",
+            "kv_k_payload_bytes", "kv_v_payload_bytes", "kv_exact_tail_bytes", "kv_exact_history_bytes",
+            "kv_exact_overlay_bytes", "kv_native_exact_bytes", "kv_rollback_reserve_bytes",
+            "kv_transient_estimate_bytes", "kv_staging_bytes",
             "kv_metadata_bytes", "kv_padding_bytes", "kv_resident_bytes", "kv_global_resident_bytes",
             "kv_swa_resident_bytes", "kv_allocated_capacity_tokens", "kv_live_tokens", "kv_descriptor_bytes",
+            "kv_tail_native_bodyless_layers", "kv_tail_native_mixed_layers",
+            "kv_tail_device_fallback_layers", "kv_tail_cpu_layers",
             "kv_partial_output_bytes", "kv_partial_meta_bytes", "kv_tail_body_meta_bytes", "kv_tail_exact_meta_bytes",
             "kv_tail_pack_bytes", "kv_tail_body_output_bytes", "kv_tail_exact_output_bytes", "kv_tail_plan_input_bytes",
             "kv_transient_bytes", "kv_peak_bytes", "cuda_used_model_bytes", "cuda_used_context_bytes",
@@ -1833,7 +1855,14 @@ struct test {
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
             field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn" || field == "kv_tail_tokens" ||
             field == "kv_tail_tokens_effective" || field == "kvarn_route_split" || field == "kvarn_route_vector" ||
-            field == "kvarn_route_generic" || field == "kvarn_route_prefill") {
+            field == "kvarn_route_generic" || field == "kvarn_route_prefill" ||
+            field == "kvarn_route_families" || field == "kvarn_route_portable" ||
+            field == "kvarn_route_amd_generic" || field == "kvarn_route_amd_split" ||
+            field == "kvarn_route_amd_vector" || field == "kvarn_route_materialize" ||
+            field == "kvarn_route_split_reduce" || field == "kvarn_route_direct" ||
+            field == "kvarn_route_compact_tail" ||
+            field == "kv_tail_native_bodyless_layers" || field == "kv_tail_native_mixed_layers" ||
+            field == "kv_tail_device_fallback_layers" || field == "kv_tail_cpu_layers") {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" ||
@@ -1907,11 +1936,23 @@ struct test {
                                              std::to_string(kvarn_route_vector),
                                              std::to_string(kvarn_route_generic),
                                              std::to_string(kvarn_route_prefill),
+                                             std::to_string(kvarn_route_families),
+                                             std::to_string(kvarn_route_portable),
+                                             std::to_string(kvarn_route_amd_generic),
+                                             std::to_string(kvarn_route_amd_split),
+                                             std::to_string(kvarn_route_amd_vector),
+                                             std::to_string(kvarn_route_materialize),
+                                             std::to_string(kvarn_route_split_reduce),
+                                             std::to_string(kvarn_route_direct),
+                                             std::to_string(kvarn_route_compact_tail),
                                              std::to_string(kv_k_payload_bytes),
                                              std::to_string(kv_v_payload_bytes),
                                              std::to_string(kv_exact_tail_bytes),
+                                             std::to_string(kv_exact_history_bytes),
                                              std::to_string(kv_exact_overlay_bytes),
                                              std::to_string(kv_native_exact_bytes),
+                                             std::to_string(kv_rollback_reserve_bytes),
+                                             std::to_string(kv_transient_estimate_bytes),
                                              std::to_string(kv_staging_bytes),
                                              std::to_string(kv_metadata_bytes),
                                              std::to_string(kv_padding_bytes),
@@ -1921,6 +1962,10 @@ struct test {
                                              std::to_string(kv_allocated_capacity_tokens),
                                              std::to_string(kv_live_tokens),
                                              std::to_string(kv_descriptor_bytes),
+                                             std::to_string(kv_tail_native_bodyless_layers),
+                                             std::to_string(kv_tail_native_mixed_layers),
+                                             std::to_string(kv_tail_device_fallback_layers),
+                                             std::to_string(kv_tail_cpu_layers),
                                              std::to_string(kv_partial_output_bytes),
                                              std::to_string(kv_partial_meta_bytes),
                                              std::to_string(kv_tail_body_meta_bytes),
@@ -2502,11 +2547,30 @@ static std::unique_ptr<printer> create_printer(output_formats format) {
 int llama_bench(int argc, char ** argv);
 
 struct bench_kvarn_route_stats {
+    uint32_t struct_size;
+    uint32_t abi_version;
+    uint32_t route_families;
+    uint32_t reserved;
     uint64_t decode_split;
     uint64_t decode_vector;
     uint64_t generic_mma;
     uint64_t prompt_prefill;
+    uint64_t portable_native;
+    uint64_t amd_generic_mma;
+    uint64_t amd_decode_split;
+    uint64_t amd_decode_vector;
+    uint64_t materialize_fallback;
+    uint64_t split_reduce;
+    uint64_t direct_entry;
+    uint64_t compact_tail_entry;
 };
+
+static bench_kvarn_route_stats make_bench_kvarn_route_stats() {
+    bench_kvarn_route_stats stats = {};
+    stats.struct_size = sizeof(stats);
+    stats.abi_version = 1;
+    return stats;
+}
 
 struct bench_kv_memory_transient_stats {
     uint64_t kvarn_descriptor_bytes;
@@ -2528,6 +2592,52 @@ using bench_kv_memory_transient_stats_reset_fn = void (*)();
 using bench_kv_memory_transient_stats_get_fn = void (*)(bench_kv_memory_transient_stats *);
 using bench_cuda_memory_checkpoint_fn = bool (*)(int, uint64_t *, uint64_t *, uint64_t *);
 
+static ggml_backend_dev_t bench_memory_device(const cmd_params_instance & inst) {
+    if (inst.main_gpu >= 0 && size_t(inst.main_gpu) < inst.devices.size() &&
+            inst.devices[inst.main_gpu] != nullptr) {
+        return inst.devices[inst.main_gpu];
+    }
+    for (ggml_backend_dev_t dev : inst.devices) {
+        if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            return dev;
+        }
+    }
+    return ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+}
+
+static bool bench_device_memory_checkpoint(
+        ggml_backend_dev_t memory_dev,
+        bench_cuda_memory_checkpoint_fn cuda_memory_checkpoint,
+        int cuda_device,
+        llama_context * ctx,
+        uint64_t * used_bytes,
+        uint64_t * free_bytes,
+        uint64_t * total_bytes) {
+    if (memory_dev == nullptr || used_bytes == nullptr || free_bytes == nullptr || total_bytes == nullptr) {
+        return false;
+    }
+    if (ctx != nullptr) {
+        llama_synchronize(ctx);
+    }
+
+    const char * name = ggml_backend_dev_name(memory_dev);
+    if (cuda_memory_checkpoint != nullptr && name != nullptr && strncmp(name, "CUDA", 4) == 0) {
+        return cuda_memory_checkpoint(cuda_device, used_bytes, free_bytes, total_bytes);
+    }
+
+    size_t free_value = 0;
+    size_t total_value = 0;
+    ggml_backend_dev_memory(memory_dev, &free_value, &total_value);
+    if (total_value == 0 || free_value > total_value) {
+        return false;
+    }
+
+    *free_bytes = free_value;
+    *total_bytes = total_value;
+    *used_bytes = total_value - free_value;
+    return true;
+}
+
 int llama_bench(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
     // try to set locale for unicode characters in markdown
@@ -2547,30 +2657,6 @@ int llama_bench(int argc, char ** argv) {
 
     // initialize backends
     ggml_backend_load_all();
-
-    bench_kvarn_route_stats_reset_fn kvarn_route_stats_reset = nullptr;
-    bench_kvarn_route_stats_get_fn kvarn_route_stats_get = nullptr;
-    bench_kv_memory_transient_stats_reset_fn kv_memory_transient_stats_reset = nullptr;
-    bench_kv_memory_transient_stats_get_fn kv_memory_transient_stats_get = nullptr;
-    bench_cuda_memory_checkpoint_fn cuda_memory_checkpoint = nullptr;
-    for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
-        ggml_backend_reg_t reg = ggml_backend_reg_get(i);
-        auto reset = reinterpret_cast<bench_kvarn_route_stats_reset_fn>(
-            ggml_backend_reg_get_proc_address(reg, "ggml_backend_kvarn_route_stats_reset"));
-        auto get = reinterpret_cast<bench_kvarn_route_stats_get_fn>(
-            ggml_backend_reg_get_proc_address(reg, "ggml_backend_kvarn_route_stats_get"));
-        if (reset != nullptr && get != nullptr) {
-            kvarn_route_stats_reset = reset;
-            kvarn_route_stats_get = get;
-            kv_memory_transient_stats_reset = reinterpret_cast<bench_kv_memory_transient_stats_reset_fn>(
-                ggml_backend_reg_get_proc_address(reg, "ggml_backend_kv_memory_transient_stats_reset"));
-            kv_memory_transient_stats_get = reinterpret_cast<bench_kv_memory_transient_stats_get_fn>(
-                ggml_backend_reg_get_proc_address(reg, "ggml_backend_kv_memory_transient_stats_get"));
-            cuda_memory_checkpoint = reinterpret_cast<bench_cuda_memory_checkpoint_fn>(
-                ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_memory_checkpoint"));
-            break;
-        }
-    }
 
     cmd_params params = parse_cmd_params(argc, argv);
 
@@ -2678,15 +2764,39 @@ int llama_bench(int argc, char ** argv) {
         uint64_t cuda_used_model = 0;
         uint64_t cuda_free_model = 0;
         uint64_t cuda_total = 0;
+        ggml_backend_dev_t memory_dev = bench_memory_device(inst);
+        ggml_backend_reg_t memory_reg =
+            memory_dev != nullptr ? ggml_backend_dev_backend_reg(memory_dev) : nullptr;
+        auto kvarn_route_stats_reset = memory_reg != nullptr ?
+            reinterpret_cast<bench_kvarn_route_stats_reset_fn>(
+                ggml_backend_reg_get_proc_address(
+                    memory_reg, "ggml_backend_kvarn_route_stats_reset")) : nullptr;
+        auto kvarn_route_stats_get = memory_reg != nullptr ?
+            reinterpret_cast<bench_kvarn_route_stats_get_fn>(
+                ggml_backend_reg_get_proc_address(
+                    memory_reg, "ggml_backend_kvarn_route_stats_get")) : nullptr;
+        auto kv_memory_transient_stats_reset = memory_reg != nullptr ?
+            reinterpret_cast<bench_kv_memory_transient_stats_reset_fn>(
+                ggml_backend_reg_get_proc_address(
+                    memory_reg, "ggml_backend_kv_memory_transient_stats_reset")) : nullptr;
+        auto kv_memory_transient_stats_get = memory_reg != nullptr ?
+            reinterpret_cast<bench_kv_memory_transient_stats_get_fn>(
+                ggml_backend_reg_get_proc_address(
+                    memory_reg, "ggml_backend_kv_memory_transient_stats_get")) : nullptr;
+        auto cuda_memory_checkpoint = memory_reg != nullptr ?
+            reinterpret_cast<bench_cuda_memory_checkpoint_fn>(
+                ggml_backend_reg_get_proc_address(
+                    memory_reg, "ggml_backend_cuda_memory_checkpoint")) : nullptr;
         if (params.kv_memory) {
             if (kv_memory_transient_stats_reset == nullptr || kv_memory_transient_stats_get == nullptr ||
-                    cuda_memory_checkpoint == nullptr) {
-                fprintf(stderr, "%s: error: CUDA KV memory telemetry is unavailable\n", __func__);
+                    memory_dev == nullptr) {
+                fprintf(stderr, "%s: error: KV memory telemetry is unavailable for the selected backend\n", __func__);
                 llama_model_free(lmodel);
                 return 1;
             }
-            if (!cuda_memory_checkpoint(inst.main_gpu, &cuda_used_model, &cuda_free_model, &cuda_total)) {
-                fprintf(stderr, "%s: error: failed to capture the synchronized model-only CUDA checkpoint\n", __func__);
+            if (!bench_device_memory_checkpoint(memory_dev, cuda_memory_checkpoint, inst.main_gpu, nullptr,
+                    &cuda_used_model, &cuda_free_model, &cuda_total)) {
+                fprintf(stderr, "%s: error: failed to capture the synchronized model-only device checkpoint\n", __func__);
                 llama_model_free(lmodel);
                 return 1;
             }
@@ -2706,8 +2816,11 @@ int llama_bench(int argc, char ** argv) {
             t.kv_k_payload_bytes = kv_stats.k_payload_bytes();
             t.kv_v_payload_bytes = kv_stats.v_payload_bytes();
             t.kv_exact_tail_bytes = kv_stats.exact_tail_bytes();
+            t.kv_exact_history_bytes = kv_stats.exact_history_bytes();
             t.kv_exact_overlay_bytes = kv_stats.exact_overlay_bytes();
             t.kv_native_exact_bytes = kv_stats.native_exact_bytes();
+            t.kv_rollback_reserve_bytes = kv_stats.rollback_reserve_bytes();
+            t.kv_transient_estimate_bytes = kv_stats.transient_estimate_bytes();
             t.kv_staging_bytes = kv_stats.global.staging_bytes + kv_stats.swa.staging_bytes;
             t.kv_metadata_bytes = kv_stats.global.metadata_bytes + kv_stats.swa.metadata_bytes;
             t.kv_padding_bytes = kv_stats.global.padding_bytes + kv_stats.swa.padding_bytes;
@@ -2715,6 +2828,10 @@ int llama_bench(int argc, char ** argv) {
             t.kv_global_resident_bytes = kv_stats.global.resident_bytes();
             t.kv_swa_resident_bytes = kv_stats.swa.resident_bytes();
             t.kv_allocated_capacity_tokens = kv_stats.allocated_capacity_tokens();
+            t.kv_tail_native_bodyless_layers = kv_stats.tail_native_bodyless_layers();
+            t.kv_tail_native_mixed_layers = kv_stats.tail_native_mixed_layers();
+            t.kv_tail_device_fallback_layers = kv_stats.tail_device_fallback_layers();
+            t.kv_tail_cpu_layers = kv_stats.tail_cpu_layers();
             t.cuda_used_model_bytes = cuda_used_model;
             t.cuda_total_bytes = cuda_total;
 
@@ -2728,9 +2845,9 @@ int llama_bench(int argc, char ** argv) {
 
             uint64_t cuda_free_context = 0;
             uint64_t cuda_total_context = 0;
-            if (!cuda_memory_checkpoint(inst.main_gpu, &t.cuda_used_context_bytes,
-                    &cuda_free_context, &cuda_total_context)) {
-                fprintf(stderr, "%s: error: failed to capture the synchronized post-context CUDA checkpoint\n", __func__);
+            if (!bench_device_memory_checkpoint(memory_dev, cuda_memory_checkpoint, inst.main_gpu, ctx,
+                    &t.cuda_used_context_bytes, &cuda_free_context, &cuda_total_context)) {
+                fprintf(stderr, "%s: error: failed to capture the synchronized post-context device checkpoint\n", __func__);
                 llama_free(ctx);
                 llama_model_free(lmodel);
                 return 1;
@@ -2849,9 +2966,9 @@ int llama_bench(int argc, char ** argv) {
                 t.kv_live_tokens = uint64_t(t.n_depth + t.n_prompt);
                 uint64_t cuda_free_prefill = 0;
                 uint64_t cuda_total_prefill = 0;
-                if (!cuda_memory_checkpoint(inst.main_gpu, &t.cuda_used_prefill_bytes,
-                        &cuda_free_prefill, &cuda_total_prefill)) {
-                    fprintf(stderr, "%s: error: failed to capture the synchronized post-prefill CUDA checkpoint\n", __func__);
+                if (!bench_device_memory_checkpoint(memory_dev, cuda_memory_checkpoint, inst.main_gpu, ctx,
+                        &t.cuda_used_prefill_bytes, &cuda_free_prefill, &cuda_total_prefill)) {
+                    fprintf(stderr, "%s: error: failed to capture the synchronized post-prefill device checkpoint\n", __func__);
                     llama_free(ctx);
                     llama_model_free(lmodel);
                     return 1;
@@ -2895,9 +3012,9 @@ int llama_bench(int argc, char ** argv) {
                 uint64_t cuda_used_peak = 0;
                 uint64_t cuda_free_peak = 0;
                 uint64_t cuda_total_peak = 0;
-                if (!cuda_memory_checkpoint(inst.main_gpu, &cuda_used_peak,
-                        &cuda_free_peak, &cuda_total_peak)) {
-                    fprintf(stderr, "%s: error: failed to capture the synchronized decode CUDA checkpoint\n", __func__);
+                if (!bench_device_memory_checkpoint(memory_dev, cuda_memory_checkpoint, inst.main_gpu, ctx,
+                        &cuda_used_peak, &cuda_free_peak, &cuda_total_peak)) {
+                    fprintf(stderr, "%s: error: failed to capture the synchronized decode device checkpoint\n", __func__);
                     llama_free(ctx);
                     llama_model_free(lmodel);
                     return 1;
@@ -2908,12 +3025,21 @@ int llama_bench(int argc, char ** argv) {
         }
 
         if (kvarn_route_stats_get != nullptr) {
-            bench_kvarn_route_stats stats = {};
+            bench_kvarn_route_stats stats = make_bench_kvarn_route_stats();
             kvarn_route_stats_get(&stats);
             t.kvarn_route_split = stats.decode_split;
             t.kvarn_route_vector = stats.decode_vector;
             t.kvarn_route_generic = stats.generic_mma;
             t.kvarn_route_prefill = stats.prompt_prefill;
+            t.kvarn_route_families = stats.route_families;
+            t.kvarn_route_portable = stats.portable_native;
+            t.kvarn_route_amd_generic = stats.amd_generic_mma;
+            t.kvarn_route_amd_split = stats.amd_decode_split;
+            t.kvarn_route_amd_vector = stats.amd_decode_vector;
+            t.kvarn_route_materialize = stats.materialize_fallback;
+            t.kvarn_route_split_reduce = stats.split_reduce;
+            t.kvarn_route_direct = stats.direct_entry;
+            t.kvarn_route_compact_tail = stats.compact_tail_entry;
         }
 
         if (params.kv_memory) {
@@ -2940,9 +3066,9 @@ int llama_bench(int argc, char ** argv) {
 
             uint64_t cuda_free_after = 0;
             uint64_t cuda_total_after = 0;
-            if (!cuda_memory_checkpoint(inst.main_gpu, &t.cuda_used_after_context_bytes,
-                    &cuda_free_after, &cuda_total_after)) {
-                fprintf(stderr, "%s: error: failed to capture the synchronized post-teardown CUDA checkpoint\n", __func__);
+            if (!bench_device_memory_checkpoint(memory_dev, cuda_memory_checkpoint, inst.main_gpu, nullptr,
+                    &t.cuda_used_after_context_bytes, &cuda_free_after, &cuda_total_after)) {
+                fprintf(stderr, "%s: error: failed to capture the synchronized post-teardown device checkpoint\n", __func__);
                 llama_model_free(lmodel);
                 return 1;
             }

@@ -15,6 +15,18 @@ The default build contains 50 standard FlashAttention cache pairs and 15
 balanced KVarN fast-decode pairs. Use `-DGGML_CUDA_FA_ALL_QUANTS=ON` only when
 the workload needs all 169 standard pairs and all 36 ordered KVarN pairs.
 
+For ROCm/HIP on Strix Point, use:
+
+```bash
+HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -R)" \
+cmake -S . -B build-hip -DGGML_HIP=ON -DGGML_CUDA_KVARN=ON \
+  -DGGML_CUDA_FA=ON -DGPU_TARGETS=gfx1150 -DCMAKE_BUILD_TYPE=Release
+cmake --build build-hip --parallel 16
+```
+
+Use `GPU_TARGETS=gfx942` for CDNA3. CDNA fast routing is experimental until
+validated on matching hardware.
+
 ## 2. Prepare the models
 
 The drafter must be trained for the exact target model and use upstream
@@ -55,16 +67,27 @@ also pass `--spec-dm-controller off`.
 ## 5. Choose and measure the target cache
 
 The command uses conventional q caches. For lower target-cache memory on a
-supported CUDA layout, try:
+supported target-model layout, try:
 
 ```text
 --cache-type-k kvarn4 --cache-type-v kvarn4
 ```
 
 KVarN is target-context-only; keep the DFlash draft cache on a standard type.
-For KLD or cache-quality comparisons, use the intended serving ubatch and keep
-the corpus, context, logical batch, physical ubatch, model files, and commit
-identical between both legs.
+CUDA, ROCm/HIP, Vulkan, and CPU consume compressed records directly in native
+attention paths. Vulkan needs shader Int64 and buffer-device-address support.
+For KLD or cache-quality comparisons, use the intended serving backend and
+ubatch and keep the corpus, context, logical batch, physical ubatch, model
+files, and commit identical between both legs.
+
+An exact HIP decode smoke command is:
+
+```bash
+GGML_KVARN_DEBUG_ROUTES=1 build-hip/bin/llama-bench \
+  -m /models/Qwen3.6-27B-Q5_K_S.gguf -ngl 999 -p 0 -n 4 \
+  -d 0,512,2048 -b 2048 -ub 512 -r 1 \
+  -ctk kvarn5 -ctv kvarn5 -fa on -mmp 0 --no-host 1
+```
 
 ## 6. Optional reasoning controls
 

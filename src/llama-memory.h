@@ -4,6 +4,7 @@
 #include "llama-graph.h"
 #include "llama-kv-memory-stats.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -35,6 +36,9 @@ struct llama_memory_params {
     uint32_t  kv_tail_tokens_swa;
     uint32_t  kv_tail_tokens_requested;
     uint32_t  kv_tail_tokens_swa_requested;
+    bool      kv_tail_native_exact;
+    bool      kv_tail_native_exact_swa;
+    uint32_t  kv_tail_rollback_tokens;
     ggml_type kv_tail_type;
 
     llama_memory_t mem_other;
@@ -77,6 +81,12 @@ struct llama_memory_context_i {
 
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
+
+    // Compact cache metadata is prepared by apply(), but is not authoritative
+    // until the graph finishes. Wrappers must forward both hooks to their
+    // participating child contexts.
+    virtual void graph_compute_start() {}
+    virtual void graph_compute_finish(ggml_status /* status */) {}
 
 };
 
@@ -127,6 +137,14 @@ struct llama_memory_i {
         GGML_UNUSED(p1);
         return true;
     }
+
+    struct seq_rm_capability {
+        bool full_clear = true;
+        bool arbitrary_ranges = true;
+        uint32_t suffix_rollback_tokens = UINT32_MAX;
+    };
+
+    virtual seq_rm_capability get_seq_rm_capability() const { return {}; }
 
     virtual bool seq_rm_plan(
             llama_seq_id seq_id, llama_pos p0, llama_pos p1,
@@ -234,6 +252,22 @@ inline bool llama_memory_seq_rm_plan_all(
     planned_p0 = common_p0;
     planned_p1 = common_p1;
     return true;
+}
+
+inline llama_memory_i::seq_rm_capability llama_memory_seq_rm_capability_all(
+        std::initializer_list<const llama_memory_i *> children) {
+    llama_memory_i::seq_rm_capability result;
+    for (const llama_memory_i * child : children) {
+        if (!child) {
+            return { false, false, 0 };
+        }
+        const auto capability = child->get_seq_rm_capability();
+        result.full_clear = result.full_clear && capability.full_clear;
+        result.arbitrary_ranges = result.arbitrary_ranges && capability.arbitrary_ranges;
+        result.suffix_rollback_tokens = std::min(
+                result.suffix_rollback_tokens, capability.suffix_rollback_tokens);
+    }
+    return result;
 }
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;

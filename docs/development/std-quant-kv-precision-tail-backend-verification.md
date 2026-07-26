@@ -15,7 +15,15 @@ llama-cli -m <MODEL.gguf> -p "tail backend verification" -n 8 -c 512 -b 128 -ub 
   --cache-type-k q4_0 --cache-type-v f16 --kv-tail-tokens 64 --kv-tail-type bf16
 ```
 
-For each CLI run, repeat with `-ub 32` and compare greedy output. Report the
+Compact-capable backends must additionally run the segmented source oracle
+(`n_tail_current > 0`) for D128/D256/D512, including 1024 history + 1 current
+and 1024 history + 100 current at D512. A backend may select the declared
+generic fallback, but it must not advertise segmented native attention and then
+ignore sources 10/11. State validation must include `ub=128 -> ub=512` and the
+reverse with a populated rollback reserve.
+
+For each CLI run, repeat with `-ub 32` and compare greedy output. Persistent
+exact bytes must remain unchanged; only transient workspace may differ. Report the
 device, driver/runtime, model SHA-256, full command, commit, output, startup
 memory accounting, and whether any graph node fell back to CPU.
 
@@ -29,8 +37,8 @@ cmake --build build -j
 ```
 
 Run the common matrix above with `-ngl 99 --flash-attn on`. HIP shares the CUDA
-quantized `OUT_PROD` source route, but only a real ROCm run can validate device
-dispatch and graph scheduling.
+segmented implementation and quantized `OUT_PROD` source route, but only a real
+ROCm run can validate device dispatch and graph scheduling.
 
 ## Metal issue draft
 
@@ -55,7 +63,9 @@ cmake --build build -j
 ```
 
 Run the common matrix with `-ngl 99` on one Vulkan device and include validation
-layer output when available.
+layer output when available. Vulkan KVarN direct-record attention currently
+declines compact segmented-current routing and must select the generic compact
+fallback; standard compact tails likewise use the advertised generic route.
 
 ## SYCL issue draft
 

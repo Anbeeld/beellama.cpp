@@ -13,6 +13,10 @@ struct llama_hparams;
 struct llama_model;
 
 bool llama_kvarn_backend_supports_native_ops(ggml_backend_dev_t dev);
+bool llama_kvarn_backend_supports_ops(ggml_backend_dev_t dev);
+bool llama_kvarn_backend_native_attention_uses_original_v(ggml_backend_dev_t dev);
+uint32_t llama_kvarn_backend_native_rotated_max_query_tokens(ggml_backend_dev_t dev);
+bool llama_kvarn_backend_mixed_tail_native_preferred(ggml_backend_dev_t dev);
 
 struct llama_kvarn_tail_policy {
     uint32_t raw_requested_tokens;
@@ -71,6 +75,8 @@ public:
 
     bool next() override;
     bool apply() override;
+    void graph_compute_start() override;
+    void graph_compute_finish(ggml_status compute_status) override;
 
     llama_memory_status get_status() const override;
     const llama_ubatch & get_ubatch() const override;
@@ -87,16 +93,33 @@ public:
     ggml_tensor * get_k_tail(ggml_context * ctx, int32_t il) const override;
     ggml_tensor * get_v_tail(ggml_context * ctx, int32_t il) const override;
     uint32_t get_tail_slots() const override;
+    ggml_type get_tail_type() const override;
     uint32_t get_tail_tokens() const override;
     uint32_t get_tail_arena_stride() const override;
     uint32_t get_tail_attention_stride(uint32_t n_query_tokens = 0) const override;
+    uint32_t get_tail_body_execution_stride() const override;
+    uint32_t get_tail_body_execution_rows(int32_t il) const override;
+    bool has_compact_tail() const override;
+    bool has_kv_body() const override;
+    bool has_kv_body(int32_t il) const override;
+    bool has_tail_current(int32_t il) const override;
+    ggml_backend_dev_t get_tail_backend(int32_t il) const override;
+    llama_kv_tail_storage_kind get_tail_storage_kind() const override;
+    uint32_t get_tail_rollback_tokens() const override;
     llama_kv_tail_route get_tail_route(int32_t il) const override;
+    const llama_kv_tail_layer_route * get_tail_layer_route(int32_t il) const override;
     bool get_tail_explicit_bias(int32_t il) const override;
     bool can_pack_tail_body(const llama_ubatch & ubatch) const override;
     ggml_tensor * get_k_native(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v_native(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_k_for_attention(ggml_context * ctx, int32_t il, bool native_attention) const;
+    ggml_tensor * get_v_for_attention(ggml_context * ctx, int32_t il, bool native_attention) const;
+    bool uses_native_attention(int32_t il) const;
+    bool mixed_tail_native_preferred(int32_t il) const;
+    bool native_attention_uses_original_v(int32_t il) const;
+    uint32_t native_rotated_max_query_tokens(int32_t il) const;
 
-    // SWA sliding-window ring: per-cell absolute positions for native KVarN views.
+    // SWA sliding-window ring: per-cell absolute positions for KVarN reads.
     // Built as a graph input sized [n_kv]; set on the host from cells.pos_get(cell).
     ggml_tensor * build_input_kvarn_rot(ggml_context * ctx, int n_rot) const;
     void set_input_kvarn_rot(ggml_tensor * dst) const;
@@ -112,8 +135,12 @@ public:
     ggml_tensor * cpy_v_with_tail(
             ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs,
             ggml_tensor * tail_idxs, int32_t il) const override;
-    ggml_tensor * cpy_k_tail(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * tail_idxs, int32_t il) const override;
-    ggml_tensor * cpy_v_tail(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * tail_idxs, int32_t il) const override;
+    ggml_tensor * cpy_k_tail(
+            ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * tail_idxs,
+            int32_t il, ggml_tensor * dependency = nullptr) const override;
+    ggml_tensor * cpy_v_tail(
+            ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * tail_idxs,
+            int32_t il, ggml_tensor * dependency = nullptr) const override;
 
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const override;
     ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const override;
@@ -152,7 +179,7 @@ private:
 
     mutable std::unordered_map<int32_t, ggml_tensor *> stored_k;
     mutable std::unordered_map<int32_t, ggml_tensor *> stored_v;
-    mutable ggml_tensor * mat_idxs = nullptr; // SWA per-cell absolute positions for native KVarN views
+    mutable ggml_tensor * mat_idxs = nullptr; // SWA per-cell absolute positions for views/materialization
 };
 
 class llama_kv_cache_kvarn : public llama_memory_i {
@@ -174,7 +201,8 @@ public:
             const layer_reuse_cb & reuse = nullptr,
             uint32_t tail_tokens = 0,
             ggml_type tail_type = GGML_TYPE_F16,
-            uint32_t tail_tokens_requested = UINT32_MAX);
+            uint32_t tail_tokens_requested = UINT32_MAX,
+            uint32_t tail_rollback_tokens = 0);
 
     llama_memory_context_ptr init_batch(
             llama_batch_allocr & balloc,
@@ -188,6 +216,7 @@ public:
     llama_memory_context_ptr init_kv_batch(const std::vector<llama_ubatch> & ubatches) override;
 
     bool get_can_shift() const override;
+    seq_rm_capability get_seq_rm_capability() const override;
 
     void clear(bool data) override;
     bool can_seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const override;
@@ -230,6 +259,10 @@ public:
     bool stream_is_exclusive_for(llama_seq_id seq_id) const;
     bool apply_pending_stream_copies(llama_context * lctx);
     bool is_swa() const { return swa; }
+    bool uses_native_attention(int32_t il) const;
+    bool mixed_tail_native_preferred(int32_t il) const;
+    bool native_attention_uses_original_v(int32_t il) const;
+    uint32_t native_rotated_max_query_tokens(int32_t il) const;
 
     // Reference-faithful staging keeps one incomplete 128-token group lossless.
     // Completed records are committed eagerly, so physical ubatch size does not
@@ -259,10 +292,18 @@ public:
             const llama_kv_cache::slot_info & sinfo,
             bool value,
             ggml_tensor * mat_idxs = nullptr) const;
+    ggml_tensor * materialize(
+            ggml_context * ctx,
+            ggml_tensor * stored,
+            int32_t il,
+            uint32_t n_kv,
+            const llama_kv_cache::slot_info & sinfo,
+            bool value,
+            ggml_tensor * mat_idxs = nullptr) const;
     ggml_tensor * get_tail(ggml_context * ctx, int32_t il, bool value) const;
     ggml_tensor * store_tail(
             ggml_context * ctx, ggml_tensor * current, ggml_tensor * indices,
-            int32_t il, bool value) const;
+            int32_t il, bool value, ggml_tensor * dependency = nullptr) const;
 
 private:
     struct layer {
@@ -272,6 +313,10 @@ private:
         uint32_t head_dim_v;
         uint32_t k_slices;
         uint32_t v_slices;
+        bool native_attention;
+        bool mixed_tail_native;
+        bool native_original_v;
+        uint32_t native_rotated_max_query_tokens;
         ggml_tensor * k_records;
         ggml_tensor * v_records;
         ggml_tensor * k_stage;

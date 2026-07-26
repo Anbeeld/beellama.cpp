@@ -10,6 +10,12 @@ limits, and measurement guidance.
 KVarN values are `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`, `kvarn6`, and
 `kvarn8`. K and V may use different bit widths.
 
+CUDA, ROCm/HIP, Vulkan, and CPU consume compressed KVarN records directly in
+native FlashAttention paths. Vulkan requires shader Int64 and
+buffer-device-address support for its direct route. An explicitly supported
+materialization fallback retains compressed persistent storage when a native
+route is unavailable.
+
 | Argument | Env var | Default | Behavior |
 |---|---|---|---|
 | `-ctk TYPE`, `--cache-type-k TYPE` | `LLAMA_ARG_CACHE_TYPE_K` | `f16` | Selects the target K cache. Bee adds the six KVarN values and standard `q6_0`, `q6_1`, `q3_0`, `q3_1`, `q2_0`, and `q2_1`. If only K or V is KVarN, the other side is promoted to the same KVarN width with a warning. |
@@ -21,14 +27,15 @@ KVarN values are `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`, `kvarn6`, and
 
 The KV cache precision tail (KVCPT) makes the newest attention-visible entries exact in F16 or BF16 for
 standard quantized and KVarN target caches. A partial tail keeps the complete
-quantized body and adds a compact shadow. A full-window request may instead
-promote an owned cache group to one native exact body. Draft and auxiliary
+quantized body and adds a compact exact-history ring. The active ubatch remains
+a separate graph-local exact source. A full-window SWA request uses a compact
+native-exact ring and omits the unread compressed SWA body. Draft and auxiliary
 contexts remain on standard cache types and do not inherit the target tail.
 
 | Argument | Env var | Default | Behavior |
 |---|---|---|---|
 | `--kv-tail-tokens SPEC` | `LLAMA_ARG_KV_TAIL_TOKENS` | `0` | For standard caches, `0` keeps the ordinary cache path. For KVarN, omitted or `0` retains the intrinsic 128-token exact suffix. A number applies to every canonical group; KVarN rounds positive values upward to complete 128-token groups. `N0,N1` follows canonical group order, while `full=N,swa=N` accepts unique role aliases or structural IDs such as `full@l0`. Invalid, duplicate, incomplete, or wrong-length specifications resolve additional coverage to zero, while KVarN still retains its intrinsic suffix. `auto` requests 1024 exact tokens per applicable target-cache group, capped by that group's effective context or attention window. |
-| `--kv-tail-type TYPE` | `LLAMA_ARG_KV_TAIL_TYPE` | `bf16` for standard caches; `f16` for KVarN | Selects `f16` or `bf16` exact storage for overlay shadows or a promoted native-exact body. An explicit value overrides the cache-family default in either direction. Other types are rejected. |
+| `--kv-tail-type TYPE` | `LLAMA_ARG_KV_TAIL_TYPE` | `bf16` for standard caches; `f16` for KVarN | Selects `f16` or `bf16` exact storage for compact history and compact-native SWA. An explicit value overrides the cache-family default in either direction. Other types are rejected. |
 
 An omitted tail type remains automatic until context placement. If the standard
 BF16 default lacks a complete Metal or SYCL route but F16 is complete, automatic
@@ -38,18 +45,26 @@ instead of changing the requested representation.
 Explicit values are capped by the group's effective attention window and context
 capacity. KVarN values are also rounded upward to 128-token groups. Startup logs
 show raw, requested, effective, and window lengths, the structural group ID,
-participating layers, selected overlay or native-exact
-representation, actual body and shadow types, physical rows, arena and sink
-rows, and memory increments. Only a quantized K side receives an added K
-shadow, and only a quantized V side receives an added V shadow. A native-exact
-group has no shadow or tail planner because its ordinary body is exact.
+participating layers, selected compact-overlay or compact-native-exact
+representation, actual body and exact types, logical history rows, rollback
+rows, graph-local body execution rows, owner backend, current-segment
+presence, transient estimate, and memory increments. Native routes are checked
+again against the final constructed operation. A mismatch fails context/graph
+construction instead of allowing the scheduler to move that layer silently.
 
-Standard shadow capacity is
-`round_up(N + n_ubatch, 256) * n_seq_max + sink_slots`; `sink_slots` is
-`n_ubatch` for a multi-sequence context and zero otherwise. The round-up is
-per-sequence arena padding, while sinks are separately reserved. Exact arenas
-remain per logical sequence even with `--kv-unified`. Positive exact overlays
-on K-only MLA or DSA attention are rejected during context creation.
+Let `N` be the resolved exact length, `U` the physical ubatch limit, `R` the
+advertised suffix-rollback horizon, and `S` the number of exact streams. Compact
+persistent exact capacity is `(N + R) * S` rows and is independent of `U`.
+`U` sizes only graph inputs and reusable transient workspace. Backend buffer
+alignment may round bytes but does not add logical rows. Exact history remains
+per logical sequence even with `--kv-unified`. Positive tails on K-only MLA or
+DSA attention are rejected during context creation.
+
+`R` comes from the context's rollback requirement. Contexts that otherwise
+request no rollback retain one row for the common one-token capability probe;
+it never defaults to `U`. The memory capability API reports this bound, and a
+larger speculative removal must use the checkpoint/reprocess path before cache
+metadata is mutated.
 
 Partial exact overlays are compatible with `--split-mode layer`; every shadow
 stays on the same device as its layer's ordinary K/V body. They are not
@@ -59,16 +74,28 @@ requires `--kv-tail-tokens 0` or a full-window standard native-exact result,
 which has no shadow and uses the ordinary KV split descriptor.
 
 KVarN's physical staging depth is independent of this logical policy. Increasing
-`-ub` may increase transient work but never increases exact coverage. Completed
-128-token records are committed eagerly, while exact K/V payloads remain live
-only for the resolved suffix. Full-window promotion uses `--kv-tail-type` for
-both native K and V and allocates no KVarN records or overlay.
+`-ub` may increase transient work but never increases persistent exact coverage.
+Completed 128-token records are committed eagerly for partial tails, while the
+canonical exact history stores only `N + R` rows. A fully covered SWA group uses
+`--kv-tail-type` for its `W + R` compact-native ring and allocates no SWA KVarN
+records or stage; non-SWA and partially covered groups remain KVarN.
 
-SWA groups keep the upstream-aligned physical `W + U` allocation, where `W` is
-the sliding window and `U` is the ubatch reserve. Exact-tail selection does not
-compact or otherwise change that ring. The generic sparse-body route is used
-only when the complete physical stream fits in the per-sequence exact arena;
-larger streams deterministically use the ordinary body route.
+Partial SWA tails retain the upstream-aligned compressed `W + U` body because
+older visible rows still use it. Full-window compact-native SWA has no body and
+stores exactly `W + R` persistent rows. In both cases current K/V is consumed
+directly by the same attention softmax before an explicitly ordered history
+commit.
+
+`llama-bench --kv-memory` reports cache-owned bytes directly. The
+`kv_k_payload_bytes`, `kv_v_payload_bytes`, `kv_exact_history_bytes`,
+`kv_rollback_reserve_bytes`, `kv_staging_bytes`, `kv_padding_bytes`, and
+`kv_resident_bytes` fields describe persistent ownership.
+`kv_transient_bytes` is the observed reusable CUDA-pool high water and
+`kv_peak_bytes` is resident plus transient. The per-route layer counters show
+native bodyless, native mixed, planned device-fallback, and CPU layers. These
+fields are more precise than deriving cache memory from whole-process VRAM;
+the separate CUDA/WDDM fields remain useful for reconciliation and spill
+detection.
 
 Overlay state uses a framed standard-memory section. Exact restore requires the
 same structural group, resolved length, representation, and exact type. Native
@@ -80,15 +107,17 @@ that state into a tail-enabled context is valid, but the coverage API reports
 window. Server metrics expose requested/exact token totals, complete/partial/no
 coverage group counts, and degraded-sequence counts.
 
-KVarN state version 12 stores logical compressed records and exact payloads
+KVarN state version 13 stores logical compressed records and compact exact payloads
 independently of ubatch workspace, so state may move between `ub=128` and
-`ub=512`. It rejects version 11 rather than reinterpreting the old
-workspace-dependent layout. Tail length, type, preset, and structural-group
-mismatches also fail closed.
+`ub=512`. Version 12 remains readable where its logical representation is
+compatible; version 11 is rejected rather than reinterpreting its old physical
+workspace layout. Tail length, type, preset, rollback horizon, representation,
+and structural-group mismatches fail closed.
 
-Sequence-state framing version 2 writes the current validated tail manifest and
-supports host or on-device tensor transfer. Tail manifest version 1 remains
-readable but restores conservative degraded provenance. Immediate body
+Sequence state writes precision-tail manifest version 3, including the compact
+representation and rollback horizon, and supports host or on-device tensor
+transfer. Manifest version 2 remains readable for non-compact layouts; version
+1 restores conservative degraded provenance. Immediate body
 membership and position changes after sequence copy are preserved; pending
 exact rows materialize as one batch when state data is requested.
 
@@ -179,7 +208,7 @@ Use the same corpus, context, logical batch, and physical ubatch for both KLD le
 | Argument | Env var | Default | Behavior |
 |---|---|---|---|
 | `-DGGML_CUDA_FA_ALL_QUANTS=ON` | — | Off | Expands the CUDA vector matrix from 50 to all 169 standard cache pairs and, when `GGML_CUDA_KVARN=ON`, KVarN fast-decode instances from 15 balanced pairs to all 36 ordered bit pairs. Valid KVarN pairs outside the fast matrix use descriptor-native MMA. |
-| `-DGGML_CUDA_KVARN=ON/OFF` | — | On | Compiles or omits all dedicated CUDA KVarN kernels and template instances. When enabled, `GGML_CUDA_FA_ALL_QUANTS` selects 15 default or all 36 fast-decode pairs. |
+| `-DGGML_CUDA_KVARN=ON/OFF` | — | On | Compiles or omits the shared CUDA/HIP KVarN kernels and CUDA native-attention template instances. When enabled, `GGML_CUDA_FA_ALL_QUANTS` selects 15 default or all 36 CUDA fast-decode pairs. |
 
 ## Migration from earlier versions
 

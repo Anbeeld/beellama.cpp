@@ -97,7 +97,8 @@ public:
         const  layer_reuse_cb & reuse,
                      uint32_t   tail_tokens = 0,
                     ggml_type   tail_type = GGML_TYPE_F16,
-                     uint32_t   tail_tokens_requested = UINT32_MAX);
+                     uint32_t   tail_tokens_requested = UINT32_MAX,
+                     uint32_t   tail_rollback_tokens = 0);
 
     ~llama_kv_cache_dsv4() = default;
 
@@ -115,6 +116,7 @@ public:
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
+    seq_rm_capability get_seq_rm_capability() const override;
 
     void clear(bool data) override;
 
@@ -194,6 +196,8 @@ public:
 
     bool next() override;
     bool apply() override;
+    void graph_compute_start() override;
+    void graph_compute_finish(ggml_status status) override;
 
     llama_memory_status get_status() const override;
     const llama_ubatch & get_ubatch() const override;
@@ -237,6 +241,7 @@ private:
     const llama_memory_context_ptr ctx_swa_mem;
 
     uint32_t n_kv = 0;
+    bool graph_started = false;
 
     const llama_memory_status status;
 };
@@ -345,6 +350,8 @@ public:
 
     bool next()  override;
     bool apply() override;
+    void graph_compute_start() override;
+    void graph_compute_finish(ggml_status status) override;
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;

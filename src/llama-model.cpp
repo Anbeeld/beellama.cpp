@@ -2084,7 +2084,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         nullptr,
                         cparams.n_ubatch,
                         params.kv_tail_tokens,
-                        params.kv_tail_type);
+                        params.kv_tail_type,
+                        params.kv_tail_rollback_tokens);
             } break;
         // Models that need standard caching should rely on recurrent/hybrid
         // checks
@@ -2156,25 +2157,29 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* tail_tokens_swa   */ params.kv_tail_tokens_swa,
                             /* tail_type         */ params.kv_tail_type,
                             /* tail requested    */ params.kv_tail_tokens_requested,
-                            /* SWA requested     */ params.kv_tail_tokens_swa_requested);
+                            /* SWA requested     */ params.kv_tail_tokens_swa_requested,
+                            /* rollback reserve  */ params.kv_tail_rollback_tokens,
+                            /* SWA native exact  */ params.kv_tail_native_exact_swa);
                     } else {
                         if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
                             std::unique_ptr<llama_memory_i> mem_attn;
-                            if (params.kv_tail_tokens >= cparams.n_ctx_seq) {
+                            if (params.kv_tail_native_exact) {
                                 mem_attn = std::make_unique<llama_kv_cache>(
                                         *this, hparams, kvarn_tail_type, kvarn_tail_type,
                                         !cparams.flash_attn, cparams.offload_kqv, cparams.kv_unified,
                                         cparams.n_ctx_seq, cparams.n_seq_max, 1,
                                         hparams.n_swa, hparams.swa_type, nullptr, filter_attn,
                                         nullptr, nullptr, cparams.n_ubatch, 0,
-                                        kvarn_tail_type, 0);
+                                        kvarn_tail_type, 0, false, params.kv_tail_rollback_tokens,
+                                        params.kv_tail_native_exact ? cparams.n_ctx : 0);
                             } else {
                                 mem_attn = std::make_unique<llama_kv_cache_kvarn>(
                                         *this, hparams, params.kvarn, cparams.offload_kqv,
                                         cparams.kv_unified, cparams.n_ctx_seq, cparams.n_seq_max,
                                         cparams.n_batch, cparams.n_ubatch, 1, hparams.n_swa,
                                         hparams.swa_type, filter_attn, nullptr, params.kv_tail_tokens,
-                                        kvarn_tail_type, params.kv_tail_tokens_requested);
+                                        kvarn_tail_type, params.kv_tail_tokens_requested,
+                                        params.kv_tail_rollback_tokens);
                             }
                             auto mem_recr = std::make_unique<llama_memory_recurrent>(
                                     *this,
@@ -2208,7 +2213,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 /* n_ubatch          */ cparams.n_ubatch,
                                 /* tail_tokens       */ params.kv_tail_tokens,
                                 /* tail_type         */ params.kv_tail_type,
-                                /* tail requested    */ params.kv_tail_tokens_requested);
+                                /* tail requested    */ params.kv_tail_tokens_requested,
+                                /* rollback reserve  */ params.kv_tail_rollback_tokens);
                         }
                     }
                 } else {
@@ -2259,7 +2265,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 reuse,
                                 params.kv_tail_tokens_swa,
                                 params.kv_tail_type,
-                                params.kv_tail_tokens_swa_requested);
+                                params.kv_tail_tokens_swa_requested,
+                                params.kv_tail_rollback_tokens);
                     } else if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         GGML_ASSERT(hparams.is_swa_any());
 
@@ -2298,7 +2305,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     params.kv_tail_tokens_swa,
                                     params.kv_tail_type,
                                     params.kv_tail_tokens_requested,
-                                    params.kv_tail_tokens_swa_requested);
+                                    params.kv_tail_tokens_swa_requested,
+                                    params.kv_tail_rollback_tokens,
+                                    params.kv_tail_native_exact_swa);
                         } else {
                             res = new llama_kv_cache_iswa(
                                     *this,
@@ -2322,27 +2331,31 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     params.kv_tail_tokens_swa,
                                     params.kv_tail_type,
                                     params.kv_tail_tokens_requested,
-                                    params.kv_tail_tokens_swa_requested);
+                                    params.kv_tail_tokens_swa_requested,
+                                    params.kv_tail_rollback_tokens,
+                                    params.kv_tail_native_exact_swa);
                         }
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
                         if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
-                            if (params.kv_tail_tokens >= cparams.n_ctx_seq) {
+                            if (params.kv_tail_native_exact) {
                                 res = new llama_kv_cache(
                                         *this, hparams, kvarn_tail_type, kvarn_tail_type,
                                         !cparams.flash_attn, cparams.offload_kqv, cparams.kv_unified,
                                         cparams.n_ctx_seq, cparams.n_seq_max, 1,
                                         hparams.n_swa, hparams.swa_type, nullptr, filter,
                                         reuse, nullptr, cparams.n_ubatch, 0,
-                                        kvarn_tail_type, 0);
+                                        kvarn_tail_type, 0, false, params.kv_tail_rollback_tokens,
+                                        params.kv_tail_native_exact ? cparams.n_ctx : 0);
                             } else {
                                 res = new llama_kv_cache_kvarn(
                                         *this, hparams, params.kvarn, cparams.offload_kqv,
                                         cparams.kv_unified, cparams.n_ctx_seq, cparams.n_seq_max,
                                         cparams.n_batch, cparams.n_ubatch, 1, hparams.n_swa,
                                         hparams.swa_type, filter, reuse, params.kv_tail_tokens,
-                                        kvarn_tail_type, params.kv_tail_tokens_requested);
+                                        kvarn_tail_type, params.kv_tail_tokens_requested,
+                                        params.kv_tail_rollback_tokens);
                             }
                         } else {
                             res = new llama_kv_cache(
@@ -2365,7 +2378,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     cparams.n_ubatch,
                                     params.kv_tail_tokens,
                                     params.kv_tail_type,
-                                    params.kv_tail_tokens_requested);
+                                    params.kv_tail_tokens_requested,
+                                    false,
+                                    params.kv_tail_rollback_tokens);
                         }
                     }
                 }

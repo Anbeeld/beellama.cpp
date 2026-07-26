@@ -1,0 +1,100 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint n_rows;
+    uint head_width;
+    uint data_type;
+} p;
+
+layout(binding = 0, std430) readonly buffer Src { uint data_src[]; };
+layout(binding = 1, std430) writeonly buffer Dst { uint data_dst[]; };
+
+shared float sh_values[4 * 128];
+
+float load_value(uint index) {
+    if (p.data_type == 0u) {
+        return uintBitsToFloat(data_src[index]);
+    }
+    const uint word = data_src[index >> 1u];
+    const uint bits = (index & 1u) == 0u ? word & 0xffffu : word >> 16u;
+    if (p.data_type == 1u) {
+        return unpackHalf2x16(bits).x;
+    }
+    return uintBitsToFloat(bits << 16u);
+}
+
+uint float_to_bf16(float value) {
+    const uint bits = floatBitsToUint(value);
+    const uint rounding_bias = 0x7fffu + ((bits >> 16u) & 1u);
+    return (bits + rounding_bias) >> 16u;
+}
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+    const uint row = gl_WorkGroupID.x;
+    if (row >= p.n_rows) {
+        return;
+    }
+
+    const uint slices = p.head_width / 128u;
+    const uint row_base = row * p.head_width;
+    float values[4] = float[4](0.0, 0.0, 0.0, 0.0);
+
+    for (uint slice = 0u; slice < slices; ++slice) {
+        float value = load_value(row_base + slice * 128u + lane);
+        uint stride = 1u;
+        for (; stride < min(gl_SubgroupSize, 128u); stride <<= 1u) {
+            const float other = subgroupShuffleXor(value, stride);
+            value = (lane & stride) == 0u ? value + other : other - value;
+        }
+        for (; stride < 128u; stride <<= 1u) {
+            sh_values[slice * 128u + lane] = value;
+            barrier();
+            const float other =
+                sh_values[slice * 128u + (lane ^ stride)];
+            // Every invocation must finish the shared read before any lane
+            // overwrites the same slice in the next butterfly stage.
+            barrier();
+            value = (lane & stride) == 0u ? value + other : other - value;
+        }
+        values[slice] = value * 0.08838834764831845;
+    }
+
+    const float slice_scale = slices == 1u ? 1.0 :
+        (slices == 2u ? 0.7071067811865475 : 0.5);
+    for (uint stride = 1u; stride < slices; stride <<= 1u) {
+        for (uint base = 0u; base < slices; base += 2u * stride) {
+            for (uint i = 0u; i < stride; ++i) {
+                const float a = values[base + i];
+                const float b = values[base + stride + i];
+                values[base + i] = a + b;
+                values[base + stride + i] = a - b;
+            }
+        }
+    }
+    for (uint slice = 0u; slice < slices; ++slice) {
+        values[slice] *= slice_scale;
+        sh_values[slice * 128u + lane] = values[slice];
+    }
+    barrier();
+
+    if (p.data_type == 0u) {
+        for (uint slice = 0u; slice < slices; ++slice) {
+            data_dst[row_base + slice * 128u + lane] =
+                floatBitsToUint(values[slice]);
+        }
+    } else if (lane < 64u) {
+        for (uint slice = 0u; slice < slices; ++slice) {
+            const float lo = sh_values[slice * 128u + 2u * lane];
+            const float hi = sh_values[slice * 128u + 2u * lane + 1u];
+            const uint word_index = (row_base + slice * 128u) / 2u + lane;
+            data_dst[word_index] = p.data_type == 1u ?
+                packHalf2x16(vec2(lo, hi)) :
+                (float_to_bf16(lo) | (float_to_bf16(hi) << 16u));
+        }
+    }
+}

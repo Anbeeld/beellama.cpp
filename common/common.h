@@ -1015,9 +1015,9 @@ enum common_context_seq_rm_type {
     COMMON_CONTEXT_SEQ_RM_TYPE_RS = 3, // can seq_rm partial sequences, bounded by n_rs_seq
 };
 
-// Destructive startup-only capability probe for recurrent/speculative setup.
-// Clears the memory of the context; never use for request-time range planning.
+// Read-only memory capability query for recurrent/speculative setup.
 common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx);
+uint32_t common_context_seq_rm_max_rollback(llama_context * ctx);
 
 // aborts execution on failure
 void common_context_seq_rm (llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1);

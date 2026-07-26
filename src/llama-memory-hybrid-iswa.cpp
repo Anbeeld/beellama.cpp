@@ -4,6 +4,7 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+
 //
 // llama_memory_hybrid_iswa
 //
@@ -36,7 +37,9 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
                  uint32_t tail_tokens_swa,
                 ggml_type tail_type,
                  uint32_t tail_tokens_requested,
-                 uint32_t tail_tokens_swa_requested) :
+                 uint32_t tail_tokens_swa_requested,
+                 uint32_t tail_rollback_tokens,
+                     bool tail_native_exact_swa) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache_iswa(
         model,
@@ -62,7 +65,9 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         tail_tokens_swa,
         tail_type,
         tail_tokens_requested,
-        tail_tokens_swa_requested
+        tail_tokens_swa_requested,
+        tail_rollback_tokens,
+        tail_native_exact_swa
     )),
     mem_recr(new llama_memory_recurrent(
         model,
@@ -145,6 +150,10 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_update(llama_context * l
 bool llama_memory_hybrid_iswa::get_can_shift() const {
     // Shifting is trivially supported for recurrent
     return mem_attn->get_can_shift();
+}
+
+llama_memory_i::seq_rm_capability llama_memory_hybrid_iswa::get_seq_rm_capability() const {
+    return llama_memory_seq_rm_capability_all({ mem_attn.get(), mem_recr.get() });
 }
 
 void llama_memory_hybrid_iswa::clear(bool data) {
@@ -340,6 +349,16 @@ bool llama_memory_hybrid_iswa_context::apply() {
     res = res & ctx_recr->apply();
 
     return res;
+}
+
+void llama_memory_hybrid_iswa_context::graph_compute_start() {
+    ctx_attn->graph_compute_start();
+    ctx_recr->graph_compute_start();
+}
+
+void llama_memory_hybrid_iswa_context::graph_compute_finish(ggml_status compute_status) {
+    ctx_attn->graph_compute_finish(compute_status);
+    ctx_recr->graph_compute_finish(compute_status);
 }
 
 llama_memory_status llama_memory_hybrid_iswa_context::get_status() const {
