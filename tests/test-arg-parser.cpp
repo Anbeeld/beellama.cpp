@@ -2,6 +2,7 @@
 #include "common.h"
 #include "download.h"
 #include "gguf.h"
+#include "llama.h"
 #include "preset.h"
 
 #include <filesystem>
@@ -256,10 +257,8 @@ static void test(void) {
     argv = {"binary_name", "--spec-draft-replace", "TARGET", "DRAFT"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
 
-    // negated arg
-    argv = {"binary_name", "--no-mmap"};
+    argv = {"binary_name", "-lm", "hello"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
-
 
     printf("test-arg-parser: test valid usage\n\n");
 
@@ -638,6 +637,26 @@ static void test(void) {
     argv = {"binary_name", "--reasoning-loop-window", "64", "--reasoning-loop-min-coverage", "128"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
 
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "-lm", "none"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.load_mode == LLAMA_LOAD_MODE_NONE);
+
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "-lm", "mmap"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.load_mode == LLAMA_LOAD_MODE_MMAP);
+
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "-lm", "mlock"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.load_mode == LLAMA_LOAD_MODE_MLOCK);
+
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "-lm", "dio"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO);
+
     // multi-value args (CSV)
     params = common_params();
     params.model.path = "model_file.gguf";
@@ -666,13 +685,32 @@ static void test(void) {
     assert(params.model.path == "blah.gguf");
     assert(params.cpuparams.n_threads == 1010);
 
+    setenv("LLAMA_ARG_LOAD_MODE", "blah", true);
+    argv = {"binary_name"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+
+    setenv("LLAMA_ARG_LOAD_MODE", "mmap", true);
+    argv = {"binary_name"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.load_mode == LLAMA_LOAD_MODE_MMAP);
+
+    setenv("LLAMA_ARG_LOAD_MODE", "mlock", true);
+    argv = {"binary_name"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.load_mode == LLAMA_LOAD_MODE_MLOCK);
+
+    setenv("LLAMA_ARG_LOAD_MODE", "dio", true);
+    argv = {"binary_name"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO);
+
     printf("test-arg-parser: test negated environment variables\n\n");
 
-    setenv("LLAMA_ARG_MMAP", "0", true);
+    setenv("LLAMA_ARG_LOAD_MODE", "none", true);
     setenv("LLAMA_ARG_NO_PERF", "1", true); // legacy format
     argv = {"binary_name"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
-    assert(params.use_mmap == false);
+    assert(params.load_mode == LLAMA_LOAD_MODE_NONE);
     assert(params.no_perf == true);
 
     printf("test-arg-parser: test environment variables being overwritten\n\n");

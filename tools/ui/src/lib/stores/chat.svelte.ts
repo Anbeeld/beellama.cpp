@@ -16,6 +16,8 @@ import { DatabaseService } from '$lib/services/database.service';
 import { ChatService } from '$lib/services/chat.service';
 import { streamIdentity } from '$lib/utils/stream-identity';
 import { getAuthHeaders } from '$lib/utils/api-headers';
+import { CONTENT_TYPE_HEADER } from '$lib/constants';
+import { MimeTypeApplication } from '$lib/enums';
 import { conversationsStore } from '$lib/stores/conversations.svelte';
 import { config } from '$lib/stores/settings.svelte';
 import { agenticStore } from '$lib/stores/agentic.svelte';
@@ -208,7 +210,7 @@ class ChatStore {
 			// POST the one conv id we are probing
 			listResp = await fetch(`./v1/streams/lookup`, {
 				method: 'POST',
-				headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+				headers: { ...getAuthHeaders(), [CONTENT_TYPE_HEADER]: MimeTypeApplication.JSON },
 				body: JSON.stringify({ conversation_ids: [convId] })
 			});
 		} catch (e) {
@@ -672,7 +674,7 @@ class ChatStore {
 		try {
 			const resp = await fetch('./v1/streams/lookup', {
 				method: 'POST',
-				headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+				headers: { ...getAuthHeaders(), [CONTENT_TYPE_HEADER]: MimeTypeApplication.JSON },
 				body: JSON.stringify({ conversation_ids: lookupIds })
 			});
 			if (!resp.ok) return;
@@ -1596,7 +1598,7 @@ class ChatStore {
 			conversationsStore.updateMessageAtIndex(messageIndex, { content: newContent });
 			await DatabaseService.updateMessage(messageId, { content: newContent });
 			if (isFirstUserMessage && newContent.trim())
-				await conversationsStore.updateConversationTitleWithConfirmation(
+				await conversationsStore.updateConversationName(
 					activeConv.id,
 					generateConversationTitle(newContent, Boolean(config().titleGenerationUseFirstLine))
 				);
@@ -2113,7 +2115,7 @@ class ChatStore {
 			const rootMessage = allMessages.find((m) => m.type === 'root' && m.parent === null);
 
 			if (rootMessage && msg.parent === rootMessage.id && newContent.trim()) {
-				await conversationsStore.updateConversationTitleWithConfirmation(
+				await conversationsStore.updateConversationName(
 					activeConv.id,
 					generateConversationTitle(newContent, Boolean(config().titleGenerationUseFirstLine))
 				);
@@ -2187,7 +2189,7 @@ class ChatStore {
 
 			conversationsStore.updateConversationTimestamp();
 			if (isFirstUserMessage && newContent.trim())
-				await conversationsStore.updateConversationTitleWithConfirmation(
+				await conversationsStore.updateConversationName(
 					activeConv.id,
 					generateConversationTitle(newContent, Boolean(config().titleGenerationUseFirstLine))
 				);
@@ -2373,9 +2375,12 @@ class ChatStore {
 
 		if (currentConfig.excludeReasoningFromContext) apiOptions.excludeReasoningFromContext = true;
 
-		apiOptions.enableThinking = conversationsStore.getThinkingEnabled();
+		// an explicit reasoning choice overrides the server default, DEFAULT sends nothing
 		const effort = conversationsStore.getReasoningEffort();
-		if (effort !== ReasoningEffort.OFF) apiOptions.reasoningEffort = effort;
+		if (effort !== ReasoningEffort.DEFAULT) {
+			apiOptions.enableThinking = effort !== ReasoningEffort.OFF;
+			if (effort !== ReasoningEffort.OFF) apiOptions.reasoningEffort = effort;
+		}
 
 		if (hasValue(currentConfig.temperature))
 			apiOptions.temperature = Number(currentConfig.temperature);
@@ -2428,7 +2433,8 @@ class ChatStore {
 
 		if (currentConfig.samplers) apiOptions.samplers = currentConfig.samplers;
 
-		apiOptions.backend_sampling = currentConfig.backend_sampling;
+		if (hasValue(currentConfig.backend_sampling))
+			apiOptions.backend_sampling = currentConfig.backend_sampling;
 
 		if (currentConfig.customJson) apiOptions.custom = currentConfig.customJson;
 

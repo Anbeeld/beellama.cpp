@@ -312,7 +312,7 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
              params.reasoning_budget_tracking || params.reasoning_control)) {
         rbudget = common_reasoning_budget_init(
             vocab,
-            params.reasoning_budget_start,
+            {params.reasoning_budget_start},
             params.reasoning_budget_end,
             params.reasoning_budget_forced,
             params.reasoning_budget_tokens < 0 ? INT_MAX : params.reasoning_budget_tokens);
@@ -509,6 +509,17 @@ static common_sampler_accept_info common_sampler_accept_impl(
         llama_sampler_accept(gsmpl->rbudget, token);
         if (info) {
             local.reasoning_state_after = common_reasoning_budget_get_state(gsmpl->rbudget);
+        }
+
+        // if done, replay end sequence which may contain a grammar trigger
+        const bool is_done = common_reasoning_budget_get_state(gsmpl->rbudget) == REASONING_BUDGET_DONE;
+        if (gsmpl->grmr && !accept_grammar && is_done) {
+            const llama_tokens * end_seq = common_reasoning_budget_get_end_match(gsmpl->rbudget);
+            if (end_seq) {
+                for (const llama_token end_token : *end_seq) {
+                    llama_sampler_accept(gsmpl->grmr, end_token);
+                }
+            }
         }
     }
 
