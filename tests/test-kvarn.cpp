@@ -1640,7 +1640,10 @@ static std::vector<float> test_native_flash_attention_output(
         bool           force_generic = false,
         int            exact_tail_tokens = 0,
         bool           original_value_domain = false,
-        ggml_type      exact_tail_type = GGML_TYPE_F16) {
+        ggml_type      exact_tail_type = GGML_TYPE_F16,
+        int            exact_tail_current_tokens = 0,
+        bool           exact_tail_bodyless = false,
+        bool           production_query_layout = false) {
     ggml_init_params params = {
         /*.mem_size   =*/ 32 * 1024 * 1024,
         /*.mem_buffer =*/ nullptr,
@@ -1656,10 +1659,15 @@ static std::vector<float> test_native_flash_attention_output(
     const int k_record_bytes = int(llama_kvarn_packed_bytes(128 * 128, bits_k) + 3 * 128 * sizeof(ggml_fp16_t));
     const int v_record_bytes = int(llama_kvarn_packed_bytes(128 * 128, bits_v) + 3 * 128 * sizeof(ggml_fp16_t));
 
-    ggml_tensor * q_in = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_dim, n_q, n_q_heads, n_stream);
+    ggml_tensor * q_in = production_query_layout ?
+        ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_dim, n_q_heads, n_q, n_stream) :
+        ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_dim, n_q, n_q_heads, n_stream);
     const bool use_q_rot = native_view && rotate_graph;
     const bool use_output_rot = use_q_rot && !original_value_domain;
     ggml_tensor * q = use_q_rot ? apply_kvarn_wht_head(ctx, q_in, head_dim) : q_in;
+    if (production_query_layout) {
+        q = ggml_permute(ctx, q, 0, 2, 1, 3);
+    }
     ggml_tensor * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_kv * n_stream);
     ggml_tensor * current_k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, record_heads, n_kv * n_stream);
     ggml_tensor * current_v = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, record_heads, n_kv * n_stream);
@@ -1720,13 +1728,20 @@ static std::vector<float> test_native_flash_attention_output(
     ggml_tensor * tail_mask = nullptr;
     ggml_tensor * query_order = nullptr;
     ggml_tensor * run_desc = nullptr;
+    ggml_tensor * k_tail_current_storage = nullptr;
+    ggml_tensor * v_tail_current_storage = nullptr;
     if (exact_tail_tokens > 0) {
         require(body_meta_output == nullptr,
                 "native FA: exact-tail attention owns the body metadata output");
         require(exact_tail_type == GGML_TYPE_F16 ||
                 exact_tail_type == GGML_TYPE_BF16,
                 "native FA: unsupported exact-tail test type");
-        const int arena_stride = int(GGML_PAD(exact_tail_tokens + n_q, 256));
+        require(exact_tail_current_tokens >= 0 &&
+                exact_tail_current_tokens < exact_tail_tokens,
+                "native FA: invalid compact current-tail width");
+        const int history_tail_tokens = exact_tail_tokens - exact_tail_current_tokens;
+        const int arena_stride = exact_tail_current_tokens > 0 ?
+                history_tail_tokens : int(GGML_PAD(exact_tail_tokens + n_q, 256));
         k_tail_storage = ggml_new_tensor_4d(
                 ctx, exact_tail_type, head_dim, n_kv_heads, arena_stride, n_stream);
         v_tail_storage = ggml_new_tensor_4d(
@@ -1737,12 +1752,40 @@ static std::vector<float> test_native_flash_attention_output(
             apply_kvarn_wht_head(ctx, v_tail_storage, head_dim) : v_tail_storage;
         ggml_tensor * k_tail = ggml_permute(ctx, k_tail_source, 0, 2, 1, 3);
         ggml_tensor * v_tail = ggml_permute(ctx, v_tail_source, 0, 2, 1, 3);
+        ggml_tensor * k_tail_current = nullptr;
+        ggml_tensor * v_tail_current = nullptr;
+        if (exact_tail_current_tokens > 0) {
+            k_tail_current_storage = ggml_new_tensor_4d(
+                    ctx, exact_tail_type, head_dim, n_kv_heads, exact_tail_current_tokens, 1);
+            v_tail_current_storage = ggml_new_tensor_4d(
+                    ctx, exact_tail_type, head_dim, n_kv_heads, exact_tail_current_tokens, 1);
+            ggml_tensor * k_current_source = use_q_rot ?
+                apply_kvarn_wht_head(ctx, k_tail_current_storage, head_dim) : k_tail_current_storage;
+            ggml_tensor * v_current_source = use_output_rot ?
+                apply_kvarn_wht_head(ctx, v_tail_current_storage, head_dim) : v_tail_current_storage;
+            k_tail_current = ggml_permute(ctx, k_current_source, 0, 2, 1, 3);
+            v_tail_current = ggml_permute(ctx, v_current_source, 0, 2, 1, 3);
+        }
         tail_mask = ggml_new_tensor_4d(
                 ctx, GGML_TYPE_F16, exact_tail_tokens, n_q, 1, n_stream);
         query_order = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_q, n_stream);
         run_desc = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 6 + exact_tail_tokens, n_stream);
-        out = ggml_kv_tail_attention_merge(
-                ctx, out, k_tail, v_tail, tail_mask, query_order, run_desc);
+        if (k_tail_current != nullptr) {
+            out = ggml_kv_tail_attention_merge_segmented(
+                    ctx, out, k_tail, v_tail, k_tail_current, v_tail_current,
+                    tail_mask, query_order, run_desc);
+            ggml_flash_attn_ext_set_kv_tail_history_slots(out, history_tail_tokens);
+        } else {
+            out = ggml_kv_tail_attention_merge(
+                    ctx, out, k_tail, v_tail, tail_mask, query_order, run_desc);
+        }
+        if (exact_tail_bodyless) {
+            ggml_flash_attn_ext_set_kv_tail_bodyless(out);
+        }
+        if (native_view && k_tail_current != nullptr) {
+            require(ggml_backend_supports_op(backend, out),
+                    "native compact segmented KVarN tail was rejected by its backend");
+        }
     }
     ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
     if (use_output_rot) {
@@ -1800,7 +1843,8 @@ static std::vector<float> test_native_flash_attention_output(
     std::vector<ggml_fp16_t> mask_data((size_t) n_kv * n_q * n_stream);
     for (int iq = 0; iq < n_q; ++iq) {
         for (int ikv = 0; ikv < n_kv; ++ikv) {
-            mask_data[(size_t) iq * n_kv + ikv] = ggml_fp32_to_fp16(ikv <= iq + n_kv - n_q ? 0.0f : -INFINITY);
+            mask_data[(size_t) iq * n_kv + ikv] = ggml_fp32_to_fp16(
+                    !exact_tail_bodyless && ikv <= iq + n_kv - n_q ? 0.0f : -INFINITY);
         }
     }
 
@@ -1822,16 +1866,29 @@ static std::vector<float> test_native_flash_attention_output(
     if (exact_tail_tokens > 0) {
         std::vector<float> k_tail_data(ggml_nelements(k_tail_storage), 0.0f);
         std::vector<float> v_tail_data(ggml_nelements(v_tail_storage), 0.0f);
+        std::vector<float> k_tail_current_data(
+                k_tail_current_storage ? ggml_nelements(k_tail_current_storage) : 0, 0.0f);
+        std::vector<float> v_tail_current_data(
+                v_tail_current_storage ? ggml_nelements(v_tail_current_storage) : 0, 0.0f);
+        const int history_tail_tokens = exact_tail_tokens - exact_tail_current_tokens;
         for (int t = 0; t < exact_tail_tokens; ++t) {
             for (int h = 0; h < n_kv_heads; ++h) {
                 for (int d = 0; d < head_dim; ++d) {
-                    const size_t off = ((size_t) t * n_kv_heads + h) * head_dim + d;
-                    k_tail_data[off] =
+                    const int source_t = t < history_tail_tokens ? t : t - history_tail_tokens;
+                    const size_t off = ((size_t) source_t * n_kv_heads + h) * head_dim + d;
+                    const float k_value =
                         0.67f * std::sin(float(d) * 0.014f + float(t) * 0.023f) +
                         0.11f * std::cos(float(t) * 0.007f + float(h) * 0.19f);
-                    v_tail_data[off] =
+                    const float v_value =
                         0.63f * std::cos(float(d) * 0.018f - float(t) * 0.017f) +
                         0.09f * std::sin(float(t) * 0.012f + float(h) * 0.29f);
+                    if (t < history_tail_tokens) {
+                        k_tail_data[off] = k_value;
+                        v_tail_data[off] = v_value;
+                    } else {
+                        k_tail_current_data[off] = k_value;
+                        v_tail_current_data[off] = v_value;
+                    }
                 }
             }
         }
@@ -1839,7 +1896,10 @@ static std::vector<float> test_native_flash_attention_output(
         for (int iq = 0; iq < n_q; ++iq) {
             const int last_visible = exact_tail_tokens - n_q + iq;
             for (int t = 0; t < exact_tail_tokens; ++t) {
-                if (t <= last_visible) {
+                if (t <= last_visible &&
+                        (exact_tail_bodyless ||
+                         exact_tail_current_tokens == 0 ||
+                         t >= history_tail_tokens)) {
                     tail_mask_data[(size_t) iq * exact_tail_tokens + t] = ggml_fp32_to_fp16(0.0f);
                 }
             }
@@ -1875,6 +1935,10 @@ static std::vector<float> test_native_flash_attention_output(
         };
         upload_tail(k_tail_storage, k_tail_data);
         upload_tail(v_tail_storage, v_tail_data);
+        if (k_tail_current_storage != nullptr) {
+            upload_tail(k_tail_current_storage, k_tail_current_data);
+            upload_tail(v_tail_current_storage, v_tail_current_data);
+        }
         ggml_backend_tensor_set(tail_mask, tail_mask_data.data(), 0, ggml_nbytes(tail_mask));
         ggml_backend_tensor_set(query_order, query_order_data.data(), 0, ggml_nbytes(query_order));
         ggml_backend_tensor_set(run_desc, run_desc_data.data(), 0, ggml_nbytes(run_desc));
@@ -2475,6 +2539,11 @@ static test_kvarn_route_stats make_test_kvarn_route_stats() {
 using test_kvarn_route_stats_reset_fn = void (*)();
 using test_kvarn_route_stats_get_fn = void (*)(test_kvarn_route_stats *);
 using test_kvarn_rotated_max_query_tokens_fn = uint32_t (*)(ggml_backend_dev_t);
+using test_kv_tail_segmented_supported_fn = bool (*)(
+        ggml_type, ggml_type, ggml_type, ggml_type, int64_t, int64_t);
+using test_kvarn_tail_supported_fn = bool (*)(
+        ggml_backend_dev_t, ggml_type, ggml_type, ggml_type, ggml_type, int64_t, int64_t);
+using test_kvarn_mixed_tail_preferred_fn = bool (*)(ggml_backend_dev_t);
 
 struct test_kvarn_store_route_stats {
     uint32_t struct_size;
@@ -2633,6 +2702,30 @@ static void test_native_flash_attention_portable_backend(
                 "portable KVarN FlashAttention with an exact tail differs from materialized reference");
     }
 
+    for (int head_dim : { 128, 256, 512 }) {
+        for (int n_q : { 1, 2, 8, 16 }) {
+            for (ggml_type exact_type : { GGML_TYPE_F16, GGML_TYPE_BF16 }) {
+                const int current_tokens = std::max(n_q, 4);
+                if (trace) {
+                    std::fprintf(stderr,
+                            "native trace: %s compact bodyless tail D%d nq=%d %s\n",
+                            backend_label, head_dim, n_q, ggml_type_name(exact_type));
+                    std::fflush(stderr);
+                }
+                const std::vector<float> expected = test_native_flash_attention_output(
+                        reference_backend, false, false, head_dim, 4, 3, n_q,
+                        6, 1, 512, 5, false, nullptr, false, 128,
+                        false, exact_type, current_tokens, true, true);
+                const std::vector<float> actual = test_native_flash_attention_output(
+                        backend, true, true, head_dim, 4, 3, n_q,
+                        6, 1, 512, 5, false, nullptr, false, 128,
+                        false, exact_type, current_tokens, true, true);
+                require_close_f32_rmse(actual, expected, 1e-2f,
+                        "portable compact bodyless segmented KVarN tail differs from materialized reference");
+            }
+        }
+    }
+
     std::printf("test-kvarn: %s direct KVarN FlashAttention parity OK\n", backend_label);
 }
 
@@ -2657,16 +2750,72 @@ static void test_native_flash_attention_gpu() {
     ggml_backend_t cpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_CPU, true);
 
     const auto [route_stats_reset, route_stats_get] = get_kvarn_route_stats_fns(gpu_backend);
+    const char * requested_backend = std::getenv("GGML_KVARN_TEST_BACKEND");
+    const bool expect_vulkan_route_stats = requested_backend != nullptr &&
+        std::strncmp(requested_backend, "Vulkan", 6) == 0;
+    require(!expect_vulkan_route_stats ||
+            (route_stats_reset != nullptr && route_stats_get != nullptr),
+            "Vulkan KVarN backend omitted ABI-v1 route telemetry");
+    if (expect_vulkan_route_stats) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(gpu_backend);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        auto segmented_supported = reg ? reinterpret_cast<test_kv_tail_segmented_supported_fn>(
+            ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_kv_tail_segmented_attention_supported")) : nullptr;
+        auto kvarn_tail_supported = reg ? reinterpret_cast<test_kvarn_tail_supported_fn>(
+            ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_kvarn_tail_attention_supported")) : nullptr;
+        auto mixed_tail_preferred = reg ? reinterpret_cast<test_kvarn_mixed_tail_preferred_fn>(
+            ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_kvarn_mixed_tail_native_preferred")) : nullptr;
+        require(segmented_supported != nullptr && kvarn_tail_supported != nullptr &&
+                mixed_tail_preferred != nullptr,
+                "Vulkan omitted a compact segmented KVarN capability predicate");
+        require(!mixed_tail_preferred(dev),
+                "Vulkan must not prefer its slower native compressed-body/tail mixture");
+        for (int64_t d : { 128, 256, 512 }) {
+            for (ggml_type exact_type : { GGML_TYPE_F16, GGML_TYPE_BF16 }) {
+                require(segmented_supported(
+                            GGML_TYPE_F16, GGML_TYPE_F16,
+                            exact_type, exact_type, d, d) &&
+                        kvarn_tail_supported(
+                            dev, GGML_TYPE_F16, GGML_TYPE_F16,
+                            exact_type, exact_type, d, d),
+                        "Vulkan compact segmented and KVarN capability predicates disagree");
+            }
+        }
+        require(!segmented_supported(
+                    GGML_TYPE_Q4_0, GGML_TYPE_Q4_0,
+                    GGML_TYPE_F16, GGML_TYPE_F16, 256, 256) &&
+                !segmented_supported(
+                    GGML_TYPE_F16, GGML_TYPE_F16,
+                    GGML_TYPE_F16, GGML_TYPE_F16, 384, 384),
+                "Vulkan compact segmented capability accepted an unsupported standard/body shape");
+    }
     if (route_stats_reset != nullptr && route_stats_get != nullptr) {
+        route_stats_get(nullptr);
+        test_kvarn_route_stats undersized = make_test_kvarn_route_stats();
+        undersized.struct_size -= sizeof(undersized.compact_tail_entry);
+        undersized.route_families = 0xa5a5a5a5u;
+        route_stats_get(&undersized);
+        require(undersized.route_families == 0xa5a5a5a5u,
+                "KVarN route telemetry wrote an undersized caller structure");
+        test_kvarn_route_stats wrong_version = make_test_kvarn_route_stats();
+        wrong_version.abi_version += 1;
+        wrong_version.route_families = 0x5a5a5a5au;
+        route_stats_get(&wrong_version);
+        require(wrong_version.route_families == 0x5a5a5a5au,
+                "KVarN route telemetry wrote a caller structure with an unsupported ABI version");
+        route_stats_reset();
         ggml_backend_dev_t dev = ggml_backend_get_device(gpu_backend);
         ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
         auto rotated_max_query_tokens = reg ? reinterpret_cast<test_kvarn_rotated_max_query_tokens_fn>(
             ggml_backend_reg_get_proc_address(
                 reg, "ggml_backend_kvarn_native_rotated_max_query_tokens")) : nullptr;
         require(rotated_max_query_tokens != nullptr,
-                "optimized CUDA KVarN backend omitted its rotated query-batch capability");
+                "native KVarN backend omitted its rotated query-batch capability");
         require(rotated_max_query_tokens(dev) >= 16,
-                "optimized CUDA KVarN backend does not cover a complete DFlash verification block");
+                "native KVarN backend does not cover a complete DFlash verification block");
     }
     test_native_flash_attention_portable_backend(gpu_backend, cpu_backend, "GPU");
     if (route_stats_reset == nullptr || route_stats_get == nullptr ||
@@ -2682,18 +2831,24 @@ static void test_native_flash_attention_gpu() {
     route_stats_get(&route_capabilities);
     require(route_capabilities.direct_entry > 0,
             "KVarN route telemetry did not observe the direct attention entry");
-    require(route_capabilities.compact_tail_entry > 0,
-            "KVarN route telemetry did not observe the exact/compact-tail body entry");
     constexpr uint32_t specialized_route_families = (1u << 1) | (1u << 2) | (1u << 3);
     if ((route_capabilities.route_families & specialized_route_families) == 0) {
-        // Portable-only HIP/MUSA devices expose counters for diagnostics, but
-        // must not be asserted against CUDA/AMD matrix-route expectations.
+        // Portable-only Vulkan/HIP/MUSA devices expose counters for diagnostics,
+        // but must not be asserted against CUDA/AMD matrix-route expectations.
+        require((route_capabilities.route_families & (1u << 0)) != 0,
+                "portable-only KVarN backend did not advertise its portable route family");
         require(route_capabilities.portable_native > 0,
                 "portable-only KVarN backend did not report its native route");
+        require(route_capabilities.compact_tail_entry > 0,
+                "portable-only KVarN backend did not report its compact-tail entry");
+        require(route_capabilities.materialize_fallback == 0,
+                "portable-only compact KVarN tail unexpectedly materialized");
         ggml_backend_free(cpu_backend);
         ggml_backend_free(gpu_backend);
         return;
     }
+    require(route_capabilities.compact_tail_entry > 0,
+            "KVarN route telemetry did not observe the exact/compact-tail body entry");
 
     const auto require_metadata_case = [&](int head_dim, int n_q, int n_q_heads,
                                            int n_kv_heads, int bits, bool swa,

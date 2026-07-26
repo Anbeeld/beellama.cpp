@@ -125,6 +125,20 @@ uint32_t llama_kvarn_backend_native_rotated_max_query_tokens(ggml_backend_dev_t 
     return fn != nullptr ? fn(dev) : 0;
 }
 
+bool llama_kvarn_backend_mixed_tail_native_preferred(ggml_backend_dev_t dev) {
+    if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return true;
+    }
+
+    using ggml_backend_kvarn_mixed_tail_native_preferred_t = bool (*)(
+        ggml_backend_dev_t dev);
+    auto * reg = ggml_backend_dev_backend_reg(dev);
+    auto * fn = reg ? (ggml_backend_kvarn_mixed_tail_native_preferred_t)
+        ggml_backend_reg_get_proc_address(
+            reg, "ggml_backend_kvarn_mixed_tail_native_preferred") : nullptr;
+    return fn == nullptr || fn(dev);
+}
+
 bool llama_kvarn_backend_supports_ops(ggml_backend_dev_t dev) {
     if (dev == nullptr) {
         return true; // the built-in CPU backend implements store + materialize
@@ -1075,6 +1089,8 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
                 dev, exact_tail_type, head_dim_k, head_dim_v));
         const bool native_attention =
             llama_kvarn_backend_supports_native_ops(dev) && native_tail;
+        const bool mixed_tail_native = native_attention &&
+            llama_kvarn_backend_mixed_tail_native_preferred(dev);
         const bool native_original_v = native_attention &&
             llama_kvarn_backend_native_attention_uses_original_v(dev);
         const uint32_t native_rotated_max_query_tokens = native_attention ?
@@ -1145,6 +1161,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
             (uint32_t) k_slices,
             (uint32_t) v_slices,
             native_attention,
+            mixed_tail_native,
             native_original_v,
             native_rotated_max_query_tokens,
             k_records,
@@ -1933,6 +1950,10 @@ bool llama_kv_cache_kvarn_context::uses_native_attention(int32_t il) const {
     return cache->uses_native_attention(il);
 }
 
+bool llama_kv_cache_kvarn_context::mixed_tail_native_preferred(int32_t il) const {
+    return cache->mixed_tail_native_preferred(il);
+}
+
 bool llama_kv_cache_kvarn_context::native_attention_uses_original_v(int32_t il) const {
     return cache->native_attention_uses_original_v(il);
 }
@@ -2169,6 +2190,10 @@ const llama_kv_cache_kvarn::layer & llama_kv_cache_kvarn::layer_for(int32_t il) 
 
 bool llama_kv_cache_kvarn::uses_native_attention(int32_t il) const {
     return layer_for(il).native_attention;
+}
+
+bool llama_kv_cache_kvarn::mixed_tail_native_preferred(int32_t il) const {
+    return layer_for(il).mixed_tail_native;
 }
 
 bool llama_kv_cache_kvarn::native_attention_uses_original_v(int32_t il) const {

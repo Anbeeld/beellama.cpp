@@ -16,6 +16,7 @@ bool llama_kvarn_backend_supports_native_ops(ggml_backend_dev_t dev);
 bool llama_kvarn_backend_supports_ops(ggml_backend_dev_t dev);
 bool llama_kvarn_backend_native_attention_uses_original_v(ggml_backend_dev_t dev);
 uint32_t llama_kvarn_backend_native_rotated_max_query_tokens(ggml_backend_dev_t dev);
+bool llama_kvarn_backend_mixed_tail_native_preferred(ggml_backend_dev_t dev);
 
 struct llama_kvarn_tail_policy {
     uint32_t raw_requested_tokens;
@@ -114,6 +115,7 @@ public:
     ggml_tensor * get_k_for_attention(ggml_context * ctx, int32_t il, bool native_attention) const;
     ggml_tensor * get_v_for_attention(ggml_context * ctx, int32_t il, bool native_attention) const;
     bool uses_native_attention(int32_t il) const;
+    bool mixed_tail_native_preferred(int32_t il) const;
     bool native_attention_uses_original_v(int32_t il) const;
     uint32_t native_rotated_max_query_tokens(int32_t il) const;
 
@@ -258,6 +260,7 @@ public:
     bool apply_pending_stream_copies(llama_context * lctx);
     bool is_swa() const { return swa; }
     bool uses_native_attention(int32_t il) const;
+    bool mixed_tail_native_preferred(int32_t il) const;
     bool native_attention_uses_original_v(int32_t il) const;
     uint32_t native_rotated_max_query_tokens(int32_t il) const;
 
@@ -311,6 +314,7 @@ private:
         uint32_t k_slices;
         uint32_t v_slices;
         bool native_attention;
+        bool mixed_tail_native;
         bool native_original_v;
         uint32_t native_rotated_max_query_tokens;
         ggml_tensor * k_records;

@@ -1,0 +1,94 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+#ifndef HEAD_WIDTH
+#define HEAD_WIDTH 256
+#endif
+
+layout(local_size_x = HEAD_WIDTH, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint n_rows;
+    uint head_width;
+    uint data_type;
+} p;
+
+layout(binding = 0, std430) readonly buffer Src { uint data_src[]; };
+layout(binding = 1, std430) writeonly buffer Dst { uint data_dst[]; };
+
+shared float sh_values[HEAD_WIDTH];
+
+float load_value(uint index) {
+    if (p.data_type == 0u) {
+        return uintBitsToFloat(data_src[index]);
+    }
+    const uint word = data_src[index >> 1u];
+    const uint bits = (index & 1u) == 0u ? word & 0xffffu : word >> 16u;
+    if (p.data_type == 1u) {
+        return unpackHalf2x16(bits).x;
+    }
+    return uintBitsToFloat(bits << 16u);
+}
+
+uint float_to_bf16(float value) {
+    const uint bits = floatBitsToUint(value);
+    const uint rounding_bias = 0x7fffu + ((bits >> 16u) & 1u);
+    return (bits + rounding_bias) >> 16u;
+}
+
+void main() {
+    const uint invocation = gl_LocalInvocationID.x;
+    const uint slice = invocation / 128u;
+    const uint lane = invocation % 128u;
+    const uint row = gl_WorkGroupID.x;
+    if (row >= p.n_rows) {
+        return;
+    }
+
+    const uint row_base = row * HEAD_WIDTH;
+    float value = load_value(row_base + invocation);
+
+    uint stride = 1u;
+    for (; stride < min(gl_SubgroupSize, 128u); stride <<= 1u) {
+        const float other = subgroupShuffleXor(value, stride);
+        value = (lane & stride) == 0u ? value + other : other - value;
+    }
+    for (; stride < 128u; stride <<= 1u) {
+        sh_values[invocation] = value;
+        barrier();
+        const float other = sh_values[slice * 128u + (lane ^ stride)];
+        barrier();
+        value = (lane & stride) == 0u ? value + other : other - value;
+    }
+    value *= 0.08838834764831845;
+
+    const uint slices = HEAD_WIDTH / 128u;
+    const float slice_scale = slices == 2u ?
+        0.7071067811865475 : 0.5;
+    for (uint slice_stride = 1u;
+            slice_stride < slices; slice_stride <<= 1u) {
+        sh_values[invocation] = value;
+        barrier();
+        const float other =
+            sh_values[(slice ^ slice_stride) * 128u + lane];
+        barrier();
+        value = ((slice & slice_stride) == 0u ?
+            value + other : other - value);
+    }
+    value *= slice_scale;
+
+    sh_values[invocation] = value;
+    barrier();
+    if (p.data_type == 0u) {
+        data_dst[row_base + invocation] = floatBitsToUint(value);
+    } else if (lane < 64u) {
+        const float lo = sh_values[slice * 128u + 2u * lane];
+        const float hi = sh_values[slice * 128u + 2u * lane + 1u];
+        const uint word_index =
+            (row_base + slice * 128u) / 2u + lane;
+        data_dst[word_index] = p.data_type == 1u ?
+            packHalf2x16(vec2(lo, hi)) :
+            (float_to_bf16(lo) | (float_to_bf16(hi) << 16u));
+    }
+}

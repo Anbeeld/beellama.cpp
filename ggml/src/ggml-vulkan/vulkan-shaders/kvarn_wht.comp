@@ -1,5 +1,7 @@
 #version 450
 
+#extension GL_KHR_shader_subgroup_shuffle : require
+
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform parameter {
@@ -44,14 +46,20 @@ void main() {
 
     for (uint slice = 0u; slice < slices; ++slice) {
         float value = load_value(row_base + slice * 128u + lane);
-        sh_values[slice * 128u + lane] = value;
-        barrier();
-        for (uint stride = 1u; stride < 128u; stride <<= 1u) {
-            const float other = sh_values[slice * 128u + (lane ^ stride)];
-            barrier();
+        uint stride = 1u;
+        for (; stride < min(gl_SubgroupSize, 128u); stride <<= 1u) {
+            const float other = subgroupShuffleXor(value, stride);
             value = (lane & stride) == 0u ? value + other : other - value;
+        }
+        for (; stride < 128u; stride <<= 1u) {
             sh_values[slice * 128u + lane] = value;
             barrier();
+            const float other =
+                sh_values[slice * 128u + (lane ^ stride)];
+            // Every invocation must finish the shared read before any lane
+            // overwrites the same slice in the next butterfly stage.
+            barrier();
+            value = (lane & stride) == 0u ? value + other : other - value;
         }
         values[slice] = value * 0.08838834764831845;
     }

@@ -116,14 +116,17 @@ reservation and zero cumulative per-context growth.
 KVarN is target-context-only. CUDA uses its optimized descriptor-native
 FlashAttention kernels. ROCm/HIP selects between record-tiled split decode,
 generic descriptor-native WMMA/MFMA, and a portable direct-record kernel. CPU
-and Vulkan have backend-native direct-record attention paths. These routes keep
-the query, compressed body, F16/BF16 exact tail, and attention sinks in one
-softmax without materializing the body for one-row decode and short supported
-query batches. Matrix-capable HIP and CUDA retain descriptor-native large-batch
-prefill. Larger portable-only query batches explicitly materialize the rotated
-K/V body and use the backend's tiled standard FlashAttention path. Vulkan requires shader
-Int64 and buffer-device-address support. CPU placement is valid with KV offload
-disabled.
+has a backend-native direct-record attention path. Vulkan directly consumes
+compressed records for body-only inputs and consumes compact bodyless
+F16/BF16 tails for head dimensions 128, 256, and 512 with query batches through
+16 rows. A Vulkan layer with both a compressed body and an exact tail instead
+materializes the body and uses the backend's standard tiled FlashAttention
+path. That policy is intentional: hardware measurements found the mixed direct
+shader slower than the materialized upstream-style route. Matrix-capable HIP
+and CUDA retain descriptor-native large-batch prefill. Larger portable-only
+query batches likewise materialize the rotated K/V body. Vulkan requires
+shader Int64 and buffer-device-address support. CPU placement is valid with KV
+offload disabled.
 
 | HIP architecture | Physical wave | Native KVarN route |
 |---|---:|---|
@@ -139,6 +142,31 @@ Vulkan direct decode groups up to four GQA query heads per reconstructed K/V
 head and uses split-K when the query/head grid alone cannot occupy the device.
 Its split partials are reduced through the standard Vulkan FlashAttention
 reducer, including attention sinks and exact-tail contributions.
+
+For large dense prompt blocks, Vulkan validates per-stream record ownership on
+the device and performs WHT, quantization, and record commit in parallel. The
+route starts at 384 tokens per stream and reuses the cache conversion workspace
+rather than adding a new peak allocation. Invalid or non-dense layouts use the
+monolithic store fallback. Devices that permit 256- or 512-thread workgroups
+use a full-head WHT shader; other devices keep the portable 128-thread path.
+Both paths use physical subgroup operations and support subgroup widths 32 and
+64. Vulkan materialization prepares the live history/current descriptor once
+per stream before expanding output rows.
+
+Set `GGML_KVARN_DEBUG_ROUTES=1` for bounded route diagnostics and
+`GGML_VK_PERF_LOGGER=1` for synchronized per-operator Vulkan timestamps.
+The route telemetry distinguishes native attention, explicit materialization,
+parallel and monolithic stores, and rejected shapes.
+
+`llama-bench --kv-memory` resolves route and transient-memory telemetry from the
+configured benchmark device rather than the first loaded backend. Its JSONL
+output includes the complete versioned route counters and synchronized device
+allocation checkpoints. The historical `cuda_used_*` field names remain for
+harness compatibility, but contain the selected device's values on Vulkan.
+Vulkan reports backend-private KVarN workspace separately from graph-planned
+transient bytes and clamps `VK_EXT_memory_budget` availability to the physical
+heap, including the valid high-pressure case where reported usage exceeds the
+current budget.
 
 Each selected layer must be owned by a backend that implements KVarN store and
 attention, or an explicitly supported materialization fallback. Unsupported or
@@ -350,12 +378,13 @@ diagnostics name the selected native or generic route; generic long-context
 attention can be substantially slower.
 
 For compact current sources, CUDA and HIP share the segmented history/current
-implementation. CPU has the dense one-softmax reference route. Vulkan rejects
-the unimplemented 12-source native form and uses the planned device-resident
-concat/gather composition instead, so it cannot ignore current rows or rely on
-an accidental scheduler fallback. Vulkan and HIP behavior in this completion
-was source/compile-path verified; no new AMD or Vulkan hardware-performance
-claim is made.
+implementation. CPU has the dense one-softmax reference route. Vulkan consumes
+the compact history/current buffers through buffer device addresses and
+validates every source before native dispatch. Supported bodyless exact tails
+remain native; mixed compressed/exact layers use explicit device
+materialization and standard FlashAttention. Unsupported shapes or source
+layouts fail closed instead of ignoring current rows or relying on an
+accidental scheduler fallback.
 
 ### July 2026 compact-tail correction
 

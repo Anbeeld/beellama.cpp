@@ -1,5 +1,7 @@
 #version 450
 
+#extension GL_KHR_shader_subgroup_shuffle : require
+
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform parameter {
@@ -16,12 +18,18 @@ layout(push_constant) uniform parameter {
     uint stage_groups; // dynamic F16 stage depth
     uint tail_groups;  // lossless tail groups within the stage
     uint eager_records; // commit each record at its closing token
+    uint tokens_per_stream;
+    uint active_streams;
+    uint flush_candidates;
+    uint mode;
 } p;
 
 layout(binding = 0, std430) readonly buffer Current { float data_current[]; };
 layout(binding = 1, std430) readonly buffer Indices { uint data_indices[]; };
 layout(binding = 2, std430) buffer Stage { uint data_stage[]; };
 layout(binding = 3, std430) buffer Records { uint data_records[]; };
+layout(binding = 4, std430) buffer Workspace { uint data_workspace[]; };
+layout(binding = 5, std430) buffer WorkspaceValid { uint data_workspace_valid[]; };
 
 const uint KVAR_N_DIM = 128;
 // Dynamic stage depth: stage_groups and tail_groups arrive via push constants so
@@ -37,9 +45,31 @@ shared float sh_col_std[128];
 shared float sh_row_std[128];
 shared float sh_best_imbalance;
 shared uint sh_better;
+shared uint sh_workspace_valid;
+
+const uint MODE_MONOLITHIC = 0u;
+const uint MODE_VALIDATE = 1u;
+const uint MODE_STAGE = 2u;
+const uint MODE_FLUSH = 3u;
+const uint MODE_COMMIT = 4u;
+const uint MODE_FALLBACK = 5u;
 
 uint read_index_low(uint token) {
     return data_indices[2 * token];
+}
+
+uint read_index_high(uint token) {
+    return data_indices[2 * token + 1];
+}
+
+uint workspace_word_index(uint token, uint head, uint dim_pair) {
+    return (token * p.n_heads + head) * (KVAR_N_DIM / 2) + dim_pair;
+}
+
+float load_workspace_value(uint token, uint head, uint dim) {
+    const vec2 v = unpackHalf2x16(data_workspace[
+        workspace_word_index(token, head, dim >> 1)]);
+    return (dim & 1u) == 0u ? v.x : v.y;
 }
 
 uint stage_word_index(uint stage_pos, uint head, uint dim_pair) {
@@ -58,20 +88,20 @@ void store_stage_pair(uint stage_pos, uint head, uint lane) {
     }
 }
 
-void wht_stage_row(uint lane) {
-    barrier();
-    for (uint stride = 1; stride < KVAR_N_DIM; stride *= 2) {
-        if (lane < 64) {
-            const uint j = (lane / stride) * (2 * stride) + (lane % stride);
-            const float a = sh_wht[j];
-            const float b = sh_wht[j + stride];
-            sh_wht[j] = a + b;
-            sh_wht[j + stride] = a - b;
-        }
-        barrier();
+float wht_stage_value(float value, uint lane) {
+    uint stride = 1u;
+    for (; stride < min(gl_SubgroupSize, KVAR_N_DIM); stride <<= 1u) {
+        const float other = subgroupShuffleXor(value, stride);
+        value = (lane & stride) == 0u ? value + other : other - value;
     }
-    sh_wht[lane] *= KVAR_N_WHT_SCALE;
-    barrier();
+    for (; stride < KVAR_N_DIM; stride <<= 1u) {
+        sh_wht[lane] = value;
+        barrier();
+        const float other = sh_wht[lane ^ stride];
+        barrier();
+        value = (lane & stride) == 0u ? value + other : other - value;
+    }
+    return value * KVAR_N_WHT_SCALE;
 }
 
 float stage_matrix_value(uint head, uint stage_base, uint stage_group, uint row, uint col) {
@@ -242,8 +272,497 @@ void quantize_stage(uint head, uint stage_base, uint stage_group, uint record_ba
     barrier();
 }
 
-void main() {
-    const uint lane = gl_LocalInvocationID.x;
+float workspace_matrix_value(
+        uint head,
+        uint stage_base,
+        uint record_group,
+        uint row,
+        uint col,
+        uint token_base,
+        uint start_local,
+        uint end_local) {
+    const uint token = p.value != 0u ? row : col;
+    const uint out_dim = p.value != 0u ? col : row;
+    const uint local_pos = record_group * KVAR_N_DIM + token;
+    if (local_pos >= start_local && local_pos < end_local) {
+        return load_workspace_value(
+            token_base + local_pos - start_local, head, out_dim);
+    }
+    const uint stage_slot = p.swa != 0u ?
+        (record_group % p.stage_groups) :
+        (1u + ((record_group - 1u) % p.tail_groups));
+    const uint stage_pos = stage_base + stage_slot * KVAR_N_DIM + token;
+    return load_stage_value(stage_pos, head, out_dim);
+}
+
+float workspace_std_col(
+        uint head,
+        uint stage_base,
+        uint record_group,
+        uint col,
+        uint token_base,
+        uint start_local,
+        uint end_local) {
+    float sum = 0.0;
+    float sum_sq = 0.0;
+    const float sc = exp(sh_log_s_col[col]);
+    for (uint row = 0u; row < KVAR_N_DIM; ++row) {
+        const float raw = workspace_matrix_value(
+            head, stage_base, record_group, row, col,
+            token_base, start_local, end_local);
+        const float scaled = raw / (sc * exp(sh_log_s_row[row]));
+        sum += scaled;
+        sum_sq += scaled * scaled;
+    }
+    const float mean = sum / float(KVAR_N_DIM);
+    return sqrt(max((sum_sq - float(KVAR_N_DIM) * mean * mean) /
+        float(KVAR_N_DIM - 1u), 0.0));
+}
+
+float workspace_std_row(
+        uint head,
+        uint stage_base,
+        uint record_group,
+        uint row,
+        uint token_base,
+        uint start_local,
+        uint end_local) {
+    float sum = 0.0;
+    float sum_sq = 0.0;
+    const float sr = exp(sh_log_s_row[row]);
+    for (uint col = 0u; col < KVAR_N_DIM; ++col) {
+        const float raw = workspace_matrix_value(
+            head, stage_base, record_group, row, col,
+            token_base, start_local, end_local);
+        const float scaled = raw / (exp(sh_log_s_col[col]) * sr);
+        sum += scaled;
+        sum_sq += scaled * scaled;
+    }
+    const float mean = sum / float(KVAR_N_DIM);
+    return sqrt(max((sum_sq - float(KVAR_N_DIM) * mean * mean) /
+        float(KVAR_N_DIM - 1u), 0.0));
+}
+
+void workspace_update_best(
+        uint head,
+        uint stage_base,
+        uint record_group,
+        uint lane,
+        uint token_base,
+        uint start_local,
+        uint end_local) {
+    sh_col_std[lane] = workspace_std_col(
+        head, stage_base, record_group, lane,
+        token_base, start_local, end_local);
+    sh_row_std[lane] = workspace_std_row(
+        head, stage_base, record_group, lane,
+        token_base, start_local, end_local);
+    barrier();
+
+    if (lane == 0u) {
+        float col_min = sh_col_std[0];
+        float col_max = sh_col_std[0];
+        float row_min = sh_row_std[0];
+        float row_max = sh_row_std[0];
+        for (uint i = 1u; i < KVAR_N_DIM; ++i) {
+            col_min = min(col_min, sh_col_std[i]);
+            col_max = max(col_max, sh_col_std[i]);
+            row_min = min(row_min, sh_row_std[i]);
+            row_max = max(row_max, sh_row_std[i]);
+        }
+        const float imbalance =
+            col_max / max(col_min, 1e-8) +
+            row_max / max(row_min, 1e-8);
+        sh_better = imbalance <= sh_best_imbalance ? 1u : 0u;
+        if (sh_better != 0u) {
+            sh_best_imbalance = imbalance;
+        }
+    }
+    barrier();
+
+    if (sh_better != 0u) {
+        sh_best_col[lane] = exp(sh_log_s_col[lane]);
+        sh_best_row[lane] = exp(sh_log_s_row[lane]);
+    }
+    barrier();
+}
+
+void workspace_write_payload_bits(
+        uint record_base,
+        uint row,
+        uint qmax,
+        float lo,
+        float scale,
+        uint head,
+        uint stage_base,
+        uint record_group,
+        uint token_base,
+        uint start_local,
+        uint end_local) {
+    const uint row_words = p.bits * 4u;
+    const uint row_base = record_base + row * row_words;
+    for (uint w = 0u; w < row_words; ++w) {
+        data_records[row_base + w] = 0u;
+    }
+
+    for (uint col = 0u; col < KVAR_N_DIM; ++col) {
+        const float raw = workspace_matrix_value(
+            head, stage_base, record_group, row, col,
+            token_base, start_local, end_local);
+        const float x = raw / (sh_best_col[col] * sh_best_row[row]);
+        const uint q = quant_value(x, lo, scale, qmax);
+        const uint bit_offset = col * p.bits;
+        const uint word_index = bit_offset >> 5u;
+        const uint bit = bit_offset & 31u;
+        data_records[row_base + word_index] |= q << bit;
+        if (bit + p.bits > 32u) {
+            data_records[row_base + word_index + 1u] |= q >> (32u - bit);
+        }
+    }
+}
+
+void quantize_workspace(
+        uint head,
+        uint stage_base,
+        uint record_group,
+        uint record_base,
+        uint lane,
+        uint token_base,
+        uint start_local,
+        uint end_local) {
+    sh_log_s_col[lane] = 0.0;
+    sh_log_s_row[lane] = 0.0;
+    sh_best_col[lane] = 1.0;
+    sh_best_row[lane] = 1.0;
+    barrier();
+
+    sh_col_std[lane] = workspace_std_col(
+        head, stage_base, record_group, lane,
+        token_base, start_local, end_local);
+    sh_row_std[lane] = workspace_std_row(
+        head, stage_base, record_group, lane,
+        token_base, start_local, end_local);
+    barrier();
+
+    if (lane == 0u) {
+        float col_min = sh_col_std[0];
+        float col_max = sh_col_std[0];
+        float row_min = sh_row_std[0];
+        float row_max = sh_row_std[0];
+        for (uint i = 1u; i < KVAR_N_DIM; ++i) {
+            col_min = min(col_min, sh_col_std[i]);
+            col_max = max(col_max, sh_col_std[i]);
+            row_min = min(row_min, sh_row_std[i]);
+            row_max = max(row_max, sh_row_std[i]);
+        }
+        sh_best_imbalance =
+            col_max / max(col_min, 1e-8) +
+            row_max / max(row_min, 1e-8);
+    }
+    barrier();
+
+    for (uint iter = 0u; iter < p.iterations; ++iter) {
+        const float col_std = clamp(workspace_std_col(
+            head, stage_base, record_group, lane,
+            token_base, start_local, end_local), 1e-3, 1e3);
+        sh_log_s_col[lane] =
+            clamp(sh_log_s_col[lane] + log(col_std), -0.3, 10.0);
+        barrier();
+
+        const float row_std = clamp(workspace_std_row(
+            head, stage_base, record_group, lane,
+            token_base, start_local, end_local), 1e-3, 1e3);
+        sh_log_s_row[lane] =
+            clamp(sh_log_s_row[lane] + log(row_std), -0.3, 10.0);
+        barrier();
+
+        workspace_update_best(
+            head, stage_base, record_group, lane,
+            token_base, start_local, end_local);
+    }
+
+    float lo = 3.402823466e+38;
+    float hi = -3.402823466e+38;
+    for (uint col = 0u; col < KVAR_N_DIM; ++col) {
+        const float raw = workspace_matrix_value(
+            head, stage_base, record_group, lane, col,
+            token_base, start_local, end_local);
+        const float x = raw / (sh_best_col[col] * sh_best_row[lane]);
+        lo = min(lo, x);
+        hi = max(hi, x);
+    }
+
+    const uint qmax = (1u << p.bits) - 1u;
+    const float scale = max((hi - lo) / float(qmax), 1e-10);
+    workspace_write_payload_bits(
+        record_base, lane, qmax, lo, scale,
+        head, stage_base, record_group,
+        token_base, start_local, end_local);
+
+    sh_col_std[lane] = scale;
+    sh_row_std[lane] = lo;
+    barrier();
+
+    const uint payload_words = p.bits * 512u;
+    const uint axis_word = lane;
+    if (axis_word < KVAR_N_DIM / 2u) {
+        const uint r0 = 2u * axis_word;
+        const uint r1 = r0 + 1u;
+        data_records[record_base + payload_words + axis_word] =
+            packHalf2x16(vec2(
+                sh_best_row[r0] * sh_col_std[r0],
+                sh_best_row[r1] * sh_col_std[r1]));
+        data_records[record_base + payload_words + 64u + axis_word] =
+            packHalf2x16(vec2(
+                sh_best_row[r0] * sh_row_std[r0],
+                sh_best_row[r1] * sh_row_std[r1]));
+        data_records[record_base + payload_words + 128u + axis_word] =
+            packHalf2x16(vec2(sh_best_col[r0], sh_best_col[r1]));
+    }
+    barrier();
+}
+
+void validate_workspace(uint lane) {
+    if (gl_WorkGroupID.x != 0u || gl_WorkGroupID.y != 0u ||
+            gl_WorkGroupID.z != 0u) {
+        return;
+    }
+    if (lane == 0u) {
+        sh_workspace_valid =
+            p.tokens_per_stream > 0u &&
+            p.active_streams > 0u &&
+            p.active_streams <= p.n_stream &&
+            p.n_tokens == p.active_streams * p.tokens_per_stream ? 1u : 0u;
+    }
+    barrier();
+
+    for (uint active_stream = 0u;
+            active_stream < p.active_streams; ++active_stream) {
+        if (sh_workspace_valid == 0u) {
+            break;
+        }
+        const uint token_base = active_stream * p.tokens_per_stream;
+        const uint first_idx = read_index_low(token_base);
+        if (read_index_high(token_base) != 0u) {
+            if (lane == 0u) {
+                sh_workspace_valid = 0u;
+            }
+            barrier();
+            break;
+        }
+        for (uint t = lane; t < p.tokens_per_stream; t += KVAR_N_DIM) {
+            if (read_index_high(token_base + t) != 0u ||
+                    read_index_low(token_base + t) != first_idx + t) {
+                atomicAnd(sh_workspace_valid, 0u);
+            }
+        }
+        barrier();
+
+        if (lane == 0u && sh_workspace_valid != 0u) {
+            const uint first_group_global = first_idx / KVAR_N_DIM;
+            const uint stream = p.swa != 0u ?
+                0u : first_group_global / p.groups_per_stream;
+            const uint first_group = p.swa != 0u ?
+                first_group_global :
+                first_group_global - stream * p.groups_per_stream;
+            const uint first_pos = first_idx % KVAR_N_DIM;
+            const uint start_local = first_group * KVAR_N_DIM + first_pos;
+            const uint end_local = start_local + p.tokens_per_stream;
+            if (stream >= p.n_stream ||
+                    (p.swa == 0u && first_group >= p.groups_per_stream) ||
+                    (p.swa == 0u &&
+                     end_local > p.groups_per_stream * KVAR_N_DIM)) {
+                sh_workspace_valid = 0u;
+            }
+        }
+        barrier();
+    }
+
+    if (lane == 0u) {
+        data_workspace_valid[0] = sh_workspace_valid;
+    }
+}
+
+void stage_workspace(uint lane) {
+    if (data_workspace_valid[0] == 0u) {
+        return;
+    }
+    const uint token = gl_WorkGroupID.y;
+    const uint head0 = gl_WorkGroupID.x * p.head_slices;
+    if (token >= p.n_tokens || head0 + p.head_slices > p.n_heads) {
+        return;
+    }
+
+    float values[4] = float[4](0.0, 0.0, 0.0, 0.0);
+    for (uint slice = 0u; slice < p.head_slices; ++slice) {
+        const uint head = head0 + slice;
+        values[slice] = wht_stage_value(
+            data_current[(token * p.n_heads + head) * KVAR_N_DIM + lane],
+            lane);
+    }
+    if (p.head_slices == 2u) {
+        const float a = values[0];
+        const float b = values[1];
+        values[0] = (a + b) * 0.7071067811865475;
+        values[1] = (a - b) * 0.7071067811865475;
+    } else if (p.head_slices == 4u) {
+        const float a = values[0];
+        const float b = values[1];
+        const float c = values[2];
+        const float d = values[3];
+        values[0] = (a + b + c + d) * 0.5;
+        values[1] = (a - b + c - d) * 0.5;
+        values[2] = (a + b - c - d) * 0.5;
+        values[3] = (a - b - c + d) * 0.5;
+    }
+
+    for (uint slice = 0u; slice < p.head_slices; ++slice) {
+        sh_wht[lane] = values[slice];
+        barrier();
+        if (lane < KVAR_N_DIM / 2u) {
+            const uint head = head0 + slice;
+            data_workspace[workspace_word_index(token, head, lane)] =
+                packHalf2x16(vec2(
+                    sh_wht[2u * lane], sh_wht[2u * lane + 1u]));
+        }
+        barrier();
+    }
+}
+
+void flush_workspace(uint lane) {
+    if (data_workspace_valid[0] == 0u) {
+        return;
+    }
+    const uint head = gl_WorkGroupID.x;
+    const uint active_stream =
+        gl_WorkGroupID.y / p.flush_candidates;
+    const uint candidate =
+        gl_WorkGroupID.y - active_stream * p.flush_candidates;
+    const uint token_base = active_stream * p.tokens_per_stream;
+    if (head >= p.n_heads || active_stream >= p.active_streams ||
+            token_base + p.tokens_per_stream > p.n_tokens) {
+        return;
+    }
+
+    const uint first_idx = read_index_low(token_base);
+    const uint first_group_global = first_idx / KVAR_N_DIM;
+    const uint stream = p.swa != 0u ?
+        0u : first_group_global / p.groups_per_stream;
+    const uint first_group = p.swa != 0u ?
+        first_group_global :
+        first_group_global - stream * p.groups_per_stream;
+    const uint first_pos = first_idx % KVAR_N_DIM;
+    const uint start_local = first_group * KVAR_N_DIM + first_pos;
+    const uint end_local = start_local + p.tokens_per_stream;
+    const uint boundary_group =
+        (start_local + KVAR_N_DIM - 1u) / KVAR_N_DIM + candidate;
+    if (boundary_group * KVAR_N_DIM >= end_local) {
+        return;
+    }
+
+    const int record_group_signed = p.eager_records != 0u ?
+        int(boundary_group) : int(boundary_group) - int(p.tail_groups);
+    if (record_group_signed < 0 ||
+            (p.swa == 0u &&
+             (record_group_signed < 1 ||
+              record_group_signed >= int(p.groups_per_stream)))) {
+        return;
+    }
+    const uint record_group = uint(record_group_signed);
+    if (p.swa != 0u) {
+        const uint next_same_record_boundary_group =
+            record_group + p.groups_per_stream +
+            (p.eager_records != 0u ? 0u : p.tail_groups);
+        if (next_same_record_boundary_group * KVAR_N_DIM < end_local) {
+            return;
+        }
+    }
+
+    const uint stage_base = stream * KVAR_N_DIM * p.stage_groups;
+    const uint flush_record_group =
+        stream * p.groups_per_stream +
+        (p.swa != 0u ?
+         record_group % p.groups_per_stream : record_group);
+    const uint record_base =
+        (flush_record_group * p.n_heads + head) * p.record_words;
+    quantize_workspace(
+        head, stage_base, record_group, record_base, lane,
+        token_base, start_local, end_local);
+}
+
+void commit_workspace(uint lane) {
+    if (data_workspace_valid[0] == 0u) {
+        return;
+    }
+    const uint head = gl_WorkGroupID.x;
+    const uint active_stream =
+        gl_WorkGroupID.y / (KVAR_N_DIM * p.stage_groups);
+    const uint stage_local =
+        gl_WorkGroupID.y -
+        active_stream * (KVAR_N_DIM * p.stage_groups);
+    const uint token_base = active_stream * p.tokens_per_stream;
+    if (head >= p.n_heads || active_stream >= p.active_streams ||
+            token_base + p.tokens_per_stream > p.n_tokens) {
+        return;
+    }
+
+    const uint first_idx = read_index_low(token_base);
+    const uint first_group_global = first_idx / KVAR_N_DIM;
+    const uint stream = p.swa != 0u ?
+        0u : first_group_global / p.groups_per_stream;
+    const uint first_group = p.swa != 0u ?
+        first_group_global :
+        first_group_global - stream * p.groups_per_stream;
+    const uint first_pos = first_idx % KVAR_N_DIM;
+    const uint start_local = first_group * KVAR_N_DIM + first_pos;
+    const uint end_local = start_local + p.tokens_per_stream;
+    const uint pos = stage_local % KVAR_N_DIM;
+
+    uint group = 0u;
+    if (p.swa == 0u && stage_local < KVAR_N_DIM) {
+        if (pos < start_local || pos >= end_local) {
+            return;
+        }
+    } else {
+        const uint slot = p.swa != 0u ?
+            stage_local / KVAR_N_DIM :
+            (stage_local - KVAR_N_DIM) / KVAR_N_DIM;
+        int max_group = int((end_local - 1u - pos) / KVAR_N_DIM);
+        const int min_group = p.swa != 0u ? 0 : 1;
+        while (max_group >= min_group &&
+                (p.swa != 0u ?
+                 uint(max_group) % p.stage_groups != slot :
+                 (uint(max_group) - 1u) % p.tail_groups != slot)) {
+            --max_group;
+        }
+        if (max_group < min_group) {
+            return;
+        }
+        group = uint(max_group);
+        const uint local_pos = group * KVAR_N_DIM + pos;
+        if ((p.swa == 0u && group >= p.groups_per_stream) ||
+                local_pos < start_local || local_pos >= end_local) {
+            return;
+        }
+    }
+
+    const uint local_pos = group * KVAR_N_DIM + pos;
+    const uint token = token_base + local_pos - start_local;
+    if (token < token_base ||
+            token >= token_base + p.tokens_per_stream) {
+        return;
+    }
+
+    if (lane < KVAR_N_DIM / 2u) {
+        const uint stage_base =
+            stream * KVAR_N_DIM * p.stage_groups;
+        const uint stage_pos = stage_base + stage_local;
+        data_stage[stage_word_index(stage_pos, head, lane)] =
+            data_workspace[workspace_word_index(token, head, lane)];
+    }
+}
+
+void monolithic_store(uint lane) {
     const uint head0 = gl_WorkGroupID.x * p.head_slices;
 
     for (uint token = 0; token < p.n_tokens; ++token) {
@@ -274,9 +793,9 @@ void main() {
         float values[4] = float[4](0.0, 0.0, 0.0, 0.0);
         for (uint slice = 0u; slice < p.head_slices; ++slice) {
             const uint head = head0 + slice;
-            sh_wht[lane] = data_current[(token * p.n_heads + head) * KVAR_N_DIM + lane];
-            wht_stage_row(lane);
-            values[slice] = sh_wht[lane];
+            values[slice] = wht_stage_value(
+                data_current[(token * p.n_heads + head) * KVAR_N_DIM + lane],
+                lane);
         }
         if (p.head_slices == 2u) {
             const float a = values[0];
@@ -313,4 +832,28 @@ void main() {
             }
         }
     }
+}
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+    if (p.mode == MODE_VALIDATE) {
+        validate_workspace(lane);
+        return;
+    }
+    if (p.mode == MODE_STAGE) {
+        stage_workspace(lane);
+        return;
+    }
+    if (p.mode == MODE_FLUSH) {
+        flush_workspace(lane);
+        return;
+    }
+    if (p.mode == MODE_COMMIT) {
+        commit_workspace(lane);
+        return;
+    }
+    if (p.mode == MODE_FALLBACK && data_workspace_valid[0] != 0u) {
+        return;
+    }
+    monolithic_store(lane);
 }

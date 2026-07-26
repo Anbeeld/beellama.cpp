@@ -3284,8 +3284,13 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto * mctx_cur = inp->mctx;
     const auto * kvarn_ctx = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur);
     const bool use_kvarn = kvarn_ctx != nullptr;
+    const bool kvarn_native_attention = use_kvarn &&
+        kvarn_ctx->uses_native_attention(il) &&
+        (!mctx_cur->has_compact_tail() ||
+         !mctx_cur->has_kv_body(il) ||
+         kvarn_ctx->mixed_tail_native_preferred(il));
     const auto kvarn_plan = use_kvarn ? llama_kvarn_plan_attention(
-        kvarn_ctx->uses_native_attention(il),
+        kvarn_native_attention,
         kvarn_ctx->native_attention_uses_original_v(il),
         kvarn_ctx->native_rotated_max_query_tokens(il),
         (uint32_t) q_cur->ne[2]) : llama_kvarn_attention_plan {
@@ -3390,11 +3395,15 @@ ggml_tensor * llm_graph_context::build_attn(
     const bool gather_v_tail = v_tail != nullptr;
     ggml_tensor * tail_read_idxs = inp->get_tail_read_idxs();
     llama_kv_tail_route tail_route = mctx_cur->get_tail_route(il);
-    // The KVarN body and the exact tail have independent execution routes.
-    // A large prefill can materialize the structured body while the exact
-    // history/current segments still use native segmented attention. Falling
-    // the tail back with the body would gather [sources, queries] payloads and
-    // multiply graph workspace by both query count and layer count.
+    // Vulkan and other portable KVarN backends advertise a bounded rotated
+    // query width. Outside that matrix the body is materialized, and the exact
+    // tail must use the same explicit generic oracle instead of attaching
+    // segmented sources to a standard FlashAttention operation that the
+    // backend did not advertise.
+    if (use_kvarn && tail_route == LLAMA_KV_TAIL_ROUTE_NATIVE &&
+            !kvarn_plan.native_attention) {
+        tail_route = LLAMA_KV_TAIL_ROUTE_GENERIC;
+    }
     if (tail_route != LLAMA_KV_TAIL_ROUTE_NONE) {
         GGML_ASSERT(mctx_cur->get_tail_explicit_bias(il) == (kq_b != nullptr) &&
                 "KV tail route bias contract does not match the model graph");
@@ -3705,8 +3714,13 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
     const auto * kvarn_ctx = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur);
     const bool use_kvarn = kvarn_ctx != nullptr;
+    const bool kvarn_native_attention = use_kvarn &&
+        kvarn_ctx->uses_native_attention(il) &&
+        (!mctx_cur->has_compact_tail() ||
+         !mctx_cur->has_kv_body(il) ||
+         kvarn_ctx->mixed_tail_native_preferred(il));
     const auto kvarn_plan = use_kvarn ? llama_kvarn_plan_attention(
-        kvarn_ctx->uses_native_attention(il),
+        kvarn_native_attention,
         kvarn_ctx->native_attention_uses_original_v(il),
         kvarn_ctx->native_rotated_max_query_tokens(il),
         (uint32_t) q_cur->ne[2]) : llama_kvarn_attention_plan {
@@ -3823,8 +3837,11 @@ ggml_tensor * llm_graph_context::build_attn(
     const bool gather_v_tail = v_tail != nullptr;
     ggml_tensor * tail_read_idxs = inp->get_tail_read_idxs(is_swa);
     llama_kv_tail_route tail_route = mctx_cur->get_tail_route(il);
-    // The exact tail remains eligible for segmented attention when a KVarN
-    // body is materialized for a large prefill; see the non-iSWA path above.
+    // Keep the iSWA route decision identical to the non-iSWA path above.
+    if (use_kvarn && tail_route == LLAMA_KV_TAIL_ROUTE_NATIVE &&
+            !kvarn_plan.native_attention) {
+        tail_route = LLAMA_KV_TAIL_ROUTE_GENERIC;
+    }
     if (tail_route != LLAMA_KV_TAIL_ROUTE_NONE) {
         GGML_ASSERT(mctx_cur->get_tail_explicit_bias(il) == (kq_b != nullptr) &&
                 "KV tail route bias contract does not match the model graph");

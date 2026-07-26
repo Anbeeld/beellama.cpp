@@ -49,6 +49,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <iomanip>
 #include <iostream>
@@ -954,6 +955,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_kvarn_materialize;
     vk_pipeline pipeline_kvarn_flash_attn;
     vk_pipeline pipeline_kvarn_wht;
+    vk_pipeline pipeline_kvarn_wht_d256;
+    vk_pipeline pipeline_kvarn_wht_d512;
     vk_pipeline pipeline_cumsum_f32;
     vk_pipeline pipeline_cumsum_small_f32;
     vk_pipeline pipeline_cumsum_multipass1_f32;
@@ -1277,6 +1280,10 @@ struct vk_op_kvarn_store_push_constants {
     uint32_t stage_groups;
     uint32_t tail_groups;
     uint32_t eager_records;
+    uint32_t tokens_per_stream;
+    uint32_t active_streams;
+    uint32_t flush_candidates;
+    uint32_t mode;
 };
 static_assert(sizeof(vk_op_kvarn_store_push_constants) <= 128,
         "sizeof(vk_op_kvarn_store_push_constants) must be <= 128");
@@ -1299,6 +1306,7 @@ struct vk_op_kvarn_materialize_push_constants {
     uint32_t eager_records;
     uint32_t blocks_x;
     uint32_t total_blocks;
+    uint32_t mode;
 };
 static_assert(sizeof(vk_op_kvarn_materialize_push_constants) <= 128,
         "sizeof(vk_op_kvarn_materialize_push_constants) must be <= 128");
@@ -1306,18 +1314,13 @@ static_assert(sizeof(vk_op_kvarn_materialize_push_constants) <= 128,
 struct vk_op_kvarn_flash_attn_push_constants {
     uint32_t n_heads;
     uint32_t n_kv;
-    uint32_t stream_start;
-    uint32_t groups_per_stream;
-    uint32_t k_bits;
-    uint32_t v_bits;
+    uint32_t stream_group_packed;
+    uint32_t bits_packed;
     uint32_t n_indices;
-    uint32_t head_slices;
-    uint32_t stage_groups;
-    uint32_t tail_groups;
+    uint32_t kvarn_shape_packed;
     uint32_t flags;
-    uint32_t mask_ne3;
+    uint32_t mask_query_packed;
     uint32_t tail_stride;
-    uint32_t query_order_ne0;
     uint32_t query_order_nelements;
     uint32_t run_desc_ne0;
     uint32_t k_tail_nb1;
@@ -1327,11 +1330,14 @@ struct vk_op_kvarn_flash_attn_push_constants {
     uint64_t tail_mask_addr;
     uint64_t query_order_addr;
     uint64_t run_desc_addr;
+    uint64_t k_tail_current_addr;
+    uint64_t v_tail_current_addr;
     float scale;
     float max_bias;
     float logit_softcap;
-    uint32_t n_query;
-    uint32_t gqa;
+    uint32_t query_shape_packed;
+    uint32_t q_nb1;
+    uint32_t q_nb2;
 };
 static_assert(sizeof(vk_op_kvarn_flash_attn_push_constants) == 128,
         "sizeof(vk_op_kvarn_flash_attn_push_constants) must be 128");
@@ -2024,6 +2030,135 @@ static bool vk_enable_sync_logger = false;
 // number of calls between perf logger prints
 static uint32_t vk_perf_logger_frequency = 1;
 static std::string vk_pipeline_stats_filter;
+
+constexpr uint32_t GGML_VK_FATTN_KVARN_ROUTE_STATS_ABI_VERSION = 1;
+constexpr uint32_t GGML_VK_FATTN_KVARN_FAMILY_PORTABLE_NATIVE = 1u << 0;
+
+struct ggml_vk_fattn_kvarn_route_stats {
+    uint32_t struct_size;
+    uint32_t abi_version;
+    uint32_t route_families;
+    uint32_t reserved;
+    uint64_t decode_split;
+    uint64_t decode_vector;
+    uint64_t generic_mma;
+    uint64_t prompt_prefill;
+    uint64_t portable_native;
+    uint64_t amd_generic_mma;
+    uint64_t amd_decode_split;
+    uint64_t amd_decode_vector;
+    uint64_t materialize_fallback;
+    uint64_t split_reduce;
+    uint64_t direct_entry;
+    uint64_t compact_tail_entry;
+};
+
+struct ggml_vk_kv_memory_transient_stats {
+    uint64_t kvarn_descriptor_bytes;
+    uint64_t kvarn_partial_output_bytes;
+    uint64_t kvarn_partial_meta_bytes;
+    uint64_t kvarn_total_bytes;
+    uint64_t tail_body_meta_bytes;
+    uint64_t tail_exact_meta_bytes;
+    uint64_t tail_pack_bytes;
+    uint64_t tail_body_output_bytes;
+    uint64_t tail_exact_output_bytes;
+    uint64_t tail_plan_input_bytes;
+    uint64_t tail_total_bytes;
+};
+
+static std::atomic<uint64_t> ggml_vk_fattn_kvarn_portable_native{0};
+static std::atomic<uint64_t> ggml_vk_fattn_kvarn_materialize_fallback{0};
+static std::atomic<uint64_t> ggml_vk_fattn_kvarn_split_reduce{0};
+static std::atomic<uint64_t> ggml_vk_fattn_kvarn_direct_entry{0};
+static std::atomic<uint64_t> ggml_vk_fattn_kvarn_compact_tail_entry{0};
+static std::atomic<uint64_t> ggml_vk_kv_mem_kvarn_descriptor{0};
+static std::atomic<uint64_t> ggml_vk_kv_mem_kvarn_partial_output{0};
+static std::atomic<uint64_t> ggml_vk_kv_mem_kvarn_partial_meta{0};
+static std::atomic<uint64_t> ggml_vk_kv_mem_kvarn_total{0};
+static std::atomic<bool> ggml_vk_kv_mem_stats_enabled{false};
+
+static void ggml_vk_atomic_max(std::atomic<uint64_t> & dst, uint64_t value) {
+    uint64_t current = dst.load(std::memory_order_relaxed);
+    while (current < value && !dst.compare_exchange_weak(
+            current, value, std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
+}
+
+static void ggml_backend_vk_kv_memory_transient_stats_reset() {
+    ggml_vk_kv_mem_stats_enabled.store(false, std::memory_order_relaxed);
+    ggml_vk_kv_mem_kvarn_descriptor.store(0, std::memory_order_relaxed);
+    ggml_vk_kv_mem_kvarn_partial_output.store(0, std::memory_order_relaxed);
+    ggml_vk_kv_mem_kvarn_partial_meta.store(0, std::memory_order_relaxed);
+    ggml_vk_kv_mem_kvarn_total.store(0, std::memory_order_relaxed);
+    ggml_vk_kv_mem_stats_enabled.store(true, std::memory_order_release);
+}
+
+static void ggml_backend_vk_kv_memory_transient_stats_get(
+        ggml_vk_kv_memory_transient_stats * stats) {
+    ggml_vk_kv_mem_stats_enabled.store(false, std::memory_order_release);
+    if (stats == nullptr) {
+        return;
+    }
+    *stats = {};
+    stats->kvarn_descriptor_bytes =
+        ggml_vk_kv_mem_kvarn_descriptor.load(std::memory_order_relaxed);
+    stats->kvarn_partial_output_bytes =
+        ggml_vk_kv_mem_kvarn_partial_output.load(std::memory_order_relaxed);
+    stats->kvarn_partial_meta_bytes =
+        ggml_vk_kv_mem_kvarn_partial_meta.load(std::memory_order_relaxed);
+    stats->kvarn_total_bytes =
+        ggml_vk_kv_mem_kvarn_total.load(std::memory_order_relaxed);
+}
+
+static void ggml_vk_kv_memory_transient_stats_record_kvarn(
+        uint64_t descriptor_bytes,
+        uint64_t partial_output_bytes,
+        uint64_t partial_meta_bytes,
+        uint64_t total_bytes) {
+    if (!ggml_vk_kv_mem_stats_enabled.load(std::memory_order_acquire)) {
+        return;
+    }
+    ggml_vk_atomic_max(ggml_vk_kv_mem_kvarn_descriptor, descriptor_bytes);
+    ggml_vk_atomic_max(ggml_vk_kv_mem_kvarn_partial_output, partial_output_bytes);
+    ggml_vk_atomic_max(ggml_vk_kv_mem_kvarn_partial_meta, partial_meta_bytes);
+    ggml_vk_atomic_max(ggml_vk_kv_mem_kvarn_total, total_bytes);
+}
+
+static void ggml_backend_vk_kvarn_route_stats_reset() {
+    ggml_vk_fattn_kvarn_portable_native.store(0, std::memory_order_relaxed);
+    ggml_vk_fattn_kvarn_materialize_fallback.store(0, std::memory_order_relaxed);
+    ggml_vk_fattn_kvarn_split_reduce.store(0, std::memory_order_relaxed);
+    ggml_vk_fattn_kvarn_direct_entry.store(0, std::memory_order_relaxed);
+    ggml_vk_fattn_kvarn_compact_tail_entry.store(0, std::memory_order_relaxed);
+}
+
+static void ggml_backend_vk_kvarn_route_stats_get(ggml_vk_fattn_kvarn_route_stats * stats) {
+    if (stats == nullptr ||
+            stats->struct_size < sizeof(ggml_vk_fattn_kvarn_route_stats) ||
+            stats->abi_version != GGML_VK_FATTN_KVARN_ROUTE_STATS_ABI_VERSION) {
+        return;
+    }
+
+    *stats = {
+        sizeof(ggml_vk_fattn_kvarn_route_stats),
+        GGML_VK_FATTN_KVARN_ROUTE_STATS_ABI_VERSION,
+        GGML_VK_FATTN_KVARN_FAMILY_PORTABLE_NATIVE,
+        0,
+        0,
+        0,
+        0,
+        0,
+        ggml_vk_fattn_kvarn_portable_native.load(std::memory_order_relaxed),
+        0,
+        0,
+        0,
+        ggml_vk_fattn_kvarn_materialize_fallback.load(std::memory_order_relaxed),
+        ggml_vk_fattn_kvarn_split_reduce.load(std::memory_order_relaxed),
+        ggml_vk_fattn_kvarn_direct_entry.load(std::memory_order_relaxed),
+        ggml_vk_fattn_kvarn_compact_tail_entry.load(std::memory_order_relaxed),
+    };
+}
 
 static uint64_t ggml_vk_get_node_flops(const ggml_tensor * node) {
     if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
@@ -3957,6 +4092,7 @@ static constexpr int KVAR_N_OP_PARAM_MAT_VALUE = 1;
 static constexpr int KVAR_N_OP_PARAM_STORE_VALUE = 2;
 static constexpr int KVAR_N_OP_PARAM_STREAM_START = 2;
 static constexpr int KVAR_N_OP_PARAM_N_STREAM = 3;
+static constexpr int KVAR_N_OP_PARAM_TOKENS_PER_STREAM = 3;
 static constexpr int KVAR_N_OP_PARAM_STORE_SWA = 4;
 static constexpr int KVAR_N_OP_PARAM_MAT_EMIT_ROTATED = 4;
 static constexpr int KVAR_N_OP_PARAM_HEAD_SLICES = 5;
@@ -5615,14 +5751,22 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     if (ggml_vk_kvarn_limits_supported(device)) {
         ggml_vk_create_pipeline(device, device->pipeline_kvarn_store,
-                "kvarn_store", kvarn_store_len, kvarn_store_data, "main", 4,
+                "kvarn_store", kvarn_store_len, kvarn_store_data, "main", 6,
                 sizeof(vk_op_kvarn_store_push_constants), {1, 1, 1}, {}, 1);
         ggml_vk_create_pipeline(device, device->pipeline_kvarn_materialize,
-                "kvarn_materialize", kvarn_materialize_len, kvarn_materialize_data, "main", 4,
+                "kvarn_materialize", kvarn_materialize_len, kvarn_materialize_data, "main", 5,
                 sizeof(vk_op_kvarn_materialize_push_constants), {1, 1, 1}, {}, 1);
         ggml_vk_create_pipeline(device, device->pipeline_kvarn_wht,
                 "kvarn_wht", kvarn_wht_len, kvarn_wht_data, "main", 2,
                 sizeof(vk_op_kvarn_wht_push_constants), {1, 1, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_kvarn_wht_d256,
+                "kvarn_wht_d256", kvarn_wht_d256_len, kvarn_wht_d256_data,
+                "main", 2, sizeof(vk_op_kvarn_wht_push_constants),
+                {1, 1, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_kvarn_wht_d512,
+                "kvarn_wht_d512", kvarn_wht_d512_len, kvarn_wht_d512_data,
+                "main", 2, sizeof(vk_op_kvarn_wht_push_constants),
+                {1, 1, 1}, {}, 1);
         if (device->shader_int64 && device->buffer_device_address) {
             ggml_vk_create_pipeline(device, device->pipeline_kvarn_flash_attn,
                     "kvarn_flash_attn", kvarn_flash_attn_len, kvarn_flash_attn_data, "main", 12,
@@ -9793,6 +9937,13 @@ static void ggml_vk_kvarn_wht(
     }
 
     vk_pipeline pipeline = ctx->device->pipeline_kvarn_wht;
+    if (head_width == 256 &&
+            ctx->device->properties.limits.maxComputeWorkGroupInvocations >= 256) {
+        pipeline = ctx->device->pipeline_kvarn_wht_d256;
+    } else if (head_width == 512 &&
+            ctx->device->properties.limits.maxComputeWorkGroupInvocations >= 512) {
+        pipeline = ctx->device->pipeline_kvarn_wht_d512;
+    }
     GGML_ASSERT(pipeline != nullptr);
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     const vk_op_kvarn_wht_push_constants pc = {
@@ -9819,7 +9970,6 @@ static void ggml_vk_kvarn_store(ggml_backend_vk_context * ctx, vk_context& subct
 
     vk_pipeline pipeline = ctx->device->pipeline_kvarn_store;
     GGML_ASSERT(pipeline != nullptr);
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
     const int bits = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_BITS);
     const int iterations = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_STORE_ITERS);
@@ -9831,6 +9981,8 @@ static void ggml_vk_kvarn_store(ggml_backend_vk_context * ctx, vk_context& subct
     const int tail_groups_param = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_TAIL_GROUPS);
     const int tail_groups = tail_groups_param > 0 ? tail_groups_param : stage_groups - 1;
     const bool eager_records = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_EAGER_RECORDS) != 0;
+    const int tokens_per_stream_hint =
+        ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_TOKENS_PER_STREAM);
     GGML_ASSERT(ggml_vk_kvarn_valid_bits(bits));
     GGML_ASSERT(head_slices == 1 || head_slices == 2 || head_slices == 4);
     GGML_ASSERT(current->ne[1] % head_slices == 0);
@@ -9844,6 +9996,25 @@ static void ggml_vk_kvarn_store(ggml_backend_vk_context * ctx, vk_context& subct
     if (swa) {
         GGML_ASSERT(n_stream == 1 && "SWA KVarN ring requires a single stream");
     }
+    const int n_tokens = (int) current->ne[2];
+    const bool hint_well_formed =
+        tokens_per_stream_hint > 0 &&
+        tokens_per_stream_hint <= n_tokens &&
+        n_tokens % tokens_per_stream_hint == 0;
+    const int active_streams =
+        hint_well_formed ? n_tokens / tokens_per_stream_hint : 0;
+    const bool use_workspace =
+        hint_well_formed &&
+        tokens_per_stream_hint >= 3 * KVAR_N_GROUP &&
+        active_streams > 0 &&
+        active_streams <= n_stream &&
+        (!swa ||
+         (n_stream == 1 &&
+          tokens_per_stream_hint <= groups_per_stream * KVAR_N_GROUP));
+    const int flush_candidates = use_workspace ?
+        (tokens_per_stream_hint + KVAR_N_GROUP - 1) / KVAR_N_GROUP +
+            stage_groups :
+        0;
 
     vk_op_kvarn_store_push_constants pc = {
         (uint32_t) current->ne[1],
@@ -9859,6 +10030,10 @@ static void ggml_vk_kvarn_store(ggml_backend_vk_context * ctx, vk_context& subct
         (uint32_t) stage_groups,
         (uint32_t) tail_groups,
         eager_records ? 1u : 0u,
+        use_workspace ? (uint32_t) tokens_per_stream_hint : 0u,
+        use_workspace ? (uint32_t) active_streams : 0u,
+        use_workspace ? (uint32_t) flush_candidates : 0u,
+        0u,
     };
 
     const vk_subbuffer current_buf = ggml_vk_tensor_subbuffer(ctx, current);
@@ -9866,11 +10041,136 @@ static void ggml_vk_kvarn_store(ggml_backend_vk_context * ctx, vk_context& subct
     const vk_subbuffer stage_buf = ggml_vk_tensor_subbuffer(ctx, stage);
     const vk_subbuffer records_buf = ggml_vk_tensor_subbuffer(ctx, records);
 
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-            { current_buf, indices_buf, stage_buf, records_buf }, pc, { pc.n_heads / pc.head_slices, 1, 1 });
+    if (!use_workspace) {
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        ggml_vk_dispatch_pipeline(
+            ctx, subctx, pipeline,
+            { current_buf, indices_buf, stage_buf, records_buf,
+              stage_buf, stage_buf },
+            pc, { pc.n_heads / pc.head_slices, 1, 1 });
+        return;
+    }
+
+    const size_t workspace_bytes =
+        size_t(current->ne[0]) * size_t(current->ne[1]) *
+        size_t(current->ne[2]) * sizeof(ggml_fp16_t);
+    const size_t valid_offset = ROUNDUP_POW2(
+        workspace_bytes,
+        size_t(ctx->device->properties.limits.minStorageBufferOffsetAlignment));
+    const size_t workspace_total = valid_offset + sizeof(uint32_t);
+    if (workspace_total > ctx->device->properties.limits.maxStorageBufferRange) {
+        GGML_ABORT("Requested KVarN store workspace is too large");
+    }
+    ggml_vk_kv_memory_transient_stats_record_kvarn(
+        0, 0, 0, workspace_total);
+    if (ctx->prealloc_size_y < workspace_total) {
+        ctx->prealloc_size_y = workspace_total;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+    if (ctx->prealloc_y_need_sync) {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+
+    const vk_subbuffer workspace_buf =
+        ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0);
+    const vk_subbuffer valid_buf =
+        ggml_vk_subbuffer(ctx, ctx->prealloc_y, valid_offset);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 5);
+
+    pc.mode = 1u; // validate the dense per-stream workspace contract
+    ggml_vk_dispatch_pipeline(
+        ctx, subctx, pipeline,
+        { current_buf, indices_buf, stage_buf, records_buf,
+          workspace_buf, valid_buf },
+        pc, { 1, 1, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    pc.mode = 2u; // WHT current tokens into the transient workspace
+    ggml_vk_dispatch_pipeline(
+        ctx, subctx, pipeline,
+        { current_buf, indices_buf, stage_buf, records_buf,
+          workspace_buf, valid_buf },
+        pc,
+        { pc.n_heads / pc.head_slices, pc.n_tokens, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    pc.mode = 3u; // quantize completed records in parallel
+    ggml_vk_dispatch_pipeline(
+        ctx, subctx, pipeline,
+        { current_buf, indices_buf, stage_buf, records_buf,
+          workspace_buf, valid_buf },
+        pc,
+        { pc.n_heads, pc.active_streams * pc.flush_candidates, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    pc.mode = 4u; // commit the newest stage slots
+    ggml_vk_dispatch_pipeline(
+        ctx, subctx, pipeline,
+        { current_buf, indices_buf, stage_buf, records_buf,
+          workspace_buf, valid_buf },
+        pc,
+        { pc.n_heads,
+          pc.active_streams * KVAR_N_GROUP * pc.stage_groups,
+          1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    // If validation found discontinuous or cross-stream indices, preserve the
+    // established monolithic shader as the exact fallback without a host wait.
+    pc.mode = 5u;
+    ggml_vk_dispatch_pipeline(
+        ctx, subctx, pipeline,
+        { current_buf, indices_buf, stage_buf, records_buf,
+          workspace_buf, valid_buf },
+        pc,
+        { pc.n_heads / pc.head_slices, 1, 1 });
+    ctx->prealloc_y_need_sync = true;
+    ctx->prealloc_y_last_pipeline_used = nullptr;
+    ctx->prealloc_y_last_tensor_used = nullptr;
+    ctx->prealloc_y_last_decode_vector_staging = false;
+
+    const char * debug_routes = getenv("GGML_KVARN_DEBUG_ROUTES");
+    if (debug_routes != nullptr && atoi(debug_routes) != 0) {
+        std::ostringstream route_key;
+        route_key << ctx->device->name << ":store-workspace:" <<
+            pc.n_heads << ':' << pc.n_tokens << ':' << pc.head_slices <<
+            ':' << pc.swa << ':' << pc.eager_records;
+        static std::mutex debug_routes_mutex;
+        static std::set<std::string> reported_routes;
+        std::lock_guard<std::mutex> lock(debug_routes_mutex);
+        if (reported_routes.insert(route_key.str()).second) {
+            std::cerr << "kvarn-store-route backend=Vulkan device=\"" <<
+                ctx->device->name << "\" route=workspace-parallel" <<
+                " heads=" << pc.n_heads <<
+                " tokens=" << pc.n_tokens <<
+                " streams=" << pc.active_streams <<
+                " flush-candidates=" << pc.flush_candidates <<
+                " workspace-bytes=" << workspace_bytes <<
+                " fallback=validated-monolithic" << std::endl;
+        }
+    }
 }
 
 static void ggml_vk_kvarn_materialize(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    ggml_vk_fattn_kvarn_materialize_fallback.fetch_add(1, std::memory_order_relaxed);
+    const char * debug_routes = getenv("GGML_KVARN_DEBUG_ROUTES");
+    if (debug_routes != nullptr && atoi(debug_routes) != 0) {
+        std::ostringstream route_key;
+        route_key << ctx->device->name << ':' << dst->ne[0] << ':' <<
+            dst->ne[1] << ':' << dst->ne[2] << ':' << dst->ne[3] << ':' <<
+            ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_BITS) << ':' <<
+            ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_MAT_VALUE);
+        static std::mutex debug_routes_mutex;
+        static std::set<std::string> reported_routes;
+        std::lock_guard<std::mutex> lock(debug_routes_mutex);
+        if (reported_routes.insert(route_key.str()).second) {
+            std::cerr << "kvarn-route backend=Vulkan device=\"" << ctx->device->name <<
+                "\" subgroup=" << ctx->device->subgroup_size <<
+                " D=" << dst->ne[0] <<
+                " bits=" << ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_BITS) <<
+                " value=" << ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_MAT_VALUE) <<
+                " route=materialize fallback=explicit-materialization" << std::endl;
+        }
+    }
     const ggml_tensor * records = dst->src[0];
     const ggml_tensor * stage = dst->src[1];
     const ggml_tensor * indices = dst->src[2];
@@ -9880,8 +10180,6 @@ static void ggml_vk_kvarn_materialize(ggml_backend_vk_context * ctx, vk_context&
 
     vk_pipeline pipeline = ctx->device->pipeline_kvarn_materialize;
     GGML_ASSERT(pipeline != nullptr);
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
-
     const int bits = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_BITS);
     const bool value = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_MAT_VALUE) != 0;
     const int stream_start = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_STREAM_START);
@@ -9911,19 +10209,47 @@ static void ggml_vk_kvarn_materialize(ggml_backend_vk_context * ctx, vk_context&
             total_blocks, ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
     const uint32_t blocks_y = 1 + (total_blocks - 1) / blocks_x;
     GGML_ASSERT(blocks_y <= ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+    const size_t live_bytes = size_t(2) * size_t(n_stream) * sizeof(uint32_t);
+    if (live_bytes > ctx->device->properties.limits.maxStorageBufferRange) {
+        GGML_ABORT("Requested KVarN materialization live descriptor is too large");
+    }
+    ggml_vk_kv_memory_transient_stats_record_kvarn(
+        live_bytes, 0, 0, live_bytes);
+    if (ctx->prealloc_size_y < live_bytes) {
+        ctx->prealloc_size_y = live_bytes;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+    if (ctx->prealloc_y_need_sync) {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+    const vk_subbuffer live_buf =
+        ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 2);
+
     vk_op_kvarn_materialize_push_constants pc = {
         uint32_t(dst->ne[1]), uint32_t(dst->ne[2]), uint32_t(stream_start), uint32_t(n_stream),
         uint32_t(groups_per_stream), uint32_t(records->ne[0] / 4), uint32_t(bits), value ? 1u : 0u,
         uint32_t(indices->ne[0]), emit_rotated ? 1u : 0u, uint32_t(head_slices), swa ? 1u : 0u,
         uint32_t(stage_groups), uint32_t(tail_groups), eager_records ? 1u : 0u,
-        blocks_x, total_blocks,
+        blocks_x, total_blocks, 1u,
     };
     const vk_subbuffer records_buf = ggml_vk_tensor_subbuffer(ctx, records);
     const vk_subbuffer stage_buf = ggml_vk_tensor_subbuffer(ctx, stage);
     const vk_subbuffer indices_buf = ggml_vk_tensor_subbuffer(ctx, indices);
     const vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-            { records_buf, stage_buf, indices_buf, dst_buf }, pc, { blocks_x, blocks_y, 1 });
+            { records_buf, stage_buf, indices_buf, dst_buf, live_buf },
+            pc, { uint32_t(n_stream), 1, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    pc.mode = 0u;
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            { records_buf, stage_buf, indices_buf, dst_buf, live_buf },
+            pc, { blocks_x, blocks_y, 1 });
+    ctx->prealloc_y_need_sync = true;
+    ctx->prealloc_y_last_pipeline_used = nullptr;
+    ctx->prealloc_y_last_tensor_used = nullptr;
+    ctx->prealloc_y_last_decode_vector_staging = false;
 }
 
 static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -10745,7 +11071,8 @@ static bool ggml_vk_kvarn_attn_parse_side(
     const ggml_tensor * indices = view->src[2];
     if (!valid_bits || stream_start < 0 || n_stream <= 0 ||
             (head_slices != 1 && head_slices != 2 && head_slices != 4) ||
-            stage_groups < 2 || tail_groups < 1 || tail_groups > stage_groups ||
+            stage_groups < 2 || stage_groups > 255 ||
+            tail_groups < 1 || tail_groups > stage_groups || tail_groups > 255 ||
             records->type != GGML_TYPE_I8 || stage->type != GGML_TYPE_F16 ||
             indices->type != GGML_TYPE_I64 ||
             stage->ne[2] % (128 * stage_groups) != 0 ||
@@ -10782,6 +11109,118 @@ static bool ggml_vk_kvarn_attn_parse_side(
     return true;
 }
 
+static bool ggml_vk_kvarn_attn_tail_sources_supported(const ggml_tensor * dst) {
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+    const ggml_tensor * k_tail = dst->src[5];
+    const ggml_tensor * v_tail = dst->src[6];
+    const ggml_tensor * tail_mask = dst->src[7];
+    const ggml_tensor * query_order = dst->src[8];
+    const ggml_tensor * run_desc = dst->src[9];
+    const ggml_tensor * k_current = dst->src[10];
+    const ggml_tensor * v_current = dst->src[11];
+
+    if ((k_current == nullptr) != (v_current == nullptr)) {
+        return false;
+    }
+    if (k_tail == nullptr) {
+        return v_tail == nullptr && tail_mask == nullptr &&
+            query_order == nullptr && run_desc == nullptr &&
+            k_current == nullptr;
+    }
+    if (v_tail == nullptr || tail_mask == nullptr ||
+            query_order == nullptr || run_desc == nullptr ||
+            (k_tail->type != GGML_TYPE_F16 && k_tail->type != GGML_TYPE_BF16) ||
+            (v_tail->type != GGML_TYPE_F16 && v_tail->type != GGML_TYPE_BF16) ||
+            tail_mask->type != GGML_TYPE_F16 ||
+            query_order->type != GGML_TYPE_I32 ||
+            run_desc->type != GGML_TYPE_I32 ||
+            !ggml_is_contiguous(tail_mask) ||
+            !ggml_is_contiguous(query_order) ||
+            !ggml_is_contiguous(run_desc) ||
+            k_tail->ne[0] != q->ne[0] ||
+            v_tail->ne[0] != dst->ne[0] ||
+            k_tail->ne[1] != v_tail->ne[1] ||
+            k_tail->ne[2] != k->ne[2] ||
+            v_tail->ne[2] != v->ne[2] ||
+            query_order->ne[0] <= 0 || query_order->ne[0] > UINT16_MAX ||
+            query_order->ne[1] != run_desc->ne[1] ||
+            tail_mask->ne[0] <= 0 ||
+            tail_mask->ne[1] != q->ne[1] ||
+            tail_mask->ne[2] != 1 ||
+            tail_mask->ne[3] != q->ne[3] ||
+            q->ne[3] > UINT16_MAX ||
+            run_desc->ne[0] != 6 + tail_mask->ne[0] ||
+            k_tail->nb[0] != sizeof(uint16_t) ||
+            v_tail->nb[0] != sizeof(uint16_t) ||
+            k_tail->nb[1] % sizeof(uint16_t) != 0 ||
+            k_tail->nb[2] % sizeof(uint16_t) != 0 ||
+            v_tail->nb[1] % sizeof(uint16_t) != 0 ||
+            v_tail->nb[2] % sizeof(uint16_t) != 0 ||
+            k_tail->nb[1] != v_tail->nb[1] ||
+            k_tail->nb[2] != v_tail->nb[2] ||
+            k_tail->nb[1] / sizeof(uint16_t) > UINT32_MAX ||
+            k_tail->nb[2] / sizeof(uint16_t) > UINT32_MAX ||
+            v_tail->nb[1] / sizeof(uint16_t) > UINT32_MAX ||
+            v_tail->nb[2] / sizeof(uint16_t) > UINT32_MAX) {
+        return false;
+    }
+
+    if (k_current == nullptr) {
+        return true;
+    }
+
+    const int history_slots = ggml_get_op_params_i32(
+            dst, GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_HISTORY_SLOTS);
+    constexpr int max_encoded_history_slots = (1 << 22) - 1;
+    const bool supported = history_slots > 0 && history_slots <= max_encoded_history_slots &&
+        history_slots <= k_tail->ne[1] &&
+        history_slots <= v_tail->ne[1] &&
+        k_current->type == k_tail->type &&
+        v_current->type == v_tail->type &&
+        k_current->ne[0] == k_tail->ne[0] &&
+        v_current->ne[0] == v_tail->ne[0] &&
+        k_current->ne[1] == v_current->ne[1] &&
+        k_current->ne[1] > 0 &&
+        k_current->ne[2] == k_tail->ne[2] &&
+        v_current->ne[2] == v_tail->ne[2] &&
+        k_current->ne[3] == 1 &&
+        v_current->ne[3] == 1 &&
+        k_current->nb[0] == sizeof(uint16_t) &&
+        v_current->nb[0] == sizeof(uint16_t) &&
+        k_current->nb[1] == k_tail->nb[1] &&
+        k_current->nb[2] == k_tail->nb[2] &&
+        v_current->nb[1] == v_tail->nb[1] &&
+        v_current->nb[2] == v_tail->nb[2] &&
+        history_slots + k_current->ne[1] >= tail_mask->ne[0] &&
+        history_slots + v_current->ne[1] >= tail_mask->ne[0];
+    const char * debug_routes = getenv("GGML_KVARN_DEBUG_ROUTES");
+    if (!supported && debug_routes != nullptr && atoi(debug_routes) != 0) {
+        std::cerr << "kvarn-tail-source-reject"
+                  << " history=" << history_slots
+                  << " tail-mask=" << tail_mask->ne[0]
+                  << " k-tail=[" << k_tail->ne[0] << ',' << k_tail->ne[1] << ','
+                  << k_tail->ne[2] << ',' << k_tail->ne[3] << "]"
+                  << " k-tail-stride=[" << k_tail->nb[0] << ',' << k_tail->nb[1] << ','
+                  << k_tail->nb[2] << ',' << k_tail->nb[3] << "]"
+                  << " v-tail=[" << v_tail->ne[0] << ',' << v_tail->ne[1] << ','
+                  << v_tail->ne[2] << ',' << v_tail->ne[3] << "]"
+                  << " v-tail-stride=[" << v_tail->nb[0] << ',' << v_tail->nb[1] << ','
+                  << v_tail->nb[2] << ',' << v_tail->nb[3] << "]"
+                  << " k-current=[" << k_current->ne[0] << ',' << k_current->ne[1] << ','
+                  << k_current->ne[2] << ',' << k_current->ne[3] << "]"
+                  << " k-current-stride=[" << k_current->nb[0] << ',' << k_current->nb[1] << ','
+                  << k_current->nb[2] << ',' << k_current->nb[3] << "]"
+                  << " v-current=[" << v_current->ne[0] << ',' << v_current->ne[1] << ','
+                  << v_current->ne[2] << ',' << v_current->ne[3] << "]"
+                  << " v-current-stride=[" << v_current->nb[0] << ',' << v_current->nb[1] << ','
+                  << v_current->nb[2] << ',' << v_current->nb[3] << "]"
+                  << std::endl;
+    }
+    return supported;
+}
+
 static bool ggml_vk_flash_attn_kvarn(
         ggml_backend_vk_context * ctx,
         vk_context & subctx,
@@ -10796,7 +11235,10 @@ static bool ggml_vk_flash_attn_kvarn(
     const ggml_tensor * tail_mask = dst->src[7];
     const ggml_tensor * query_order = dst->src[8];
     const ggml_tensor * run_desc = dst->src[9];
+    const ggml_tensor * k_tail_current = dst->src[10];
+    const ggml_tensor * v_tail_current = dst->src[11];
     const bool has_tail = k_tail != nullptr;
+    const bool has_tail_current = k_tail_current != nullptr;
     vk_kvarn_attn_side k_side = {};
     vk_kvarn_attn_side v_side = {};
     const bool has_k = ggml_vk_kvarn_attn_parse_side(k, k_side);
@@ -10818,31 +11260,29 @@ static bool ggml_vk_flash_attn_kvarn(
     GGML_ASSERT(q->ne[0] == k->ne[0] && q->ne[0] == v->ne[0]);
     GGML_ASSERT(q->ne[3] == k_side.n_stream);
     GGML_ASSERT(q->ne[2] % k->ne[2] == 0 && k->ne[2] == v->ne[2]);
-    GGML_ASSERT(ggml_is_contiguous(q) && ggml_is_contiguous(dst));
+    const bool q_layout_supported = q->nb[0] == sizeof(float) &&
+        q->nb[1] % sizeof(float) == 0 && q->nb[1] / sizeof(float) <= UINT32_MAX &&
+        q->nb[2] % sizeof(float) == 0 && q->nb[2] / sizeof(float) <= UINT32_MAX &&
+        (q->ne[3] == 1 ||
+         q->nb[3] == size_t(q->ne[0] * q->ne[1] * q->ne[2]) * sizeof(float)) &&
+        ggml_is_contiguous(dst);
+    const char * debug_routes = getenv("GGML_KVARN_DEBUG_ROUTES");
+    if (!q_layout_supported && debug_routes != nullptr && atoi(debug_routes) != 0) {
+        std::cerr << "kvarn-q-layout-reject"
+                  << " q=[" << q->ne[0] << ',' << q->ne[1] << ',' << q->ne[2] << ',' << q->ne[3] << ']'
+                  << " q-stride=[" << q->nb[0] << ',' << q->nb[1] << ',' << q->nb[2] << ',' << q->nb[3] << ']'
+                  << " dst-contiguous=" << ggml_is_contiguous(dst)
+                  << std::endl;
+    }
+    GGML_ASSERT(q_layout_supported);
     GGML_ASSERT(mask == nullptr ||
         (ggml_is_contiguous(mask) && mask->ne[0] == k->ne[1] &&
          mask->ne[1] == q->ne[1] && mask->ne[2] == 1 &&
          (mask->ne[3] == 1 || mask->ne[3] == q->ne[3])));
-    GGML_ASSERT((k_tail == nullptr) ==
-        (v_tail == nullptr && tail_mask == nullptr &&
-         query_order == nullptr && run_desc == nullptr));
+    GGML_ASSERT(ggml_vk_kvarn_attn_tail_sources_supported(dst));
     if (has_tail) {
-        GGML_ASSERT(
-            (k_tail->type == GGML_TYPE_F16 || k_tail->type == GGML_TYPE_BF16) &&
-            (v_tail->type == GGML_TYPE_F16 || v_tail->type == GGML_TYPE_BF16));
-        GGML_ASSERT(tail_mask->type == GGML_TYPE_F16 &&
-            query_order->type == GGML_TYPE_I32 &&
-            run_desc->type == GGML_TYPE_I32);
         GGML_ASSERT(k_tail->ne[0] == q->ne[0] &&
-            v_tail->ne[0] == q->ne[0] &&
-            k_tail->ne[2] == k->ne[2] &&
-            v_tail->ne[2] == v->ne[2] &&
-            query_order->ne[1] == run_desc->ne[1] &&
-            run_desc->ne[0] == 6 + tail_mask->ne[0] &&
-            ggml_is_contiguous(tail_mask) &&
-            tail_mask->ne[1] == q->ne[1] &&
-            tail_mask->ne[2] == 1 &&
-            tail_mask->ne[3] == q->ne[3]);
+            v_tail->ne[0] == q->ne[0]);
     }
 
     float scale = 1.0f;
@@ -10864,10 +11304,22 @@ static bool ggml_vk_flash_attn_kvarn(
     flags |= has_tail && k_tail->type == GGML_TYPE_BF16 ? 32u : 0u;
     flags |= has_tail && v_tail->type == GGML_TYPE_BF16 ? 64u : 0u;
     flags |= k_side.indices == v_side.indices ? 128u : 0u;
+    flags |= has_tail_current ? 256u : 0u;
+    flags |= ggml_get_op_params_i32(
+        dst, GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_BODYLESS) != 0 ? 512u : 0u;
+    const uint32_t history_slots = has_tail_current ? uint32_t(
+        ggml_get_op_params_i32(
+            dst, GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_HISTORY_SLOTS)) : 0u;
+    flags |= history_slots << 10u;
 
     const uint32_t n_query_heads = uint32_t(q->ne[2]);
     const uint32_t n_kv_heads = uint32_t(k->ne[2]);
     const uint32_t gqa = n_query_heads / n_kv_heads;
+    GGML_ASSERT(q->ne[1] <= UINT16_MAX && gqa <= UINT16_MAX &&
+        k_side.stream_start <= UINT16_MAX && k_side.groups_per_stream <= UINT16_MAX &&
+        q->nb[0] == sizeof(float) &&
+        q->nb[1] % sizeof(float) == 0 && q->nb[1] / sizeof(float) <= UINT32_MAX &&
+        q->nb[2] % sizeof(float) == 0 && q->nb[2] / sizeof(float) <= UINT32_MAX);
     const ggml_vk_fattn_kvarn_plan_result route = ggml_vk_fattn_kvarn_plan({
         uint32_t(k->ne[1]),
         uint32_t(q->ne[1]),
@@ -10893,21 +11345,17 @@ static bool ggml_vk_flash_attn_kvarn(
         return uint64_t(subbuffer.buffer->bda_addr + subbuffer.offset);
     };
 
-    const vk_op_kvarn_flash_attn_push_constants pc = {
+    vk_op_kvarn_flash_attn_push_constants pc = {
         uint32_t(k_side.view->ne[1]),
         uint32_t(k->ne[1]),
-        k_side.stream_start,
-        k_side.groups_per_stream,
-        k_side.bits,
-        v_side.bits,
+        k_side.stream_start | (k_side.groups_per_stream << 16u),
+        k_side.bits | (v_side.bits << 16u),
         uint32_t(k_side.indices->ne[0]),
-        k_side.head_slices,
-        k_side.stage_groups,
-        k_side.tail_groups,
+        k_side.head_slices | (k_side.stage_groups << 8u) | (k_side.tail_groups << 16u),
         flags,
-        mask ? uint32_t(mask->ne[3]) : 1u,
+        (mask ? uint32_t(mask->ne[3]) : 1u) |
+            ((has_tail ? uint32_t(query_order->ne[0]) : 0u) << 16u),
         has_tail ? uint32_t(tail_mask->ne[0]) : 0u,
-        has_tail ? uint32_t(query_order->ne[0]) : 0u,
         has_tail ? uint32_t(ggml_nelements(query_order)) : 0u,
         has_tail ? uint32_t(run_desc->ne[0]) : 0u,
         has_tail ? uint32_t(k_tail->nb[1] / sizeof(ggml_fp16_t)) : 0u,
@@ -10917,11 +11365,14 @@ static bool ggml_vk_flash_attn_kvarn(
         has_tail ? tensor_address(tail_mask) : 0u,
         has_tail ? tensor_address(query_order) : 0u,
         has_tail ? tensor_address(run_desc) : 0u,
+        has_tail_current ? tensor_address(k_tail_current) : 0u,
+        has_tail_current ? tensor_address(v_tail_current) : 0u,
         scale,
         max_bias,
         logit_softcap,
-        uint32_t(q->ne[1]),
-        gqa,
+        uint32_t(q->ne[1]) | (gqa << 16u),
+        uint32_t(q->nb[1] / sizeof(float)),
+        uint32_t(q->nb[2] / sizeof(float)),
     };
 
     vk_pipeline pipeline = ctx->device->pipeline_kvarn_flash_attn;
@@ -10931,6 +11382,12 @@ static bool ggml_vk_flash_attn_kvarn(
     const uint64_t split_k_size = route.split_k > 1 ?
         (q->ne[0] * q->ne[1] * sizeof(float) + q->ne[1] * sizeof(float) * 2) *
             route.split_k * q->ne[2] * q->ne[3] : 0;
+    const uint64_t split_k_output_size = route.split_k > 1 ?
+        q->ne[0] * q->ne[1] * sizeof(float) *
+            route.split_k * q->ne[2] * q->ne[3] : 0;
+    const uint64_t split_k_meta_size = split_k_size - split_k_output_size;
+    ggml_vk_kv_memory_transient_stats_record_kvarn(
+        0, split_k_output_size, split_k_meta_size, split_k_size);
     if (split_k_size > ctx->device->properties.limits.maxStorageBufferRange) {
         GGML_ABORT("Requested KVarN split-K preallocation size is too large");
     }
@@ -10948,6 +11405,43 @@ static bool ggml_vk_flash_attn_kvarn(
             ggml_vk_sync_buffers(ctx, subctx);
         }
         attn_dst_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
+    }
+
+    if (debug_routes != nullptr && atoi(debug_routes) != 0) {
+        std::ostringstream route_key;
+        route_key << ctx->device->name << ':' << q->ne[0] << ':' <<
+            k_side.bits << ':' << v_side.bits << ':' << q->ne[1] << ':' <<
+            k->ne[1] << ':' << gqa << ':' << q->ne[3] << ':' <<
+            k_side.swa << ':' << (has_tail ? tail_mask->ne[0] : 0) << ':' <<
+            history_slots << ':' << route.workgroups_y << ':' << route.split_k;
+        static std::mutex debug_routes_mutex;
+        static std::set<std::string> reported_routes;
+        std::lock_guard<std::mutex> lock(debug_routes_mutex);
+        if (reported_routes.insert(route_key.str()).second) {
+            std::cerr << "kvarn-route" <<
+                " backend=Vulkan device=\"" << ctx->device->name <<
+                "\" subgroup=" << ctx->device->subgroup_size <<
+                " D=" << q->ne[0] << " k=" << k_side.bits << " v=" << v_side.bits <<
+                " nq=" << q->ne[1] << " nkv=" << k->ne[1] << " gqa=" << gqa <<
+                " streams=" << q->ne[3] << " swa=" << (k_side.swa ? 1 : 0) <<
+                " tail_stride=" << (has_tail ? tail_mask->ne[0] : 0) <<
+                " tail_history=" << history_slots <<
+                " tail_current=" << (has_tail_current ? k_tail_current->ne[1] : 0) <<
+                " route=portable-native entry=" <<
+                (has_tail_current ? "compact-tail" : "direct") <<
+                " workgroups_y=" << route.workgroups_y <<
+                " split=" << route.split_k << " fallback=none" << std::endl;
+        }
+    }
+
+    ggml_vk_fattn_kvarn_portable_native.fetch_add(1, std::memory_order_relaxed);
+    if (dst->src[10] != nullptr || dst->src[11] != nullptr) {
+        ggml_vk_fattn_kvarn_compact_tail_entry.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        ggml_vk_fattn_kvarn_direct_entry.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (route.split_k > 1) {
+        ggml_vk_fattn_kvarn_split_reduce.fetch_add(1, std::memory_order_relaxed);
     }
 
     ggml_vk_dispatch_pipeline(
@@ -17178,6 +17672,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         std::fill(ctx->query_nodes.begin(), ctx->query_nodes.end(), nullptr);
         std::fill(ctx->query_node_idx.begin(), ctx->query_node_idx.end(), 0);
 
+        // Out-of-graph helpers such as KVarN store can leave work recorded in
+        // the shared compute context before the graph starts. Timestamp
+        // profiling needs a clean command-buffer boundary so its first query
+        // cannot be reordered ahead of that work.
+        if (!ctx->compute_ctx.expired()) {
+            ggml_vk_synchronize(ctx);
+        }
         GGML_ASSERT(ctx->compute_ctx.expired());
         compute_ctx = ggml_vk_get_compute_ctx(ctx);
         ctx->query_idx = 0;
@@ -17930,7 +18431,10 @@ void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total
             *total += heap.size;
 
             if (membudget_supported && i < budgetprops.heapUsage.size()) {
-                *free += budgetprops.heapBudget[i] - budgetprops.heapUsage[i];
+                const vk::DeviceSize budget = budgetprops.heapBudget[i];
+                const vk::DeviceSize usage = budgetprops.heapUsage[i];
+                const vk::DeviceSize available = budget > usage ? budget - usage : 0;
+                *free += std::min<vk::DeviceSize>(available, heap.size);
             } else {
                 *free += heap.size;
             }
@@ -18211,12 +18715,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_FLASH_ATTN_EXT:
             {
-                // Compact precision tails attach graph-local current K/V in
-                // sources 10/11. The Vulkan shaders do not consume those
-                // segments yet, so accepting this shape would silently omit
-                // current tokens. Decline it and let graph placement use the
-                // backend-neutral compact materialization route.
-                if (op->src[10] != nullptr || op->src[11] != nullptr) {
+                if ((op->src[10] == nullptr) != (op->src[11] == nullptr)) {
                     return false;
                 }
                 vk_kvarn_attn_side k_side = {};
@@ -18226,37 +18725,14 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 const bool kvarn_k = ggml_vk_kvarn_attn_parse_side(op->src[1], k_side);
                 const bool kvarn_v = ggml_vk_kvarn_attn_parse_side(op->src[2], v_side);
                 if (uses_kvarn_k || uses_kvarn_v) {
-                    const bool has_tail = op->src[5] != nullptr;
-                    const bool tail_ok = !has_tail ||
-                        (op->src[6] != nullptr && op->src[7] != nullptr &&
-                         op->src[8] != nullptr && op->src[9] != nullptr &&
-                         (op->src[5]->type == GGML_TYPE_F16 ||
-                          op->src[5]->type == GGML_TYPE_BF16) &&
-                         (op->src[6]->type == GGML_TYPE_F16 ||
-                          op->src[6]->type == GGML_TYPE_BF16) &&
-                         op->src[7]->type == GGML_TYPE_F16 &&
-                         op->src[8]->type == GGML_TYPE_I32 &&
-                         op->src[9]->type == GGML_TYPE_I32 &&
-                         ggml_is_contiguous(op->src[7]) &&
-                         ggml_is_contiguous(op->src[8]) &&
-                         ggml_is_contiguous(op->src[9]) &&
-                         op->src[5]->ne[0] == op->src[0]->ne[0] &&
-                         op->src[6]->ne[0] == op->ne[0] &&
-                         op->src[5]->ne[2] == op->src[1]->ne[2] &&
-                         op->src[6]->ne[2] == op->src[2]->ne[2] &&
-                         op->src[8]->ne[0] > 0 &&
-                         op->src[8]->ne[1] == op->src[9]->ne[1] &&
-                         op->src[7]->ne[1] == op->src[0]->ne[1] &&
-                         op->src[7]->ne[2] == 1 &&
-                         op->src[7]->ne[3] == op->src[0]->ne[3] &&
-                         op->src[9]->ne[0] == 6 + op->src[7]->ne[0]);
+                    const bool tail_ok = ggml_vk_kvarn_attn_tail_sources_supported(op);
                     const int domain = ggml_get_op_params_i32(
                         op, GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN);
                     const bool rotated =
                         domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED ||
                         (domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO &&
                          op->src[0]->ne[1] == 1);
-                    return kvarn_k && kvarn_v && rotated && tail_ok &&
+                    const bool supported = kvarn_k && kvarn_v && rotated && tail_ok &&
                         ggml_vk_kvarn_limits_supported(device) &&
                         device->shader_int64 && device->buffer_device_address &&
                         !k_side.value && v_side.value &&
@@ -18279,7 +18755,18 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                         op->src[1]->ne[2] == op->src[2]->ne[2] &&
                         op->src[0]->ne[3] == k_side.n_stream &&
                         op->type == GGML_TYPE_F32 &&
-                        ggml_is_contiguous(op->src[0]) &&
+                        op->src[0]->ne[1] <= UINT16_MAX &&
+                        op->src[0]->ne[2] / op->src[1]->ne[2] <= UINT16_MAX &&
+                        op->src[0]->nb[0] == sizeof(float) &&
+                        op->src[0]->nb[1] % sizeof(float) == 0 &&
+                        op->src[0]->nb[1] / sizeof(float) <= UINT32_MAX &&
+                        op->src[0]->nb[2] % sizeof(float) == 0 &&
+                        op->src[0]->nb[2] / sizeof(float) <= UINT32_MAX &&
+                        k_side.stream_start <= UINT16_MAX &&
+                        k_side.groups_per_stream <= UINT16_MAX &&
+                        (op->src[0]->ne[3] == 1 ||
+                         op->src[0]->nb[3] == size_t(op->src[0]->ne[0] *
+                            op->src[0]->ne[1] * op->src[0]->ne[2]) * sizeof(float)) &&
                         ggml_is_contiguous(op) &&
                         (op->src[3] == nullptr ||
                          (op->src[3]->type == GGML_TYPE_F16 &&
@@ -18290,6 +18777,36 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                           (op->src[3]->ne[3] == 1 ||
                            op->src[3]->ne[3] == op->src[0]->ne[3]))) &&
                         (op->src[4] == nullptr || op->src[4]->type == GGML_TYPE_F32);
+                    const char * debug_routes = getenv("GGML_KVARN_DEBUG_ROUTES");
+                    if (!supported && debug_routes != nullptr && atoi(debug_routes) != 0) {
+                        std::cerr << "kvarn-support-reject"
+                                  << " kvarn-k=" << kvarn_k
+                                  << " kvarn-v=" << kvarn_v
+                                  << " domain=" << domain
+                                  << " rotated=" << rotated
+                                  << " tail-ok=" << tail_ok
+                                  << " limits=" << ggml_vk_kvarn_limits_supported(device)
+                                  << " int64=" << device->shader_int64
+                                  << " bda=" << device->buffer_device_address
+                                  << " q=[" << op->src[0]->ne[0] << ',' << op->src[0]->ne[1] << ','
+                                  << op->src[0]->ne[2] << ',' << op->src[0]->ne[3] << "]"
+                                  << " k=[" << op->src[1]->ne[0] << ',' << op->src[1]->ne[1] << ','
+                                  << op->src[1]->ne[2] << ',' << op->src[1]->ne[3] << "]"
+                                  << " v=[" << op->src[2]->ne[0] << ',' << op->src[2]->ne[1] << ','
+                                  << op->src[2]->ne[2] << ',' << op->src[2]->ne[3] << "]"
+                                  << " q-type=" << ggml_type_name(op->src[0]->type)
+                                  << " dst-type=" << ggml_type_name(op->type)
+                                  << " q-contiguous=" << ggml_is_contiguous(op->src[0])
+                                  << " dst-contiguous=" << ggml_is_contiguous(op)
+                                  << std::endl;
+                    }
+                    return supported;
+                }
+                if (op->src[10] != nullptr || op->src[11] != nullptr) {
+                    // Standard compact-tail attention remains on its explicit
+                    // body/exact/merge fallback because the measured portable
+                    // native route is slower for q4_0 and q5_0.
+                    return false;
                 }
                 bool coopmat2 = device->coopmat2;
                 uint32_t HSK = op->src[1]->ne[0];
@@ -19039,6 +19556,23 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+static bool ggml_backend_vk_kv_tail_segmented_attention_supported(
+        ggml_type body_k,
+        ggml_type body_v,
+        ggml_type tail_k,
+        ggml_type tail_v,
+        int64_t d_k,
+        int64_t d_v) {
+    const bool exact_types =
+        (tail_k == GGML_TYPE_F16 || tail_k == GGML_TYPE_BF16) &&
+        (tail_v == GGML_TYPE_F16 || tail_v == GGML_TYPE_BF16);
+    const bool kvarn_virtual_body =
+        body_k == GGML_TYPE_F16 && body_v == GGML_TYPE_F16;
+    return exact_types &&
+        kvarn_virtual_body &&
+        d_k == d_v && (d_k == 128 || d_k == 256 || d_k == 512);
+}
+
 static bool ggml_backend_vk_kvarn_tail_attention_supported(
         ggml_backend_dev_t dev,
         ggml_type body_k,
@@ -19054,14 +19588,17 @@ static bool ggml_backend_vk_kvarn_tail_attention_supported(
     const auto & device = ggml_vk_get_device(ctx->device);
     return ggml_vk_kvarn_limits_supported(device) &&
         device->shader_int64 && device->buffer_device_address &&
-        body_k == GGML_TYPE_F16 && body_v == GGML_TYPE_F16 &&
-        (tail_k == GGML_TYPE_F16 || tail_k == GGML_TYPE_BF16) &&
-        (tail_v == GGML_TYPE_F16 || tail_v == GGML_TYPE_BF16) &&
-        d_k == d_v && (d_k == 128 || d_k == 256 || d_k == 512);
+        ggml_backend_vk_kv_tail_segmented_attention_supported(
+            body_k, body_v, tail_k, tail_v, d_k, d_v);
 }
 
 static uint32_t ggml_backend_vk_kvarn_native_rotated_max_query_tokens(ggml_backend_dev_t dev) {
     return ggml_backend_vk_kvarn_native_ops(dev) ? 16u : 0u;
+}
+
+static bool ggml_backend_vk_kvarn_mixed_tail_native_preferred(ggml_backend_dev_t dev) {
+    GGML_UNUSED(dev);
+    return false;
 }
 
 static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
@@ -19075,8 +19612,26 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     if (strcmp(name, "ggml_backend_kvarn_tail_attention_supported") == 0) {
         return (void *) ggml_backend_vk_kvarn_tail_attention_supported;
     }
+    if (strcmp(name, "ggml_backend_kv_tail_segmented_attention_supported") == 0) {
+        return (void *) ggml_backend_vk_kv_tail_segmented_attention_supported;
+    }
     if (strcmp(name, "ggml_backend_kvarn_native_rotated_max_query_tokens") == 0) {
         return (void *) ggml_backend_vk_kvarn_native_rotated_max_query_tokens;
+    }
+    if (strcmp(name, "ggml_backend_kvarn_mixed_tail_native_preferred") == 0) {
+        return (void *) ggml_backend_vk_kvarn_mixed_tail_native_preferred;
+    }
+    if (strcmp(name, "ggml_backend_kvarn_route_stats_reset") == 0) {
+        return (void *) ggml_backend_vk_kvarn_route_stats_reset;
+    }
+    if (strcmp(name, "ggml_backend_kvarn_route_stats_get") == 0) {
+        return (void *) ggml_backend_vk_kvarn_route_stats_get;
+    }
+    if (strcmp(name, "ggml_backend_kv_memory_transient_stats_reset") == 0) {
+        return (void *) ggml_backend_vk_kv_memory_transient_stats_reset;
+    }
+    if (strcmp(name, "ggml_backend_kv_memory_transient_stats_get") == 0) {
+        return (void *) ggml_backend_vk_kv_memory_transient_stats_get;
     }
     return nullptr;
 }

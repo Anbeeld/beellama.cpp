@@ -20,15 +20,19 @@ layout(push_constant) uniform parameter {
     uint eager_records;
     uint blocks_x;
     uint total_blocks;
+    uint mode;
 } p;
 
 layout(binding = 0, std430) readonly buffer Records { uint data_records[]; };
 layout(binding = 1, std430) readonly buffer Stage { uint data_stage[]; };
 layout(binding = 2, std430) readonly buffer Indices { uint data_indices[]; };
 layout(binding = 3, std430) buffer Dst { uint data_dst[]; };
+layout(binding = 4, std430) buffer Live { uint data_live[]; };
 
 const uint KVAR_N_DIM = 128;
 const float KVAR_N_WHT_SCALE = 0.08838834764831845;
+const uint MODE_MATERIALIZE = 0u;
+const uint MODE_PREPARE_LIVE = 1u;
 shared float sh_wht[128];
 shared uint sh_live_group[128];
 shared uint sh_live_pos[128];
@@ -90,6 +94,21 @@ void compute_live(uint stream, uint lane, out uint group_out, out uint pos_out) 
     }
     group_out = sh_live_group[0];
     pos_out = sh_live_pos[0];
+}
+
+void prepare_live(uint lane) {
+    const uint out_stream = gl_WorkGroupID.x;
+    if (out_stream >= p.n_stream) {
+        return;
+    }
+    uint live_group;
+    uint live_pos;
+    compute_live(
+        p.stream_start + out_stream, lane, live_group, live_pos);
+    if (lane == 0u) {
+        data_live[2u * out_stream + 0u] = live_group;
+        data_live[2u * out_stream + 1u] = live_pos;
+    }
 }
 
 void wht_128(uint lane) {
@@ -154,9 +173,12 @@ float load_materialized(
         const uint col = p.value != 0u ? lane : pos;
         const uint payload_words = p.bits * 512u;
         const uint q = unpack_record_value(record_base, row * KVAR_N_DIM + col);
-        const float scale = load_axis_value(record_base, payload_words, 0u, row);
-        const float zp = load_axis_value(record_base, payload_words, 1u, row);
-        const float other = load_axis_value(record_base, payload_words, 2u, col);
+        const float scale = load_axis_value(
+            record_base, payload_words, 0u, row);
+        const float zp = load_axis_value(
+            record_base, payload_words, 1u, row);
+        const float other = load_axis_value(
+            record_base, payload_words, 2u, col);
         return (float(q) * scale + zp) * other;
     }
     return 0.0;
@@ -164,6 +186,10 @@ float load_materialized(
 
 void main() {
     const uint lane = gl_LocalInvocationID.x;
+    if (p.mode == MODE_PREPARE_LIVE) {
+        prepare_live(lane);
+        return;
+    }
     const uint flat_block = gl_WorkGroupID.x + gl_WorkGroupID.y * p.blocks_x;
     if (flat_block >= p.total_blocks) {
         return;
@@ -175,9 +201,8 @@ void main() {
     const uint token = token_stream % p.n_kv;
     const uint out_stream = token_stream / p.n_kv;
     const uint stream = p.stream_start + out_stream;
-    uint live_group;
-    uint live_pos;
-    compute_live(stream, lane, live_group, live_pos);
+    const uint live_group = data_live[2u * out_stream + 0u];
+    const uint live_pos = data_live[2u * out_stream + 1u];
 
     float values[4] = float[4](0.0, 0.0, 0.0, 0.0);
     for (uint slice = 0u; slice < p.head_slices; ++slice) {
