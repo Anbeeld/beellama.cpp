@@ -369,6 +369,7 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
     }
 
     half * p_h = (half *) p_sh;
+#if defined(GGML_USE_HIP) && defined(CDNA)
     if (tid < MAX_GQA) {
         const int h = tid;
         float m = -FLT_MAX / 2.0f;
@@ -385,6 +386,38 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
         m_sh[h] = m;
         denom_sh[h] = denom;
     }
+#else
+    const int h = tid / 16;
+    const int lane_h = tid % 16;
+    float m = -FLT_MAX / 2.0f;
+    if (h < MAX_GQA) {
+        for (int token = lane_h; token < SPLIT_TOKENS; token += 16) {
+            m = fmaxf(m, score_sh[h][token] + FATTN_KQ_MAX_OFFSET);
+        }
+    }
+#pragma unroll
+    for (int offset = 8; offset > 0; offset >>= 1) {
+        m = fmaxf(m, __shfl_xor_sync(0xFFFFFFFFu, m, offset, 16));
+    }
+
+    float denom = 0.0f;
+    if (h < MAX_GQA) {
+        for (int token = lane_h; token < SPLIT_TOKENS; token += 16) {
+            const float diff = score_sh[h][token] - m;
+            const float weight = diff >= SOFTMAX_FTZ_THRESHOLD ? expf(diff) : 0.0f;
+            denom += weight;
+            p_h[h * (2 * P_STRIDE2) + token] = __float2half(weight);
+        }
+    }
+#pragma unroll
+    for (int offset = 8; offset > 0; offset >>= 1) {
+        denom += __shfl_xor_sync(0xFFFFFFFFu, denom, offset, 16);
+    }
+    if (h < MAX_GQA && lane_h == 0) {
+        m_sh[h] = m;
+        denom_sh[h] = denom;
+    }
+#endif
     __syncthreads();
 
     if (v_from_record) {

@@ -317,6 +317,15 @@ def main() -> None:
     if ("#if !defined(GGML_CUDA_KVARN) || defined(GGML_USE_MUSA)" not in cuda_backend or
             "#if defined(GGML_CUDA_KVARN)\n        case GGML_OP_KVARN_WHT:" not in cuda_backend):
         raise AssertionError("disabled KVarN kernels must not be advertised or dispatched by CUDA")
+    if not re.search(
+        r"#if defined\(GGML_CUDA_KVARN\)\s+"
+        r'if \(strcmp\(name, "ggml_backend_kvarn_store_route_stats_reset"\).*?'
+        r'if \(strcmp\(name, "ggml_backend_kvarn_store_route_stats_get"\).*?'
+        r"#endif",
+        cuda_backend,
+        re.DOTALL,
+    ):
+        raise AssertionError("KVarN-off builds must not link store-route telemetry from the excluded kvarn.cu")
 
     default_build = (ROOT / "tmp/build-local-3090-cuda13.1-default.ps1").read_text(encoding="utf-8")
     if default_build.count(f"-D{kvarn_option}=ON") != 1:

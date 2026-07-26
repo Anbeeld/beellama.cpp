@@ -64,6 +64,7 @@ int main(int argc, char ** argv) {
     const std::string musa_cmake = read_file(root + "/ggml/src/ggml-musa/CMakeLists.txt");
     const std::string kvarn_mma = read_file(root + "/ggml/src/ggml-cuda/fattn-mma-kvarn-impl.cuh");
     const std::string kvarn_mma_case = read_file(root + "/ggml/src/ggml-cuda/fattn-mma-kvarn-case.cuh");
+    const std::string fattn_mma_f16 = read_file(root + "/ggml/src/ggml-cuda/fattn-mma-f16.cuh");
     const std::string kvarn_decode = read_file(root + "/ggml/src/ggml-cuda/fattn-mma-kvarn-decode.cuh");
     const std::string kvarn_dispatch_header = read_file(root + "/ggml/src/ggml-cuda/fattn-kvarn-dispatch.cuh");
     const std::string kvarn_wht = read_file(root + "/ggml/src/ggml-cuda/kvarn-wht.cu");
@@ -239,6 +240,19 @@ int main(int argc, char ** argv) {
     ok &= expect(kvarn_wide_instance.find("!defined(GGML_USE_HIP)") == std::string::npos &&
                  kvarn_wide_instance.find("!defined(GGML_USE_MUSA)") != std::string::npos,
         "wide KVarN MMA instances must compile for AMD HIP while MUSA stays portable");
+    const std::string rdna_mma_config = slice_between(
+        fattn_mma_f16, "ggml_cuda_fattn_mma_get_config_rdna", "ggml_cuda_fattn_mma_get_config_cdna");
+    const std::string cdna_mma_config = slice_between(
+        fattn_mma_f16, "ggml_cuda_fattn_mma_get_config_cdna", "static __host__ fattn_mma_config");
+    ok &= expect(rdna_mma_config.find(
+                     "GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 128, 256") != std::string::npos &&
+                 rdna_mma_config.find(
+                     "GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 128, 256") != std::string::npos &&
+                 cdna_mma_config.find(
+                     "GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 128, 512") != std::string::npos &&
+                 cdna_mma_config.find(
+                     "GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 128, 512") != std::string::npos,
+        "wide KVarN MMA requires explicit 128-column RDNA/CDNA configurations");
     ok &= expect(kvarn_mma_case.find("cudaOccupancyMaxActiveBlocksPerMultiprocessor") != std::string::npos &&
                  kvarn_mma_case.find("smpbo") != std::string::npos,
         "wide KVarN MMA eligibility must be based on actual device resources and kernel occupancy");
@@ -246,6 +260,12 @@ int main(int argc, char ** argv) {
                  kvarn_decode.find("static_assert(WARP_SIZE == 32") == std::string::npos &&
                  kvarn_decode.find("devices[device].warp_size") != std::string::npos,
         "KVarN split decode must launch and index physical RDNA/CDNA waves");
+    const std::string decode_softmax = slice_between(
+        kvarn_decode, "half * p_h = (half *) p_sh;", "if (v_from_record)");
+    ok &= expect(decode_softmax.find("#if defined(GGML_USE_HIP) && defined(CDNA)") != std::string::npos &&
+                 decode_softmax.find("const int lane_h = tid % 16;") != std::string::npos &&
+                 count_occurrences(decode_softmax, "__shfl_xor_sync") >= 2,
+        "CDNA softmax fallback must not serialize the mature CUDA/RDNA subgroup path");
     ok &= expect(kvarn_wht.find("__shfl_xor_sync") != std::string::npos &&
                  kvarn_wht.find("ggml_cuda_get_physical_warp_size()") != std::string::npos &&
                  kvarn_wht.find("GGML_KVARN_TEST_FORCE_SHARED_WHT") != std::string::npos,

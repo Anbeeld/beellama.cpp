@@ -5555,12 +5555,14 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_kvarn_route_stats_get") == 0) {
         return (void *)ggml_cuda_fattn_kvarn_route_stats_get;
     }
+#if defined(GGML_CUDA_KVARN)
     if (strcmp(name, "ggml_backend_kvarn_store_route_stats_reset") == 0) {
         return (void *)ggml_cuda_kvarn_store_route_stats_reset;
     }
     if (strcmp(name, "ggml_backend_kvarn_store_route_stats_get") == 0) {
         return (void *)ggml_cuda_kvarn_store_route_stats_get;
     }
+#endif
     if (strcmp(name, "ggml_backend_kv_memory_transient_stats_reset") == 0) {
         return (void *)ggml_cuda_kv_memory_transient_stats_reset;
     }
