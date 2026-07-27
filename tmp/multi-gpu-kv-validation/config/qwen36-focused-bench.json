@@ -1,0 +1,15 @@
+{
+  "executable": "C:\\Users\\anbee\\projects\\beellama.cpp\\build-local-rtx3090-cuda-13.1\\bin\\llama-bench.exe",
+  "model": "D:\\models\\Qwen3.6-27B-GGUF\\Qwen3.6-27B-Q5_K_S.gguf",
+  "context": 16384,
+  "coordinates": [
+    { "id": "bench-none-bf16", "task": "performance", "timeout_seconds": 3600, "arguments": ["-m", "{model}", "-p", "16384", "-n", "128", "-d", "4096,16384", "-r", "7", "-b", "2048", "-ub", "512", "-fa", "on", "-ctk", "bf16", "-ctv", "bf16", "-sm", "none", "-ngl", "999", "-o", "jsonl"] },
+    { "id": "bench-tensor-bf16", "task": "performance", "timeout_seconds": 3600, "arguments": ["-m", "{model}", "-p", "16384", "-n", "128", "-d", "4096,16384", "-r", "7", "-b", "2048", "-ub", "512", "-fa", "on", "-ctk", "bf16", "-ctv", "bf16", "-dev", "CUDA0/CUDA0", "-sm", "tensor", "-ts", "1/1", "-ngl", "999", "-o", "jsonl"] },
+    { "id": "bench-none-q4-tail0", "task": "performance", "timeout_seconds": 3600, "arguments": ["-m", "{model}", "-p", "16384", "-n", "128", "-d", "4096,16384", "-r", "7", "-b", "2048", "-ub", "512", "-fa", "on", "-ctk", "q4_0", "-ctv", "q4_0", "--kv-tail-tokens", "0", "--kv-tail-type", "bf16", "-sm", "none", "-ngl", "999", "-o", "jsonl"] },
+    { "id": "bench-none-q4-tail1024", "task": "performance", "timeout_seconds": 3600, "arguments": ["-m", "{model}", "-p", "16384", "-n", "128", "-d", "4096,16384", "-r", "7", "-b", "2048", "-ub", "512", "-fa", "on", "-ctk", "q4_0", "-ctv", "q4_0", "--kv-tail-tokens", "1024", "--kv-tail-type", "bf16", "-sm", "none", "-ngl", "999", "-o", "jsonl"] },
+    { "id": "bench-tensor-q4-tail1024", "task": "performance", "timeout_seconds": 3600, "arguments": ["-m", "{model}", "-p", "16384", "-n", "128", "-d", "4096,16384", "-r", "7", "-b", "2048", "-ub", "512", "-fa", "on", "-ctk", "q4_0", "-ctv", "q4_0", "--kv-tail-tokens", "1024", "--kv-tail-type", "bf16", "-dev", "CUDA0/CUDA0", "-sm", "tensor", "-ts", "1/1", "-ngl", "999", "-o", "jsonl"] },
+    { "id": "bench-none-kvarn4-tail0", "task": "performance", "timeout_seconds": 3600, "arguments": ["-m", "{model}", "-p", "16384", "-n", "128", "-d", "4096,16384", "-r", "7", "-b", "2048", "-ub", "512", "-fa", "on", "-ctk", "kvarn4", "-ctv", "kvarn4", "--kv-tail-tokens", "0", "--kv-tail-type", "f16", "-sm", "none", "-ngl", "999", "-o", "jsonl"] },
+    { "id": "bench-none-kvarn4-tail1024", "task": "performance", "timeout_seconds": 3600, "arguments": ["-m", "{model}", "-p", "16384", "-n", "128", "-d", "4096,16384", "-r", "7", "-b", "2048", "-ub", "512", "-fa", "on", "-ctk", "kvarn4", "-ctv", "kvarn4", "--kv-tail-tokens", "1024", "--kv-tail-type", "f16", "-sm", "none", "-ngl", "999", "-o", "jsonl"] },
+    { "id": "bench-tensor-kvarn4-tail1024", "task": "performance", "timeout_seconds": 3600, "arguments": ["-m", "{model}", "-p", "16384", "-n", "128", "-d", "4096,16384", "-r", "7", "-b", "2048", "-ub", "512", "-fa", "on", "-ctk", "kvarn4", "-ctv", "kvarn4", "--kv-tail-tokens", "1024", "--kv-tail-type", "f16", "-dev", "CUDA0/CUDA0", "-sm", "tensor", "-ts", "3/1", "-ngl", "999", "-o", "jsonl"] }
+  ]
+}

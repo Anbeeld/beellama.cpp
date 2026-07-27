@@ -4,6 +4,7 @@
 #include "gguf.h"
 #include "llama.h"
 #include "preset.h"
+#include "speculative.h"
 
 #include <filesystem>
 #include <algorithm>
@@ -765,9 +766,29 @@ static void test(void) {
     printf("test-arg-parser: all tests OK\n\n");
 }
 
+static void test_single_device_draft_does_not_inherit_target_tensor_split() {
+    common_params params;
+    params.split_mode      = LLAMA_SPLIT_MODE_TENSOR;
+    params.tensor_split[0] = 3.0f;
+    params.tensor_split[1] = 1.0f;
+    params.speculative.draft.mparams.path = "draft.gguf";
+    params.speculative.draft.devices = {
+        reinterpret_cast<ggml_backend_dev_t>(uintptr_t{1}),
+        nullptr,
+    };
+
+    const common_params draft = common_base_params_to_speculative(params);
+
+    assert(draft.split_mode == LLAMA_SPLIT_MODE_NONE);
+    for (float value : draft.tensor_split) {
+        assert(value == 0.0f);
+    }
+}
+
 int main(void) {
     try {
         test();
+        test_single_device_draft_does_not_inherit_target_tensor_split();
     } catch (std::exception & e) {
         fprintf(stderr, "test-arg-parser: exception: %s\n", e.what());
         return 1;

@@ -9,6 +9,7 @@
 #include "llama-model-loader.h"
 
 #include "llama-kv-cache.h"
+#include "llama-kv-cache-placement.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-kvarn.h"
 #include "llama-kv-cache-dsa.h"
@@ -342,6 +343,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
     const std::string tensor_name = tensor->name;
+    const llama_kv_cache_component cache_component =
+            llama_kv_cache_component_from_name(tensor_name);
 
     static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
     static const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");
@@ -350,7 +353,6 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_kv_bias         ("blk\\.\\d*\\.attn_(k|v)\\.bias");
     static const std::regex pattern_qkv_bias        ("blk\\.\\d*\\.attn_qkv.bias");
     static const std::regex pattern_qk_norm         ("blk\\.\\d*\\.attn_(q|k)_norm\\.weight");
-    static const std::regex pattern_kv_cache        ("cache_(k|v)_l\\d*");
     static const std::regex pattern_attn_sinks      ("blk\\.\\d*\\.attn_sinks.weight");
     static const std::regex pattern_attn_out_weight ("blk\\.\\d*\\.attn_output.weight");
     static const std::regex pattern_attn_out_bias   ("blk\\.\\d*\\.attn_output.bias");
@@ -430,6 +432,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_tensor_config = [&]() -> tensor_config {
+        if (cache_component.valid) {
+            return get_tensor_config_impl(
+                    ggml_backend_meta_split_axis(cache_component.split_axis),
+                    "attn_output.weight");
+        }
         // standard attention
         if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
@@ -446,7 +453,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         if (std::regex_match(tensor_name, pattern_qk_norm)) {
             return get_tensor_config_impl(tensor->ne[1] == 1 ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
         }
-        if (std::regex_match(tensor_name, pattern_kv_cache) || std::regex_match(tensor_name, pattern_attn_sinks)) {
+        if (std::regex_match(tensor_name, pattern_attn_sinks)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
         }
         if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
@@ -635,9 +642,30 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
 
             const int64_t granularity_kv = granularity_q / n_gqa;
+            if (cache_component.valid) {
+                GGML_ASSERT(segments.size() == 1);
+                switch (cache_component.role) {
+                    case LLAMA_KV_CACHE_COMPONENT_STANDARD_K:
+                    case LLAMA_KV_CACHE_COMPONENT_STANDARD_K_TAIL:
+                    case LLAMA_KV_CACHE_COMPONENT_KVARN_K_TAIL:
+                        return { int64_t(hparams.n_embd_head_k(il)) };
+                    case LLAMA_KV_CACHE_COMPONENT_STANDARD_V:
+                    case LLAMA_KV_CACHE_COMPONENT_STANDARD_V_TAIL:
+                    case LLAMA_KV_CACHE_COMPONENT_KVARN_V_TAIL:
+                        return { int64_t(hparams.n_embd_head_v(il)) };
+                    case LLAMA_KV_CACHE_COMPONENT_KVARN_K_RECORDS:
+                    case LLAMA_KV_CACHE_COMPONENT_KVARN_K_STAGE:
+                        return { int64_t(llama_kvarn_head_slices(hparams.n_embd_head_k(il))) };
+                    case LLAMA_KV_CACHE_COMPONENT_KVARN_V_RECORDS:
+                    case LLAMA_KV_CACHE_COMPONENT_KVARN_V_STAGE:
+                        return { int64_t(llama_kvarn_head_slices(hparams.n_embd_head_v(il))) };
+                    case LLAMA_KV_CACHE_COMPONENT_UNKNOWN:
+                        break;
+                }
+                GGML_ABORT("unknown typed KV cache component");
+            }
             if (std::regex_match(tensor_name, pattern_kv_weight) ||
-                std::regex_match(tensor_name, pattern_kv_bias) ||
-                std::regex_match(tensor_name, pattern_kv_cache)) {
+                std::regex_match(tensor_name, pattern_kv_bias)) {
                 GGML_ASSERT(segments.size() == 1);
                 return {granularity_kv};
             }

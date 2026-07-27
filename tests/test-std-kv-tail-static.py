@@ -267,12 +267,37 @@ def main() -> None:
         raise AssertionError("standard overlay placement still uses CLI split mode instead of realized body storage")
     standard_order = [
         constructor.find("ggml_backend_alloc_ctx_tensors_from_buft"),
-        constructor.find("realized %s body uses a tensor/meta split buffer"),
+        constructor.find("validate_meta_body(layer, owner_k"),
         constructor.find("finalize_tail_overlay_metadata()"),
         constructor.find('ggml_format_name(layer.k_tail, "cache_k_tail_l%d"'),
     ]
     if min(standard_order) < 0 or standard_order != sorted(standard_order):
-        raise AssertionError("standard cache must allocate body, reject meta placement, then allocate tail metadata/tensors")
+        raise AssertionError("standard cache must validate its realized meta split before allocating tail metadata/tensors")
+    if "realized %s body uses a tensor/meta split buffer" in constructor:
+        raise AssertionError("standard precision tails still reject a valid upstream tensor/meta owner")
+
+    model_source = (ROOT / "src/llama-model.cpp").read_text(encoding="utf-8")
+    placement_header = (ROOT / "src/llama-kv-cache-placement.h").read_text(encoding="utf-8")
+    meta_source = (ROOT / "ggml/src/ggml-backend-meta.cpp").read_text(encoding="utf-8")
+    for role in (
+        "STANDARD_K_TAIL", "STANDARD_V_TAIL", "KVARN_K_RECORDS",
+        "KVARN_V_RECORDS", "KVARN_K_STAGE", "KVARN_V_STAGE",
+        "KVARN_K_TAIL", "KVARN_V_TAIL",
+    ):
+        if f"LLAMA_KV_CACHE_COMPONENT_{role}" not in placement_header or f"LLAMA_KV_CACHE_COMPONENT_{role}" not in model_source:
+            raise AssertionError(f"typed meta placement is missing cache component role {role}")
+    if "llama_kv_cache_component_from_name" not in model_source:
+        raise AssertionError("upstream split callback does not consume the typed cache component adapter")
+    if "handle_kvarn_cache" not in meta_source:
+        raise AssertionError("meta dispatch does not preserve KVarN's sharded payload state")
+    if "cgraph_ij->uid = 0" not in meta_source:
+        raise AssertionError("projected meta graphs must declare that they have no stable identity")
+    cuda_graph_source = (ROOT / "ggml/src/ggml-cuda/ggml-cuda.cu").read_text(encoding="utf-8")
+    cuda_graph_compatibility = cuda_graph_source.split(
+        "static bool ggml_cuda_graph_check_compability", 1
+    )[1].split("static const void * ggml_cuda_graph_get_key", 1)[0]
+    if "cgraph->uid == 0" not in cuda_graph_compatibility:
+        raise AssertionError("CUDA graph replay must reject projected graphs without a stable identity")
 
     cache_header = (ROOT / "src/llama-kv-cache.h").read_text(encoding="utf-8")
     get_tail_tokens = cache_header.split("uint32_t get_tail_tokens() const", 1)[1].split("}", 1)[0]
@@ -375,12 +400,14 @@ def main() -> None:
         raise AssertionError("KVarN does not store its finalized route in the shared tail plan")
     kvarn_order = [
         kvarn_cache.find("ggml_backend_alloc_ctx_tensors_from_buft"),
-        kvarn_cache.find("realized body uses a tensor/meta split buffer"),
+        kvarn_cache.find("expected complete-head axis 1"),
         kvarn_cache.find("metadata->finalize_tail_overlay_metadata()"),
         kvarn_cache.find('ggml_format_name(layer.k_tail, "cache_kvarn_k_tail_l%d"'),
     ]
     if min(kvarn_order) < 0 or kvarn_order != sorted(kvarn_order):
-        raise AssertionError("KVarN must allocate body, reject meta placement, then allocate tail metadata/tensors")
+        raise AssertionError("KVarN must validate its complete-head meta split before allocating tail metadata/tensors")
+    if "realized body uses a tensor/meta split buffer" in kvarn_cache:
+        raise AssertionError("KVarN still rejects a valid upstream tensor/meta owner")
     for required in ("ggml_flash_attn_ext_add_kv_tail", "ggml_kv_tail_attention_merge"):
         if required not in ggml_header:
             raise AssertionError(f"ggml tail-attention contract lacks {required}")

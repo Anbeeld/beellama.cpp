@@ -3,6 +3,7 @@
 #include "llama-kv-cache-tail.h"
 
 #include <cmath>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -38,6 +39,24 @@ static void test_representation_topology() {
             native.layout.total_slots == 0) {
         fail("native-exact representation unexpectedly requires a shadow merge graph");
     }
+}
+
+static ggml_backend_meta_split_state test_standard_meta_split(
+        const ggml_tensor * tensor, void *) {
+    if (std::strcmp(tensor->name, "meta_cache") == 0 ||
+            std::strcmp(tensor->name, "meta_current") == 0) {
+        ggml_backend_meta_split_state result = {
+            GGML_BACKEND_SPLIT_AXIS_0, { 0 }, { 1 }, 1
+        };
+        // Two complete four-element heads over three logical devices.  This
+        // is the zero-head-shard case exercised by upstream tensor mode when
+        // there are more participating devices than KV heads.
+        result.ne[0] = 0;
+        result.ne[1] = 4;
+        result.ne[2] = 4;
+        return result;
+    }
+    return { GGML_BACKEND_SPLIT_AXIS_MIRRORED, { 0 }, { 1 }, 1 };
 }
 
 static void test_shadow_roundtrip(ggml_backend_t backend) {
@@ -107,6 +126,90 @@ static void test_shadow_roundtrip(ggml_backend_t backend) {
     }
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
+}
+
+static void test_meta_shadow_roundtrip(ggml_backend_t backend) {
+    constexpr int64_t width = 8;
+    constexpr int64_t slots = 7;
+    constexpr int64_t writes = 3;
+    constexpr int64_t tail = 3;
+    constexpr int64_t queries = 3;
+    ggml_init_params params = { 1024*1024, nullptr, true };
+    ggml_context * static_ctx = ggml_init(params);
+    ggml_tensor * storage = ggml_new_tensor_2d(static_ctx, GGML_TYPE_F16, width, slots);
+    ggml_tensor * source = ggml_new_tensor_2d(static_ctx, GGML_TYPE_F32, width, writes);
+    ggml_tensor * write_idxs = ggml_new_tensor_1d(static_ctx, GGML_TYPE_I64, writes);
+    ggml_tensor * read_idxs = ggml_new_tensor_2d(static_ctx, GGML_TYPE_I32, tail, queries);
+    ggml_set_name(storage, "meta_cache");
+    ggml_set_name(source, "meta_current");
+    ggml_backend_buffer_t static_buffer = ggml_backend_alloc_ctx_tensors(
+            static_ctx, backend);
+    if (!static_buffer) {
+        fail("failed to allocate static meta exact-tail tensors");
+    }
+
+    ggml_context * compute_ctx = ggml_init(params);
+    ggml_tensor * write = ggml_set_rows(
+            compute_ctx, storage, source, write_idxs);
+    ggml_tensor * rows = ggml_get_rows_as(
+            compute_ctx, write,
+            ggml_reshape_1d(compute_ctx, read_idxs, tail*queries),
+            GGML_TYPE_F16);
+    rows = ggml_reshape_4d(compute_ctx, rows, width, 1, tail, queries);
+    ggml_cgraph * graph = ggml_new_graph(compute_ctx);
+    ggml_build_forward_expand(graph, write);
+    ggml_build_forward_expand(graph, rows);
+    ggml_backend_t cpu_backend = ggml_backend_init_by_type(
+            GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    if (!cpu_backend) {
+        fail("failed to initialize CPU scheduler fallback");
+    }
+    ggml_backend_t backends[] = { backend, cpu_backend };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(
+            backends, nullptr, 2, 32, false, true);
+    if (!sched || !ggml_backend_sched_alloc_graph(sched, graph)) {
+        fail("failed to allocate scheduled meta exact-tail graph");
+    }
+
+    const std::vector<float> source_data = {
+        1,2,3,4,5,6,7,8, 11,12,13,14,15,16,17,18, 21,22,23,24,25,26,27,28,
+    };
+    const int64_t write_data[] = { 2, 5, 1 };
+    const int32_t read_data[] = { 2,5,1, 1,2,5, 5,1,2 };
+    ggml_backend_tensor_set(source, source_data.data(), 0, ggml_nbytes(source));
+    ggml_backend_tensor_set(write_idxs, write_data, 0, sizeof(write_data));
+    ggml_backend_tensor_set(read_idxs, read_data, 0, sizeof(read_data));
+    if (ggml_backend_sched_graph_compute(sched, graph) != GGML_STATUS_SUCCESS) {
+        fail("scheduled meta exact-tail compute failed");
+    }
+    std::vector<ggml_fp16_t> got_f16(ggml_nelements(rows));
+    std::vector<float> got(got_f16.size());
+    ggml_backend_tensor_get(rows, got_f16.data(), 0,
+            got_f16.size()*sizeof(ggml_fp16_t));
+    ggml_fp16_to_fp32_row(got_f16.data(), got.data(), got.size());
+    for (int64_t iq = 0; iq < queries; ++iq) {
+        for (int64_t it = 0; it < tail; ++it) {
+            int source_row = -1;
+            for (int iw = 0; iw < writes; ++iw) {
+                if (write_data[iw] == read_data[it + tail*iq]) {
+                    source_row = iw;
+                }
+            }
+            for (int64_t i = 0; i < width; ++i) {
+                const float expected = source_data[i + width*source_row];
+                const float actual = got[i + width*(it + tail*iq)];
+                if (actual != expected) {
+                    fail("scheduled meta exact-tail roundtrip mismatch");
+                }
+            }
+        }
+    }
+
+    ggml_backend_sched_free(sched);
+    ggml_backend_free(cpu_backend);
+    ggml_free(compute_ctx);
+    ggml_backend_buffer_free(static_buffer);
+    ggml_free(static_ctx);
 }
 
 static void test_fully_masked_quant_body(ggml_backend_t backend, ggml_type body_type) {
@@ -687,6 +790,21 @@ int main() {
     test_attention_graph(backend);
     test_shadow_roundtrip(backend);
     ggml_backend_free(backend);
+
+    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (!cpu) {
+        fail("failed to find CPU device for meta exact-tail test");
+    }
+    ggml_backend_dev_t logical_devices[] = { cpu, cpu, cpu };
+    ggml_backend_dev_t meta_dev = ggml_backend_meta_device(
+            logical_devices, 3, test_standard_meta_split, nullptr);
+    ggml_backend_t meta_backend = ggml_backend_dev_init(meta_dev, nullptr);
+    if (!meta_backend) {
+        fail("failed to initialize meta backend for exact-tail test");
+    }
+    test_meta_shadow_roundtrip(meta_backend);
+    ggml_backend_free(meta_backend);
+
     backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
     if (backend) {
         test_attention_graph(backend);

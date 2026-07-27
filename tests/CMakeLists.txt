@@ -354,6 +354,8 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
 llama_build_and_test(test-arg-parser.cpp)
 llama_build_and_test(test-kv-cache-tail.cpp ../src/llama-kv-cache-tail.cpp)
 target_include_directories(test-kv-cache-tail PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_build_and_test(test-kv-cache-placement.cpp ../src/llama-kv-cache-placement.cpp)
+target_include_directories(test-kv-cache-placement PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build_and_test(test-std-kv-tail-graph.cpp ../src/llama-kv-cache-tail.cpp)
 target_include_directories(test-std-kv-tail-graph PRIVATE ${PROJECT_SOURCE_DIR}/src)
 

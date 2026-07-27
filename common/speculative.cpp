@@ -2236,6 +2236,19 @@ common_params common_base_params_to_speculative(const common_params & params) {
         result.n_gpu_layers          = params_spec.n_gpu_layers;
         result.tensor_buft_overrides = params_spec.tensor_buft_overrides;
 
+        // A tensor split is a topology property of the model being loaded, not
+        // a global property that can be inherited from the target.  In
+        // particular, a single explicitly selected draft device cannot form a
+        // tensor-split meta device.  Keep upstream's split behavior for true
+        // multi-device drafts, but collapse the degenerate topology before
+        // model fitting and buffer placement see it.
+        const size_t n_draft_devices = std::count_if(
+            result.devices.begin(), result.devices.end(), [](ggml_backend_dev_t dev) { return dev != nullptr; });
+        if (!result.devices.empty() && n_draft_devices <= 1) {
+            result.split_mode = LLAMA_SPLIT_MODE_NONE;
+            std::fill(std::begin(result.tensor_split), std::end(result.tensor_split), 0.0f);
+        }
+
         if (params_spec.cpuparams.n_threads > 0) {
             result.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
             result.cpuparams_batch.n_threads = params_spec.cpuparams_batch.n_threads;

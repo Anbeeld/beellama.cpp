@@ -194,7 +194,8 @@ struct llama_kv_tail_layer_route {
 // Backend-neutral ownership contract for one persistent KV layer. Owner tokens
 // are deliberately opaque: production code derives them from the realized
 // backend buffers while synthetic tests can use stable logical device IDs.
-// A zero shadow owner means that side has no exact overlay tensor.
+// A zero shadow owner means that side has no exact overlay tensor. Meta buffers
+// are valid owners: they retain the concrete device ownership of every shard.
 struct llama_kv_tail_layer_ownership {
     uint32_t layer_id;
     uintptr_t body_k_owner;

@@ -3860,6 +3860,164 @@ static void test_eager_completed_record(enum ggml_backend_dev_type device_type, 
     ggml_backend_free(backend);
 }
 
+static ggml_backend_meta_split_state test_kvarn_meta_split(
+        const ggml_tensor * tensor, void *) {
+    if (std::strcmp(tensor->name, "meta_current") == 0 ||
+            std::strcmp(tensor->name, "meta_current_next") == 0 ||
+            std::strcmp(tensor->name, "meta_stage") == 0 ||
+            std::strcmp(tensor->name, "meta_records") == 0) {
+        ggml_backend_meta_split_state result = {
+            GGML_BACKEND_SPLIT_AXIS_1, { 0 }, { 1 }, 1
+        };
+        // Two complete heads over three devices: the first shard is a valid
+        // zero-head no-op and the remaining devices own one head each.
+        result.ne[0] = 0;
+        result.ne[1] = 1;
+        result.ne[2] = 1;
+        return result;
+    }
+    return { GGML_BACKEND_SPLIT_AXIS_MIRRORED, { 0 }, { 1 }, 1 };
+}
+
+static void test_meta_kvarn_zero_head_shard() {
+    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    require(cpu != nullptr, "meta KVarN: CPU device unavailable");
+    ggml_backend_dev_t devices[] = { cpu, cpu, cpu };
+    ggml_backend_dev_t meta_dev = ggml_backend_meta_device(
+            devices, 3, test_kvarn_meta_split, nullptr);
+    require(meta_dev != nullptr, "meta KVarN: failed to create meta device");
+    ggml_backend_t backend = ggml_backend_dev_init(meta_dev, nullptr);
+    require(backend != nullptr, "meta KVarN: failed to create backend");
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ 4 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * static_ctx = ggml_init(params);
+    require(static_ctx != nullptr, "meta KVarN: failed to create static context");
+    ggml_context * input_ctx = ggml_init(params);
+    require(input_ctx != nullptr, "meta KVarN: failed to create input context");
+
+    constexpr int n_heads = 2;
+    constexpr int n_tokens = 128;
+    constexpr int stage_groups = 3;
+    constexpr int bits = 4;
+    const int record_bytes = int(llama_kvarn_packed_bytes(128 * 128, bits) +
+            3 * 128 * sizeof(ggml_fp16_t));
+    ggml_tensor * current = ggml_new_tensor_3d(
+            static_ctx, GGML_TYPE_F32, 128, n_heads, n_tokens);
+    ggml_tensor * current_next = ggml_new_tensor_3d(
+            static_ctx, GGML_TYPE_F32, 128, n_heads, n_tokens);
+    // Index graph inputs can remain ordinary scheduler-owned tensors in
+    // production. Split-state recursion must retain the owning meta context
+    // while following this non-meta source.
+    ggml_tensor * indices = ggml_new_tensor_1d(input_ctx, GGML_TYPE_I64, n_tokens);
+    ggml_tensor * stage = ggml_new_tensor_3d(
+            static_ctx, GGML_TYPE_F16, 128, n_heads, 128 * stage_groups);
+    ggml_tensor * records = ggml_new_tensor_3d(
+            static_ctx, GGML_TYPE_I8, record_bytes, n_heads, 4);
+    ggml_set_name(current, "meta_current");
+    ggml_set_name(current_next, "meta_current_next");
+    ggml_set_name(stage, "meta_stage");
+    ggml_set_name(records, "meta_records");
+
+    ggml_backend_buffer_t static_buffer = ggml_backend_alloc_ctx_tensors_from_buft(
+            static_ctx, ggml_backend_dev_buffer_type(meta_dev));
+    require(static_buffer != nullptr, "meta KVarN: failed to allocate split tensors");
+    ggml_backend_buffer_t input_buffer = ggml_backend_alloc_ctx_tensors_from_buft(
+            input_ctx, ggml_backend_dev_buffer_type(cpu));
+    require(input_buffer != nullptr, "meta KVarN: failed to allocate mirrored input tensors");
+
+    ggml_context * compute_ctx = ggml_init(params);
+    require(compute_ctx != nullptr, "meta KVarN: failed to create compute context");
+    ggml_tensor * stored = ggml_kvarn_store(
+            compute_ctx, current, indices, stage, records, bits, 16, false, stage_groups);
+    ggml_tensor * materialized = ggml_kvarn_materialize(
+            compute_ctx, records, stored, indices, n_tokens, 0, 1,
+            bits, false, stage_groups);
+    ggml_cgraph * graph = ggml_new_graph(compute_ctx);
+    ggml_build_forward_expand(graph, materialized);
+    ggml_backend_t cpu_backend = ggml_backend_init_by_type(
+            GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    require(cpu_backend != nullptr, "meta KVarN: failed to initialize scheduler fallback");
+    ggml_backend_t backends[] = { backend, cpu_backend };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(
+            backends, nullptr, 2, 32, false, true);
+    require(sched != nullptr && ggml_backend_sched_alloc_graph(sched, graph),
+            "meta KVarN: failed to allocate scheduled graph");
+
+    std::vector<float> input(size_t(128) * n_heads * n_tokens);
+    for (int token = 0; token < n_tokens; ++token) {
+        for (int head = 0; head < n_heads; ++head) {
+            for (int dim = 0; dim < 128; ++dim) {
+                input[(size_t(token)*n_heads + head)*128 + dim] =
+                        std::sin(float(token)*0.03f) +
+                        std::cos(float(dim)*0.05f) + float(head)*0.25f;
+            }
+        }
+    }
+    std::vector<int64_t> index_data(n_tokens);
+    std::iota(index_data.begin(), index_data.end(), int64_t(0));
+    std::vector<float> input_next(input.size());
+    for (size_t i = 0; i < input_next.size(); ++i) {
+        input_next[i] = input[i] + 2.0f;
+    }
+    std::vector<uint8_t> stage_zeros(ggml_nbytes(stage), 0);
+    std::vector<uint8_t> record_zeros(ggml_nbytes(records), 0);
+    ggml_backend_tensor_memset(records, 0xa5, 0, ggml_nbytes(records));
+    std::vector<uint8_t> memset_records(ggml_nbytes(records), 0);
+    ggml_backend_tensor_get(records, memset_records.data(), 0, memset_records.size());
+    require(std::all_of(memset_records.begin(), memset_records.end(),
+                    [](uint8_t value) { return value == 0xa5; }),
+            "meta KVarN: split tensor memset did not cover every logical record byte");
+    ggml_backend_tensor_set(current, input.data(), 0, ggml_nbytes(current));
+    ggml_backend_tensor_set(current_next, input_next.data(), 0, ggml_nbytes(current_next));
+    ggml_backend_tensor_set(indices, index_data.data(), 0, ggml_nbytes(indices));
+    ggml_backend_tensor_set(stage, stage_zeros.data(), 0, stage_zeros.size());
+    ggml_backend_tensor_set(records, record_zeros.data(), 0, record_zeros.size());
+    require(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS,
+            "meta KVarN: split store/materialize graph failed");
+
+    std::vector<ggml_fp16_t> output(ggml_nelements(materialized));
+    ggml_backend_tensor_get(materialized, output.data(), 0, ggml_nbytes(materialized));
+    double max_error = 0.0;
+    for (size_t i = 0; i < output.size(); ++i) {
+        max_error = std::max(max_error,
+                std::fabs(double(ggml_fp16_to_fp32(output[i])) - input[i]));
+    }
+    require(max_error < 0.002,
+            "meta KVarN: zero-head split changed lossless staged values");
+
+    // The scheduler deliberately reuses the parent graph identity while the
+    // graph-local KVarN node changes its persistent input. A stale projected
+    // meta node would continue reading `current` here. This is the lifecycle
+    // exercised by decode graphs whose graph-local tensors are rebuilt in
+    // place between tokens.
+    stored->src[0] = current_next;
+    ggml_backend_tensor_set(stage, stage_zeros.data(), 0, stage_zeros.size());
+    ggml_backend_tensor_set(records, record_zeros.data(), 0, record_zeros.size());
+    require(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS,
+            "meta KVarN: rebuilt split graph failed");
+    ggml_backend_tensor_get(materialized, output.data(), 0, ggml_nbytes(materialized));
+    max_error = 0.0;
+    for (size_t i = 0; i < output.size(); ++i) {
+        max_error = std::max(max_error,
+                std::fabs(double(ggml_fp16_to_fp32(output[i])) - input_next[i]));
+    }
+    require(max_error < 0.005,
+            "meta KVarN: projected graph retained a stale graph-local source");
+
+    ggml_backend_sched_free(sched);
+    ggml_backend_free(cpu_backend);
+    ggml_free(compute_ctx);
+    ggml_backend_buffer_free(input_buffer);
+    ggml_free(input_ctx);
+    ggml_backend_buffer_free(static_buffer);
+    ggml_free(static_ctx);
+    ggml_backend_free(backend);
+}
+
 int main() {
     ggml_backend_load_all();
 
@@ -3886,6 +4044,7 @@ int main() {
     test_vulkan_decode_route_policy();
     test_stage_policy();
     test_memory_stats_aggregation();
+    test_meta_kvarn_zero_head_shard();
     test_exact_tail_policy();
     test_tile_layout();
     test_head_dimension_slicing();

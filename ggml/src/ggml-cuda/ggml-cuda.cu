@@ -1222,6 +1222,28 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
         ret->dev_ids.push_back(static_cast<ggml_backend_cuda_context *>(backends[i]->context)->device);
     }
 
+    // NCCL requires one distinct device per rank, and the internal pipeline
+    // likewise models peer communication between distinct CUDA devices.  A
+    // meta device may deliberately list the same CUDA device more than once
+    // (for example to exercise tensor placement on a single-GPU host).  Do
+    // not feed that topology to either optimized collective: sharing one
+    // physical execution engine between their ranks can deadlock once the
+    // streams reach an AllReduce in different orders.  The meta backend's
+    // generic butterfly remains correct for this topology because it uses
+    // ordinary stream-ordered copies and adds.
+    for (size_t i = 0; i < ret->dev_ids.size(); ++i) {
+        for (size_t j = 0; j < i; ++j) {
+            if (ret->dev_ids[i] == ret->dev_ids[j]) {
+                GGML_LOG_WARN(
+                        "optimized CUDA AllReduce disabled: device %d is used by multiple meta ranks; "
+                        "falling back to meta-backend butterfly\n",
+                        ret->dev_ids[i]);
+                ggml_backend_cuda_comm_init_none(ret);
+                return ret;
+            }
+        }
+    }
+
     const char * env = getenv("GGML_CUDA_ALLREDUCE");
     if (!env) {
         // Platform default: Linux uses NCCL, otherwise (generally Windows) internal
@@ -2531,6 +2553,12 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+    // A zero UID deliberately means that the graph has no stable identity.
+    // Projected meta graphs reuse tensor storage in place, so a first-node
+    // pointer plus an incomplete property snapshot cannot make replay safe.
+    if (cgraph->uid == 0) {
+        return false;
+    }
 
     bool use_cuda_graph = true;
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph

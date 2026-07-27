@@ -66,12 +66,12 @@ it never defaults to `U`. The memory capability API reports this bound, and a
 larger speculative removal must use the checkpoint/reprocess path before cache
 metadata is mutated.
 
-Partial exact overlays are compatible with `--split-mode layer`; every shadow
-stays on the same device as its layer's ordinary K/V body. They are not
-compatible with `--split-mode tensor`, whose meta buffer shards a body tensor
-across devices. That combination fails before tail allocation. Tensor split
-requires `--kv-tail-tokens 0` or a full-window standard native-exact result,
-which has no shadow and uses the ordinary KV split descriptor.
+Partial exact overlays are compatible with `--split-mode layer` and
+`--split-mode tensor`. Layer mode keeps each shadow with its ordinary K/V body.
+Tensor mode shards standard body/shadow rows, KVarN records and staging, and
+exact history at complete KV-head boundaries through the model's meta split
+descriptor. Invalid or unsupported component splits fail during cache
+construction rather than after graph execution starts.
 
 KVarN's physical staging depth is independent of this logical policy. Increasing
 `-ub` may increase transient work but never increases persistent exact coverage.

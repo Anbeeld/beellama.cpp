@@ -28,6 +28,16 @@ bool kvarn_backend_supports_native_tail(
     if (dev == nullptr) {
         dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     }
+    if (ggml_backend_dev_is_meta(dev)) {
+        const size_t count = ggml_backend_meta_device_count(dev);
+        for (size_t i = 0; i < count; ++i) {
+            if (!kvarn_backend_supports_native_tail(
+                        ggml_backend_meta_device_get(dev, i), exact_type, d_k, d_v)) {
+                return false;
+            }
+        }
+        return count > 0;
+    }
     auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
     auto * segmented_fn = reg ? reinterpret_cast<backend_kv_tail_attention_supported_t>(
             ggml_backend_reg_get_proc_address(
@@ -53,6 +63,16 @@ bool kvarn_backend_supports_tail_write(
         ggml_backend_dev_t dev, ggml_type exact_type, int64_t n_embd) {
     if (!dev) {
         return false;
+    }
+    if (ggml_backend_dev_is_meta(dev)) {
+        const size_t count = ggml_backend_meta_device_count(dev);
+        for (size_t i = 0; i < count; ++i) {
+            if (!kvarn_backend_supports_tail_write(
+                        ggml_backend_meta_device_get(dev, i), exact_type, n_embd)) {
+                return false;
+            }
+        }
+        return count > 0;
     }
     ggml_init_params params = {
         /*.mem_size   =*/ 16*ggml_tensor_overhead() + 4096,
@@ -93,6 +113,16 @@ bool llama_kvarn_backend_supports_native_ops(ggml_backend_dev_t dev) {
         return true; // the built-in CPU backend consumes KVarN views directly
     }
 
+    if (ggml_backend_dev_is_meta(dev)) {
+        const size_t count = ggml_backend_meta_device_count(dev);
+        for (size_t i = 0; i < count; ++i) {
+            if (!llama_kvarn_backend_supports_native_ops(
+                        ggml_backend_meta_device_get(dev, i))) {
+                return false;
+            }
+        }
+        return count > 0;
+    }
     using ggml_backend_kvarn_native_ops_t = bool (*)(ggml_backend_dev_t dev);
     auto * reg = ggml_backend_dev_backend_reg(dev);
     auto * fn = reg ? (ggml_backend_kvarn_native_ops_t) ggml_backend_reg_get_proc_address(
@@ -105,6 +135,16 @@ bool llama_kvarn_backend_native_attention_uses_original_v(ggml_backend_dev_t dev
         return false;
     }
 
+    if (ggml_backend_dev_is_meta(dev)) {
+        const size_t count = ggml_backend_meta_device_count(dev);
+        for (size_t i = 0; i < count; ++i) {
+            if (!llama_kvarn_backend_native_attention_uses_original_v(
+                        ggml_backend_meta_device_get(dev, i))) {
+                return false;
+            }
+        }
+        return count > 0;
+    }
     using ggml_backend_kvarn_native_original_v_t = bool (*)(ggml_backend_dev_t dev);
     auto * reg = ggml_backend_dev_backend_reg(dev);
     auto * fn = reg ? (ggml_backend_kvarn_native_original_v_t) ggml_backend_reg_get_proc_address(
@@ -117,6 +157,15 @@ uint32_t llama_kvarn_backend_native_rotated_max_query_tokens(ggml_backend_dev_t 
         return 0;
     }
 
+    if (ggml_backend_dev_is_meta(dev)) {
+        const size_t count = ggml_backend_meta_device_count(dev);
+        uint32_t result = UINT32_MAX;
+        for (size_t i = 0; i < count; ++i) {
+            result = std::min(result, llama_kvarn_backend_native_rotated_max_query_tokens(
+                    ggml_backend_meta_device_get(dev, i)));
+        }
+        return count > 0 ? result : 0;
+    }
     using ggml_backend_kvarn_native_rotated_max_query_tokens_t = uint32_t (*)(ggml_backend_dev_t dev);
     auto * reg = ggml_backend_dev_backend_reg(dev);
     auto * fn = reg ? (ggml_backend_kvarn_native_rotated_max_query_tokens_t)
@@ -130,6 +179,16 @@ bool llama_kvarn_backend_mixed_tail_native_preferred(ggml_backend_dev_t dev) {
         return true;
     }
 
+    if (ggml_backend_dev_is_meta(dev)) {
+        const size_t count = ggml_backend_meta_device_count(dev);
+        for (size_t i = 0; i < count; ++i) {
+            if (!llama_kvarn_backend_mixed_tail_native_preferred(
+                        ggml_backend_meta_device_get(dev, i))) {
+                return false;
+            }
+        }
+        return count > 0;
+    }
     using ggml_backend_kvarn_mixed_tail_native_preferred_t = bool (*)(
         ggml_backend_dev_t dev);
     auto * reg = ggml_backend_dev_backend_reg(dev);
@@ -144,6 +203,16 @@ bool llama_kvarn_backend_supports_ops(ggml_backend_dev_t dev) {
         return true; // the built-in CPU backend implements store + materialize
     }
 
+    if (ggml_backend_dev_is_meta(dev)) {
+        const size_t count = ggml_backend_meta_device_count(dev);
+        for (size_t i = 0; i < count; ++i) {
+            if (!llama_kvarn_backend_supports_ops(
+                        ggml_backend_meta_device_get(dev, i))) {
+                return false;
+            }
+        }
+        return count > 0;
+    }
     using ggml_backend_kvarn_ops_t = bool (*)(ggml_backend_dev_t dev);
     auto * reg = ggml_backend_dev_backend_reg(dev);
     auto * fn = reg ? (ggml_backend_kvarn_ops_t) ggml_backend_reg_get_proc_address(
@@ -1228,41 +1297,46 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
+    const auto tensor_buft = [](const ggml_tensor * tensor) -> ggml_backend_buffer_type_t {
+        return tensor && tensor->buffer ? ggml_backend_buffer_get_type(tensor->buffer) : nullptr;
+    };
+    // Records and stages are always the persistent KVarN body, including when
+    // no enlarged exact tail was requested.  Validate their complete-head
+    // contract once for every construction path so tail=0 cannot bypass the
+    // same fail-closed placement guarantees.
+    for (const auto & layer : layers) {
+        const auto k_buft = tensor_buft(layer.k_records);
+        const auto v_buft = tensor_buft(layer.v_records);
+        if (!k_buft || !v_buft) {
+            throw std::runtime_error(format("KVarN body layer %u has no realized backend buffer", layer.il));
+        }
+        if (k_buft != v_buft) {
+            throw std::runtime_error(format(
+                    "KVarN body layer %u places K and V records on different owners", layer.il));
+        }
+        auto * dev = ggml_backend_buft_get_device(k_buft);
+        if (ggml_backend_dev_is_meta(dev)) {
+            for (const auto & component : {
+                    std::pair<const ggml_tensor *, const char *> { layer.k_records, "K records" },
+                    std::pair<const ggml_tensor *, const char *> { layer.v_records, "V records" },
+                    std::pair<const ggml_tensor *, const char *> { layer.k_stage,   "K stage" },
+                    std::pair<const ggml_tensor *, const char *> { layer.v_stage,   "V stage" } }) {
+                const auto split = llama_meta_device_get_split_state(
+                        component.first,
+                        const_cast<llama_meta_device_get_split_state_userdata *>(&model.get_split_state_ud));
+                if (split.axis != GGML_BACKEND_SPLIT_AXIS_1 || split.n_segments == 0) {
+                    throw std::runtime_error(format(
+                            "KVarN tensor/meta split is invalid for layer %u %s: expected complete-head axis 1, got %s",
+                            layer.il, component.second,
+                            ggml_backend_meta_split_axis_name(split.axis)));
+                }
+            }
+        }
+    }
+
     uint32_t exact_slots = 0;
     std::vector<llama_kv_tail_layer_route> tail_routes;
     if (exact_tail_tokens > 0) {
-        const auto tensor_buft = [](const ggml_tensor * tensor) -> ggml_backend_buffer_type_t {
-            return tensor && tensor->buffer ? ggml_backend_buffer_get_type(tensor->buffer) : nullptr;
-        };
-        const auto buft_is_meta = [](ggml_backend_buffer_type_t buft) {
-            auto * dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
-            return dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_META;
-        };
-
-        // The structured records/stages are the ordinary persistent body. They
-        // must exist before overlay placement is accepted, and a meta-split
-        // body is rejected before any exact-tail tensor or metadata arena.
-        for (const auto & layer : layers) {
-            const auto k_buft = tensor_buft(layer.k_records);
-            const auto v_buft = tensor_buft(layer.v_records);
-            if (!k_buft || !v_buft) {
-                throw std::runtime_error(format("KVarN body layer %u has no realized backend buffer", layer.il));
-            }
-            if (k_buft != v_buft) {
-                throw std::runtime_error(format(
-                        "KVarN body layer %u places K and V records on different owners", layer.il));
-            }
-            if (buft_is_meta(k_buft) || buft_is_meta(v_buft)) {
-                const auto split = llama_meta_device_get_split_state(
-                        layer.k_records, const_cast<llama_meta_device_get_split_state_userdata *>(&model.get_split_state_ud));
-                throw std::runtime_error(format(
-                        "KVarN exact-tail overlay rejected for layer %u: realized body uses a tensor/meta split buffer "
-                        "with split descriptor %s; "
-                        "--split-mode layer is supported, while --split-mode tensor currently requires "
-                        "--kv-tail-tokens 0 or a full-window native-exact representation",
-                        layer.il, ggml_backend_meta_split_axis_name(split.axis)));
-            }
-        }
 
         for (const auto & layer_entry : map_layer_ids) {
             // plain locals instead of structured bindings: fail_route below

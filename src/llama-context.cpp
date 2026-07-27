@@ -587,12 +587,37 @@ llama_context::llama_context(
 
     if (!hparams.vocab_only) {
         // GPU backends
-        for (const auto & dev : model.devices) {
+        std::vector<ggml_backend_dev_t> initialized_devices;
+        auto add_device_backend = [&](const llama_device & dev) {
+            if (std::find(initialized_devices.begin(), initialized_devices.end(), dev.dev) !=
+                    initialized_devices.end()) {
+                return;
+            }
             ggml_backend_t backend = ggml_backend_dev_init(dev.dev, nullptr);
             if (backend == nullptr) {
                 throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
             }
             backends.emplace_back(backend);
+            initialized_devices.push_back(dev.dev);
+        };
+        for (const auto & dev : model.devices) {
+            add_device_backend(dev);
+        }
+
+        // EAGLE3, DFlash, and assistant contexts borrow target-model tensors.
+        // Their scheduler must therefore know the owning target devices in
+        // addition to the devices that hold the auxiliary model itself.  This
+        // is normally invisible when both models use the same simple backend,
+        // but a tensor-split target owns its weights through a distinct meta
+        // device.  Adding only missing devices keeps auxiliary layers on their
+        // requested device while borrowed projections execute where they are
+        // physically resident.
+        if (cparams.ctx_other != nullptr) {
+            const llama_model * model_other = llama_get_model(cparams.ctx_other);
+            GGML_ASSERT(model_other != nullptr);
+            for (const auto & dev : model_other->devices) {
+                add_device_backend(dev);
+            }
         }
 
         // add ACCEL backends (such as BLAS)

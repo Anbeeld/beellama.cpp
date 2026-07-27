@@ -246,12 +246,6 @@ llama_kv_tail_type_resolution llama_kv_tail_resolve_type(
 
 llama_kv_tail_ownership_error llama_kv_tail_validate_layer_ownership(
         const llama_kv_tail_layer_ownership & ownership) {
-    if (ownership.body_k_meta_split) {
-        return LLAMA_KV_TAIL_OWNERSHIP_META_SPLIT_K;
-    }
-    if (ownership.body_v_meta_split) {
-        return LLAMA_KV_TAIL_OWNERSHIP_META_SPLIT_V;
-    }
     if (ownership.shadow_k_owner != 0 && ownership.shadow_k_owner != ownership.body_k_owner) {
         return LLAMA_KV_TAIL_OWNERSHIP_SHADOW_K;
     }

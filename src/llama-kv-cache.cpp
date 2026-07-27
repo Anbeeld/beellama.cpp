@@ -51,12 +51,24 @@ static bool backend_supports_native_kv_tail(
     if (!dev) {
         dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     }
-    const auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
-    const auto fn = reg ? reinterpret_cast<backend_kv_tail_attention_supported_t>(
-            ggml_backend_reg_get_proc_address(reg, segmented ?
-                    "ggml_backend_kv_tail_segmented_attention_supported" :
-                    "ggml_backend_kv_tail_attention_supported")) : nullptr;
-    return fn && fn(body_k, body_v, tail_k, tail_v, d_k, d_v);
+    const auto supports = [&](ggml_backend_dev_t candidate) {
+        const auto reg = candidate ? ggml_backend_dev_backend_reg(candidate) : nullptr;
+        const auto fn = reg ? reinterpret_cast<backend_kv_tail_attention_supported_t>(
+                ggml_backend_reg_get_proc_address(reg, segmented ?
+                        "ggml_backend_kv_tail_segmented_attention_supported" :
+                        "ggml_backend_kv_tail_attention_supported")) : nullptr;
+        return fn && fn(body_k, body_v, tail_k, tail_v, d_k, d_v);
+    };
+    if (!ggml_backend_dev_is_meta(dev)) {
+        return supports(dev);
+    }
+    const size_t count = ggml_backend_meta_device_count(dev);
+    for (size_t i = 0; i < count; ++i) {
+        if (!supports(ggml_backend_meta_device_get(dev, i))) {
+            return false;
+        }
+    }
+    return count > 0;
 }
 
 static llama_kv_tail_route_capability probe_standard_kv_tail_route(
@@ -968,7 +980,7 @@ llama_kv_cache::llama_kv_cache(
                 const_cast<llama_meta_device_get_split_state_userdata *>(&model.get_split_state_ud));
         if (split.axis != GGML_BACKEND_SPLIT_AXIS_0 || split.n_segments == 0) {
             throw std::runtime_error(format(
-                    "standard KV native-exact tensor/meta split is invalid for layer %u %s body; "
+                    "standard KV tensor/meta split is invalid for layer %u %s body; "
                     "the ordinary KV path did not produce a valid row split",
                     layer.il, side));
         }
@@ -1001,26 +1013,11 @@ llama_kv_cache::llama_kv_cache(
 
         const bool k_meta = buft_is_meta(k_buft);
         const bool v_meta = buft_is_meta(v_buft);
-        if ((tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY ||
-                tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_OVERLAY ||
-                tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_NATIVE_EXACT) && (k_meta || v_meta)) {
-            const auto * split_tensor = k_meta ? owner_k : owner_v;
-            const auto split = llama_meta_device_get_split_state(
-                    split_tensor, const_cast<llama_meta_device_get_split_state_userdata *>(&model.get_split_state_ud));
-            throw std::runtime_error(format(
-                    "standard KV tail overlay rejected for layer %u: realized %s body uses a tensor/meta split buffer "
-                    "with split descriptor %s; "
-                    "--split-mode layer is supported, while --split-mode tensor currently requires "
-                    "--kv-tail-tokens 0 or a full-window native-exact representation",
-                    spec.layer_id, k_meta ? "K" : "V", ggml_backend_meta_split_axis_name(split.axis)));
+        if (k_meta) {
+            validate_meta_body(layer, owner_k, "K");
         }
-        if (tail_plan.kind == LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT) {
-            if (k_meta) {
-                validate_meta_body(layer, layer.k, "K");
-            }
-            if (v_meta) {
-                validate_meta_body(layer, layer.v, "V");
-            }
+        if (v_meta) {
+            validate_meta_body(layer, owner_v, "V");
         }
     }
 

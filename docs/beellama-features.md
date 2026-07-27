@@ -253,15 +253,19 @@ descriptors and current sources are attached. Unsupported native shapes fail
 closed before scheduling rather than appearing later as CPU/CUDA split
 boundaries.
 
-Exact overlays support the normal `--split-mode layer` ownership model: each
-body and its K/V shadows are allocated on that layer's owning device, and graph
-writes, reads, and state payload rows retain the same owner. Tensor/meta split
-shards an individual body tensor, so a mirrored compact shadow would be
-incorrect; partial standard and KVarN overlays therefore fail during context
-creation after the ordinary body placement is known and before any tail arena
-or shadow allocation. With `--split-mode tensor`, use `--kv-tail-tokens 0` or a
-full-window standard native-exact representation. Native-exact has no shadow
-and follows the ordinary KV tensor split when that split descriptor is valid.
+Exact overlays support both layer and tensor placement. Layer mode keeps each
+body and K/V shadow on the device that owns the layer. Tensor mode projects the
+body, standard shadow, KVarN records and staging, and exact history through one
+typed cache-component split contract. Standard rows and exact tails split on
+complete KV-head widths; KVarN records and staging split on their sliced-head
+axis, so one head/group record never spans devices. A malformed split fails
+during cache construction with the layer and component named in the error.
+
+The local CUDA acceptance rows use two logical shards on one RTX 3090, including
+`1,1` standard-tail and `3,1` KVarN-tail placement on Qwen3.6-27B at a 16K
+context. Executable CPU/meta tests cover zero-head shards. This verifies local
+projection and scheduling but not physical peer copies, NCCL, heterogeneous GPU
+rollback, or per-device memory pressure; those remain external two-GPU gates.
 
 KVarN differs from standard caches in three intentional ways. Its exact suffix
 has a non-disableable 128-token floor, positive requests round upward to 128
