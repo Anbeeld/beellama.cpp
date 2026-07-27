@@ -5,6 +5,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / ".github/workflows"
+ACTIONS = ROOT / ".github/actions"
 
 
 def require(condition: bool, message: str) -> None:
@@ -28,6 +29,7 @@ def main() -> None:
     release = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
     preview_dispatch = (WORKFLOWS / "release-preview-dispatch.yml").read_text(encoding="utf-8")
     stable_dispatch = (WORKFLOWS / "release-dispatch.yml").read_text(encoding="utf-8")
+    setup_ccache = (ACTIONS / "setup-ccache/action.yml").read_text(encoding="utf-8")
 
     require(
         "\n  push:\n" not in release,
@@ -36,6 +38,10 @@ def main() -> None:
     require(
         "cache_channel: ${{ steps.meta.outputs.cache_channel }}" in release,
         "release metadata must expose the v* cache channel",
+    )
+    require(
+        "cache_parent_channel: ${{ steps.meta.outputs.cache_parent_channel }}" in release,
+        "release metadata must expose the nearest compatible predecessor cache channel",
     )
     require("ccache_ref" not in release, "cache channel and cache owner ref must not be conflated")
     require(
@@ -53,12 +59,21 @@ def main() -> None:
         "stable releases must verify that the matching v* branch is an ancestor of the tag",
     )
     require(
-        "restore-keys:" not in release,
-        "release jobs must restore only their exact rolling branch cache",
+        "resolve-release-cache-parent.py" in release,
+        "release metadata must resolve the predecessor cache channel from live version branches",
     )
 
     save_count = release.count("- name: Save ccache")
     require(save_count == 11, f"expected 11 rolling-cache save steps, found {save_count}")
+    setup_count = release.count("uses: ./.github/actions/setup-ccache")
+    require(setup_count == save_count, "every rolling cache must have one setup and one save step")
+    require(
+        release.count(
+            "restore-keys: release-${{ needs.release-meta.outputs.cache_parent_channel }}-"
+        )
+        == setup_count,
+        "every release cache must fall back to the same backend/toolchain key in the parent channel",
+    )
     require(
         release.count("if: ${{ always() && needs.release-meta.outputs.preview == 'true' }}")
         == save_count,
@@ -71,6 +86,14 @@ def main() -> None:
     require(
         "needs.release-meta.outputs.cache_channel" in release,
         "release cache keys must use the branch cache channel",
+    )
+    require(
+        'default: "3G"' in setup_ccache,
+        "the shared ccache action must enforce the unified 3G limit",
+    )
+    require(
+        "max-size: 5G" not in release,
+        "release jobs must not override the unified ccache limit",
     )
 
     require(
