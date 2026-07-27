@@ -1411,22 +1411,43 @@ static __global__ void kvarn_store_workspace_flush_kernel(
 
     const int start_local = first_group * KVAR_N_DIM + first_pos;
     const int end_local = start_local + tokens_per_stream;
-    const int boundary_group = (start_local + KVAR_N_DIM - 1) / KVAR_N_DIM + candidate;
-    if (boundary_group * KVAR_N_DIM >= end_local) {
-        return;
-    }
 
-    // Delayed stores seal a group when it leaves the transient stage. Exact-tail
-    // stores instead need a compressed copy as soon as the source tile completes,
-    // even while the canonical exact suffix still shadows that record.
-    const int record_group = eager_records ? boundary_group : boundary_group - tail_groups;
+    // Delayed stores seal a group when it leaves the transient stage, so they
+    // enumerate the group boundaries this store crosses. Exact-tail stores
+    // instead need a compressed copy as soon as the source tile completes, so
+    // they enumerate the groups that COMPLETE inside this store - starting at
+    // the group containing start_local. An unaligned start leaves that group
+    // straddling the store boundary: its prefix is still resident in the
+    // transient stage slot and is picked up by the tile loader below. Anchoring
+    // the eager scan on the first crossed boundary instead would skip that
+    // group permanently, because no later store enumerates it either.
+    const int record_group = eager_records ?
+        start_local / KVAR_N_DIM + candidate :
+        (start_local + KVAR_N_DIM - 1) / KVAR_N_DIM + candidate - tail_groups;
+    if (eager_records) {
+        // Only seal a complete tile. A trailing partial group stays in the stage
+        // until a later store finishes it; quantizing it early would fold stale
+        // stage rows past end_local into its scales.
+        if ((record_group + 1) * KVAR_N_DIM > end_local) {
+            return;
+        }
+    } else {
+        const int boundary_group = record_group + tail_groups;
+        if (boundary_group * KVAR_N_DIM >= end_local) {
+            return;
+        }
+    }
     if (swa ? record_group < 0 : (record_group < 1 || record_group >= groups_per_stream)) {
         return;
     }
     if (swa) {
-        const int next_same_record_boundary_group =
-            record_group + groups_per_stream + (eager_records ? 0 : tail_groups);
-        if (next_same_record_boundary_group * KVAR_N_DIM < end_local) {
+        if (eager_records) {
+            // The ring slot is rewritten later in this same store; let that
+            // candidate win instead of quantizing the older tile first.
+            if ((record_group + groups_per_stream + 1) * KVAR_N_DIM <= end_local) {
+                return;
+            }
+        } else if ((record_group + groups_per_stream + tail_groups) * KVAR_N_DIM < end_local) {
             return;
         }
     }

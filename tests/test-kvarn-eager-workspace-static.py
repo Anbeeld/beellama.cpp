@@ -31,8 +31,18 @@ def main() -> None:
     assert "bool eager_records" in source.split(
         "static __global__ void kvarn_store_workspace_flush_kernel(", 1
     )[1].split(") {", 1)[0], "workspace flush must receive the eager-record policy"
-    assert "eager_records ? boundary_group : boundary_group - tail_groups" in flush, (
-        "workspace flush must quantize newly completed groups when records are eager"
+    # Eager stores must enumerate the groups that COMPLETE inside the store,
+    # anchored on the group containing start_local. Anchoring on the first
+    # crossed boundary (ceil(start_local / KVAR_N_DIM)) silently drops the group
+    # straddling an unaligned store start, because no later store enumerates it.
+    assert "start_local / KVAR_N_DIM + candidate" in flush, (
+        "eager workspace flush must anchor on the group holding start_local"
+    )
+    assert "(record_group + 1) * KVAR_N_DIM > end_local" in flush, (
+        "eager workspace flush must only seal groups that complete inside the store"
+    )
+    assert "eager_records ? boundary_group : boundary_group - tail_groups" not in flush, (
+        "eager workspace flush must not reuse the delayed boundary anchor"
     )
 
 

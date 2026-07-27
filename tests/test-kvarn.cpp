@@ -3744,6 +3744,163 @@ static void test_unaligned_start(enum ggml_backend_dev_type device_type, bool re
     ggml_backend_free(backend);
 }
 
+// Eager unaligned-start coverage at the production non-SWA stage depth
+// (stage_groups=2 => tail_groups=1). The second store is large enough to take
+// the CUDA/Vulkan bulk workspace path (>= 3 * 128 tokens) and begins inside an
+// already-open non-sink group. That straddling group completes inside the
+// second store, so it must reach `records`.
+static void test_eager_unaligned_start(enum ggml_backend_dev_type device_type, bool required,
+                                       int start_offset, int n_tokens, int bits) {
+    ggml_backend_t backend = init_test_backend(device_type, required);
+    if (backend == nullptr) {
+        return;
+    }
+
+    constexpr int stage_groups = 2; // production non-SWA: sink slot + one transient group
+    constexpr int n_heads = 1;
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ 8 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr, "eager-unaligned: failed to initialize ggml context");
+
+    const int second_start = 128 + start_offset;
+    const int total_tokens = second_start + n_tokens;
+    const int straddling_group = second_start / 128;
+    const int last_group = (total_tokens - 1) / 128;
+    const int n_groups_per_stream = std::max(8, last_group + 1);
+    const int record_bytes = int(llama_kvarn_packed_bytes(128 * 128, bits) + 3 * 128 * sizeof(ggml_fp16_t));
+
+    require(start_offset > 0 && start_offset < 128, "eager-unaligned: start must be inside a group");
+    require((straddling_group + 1) * 128 <= total_tokens,
+            "eager-unaligned: straddling group must complete inside the second store");
+
+    ggml_tensor * current_prefix = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, n_heads, second_start);
+    ggml_tensor * indices_prefix = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, second_start);
+    ggml_tensor * current        = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, n_heads, n_tokens);
+    ggml_tensor * indices        = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
+    ggml_tensor * stage    = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, n_heads, 128 * stage_groups);
+    ggml_tensor * records  = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, record_bytes, n_heads, n_groups_per_stream);
+
+    ggml_tensor * stored_prefix = ggml_kvarn_store(ctx, current_prefix, indices_prefix, stage, records, bits, 16, false, stage_groups);
+    stored_prefix->op_params[3] = second_start;
+    stored_prefix->op_params[9] = 1; // eager records, as the KVarN cache always sets
+    ggml_tensor * stored = ggml_kvarn_store(ctx, current, indices, stored_prefix, records, bits, 16, false, stage_groups);
+    stored->op_params[3] = n_tokens;
+    stored->op_params[9] = 1;
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, stored);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    require(buffer != nullptr, "eager-unaligned: failed to allocate tensors");
+
+    auto sample = [](int abs_pos, int d) {
+        return std::sin(float(d) * 0.071f) +
+            std::cos(float(abs_pos) * 0.037f) +
+            float((d * 13 + abs_pos * 17) % 31 - 15) * 0.01f;
+    };
+    std::vector<float> prefix_input(128 * n_heads * second_start);
+    std::vector<float> input(128 * n_heads * n_tokens);
+    std::vector<float> expected(128 * n_heads * total_tokens);
+    for (int t = 0; t < total_tokens; ++t) {
+        for (int d = 0; d < 128; ++d) {
+            const float value = sample(t, d);
+            expected[t * 128 + d] = value;
+            if (t < second_start) {
+                prefix_input[t * 128 + d] = value;
+            } else {
+                input[(t - second_start) * 128 + d] = value;
+            }
+        }
+    }
+    std::vector<int64_t> idx_prefix(second_start);
+    for (int i = 0; i < second_start; ++i) {
+        idx_prefix[i] = int64_t(i);
+    }
+    std::vector<int64_t> idx(n_tokens);
+    for (int i = 0; i < n_tokens; ++i) {
+        idx[i] = int64_t(second_start + i);
+    }
+    std::vector<uint8_t> stage_zeros(ggml_nbytes(stage), 0);
+    std::vector<uint8_t> record_zeros(ggml_nbytes(records), 0);
+
+    ggml_backend_tensor_set(current_prefix, prefix_input.data(), 0, ggml_nbytes(current_prefix));
+    ggml_backend_tensor_set(indices_prefix, idx_prefix.data(), 0, ggml_nbytes(indices_prefix));
+    ggml_backend_tensor_set(current, input.data(), 0, ggml_nbytes(current));
+    ggml_backend_tensor_set(indices, idx.data(), 0, ggml_nbytes(indices));
+    ggml_backend_tensor_set(stage, stage_zeros.data(), 0, stage_zeros.size());
+    ggml_backend_tensor_set(records, record_zeros.data(), 0, record_zeros.size());
+
+    require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
+            "eager-unaligned: graph compute failed");
+
+    // Direct check: the straddling group completed in this store, so its record
+    // must have been written.
+    std::vector<uint8_t> record_data(ggml_nbytes(records));
+    ggml_backend_tensor_get(records, record_data.data(), 0, record_data.size());
+    const size_t off = size_t(straddling_group) * size_t(record_bytes);
+    const bool straddling_written = std::any_of(
+            record_data.begin() + ptrdiff_t(off),
+            record_data.begin() + ptrdiff_t(off + record_bytes),
+            [](uint8_t v) { return v != 0; });
+    // Investigation aid: KVARN_EAGER_UNALIGNED_SOFT=1 reports the whole matrix
+    // instead of aborting on the first failure.
+    const bool soft = std::getenv("KVARN_EAGER_UNALIGNED_SOFT") != nullptr;
+    if (soft) {
+        std::fprintf(stderr, "eager-unaligned[%s]: start=%3d n=%3d bits=%d group=%d record=%s\n",
+                device_type == GGML_BACKEND_DEVICE_TYPE_CPU ? "CPU" : "GPU",
+                start_offset, n_tokens, bits, straddling_group,
+                straddling_written ? "WRITTEN" : "UNWRITTEN <-- LOST");
+    }
+    if (!straddling_written && !soft) {
+        std::fprintf(stderr,
+                "eager-unaligned: group %d completed in the store but its record is unwritten "
+                "(start=%d abs=%d n=%d bits=%d)\n",
+                straddling_group, start_offset, second_start, n_tokens, bits);
+        require(false, "eager-unaligned: completed straddling group was never quantized");
+    }
+    if (!straddling_written) {
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return;
+    }
+
+    const std::vector<float> output = test_kvarn_reference_decode_f32(
+            records, stored, idx, total_tokens, 0, 1, bits, false, stage_groups);
+
+    double mse = 0.0;
+    double max_diff = 0.0;
+    double group_mse = 0.0;
+    for (int t = 0; t < total_tokens; ++t) {
+        for (int d = 0; d < 128; ++d) {
+            const double diff = double(expected[t * 128 + d]) - double(output[t * 128 + d]);
+            mse += diff * diff;
+            max_diff = std::max(max_diff, std::fabs(diff));
+            if (t / 128 == straddling_group) {
+                group_mse += diff * diff;
+            }
+        }
+    }
+    const double rmse = std::sqrt(mse / double(total_tokens * 128));
+    const double group_rmse = std::sqrt(group_mse / double(128 * 128));
+    if (!std::isfinite(rmse) || rmse >= 0.30 || group_rmse >= 0.30) {
+        std::fprintf(stderr,
+                "eager-unaligned: reconstruction error too high (start=%d abs=%d n=%d bits=%d "
+                "rmse=%g straddling-group-%d rmse=%g max=%g)\n",
+                start_offset, second_start, n_tokens, bits, rmse, straddling_group, group_rmse, max_diff);
+        require(false, "eager-unaligned: reconstruction error too high");
+    }
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+}
+
 static void test_eager_completed_record(enum ggml_backend_dev_type device_type, bool required) {
     ggml_backend_t backend = init_test_backend(device_type, required);
     if (backend == nullptr) {
@@ -4101,6 +4258,14 @@ int main() {
         test_unaligned_start(GGML_BACKEND_DEVICE_TYPE_GPU, false, start, 512, 5);
         test_unaligned_start(GGML_BACKEND_DEVICE_TYPE_CPU, true,  start, 513, 6);
         test_unaligned_start(GGML_BACKEND_DEVICE_TYPE_GPU, false, start, 513, 6);
+    }
+    // Eager unaligned-start coverage at the production stage depth (stage_groups=2).
+    // 512/535 tokens take the GPU bulk workspace path; 256 stays on the per-token path.
+    for (int start : { 1, 64, 88, 127 }) {
+        for (int n : { 256, 512, 535 }) {
+            test_eager_unaligned_start(GGML_BACKEND_DEVICE_TYPE_CPU, true,  start, n, 6);
+            test_eager_unaligned_start(GGML_BACKEND_DEVICE_TYPE_GPU, false, start, n, 6);
+        }
     }
     test_cache_ops_multi_stream(GGML_BACKEND_DEVICE_TYPE_CPU, true, 6);
     test_cache_ops_multi_stream(GGML_BACKEND_DEVICE_TYPE_GPU, false, 6);
