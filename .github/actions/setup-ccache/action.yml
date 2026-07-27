@@ -11,7 +11,7 @@ inputs:
   max-size:
     description: Maximum cache size (ccache max_size value, e.g. 500MB, 5G).
     required: false
-    default: "500MB"
+    default: "3G"
   sloppiness:
     description: ccache sloppiness setting (e.g. time_macros, file_macro).
     required: false
