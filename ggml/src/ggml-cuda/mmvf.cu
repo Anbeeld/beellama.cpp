@@ -783,7 +783,18 @@ void ggml_cuda_op_mul_mat_vec_f(
     GGML_UNUSED_VARS(ctx, src1, dst, src1_ddq_i, src1_ncols, src1_padded_row_size);
 }
 
-bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {
+bool ggml_cuda_mmvf_rhs_compatible(const size_t * src1_nb) {
+    // MMVF casts every reachable RHS row/channel/sample base to float2.
+    for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
+        if (src1_nb[i] % (2*sizeof(float)) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb,
+        const size_t * src1_nb, int64_t ne11) {
     if (src0_ne[0] % 2 != 0) {
         return false;
     }
@@ -798,6 +809,9 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
         if (src0_nb[i] % (2*ts) != 0) {
             return false;
         }
+    }
+    if (!ggml_cuda_mmvf_rhs_compatible(src1_nb)) {
+        return false;
     }
 
     switch (type) {
