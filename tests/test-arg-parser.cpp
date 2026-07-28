@@ -654,6 +654,11 @@ static void test(void) {
     assert(params.load_mode == LLAMA_LOAD_MODE_MLOCK);
 
     params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "-lm", "mmap+mlock"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK);
+
+    params = common_params();
     argv = {"binary_name", "-m", "model_file.gguf", "-lm", "dio"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO);
@@ -699,6 +704,11 @@ static void test(void) {
     argv = {"binary_name"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_MLOCK);
+
+    setenv("LLAMA_ARG_LOAD_MODE", "mmap+mlock", true);
+    argv = {"binary_name"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK);
 
     setenv("LLAMA_ARG_LOAD_MODE", "dio", true);
     argv = {"binary_name"};
