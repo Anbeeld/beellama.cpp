@@ -109,8 +109,9 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
 #define VDR_Q1_0_Q8_1_MMVQ 1  // Process one 32-element chunk at a time for parallelism
 #define VDR_Q1_0_Q8_1_MMQ  4  // Q1_0 has 128 bits (4 ints) per block
 
-#define VDR_Q2_0_Q8_1_MMVQ 1  // Process one 32-element chunk at a time for parallelism
-#define VDR_Q2_0_Q8_1_MMQ  2  // Q2_0 group 64: 128 bits (4 ints) per block, 2 32-element chunks
+// Shared by the Q2_0 weight and Q2_0S cache dot products.
+#define VDR_Q2_0_Q8_1_MMVQ 1
+#define VDR_Q2_0_Q8_1_MMQ  2
 
 #define VDR_Q4_0_Q8_1_MMVQ 2
 #define VDR_Q4_0_Q8_1_MMQ  4
@@ -322,9 +323,6 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q3_1_q8_1_imp
     // scale second part of sum by QI8_1 / (4 * vdr) to compensate for multiple threads adding it
     return sumi * d3d8 + m3s8 / (QI8_1 / (4 * vdr));
 }
-
-#define VDR_Q2_0_Q8_1_MMVQ 1
-#define VDR_Q2_0_Q8_1_MMQ  2
 
 template <int vdr> static __device__ __forceinline__ float vec_dot_q2_0s_q8_1_impl(
     const int * v, const int * u, const float & d2, const half2 & ds8) {
