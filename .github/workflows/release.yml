@@ -824,7 +824,12 @@ jobs:
       - name: Build
         shell: cmd
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VS_INSTALL_DIR=%%i"
+          if not defined VS_INSTALL_DIR (
+            echo No Visual Studio installation with the x64 C++ toolset was found
+            exit /b 1
+          )
+          call "%VS_INSTALL_DIR%\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
           cmake -S . -B build -G "Ninja Multi-Config" ^
             -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
             -DLLAMA_BUILD_BORINGSSL=ON ^
@@ -836,6 +841,14 @@ jobs:
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache ^
             %CMAKE_ARGS%
           cmake --build build --config Release -j %NUMBER_OF_PROCESSORS%
+
+      - name: Verify OpenMP is enabled
+        shell: cmd
+        run: |
+          findstr /c:"GGML_OPENMP_ENABLED:INTERNAL=ON" build\CMakeCache.txt >nul || (
+            echo GGML_OPENMP=ON was requested but OpenMP was not found; the CPU backend would ship without it
+            exit /b 1
+          )
 
       - name: ccache stats
         if: always()
@@ -1039,7 +1052,12 @@ jobs:
       - name: Build
         shell: cmd
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VS_INSTALL_DIR=%%i"
+          if not defined VS_INSTALL_DIR (
+            echo No Visual Studio installation with the x64 C++ toolset was found
+            exit /b 1
+          )
+          call "%VS_INSTALL_DIR%\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
           cmake -S . -B build -G "Ninja Multi-Config" ^
             -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
             -DGGML_BACKEND_DL=ON ^
