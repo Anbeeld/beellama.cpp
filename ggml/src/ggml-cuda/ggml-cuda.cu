@@ -312,6 +312,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
         info.devices[id].nsm        = prop.multiProcessorCount;
         info.devices[id].smpb       = prop.sharedMemPerBlock;
         info.devices[id].warp_size  = prop.warpSize;
+        info.devices[id].max_threads_per_block = prop.maxThreadsPerBlock;
 
 #ifndef GGML_USE_MUSA
         int supports_coop_launch = 0;
@@ -4784,6 +4785,49 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
     return ggml_backend_cuda_host_buffer_type();
 }
 
+static bool ggml_backend_cuda_kvarn_capabilities(
+        ggml_backend_dev_t dev,
+        ggml_backend_kvarn_capabilities * result) {
+#if !defined(GGML_CUDA_KVARN) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(dev);
+    GGML_UNUSED(result);
+    return false;
+#else
+    if (dev == nullptr || dev->context == nullptr || result == nullptr ||
+            result->struct_size < sizeof(*result) ||
+            result->abi_version != GGML_BACKEND_KVARN_CAPABILITIES_ABI_VERSION) {
+        return false;
+    }
+    const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
+    const auto & info = ggml_cuda_info();
+    if (device < 0 || device >= info.device_count) {
+        return false;
+    }
+
+    const auto capabilities = ggml_cuda_fattn_kvarn_device_capabilities(device);
+    *result = {
+        /* .struct_size                      = */ sizeof(*result),
+        /* .abi_version                      = */ GGML_BACKEND_KVARN_CAPABILITIES_ABI_VERSION,
+        /* .route_families                   = */ capabilities.route_families,
+        /* .supported_head_dims              = */ capabilities.supported_head_dims,
+        /* .store_materialize                = */ capabilities.store_materialize,
+        /* .portable_direct_body             = */ capabilities.portable_native,
+        /* .portable_integrated_tail_f16     = */ capabilities.portable_tail_f16,
+        /* .portable_integrated_tail_bf16    = */ capabilities.portable_tail_bf16,
+        /* .specialized_generic_mma          = */ capabilities.generic_mma,
+        /* .specialized_decode_split         = */ capabilities.decode_split,
+        /* .specialized_decode_vector        = */ capabilities.decode_vector,
+        /* .original_v_domain                = */ capabilities.original_v_domain,
+        /* .rotated_query_max_portable       = */ capabilities.rotated_query_max_portable,
+        /* .rotated_query_max_specialized    = */ capabilities.rotated_query_max_specialized,
+        /* .physical_warp_size               = */ (uint32_t) capabilities.physical_wave_size,
+        /* .reserved                         = */ 0,
+        /* .minimum_dynamic_shared_bytes     = */ capabilities.minimum_dynamic_shared_bytes,
+    };
+    return true;
+#endif
+}
+
 static bool ggml_backend_cuda_kvarn_native_ops(ggml_backend_dev_t dev) {
 #if !defined(GGML_CUDA_KVARN) || defined(GGML_USE_MUSA)
     GGML_UNUSED(dev);
@@ -4799,16 +4843,8 @@ static bool ggml_backend_cuda_kvarn_native_ops(ggml_backend_dev_t dev) {
     if (device < 0 || device >= info.device_count) {
         return false;
     }
-#if !defined(GGML_USE_HIP)
-    if (!turing_mma_available(info.devices[device].cc)) {
-        return false;
-    }
-#endif
-
-    const size_t high_shared = ggml_cuda_kvarn_required_shared_bytes();
-    const size_t low_shared = ggml_cuda_kvarn_low_shared_bytes();
-    GGML_ASSERT(low_shared <= high_shared);
-    return info.devices[device].smpbo >= low_shared;
+    const auto capabilities = ggml_cuda_fattn_kvarn_device_capabilities(device);
+    return capabilities.portable_native || capabilities.specialized_routes;
 #endif
 }
 
@@ -4817,16 +4853,11 @@ static bool ggml_backend_cuda_kvarn_native_original_v(ggml_backend_dev_t dev) {
     GGML_UNUSED(dev);
     return false;
 #else
-#if defined(GGML_USE_HIP)
     if (!ggml_backend_cuda_kvarn_native_ops(dev)) {
         return false;
     }
     const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
-    const int cc = ggml_cuda_info().devices[device].cc;
-    return amd_wmma_available(cc) || amd_mfma_available(cc);
-#else
-    return ggml_backend_cuda_kvarn_native_ops(dev);
-#endif
+    return ggml_cuda_fattn_kvarn_device_capabilities(device).original_v_domain;
 #endif
 }
 
@@ -4835,8 +4866,14 @@ static uint32_t ggml_backend_cuda_kvarn_native_rotated_max_query_tokens(ggml_bac
     GGML_UNUSED(dev);
     return 0;
 #else
-    return ggml_backend_cuda_kvarn_native_ops(dev) ?
-        ggml_cuda_fattn_kvarn_decode_max_q() : 0;
+    if (!ggml_backend_cuda_kvarn_native_ops(dev)) {
+        return 0;
+    }
+    const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
+    const auto capabilities = ggml_cuda_fattn_kvarn_device_capabilities(device);
+    return capabilities.specialized_routes ?
+        capabilities.rotated_query_max_specialized :
+        capabilities.rotated_query_max_portable;
 #endif
 }
 
@@ -4851,7 +4888,7 @@ static bool ggml_backend_cuda_kvarn_ops(ggml_backend_dev_t dev) {
     const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
     const auto & info = ggml_cuda_info();
     return device >= 0 && device < info.device_count &&
-        info.devices[device].smpbo >= ggml_cuda_kvarn_low_shared_bytes();
+        ggml_cuda_fattn_kvarn_device_capabilities(device).store_materialize;
 #endif
 }
 
@@ -5557,7 +5594,9 @@ static bool ggml_backend_cuda_kvarn_tail_attention_supported(
         ggml_type tail_v,
         int64_t d_k,
         int64_t d_v) {
-    GGML_UNUSED(dev);
+    if (!ggml_backend_cuda_kvarn_native_ops(dev)) {
+        return false;
+    }
 #if defined(GGML_USE_HIP)
     return body_k == GGML_TYPE_F16 && body_v == GGML_TYPE_F16 &&
         (tail_k == GGML_TYPE_F16 || tail_k == GGML_TYPE_BF16) &&
@@ -5609,6 +5648,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_kvarn_capabilities") == 0) {
+        return (void *)ggml_backend_cuda_kvarn_capabilities;
     }
     if (strcmp(name, "ggml_backend_kvarn_native_ops") == 0) {
         return (void *)ggml_backend_cuda_kvarn_native_ops;

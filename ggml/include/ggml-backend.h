@@ -176,6 +176,46 @@ extern "C" {
         struct ggml_backend_dev_caps caps;
     };
 
+    // Versioned KVarN extension returned by the optional
+    // "ggml_backend_kvarn_capabilities" backend procedure. Callers initialize
+    // struct_size and abi_version; unknown versions fail closed.
+    enum {
+        GGML_BACKEND_KVARN_CAPABILITIES_ABI_VERSION = 1,
+    };
+
+    enum ggml_backend_kvarn_route_family {
+        GGML_BACKEND_KVARN_ROUTE_PORTABLE_NATIVE = 1u << 0,
+        GGML_BACKEND_KVARN_ROUTE_GENERIC_MMA     = 1u << 1,
+        GGML_BACKEND_KVARN_ROUTE_DECODE_SPLIT    = 1u << 2,
+        GGML_BACKEND_KVARN_ROUTE_DECODE_VECTOR   = 1u << 3,
+    };
+
+    enum ggml_backend_kvarn_head_dim {
+        GGML_BACKEND_KVARN_HEAD_DIM_128 = 1u << 0,
+        GGML_BACKEND_KVARN_HEAD_DIM_256 = 1u << 1,
+        GGML_BACKEND_KVARN_HEAD_DIM_512 = 1u << 2,
+    };
+
+    struct ggml_backend_kvarn_capabilities {
+        uint32_t struct_size;
+        uint32_t abi_version;
+        uint32_t route_families;
+        uint32_t supported_head_dims;
+        uint32_t store_materialize;
+        uint32_t portable_direct_body;
+        uint32_t portable_integrated_tail_f16;
+        uint32_t portable_integrated_tail_bf16;
+        uint32_t specialized_generic_mma;
+        uint32_t specialized_decode_split;
+        uint32_t specialized_decode_vector;
+        uint32_t original_v_domain;
+        uint32_t rotated_query_max_portable;
+        uint32_t rotated_query_max_specialized;
+        uint32_t physical_warp_size;
+        uint32_t reserved;
+        uint64_t minimum_dynamic_shared_bytes;
+    };
+
     GGML_API const char *                  ggml_backend_dev_name(ggml_backend_dev_t device);
     GGML_API const char *                  ggml_backend_dev_description(ggml_backend_dev_t device);
     GGML_API void                          ggml_backend_dev_memory(ggml_backend_dev_t device, size_t * free, size_t * total);

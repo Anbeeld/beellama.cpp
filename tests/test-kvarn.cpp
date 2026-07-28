@@ -70,6 +70,13 @@ static void test_attention_domain_policy() {
     require(portable_prefill.domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED,
             "portable materialized prefill must remain in the rotated domain");
 
+    const auto cuda_portable_prefill =
+        llama_kvarn_plan_attention(true, false, UINT32_MAX, 1024);
+    require(cuda_portable_prefill.native_attention,
+            "portable CUDA prompt processing must remain native through the advertised limit");
+    require(cuda_portable_prefill.domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED,
+            "portable-only CUDA prompt processing must remain in the rotated domain");
+
     const auto cuda_prefill = llama_kvarn_plan_attention(true, true, 16, 17);
     require(cuda_prefill.native_attention,
             "backends with original-domain V support must retain native prefill");
@@ -2553,6 +2560,8 @@ static test_kvarn_route_stats make_test_kvarn_route_stats() {
 
 using test_kvarn_route_stats_reset_fn = void (*)();
 using test_kvarn_route_stats_get_fn = void (*)(test_kvarn_route_stats *);
+using test_kvarn_capabilities_fn = bool (*)(
+        ggml_backend_dev_t, ggml_backend_kvarn_capabilities *);
 using test_kvarn_rotated_max_query_tokens_fn = uint32_t (*)(ggml_backend_dev_t);
 using test_kv_tail_segmented_supported_fn = bool (*)(
         ggml_type, ggml_type, ggml_type, ggml_type, int64_t, int64_t);
@@ -2717,6 +2726,25 @@ static void test_native_flash_attention_portable_backend(
                 "portable KVarN FlashAttention with an exact tail differs from materialized reference");
     }
 
+    if (std::strcmp(backend_label, "GPU") == 0 &&
+            std::getenv("GGML_KVARN_TEST_FORCE_PORTABLE_CAPABILITY") != nullptr) {
+        for (int n_q : { 64, 256, 1024 }) {
+            if (trace) {
+                std::fprintf(stderr, "native trace: %s portable prefill nq=%d\n",
+                        backend_label, n_q);
+                std::fflush(stderr);
+            }
+            const std::vector<float> expected = test_native_flash_attention_output(
+                    reference_backend, false, false, 256, 4, 4, n_q,
+                    2, 1, 256, 3, false, nullptr, false, 128);
+            const std::vector<float> actual = test_native_flash_attention_output(
+                    backend, true, true, 256, 4, 4, n_q,
+                    2, 1, 256, 3, false, nullptr, false, 128);
+            require_close_f32_rmse(actual, expected, 1e-2f,
+                    "portable prompt-sized KVarN body-plus-tail attention differs from materialized reference");
+        }
+    }
+
     for (int head_dim : { 128, 256, 512 }) {
         for (int n_q : { 1, 2, 8, 16 }) {
             for (ggml_type exact_type : { GGML_TYPE_F16, GGML_TYPE_BF16 }) {
@@ -2827,10 +2855,52 @@ static void test_native_flash_attention_gpu() {
         auto rotated_max_query_tokens = reg ? reinterpret_cast<test_kvarn_rotated_max_query_tokens_fn>(
             ggml_backend_reg_get_proc_address(
                 reg, "ggml_backend_kvarn_native_rotated_max_query_tokens")) : nullptr;
+        auto get_capabilities = reg ? reinterpret_cast<test_kvarn_capabilities_fn>(
+            ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_kvarn_capabilities")) : nullptr;
         require(rotated_max_query_tokens != nullptr,
                 "native KVarN backend omitted its rotated query-batch capability");
         require(rotated_max_query_tokens(dev) >= 16,
                 "native KVarN backend does not cover a complete DFlash verification block");
+        require(get_capabilities != nullptr,
+                "native KVarN backend omitted its versioned capability record");
+        ggml_backend_kvarn_capabilities undersized_capabilities = {};
+        undersized_capabilities.struct_size =
+            sizeof(undersized_capabilities) - sizeof(undersized_capabilities.minimum_dynamic_shared_bytes);
+        undersized_capabilities.abi_version = GGML_BACKEND_KVARN_CAPABILITIES_ABI_VERSION;
+        undersized_capabilities.route_families = 0xa5a5a5a5u;
+        require(!get_capabilities(dev, &undersized_capabilities) &&
+                undersized_capabilities.route_families == 0xa5a5a5a5u,
+                "KVarN capability query wrote an undersized caller structure");
+        ggml_backend_kvarn_capabilities wrong_capability_version = {};
+        wrong_capability_version.struct_size = sizeof(wrong_capability_version);
+        wrong_capability_version.abi_version =
+            GGML_BACKEND_KVARN_CAPABILITIES_ABI_VERSION + 1;
+        wrong_capability_version.route_families = 0x5a5a5a5au;
+        require(!get_capabilities(dev, &wrong_capability_version) &&
+                wrong_capability_version.route_families == 0x5a5a5a5au,
+                "KVarN capability query accepted an unknown ABI version");
+        ggml_backend_kvarn_capabilities capabilities = {};
+        capabilities.struct_size = sizeof(capabilities);
+        capabilities.abi_version = GGML_BACKEND_KVARN_CAPABILITIES_ABI_VERSION;
+        require(get_capabilities(dev, &capabilities),
+                "native KVarN backend rejected the current capability ABI");
+        require(capabilities.store_materialize &&
+                capabilities.portable_direct_body &&
+                capabilities.portable_integrated_tail_f16 &&
+                capabilities.portable_integrated_tail_bf16 &&
+                capabilities.minimum_dynamic_shared_bytes > 0,
+                "native KVarN backend capability record omitted its portable body-plus-tail contract");
+        if (std::getenv("GGML_KVARN_TEST_FORCE_PORTABLE_CAPABILITY") != nullptr) {
+            require(!capabilities.specialized_generic_mma &&
+                    !capabilities.specialized_decode_split &&
+                    !capabilities.specialized_decode_vector &&
+                    !capabilities.original_v_domain &&
+                    capabilities.rotated_query_max_portable == UINT32_MAX &&
+                    capabilities.rotated_query_max_specialized == 0 &&
+                    rotated_max_query_tokens(dev) == UINT32_MAX,
+                    "simulated pre-Turing CUDA capability did not remain portable-only");
+        }
     }
     test_native_flash_attention_portable_backend(gpu_backend, cpu_backend, "GPU");
     if (route_stats_reset == nullptr || route_stats_get == nullptr ||
@@ -2854,8 +2924,8 @@ static void test_native_flash_attention_gpu() {
                 "portable-only KVarN backend did not advertise its portable route family");
         require(route_capabilities.portable_native > 0,
                 "portable-only KVarN backend did not report its native route");
-        require(route_capabilities.compact_tail_entry > 0,
-                "portable-only KVarN backend did not report its compact-tail entry");
+        require(route_capabilities.direct_entry > 0,
+                "portable-only KVarN backend did not report its direct body-plus-tail entry");
         require(route_capabilities.materialize_fallback == 0,
                 "portable-only compact KVarN tail unexpectedly materialized");
         ggml_backend_free(cpu_backend);

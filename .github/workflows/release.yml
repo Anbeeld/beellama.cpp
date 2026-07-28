@@ -258,6 +258,14 @@ jobs:
           INPUT_TAG_NAME: ${{ inputs.tag_name }}
           INPUT_PUBLISH_RELEASE: ${{ inputs.publish_release }}
 
+  cuda-architecture-compile:
+    name: Validate CUDA architecture coverage
+    needs: release-meta
+    if: ${{ needs.release-meta.outputs.build_packages == 'true' }}
+    uses: ./.github/workflows/cuda-architecture-compile.yml
+    with:
+      source_sha: ${{ needs.release-meta.outputs.source_sha }}
+
   macos-arm64:
     name: macOS arm64 Metal
     needs: release-meta
@@ -1321,6 +1329,7 @@ jobs:
     name: Assemble release assets
     needs:
       - release-meta
+      - cuda-architecture-compile
       - macos-arm64
       - ubuntu-cpu
       - ubuntu-vulkan

@@ -7,6 +7,7 @@
 #include "fattn-mma-kvarn-decode-decl.cuh"
 #include "fattn-mma-kvarn.cuh"
 #include "fattn-kvarn-portable.cuh"
+#include "kvarn.cuh"
 
 #include <cstdio>
 #include <cstdlib>
@@ -38,7 +39,7 @@ static std::atomic<uint64_t> g_kv_mem_tail_plan_input{0};
 static std::atomic<uint64_t> g_kv_mem_tail_total{0};
 static std::atomic<bool> g_kv_mem_stats_enabled{false};
 
-static ggml_cuda_fattn_kvarn_capabilities ggml_cuda_fattn_kvarn_device_capabilities(int device) {
+ggml_cuda_fattn_kvarn_capabilities ggml_cuda_fattn_kvarn_device_capabilities(int device) {
     if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
         return {};
     }
@@ -51,20 +52,32 @@ static ggml_cuda_fattn_kvarn_capabilities ggml_cuda_fattn_kvarn_device_capabilit
     const bool matrix_mma = amd_wmma_available(device_info.cc) || amd_mfma_available(device_info.cc);
 #else
     constexpr ggml_cuda_fattn_kvarn_backend backend = GGML_CUDA_FATTN_KVARN_BACKEND_CUDA;
-    const bool matrix_mma = turing_mma_available(device_info.cc);
+    const char * force_portable_capability =
+        getenv("GGML_KVARN_TEST_FORCE_PORTABLE_CAPABILITY");
+    const bool matrix_mma =
+        turing_mma_available(device_info.cc) &&
+        !(force_portable_capability != nullptr && atoi(force_portable_capability) != 0);
 #endif
 #if defined(GGML_CUDA_KVARN)
     constexpr bool kvarn_instances = true;
+    const uint64_t minimum_dynamic_shared_bytes = ggml_cuda_kvarn_low_shared_bytes();
 #else
     constexpr bool kvarn_instances = false;
+    constexpr uint64_t minimum_dynamic_shared_bytes = 0;
 #endif
     return ggml_cuda_fattn_kvarn_select_capabilities({
-        backend, device_info.warp_size, matrix_mma, kvarn_instances,
+        backend,
+        device_info.warp_size,
+        matrix_mma,
+        kvarn_instances,
+        device_info.max_threads_per_block,
+        device_info.smpbo,
+        minimum_dynamic_shared_bytes,
     });
 }
 
 uint32_t ggml_cuda_fattn_kvarn_decode_max_q() {
-    return GGML_CUDA_FATTN_KVARN_DECODE_MAX_Q;
+    return GGML_CUDA_FATTN_KVARN_SPECIALIZED_DECODE_MAX_Q;
 }
 
 static void ggml_cuda_atomic_max(std::atomic<uint64_t> & dst, uint64_t value) {
@@ -625,7 +638,7 @@ static bool ggml_cuda_flash_attn_ext_kvarn_decode_supported(
     if (!ggml_cuda_fattn_kvarn_rotated_decode_domain(dst)) {
         return false;
     }
-    if (Q->ne[1] > GGML_CUDA_FATTN_KVARN_DECODE_MAX_Q) {
+    if (Q->ne[1] > GGML_CUDA_FATTN_KVARN_SPECIALIZED_DECODE_MAX_Q) {
         return false;
     }
     if (sinks != nullptr || max_bias != 0.0f) {
@@ -874,7 +887,8 @@ bool ggml_cuda_flash_attn_ext_kvarn_supported(
     }
     const auto capabilities = ggml_cuda_fattn_kvarn_device_capabilities(device);
     return capabilities.generic_mma || capabilities.decode_split ||
-        ggml_cuda_fattn_kvarn_portable_supported(plan, dst);
+        (capabilities.portable_native &&
+         ggml_cuda_fattn_kvarn_portable_supported(plan, dst));
 #endif // FLASH_ATTN_AVAILABLE
 }
 
@@ -886,8 +900,10 @@ bool ggml_cuda_flash_attn_ext_kvarn_portable_supported(
     GGML_UNUSED(dst);
     return false;
 #else
+    const auto capabilities = ggml_cuda_fattn_kvarn_device_capabilities(device);
     ggml_cuda_fattn_kvarn_plan plan;
-    return ggml_cuda_fattn_kvarn_supported(device, dst, &plan) &&
+    return capabilities.portable_native &&
+        ggml_cuda_fattn_kvarn_supported(device, dst, &plan) &&
         ggml_cuda_fattn_kvarn_portable_supported(plan, dst);
 #endif
 }
@@ -895,9 +911,13 @@ bool ggml_cuda_flash_attn_ext_kvarn_portable_supported(
 bool ggml_cuda_flash_attn_ext_kvarn_direct_tail_supported(
         int device,
         const ggml_tensor * dst) {
+    const auto capabilities = ggml_cuda_fattn_kvarn_device_capabilities(device);
     const char * force_portable = getenv("GGML_KVARN_TEST_FORCE_PORTABLE_FATTN");
+    const bool portable_route =
+        !capabilities.specialized_routes ||
+        (force_portable != nullptr && atoi(force_portable) != 0);
     return dst != nullptr && dst->src[10] == nullptr &&
-        force_portable != nullptr && atoi(force_portable) != 0 &&
+        capabilities.portable_native && portable_route &&
         ggml_cuda_flash_attn_ext_kvarn_portable_supported(device, dst);
 }
 
@@ -925,11 +945,14 @@ static void ggml_cuda_fattn_kvarn_debug_route(
         return;
     }
     const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * k_tail = dst->src[5];
+    const ggml_tensor * k_tail_current = dst->src[10];
     const auto & device_info = ggml_cuda_info().devices[device];
     const int gqa = plan.n_kv_heads > 0 && Q->ne[2] % plan.n_kv_heads == 0 ?
         int(Q->ne[2] / plan.n_kv_heads) : 0;
     std::fprintf(stderr,
         "kvarn-route backend=%s cc=%d wave=%d D=%d k=%d v=%d gqa=%d nq=%d nkv=%d "
+        "domain=%s tail_type=%s tail_history=%d tail_current=%d "
         "route=%s entry=%s fallback=%s\n",
 #if defined(GGML_USE_MUSA)
         "MUSA",
@@ -939,7 +962,10 @@ static void ggml_cuda_fattn_kvarn_debug_route(
         "CUDA",
 #endif
         device_info.cc, device_info.warp_size, int(Q->ne[0]), plan.k.bits, plan.v.bits,
-        gqa, int(Q->ne[1]), plan.n_kv, route,
+        gqa, int(Q->ne[1]), plan.n_kv, ggml_cuda_fattn_kvarn_domain_name(dst),
+        k_tail != nullptr ? ggml_type_name(k_tail->type) : "none",
+        k_tail != nullptr ? int(k_tail->ne[1]) : 0,
+        k_tail_current != nullptr ? int(k_tail_current->ne[1]) : 0, route,
         entry_path == GGML_CUDA_FATTN_KVARN_ENTRY_COMPACT_TAIL ? "compact-tail" : "direct",
         fallback_reason != nullptr ? fallback_reason : "none");
 }
@@ -957,7 +983,8 @@ bool ggml_cuda_flash_attn_ext_kvarn(
     ggml_cuda_fattn_kvarn_record_entry(entry_path);
 
     const char * force_portable = getenv("GGML_KVARN_TEST_FORCE_PORTABLE_FATTN");
-    if (force_portable != nullptr && atoi(force_portable) != 0 &&
+    if (capabilities.portable_native &&
+            force_portable != nullptr && atoi(force_portable) != 0 &&
             ggml_cuda_fattn_kvarn_portable_supported(plan, dst)) {
         g_kvarn_route_portable_native.fetch_add(1, std::memory_order_relaxed);
         ggml_cuda_fattn_kvarn_debug_route(
@@ -968,6 +995,9 @@ bool ggml_cuda_flash_attn_ext_kvarn(
     if (!capabilities.specialized_routes) {
         if (!ggml_cuda_fattn_kvarn_portable_supported(plan, dst)) {
             g_kvarn_route_materialize_fallback.fetch_add(1, std::memory_order_relaxed);
+            ggml_cuda_fattn_kvarn_debug_route(
+                ctx.device, plan, dst, entry_path,
+                "materialize-fallback", "portable-shape-unsupported");
             return false;
         }
         g_kvarn_route_portable_native.fetch_add(1, std::memory_order_relaxed);
@@ -977,7 +1007,8 @@ bool ggml_cuda_flash_attn_ext_kvarn(
     }
 
     const ggml_tensor * Q = dst->src[0];
-    const bool prompt_prefill = Q->ne[1] > GGML_CUDA_FATTN_KVARN_DECODE_MAX_Q;
+    const bool prompt_prefill =
+        Q->ne[1] > GGML_CUDA_FATTN_KVARN_SPECIALIZED_DECODE_MAX_Q;
     const bool vector_eligible = capabilities.decode_vector && !prompt_prefill &&
         ggml_cuda_flash_attn_ext_kvarn_vec_supported(plan, dst);
     const bool split_eligible = capabilities.decode_split && !prompt_prefill &&
@@ -1034,6 +1065,9 @@ bool ggml_cuda_flash_attn_ext_kvarn(
 
     if (!ggml_cuda_fattn_kvarn_portable_supported(plan, dst)) {
         g_kvarn_route_materialize_fallback.fetch_add(1, std::memory_order_relaxed);
+        ggml_cuda_fattn_kvarn_debug_route(
+            ctx.device, plan, dst, entry_path,
+            "materialize-fallback", "portable-shape-unsupported");
         return false;
     }
     g_kvarn_route_portable_native.fetch_add(1, std::memory_order_relaxed);

@@ -49,8 +49,8 @@ int main(int argc, char ** argv) {
     bool ok = true;
 
     ok &= expect(argc == 2, "expected repo root argument");
-    ok &= expect(GGML_CUDA_FATTN_KVARN_DECODE_MAX_Q == 16,
-        "CUDA KVarN native attention must cover a complete DFlash verification block");
+    ok &= expect(GGML_CUDA_FATTN_KVARN_SPECIALIZED_DECODE_MAX_Q == 16,
+        "specialized CUDA KVarN attention must cover a complete DFlash verification block");
     if (!ok) {
         return 1;
     }
@@ -58,6 +58,7 @@ int main(int argc, char ** argv) {
     const std::string root = argv[1];
     const std::string fattn = read_file(root + "/ggml/src/ggml-cuda/fattn.cu");
     const std::string kvarn = read_file(root + "/ggml/src/ggml-cuda/fattn-kvarn-dispatch.cu");
+    const std::string cuda_backend = read_file(root + "/ggml/src/ggml-cuda/ggml-cuda.cu");
     const std::string cmake = read_file(root + "/ggml/CMakeLists.txt");
     const std::string cuda_cmake = read_file(root + "/ggml/src/ggml-cuda/CMakeLists.txt");
     const std::string hip_cmake = read_file(root + "/ggml/src/ggml-hip/CMakeLists.txt");
@@ -72,6 +73,8 @@ int main(int argc, char ** argv) {
     const std::string kvarn_wide_instance = read_file(
         root + "/ggml/src/ggml-cuda/template-instances/fattn-mma-kvarn-instance-ncols1_16-ncols2_8.cu");
     const std::string release = read_file(root + "/.github/workflows/release.yml");
+    const std::string architecture_compile =
+        read_file(root + "/.github/workflows/cuda-architecture-compile.yml");
 
     const auto expect_route = [&](const ggml_cuda_fattn_kvarn_route_input & base,
                                   ggml_cuda_fattn_kvarn_route expected,
@@ -94,7 +97,7 @@ int main(int argc, char ** argv) {
     expect_route({256, 1, 2, 4, 4, true, false, true, true, false},
         GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_VECTOR,
         "Gemma-like D256 SWA decode did not select vector decode");
-    for (int n_q = 2; n_q <= GGML_CUDA_FATTN_KVARN_DECODE_MAX_Q; ++n_q) {
+    for (int n_q = 2; n_q <= GGML_CUDA_FATTN_KVARN_SPECIALIZED_DECODE_MAX_Q; ++n_q) {
         expect_route({256, n_q, 6, 4, 4, false, false, false, true, false},
             GGML_CUDA_FATTN_KVARN_ROUTE_GENERIC_MMA,
             "supported multi-token verification shape did not select tiled native MMA");
@@ -113,28 +116,76 @@ int main(int argc, char ** argv) {
         "wide MMA tile must retain shape and device-resource fallbacks");
 
     const auto cuda_caps = ggml_cuda_fattn_kvarn_select_capabilities({
-        GGML_CUDA_FATTN_KVARN_BACKEND_CUDA, 32, true, true,
+        GGML_CUDA_FATTN_KVARN_BACKEND_CUDA, 32, true, true, 1024, 48*1024, 4*1024,
     });
     ok &= expect(cuda_caps.generic_mma && cuda_caps.decode_split && cuda_caps.decode_vector &&
-                 cuda_caps.portable_native && cuda_caps.specialized_routes,
-        "CUDA KVarN capability selection changed while adding AMD routes");
+                 cuda_caps.portable_native && cuda_caps.specialized_routes &&
+                 cuda_caps.store_materialize && cuda_caps.original_v_domain &&
+                 cuda_caps.portable_tail_f16 && cuda_caps.portable_tail_bf16 &&
+                 cuda_caps.rotated_query_max_specialized == 16 &&
+                 cuda_caps.rotated_query_max_portable == UINT32_MAX,
+        "Turing-or-newer CUDA must expose independent portable and specialized KVarN capabilities");
+
+    const auto pre_turing_cuda_caps = ggml_cuda_fattn_kvarn_select_capabilities({
+        GGML_CUDA_FATTN_KVARN_BACKEND_CUDA, 32, false, true, 1024, 48*1024, 4*1024,
+    });
+    ok &= expect(!pre_turing_cuda_caps.generic_mma &&
+                 !pre_turing_cuda_caps.decode_split &&
+                 !pre_turing_cuda_caps.decode_vector &&
+                 pre_turing_cuda_caps.portable_native &&
+                 pre_turing_cuda_caps.portable_tail_f16 &&
+                 pre_turing_cuda_caps.portable_tail_bf16 &&
+                 !pre_turing_cuda_caps.specialized_routes &&
+                 !pre_turing_cuda_caps.original_v_domain &&
+                 pre_turing_cuda_caps.rotated_query_max_portable == UINT32_MAX &&
+                 pre_turing_cuda_caps.rotated_query_max_specialized == 0,
+        "pre-Turing CUDA must retain unbounded portable rotated-domain KVarN attention");
+
+    const auto low_shared_cuda_caps = ggml_cuda_fattn_kvarn_select_capabilities({
+        GGML_CUDA_FATTN_KVARN_BACKEND_CUDA, 32, false, true, 1024, 2*1024, 4*1024,
+    });
+    ok &= expect(!low_shared_cuda_caps.store_materialize &&
+                 !low_shared_cuda_caps.portable_native &&
+                 low_shared_cuda_caps.route_families == 0,
+        "CUDA with insufficient shared memory must fail KVarN capabilities closed");
+
+    const auto low_threads_cuda_caps = ggml_cuda_fattn_kvarn_select_capabilities({
+        GGML_CUDA_FATTN_KVARN_BACKEND_CUDA, 32, false, true, 64, 48*1024, 4*1024,
+    });
+    ok &= expect(!low_threads_cuda_caps.store_materialize &&
+                 !low_threads_cuda_caps.portable_native,
+        "CUDA unable to launch a 128-thread portable block must fail closed");
+
+    const auto wrong_warp_cuda_caps = ggml_cuda_fattn_kvarn_select_capabilities({
+        GGML_CUDA_FATTN_KVARN_BACKEND_CUDA, 64, false, true, 1024, 48*1024, 4*1024,
+    });
+    ok &= expect(!wrong_warp_cuda_caps.portable_native,
+        "CUDA portable KVarN attention must require the physical 32-thread warp contract");
+
+    const auto disabled_cuda_caps = ggml_cuda_fattn_kvarn_select_capabilities({
+        GGML_CUDA_FATTN_KVARN_BACKEND_CUDA, 32, true, false, 1024, 48*1024, 4*1024,
+    });
+    ok &= expect(!disabled_cuda_caps.store_materialize &&
+                 !disabled_cuda_caps.portable_native &&
+                 !disabled_cuda_caps.specialized_routes,
+        "a build without KVarN instances must advertise no native route");
 
     const auto rdna_caps = ggml_cuda_fattn_kvarn_select_capabilities({
-        GGML_CUDA_FATTN_KVARN_BACKEND_HIP, 32, true, true,
+        GGML_CUDA_FATTN_KVARN_BACKEND_HIP, 32, true, true, 1024, 48*1024, 4*1024,
     });
     ok &= expect(rdna_caps.generic_mma && rdna_caps.decode_split && !rdna_caps.decode_vector &&
                  rdna_caps.portable_native && rdna_caps.specialized_routes,
         "RDNA wave32 must expose generic WMMA, split decode, and portable fallback");
 
     const auto cdna_caps = ggml_cuda_fattn_kvarn_select_capabilities({
-        GGML_CUDA_FATTN_KVARN_BACKEND_HIP, 64, true, true,
+        GGML_CUDA_FATTN_KVARN_BACKEND_HIP, 64, true, true, 1024, 48*1024, 4*1024,
     });
     ok &= expect(cdna_caps.generic_mma && cdna_caps.decode_split && !cdna_caps.decode_vector &&
                  cdna_caps.portable_native && cdna_caps.specialized_routes,
         "CDNA wave64 must expose generic MFMA, split decode, and portable fallback");
 
     const auto old_amd_caps = ggml_cuda_fattn_kvarn_select_capabilities({
-        GGML_CUDA_FATTN_KVARN_BACKEND_HIP, 32, false, true,
+        GGML_CUDA_FATTN_KVARN_BACKEND_HIP, 32, false, true, 1024, 48*1024, 4*1024,
     });
     ok &= expect(!old_amd_caps.generic_mma && !old_amd_caps.decode_split &&
                  !old_amd_caps.decode_vector && old_amd_caps.portable_native &&
@@ -142,7 +193,7 @@ int main(int argc, char ** argv) {
         "AMD targets without WMMA/MFMA must remain portable-native");
 
     const auto musa_caps = ggml_cuda_fattn_kvarn_select_capabilities({
-        GGML_CUDA_FATTN_KVARN_BACKEND_MUSA, 32, false, true,
+        GGML_CUDA_FATTN_KVARN_BACKEND_MUSA, 32, false, true, 1024, 48*1024, 4*1024,
     });
     ok &= expect(!musa_caps.generic_mma && !musa_caps.decode_split &&
                  !musa_caps.decode_vector && musa_caps.portable_native &&
@@ -181,6 +232,17 @@ int main(int argc, char ** argv) {
                  kvarn_dispatch.find("ggml_cuda_fattn_kvarn_device_capabilities") != std::string::npos &&
                  kvarn_dispatch.find("GGML_KVARN_TEST_FORCE_PORTABLE_FATTN") != std::string::npos,
         "HIP and CUDA must share capability-driven KVarN routing with a forced-portable override");
+    const std::string cuda_native_ops = slice_between(cuda_backend,
+            "static bool ggml_backend_cuda_kvarn_native_ops(",
+            "static bool ggml_backend_cuda_kvarn_native_original_v(");
+    ok &= expect(!cuda_native_ops.empty() &&
+                 cuda_native_ops.find("turing_mma_available") == std::string::npos &&
+                 cuda_native_ops.find("ggml_cuda_fattn_kvarn_device_capabilities") != std::string::npos,
+        "CUDA backend native KVarN support must use route capabilities instead of requiring Turing MMA");
+    ok &= expect(cuda_backend.find("\"ggml_backend_kvarn_capabilities\"") != std::string::npos,
+        "CUDA must expose the versioned KVarN capability record through the backend registry");
+    ok &= expect(kvarn.find("GGML_KVARN_TEST_FORCE_PORTABLE_CAPABILITY") != std::string::npos,
+        "CUDA tests must be able to simulate a portable-only pre-Turing capability on current hardware");
     ok &= expect(fattn.find("ggml_cuda_flash_attn_ext_kvarn_direct_tail_supported") != std::string::npos &&
                  count_occurrences(fattn, "ggml_cuda_flash_attn_ext_kvarn_direct_tail_supported") == 2,
         "KVarN exact-tail execution and support reporting must share one direct-entry predicate");
@@ -218,6 +280,20 @@ int main(int argc, char ** argv) {
         "CMake must retain exactly the 15-pair default KVarN fast-decode policy without HALF");
     ok &= expect(count_occurrences(release, "-DGGML_CUDA_KVARN=ON") == 4,
         "all Linux/Windows CUDA and ROCm release builds must explicitly enable KVarN");
+    for (const char * target : {
+            "50-real", "52-real", "53-real", "60-real", "61-real",
+            "62-real", "70-real", "72-real", "75-real", "80-real",
+            "86-real", "89-real", "90-real", "120a-real", "121a-real" }) {
+        ok &= expect(architecture_compile.find(target) != std::string::npos,
+            "explicit CUDA architecture compile coverage omitted a required target");
+    }
+    ok &= expect(
+            architecture_compile.find("nvidia/cuda:12.4.1-devel-ubuntu22.04") != std::string::npos &&
+            architecture_compile.find("nvidia/cuda:13.1.1-devel-ubuntu24.04") != std::string::npos &&
+            architecture_compile.find("-DGGML_CUDA_KVARN=ON") != std::string::npos &&
+            architecture_compile.find("-DGGML_CUDA_FA=ON") != std::string::npos &&
+            architecture_compile.find("-DGGML_CUDA_FA_ALL_QUANTS=ON") != std::string::npos,
+        "CUDA architecture compile coverage must retain both toolkit lanes and an all-quant KVarN probe");
     ok &= expect(hip_cmake.find("ggml_cuda_select_kvarn_fast_decode_sources") != std::string::npos &&
                  musa_cmake.find("ggml_cuda_select_kvarn_fast_decode_sources") != std::string::npos &&
                  cmake.find("GGML_CUDA_KVARN_ALL_PAIR_COUNT 36") != std::string::npos &&

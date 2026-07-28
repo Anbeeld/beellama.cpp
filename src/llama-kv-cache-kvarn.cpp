@@ -17,6 +17,31 @@
 
 namespace {
 
+using backend_kvarn_capabilities_t = bool (*)(
+        ggml_backend_dev_t,
+        ggml_backend_kvarn_capabilities *);
+
+static backend_kvarn_capabilities_t kvarn_capabilities_proc(ggml_backend_dev_t dev) {
+    auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    return reg ? reinterpret_cast<backend_kvarn_capabilities_t>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_kvarn_capabilities")) : nullptr;
+}
+
+static bool query_kvarn_capabilities(
+        ggml_backend_dev_t dev,
+        backend_kvarn_capabilities_t fn,
+        ggml_backend_kvarn_capabilities & capabilities) {
+    if (fn == nullptr) {
+        return false;
+    }
+    capabilities = {};
+    capabilities.struct_size = sizeof(capabilities);
+    capabilities.abi_version = GGML_BACKEND_KVARN_CAPABILITIES_ABI_VERSION;
+    return fn(dev, &capabilities) &&
+        capabilities.struct_size == sizeof(capabilities) &&
+        capabilities.abi_version == GGML_BACKEND_KVARN_CAPABILITIES_ABI_VERSION;
+}
+
 using backend_kv_tail_attention_supported_t = bool (*)(
         ggml_type, ggml_type, ggml_type, ggml_type, int64_t, int64_t);
 using backend_kvarn_tail_attention_supported_t = bool (*)(
@@ -123,6 +148,14 @@ bool llama_kvarn_backend_supports_native_ops(ggml_backend_dev_t dev) {
         }
         return count > 0;
     }
+    if (auto * capabilities_fn = kvarn_capabilities_proc(dev)) {
+        ggml_backend_kvarn_capabilities capabilities = {};
+        return query_kvarn_capabilities(dev, capabilities_fn, capabilities) &&
+            (capabilities.portable_direct_body ||
+             capabilities.specialized_generic_mma ||
+             capabilities.specialized_decode_split ||
+             capabilities.specialized_decode_vector);
+    }
     using ggml_backend_kvarn_native_ops_t = bool (*)(ggml_backend_dev_t dev);
     auto * reg = ggml_backend_dev_backend_reg(dev);
     auto * fn = reg ? (ggml_backend_kvarn_native_ops_t) ggml_backend_reg_get_proc_address(
@@ -145,6 +178,11 @@ bool llama_kvarn_backend_native_attention_uses_original_v(ggml_backend_dev_t dev
         }
         return count > 0;
     }
+    if (auto * capabilities_fn = kvarn_capabilities_proc(dev)) {
+        ggml_backend_kvarn_capabilities capabilities = {};
+        return query_kvarn_capabilities(dev, capabilities_fn, capabilities) &&
+            capabilities.original_v_domain;
+    }
     using ggml_backend_kvarn_native_original_v_t = bool (*)(ggml_backend_dev_t dev);
     auto * reg = ggml_backend_dev_backend_reg(dev);
     auto * fn = reg ? (ggml_backend_kvarn_native_original_v_t) ggml_backend_reg_get_proc_address(
@@ -165,6 +203,19 @@ uint32_t llama_kvarn_backend_native_rotated_max_query_tokens(ggml_backend_dev_t 
                     ggml_backend_meta_device_get(dev, i)));
         }
         return count > 0 ? result : 0;
+    }
+    if (auto * capabilities_fn = kvarn_capabilities_proc(dev)) {
+        ggml_backend_kvarn_capabilities capabilities = {};
+        if (!query_kvarn_capabilities(dev, capabilities_fn, capabilities)) {
+            return 0;
+        }
+        const bool specialized =
+            capabilities.specialized_generic_mma ||
+            capabilities.specialized_decode_split ||
+            capabilities.specialized_decode_vector;
+        return specialized ?
+            capabilities.rotated_query_max_specialized :
+            capabilities.rotated_query_max_portable;
     }
     using ggml_backend_kvarn_native_rotated_max_query_tokens_t = uint32_t (*)(ggml_backend_dev_t dev);
     auto * reg = ggml_backend_dev_backend_reg(dev);
@@ -212,6 +263,11 @@ bool llama_kvarn_backend_supports_ops(ggml_backend_dev_t dev) {
             }
         }
         return count > 0;
+    }
+    if (auto * capabilities_fn = kvarn_capabilities_proc(dev)) {
+        ggml_backend_kvarn_capabilities capabilities = {};
+        return query_kvarn_capabilities(dev, capabilities_fn, capabilities) &&
+            capabilities.store_materialize;
     }
     using ggml_backend_kvarn_ops_t = bool (*)(ggml_backend_dev_t dev);
     auto * reg = ggml_backend_dev_backend_reg(dev);

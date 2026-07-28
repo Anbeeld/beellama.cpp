@@ -1,0 +1,229 @@
+name: CUDA architecture compile
+
+on:
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Exact source commit to compile
+        required: false
+        type: string
+      all_quants:
+        description: Also compile the full KVarN and standard quant matrix
+        required: false
+        default: false
+        type: boolean
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact source commit to compile; defaults to the selected ref
+        required: false
+        type: string
+      all_quants:
+        description: Also compile the full KVarN and standard quant matrix
+        required: false
+        default: true
+        type: boolean
+  pull_request:
+    paths:
+      - ".github/workflows/cuda-architecture-compile.yml"
+      - "CMakeLists.txt"
+      - "ggml/CMakeLists.txt"
+      - "ggml/include/**"
+      - "ggml/src/ggml-cuda/**"
+      - "src/llama-kv-cache-kvarn.*"
+      - "tests/test-cuda-fattn-route-policy.cpp"
+      - "tests/test-kvarn.cpp"
+  schedule:
+    - cron: "23 3 * * 6"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cuda-architecture-${{ github.workflow }}-${{ github.ref }}-${{ inputs.source_sha || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  compile:
+    name: CUDA ${{ matrix.toolkit }} sm_${{ matrix.sm }}
+    runs-on: ubuntu-24.04
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - toolkit: "12.4"
+            container: nvidia/cuda:12.4.1-devel-ubuntu22.04
+            architecture: 50-real
+            sm: "50"
+          - toolkit: "12.4"
+            container: nvidia/cuda:12.4.1-devel-ubuntu22.04
+            architecture: 52-real
+            sm: "52"
+          - toolkit: "12.4"
+            container: nvidia/cuda:12.4.1-devel-ubuntu22.04
+            architecture: 53-real
+            sm: "53"
+          - toolkit: "12.4"
+            container: nvidia/cuda:12.4.1-devel-ubuntu22.04
+            architecture: 60-real
+            sm: "60"
+          - toolkit: "12.4"
+            container: nvidia/cuda:12.4.1-devel-ubuntu22.04
+            architecture: 61-real
+            sm: "61"
+          - toolkit: "12.4"
+            container: nvidia/cuda:12.4.1-devel-ubuntu22.04
+            architecture: 62-real
+            sm: "62"
+          - toolkit: "12.4"
+            container: nvidia/cuda:12.4.1-devel-ubuntu22.04
+            architecture: 70-real
+            sm: "70"
+          - toolkit: "12.4"
+            container: nvidia/cuda:12.4.1-devel-ubuntu22.04
+            architecture: 72-real
+            sm: "72"
+          - toolkit: "12.4"
+            container: nvidia/cuda:12.4.1-devel-ubuntu22.04
+            architecture: 75-real
+            sm: "75"
+          - toolkit: "13.1"
+            container: nvidia/cuda:13.1.1-devel-ubuntu24.04
+            architecture: 75-real
+            sm: "75"
+          - toolkit: "13.1"
+            container: nvidia/cuda:13.1.1-devel-ubuntu24.04
+            architecture: 80-real
+            sm: "80"
+          - toolkit: "13.1"
+            container: nvidia/cuda:13.1.1-devel-ubuntu24.04
+            architecture: 86-real
+            sm: "86"
+          - toolkit: "13.1"
+            container: nvidia/cuda:13.1.1-devel-ubuntu24.04
+            architecture: 89-real
+            sm: "89"
+          - toolkit: "13.1"
+            container: nvidia/cuda:13.1.1-devel-ubuntu24.04
+            architecture: 90-real
+            sm: "90"
+          - toolkit: "13.1"
+            container: nvidia/cuda:13.1.1-devel-ubuntu24.04
+            architecture: 120a-real
+            sm: "120a"
+          - toolkit: "13.1"
+            container: nvidia/cuda:13.1.1-devel-ubuntu24.04
+            architecture: 121a-real
+            sm: "121a"
+    steps:
+      - name: Install build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git ninja-build python3-pip
+          PIP_BREAK_SYSTEM_PACKAGES=1 python3 -m pip install "cmake>=4.0,<5"
+
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.source_sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Configure
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-cuda-architecture -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_ARCHITECTURES=${{ matrix.architecture }} \
+            -DGGML_CUDA=ON \
+            -DGGML_CUDA_FA=ON \
+            -DGGML_CUDA_KVARN=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU=OFF \
+            -DGGML_CCACHE=OFF \
+            -DGGML_CUDA_NCCL=OFF \
+            -DLLAMA_BUILD_COMMON=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_TOOLS=OFF \
+            -DLLAMA_BUILD_SERVER=OFF
+
+      - name: Compile CUDA backend
+        run: cmake --build build-cuda-architecture --target ggml-cuda --parallel 2
+
+      - name: Verify architecture image
+        shell: bash
+        run: |
+          set -euo pipefail
+          library="$(find build-cuda-architecture -type f -name 'libggml-cuda.so' -print -quit)"
+          test -n "${library}"
+          cuobjdump --list-elf "${library}" | grep -F "sm_${{ matrix.sm }}"
+
+  all-quants:
+    name: CUDA all-quants ${{ matrix.toolkit }} sm_${{ matrix.sm }}
+    if: ${{ github.event_name == 'schedule' || inputs.all_quants }}
+    runs-on: ubuntu-24.04
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - toolkit: "12.4"
+            container: nvidia/cuda:12.4.1-devel-ubuntu22.04
+            architecture: 61-real
+            sm: "61"
+          - toolkit: "13.1"
+            container: nvidia/cuda:13.1.1-devel-ubuntu24.04
+            architecture: 86-real
+            sm: "86"
+    steps:
+      - name: Install build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git ninja-build python3-pip
+          PIP_BREAK_SYSTEM_PACKAGES=1 python3 -m pip install "cmake>=4.0,<5"
+
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.source_sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Configure
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-cuda-all-quants -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_ARCHITECTURES=${{ matrix.architecture }} \
+            -DGGML_CUDA=ON \
+            -DGGML_CUDA_FA=ON \
+            -DGGML_CUDA_FA_ALL_QUANTS=ON \
+            -DGGML_CUDA_KVARN=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU=OFF \
+            -DGGML_CCACHE=OFF \
+            -DGGML_CUDA_NCCL=OFF \
+            -DLLAMA_BUILD_COMMON=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_TOOLS=OFF \
+            -DLLAMA_BUILD_SERVER=OFF
+
+      - name: Compile CUDA backend
+        run: cmake --build build-cuda-all-quants --target ggml-cuda --parallel 2
+
+      - name: Verify architecture image
+        shell: bash
+        run: |
+          set -euo pipefail
+          library="$(find build-cuda-all-quants -type f -name 'libggml-cuda.so' -print -quit)"
+          test -n "${library}"
+          cuobjdump --list-elf "${library}" | grep -F "sm_${{ matrix.sm }}"
