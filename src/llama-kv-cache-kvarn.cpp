@@ -1570,6 +1570,15 @@ bool llama_kv_cache_kvarn::can_remove(llama_seq_id seq_id, llama_pos p0, llama_p
         return p0 <= 0 && p1 < 0;
     }
 
+    // seq_rm() delegates the mutation to the metadata cache, which owns the
+    // compact precision tail and its much tighter suffix-rollback reserve. The
+    // capability query has to honour that too: callers treat can_seq_rm() as a
+    // promise, and the server turns a seq_rm() that fails after can_seq_rm()
+    // succeeded into a hard error instead of falling back to reprocessing.
+    if (!metadata->can_seq_rm(seq_id, p0, p1)) {
+        return false;
+    }
+
     if (swa) {
         // SWA ring: eviction is implicit (ring overwrite). The metadata cache
         // already enforces the SWA window, so defer all removal decisions to it.
@@ -1612,6 +1621,9 @@ bool llama_kv_cache_kvarn::seq_rm_plan(
     }
     if (swa || llama_kvarn_can_remove_range(
             metadata->seq_pos_max(seq_id), p0, p1, KVAR_N_GROUP)) {
+        if (!metadata->can_seq_rm(seq_id, p0, p1)) {
+            return false;
+        }
         planned_p0 = p0;
         planned_p1 = p1;
         return true;
@@ -1619,9 +1631,11 @@ bool llama_kv_cache_kvarn::seq_rm_plan(
     if (p0 <= 0 || p1 >= 0) {
         return false;
     }
+    // A widened plan still has to survive the metadata cache's own tail rules.
     return llama_kvarn_plan_remove_range(
             metadata->seq_pos_max(seq_id), p0, p1, KVAR_N_GROUP,
-            stream_is_exclusive_for(seq_id), planned_p0, planned_p1);
+            stream_is_exclusive_for(seq_id), planned_p0, planned_p1) &&
+           metadata->can_seq_rm(seq_id, planned_p0, planned_p1);
 }
 
 bool llama_kv_cache_kvarn::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {

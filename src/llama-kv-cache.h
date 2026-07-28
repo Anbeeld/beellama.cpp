@@ -374,6 +374,12 @@ private:
 
     const uint32_t tail_tokens = 0;
     const uint32_t tail_rollback_tokens = 0;
+
+    // A metadata-only cache does not own the exact payload: its caller keeps a
+    // compressed body that still holds every position. Losing exact rows to a
+    // deep suffix removal therefore only shrinks coverage to PARTIAL until the
+    // tail refills, so no persistent rollback reserve is required.
+    const bool tail_metadata_only = false;
     ggml_type tail_type = GGML_TYPE_COUNT;
     llama_kv_tail_storage_plan tail_plan {
         LLAMA_KV_TAIL_STORAGE_DISABLED,

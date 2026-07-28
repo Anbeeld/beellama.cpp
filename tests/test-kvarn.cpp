@@ -277,11 +277,16 @@ static void kvarn_unified_restore_requires_exclusive_stream() {
 }
 
 static void test_stage_policy() {
-    require(llama_kvarn_non_swa_tail_groups(0, 0) == 1,
-            "non-SWA KVarN must retain one incomplete reference group");
-    require(llama_kvarn_non_swa_tail_groups(2048, 128) == 1,
+    // The reference keeps one incomplete group in F16, but the suffix-removal
+    // contract advertised by llama_kvarn_can_remove_range reaches back into the
+    // previous group from any position. That group's own F16 source therefore
+    // has to stay resident, otherwise re-sealing a partially reopened group
+    // pulls its surviving prefix from the newer group's aliased stage rows.
+    require(llama_kvarn_non_swa_tail_groups(0, 0) == 2,
+            "non-SWA KVarN must retain the reopenable previous group");
+    require(llama_kvarn_non_swa_tail_groups(2048, 128) == 2,
             "reference KVarN tail must not scale with the scheduler batch");
-    require(llama_kvarn_non_swa_tail_groups(2048, 512) == 1,
+    require(llama_kvarn_non_swa_tail_groups(2048, 512) == 2,
             "reference KVarN tail must not scale with the physical ubatch");
 }
 
@@ -3901,6 +3906,158 @@ static void test_eager_unaligned_start(enum ggml_backend_dev_type device_type, b
     ggml_backend_free(backend);
 }
 
+// Investigation: does a partial rollback into an already-sealed group leak the
+// newer group's stage rows into that group's record?
+//
+// Sequence (all stores are small, so they take the per-token path that decode
+// and speculative rollback use):
+//   1. seal group 1 completely            -> stage slot 1 holds group 1
+//   2. write the first `p` tokens of group 2 -> slot 1 positions [0,p) now hold group 2
+//   3. roll back and re-complete group 1 from offset q > p
+// Step 3 rewrites slot 1 positions [q,128) and re-seals group 1 from the whole
+// slot, so positions [0,p) are sourced from group 2 if the leak is real.
+//
+// The control run performs steps 1 and 3 only. Group 1's record must be
+// byte-identical between the two runs; any difference is the leak.
+static std::vector<uint8_t> kvarn_reseal_after_rollback_record(
+        ggml_backend_t backend, bool write_next_group, int p, int q, int bits, int stage_groups) {
+    constexpr int n_heads = 1;
+    const int record_bytes = int(llama_kvarn_packed_bytes(128 * 128, bits) + 3 * 128 * sizeof(ggml_fp16_t));
+
+    ggml_init_params params = { /*.mem_size =*/ 8 * 1024 * 1024, nullptr, /*.no_alloc =*/ true };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr, "reseal: failed to initialize ggml context");
+
+    const int n_next = write_next_group ? p : 0;
+    const int n_tail = 128 - q;
+
+    ggml_tensor * g1     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, n_heads, 128);
+    ggml_tensor * g1_idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 128);
+    ggml_tensor * nxt     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, n_heads, std::max(1, n_next));
+    ggml_tensor * nxt_idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, std::max(1, n_next));
+    ggml_tensor * tail     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, n_heads, n_tail);
+    ggml_tensor * tail_idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tail);
+    ggml_tensor * stage   = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, n_heads, 128 * stage_groups);
+    ggml_tensor * records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, record_bytes, n_heads, 4);
+
+    auto mk_store = [&](ggml_tensor * cur, ggml_tensor * idx, ggml_tensor * prev) {
+        ggml_tensor * s = ggml_kvarn_store(ctx, cur, idx, prev, records, bits, 16, false, stage_groups);
+        s->op_params[3] = (int32_t) cur->ne[2];
+        s->op_params[9] = 1; // eager records, as the cache always sets
+        return s;
+    };
+    ggml_tensor * chain = mk_store(g1, g1_idx, stage);
+    if (write_next_group) {
+        chain = mk_store(nxt, nxt_idx, chain);
+    }
+    chain = mk_store(tail, tail_idx, chain);
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, chain);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    require(buffer != nullptr, "reseal: failed to allocate tensors");
+
+    // Group 1 rows, the next group's rows, and the refilled tail are all
+    // deliberately far apart so a leak cannot be mistaken for quantization noise.
+    auto orig = [](int pos, int d) { return std::sin(float(pos) * 0.031f) + std::cos(float(d) * 0.017f); };
+    auto next = [](int pos, int d) { return 6.0f + 3.0f * std::sin(float(pos * 7 + d) * 0.11f); };
+    auto refill = [](int pos, int d) { return -4.0f + std::cos(float(pos * 3 + d) * 0.09f); };
+
+    std::vector<float>   g1_data(128 * 128), nxt_data(128 * std::max(1, n_next)), tail_data(128 * n_tail);
+    std::vector<int64_t> g1_i(128), nxt_i(std::max(1, n_next)), tail_i(n_tail);
+    for (int t = 0; t < 128; ++t) {
+        g1_i[t] = 128 + t;
+        for (int d = 0; d < 128; ++d) { g1_data[t * 128 + d] = orig(t, d); }
+    }
+    for (int t = 0; t < n_next; ++t) {
+        nxt_i[t] = 256 + t;
+        for (int d = 0; d < 128; ++d) { nxt_data[t * 128 + d] = next(t, d); }
+    }
+    if (n_next == 0) { nxt_i[0] = -1; }
+    for (int t = 0; t < n_tail; ++t) {
+        tail_i[t] = 128 + q + t;
+        for (int d = 0; d < 128; ++d) { tail_data[t * 128 + d] = refill(q + t, d); }
+    }
+
+    std::vector<uint8_t> zeros_stage(ggml_nbytes(stage), 0);
+    std::vector<uint8_t> zeros_rec(ggml_nbytes(records), 0);
+    ggml_backend_tensor_set(stage, zeros_stage.data(), 0, zeros_stage.size());
+    ggml_backend_tensor_set(records, zeros_rec.data(), 0, zeros_rec.size());
+    ggml_backend_tensor_set(g1, g1_data.data(), 0, ggml_nbytes(g1));
+    ggml_backend_tensor_set(g1_idx, g1_i.data(), 0, ggml_nbytes(g1_idx));
+    ggml_backend_tensor_set(nxt, nxt_data.data(), 0, ggml_nbytes(nxt));
+    ggml_backend_tensor_set(nxt_idx, nxt_i.data(), 0, ggml_nbytes(nxt_idx));
+    ggml_backend_tensor_set(tail, tail_data.data(), 0, ggml_nbytes(tail));
+    ggml_backend_tensor_set(tail_idx, tail_i.data(), 0, ggml_nbytes(tail_idx));
+
+    require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "reseal: graph compute failed");
+
+    std::vector<uint8_t> all(ggml_nbytes(records));
+    ggml_backend_tensor_get(records, all.data(), 0, all.size());
+    std::vector<uint8_t> group1(all.begin() + record_bytes, all.begin() + 2 * record_bytes);
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    return group1;
+}
+
+static void test_reseal_after_partial_rollback(enum ggml_backend_dev_type device_type, bool required) {
+    ggml_backend_t backend = init_test_backend(device_type, required);
+    if (backend == nullptr) {
+        return;
+    }
+    const char * dev = device_type == GGML_BACKEND_DEVICE_TYPE_CPU ? "CPU" : "GPU";
+    constexpr int bits = 6;
+    const int q = 126;
+
+    // Expected rotated-domain contents of group 1 after the rollback: the
+    // surviving original prefix, then the refilled tail.
+    auto orig   = [](int pos, int d) { return std::sin(float(pos) * 0.031f) + std::cos(float(d) * 0.017f); };
+    auto refill = [](int pos, int d) { return -4.0f + std::cos(float(pos * 3 + d) * 0.09f); };
+    std::vector<float> expect(128 * 128);
+    for (int pos = 0; pos < 128; ++pos) {
+        std::array<float, 128> row{};
+        for (int d = 0; d < 128; ++d) { row[d] = pos < q ? orig(pos, d) : refill(pos, d); }
+        llama_kvarn_hadamard_128(row.data());
+        for (int d = 0; d < 128; ++d) { expect[pos * 128 + d] = row[d]; }
+    }
+
+    auto rmse_over = [&](const std::vector<uint8_t> & rec, int pos0, int pos1) {
+        double se = 0.0; int n = 0;
+        for (int pos = pos0; pos < pos1; ++pos) {
+            for (int d = 0; d < 128; ++d) {
+                const double got = test_kvarn_record_value(rec.data(), bits, false, pos, d);
+                const double dif = got - double(expect[pos * 128 + d]);
+                se += dif * dif; ++n;
+            }
+        }
+        return n > 0 ? std::sqrt(se / double(n)) : 0.0;
+    };
+
+    // Track the production stage depth rather than hard-coding it, so this test
+    // follows llama_kvarn_non_swa_tail_groups if that policy ever changes.
+    const int stage_groups = int(llama_kvarn_non_swa_tail_groups(0, 0)) + 1;
+
+    for (int p : { 1, 4, 16 }) {
+        const auto control = kvarn_reseal_after_rollback_record(backend, false, p, q, bits, stage_groups);
+        const auto leaked  = kvarn_reseal_after_rollback_record(backend, true,  p, q, bits, stage_groups);
+        size_t diff = 0;
+        for (size_t i = 0; i < control.size(); ++i) {
+            diff += control[i] != leaked[i] ? 1 : 0;
+        }
+        if (diff != 0) {
+            std::fprintf(stderr,
+                    "reseal-rollback[%s]: stage_groups=%d p=%2d -> %zu/%zu record bytes differ | "
+                    "leaked rows [0,%d) rmse %.4f -> %.4f | untouched rows [%d,%d) rmse %.4f -> %.4f\n",
+                    dev, stage_groups, p, diff, control.size(),
+                    p, rmse_over(control, 0, p), rmse_over(leaked, 0, p),
+                    p, q, rmse_over(control, p, q), rmse_over(leaked, p, q));
+            require(false, "reseal-rollback: reopening a sealed group leaked the newer group's stage rows");
+        }
+    }
+    ggml_backend_free(backend);
+}
+
 static void test_eager_completed_record(enum ggml_backend_dev_type device_type, bool required) {
     ggml_backend_t backend = init_test_backend(device_type, required);
     if (backend == nullptr) {
@@ -4247,6 +4404,8 @@ int main() {
     test_cache_ops_dynamic_stage(GGML_BACKEND_DEVICE_TYPE_GPU, false, 4);
     test_eager_completed_record(GGML_BACKEND_DEVICE_TYPE_CPU, true);
     test_eager_completed_record(GGML_BACKEND_DEVICE_TYPE_GPU, false);
+    test_reseal_after_partial_rollback(GGML_BACKEND_DEVICE_TYPE_CPU, true);
+    test_reseal_after_partial_rollback(GGML_BACKEND_DEVICE_TYPE_GPU, false);
     // W2 unaligned-start coverage: first persist a prefix, then run a second
     // store whose first index is 128 + {1, 64, 127}. The 256/512 cases force a
     // transient slot reuse/flush from the second store; all cases decode

@@ -380,6 +380,7 @@ llama_kv_cache::llama_kv_cache(
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa),
     tail_tokens(tail_tokens), tail_rollback_tokens(tail_rollback_tokens),
+    tail_metadata_only(tail_metadata_only),
     tail_type(tail_type_requested), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
@@ -1375,6 +1376,18 @@ bool llama_kv_cache::can_seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1)
     }
     if (p0 <= 0 || p1 >= 0) {
         return false;
+    }
+    // A compact tail that shadows a body is an optimisation overlay: the body
+    // still holds every surviving position, so dropping exact rows to a deep
+    // suffix removal costs precision until the tail refills, never data. Only a
+    // bodyless tail (COMPACT_NATIVE_EXACT, where the body was omitted because
+    // the tail covers the whole window) is the sole copy of those rows and has
+    // to keep its removal inside the persistent reserve.
+    //
+    // tail_metadata_only covers the structured-cache case, where the body is
+    // owned by the enclosing cache (KVarN records) rather than by this one.
+    if (tail_metadata_only || tail_plan.has_owned_body || tail_plan.has_shared_body) {
+        return true;
     }
     return llama_kv_tail_can_remove_suffix(
             seq_pos_max(seq_id), p0, p1, tail_rollback_tokens);

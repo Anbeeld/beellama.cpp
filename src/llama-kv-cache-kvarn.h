@@ -60,8 +60,25 @@ inline uint32_t llama_kvarn_non_swa_tail_groups(uint32_t n_batch, uint32_t n_uba
     GGML_UNUSED(n_ubatch);
 
     // Reference KVarN keeps only the currently incomplete 128-token group in
-    // F16. Completed groups are quantized before the next group is evaluated.
-    return 1;
+    // F16, and completed groups are quantized before the next group starts.
+    // A second transient slot is still required: llama_kvarn_can_remove_range
+    // promises a position-independent suffix rollback that reaches back into
+    // the previous group, and callers rely on that promise
+    // (common_context_seq_rm aborts when a removal it was told to expect is
+    // refused). With a single slot both groups alias one stage row range, so
+    // re-sealing a partially reopened group sources its surviving prefix from
+    // the newer group's rows. Two slots keep the reopened group's own F16
+    // source resident for exactly the depth the removal contract advertises.
+    //
+    // This second slot is rollback insurance only - it does not widen the
+    // window served from F16, so it does not move the cache away from the
+    // reference's single-incomplete-group semantics. That holds because records
+    // are eager: ggml_cuda_fattn_kvarn_group_from_stage() ignores tail_groups on
+    // the eager path and serves the sink plus the live group alone. Perplexity
+    // is unchanged between depth 1 and 2 (7.1898 either way, Qwen3.6-27B kvarn6
+    // at 4K). On the delayed path from_stage() DOES widen with tail_groups, so
+    // anything that turns eager records off must revisit this value.
+    return 2;
 }
 
 class llama_kv_cache_kvarn;
