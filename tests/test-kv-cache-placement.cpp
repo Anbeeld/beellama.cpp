@@ -3,14 +3,19 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
-#include <cassert>
 #include <cmath>
+#include <iostream>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <vector>
 
-#define CHECK(condition) do { if (!(condition)) { assert(condition); } } while (0)
+#define CHECK(condition) do { \
+    if (!(condition)) { \
+        std::cerr << "check failed at line " << __LINE__ << ": " #condition "\n"; \
+        return 1; \
+    } \
+} while (0)
 
 static ggml_backend_meta_split_state mirrored_split(const ggml_tensor *, void *) {
     return { GGML_BACKEND_SPLIT_AXIS_MIRRORED, { 0 }, { 1 }, 1 };
@@ -58,29 +63,52 @@ int main() {
 
     // Qwen3.6 has four KV heads. Split ratios are rounded only at complete
     // head boundaries and may legitimately leave a shard empty.
-    CHECK((llama_kv_cache_head_split(4, { 1.0f, 1.0f }) ==
-            std::vector<uint32_t> { 2, 2 }));
-    CHECK((llama_kv_cache_head_split(4, { 3.0f, 1.0f }) ==
-            std::vector<uint32_t> { 3, 1 }));
-    const auto zero_head_shards = llama_kv_cache_head_split(
-            2, { 1.0f, 1.0f, 1.0f, 1.0f });
+    CHECK((llama_tensor_split_counts(4, { 1.0f, 1.0f }, 1) ==
+            std::vector<int64_t> { 2, 2 }));
+    CHECK((llama_tensor_split_counts(4, { 3.0f, 1.0f }, 1) ==
+            std::vector<int64_t> { 3, 1 }));
+    const auto zero_head_shards = llama_tensor_split_counts(
+            2, { 1.0f, 1.0f, 1.0f, 1.0f }, 1);
     CHECK(zero_head_shards.size() == 4);
-    CHECK(std::count(zero_head_shards.begin(), zero_head_shards.end(), 0u) == 2);
-    CHECK(std::accumulate(zero_head_shards.begin(), zero_head_shards.end(), 0u) == 2);
-    CHECK((llama_kv_cache_head_split(4, { 0.0f, 0.0f }) ==
-            std::vector<uint32_t> { 2, 2 }));
+    CHECK(std::count(zero_head_shards.begin(), zero_head_shards.end(), int64_t(0)) == 2);
+    CHECK(std::accumulate(zero_head_shards.begin(), zero_head_shards.end(), int64_t(0)) == 2);
+    CHECK((llama_tensor_split_counts(4, { 0.0f, 0.0f }, 1) ==
+            std::vector<int64_t> { 2, 2 }));
+    CHECK((llama_tensor_split_counts(10, { 1.0f, 1.0f, 1.0f }, 4) ==
+            std::vector<int64_t> { 0, 4, 6 }));
 
     bool rejected = false;
     try {
-        (void) llama_kv_cache_head_split(4, { 1.0f, -1.0f });
+        (void) llama_tensor_split_counts(4, { 1.0f, -1.0f }, 1);
     } catch (const std::invalid_argument &) {
         rejected = true;
     }
     CHECK(rejected);
     rejected = false;
     try {
-        (void) llama_kv_cache_head_split(4, {
-                1.0f, std::numeric_limits<float>::quiet_NaN() });
+        (void) llama_tensor_split_counts(4, {
+                1.0f, std::numeric_limits<float>::quiet_NaN() }, 1);
+    } catch (const std::invalid_argument &) {
+        rejected = true;
+    }
+    CHECK(rejected);
+    rejected = false;
+    try {
+        (void) llama_tensor_split_counts(4, {}, 1);
+    } catch (const std::invalid_argument &) {
+        rejected = true;
+    }
+    CHECK(rejected);
+    rejected = false;
+    try {
+        (void) llama_tensor_split_counts(4, { 1.0f }, 0);
+    } catch (const std::invalid_argument &) {
+        rejected = true;
+    }
+    CHECK(rejected);
+    rejected = false;
+    try {
+        (void) llama_tensor_split_counts(-1, { 1.0f }, 1);
     } catch (const std::invalid_argument &) {
         rejected = true;
     }

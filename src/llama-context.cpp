@@ -685,13 +685,17 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
-        const ggml_type actual_tail_type = memory->get_kv_tail_type();
-        if ((cparams.kv_tail_tokens > 0 || cparams.kv_tail_tokens_swa > 0) &&
-                actual_tail_type == GGML_TYPE_COUNT) {
-            throw std::runtime_error("KV tail cache did not report its resolved storage type");
-        }
-        if (actual_tail_type != GGML_TYPE_COUNT) {
-            cparams.kv_tail_type = actual_tail_type;
+        if (memory) {
+            const ggml_type actual_tail_type = memory->get_kv_tail_type();
+            if ((cparams.kv_tail_tokens > 0 || cparams.kv_tail_tokens_swa > 0) &&
+                    actual_tail_type == GGML_TYPE_COUNT) {
+                throw std::runtime_error("KV tail cache did not report its resolved storage type");
+            }
+            if (actual_tail_type != GGML_TYPE_COUNT) {
+                cparams.kv_tail_type = actual_tail_type;
+            }
+        } else if (cparams.kv_tail_tokens > 0 || cparams.kv_tail_tokens_swa > 0) {
+            throw std::runtime_error("KV tail cache requested for a model without cache memory");
         }
     }
 

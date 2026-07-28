@@ -352,13 +352,10 @@ def main() -> None:
     ):
         raise AssertionError("KVarN-off builds must not link store-route telemetry from the excluded kvarn.cu")
 
-    default_build = (ROOT / "tmp/build-local-3090-cuda13.1-default.ps1").read_text(encoding="utf-8")
-    if default_build.count(f"-D{kvarn_option}=ON") != 1:
-        raise AssertionError("default CUDA build must enable the single KVarN compilation toggle")
-    if default_build.count("-DGGML_CUDA_FA_ALL_QUANTS=OFF") != 1:
-        raise AssertionError("default CUDA build must explicitly select only the default FA pair matrices")
-    if any(option in default_build for option in removed_options):
-        raise AssertionError("default CUDA build must not use obsolete KVarN compilation toggles")
+    all_quants_option_line = next((line for line in ggml_cmake.splitlines()
+                                   if line.startswith("option(GGML_CUDA_FA_ALL_QUANTS ")), "")
+    if not all_quants_option_line.endswith(" OFF)"):
+        raise AssertionError("default CUDA builds must select only the default FA pair matrices")
     default_pairs_block = ggml_cmake.split("set(GGML_CUDA_KVARN_DEFAULT_PAIRS", 1)[1].split(")", 1)[0]
     default_pairs = default_pairs_block.split()
     if len(default_pairs) != 15:

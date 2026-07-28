@@ -31,8 +31,11 @@ struct llama_kv_cache_component {
 
 llama_kv_cache_component llama_kv_cache_component_from_name(const std::string & name);
 
-// Return per-device head counts using the same cumulative-ratio convention as
-// the upstream meta device. Empty shards are valid when devices outnumber heads.
-std::vector<uint32_t> llama_kv_cache_head_split(
-        uint32_t n_heads,
-        const std::vector<float> & weights);
+// Return per-device element counts using the cumulative-ratio convention used
+// by tensor-parallel placement. Non-final boundaries are rounded down to the
+// requested granularity; empty shards and a shorter final remainder are valid.
+// Throws std::invalid_argument for invalid dimensions, granularity, or weights.
+std::vector<int64_t> llama_tensor_split_counts(
+        int64_t n_elements,
+        const std::vector<float> & weights,
+        int64_t granularity);
