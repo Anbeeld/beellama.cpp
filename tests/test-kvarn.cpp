@@ -504,6 +504,16 @@ static void kvarn_historical_suffix_plans_group_boundary() {
     expect_plan(5626, 5700, true, false,  -1, -1); // finite middle range is never widened
 }
 
+static void kvarn_swa_deep_rollback_plans_group_boundary() {
+    llama_pos planned_p0 = -1;
+    llama_pos planned_p1 = 0;
+    require(llama_kvarn_plan_remove_range(
+                1023, 300, -1, KVAR_N_GROUP, true, planned_p0, planned_p1),
+            "deep SWA rollback did not produce a stage-safe removal plan");
+    require(planned_p0 == 256 && planned_p1 == -1,
+            "deep SWA rollback did not widen to the requested group's boundary");
+}
+
 static void kvarn_historical_suffix_rejects_contended_unified_stream() {
     llama_pos planned_p0 = -99;
     llama_pos planned_p1 = -99;
@@ -3761,7 +3771,7 @@ static void test_eager_unaligned_start(enum ggml_backend_dev_type device_type, b
         return;
     }
 
-    constexpr int stage_groups = 2; // production non-SWA: sink slot + one transient group
+    const int stage_groups = int(llama_kvarn_non_swa_tail_groups(0, 0) + 1);
     constexpr int n_heads = 1;
 
     ggml_init_params params = {
@@ -4367,6 +4377,7 @@ int main() {
     test_remove_policy();
     kvarn_historical_suffix_rejects_contended_unified_stream();
     kvarn_historical_suffix_plans_group_boundary();
+    kvarn_swa_deep_rollback_plans_group_boundary();
     test_pack_roundtrip(2);
     test_pack_roundtrip(3);
     test_pack_roundtrip(4);

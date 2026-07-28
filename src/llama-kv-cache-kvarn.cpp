@@ -1579,12 +1579,6 @@ bool llama_kv_cache_kvarn::can_remove(llama_seq_id seq_id, llama_pos p0, llama_p
         return false;
     }
 
-    if (swa) {
-        // SWA ring: eviction is implicit (ring overwrite). The metadata cache
-        // already enforces the SWA window, so defer all removal decisions to it.
-        return true;
-    }
-
     const llama_pos pos_max = metadata->seq_pos_max(seq_id);
     if (llama_kvarn_can_remove_range(pos_max, p0, p1, KVAR_N_GROUP)) {
         return true;
@@ -1619,7 +1613,7 @@ bool llama_kv_cache_kvarn::seq_rm_plan(
     if (uint32_t(seq_id) >= n_seq_max) {
         return false;
     }
-    if (swa || llama_kvarn_can_remove_range(
+    if (llama_kvarn_can_remove_range(
             metadata->seq_pos_max(seq_id), p0, p1, KVAR_N_GROUP)) {
         if (!metadata->can_seq_rm(seq_id, p0, p1)) {
             return false;

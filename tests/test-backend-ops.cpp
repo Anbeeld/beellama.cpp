@@ -4365,11 +4365,15 @@ struct test_mul_mat : public test_case {
     const int64_t k_v; // size of k in memory, resulting in a non-contiguous view for k_v > k, no view for k_v == 0
     const uint32_t o; // number of outputs
     const int64_t k_v_rhs; // optional RHS-only physical k; -1 preserves the shared k_v behavior
+    const size_t rhs_offset; // byte offset of the RHS view
 
     std::string vars() override {
         std::string result = VARS_TO_STR10(type_a, type_b, m, n, k, bs, nr, per, k_v, o);
         if (k_v_rhs >= 0) {
             result += ",k_v_rhs=" + std::to_string(k_v_rhs);
+        }
+        if (rhs_offset != 0) {
+            result += ",rhs_offset=" + std::to_string(rhs_offset);
         }
         return result;
     }
@@ -4400,9 +4404,9 @@ struct test_mul_mat : public test_case {
             std::array<int64_t, 2> bs = {10, 10},
             std::array<int64_t, 2> nr = {2, 2},
             std::array<int64_t, 4> per = {0, 1, 2, 3},
-            int64_t k_v = 0, uint32_t o = 1, int64_t k_v_rhs = -1)
+            int64_t k_v = 0, uint32_t o = 1, int64_t k_v_rhs = -1, size_t rhs_offset = 0)
         : type_a(type_a), type_b(type_b), m(m), n(n), k(k), bs(bs), nr(nr), per(per), k_v(k_v), o(o),
-          k_v_rhs(k_v_rhs) {}
+          k_v_rhs(k_v_rhs), rhs_offset(rhs_offset) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         // C^T = A * B^T: (k, m) * (k, n) => (m, n)
@@ -4414,6 +4418,7 @@ struct test_mul_mat : public test_case {
             GGML_ASSERT(npermuted == 2);
             GGML_ASSERT(k_v == 0); // not handled
             GGML_ASSERT(k_v_rhs == -1); // not handled
+            GGML_ASSERT(rhs_offset == 0); // not handled
             GGML_ASSERT(!ggml_is_quantized(type_a) || per[0] == 0);
             GGML_ASSERT(!ggml_is_quantized(type_b) || per[0] == 0);
 
@@ -4441,6 +4446,7 @@ struct test_mul_mat : public test_case {
             const int64_t k_physical_b = k_v_rhs < 0 ? k_physical_a : (k_v_rhs == 0 ? k : k_v_rhs);
             GGML_ASSERT(k_physical_a >= k);
             GGML_ASSERT(k_physical_b >= k);
+            GGML_ASSERT(rhs_offset % ggml_type_size(type_b) == 0);
             a = ggml_new_tensor_4d(ctx, type_a, k_physical_a, m, bs[0],       bs[1]);
             b = ggml_new_tensor_4d(ctx, type_b, k_physical_b, n, bs[0]*nr[0], bs[1]*nr[1]);
 
@@ -4454,8 +4460,10 @@ struct test_mul_mat : public test_case {
             if (k_physical_a != k) {
                 a = ggml_view_4d(ctx, a, k, m, bs[0],       bs[1],       a->nb[1], a->nb[2], a->nb[3], 0);
             }
-            if (k_physical_b != k) {
-                b = ggml_view_4d(ctx, b, k, n, bs[0]*nr[0], bs[1]*nr[1], b->nb[1], b->nb[2], b->nb[3], 0);
+            if (k_physical_b != k || rhs_offset != 0) {
+                b = ggml_view_4d(
+                    ctx, b, k, n, bs[0]*nr[0], bs[1]*nr[1],
+                    b->nb[1], b->nb[2], b->nb[3], rhs_offset);
             }
             ggml_set_name(a, "a");
             ggml_set_name(b, "b");
@@ -4564,11 +4572,15 @@ struct test_mul_mat_id : public test_case {
     const int64_t n;
     const int64_t k;
     const int64_t k_v_rhs;
+    const size_t rhs_offset;
 
     std::string vars() override {
         std::string result = VARS_TO_STR8(type_a, type_b, n_mats, n_used, b, m, n, k);
         if (k_v_rhs >= 0) {
             result += ",k_v_rhs=" + std::to_string(k_v_rhs);
+        }
+        if (rhs_offset != 0) {
+            result += ",rhs_offset=" + std::to_string(rhs_offset);
         }
         return result;
     }
@@ -4592,9 +4604,10 @@ struct test_mul_mat_id : public test_case {
 
     test_mul_mat_id(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
-            int64_t m = 32, int64_t n = 32, int64_t k = 32, int64_t k_v_rhs = -1)
+            int64_t m = 32, int64_t n = 32, int64_t k = 32,
+            int64_t k_v_rhs = -1, size_t rhs_offset = 0)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k), k_v_rhs(k_v_rhs) {
+            m(m), n(n), k(k), k_v_rhs(k_v_rhs), rhs_offset(rhs_offset) {
             GGML_ASSERT(n_used <= n_mats);
         }
 
@@ -4612,9 +4625,10 @@ struct test_mul_mat_id : public test_case {
 
         const int64_t k_physical_b = k_v_rhs < 0 ? k : k_v_rhs;
         GGML_ASSERT(k_physical_b >= k);
+        GGML_ASSERT(rhs_offset % ggml_type_size(type_b) == 0);
         ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k_physical_b, this->b ? 1 : n_used, n);
-        if (k_physical_b != k) {
-            b = ggml_view_3d(ctx, b, k, this->b ? 1 : n_used, n, b->nb[1], b->nb[2], 0);
+        if (k_physical_b != k || rhs_offset != 0) {
+            b = ggml_view_3d(ctx, b, k, this->b ? 1 : n_used, n, b->nb[1], b->nb[2], rhs_offset);
         }
         ggml_set_name(b, "b");
 
@@ -6227,12 +6241,15 @@ struct test_mul_mat_vec_fusion : public test_case {
     const bool with_lane_scale;
     std::array<int64_t, 2> batch_dims;
     const int64_t k_v_rhs;
+    const size_t rhs_offset;
 
     test_mul_mat_vec_fusion(ggml_type type, ggml_glu_op op, int64_t m, int64_t n, int64_t k,
                         bool use_id = false, int n_mats = 1, int n_used = 1, bool b = false, bool with_bias = false, bool with_gate = true,
-                        bool with_lane_scale = false, std::array<int64_t, 2> batch_dims = {4, 2}, int64_t k_v_rhs = -1)
+                        bool with_lane_scale = false, std::array<int64_t, 2> batch_dims = {4, 2},
+                        int64_t k_v_rhs = -1, size_t rhs_offset = 0)
     : type(type), glu_op(op), m(m), n(n), k(k), use_id(use_id), n_mats(n_mats), n_used(n_used), b(b), with_bias(with_bias),
-        with_gate(with_gate), with_lane_scale(with_lane_scale), batch_dims(batch_dims), k_v_rhs(k_v_rhs) {
+        with_gate(with_gate), with_lane_scale(with_lane_scale), batch_dims(batch_dims), k_v_rhs(k_v_rhs),
+        rhs_offset(rhs_offset) {
         if (use_id) {
             GGML_ASSERT(n_used <= n_mats);
         }
@@ -6243,6 +6260,9 @@ struct test_mul_mat_vec_fusion : public test_case {
             VARS_TO_STR13(type, glu_op, m, n, k, use_id, n_mats, n_used, b, with_bias, with_gate, with_lane_scale, batch_dims);
         if (k_v_rhs >= 0) {
             result += ",k_v_rhs=" + std::to_string(k_v_rhs);
+        }
+        if (rhs_offset != 0) {
+            result += ",rhs_offset=" + std::to_string(rhs_offset);
         }
         return result;
     }
@@ -6296,9 +6316,12 @@ struct test_mul_mat_vec_fusion : public test_case {
             std::array<int64_t, 4> ne0      = { k, n, channels, samples };
 
             GGML_ASSERT(ne_cur[0] >= k);
+            GGML_ASSERT(rhs_offset % sizeof(float) == 0);
             ggml_tensor * cur  = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_cur.data());
-            if (ne_cur[0] != k) {
-                cur = ggml_view_4d(ctx, cur, k, m, channels, samples, cur->nb[1], cur->nb[2], cur->nb[3], 0);
+            if (ne_cur[0] != k || rhs_offset != 0) {
+                cur = ggml_view_4d(
+                    ctx, cur, k, m, channels, samples,
+                    cur->nb[1], cur->nb[2], cur->nb[3], rhs_offset);
             }
             ggml_tensor * gate = with_gate ? ggml_new_tensor(ctx, type, 4, ne0.data()) : nullptr;
             ggml_tensor * up   = ggml_new_tensor(ctx, type, 4, ne0.data());
@@ -6351,9 +6374,12 @@ struct test_mul_mat_vec_fusion : public test_case {
 
             const int64_t k_physical = k_v_rhs < 0 ? k : k_v_rhs;
             GGML_ASSERT(k_physical >= k);
+            GGML_ASSERT(rhs_offset % sizeof(float) == 0);
             ggml_tensor * cur = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k_physical, this->b ? 1 : n_used, m);
-            if (k_physical != k) {
-                cur = ggml_view_3d(ctx, cur, k, this->b ? 1 : n_used, m, cur->nb[1], cur->nb[2], 0);
+            if (k_physical != k || rhs_offset != 0) {
+                cur = ggml_view_3d(
+                    ctx, cur, k, this->b ? 1 : n_used, m,
+                    cur->nb[1], cur->nb[2], rhs_offset);
             }
             ggml_set_name(cur, "cur");
 
@@ -9408,6 +9434,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 1, 256, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, 257));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 8, 256, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, 257));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 8, 256, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, 258));
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_F16, GGML_TYPE_F32, 128, 1, 256,
+        {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, 260, sizeof(float)));
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_F16, GGML_TYPE_F32, 128, 8, 256,
+        {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, 260, sizeof(float)));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 32, 32, { 1,  1}, {1, 1}, {0, 1, 2, 3}, 64, 3));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 64, 77, 77, {12,1}, {1,1}));
 
@@ -9465,6 +9497,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, 1));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 8, 2, false, 128, 8, 256, 257));
+    test_cases.emplace_back(new test_mul_mat_id(
+        GGML_TYPE_F16, GGML_TYPE_F32, 8, 2, false, 128, 8, 256, 260, sizeof(float)));
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3));
 
     // gpt-oss issue with Vulkan mmq_id
@@ -10269,6 +10303,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_vec_fusion(
         GGML_TYPE_F16, GGML_GLU_OP_SWIGLU, 1, 32, 256,
         true, 16, 8, false, false, true, false, {1, 1}, 257));
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(
+        GGML_TYPE_F16, GGML_GLU_OP_SWIGLU, 1, 32, 256,
+        false, 1, 1, false, false, true, false, {1, 1}, 260, sizeof(float)));
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(
+        GGML_TYPE_F16, GGML_GLU_OP_SWIGLU, 1, 32, 256,
+        true, 16, 8, false, false, true, false, {1, 1}, 260, sizeof(float)));
 
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {
         for (bool with_norm : {false, true}) {

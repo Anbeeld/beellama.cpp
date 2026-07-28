@@ -284,7 +284,7 @@ public:
     // Reference-faithful staging keeps one incomplete 128-token group lossless.
     // Completed records are committed eagerly, so physical ubatch size does not
     // change the logical exact suffix.
-    //   non-SWA tail_groups = 1
+    //   non-SWA tail_groups = 2 rollback-safe transient slots
     //   SWA tail_groups     = 2 physical wrap-safety slots
     //   stage_groups        = tail_groups + 1 for non-SWA, tail_groups for SWA
     // The +1 is only the permanent sink slot for non-SWA. SWA has no sink slot,

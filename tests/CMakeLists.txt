@@ -92,6 +92,12 @@ if (Python3_Interpreter_FOUND)
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-kvarn-eager-workspace-static.py)
     set_property(TEST test-kvarn-eager-workspace-static PROPERTY LABELS cuda)
+
+    add_test(
+        NAME test-kvarn-rollback-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-kvarn-rollback-static.py)
+    set_property(TEST test-kvarn-rollback-static PROPERTY LABELS main)
 endif()
 
 function(llama_build source)

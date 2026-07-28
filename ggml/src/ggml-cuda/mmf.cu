@@ -131,7 +131,7 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
 }
 
 bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const int64_t * src0_ne,
-        const size_t * src0_nb, const size_t * src1_nb, const int src1_ncols, bool mul_mat_id) {
+        const size_t * src0_nb, const ggml_tensor * src1, const int src1_ncols, bool mul_mat_id) {
     if (ggml_is_quantized(type)) {
         return false;
     }
@@ -152,18 +152,18 @@ bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const 
         }
     }
 
-    // MMF uses float2 RHS loads and requires every reachable RHS base to remain
-    // float2-aligned. For F16/BF16 src0, the selected column stride is divided
-    // by the number of src0 values packed in T before the kernel assertion, so
-    // validate the pre-division byte stride without truncating it.
-    for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
-        if (src1_nb[i] % (2*sizeof(float)) != 0) {
-            return false;
-        }
+    // MMF uses float2 RHS loads and requires the base pointer plus every
+    // reachable row/channel/sample base to remain float2-aligned.
+    if (!ggml_cuda_is_aligned(src1, 2*sizeof(float))) {
+        return false;
     }
+
+    // For F16/BF16 src0, the selected column stride is divided by the number
+    // of src0 values packed in T before the kernel assertion, so validate the
+    // pre-division byte stride without truncating it.
     const size_t vals_per_T = ts == sizeof(float) ? 1 : 2;
     const size_t col_dim = mul_mat_id ? 2 : 1;
-    if (src1_nb[col_dim] % (2*vals_per_T*sizeof(float)) != 0) {
+    if (src1->nb[col_dim] % (2*vals_per_T*sizeof(float)) != 0) {
         return false;
     }
 
