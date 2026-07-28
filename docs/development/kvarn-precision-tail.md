@@ -118,7 +118,7 @@ both layer groups when their native route is otherwise eligible.
 - Validation source parent: `2226885615fdd336c85d71822465d6704e51958b`;
   the implementation is the commit containing this record.
 - Hardware: NVIDIA RTX 3090, CUDA 13.1, architecture 86.
-- Build: `powershell -File tmp/build-local-3090-cuda13.1.ps1 -Parallel 16`.
+- Build: `powershell -File scripts/build-win-cuda-13.1-sm_86.ps1 -Parallel 16`.
 - Qwen target: `<QWEN_TARGET_GGUF>`.
 - Gemma target: `<GEMMA_TARGET_GGUF>`.
 - Corpus: `<KLD_CORPUS>`.
@@ -160,7 +160,7 @@ $GemmaModel = '<GEMMA_TARGET_GGUF>'
 $Corpus = '<KLD_CORPUS>'
 $GemmaBase = '<GEMMA_BF16_BASE>'
 
-build-local-rtx3090-cuda-13.1/bin/llama-perplexity.exe `
+build-win-cuda-13.1-sm_86/bin/llama-perplexity.exe `
   -m $GemmaModel `
   -ngl all -c 16384 -b 2048 -ub 256 `
   --cache-type-k kvarn4 --cache-type-v kvarn4 `

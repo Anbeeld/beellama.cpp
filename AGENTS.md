@@ -63,6 +63,19 @@ matrix use descriptor-native MMA fallback.
 Use `-DCMAKE_CUDA_ARCHITECTURES=86` for RTX 3090 and `89` for RTX 4090 when
 the build host cannot detect the target GPU.
 
+On Windows hosts matching CUDA 13.1 and compute capability 8.6, prefer:
+
+```powershell
+powershell -File scripts/build-win-cuda-13.1-sm_86.ps1 -AllTests
+powershell -File scripts/build-win-cuda-13.1-sm_86-default.ps1 -AllTests
+powershell -File scripts/build-win-vulkan.ps1 -AllTests
+```
+
+The first CUDA script compiles the expanded quant matrix; the `-default`
+variant compiles the default pair matrix. The Vulkan script requires a Vulkan
+SDK. For other hardware or toolkits, adapt the architecture, toolkit, and
+build-name parameters instead of reusing the `sm_86` artifact names.
+
 Key binaries are `llama-server`, `llama-cli`, `llama-bench`, and
 `llama-perplexity` under the configured build directory's `bin` folder.
 

@@ -75,7 +75,7 @@ running Turing-or-newer KVarN routes:
 $env:GGML_KVARN_TEST_PORTABLE_NATIVE_ONLY = "1"
 $env:GGML_KVARN_TEST_FORCE_PORTABLE_CAPABILITY = "1"
 $env:GGML_KVARN_TEST_BACKEND = "CUDA0"
-build-local-rtx3090-cuda-13.1\bin\test-kvarn.exe
+build-win-cuda-13.1-sm_86\bin\test-kvarn.exe
 ```
 
 The portable-only suite compares D128, D256, and D512 output with the
