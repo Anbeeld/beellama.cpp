@@ -61,11 +61,6 @@ bodyless mode, and multi-stream ordering.
 | Maxwell, SM 5.0/5.2/5.3 | CUDA 12.4 | Portable direct | Experimental pending real SM 5.2 validation |
 | Kepler | Outside the CUDA 12.4/13.1 lane | None | Unsupported |
 
-The architecture workflow compiles each listed target separately and checks
-that the resulting CUDA library contains its device image. A scheduled lane
-also compiles the full 36-pair KVarN and 169-pair standard quant matrix.
-Compile success is not runtime qualification.
-
 ## Deterministic validation
 
 Current CUDA hardware can simulate the portable-only capability without
