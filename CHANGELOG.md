@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.4.3
+
+- Fixed HIP/ROCm KVarN caches incorrectly falling back to full F16 materialization when precision tails were enabled. KVarN now honors the backend's dedicated native-tail capability before consulting generic segmented-tail support, avoiding context-sized fallback allocations on supported AMD GPUs while leaving ordinary HIP segmented-tail routing unchanged.
+
 ## v0.4.2
 
 - Updated the llama.cpp base through upstream commit `6ba5ef247`. Notable inherited changes include MiniMax-M3 sparse attention and vision, GLM-5.2-Vision and its indexer, Laguna, Nanbeige4.2, MiMo-V2.5 audio, DeepSeek4 fused operators, BitNet conversion, gpt-oss EAGLE3-v3, server MCP stdio, `"reasoning_effort": "none"`, multi-end-sequence reasoning budgets, draft-sidecar discovery, broad backend and Web UI updates, and the unified `--load-mode` (`-lm`) selector. `GGML_OP_COUNT` is now 105 and the RPC protocol version is 4.0.5.
