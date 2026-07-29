@@ -64,19 +64,19 @@ bool kvarn_backend_supports_native_tail(
         return count > 0;
     }
     auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
-    auto * segmented_fn = reg ? reinterpret_cast<backend_kv_tail_attention_supported_t>(
-            ggml_backend_reg_get_proc_address(
-                reg, "ggml_backend_kv_tail_segmented_attention_supported")) : nullptr;
-    if (!segmented_fn || !segmented_fn(
-            GGML_TYPE_F16, GGML_TYPE_F16, exact_type, exact_type, d_k, d_v)) {
-        return false;
-    }
     auto * kvarn_fn = reg ? reinterpret_cast<backend_kvarn_tail_attention_supported_t>(
             ggml_backend_reg_get_proc_address(
                 reg, "ggml_backend_kvarn_tail_attention_supported")) : nullptr;
     if (kvarn_fn) {
         return kvarn_fn(dev, GGML_TYPE_F16, GGML_TYPE_F16,
             exact_type, exact_type, d_k, d_v);
+    }
+    auto * segmented_fn = reg ? reinterpret_cast<backend_kv_tail_attention_supported_t>(
+            ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_kv_tail_segmented_attention_supported")) : nullptr;
+    if (!segmented_fn || !segmented_fn(
+            GGML_TYPE_F16, GGML_TYPE_F16, exact_type, exact_type, d_k, d_v)) {
+        return false;
     }
     auto * fn = reg ? reinterpret_cast<backend_kv_tail_attention_supported_t>(
             ggml_backend_reg_get_proc_address(

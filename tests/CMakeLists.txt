@@ -104,6 +104,12 @@ if (Python3_Interpreter_FOUND)
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-kvarn-rollback-static.py)
     set_property(TEST test-kvarn-rollback-static PROPERTY LABELS main)
+
+    add_test(
+        NAME test-kvarn-hip-tail-capability-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-kvarn-hip-tail-capability-static.py)
+    set_property(TEST test-kvarn-hip-tail-capability-static PROPERTY LABELS hip)
 endif()
 
 function(llama_build source)
