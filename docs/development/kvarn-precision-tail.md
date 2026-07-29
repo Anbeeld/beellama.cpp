@@ -59,12 +59,13 @@ before the exact contribution is merged. Forced-portable tests without current
 segments may enter KVarN directly. Versioned route counters distinguish both
 entries without changing the persistent tail or record ABI.
 
-Persistent placement is finalized in two phases. KVarN records and F16 stages
-are allocated first; their realized buffer owner is then used for route
-selection and for the exact K/V tensors. A tensor/meta-split record body rejects
-the overlay before exact tensors, the shared tail arena, or generation metadata
-are allocated. Layer split remains supported because each record, stage, exact
-tensor, graph consumer, and state row stays with the owning layer device.
+Persistent placement is finalized from one typed cache-component descriptor.
+Layer placement keeps each record, stage, exact tensor, graph consumer, and
+state row with the owning layer device. Tensor placement projects KVarN records
+and stages on their sliced-head axis and exact K/V on complete KV-head widths;
+all components therefore use the same model split without dividing a record or
+head across devices. Invalid component geometry fails during cache construction
+before any partial cache becomes visible.
 
 ## Lifecycle and state
 
@@ -117,7 +118,7 @@ both layer groups when their native route is otherwise eligible.
 - Validation source parent: `2226885615fdd336c85d71822465d6704e51958b`;
   the implementation is the commit containing this record.
 - Hardware: NVIDIA RTX 3090, CUDA 13.1, architecture 86.
-- Build: `powershell -File tmp/build-local-3090-cuda13.1.ps1 -Parallel 16`.
+- Build: `powershell -File scripts/build-win-cuda-13.1-sm_86.ps1 -Parallel 16`.
 - Qwen target: `<QWEN_TARGET_GGUF>`.
 - Gemma target: `<GEMMA_TARGET_GGUF>`.
 - Corpus: `<KLD_CORPUS>`.
@@ -159,7 +160,7 @@ $GemmaModel = '<GEMMA_TARGET_GGUF>'
 $Corpus = '<KLD_CORPUS>'
 $GemmaBase = '<GEMMA_BF16_BASE>'
 
-build-local-rtx3090-cuda-13.1/bin/llama-perplexity.exe `
+build-win-cuda-13.1-sm_86/bin/llama-perplexity.exe `
   -m $GemmaModel `
   -ngl all -c 16384 -b 2048 -ub 256 `
   --cache-type-k kvarn4 --cache-type-v kvarn4 `

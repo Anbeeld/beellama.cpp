@@ -85,7 +85,8 @@ int main() {
     CHECK(llama_kv_tail_validate_layer_ownership(layer1) == LLAMA_KV_TAIL_OWNERSHIP_SHADOW_V);
     layer1.shadow_v_owner = 202;
     layer1.body_k_meta_split = true;
-    CHECK(llama_kv_tail_validate_layer_ownership(layer1) == LLAMA_KV_TAIL_OWNERSHIP_META_SPLIT_K);
+    layer1.body_v_meta_split = true;
+    CHECK(llama_kv_tail_validate_layer_ownership(layer1) == LLAMA_KV_TAIL_OWNERSHIP_OK);
 
     llama_kv_tail_route_requirements route_requirements;
     route_requirements.native_attention = true;

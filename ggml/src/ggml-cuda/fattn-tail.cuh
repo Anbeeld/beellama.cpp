@@ -470,6 +470,19 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
     GGML_ASSERT(qo->type == GGML_TYPE_I32 && rd->type == GGML_TYPE_I32 && rd->ne[0] >= 4);
     GGML_ASSERT(qo->ne[1] == rd->ne[1]);
     GGML_ASSERT(kt->ne[0] == q->ne[0] && vt->ne[0] == dst->ne[0]);
+    if (kt->ne[2] != kb->ne[2] || vt->ne[2] != vb->ne[2]) {
+        GGML_LOG_ERROR(
+                "precision-tail head shard mismatch: K body=%lldx%lld/tail=%lld, V body=%lldx%lld/tail=%lld; "
+                "K ops=%s/%s/%s, V ops=%s/%s/%s\n",
+                (long long) kb->ne[1], (long long) kb->ne[2], (long long) kt->ne[2],
+                (long long) vb->ne[1], (long long) vb->ne[2], (long long) vt->ne[2],
+                ggml_op_name(kb->op),
+                kb->src[0] ? ggml_op_name(kb->src[0]->op) : "<null>",
+                kb->src[0] && kb->src[0]->src[0] ? ggml_op_name(kb->src[0]->src[0]->op) : "<null>",
+                ggml_op_name(vb->op),
+                vb->src[0] ? ggml_op_name(vb->src[0]->op) : "<null>",
+                vb->src[0] && vb->src[0]->src[0] ? ggml_op_name(vb->src[0]->src[0]->op) : "<null>");
+    }
     GGML_ASSERT(kt->ne[2] == dst->src[1]->ne[2] && vt->ne[2] == dst->src[2]->ne[2]);
     GGML_ASSERT(mt->ne[0] > 0 &&
             kt->ne[1] + (kt_current ? kt_current->ne[1] : 0) >= mt->ne[0]);

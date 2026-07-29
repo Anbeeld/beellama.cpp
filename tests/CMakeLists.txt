@@ -4,16 +4,16 @@ find_package(Python3 COMPONENTS Interpreter QUIET)
 
 if (Python3_Interpreter_FOUND)
     add_test(
-        NAME test-paired-wrapper-static
-        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-paired-wrapper-static.py)
-    set_property(TEST test-paired-wrapper-static PROPERTY LABELS main)
-
-    add_test(
         NAME test-release-workflow-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-release-workflow-static.py)
     set_property(TEST test-release-workflow-static PROPERTY LABELS main)
+
+    add_test(
+        NAME test-release-cache-parent
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-release-cache-parent.py)
+    set_property(TEST test-release-cache-parent PROPERTY LABELS main)
 
     add_test(
         NAME test-backend-ops-seed-static
@@ -50,6 +50,12 @@ if (Python3_Interpreter_FOUND)
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-issue41-regressions-static.py)
     set_property(TEST test-issue41-regressions-static PROPERTY LABELS cuda)
+
+    add_test(
+        NAME test-cuda-mmq-low-bit-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-cuda-mmq-low-bit-static.py)
+    set_property(TEST test-cuda-mmq-low-bit-static PROPERTY LABELS cuda)
 
     add_test(
         NAME test-fattn-vec-dispatch-generated
@@ -92,6 +98,12 @@ if (Python3_Interpreter_FOUND)
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-kvarn-eager-workspace-static.py)
     set_property(TEST test-kvarn-eager-workspace-static PROPERTY LABELS cuda)
+
+    add_test(
+        NAME test-kvarn-rollback-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-kvarn-rollback-static.py)
+    set_property(TEST test-kvarn-rollback-static PROPERTY LABELS main)
 endif()
 
 function(llama_build source)
@@ -354,6 +366,8 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
 llama_build_and_test(test-arg-parser.cpp)
 llama_build_and_test(test-kv-cache-tail.cpp ../src/llama-kv-cache-tail.cpp)
 target_include_directories(test-kv-cache-tail PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_build_and_test(test-kv-cache-placement.cpp ../src/llama-kv-cache-placement.cpp)
+target_include_directories(test-kv-cache-placement PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build_and_test(test-std-kv-tail-graph.cpp ../src/llama-kv-cache-tail.cpp)
 target_include_directories(test-std-kv-tail-graph PRIVATE ${PROJECT_SOURCE_DIR}/src)
 

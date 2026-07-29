@@ -113,20 +113,40 @@ reservation and zero cumulative per-context growth.
 
 ### Backend support and limitations
 
-KVarN is target-context-only. CUDA uses its optimized descriptor-native
-FlashAttention kernels. ROCm/HIP selects between record-tiled split decode,
-generic descriptor-native WMMA/MFMA, and a portable direct-record kernel. CPU
-has a backend-native direct-record attention path. Vulkan directly consumes
-compressed records for body-only inputs and consumes compact bodyless
-F16/BF16 tails for head dimensions 128, 256, and 512 with query batches through
-16 rows. A Vulkan layer with both a compressed body and an exact tail instead
-materializes the body and uses the backend's standard tiled FlashAttention
-path. That policy is intentional: hardware measurements found the mixed direct
-shader slower than the materialized upstream-style route. Matrix-capable HIP
-and CUDA retain descriptor-native large-batch prefill. Larger portable-only
-query batches likewise materialize the rotated K/V body. Vulkan requires
-shader Int64 and buffer-device-address support. CPU placement is valid with KV
-offload disabled.
+KVarN is target-context-only. CUDA selects specialized descriptor-native
+FlashAttention on Turing and newer GPUs, then falls back to a portable
+direct-record route when those matrix instructions are unavailable or the
+complete body-plus-tail request does not fit a specialized route. The portable
+CUDA route consumes rotated compressed records and attached F16 or BF16 tails
+directly for D128, D256, and D512 heads. Its correctness limit is not the
+specialized decode threshold of 16 queries, so prompt-sized query batches stay
+native instead of creating a full F32 KQ tensor.
+
+ROCm/HIP selects between record-tiled split decode, generic descriptor-native
+WMMA/MFMA, and the same portable direct-record kernel. CPU has a backend-native
+direct-record attention path. Vulkan directly consumes compressed records for
+body-only inputs and compact bodyless F16/BF16 tails for head dimensions 128,
+256, and 512 with query batches through 16 rows. A Vulkan layer with both a
+compressed body and an exact tail instead materializes the body and uses the
+backend's standard tiled FlashAttention path. That policy is intentional:
+hardware measurements found the mixed direct shader slower than the
+materialized upstream-style route. Matrix-capable HIP and CUDA retain
+descriptor-native large-batch prefill. Other portable backends retain their
+advertised query limits. Vulkan requires shader Int64 and
+buffer-device-address support. CPU placement is valid with KV offload disabled.
+
+| NVIDIA architecture | Toolkit and package | Native KVarN route | Qualification |
+|---|---|---|---|
+| Turing and newer, SM 7.5+ | CUDA 12.4 or 13.1 | Specialized MMA/split/vector routes with portable fallback | Current release tier; CUDA 13.1 is locally exercised on SM 8.6 |
+| Volta, SM 7.0/7.2 | CUDA 12.4 | Portable direct body-plus-tail attention | Explicit build target; real-device validation required |
+| Pascal, SM 6.0/6.1/6.2 | CUDA 12.4 | Portable direct body-plus-tail attention | Priority compatibility target for issue #112; real-device validation required |
+| Maxwell, SM 5.0/5.2/5.3 | CUDA 12.4 | Portable direct body-plus-tail attention | Experimental until an SM 5.2 device passes runtime gates |
+| Kepler | Not in the CUDA 12.4/13.1 release lane | None | Unsupported |
+
+Use the CUDA 12.4 release package for Maxwell, Pascal, or Volta. CUDA 13.1
+does not contain device code for those architectures. Build coverage proves
+that a translation unit accepts a target; it does not prove runtime
+correctness, memory behavior, or performance on that GPU.
 
 | HIP architecture | Physical wave | Native KVarN route |
 |---|---:|---|
@@ -137,6 +157,13 @@ offload disabled.
 CDNA fast routing is compiled and selected by capability but remains
 experimental until hardware parity and performance results are published.
 MUSA explicitly remains on the portable route.
+
+Set `GGML_KVARN_DEBUG_ROUTES=1` to log the selected CUDA/HIP route, compute
+capability, rotated/original domain, K/V bit widths, query and KV counts,
+attached exact-tail rows and type for integrated entries, entry path, and
+fallback reason. Startup tail-policy logs and `llama-bench --kv-memory` remain
+the sources of requested and effective tail coverage for compact two-pass
+entries.
 
 Vulkan direct decode groups up to four GQA query heads per reconstructed K/V
 head and uses split-K when the query/head grid alone cannot occupy the device.
@@ -253,15 +280,19 @@ descriptors and current sources are attached. Unsupported native shapes fail
 closed before scheduling rather than appearing later as CPU/CUDA split
 boundaries.
 
-Exact overlays support the normal `--split-mode layer` ownership model: each
-body and its K/V shadows are allocated on that layer's owning device, and graph
-writes, reads, and state payload rows retain the same owner. Tensor/meta split
-shards an individual body tensor, so a mirrored compact shadow would be
-incorrect; partial standard and KVarN overlays therefore fail during context
-creation after the ordinary body placement is known and before any tail arena
-or shadow allocation. With `--split-mode tensor`, use `--kv-tail-tokens 0` or a
-full-window standard native-exact representation. Native-exact has no shadow
-and follows the ordinary KV tensor split when that split descriptor is valid.
+Exact overlays support both layer and tensor placement. Layer mode keeps each
+body and K/V shadow on the device that owns the layer. Tensor mode projects the
+body, standard shadow, KVarN records and staging, and exact history through one
+typed cache-component split contract. Standard rows and exact tails split on
+complete KV-head widths; KVarN records and staging split on their sliced-head
+axis, so one head/group record never spans devices. A malformed split fails
+during cache construction with the layer and component named in the error.
+
+The local CUDA acceptance rows use two logical shards on one RTX 3090, including
+`1,1` standard-tail and `3,1` KVarN-tail placement on Qwen3.6-27B at a 16K
+context. Executable CPU/meta tests cover zero-head shards. This verifies local
+projection and scheduling but not physical peer copies, NCCL, heterogeneous GPU
+rollback, or per-device memory pressure; those remain external two-GPU gates.
 
 KVarN differs from standard caches in three intentional ways. Its exact suffix
 has a non-disableable 128-token floor, positive requests round upward to 128

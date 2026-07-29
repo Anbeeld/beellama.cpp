@@ -1182,6 +1182,10 @@ typedef struct {
 } ggml_metal_kargs_argsort_merge;
 
 typedef struct {
+    int32_t nrows;
+} ggml_metal_kargs_fwht;
+
+typedef struct {
     int64_t  ne0;
     float    start;
     float    step;

@@ -1,0 +1,39 @@
+{
+  "executable": "C:\\Users\\anbee\\projects\\beellama.cpp\\build-local-rtx3090-cuda-13.1\\bin\\llama-cli.exe",
+  "model": "D:\\models\\Qwen3.6-27B-GGUF\\Qwen3.6-27B-Q5_K_S.gguf",
+  "corpus": "C:\\Users\\anbee\\projects\\kv-cache-benchmarks\\data\\wikitext-2-raw\\wiki.test.raw",
+  "baseline": "D:\\wikitext-q5ks-bf16-baseline.ctx-65536.kld",
+  "context": 16384,
+  "coordinates": [
+    {
+      "id": "none-control-np1",
+      "task": "correctness",
+      "timeout_seconds": 1800,
+      "arguments": ["-m", "{model}", "-c", "{context}", "-b", "2048", "-ub", "512", "-fa", "on", "-ctk", "bf16", "-ctv", "bf16", "-sm", "none", "-ngl", "all", "-n", "64", "--seed", "1", "-st", "-p", "The history of reliable distributed systems begins with"]
+    },
+    {
+      "id": "none-standard-tail-np1",
+      "task": "correctness",
+      "timeout_seconds": 1800,
+      "arguments": ["-m", "{model}", "-c", "{context}", "-b", "2048", "-ub", "512", "-fa", "on", "-ctk", "q4_0", "-ctv", "q4_0", "--kv-tail-tokens", "1024", "--kv-tail-type", "bf16", "-sm", "none", "-ngl", "all", "-n", "64", "--seed", "1", "-st", "-p", "The history of reliable distributed systems begins with"]
+    },
+    {
+      "id": "none-kvarn-tail-np1",
+      "task": "correctness",
+      "timeout_seconds": 1800,
+      "arguments": ["-m", "{model}", "-c", "{context}", "-b", "2048", "-ub", "512", "-fa", "on", "-ctk", "kvarn4", "-ctv", "kvarn4", "--kv-tail-tokens", "1024", "--kv-tail-type", "f16", "-sm", "none", "-ngl", "all", "-n", "64", "--seed", "1", "-st", "-p", "The history of reliable distributed systems begins with"]
+    },
+    {
+      "id": "tensor-even-standard-tail-np1",
+      "task": "correctness",
+      "timeout_seconds": 1800,
+      "arguments": ["-m", "{model}", "-c", "{context}", "-b", "2048", "-ub", "512", "-fa", "on", "-ctk", "q4_0", "-ctv", "q4_0", "--kv-tail-tokens", "1024", "--kv-tail-type", "bf16", "--device", "CUDA0,CUDA0", "-sm", "tensor", "-ts", "1,1", "-ngl", "all", "-n", "64", "--seed", "1", "-st", "-p", "The history of reliable distributed systems begins with"]
+    },
+    {
+      "id": "tensor-uneven-kvarn-tail-np1",
+      "task": "correctness",
+      "timeout_seconds": 1800,
+      "arguments": ["-m", "{model}", "-c", "{context}", "-b", "2048", "-ub", "512", "-fa", "on", "-ctk", "kvarn4", "-ctv", "kvarn4", "--kv-tail-tokens", "1024", "--kv-tail-type", "f16", "--device", "CUDA0,CUDA0", "-sm", "tensor", "-ts", "3,1", "-ngl", "all", "-n", "64", "--seed", "1", "-st", "-p", "The history of reliable distributed systems begins with"]
+    }
+  ]
+}

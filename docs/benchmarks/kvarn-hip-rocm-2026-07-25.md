@@ -89,7 +89,7 @@ Raw local logs are under `tmp/hip-kvarn-evidence/`.
 The final Release validation used:
 
 ```powershell
-ctest --test-dir build-local-rtx3090-cuda-13.1 -C Release --output-on-failure
+ctest --test-dir build-win-cuda-13.1-sm_86 -C Release --output-on-failure
 ```
 
 All 70 tests passed in 446.74 seconds. The exhaustive `test-backend-ops`

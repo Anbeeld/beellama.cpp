@@ -240,6 +240,24 @@ static const llm_fused_op_probe llm_fused_op_lid_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+static const llm_fused_op_probe llm_fused_op_dsv4_hc_pre_probe = {
+    /*.op               =*/ LLM_FUSED_OP_DSV4_HC_PRE,
+    /*.name             =*/ "fused DeepSeek V4 HC pre",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
+static const llm_fused_op_probe llm_fused_op_dsv4_hc_comb_probe = {
+    /*.op               =*/ LLM_FUSED_OP_DSV4_HC_COMB,
+    /*.name             =*/ "fused DeepSeek V4 HC comb",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
+static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
+    /*.op               =*/ LLM_FUSED_OP_DSV4_HC_POST,
+    /*.name             =*/ "fused DeepSeek V4 HC post",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -498,6 +516,11 @@ llama_context::llama_context(
     cparams.fused_lid    = true;
     cparams.auto_flid    = true;
 
+    cparams.fused_dsv4_hc_pre  = true;
+    cparams.fused_dsv4_hc_comb = true;
+    cparams.fused_dsv4_hc_post = true;
+    cparams.auto_fhc           = true;
+
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
@@ -564,12 +587,37 @@ llama_context::llama_context(
 
     if (!hparams.vocab_only) {
         // GPU backends
-        for (const auto & dev : model.devices) {
+        std::vector<ggml_backend_dev_t> initialized_devices;
+        auto add_device_backend = [&](const llama_device & dev) {
+            if (std::find(initialized_devices.begin(), initialized_devices.end(), dev.dev) !=
+                    initialized_devices.end()) {
+                return;
+            }
             ggml_backend_t backend = ggml_backend_dev_init(dev.dev, nullptr);
             if (backend == nullptr) {
                 throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
             }
             backends.emplace_back(backend);
+            initialized_devices.push_back(dev.dev);
+        };
+        for (const auto & dev : model.devices) {
+            add_device_backend(dev);
+        }
+
+        // EAGLE3, DFlash, and assistant contexts borrow target-model tensors.
+        // Their scheduler must therefore know the owning target devices in
+        // addition to the devices that hold the auxiliary model itself.  This
+        // is normally invisible when both models use the same simple backend,
+        // but a tensor-split target owns its weights through a distinct meta
+        // device.  Adding only missing devices keeps auxiliary layers on their
+        // requested device while borrowed projections execute where they are
+        // physically resident.
+        if (cparams.ctx_other != nullptr) {
+            const llama_model * model_other = llama_get_model(cparams.ctx_other);
+            GGML_ASSERT(model_other != nullptr);
+            for (const auto & dev : model_other->devices) {
+                add_device_backend(dev);
+            }
         }
 
         // add ACCEL backends (such as BLAS)
@@ -637,13 +685,17 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
-        const ggml_type actual_tail_type = memory->get_kv_tail_type();
-        if ((cparams.kv_tail_tokens > 0 || cparams.kv_tail_tokens_swa > 0) &&
-                actual_tail_type == GGML_TYPE_COUNT) {
-            throw std::runtime_error("KV tail cache did not report its resolved storage type");
-        }
-        if (actual_tail_type != GGML_TYPE_COUNT) {
-            cparams.kv_tail_type = actual_tail_type;
+        if (memory) {
+            const ggml_type actual_tail_type = memory->get_kv_tail_type();
+            if ((cparams.kv_tail_tokens > 0 || cparams.kv_tail_tokens_swa > 0) &&
+                    actual_tail_type == GGML_TYPE_COUNT) {
+                throw std::runtime_error("KV tail cache did not report its resolved storage type");
+            }
+            if (actual_tail_type != GGML_TYPE_COUNT) {
+                cparams.kv_tail_type = actual_tail_type;
+            }
+        } else if (cparams.kv_tail_tokens > 0 || cparams.kv_tail_tokens_swa > 0) {
+            throw std::runtime_error("KV tail cache requested for a model without cache memory");
         }
     }
 
@@ -816,6 +868,14 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         LLAMA_LOG_INFO("%s: resolving fused Lightning Indexer support:\n", func);
         resolve(llm_fused_op_lid_probe, cparams.fused_lid);
         cparams.auto_flid = false;
+    }
+
+    if (cparams.auto_fhc) {
+        LLAMA_LOG_INFO("%s: resolving fused DeepSeek V4 HC support:\n", func);
+        resolve(llm_fused_op_dsv4_hc_pre_probe,  cparams.fused_dsv4_hc_pre);
+        resolve(llm_fused_op_dsv4_hc_comb_probe, cparams.fused_dsv4_hc_comb);
+        resolve(llm_fused_op_dsv4_hc_post_probe, cparams.fused_dsv4_hc_post);
+        cparams.auto_fhc = false;
     }
 }
 
@@ -2615,7 +2675,9 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_KIMI_LINEAR ||
         model.arch == LLM_ARCH_QWEN35 ||
         model.arch == LLM_ARCH_QWEN35MOE ||
-        model.arch == LLM_ARCH_DEEPSEEK4) {
+        model.arch == LLM_ARCH_DEEPSEEK4 ||
+        model.arch == LLM_ARCH_NANBEIGE ||
+        model.arch == LLM_ARCH_MINIMAX_M3) {
         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors()) + tail_nodes;
     }
     uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors()) + tail_nodes;
@@ -2749,11 +2811,12 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_set_name(cur, name);
         }
 
-        // norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
+        // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
+        // - force the last op of the layer on the specified backend to avoid running it on the backend of the next layer due to scheduling
         // FIXME: fix in ggml_backend_sched
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_all;
         if (ubatch.n_tokens < 32 || full_offload) {
-            if (il != -1 && strcmp(name, "norm") == 0) {
+            if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0)) {
                 const auto & dev_layer = model.dev_layer(il);
                 for (const auto & backend : backends) {
                     if (ggml_backend_get_device(backend.get()) == dev_layer) {

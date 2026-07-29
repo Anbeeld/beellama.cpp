@@ -14,7 +14,9 @@ CUDA, ROCm/HIP, Vulkan, and CPU consume compressed KVarN records directly in
 native FlashAttention paths. Vulkan requires shader Int64 and
 buffer-device-address support for its direct route. An explicitly supported
 materialization fallback retains compressed persistent storage when a native
-route is unavailable.
+route is unavailable. Pre-Turing NVIDIA GPUs use CUDA's portable rotated-domain
+body-plus-tail route and require a CUDA 12.4 build or release package. CUDA
+13.1 packages target Turing and newer architectures.
 
 | Argument | Env var | Default | Behavior |
 |---|---|---|---|
@@ -66,12 +68,12 @@ it never defaults to `U`. The memory capability API reports this bound, and a
 larger speculative removal must use the checkpoint/reprocess path before cache
 metadata is mutated.
 
-Partial exact overlays are compatible with `--split-mode layer`; every shadow
-stays on the same device as its layer's ordinary K/V body. They are not
-compatible with `--split-mode tensor`, whose meta buffer shards a body tensor
-across devices. That combination fails before tail allocation. Tensor split
-requires `--kv-tail-tokens 0` or a full-window standard native-exact result,
-which has no shadow and uses the ordinary KV split descriptor.
+Partial exact overlays are compatible with `--split-mode layer` and
+`--split-mode tensor`. Layer mode keeps each shadow with its ordinary K/V body.
+Tensor mode shards standard body/shadow rows, KVarN records and staging, and
+exact history at complete KV-head boundaries through the model's meta split
+descriptor. Invalid or unsupported component splits fail during cache
+construction rather than after graph execution starts.
 
 KVarN's physical staging depth is independent of this logical policy. Increasing
 `-ub` may increase transient work but never increases persistent exact coverage.
@@ -208,7 +210,14 @@ Use the same corpus, context, logical batch, and physical ubatch for both KLD le
 | Argument | Env var | Default | Behavior |
 |---|---|---|---|
 | `-DGGML_CUDA_FA_ALL_QUANTS=ON` | — | Off | Expands the CUDA vector matrix from 50 to all 169 standard cache pairs and, when `GGML_CUDA_KVARN=ON`, KVarN fast-decode instances from 15 balanced pairs to all 36 ordered bit pairs. Valid KVarN pairs outside the fast matrix use descriptor-native MMA. |
-| `-DGGML_CUDA_KVARN=ON/OFF` | — | On | Compiles or omits the shared CUDA/HIP KVarN kernels and CUDA native-attention template instances. When enabled, `GGML_CUDA_FA_ALL_QUANTS` selects 15 default or all 36 CUDA fast-decode pairs. |
+| `-DGGML_CUDA_KVARN=ON/OFF` | — | On | Compiles or omits the shared CUDA/HIP KVarN kernels and CUDA native-attention template instances. When enabled, `GGML_CUDA_FA_ALL_QUANTS` selects 15 default or all 36 CUDA fast-decode pairs. CUDA devices without the specialized Turing MMA contract use the portable direct-record route when their warp, thread-block, shared-memory, head-dimension, and tail-type capabilities pass. |
+
+CUDA 12.4 is the release lane for Maxwell, Pascal, and Volta. CUDA 13.1 covers
+Turing and newer architectures. The architecture CI compiles SM 5.0, 5.2,
+5.3, 6.0, 6.1, 6.2, 7.0, 7.2, and 7.5 separately with CUDA 12.4, and SM 7.5
+through the current Blackwell targets with CUDA 13.1. These are compile gates;
+pre-Turing support remains runtime-unqualified until matching real devices pass
+the KVarN parity, memory, and model-smoke tests.
 
 ## Migration from earlier versions
 

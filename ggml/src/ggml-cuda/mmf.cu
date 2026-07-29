@@ -131,7 +131,7 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
 }
 
 bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const int64_t * src0_ne,
-        const size_t * src0_nb, const int src1_ncols, bool mul_mat_id) {
+        const size_t * src0_nb, const ggml_tensor * src1, const int src1_ncols, bool mul_mat_id) {
     if (ggml_is_quantized(type)) {
         return false;
     }
@@ -151,6 +151,22 @@ bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const 
             return false;
         }
     }
+
+    // MMF uses float2 RHS loads and requires the base pointer plus every
+    // reachable row/channel/sample base to remain float2-aligned.
+    if (!ggml_cuda_is_aligned(src1, 2*sizeof(float))) {
+        return false;
+    }
+
+    // For F16/BF16 src0, the selected column stride is divided by the number
+    // of src0 values packed in T before the kernel assertion, so validate the
+    // pre-division byte stride without truncating it.
+    const size_t vals_per_T = ts == sizeof(float) ? 1 : 2;
+    const size_t col_dim = mul_mat_id ? 2 : 1;
+    if (src1->nb[col_dim] % (2*vals_per_T*sizeof(float)) != 0) {
+        return false;
+    }
+
     if (src0_ne[1] % mmf_get_rows_per_block(cc) != 0) {
         return false;
     }

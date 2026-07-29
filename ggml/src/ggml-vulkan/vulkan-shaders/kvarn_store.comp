@@ -654,26 +654,42 @@ void flush_workspace(uint lane) {
     const uint first_pos = first_idx % KVAR_N_DIM;
     const uint start_local = first_group * KVAR_N_DIM + first_pos;
     const uint end_local = start_local + p.tokens_per_stream;
-    const uint boundary_group =
-        (start_local + KVAR_N_DIM - 1u) / KVAR_N_DIM + candidate;
-    if (boundary_group * KVAR_N_DIM >= end_local) {
+
+    // Delayed stores seal a group when it leaves the transient stage, so they
+    // enumerate the group boundaries this store crosses. Eager stores enumerate
+    // the groups that COMPLETE inside this store, anchored on the group holding
+    // start_local so an unaligned start does not skip the straddling group (its
+    // prefix is still resident in the transient stage slot). Mirrors
+    // kvarn_store_workspace_flush_kernel in ggml-cuda/kvarn.cu.
+    const int record_group_signed = p.eager_records != 0u ?
+        int(start_local / KVAR_N_DIM) + int(candidate) :
+        int((start_local + KVAR_N_DIM - 1u) / KVAR_N_DIM) + int(candidate) - int(p.tail_groups);
+    if (record_group_signed < 0) {
         return;
     }
-
-    const int record_group_signed = p.eager_records != 0u ?
-        int(boundary_group) : int(boundary_group) - int(p.tail_groups);
-    if (record_group_signed < 0 ||
-            (p.swa == 0u &&
-             (record_group_signed < 1 ||
-              record_group_signed >= int(p.groups_per_stream)))) {
+    if (p.eager_records != 0u) {
+        // Only seal a complete tile; a trailing partial group stays in the stage.
+        if (uint(record_group_signed + 1) * KVAR_N_DIM > end_local) {
+            return;
+        }
+    } else {
+        const uint boundary_group = uint(record_group_signed) + p.tail_groups;
+        if (boundary_group * KVAR_N_DIM >= end_local) {
+            return;
+        }
+    }
+    if (p.swa == 0u &&
+            (record_group_signed < 1 ||
+             record_group_signed >= int(p.groups_per_stream))) {
         return;
     }
     const uint record_group = uint(record_group_signed);
     if (p.swa != 0u) {
-        const uint next_same_record_boundary_group =
-            record_group + p.groups_per_stream +
-            (p.eager_records != 0u ? 0u : p.tail_groups);
-        if (next_same_record_boundary_group * KVAR_N_DIM < end_local) {
+        if (p.eager_records != 0u) {
+            if ((record_group + p.groups_per_stream + 1u) * KVAR_N_DIM <= end_local) {
+                return;
+            }
+        } else if ((record_group + p.groups_per_stream + p.tail_groups) * KVAR_N_DIM < end_local) {
             return;
         }
     }

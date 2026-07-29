@@ -26,7 +26,18 @@ cmake -B build -G Ninja -DGGML_CUDA=ON -DGGML_NATIVE=ON `
 cmake --build build --config Release --parallel 16
 ```
 
-For the local Windows CUDA 13.1 setup, use `tmp/build-local-3090-cuda13.1.ps1`.
+For Windows hosts matching CUDA 13.1 and compute capability 8.6, use:
+
+```powershell
+powershell -File scripts/build-win-cuda-13.1-sm_86.ps1 -AllTests
+powershell -File scripts/build-win-cuda-13.1-sm_86-default.ps1 -AllTests
+powershell -File scripts/build-win-vulkan.ps1 -AllTests
+```
+
+The first CUDA script compiles the expanded quant matrix; the `-default`
+variant compiles the default pair matrix. The Vulkan script requires a Vulkan
+SDK. Adapt the architecture, toolkit, and build-name parameters for other
+hardware rather than reusing the `sm_86` artifact names.
 
 CUDA FlashAttention vector cache coverage has two build modes:
 

@@ -5,6 +5,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 LOW_BIT_TYPES = ("Q6_0", "Q6_1", "Q3_0", "Q3_1", "Q2_0S", "Q2_1")
+MMQ_TYPES = LOW_BIT_TYPES + ("Q2_0",)
 
 
 def require(source: str, needle: str, message: str) -> None:
@@ -16,7 +17,7 @@ def main() -> None:
     mmq = (ROOT / "ggml/src/ggml-cuda/mmq.cuh").read_text(encoding="utf-8")
     loaders = (ROOT / "ggml/src/ggml-cuda/mmq-load-tiles.cuh").read_text(encoding="utf-8")
 
-    for cache_type in LOW_BIT_TYPES:
+    for cache_type in MMQ_TYPES:
         require(
             mmq,
             f"GGML_TYPE_{cache_type}",
@@ -27,6 +28,11 @@ def main() -> None:
             f"DECL_MMQ_CASE(GGML_TYPE_{cache_type})",
             f"CUDA MMQ template declarations for {cache_type} were lost during an upstream merge",
         )
+
+    vecdot = (ROOT / "ggml/src/ggml-cuda/vecdotq.cuh").read_text(encoding="utf-8")
+    for macro in ("VDR_Q2_0_Q8_1_MMVQ", "VDR_Q2_0_Q8_1_MMQ"):
+        if vecdot.count(f"#define {macro}") != 1:
+            raise AssertionError(f"CUDA Q2_0 vector ratio macro {macro} must have exactly one definition")
 
     for loader in (
         "ggml_cuda_mmq_load_tiles_q6_0",

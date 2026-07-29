@@ -70,6 +70,13 @@ static void test_attention_domain_policy() {
     require(portable_prefill.domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED,
             "portable materialized prefill must remain in the rotated domain");
 
+    const auto cuda_portable_prefill =
+        llama_kvarn_plan_attention(true, false, UINT32_MAX, 1024);
+    require(cuda_portable_prefill.native_attention,
+            "portable CUDA prompt processing must remain native through the advertised limit");
+    require(cuda_portable_prefill.domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED,
+            "portable-only CUDA prompt processing must remain in the rotated domain");
+
     const auto cuda_prefill = llama_kvarn_plan_attention(true, true, 16, 17);
     require(cuda_prefill.native_attention,
             "backends with original-domain V support must retain native prefill");
@@ -277,11 +284,16 @@ static void kvarn_unified_restore_requires_exclusive_stream() {
 }
 
 static void test_stage_policy() {
-    require(llama_kvarn_non_swa_tail_groups(0, 0) == 1,
-            "non-SWA KVarN must retain one incomplete reference group");
-    require(llama_kvarn_non_swa_tail_groups(2048, 128) == 1,
+    // The reference keeps one incomplete group in F16, but the suffix-removal
+    // contract advertised by llama_kvarn_can_remove_range reaches back into the
+    // previous group from any position. That group's own F16 source therefore
+    // has to stay resident, otherwise re-sealing a partially reopened group
+    // pulls its surviving prefix from the newer group's aliased stage rows.
+    require(llama_kvarn_non_swa_tail_groups(0, 0) == 2,
+            "non-SWA KVarN must retain the reopenable previous group");
+    require(llama_kvarn_non_swa_tail_groups(2048, 128) == 2,
             "reference KVarN tail must not scale with the scheduler batch");
-    require(llama_kvarn_non_swa_tail_groups(2048, 512) == 1,
+    require(llama_kvarn_non_swa_tail_groups(2048, 512) == 2,
             "reference KVarN tail must not scale with the physical ubatch");
 }
 
@@ -497,6 +509,16 @@ static void kvarn_historical_suffix_plans_group_boundary() {
     expect_plan(0,    -1, false, true,    0, -1); // complete removal
     expect_plan(-1,   -1, false, true,   -1, -1); // negative full-range convention
     expect_plan(5626, 5700, true, false,  -1, -1); // finite middle range is never widened
+}
+
+static void kvarn_swa_deep_rollback_plans_group_boundary() {
+    llama_pos planned_p0 = -1;
+    llama_pos planned_p1 = 0;
+    require(llama_kvarn_plan_remove_range(
+                1023, 300, -1, KVAR_N_GROUP, true, planned_p0, planned_p1),
+            "deep SWA rollback did not produce a stage-safe removal plan");
+    require(planned_p0 == 256 && planned_p1 == -1,
+            "deep SWA rollback did not widen to the requested group's boundary");
 }
 
 static void kvarn_historical_suffix_rejects_contended_unified_stream() {
@@ -2538,6 +2560,8 @@ static test_kvarn_route_stats make_test_kvarn_route_stats() {
 
 using test_kvarn_route_stats_reset_fn = void (*)();
 using test_kvarn_route_stats_get_fn = void (*)(test_kvarn_route_stats *);
+using test_kvarn_capabilities_fn = bool (*)(
+        ggml_backend_dev_t, ggml_backend_kvarn_capabilities *);
 using test_kvarn_rotated_max_query_tokens_fn = uint32_t (*)(ggml_backend_dev_t);
 using test_kv_tail_segmented_supported_fn = bool (*)(
         ggml_type, ggml_type, ggml_type, ggml_type, int64_t, int64_t);
@@ -2702,6 +2726,25 @@ static void test_native_flash_attention_portable_backend(
                 "portable KVarN FlashAttention with an exact tail differs from materialized reference");
     }
 
+    if (std::strcmp(backend_label, "GPU") == 0 &&
+            std::getenv("GGML_KVARN_TEST_FORCE_PORTABLE_CAPABILITY") != nullptr) {
+        for (int n_q : { 64, 256, 1024 }) {
+            if (trace) {
+                std::fprintf(stderr, "native trace: %s portable prefill nq=%d\n",
+                        backend_label, n_q);
+                std::fflush(stderr);
+            }
+            const std::vector<float> expected = test_native_flash_attention_output(
+                    reference_backend, false, false, 256, 4, 4, n_q,
+                    2, 1, 256, 3, false, nullptr, false, 128);
+            const std::vector<float> actual = test_native_flash_attention_output(
+                    backend, true, true, 256, 4, 4, n_q,
+                    2, 1, 256, 3, false, nullptr, false, 128);
+            require_close_f32_rmse(actual, expected, 1e-2f,
+                    "portable prompt-sized KVarN body-plus-tail attention differs from materialized reference");
+        }
+    }
+
     for (int head_dim : { 128, 256, 512 }) {
         for (int n_q : { 1, 2, 8, 16 }) {
             for (ggml_type exact_type : { GGML_TYPE_F16, GGML_TYPE_BF16 }) {
@@ -2812,10 +2855,52 @@ static void test_native_flash_attention_gpu() {
         auto rotated_max_query_tokens = reg ? reinterpret_cast<test_kvarn_rotated_max_query_tokens_fn>(
             ggml_backend_reg_get_proc_address(
                 reg, "ggml_backend_kvarn_native_rotated_max_query_tokens")) : nullptr;
+        auto get_capabilities = reg ? reinterpret_cast<test_kvarn_capabilities_fn>(
+            ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_kvarn_capabilities")) : nullptr;
         require(rotated_max_query_tokens != nullptr,
                 "native KVarN backend omitted its rotated query-batch capability");
         require(rotated_max_query_tokens(dev) >= 16,
                 "native KVarN backend does not cover a complete DFlash verification block");
+        require(get_capabilities != nullptr,
+                "native KVarN backend omitted its versioned capability record");
+        ggml_backend_kvarn_capabilities undersized_capabilities = {};
+        undersized_capabilities.struct_size =
+            sizeof(undersized_capabilities) - sizeof(undersized_capabilities.minimum_dynamic_shared_bytes);
+        undersized_capabilities.abi_version = GGML_BACKEND_KVARN_CAPABILITIES_ABI_VERSION;
+        undersized_capabilities.route_families = 0xa5a5a5a5u;
+        require(!get_capabilities(dev, &undersized_capabilities) &&
+                undersized_capabilities.route_families == 0xa5a5a5a5u,
+                "KVarN capability query wrote an undersized caller structure");
+        ggml_backend_kvarn_capabilities wrong_capability_version = {};
+        wrong_capability_version.struct_size = sizeof(wrong_capability_version);
+        wrong_capability_version.abi_version =
+            GGML_BACKEND_KVARN_CAPABILITIES_ABI_VERSION + 1;
+        wrong_capability_version.route_families = 0x5a5a5a5au;
+        require(!get_capabilities(dev, &wrong_capability_version) &&
+                wrong_capability_version.route_families == 0x5a5a5a5au,
+                "KVarN capability query accepted an unknown ABI version");
+        ggml_backend_kvarn_capabilities capabilities = {};
+        capabilities.struct_size = sizeof(capabilities);
+        capabilities.abi_version = GGML_BACKEND_KVARN_CAPABILITIES_ABI_VERSION;
+        require(get_capabilities(dev, &capabilities),
+                "native KVarN backend rejected the current capability ABI");
+        require(capabilities.store_materialize &&
+                capabilities.portable_direct_body &&
+                capabilities.portable_integrated_tail_f16 &&
+                capabilities.portable_integrated_tail_bf16 &&
+                capabilities.minimum_dynamic_shared_bytes > 0,
+                "native KVarN backend capability record omitted its portable body-plus-tail contract");
+        if (std::getenv("GGML_KVARN_TEST_FORCE_PORTABLE_CAPABILITY") != nullptr) {
+            require(!capabilities.specialized_generic_mma &&
+                    !capabilities.specialized_decode_split &&
+                    !capabilities.specialized_decode_vector &&
+                    !capabilities.original_v_domain &&
+                    capabilities.rotated_query_max_portable == UINT32_MAX &&
+                    capabilities.rotated_query_max_specialized == 0 &&
+                    rotated_max_query_tokens(dev) == UINT32_MAX,
+                    "simulated pre-Turing CUDA capability did not remain portable-only");
+        }
     }
     test_native_flash_attention_portable_backend(gpu_backend, cpu_backend, "GPU");
     if (route_stats_reset == nullptr || route_stats_get == nullptr ||
@@ -2839,8 +2924,8 @@ static void test_native_flash_attention_gpu() {
                 "portable-only KVarN backend did not advertise its portable route family");
         require(route_capabilities.portable_native > 0,
                 "portable-only KVarN backend did not report its native route");
-        require(route_capabilities.compact_tail_entry > 0,
-                "portable-only KVarN backend did not report its compact-tail entry");
+        require(route_capabilities.direct_entry > 0,
+                "portable-only KVarN backend did not report its direct body-plus-tail entry");
         require(route_capabilities.materialize_fallback == 0,
                 "portable-only compact KVarN tail unexpectedly materialized");
         ggml_backend_free(cpu_backend);
@@ -3744,6 +3829,315 @@ static void test_unaligned_start(enum ggml_backend_dev_type device_type, bool re
     ggml_backend_free(backend);
 }
 
+// Eager unaligned-start coverage at the production non-SWA stage depth
+// (stage_groups=2 => tail_groups=1). The second store is large enough to take
+// the CUDA/Vulkan bulk workspace path (>= 3 * 128 tokens) and begins inside an
+// already-open non-sink group. That straddling group completes inside the
+// second store, so it must reach `records`.
+static void test_eager_unaligned_start(enum ggml_backend_dev_type device_type, bool required,
+                                       int start_offset, int n_tokens, int bits) {
+    ggml_backend_t backend = init_test_backend(device_type, required);
+    if (backend == nullptr) {
+        return;
+    }
+
+    const int stage_groups = int(llama_kvarn_non_swa_tail_groups(0, 0) + 1);
+    constexpr int n_heads = 1;
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ 8 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr, "eager-unaligned: failed to initialize ggml context");
+
+    const int second_start = 128 + start_offset;
+    const int total_tokens = second_start + n_tokens;
+    const int straddling_group = second_start / 128;
+    const int last_group = (total_tokens - 1) / 128;
+    const int n_groups_per_stream = std::max(8, last_group + 1);
+    const int record_bytes = int(llama_kvarn_packed_bytes(128 * 128, bits) + 3 * 128 * sizeof(ggml_fp16_t));
+
+    require(start_offset > 0 && start_offset < 128, "eager-unaligned: start must be inside a group");
+    require((straddling_group + 1) * 128 <= total_tokens,
+            "eager-unaligned: straddling group must complete inside the second store");
+
+    ggml_tensor * current_prefix = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, n_heads, second_start);
+    ggml_tensor * indices_prefix = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, second_start);
+    ggml_tensor * current        = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, n_heads, n_tokens);
+    ggml_tensor * indices        = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
+    ggml_tensor * stage    = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, n_heads, 128 * stage_groups);
+    ggml_tensor * records  = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, record_bytes, n_heads, n_groups_per_stream);
+
+    ggml_tensor * stored_prefix = ggml_kvarn_store(ctx, current_prefix, indices_prefix, stage, records, bits, 16, false, stage_groups);
+    stored_prefix->op_params[3] = second_start;
+    stored_prefix->op_params[9] = 1; // eager records, as the KVarN cache always sets
+    ggml_tensor * stored = ggml_kvarn_store(ctx, current, indices, stored_prefix, records, bits, 16, false, stage_groups);
+    stored->op_params[3] = n_tokens;
+    stored->op_params[9] = 1;
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, stored);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    require(buffer != nullptr, "eager-unaligned: failed to allocate tensors");
+
+    auto sample = [](int abs_pos, int d) {
+        return std::sin(float(d) * 0.071f) +
+            std::cos(float(abs_pos) * 0.037f) +
+            float((d * 13 + abs_pos * 17) % 31 - 15) * 0.01f;
+    };
+    std::vector<float> prefix_input(128 * n_heads * second_start);
+    std::vector<float> input(128 * n_heads * n_tokens);
+    std::vector<float> expected(128 * n_heads * total_tokens);
+    for (int t = 0; t < total_tokens; ++t) {
+        for (int d = 0; d < 128; ++d) {
+            const float value = sample(t, d);
+            expected[t * 128 + d] = value;
+            if (t < second_start) {
+                prefix_input[t * 128 + d] = value;
+            } else {
+                input[(t - second_start) * 128 + d] = value;
+            }
+        }
+    }
+    std::vector<int64_t> idx_prefix(second_start);
+    for (int i = 0; i < second_start; ++i) {
+        idx_prefix[i] = int64_t(i);
+    }
+    std::vector<int64_t> idx(n_tokens);
+    for (int i = 0; i < n_tokens; ++i) {
+        idx[i] = int64_t(second_start + i);
+    }
+    std::vector<uint8_t> stage_zeros(ggml_nbytes(stage), 0);
+    std::vector<uint8_t> record_zeros(ggml_nbytes(records), 0);
+
+    ggml_backend_tensor_set(current_prefix, prefix_input.data(), 0, ggml_nbytes(current_prefix));
+    ggml_backend_tensor_set(indices_prefix, idx_prefix.data(), 0, ggml_nbytes(indices_prefix));
+    ggml_backend_tensor_set(current, input.data(), 0, ggml_nbytes(current));
+    ggml_backend_tensor_set(indices, idx.data(), 0, ggml_nbytes(indices));
+    ggml_backend_tensor_set(stage, stage_zeros.data(), 0, stage_zeros.size());
+    ggml_backend_tensor_set(records, record_zeros.data(), 0, record_zeros.size());
+
+    require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
+            "eager-unaligned: graph compute failed");
+
+    // Direct check: the straddling group completed in this store, so its record
+    // must have been written.
+    std::vector<uint8_t> record_data(ggml_nbytes(records));
+    ggml_backend_tensor_get(records, record_data.data(), 0, record_data.size());
+    const size_t off = size_t(straddling_group) * size_t(record_bytes);
+    const bool straddling_written = std::any_of(
+            record_data.begin() + ptrdiff_t(off),
+            record_data.begin() + ptrdiff_t(off + record_bytes),
+            [](uint8_t v) { return v != 0; });
+    // Investigation aid: KVARN_EAGER_UNALIGNED_SOFT=1 reports the whole matrix
+    // instead of aborting on the first failure.
+    const bool soft = std::getenv("KVARN_EAGER_UNALIGNED_SOFT") != nullptr;
+    if (soft) {
+        std::fprintf(stderr, "eager-unaligned[%s]: start=%3d n=%3d bits=%d group=%d record=%s\n",
+                device_type == GGML_BACKEND_DEVICE_TYPE_CPU ? "CPU" : "GPU",
+                start_offset, n_tokens, bits, straddling_group,
+                straddling_written ? "WRITTEN" : "UNWRITTEN <-- LOST");
+    }
+    if (!straddling_written && !soft) {
+        std::fprintf(stderr,
+                "eager-unaligned: group %d completed in the store but its record is unwritten "
+                "(start=%d abs=%d n=%d bits=%d)\n",
+                straddling_group, start_offset, second_start, n_tokens, bits);
+        require(false, "eager-unaligned: completed straddling group was never quantized");
+    }
+    if (!straddling_written) {
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return;
+    }
+
+    const std::vector<float> output = test_kvarn_reference_decode_f32(
+            records, stored, idx, total_tokens, 0, 1, bits, false, stage_groups);
+
+    double mse = 0.0;
+    double max_diff = 0.0;
+    double group_mse = 0.0;
+    for (int t = 0; t < total_tokens; ++t) {
+        for (int d = 0; d < 128; ++d) {
+            const double diff = double(expected[t * 128 + d]) - double(output[t * 128 + d]);
+            mse += diff * diff;
+            max_diff = std::max(max_diff, std::fabs(diff));
+            if (t / 128 == straddling_group) {
+                group_mse += diff * diff;
+            }
+        }
+    }
+    const double rmse = std::sqrt(mse / double(total_tokens * 128));
+    const double group_rmse = std::sqrt(group_mse / double(128 * 128));
+    if (!std::isfinite(rmse) || rmse >= 0.30 || group_rmse >= 0.30) {
+        std::fprintf(stderr,
+                "eager-unaligned: reconstruction error too high (start=%d abs=%d n=%d bits=%d "
+                "rmse=%g straddling-group-%d rmse=%g max=%g)\n",
+                start_offset, second_start, n_tokens, bits, rmse, straddling_group, group_rmse, max_diff);
+        require(false, "eager-unaligned: reconstruction error too high");
+    }
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+}
+
+// Investigation: does a partial rollback into an already-sealed group leak the
+// newer group's stage rows into that group's record?
+//
+// Sequence (all stores are small, so they take the per-token path that decode
+// and speculative rollback use):
+//   1. seal group 1 completely            -> stage slot 1 holds group 1
+//   2. write the first `p` tokens of group 2 -> slot 1 positions [0,p) now hold group 2
+//   3. roll back and re-complete group 1 from offset q > p
+// Step 3 rewrites slot 1 positions [q,128) and re-seals group 1 from the whole
+// slot, so positions [0,p) are sourced from group 2 if the leak is real.
+//
+// The control run performs steps 1 and 3 only. Group 1's record must be
+// byte-identical between the two runs; any difference is the leak.
+static std::vector<uint8_t> kvarn_reseal_after_rollback_record(
+        ggml_backend_t backend, bool write_next_group, int p, int q, int bits, int stage_groups) {
+    constexpr int n_heads = 1;
+    const int record_bytes = int(llama_kvarn_packed_bytes(128 * 128, bits) + 3 * 128 * sizeof(ggml_fp16_t));
+
+    ggml_init_params params = { /*.mem_size =*/ 8 * 1024 * 1024, nullptr, /*.no_alloc =*/ true };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr, "reseal: failed to initialize ggml context");
+
+    const int n_next = write_next_group ? p : 0;
+    const int n_tail = 128 - q;
+
+    ggml_tensor * g1     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, n_heads, 128);
+    ggml_tensor * g1_idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 128);
+    ggml_tensor * nxt     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, n_heads, std::max(1, n_next));
+    ggml_tensor * nxt_idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, std::max(1, n_next));
+    ggml_tensor * tail     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, n_heads, n_tail);
+    ggml_tensor * tail_idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tail);
+    ggml_tensor * stage   = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, n_heads, 128 * stage_groups);
+    ggml_tensor * records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, record_bytes, n_heads, 4);
+
+    auto mk_store = [&](ggml_tensor * cur, ggml_tensor * idx, ggml_tensor * prev) {
+        ggml_tensor * s = ggml_kvarn_store(ctx, cur, idx, prev, records, bits, 16, false, stage_groups);
+        s->op_params[3] = (int32_t) cur->ne[2];
+        s->op_params[9] = 1; // eager records, as the cache always sets
+        return s;
+    };
+    ggml_tensor * chain = mk_store(g1, g1_idx, stage);
+    if (write_next_group) {
+        chain = mk_store(nxt, nxt_idx, chain);
+    }
+    chain = mk_store(tail, tail_idx, chain);
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, chain);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    require(buffer != nullptr, "reseal: failed to allocate tensors");
+
+    // Group 1 rows, the next group's rows, and the refilled tail are all
+    // deliberately far apart so a leak cannot be mistaken for quantization noise.
+    auto orig = [](int pos, int d) { return std::sin(float(pos) * 0.031f) + std::cos(float(d) * 0.017f); };
+    auto next = [](int pos, int d) { return 6.0f + 3.0f * std::sin(float(pos * 7 + d) * 0.11f); };
+    auto refill = [](int pos, int d) { return -4.0f + std::cos(float(pos * 3 + d) * 0.09f); };
+
+    std::vector<float>   g1_data(128 * 128), nxt_data(128 * std::max(1, n_next)), tail_data(128 * n_tail);
+    std::vector<int64_t> g1_i(128), nxt_i(std::max(1, n_next)), tail_i(n_tail);
+    for (int t = 0; t < 128; ++t) {
+        g1_i[t] = 128 + t;
+        for (int d = 0; d < 128; ++d) { g1_data[t * 128 + d] = orig(t, d); }
+    }
+    for (int t = 0; t < n_next; ++t) {
+        nxt_i[t] = 256 + t;
+        for (int d = 0; d < 128; ++d) { nxt_data[t * 128 + d] = next(t, d); }
+    }
+    if (n_next == 0) { nxt_i[0] = -1; }
+    for (int t = 0; t < n_tail; ++t) {
+        tail_i[t] = 128 + q + t;
+        for (int d = 0; d < 128; ++d) { tail_data[t * 128 + d] = refill(q + t, d); }
+    }
+
+    std::vector<uint8_t> zeros_stage(ggml_nbytes(stage), 0);
+    std::vector<uint8_t> zeros_rec(ggml_nbytes(records), 0);
+    ggml_backend_tensor_set(stage, zeros_stage.data(), 0, zeros_stage.size());
+    ggml_backend_tensor_set(records, zeros_rec.data(), 0, zeros_rec.size());
+    ggml_backend_tensor_set(g1, g1_data.data(), 0, ggml_nbytes(g1));
+    ggml_backend_tensor_set(g1_idx, g1_i.data(), 0, ggml_nbytes(g1_idx));
+    ggml_backend_tensor_set(nxt, nxt_data.data(), 0, ggml_nbytes(nxt));
+    ggml_backend_tensor_set(nxt_idx, nxt_i.data(), 0, ggml_nbytes(nxt_idx));
+    ggml_backend_tensor_set(tail, tail_data.data(), 0, ggml_nbytes(tail));
+    ggml_backend_tensor_set(tail_idx, tail_i.data(), 0, ggml_nbytes(tail_idx));
+
+    require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "reseal: graph compute failed");
+
+    std::vector<uint8_t> all(ggml_nbytes(records));
+    ggml_backend_tensor_get(records, all.data(), 0, all.size());
+    std::vector<uint8_t> group1(all.begin() + record_bytes, all.begin() + 2 * record_bytes);
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    return group1;
+}
+
+static void test_reseal_after_partial_rollback(enum ggml_backend_dev_type device_type, bool required) {
+    ggml_backend_t backend = init_test_backend(device_type, required);
+    if (backend == nullptr) {
+        return;
+    }
+    const char * dev = device_type == GGML_BACKEND_DEVICE_TYPE_CPU ? "CPU" : "GPU";
+    constexpr int bits = 6;
+    const int q = 126;
+
+    // Expected rotated-domain contents of group 1 after the rollback: the
+    // surviving original prefix, then the refilled tail.
+    auto orig   = [](int pos, int d) { return std::sin(float(pos) * 0.031f) + std::cos(float(d) * 0.017f); };
+    auto refill = [](int pos, int d) { return -4.0f + std::cos(float(pos * 3 + d) * 0.09f); };
+    std::vector<float> expect(128 * 128);
+    for (int pos = 0; pos < 128; ++pos) {
+        std::array<float, 128> row{};
+        for (int d = 0; d < 128; ++d) { row[d] = pos < q ? orig(pos, d) : refill(pos, d); }
+        llama_kvarn_hadamard_128(row.data());
+        for (int d = 0; d < 128; ++d) { expect[pos * 128 + d] = row[d]; }
+    }
+
+    auto rmse_over = [&](const std::vector<uint8_t> & rec, int pos0, int pos1) {
+        double se = 0.0; int n = 0;
+        for (int pos = pos0; pos < pos1; ++pos) {
+            for (int d = 0; d < 128; ++d) {
+                const double got = test_kvarn_record_value(rec.data(), bits, false, pos, d);
+                const double dif = got - double(expect[pos * 128 + d]);
+                se += dif * dif; ++n;
+            }
+        }
+        return n > 0 ? std::sqrt(se / double(n)) : 0.0;
+    };
+
+    // Track the production stage depth rather than hard-coding it, so this test
+    // follows llama_kvarn_non_swa_tail_groups if that policy ever changes.
+    const int stage_groups = int(llama_kvarn_non_swa_tail_groups(0, 0)) + 1;
+
+    for (int p : { 1, 4, 16 }) {
+        const auto control = kvarn_reseal_after_rollback_record(backend, false, p, q, bits, stage_groups);
+        const auto leaked  = kvarn_reseal_after_rollback_record(backend, true,  p, q, bits, stage_groups);
+        size_t diff = 0;
+        for (size_t i = 0; i < control.size(); ++i) {
+            diff += control[i] != leaked[i] ? 1 : 0;
+        }
+        if (diff != 0) {
+            std::fprintf(stderr,
+                    "reseal-rollback[%s]: stage_groups=%d p=%2d -> %zu/%zu record bytes differ | "
+                    "leaked rows [0,%d) rmse %.4f -> %.4f | untouched rows [%d,%d) rmse %.4f -> %.4f\n",
+                    dev, stage_groups, p, diff, control.size(),
+                    p, rmse_over(control, 0, p), rmse_over(leaked, 0, p),
+                    p, q, rmse_over(control, p, q), rmse_over(leaked, p, q));
+            require(false, "reseal-rollback: reopening a sealed group leaked the newer group's stage rows");
+        }
+    }
+    ggml_backend_free(backend);
+}
+
 static void test_eager_completed_record(enum ggml_backend_dev_type device_type, bool required) {
     ggml_backend_t backend = init_test_backend(device_type, required);
     if (backend == nullptr) {
@@ -3860,6 +4254,164 @@ static void test_eager_completed_record(enum ggml_backend_dev_type device_type, 
     ggml_backend_free(backend);
 }
 
+static ggml_backend_meta_split_state test_kvarn_meta_split(
+        const ggml_tensor * tensor, void *) {
+    if (std::strcmp(tensor->name, "meta_current") == 0 ||
+            std::strcmp(tensor->name, "meta_current_next") == 0 ||
+            std::strcmp(tensor->name, "meta_stage") == 0 ||
+            std::strcmp(tensor->name, "meta_records") == 0) {
+        ggml_backend_meta_split_state result = {
+            GGML_BACKEND_SPLIT_AXIS_1, { 0 }, { 1 }, 1
+        };
+        // Two complete heads over three devices: the first shard is a valid
+        // zero-head no-op and the remaining devices own one head each.
+        result.ne[0] = 0;
+        result.ne[1] = 1;
+        result.ne[2] = 1;
+        return result;
+    }
+    return { GGML_BACKEND_SPLIT_AXIS_MIRRORED, { 0 }, { 1 }, 1 };
+}
+
+static void test_meta_kvarn_zero_head_shard() {
+    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    require(cpu != nullptr, "meta KVarN: CPU device unavailable");
+    ggml_backend_dev_t devices[] = { cpu, cpu, cpu };
+    ggml_backend_dev_t meta_dev = ggml_backend_meta_device(
+            devices, 3, test_kvarn_meta_split, nullptr);
+    require(meta_dev != nullptr, "meta KVarN: failed to create meta device");
+    ggml_backend_t backend = ggml_backend_dev_init(meta_dev, nullptr);
+    require(backend != nullptr, "meta KVarN: failed to create backend");
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ 4 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * static_ctx = ggml_init(params);
+    require(static_ctx != nullptr, "meta KVarN: failed to create static context");
+    ggml_context * input_ctx = ggml_init(params);
+    require(input_ctx != nullptr, "meta KVarN: failed to create input context");
+
+    constexpr int n_heads = 2;
+    constexpr int n_tokens = 128;
+    constexpr int stage_groups = 3;
+    constexpr int bits = 4;
+    const int record_bytes = int(llama_kvarn_packed_bytes(128 * 128, bits) +
+            3 * 128 * sizeof(ggml_fp16_t));
+    ggml_tensor * current = ggml_new_tensor_3d(
+            static_ctx, GGML_TYPE_F32, 128, n_heads, n_tokens);
+    ggml_tensor * current_next = ggml_new_tensor_3d(
+            static_ctx, GGML_TYPE_F32, 128, n_heads, n_tokens);
+    // Index graph inputs can remain ordinary scheduler-owned tensors in
+    // production. Split-state recursion must retain the owning meta context
+    // while following this non-meta source.
+    ggml_tensor * indices = ggml_new_tensor_1d(input_ctx, GGML_TYPE_I64, n_tokens);
+    ggml_tensor * stage = ggml_new_tensor_3d(
+            static_ctx, GGML_TYPE_F16, 128, n_heads, 128 * stage_groups);
+    ggml_tensor * records = ggml_new_tensor_3d(
+            static_ctx, GGML_TYPE_I8, record_bytes, n_heads, 4);
+    ggml_set_name(current, "meta_current");
+    ggml_set_name(current_next, "meta_current_next");
+    ggml_set_name(stage, "meta_stage");
+    ggml_set_name(records, "meta_records");
+
+    ggml_backend_buffer_t static_buffer = ggml_backend_alloc_ctx_tensors_from_buft(
+            static_ctx, ggml_backend_dev_buffer_type(meta_dev));
+    require(static_buffer != nullptr, "meta KVarN: failed to allocate split tensors");
+    ggml_backend_buffer_t input_buffer = ggml_backend_alloc_ctx_tensors_from_buft(
+            input_ctx, ggml_backend_dev_buffer_type(cpu));
+    require(input_buffer != nullptr, "meta KVarN: failed to allocate mirrored input tensors");
+
+    ggml_context * compute_ctx = ggml_init(params);
+    require(compute_ctx != nullptr, "meta KVarN: failed to create compute context");
+    ggml_tensor * stored = ggml_kvarn_store(
+            compute_ctx, current, indices, stage, records, bits, 16, false, stage_groups);
+    ggml_tensor * materialized = ggml_kvarn_materialize(
+            compute_ctx, records, stored, indices, n_tokens, 0, 1,
+            bits, false, stage_groups);
+    ggml_cgraph * graph = ggml_new_graph(compute_ctx);
+    ggml_build_forward_expand(graph, materialized);
+    ggml_backend_t cpu_backend = ggml_backend_init_by_type(
+            GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    require(cpu_backend != nullptr, "meta KVarN: failed to initialize scheduler fallback");
+    ggml_backend_t backends[] = { backend, cpu_backend };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(
+            backends, nullptr, 2, 32, false, true);
+    require(sched != nullptr && ggml_backend_sched_alloc_graph(sched, graph),
+            "meta KVarN: failed to allocate scheduled graph");
+
+    std::vector<float> input(size_t(128) * n_heads * n_tokens);
+    for (int token = 0; token < n_tokens; ++token) {
+        for (int head = 0; head < n_heads; ++head) {
+            for (int dim = 0; dim < 128; ++dim) {
+                input[(size_t(token)*n_heads + head)*128 + dim] =
+                        std::sin(float(token)*0.03f) +
+                        std::cos(float(dim)*0.05f) + float(head)*0.25f;
+            }
+        }
+    }
+    std::vector<int64_t> index_data(n_tokens);
+    std::iota(index_data.begin(), index_data.end(), int64_t(0));
+    std::vector<float> input_next(input.size());
+    for (size_t i = 0; i < input_next.size(); ++i) {
+        input_next[i] = input[i] + 2.0f;
+    }
+    std::vector<uint8_t> stage_zeros(ggml_nbytes(stage), 0);
+    std::vector<uint8_t> record_zeros(ggml_nbytes(records), 0);
+    ggml_backend_tensor_memset(records, 0xa5, 0, ggml_nbytes(records));
+    std::vector<uint8_t> memset_records(ggml_nbytes(records), 0);
+    ggml_backend_tensor_get(records, memset_records.data(), 0, memset_records.size());
+    require(std::all_of(memset_records.begin(), memset_records.end(),
+                    [](uint8_t value) { return value == 0xa5; }),
+            "meta KVarN: split tensor memset did not cover every logical record byte");
+    ggml_backend_tensor_set(current, input.data(), 0, ggml_nbytes(current));
+    ggml_backend_tensor_set(current_next, input_next.data(), 0, ggml_nbytes(current_next));
+    ggml_backend_tensor_set(indices, index_data.data(), 0, ggml_nbytes(indices));
+    ggml_backend_tensor_set(stage, stage_zeros.data(), 0, stage_zeros.size());
+    ggml_backend_tensor_set(records, record_zeros.data(), 0, record_zeros.size());
+    require(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS,
+            "meta KVarN: split store/materialize graph failed");
+
+    std::vector<ggml_fp16_t> output(ggml_nelements(materialized));
+    ggml_backend_tensor_get(materialized, output.data(), 0, ggml_nbytes(materialized));
+    double max_error = 0.0;
+    for (size_t i = 0; i < output.size(); ++i) {
+        max_error = std::max(max_error,
+                std::fabs(double(ggml_fp16_to_fp32(output[i])) - input[i]));
+    }
+    require(max_error < 0.002,
+            "meta KVarN: zero-head split changed lossless staged values");
+
+    // The scheduler deliberately reuses the parent graph identity while the
+    // graph-local KVarN node changes its persistent input. A stale projected
+    // meta node would continue reading `current` here. This is the lifecycle
+    // exercised by decode graphs whose graph-local tensors are rebuilt in
+    // place between tokens.
+    stored->src[0] = current_next;
+    ggml_backend_tensor_set(stage, stage_zeros.data(), 0, stage_zeros.size());
+    ggml_backend_tensor_set(records, record_zeros.data(), 0, record_zeros.size());
+    require(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS,
+            "meta KVarN: rebuilt split graph failed");
+    ggml_backend_tensor_get(materialized, output.data(), 0, ggml_nbytes(materialized));
+    max_error = 0.0;
+    for (size_t i = 0; i < output.size(); ++i) {
+        max_error = std::max(max_error,
+                std::fabs(double(ggml_fp16_to_fp32(output[i])) - input_next[i]));
+    }
+    require(max_error < 0.005,
+            "meta KVarN: projected graph retained a stale graph-local source");
+
+    ggml_backend_sched_free(sched);
+    ggml_backend_free(cpu_backend);
+    ggml_free(compute_ctx);
+    ggml_backend_buffer_free(input_buffer);
+    ggml_free(input_ctx);
+    ggml_backend_buffer_free(static_buffer);
+    ggml_free(static_ctx);
+    ggml_backend_free(backend);
+}
+
 int main() {
     ggml_backend_load_all();
 
@@ -3886,6 +4438,7 @@ int main() {
     test_vulkan_decode_route_policy();
     test_stage_policy();
     test_memory_stats_aggregation();
+    test_meta_kvarn_zero_head_shard();
     test_exact_tail_policy();
     test_tile_layout();
     test_head_dimension_slicing();
@@ -3894,6 +4447,7 @@ int main() {
     test_remove_policy();
     kvarn_historical_suffix_rejects_contended_unified_stream();
     kvarn_historical_suffix_plans_group_boundary();
+    kvarn_swa_deep_rollback_plans_group_boundary();
     test_pack_roundtrip(2);
     test_pack_roundtrip(3);
     test_pack_roundtrip(4);
@@ -3931,6 +4485,8 @@ int main() {
     test_cache_ops_dynamic_stage(GGML_BACKEND_DEVICE_TYPE_GPU, false, 4);
     test_eager_completed_record(GGML_BACKEND_DEVICE_TYPE_CPU, true);
     test_eager_completed_record(GGML_BACKEND_DEVICE_TYPE_GPU, false);
+    test_reseal_after_partial_rollback(GGML_BACKEND_DEVICE_TYPE_CPU, true);
+    test_reseal_after_partial_rollback(GGML_BACKEND_DEVICE_TYPE_GPU, false);
     // W2 unaligned-start coverage: first persist a prefix, then run a second
     // store whose first index is 128 + {1, 64, 127}. The 256/512 cases force a
     // transient slot reuse/flush from the second store; all cases decode
@@ -3942,6 +4498,14 @@ int main() {
         test_unaligned_start(GGML_BACKEND_DEVICE_TYPE_GPU, false, start, 512, 5);
         test_unaligned_start(GGML_BACKEND_DEVICE_TYPE_CPU, true,  start, 513, 6);
         test_unaligned_start(GGML_BACKEND_DEVICE_TYPE_GPU, false, start, 513, 6);
+    }
+    // Eager unaligned-start coverage at the production stage depth (stage_groups=2).
+    // 512/535 tokens take the GPU bulk workspace path; 256 stays on the per-token path.
+    for (int start : { 1, 64, 88, 127 }) {
+        for (int n : { 256, 512, 535 }) {
+            test_eager_unaligned_start(GGML_BACKEND_DEVICE_TYPE_CPU, true,  start, n, 6);
+            test_eager_unaligned_start(GGML_BACKEND_DEVICE_TYPE_GPU, false, start, n, 6);
+        }
     }
     test_cache_ops_multi_stream(GGML_BACKEND_DEVICE_TYPE_CPU, true, 6);
     test_cache_ops_multi_stream(GGML_BACKEND_DEVICE_TYPE_GPU, false, 6);

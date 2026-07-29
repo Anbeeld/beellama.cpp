@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.cuh"
+#include "fattn-kvarn-route-policy.h"
 
 #include <cstdint>
 
@@ -43,6 +44,8 @@ struct ggml_cuda_kv_memory_transient_stats {
     uint64_t tail_plan_input_bytes;
     uint64_t tail_total_bytes;
 };
+
+ggml_cuda_fattn_kvarn_capabilities ggml_cuda_fattn_kvarn_device_capabilities(int device);
 
 void ggml_cuda_fattn_kvarn_route_stats_reset();
 void ggml_cuda_fattn_kvarn_route_stats_get(ggml_cuda_fattn_kvarn_route_stats * stats);

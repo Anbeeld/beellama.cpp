@@ -164,7 +164,7 @@ state.
 
 - Qwen hybrid target: `<QWEN_TARGET_GGUF>`
 - Gemma SWA/global target: `<GEMMA_TARGET_GGUF>`
-- Build: `tmp/build-local-3090-cuda13.1-default.ps1 -Parallel 16`
+- Build: `scripts/build-win-cuda-13.1-sm_86-default.ps1 -Parallel 16`
 - GPU: RTX 3090, CUDA 13.1, architecture 86
 - Required comparison controls: identical prompt or corpus, `-b`, `-ub`,
   context, sampler, cache pair, model file, and commit
