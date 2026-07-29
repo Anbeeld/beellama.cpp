@@ -73,8 +73,6 @@ int main(int argc, char ** argv) {
     const std::string kvarn_wide_instance = read_file(
         root + "/ggml/src/ggml-cuda/template-instances/fattn-mma-kvarn-instance-ncols1_16-ncols2_8.cu");
     const std::string release = read_file(root + "/.github/workflows/release.yml");
-    const std::string architecture_compile =
-        read_file(root + "/.github/workflows/cuda-architecture-compile.yml");
 
     const auto expect_route = [&](const ggml_cuda_fattn_kvarn_route_input & base,
                                   ggml_cuda_fattn_kvarn_route expected,
@@ -280,20 +278,6 @@ int main(int argc, char ** argv) {
         "CMake must retain exactly the 15-pair default KVarN fast-decode policy without HALF");
     ok &= expect(count_occurrences(release, "-DGGML_CUDA_KVARN=ON") == 4,
         "all Linux/Windows CUDA and ROCm release builds must explicitly enable KVarN");
-    for (const char * target : {
-            "50-real", "52-real", "53-real", "60-real", "61-real",
-            "62-real", "70-real", "72-real", "75-real", "80-real",
-            "86-real", "89-real", "90-real", "120a-real", "121a-real" }) {
-        ok &= expect(architecture_compile.find(target) != std::string::npos,
-            "explicit CUDA architecture compile coverage omitted a required target");
-    }
-    ok &= expect(
-            architecture_compile.find("nvidia/cuda:12.4.1-devel-ubuntu22.04") != std::string::npos &&
-            architecture_compile.find("nvidia/cuda:13.1.1-devel-ubuntu24.04") != std::string::npos &&
-            architecture_compile.find("-DGGML_CUDA_KVARN=ON") != std::string::npos &&
-            architecture_compile.find("-DGGML_CUDA_FA=ON") != std::string::npos &&
-            architecture_compile.find("-DGGML_CUDA_FA_ALL_QUANTS=ON") != std::string::npos,
-        "CUDA architecture compile coverage must retain both toolkit lanes and an all-quant KVarN probe");
     ok &= expect(hip_cmake.find("ggml_cuda_select_kvarn_fast_decode_sources") != std::string::npos &&
                  musa_cmake.find("ggml_cuda_select_kvarn_fast_decode_sources") != std::string::npos &&
                  cmake.find("GGML_CUDA_KVARN_ALL_PAIR_COUNT 36") != std::string::npos &&

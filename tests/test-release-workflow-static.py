@@ -15,7 +15,6 @@ def require(condition: bool, message: str) -> None:
 
 def main() -> None:
     expected = {
-        "cuda-architecture-compile.yml",
         "release-dispatch.yml",
         "release-preview-dispatch.yml",
         "release.yml",
@@ -28,7 +27,6 @@ def main() -> None:
     )
 
     release = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
-    cuda_architecture = (WORKFLOWS / "cuda-architecture-compile.yml").read_text(encoding="utf-8")
     preview_dispatch = (WORKFLOWS / "release-preview-dispatch.yml").read_text(encoding="utf-8")
     stable_dispatch = (WORKFLOWS / "release-dispatch.yml").read_text(encoding="utf-8")
     setup_ccache = (ACTIONS / "setup-ccache/action.yml").read_text(encoding="utf-8")
@@ -65,15 +63,8 @@ def main() -> None:
         "release metadata must resolve the predecessor cache channel from live version branches",
     )
     require(
-        "uses: ./.github/workflows/cuda-architecture-compile.yml" in release
-        and "\n      - cuda-architecture-compile\n" in release,
-        "release assembly must wait for explicit CUDA architecture compilation",
-    )
-    require(
-        "workflow_call:" in cuda_architecture
-        and "nvidia/cuda:12.4.1-devel-ubuntu22.04" in cuda_architecture
-        and "nvidia/cuda:13.1.1-devel-ubuntu24.04" in cuda_architecture,
-        "the reusable CUDA architecture workflow must retain both release toolkits",
+        "cuda-architecture-compile" not in release,
+        "release workflow must not run the exhaustive CUDA architecture matrix",
     )
 
     save_count = release.count("- name: Save ccache")
