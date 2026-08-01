@@ -300,7 +300,7 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        if: ${{ always() && needs.release-meta.outputs.preview == 'true' }}
+        if: ${{ always() }}
         uses: ./.github/actions/save-rolling-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-macos-arm64
@@ -388,7 +388,7 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        if: ${{ always() && needs.release-meta.outputs.preview == 'true' }}
+        if: ${{ always() }}
         uses: ./.github/actions/save-rolling-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-${{ matrix.os }}-cpu
@@ -465,7 +465,7 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        if: ${{ always() && needs.release-meta.outputs.preview == 'true' }}
+        if: ${{ always() }}
         uses: ./.github/actions/save-rolling-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-ubuntu-vulkan-x64
@@ -569,7 +569,7 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        if: ${{ always() && needs.release-meta.outputs.preview == 'true' }}
+        if: ${{ always() }}
         uses: ./.github/actions/save-rolling-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-ubuntu-rocm-${{ env.ROCM_VERSION }}-x64
@@ -677,7 +677,7 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        if: ${{ always() && needs.release-meta.outputs.preview == 'true' }}
+        if: ${{ always() }}
         uses: ./.github/actions/save-rolling-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-ubuntu-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
@@ -769,7 +769,7 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        if: ${{ always() && needs.release-meta.outputs.preview == 'true' }}
+        if: ${{ always() }}
         uses: ./.github/actions/save-rolling-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-ubuntu-cuda-${{ matrix.cuda }}-x64
@@ -855,7 +855,7 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        if: ${{ always() && needs.release-meta.outputs.preview == 'true' }}
+        if: ${{ always() }}
         uses: ./.github/actions/save-rolling-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-cpu-x64
@@ -954,7 +954,7 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        if: ${{ always() && needs.release-meta.outputs.preview == 'true' }}
+        if: ${{ always() }}
         uses: ./.github/actions/save-rolling-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
@@ -1074,7 +1074,7 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        if: ${{ always() && needs.release-meta.outputs.preview == 'true' }}
+        if: ${{ always() }}
         uses: ./.github/actions/save-rolling-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-vulkan-${{ env.VULKAN_VERSION }}-x64
@@ -1171,7 +1171,7 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        if: ${{ always() && needs.release-meta.outputs.preview == 'true' }}
+        if: ${{ always() }}
         uses: ./.github/actions/save-rolling-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-cuda-${{ matrix.cuda }}
@@ -1299,7 +1299,7 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        if: ${{ always() && needs.release-meta.outputs.preview == 'true' }}
+        if: ${{ always() }}
         uses: ./.github/actions/save-rolling-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-hip-${{ env.HIPSDK_INSTALLER_VERSION }}-x64
