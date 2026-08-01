@@ -88,9 +88,13 @@ def main() -> None:
         "every release cache must fall back to the same backend/toolchain key in the parent channel",
     )
     require(
-        release.count("if: ${{ always() && needs.release-meta.outputs.preview == 'true' }}")
+        release.count("if: ${{ always() }}")
         == save_count,
-        "every rolling-cache save must be preview-only",
+        "every rolling-cache save must run for preview and stable release builds",
+    )
+    require(
+        "always() && needs.release-meta.outputs.preview == 'true'" not in release,
+        "rolling-cache saves must not be limited to preview builds",
     )
     require(
         release.count("ref: refs/heads/main") == save_count,
