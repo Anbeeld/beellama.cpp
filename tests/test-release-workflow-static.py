@@ -25,6 +25,15 @@ def main() -> None:
         "release workflow inventory diverged: "
         f"added={sorted(actual - expected)}, missing={sorted(expected - actual)}",
     )
+    stale_rocwmma = [
+        path.name
+        for path in WORKFLOWS.glob("*.y*ml")
+        if "GGML_HIP_ROCWMMA_FATTN" in path.read_text(encoding="utf-8")
+    ]
+    require(
+        not stale_rocwmma,
+        f"release workflows still pass removed GGML_HIP_ROCWMMA_FATTN: {stale_rocwmma}",
+    )
 
     release = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
     preview_dispatch = (WORKFLOWS / "release-preview-dispatch.yml").read_text(encoding="utf-8")
