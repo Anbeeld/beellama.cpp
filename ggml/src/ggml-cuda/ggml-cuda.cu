@@ -4871,7 +4871,7 @@ static uint32_t ggml_backend_cuda_kvarn_native_rotated_max_query_tokens(ggml_bac
     }
     const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
     const auto capabilities = ggml_cuda_fattn_kvarn_device_capabilities(device);
-    return capabilities.specialized_routes ?
+    return capabilities.original_v_domain && capabilities.specialized_routes ?
         capabilities.rotated_query_max_specialized :
         capabilities.rotated_query_max_portable;
 #endif
@@ -5598,10 +5598,12 @@ static bool ggml_backend_cuda_kvarn_tail_attention_supported(
         return false;
     }
 #if defined(GGML_USE_HIP)
-    return body_k == GGML_TYPE_F16 && body_v == GGML_TYPE_F16 &&
+    const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
+    const auto capabilities = ggml_cuda_fattn_kvarn_device_capabilities(device);
+    return ggml_cuda_fattn_kvarn_body_shape_supported(capabilities, d_k, d_v) &&
+        body_k == GGML_TYPE_F16 && body_v == GGML_TYPE_F16 &&
         (tail_k == GGML_TYPE_F16 || tail_k == GGML_TYPE_BF16) &&
-        (tail_v == GGML_TYPE_F16 || tail_v == GGML_TYPE_BF16) &&
-        d_k == d_v && (d_k == 128 || d_k == 256 || d_k == 512);
+        (tail_v == GGML_TYPE_F16 || tail_v == GGML_TYPE_BF16);
 #else
     return ggml_cuda_flash_attn_ext_tail_supported(
         body_k, body_v, tail_k, tail_v, d_k, d_v);

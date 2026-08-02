@@ -172,15 +172,71 @@ int main(int argc, char ** argv) {
         GGML_CUDA_FATTN_KVARN_BACKEND_HIP, 32, true, true, 1024, 48*1024, 4*1024,
     });
     ok &= expect(rdna_caps.generic_mma && rdna_caps.decode_split && !rdna_caps.decode_vector &&
-                 rdna_caps.portable_native && rdna_caps.specialized_routes,
-        "RDNA wave32 must expose generic WMMA, split decode, and portable fallback");
+                 rdna_caps.portable_native && rdna_caps.specialized_routes &&
+                 !rdna_caps.original_v_domain &&
+                 rdna_caps.rotated_query_max_portable == UINT32_MAX,
+        "RDNA wave32 must keep broad prompt/prefill on the rotated portable domain");
 
     const auto cdna_caps = ggml_cuda_fattn_kvarn_select_capabilities({
         GGML_CUDA_FATTN_KVARN_BACKEND_HIP, 64, true, true, 1024, 48*1024, 4*1024,
     });
     ok &= expect(cdna_caps.generic_mma && cdna_caps.decode_split && !cdna_caps.decode_vector &&
-                 cdna_caps.portable_native && cdna_caps.specialized_routes,
-        "CDNA wave64 must expose generic MFMA, split decode, and portable fallback");
+                 cdna_caps.portable_native && cdna_caps.specialized_routes &&
+                 !cdna_caps.original_v_domain &&
+                 cdna_caps.rotated_query_max_portable == UINT32_MAX,
+        "CDNA wave64 must keep broad prompt/prefill on the rotated portable domain");
+
+#if defined(GGML_CUDA_FATTN_KVARN_OPERATION_POLICY)
+    const auto mma_eligibility = [&](ggml_cuda_fattn_kvarn_amd_mma_arch arch,
+                                     int head_dim, int ncols1, int ncols2) {
+        return ggml_cuda_fattn_kvarn_amd_mma_eligibility({
+            arch, head_dim, ncols1, ncols2,
+        });
+    };
+    ok &= expect(mma_eligibility(GGML_CUDA_FATTN_KVARN_AMD_RDNA_WMMA, 128, 4, 2) ==
+                     GGML_CUDA_FATTN_KVARN_MMA_TILE_TOO_SMALL &&
+                 mma_eligibility(GGML_CUDA_FATTN_KVARN_AMD_RDNA_WMMA, 128, 5, 3) ==
+                     GGML_CUDA_FATTN_KVARN_MMA_TILE_TOO_SMALL &&
+                 mma_eligibility(GGML_CUDA_FATTN_KVARN_AMD_RDNA_WMMA, 128, 8, 2) ==
+                     GGML_CUDA_FATTN_KVARN_MMA_ELIGIBLE &&
+                 mma_eligibility(GGML_CUDA_FATTN_KVARN_AMD_RDNA_WMMA, 128, 16, 2) ==
+                     GGML_CUDA_FATTN_KVARN_MMA_ELIGIBLE,
+        "RDNA WMMA tile-product boundary must reject 8/15 and admit 16/32 columns");
+    ok &= expect(mma_eligibility(GGML_CUDA_FATTN_KVARN_AMD_RDNA_WMMA, 128, 16, 1) ==
+                     GGML_CUDA_FATTN_KVARN_MMA_RDNA_SINGLE_GQA_COLUMN &&
+                 mma_eligibility(GGML_CUDA_FATTN_KVARN_AMD_RDNA_WMMA, 128, 8, 2) ==
+                     GGML_CUDA_FATTN_KVARN_MMA_ELIGIBLE,
+        "RDNA WMMA must reject ncols2=1 and admit the same-width ncols2=2 tile");
+    ok &= expect(mma_eligibility(GGML_CUDA_FATTN_KVARN_AMD_RDNA_WMMA, 256, 8, 2) ==
+                     GGML_CUDA_FATTN_KVARN_MMA_HEAD_DIM_UNSUPPORTED &&
+                 mma_eligibility(GGML_CUDA_FATTN_KVARN_AMD_RDNA_WMMA, 512, 8, 2) ==
+                     GGML_CUDA_FATTN_KVARN_MMA_HEAD_DIM_UNSUPPORTED,
+        "RDNA WMMA must reject D256 and D512 before template launch");
+    for (int head_dim : {128, 256}) {
+        ok &= expect(mma_eligibility(GGML_CUDA_FATTN_KVARN_AMD_CDNA_MFMA, head_dim, 5, 3) ==
+                         GGML_CUDA_FATTN_KVARN_MMA_TILE_TOO_SMALL &&
+                     mma_eligibility(GGML_CUDA_FATTN_KVARN_AMD_CDNA_MFMA, head_dim, 8, 2) ==
+                         GGML_CUDA_FATTN_KVARN_MMA_ELIGIBLE,
+            "CDNA MFMA tile-product boundary must reject 15 and admit 16 columns");
+    }
+    ok &= expect(mma_eligibility(GGML_CUDA_FATTN_KVARN_AMD_CDNA_MFMA, 512, 8, 2) ==
+                     GGML_CUDA_FATTN_KVARN_MMA_HEAD_DIM_UNSUPPORTED,
+        "CDNA MFMA must reject D512 before template launch");
+    ok &= expect(ggml_cuda_fattn_kvarn_select_fallback_route(false, false, true) ==
+                     GGML_CUDA_FATTN_KVARN_ROUTE_PORTABLE_NATIVE &&
+                 ggml_cuda_fattn_kvarn_select_fallback_route(true, false, true) ==
+                     GGML_CUDA_FATTN_KVARN_ROUTE_PORTABLE_NATIVE &&
+                 ggml_cuda_fattn_kvarn_select_fallback_route(false, true, true) ==
+                     GGML_CUDA_FATTN_KVARN_ROUTE_GENERIC_MMA &&
+                 ggml_cuda_fattn_kvarn_select_fallback_route(true, true, true) ==
+                     GGML_CUDA_FATTN_KVARN_ROUTE_PROMPT_PREFILL &&
+                 ggml_cuda_fattn_kvarn_select_fallback_route(false, false, false) ==
+                     GGML_CUDA_FATTN_KVARN_ROUTE_UNAVAILABLE,
+        "operation fallback policy must route rejected AMD MMA shapes to portable native attention");
+#else
+    ok &= expect(false,
+        "missing operation-specific AMD KVarN MMA eligibility and portable fallback policy");
+#endif
 
     const auto old_amd_caps = ggml_cuda_fattn_kvarn_select_capabilities({
         GGML_CUDA_FATTN_KVARN_BACKEND_HIP, 32, false, true, 1024, 48*1024, 4*1024,
@@ -219,9 +275,10 @@ int main(int argc, char ** argv) {
     ok &= expect(exec.find("ggml_cuda_flash_attn_ext_kvarn_uses_views(dst)") < exec.find("switch (ggml_cuda_get_best_fattn_kernel"),
         "KVarN dispatch must precede generic CUDA FlashAttention selection");
 
-    ok &= expect(kvarn.find("ggml_cuda_flash_attn_ext_mma_kvarn(ctx, dst);") != std::string::npos &&
-                 kvarn.find("return true;") != std::string::npos,
-        "unsupported KVarN fast-decode pairs must fall through to descriptor-native MMA");
+    ok &= expect(kvarn.find("static bool ggml_cuda_flash_attn_ext_mma_kvarn(") != std::string::npos &&
+                 kvarn.find("generic_shape_rejected") != std::string::npos &&
+                 kvarn.find("ggml_cuda_fattn_kvarn_select_fallback_route") != std::string::npos,
+        "generic KVarN launch must report shape rejection and continue through operation fallback policy");
     const std::string kvarn_dispatch = slice_between(kvarn,
             "bool ggml_cuda_flash_attn_ext_kvarn(",
             "#endif // GGML_CUDA_KVARN");
@@ -278,6 +335,11 @@ int main(int argc, char ** argv) {
         "CMake must retain exactly the 15-pair default KVarN fast-decode policy without HALF");
     ok &= expect(count_occurrences(release, "-DGGML_CUDA_KVARN=ON") == 4,
         "all Linux/Windows CUDA and ROCm release builds must explicitly enable KVarN");
+    ok &= expect(release.find("GGML_HIP_ROCWMMA_FATTN") == std::string::npos &&
+                 release.find("check-cmake-configure-vars.py") != std::string::npos,
+        "release builds must remove the unused rocWMMA switch and reject unknown project CMake variables");
+    ok &= expect(release.find("--target ggml-hip test-kvarn test-cuda-fattn-route-policy") != std::string::npos,
+        "Windows HIP validation must compile the KVarN runtime and host route-policy tests");
     ok &= expect(hip_cmake.find("ggml_cuda_select_kvarn_fast_decode_sources") != std::string::npos &&
                  musa_cmake.find("ggml_cuda_select_kvarn_fast_decode_sources") != std::string::npos &&
                  cmake.find("GGML_CUDA_KVARN_ALL_PAIR_COUNT 36") != std::string::npos &&
@@ -295,7 +357,7 @@ int main(int argc, char ** argv) {
     ok &= expect(kvarn_mma_case.find("6 * std::max(DKQ, DV) * sizeof(half)") != std::string::npos,
         "rotated KVarN MMA shared memory must reserve all three axes for both K and V records");
     ok &= expect(kvarn.find("ggml_cuda_fattn_kvarn_wide_mma_supported") != std::string::npos &&
-                 kvarn.find("ggml_cuda_flash_attn_ext_mma_kvarn_case<DKQ, DV, 16, 8>") != std::string::npos,
+                 kvarn.find("ggml_cuda_flash_attn_ext_mma_kvarn_launch_case<DKQ, DV, 16, 8>") != std::string::npos,
         "multi-token GQA verification must use the adaptive wide KVarN MMA tile when the device supports it");
     ok &= expect(kvarn_wide_instance.find("!defined(GGML_USE_HIP)") == std::string::npos &&
                  kvarn_wide_instance.find("!defined(GGML_USE_MUSA)") != std::string::npos,
@@ -336,7 +398,8 @@ int main(int argc, char ** argv) {
                  kvarn_dispatch_header.find("amd_generic_mma") != std::string::npos &&
                  kvarn_dispatch_header.find("amd_decode_split") != std::string::npos &&
                  kvarn_dispatch_header.find("direct_entry") != std::string::npos &&
-                 kvarn_dispatch_header.find("compact_tail_entry") != std::string::npos,
+                 kvarn_dispatch_header.find("compact_tail_entry") != std::string::npos &&
+                 kvarn_dispatch_header.find("generic_shape_rejected") != std::string::npos,
         "KVarN route telemetry must be ABI-sized and distinguish AMD, portable, and entry routes");
     ok &= expect(kvarn_store.find("headwide_workspace") != std::string::npos &&
                  kvarn_store.find("headwide_monolithic") != std::string::npos &&

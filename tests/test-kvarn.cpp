@@ -107,6 +107,22 @@ static void test_attention_domain_policy() {
     require(llama_kvarn_attention_domain(true, true, 0, 2) ==
                 GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V,
             "a backend without an extended capability must retain multi-row prefill");
+
+    for (uint32_t n_q : { 1u, 16u, 17u, 256u, 512u }) {
+        const auto hip_safe_first = llama_kvarn_plan_attention(
+                true, false, UINT32_MAX, n_q);
+        require(hip_safe_first.native_attention &&
+                hip_safe_first.domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED,
+                "HIP-like portable capability must keep every admitted query count in the rotated domain");
+
+        const auto cuda_domain = llama_kvarn_plan_attention(true, true, 16, n_q);
+        require(cuda_domain.native_attention,
+                "CUDA-like KVarN capability unexpectedly materialized an admitted query count");
+        require(cuda_domain.domain == (n_q <= 16 ?
+                    GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED :
+                    GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V),
+                "CUDA-like KVarN domain threshold changed while correcting HIP policy");
+    }
 }
 
 static void test_vulkan_decode_route_policy() {
@@ -2549,12 +2565,13 @@ struct test_kvarn_route_stats {
     uint64_t split_reduce;
     uint64_t direct_entry;
     uint64_t compact_tail_entry;
+    uint64_t generic_shape_rejected;
 };
 
-static test_kvarn_route_stats make_test_kvarn_route_stats() {
+static test_kvarn_route_stats make_test_kvarn_route_stats(uint32_t abi_version = 2) {
     test_kvarn_route_stats stats = {};
     stats.struct_size = sizeof(stats);
-    stats.abi_version = 1;
+    stats.abi_version = abi_version;
     return stats;
 }
 
@@ -2796,9 +2813,12 @@ static void test_native_flash_attention_gpu() {
     const char * requested_backend = std::getenv("GGML_KVARN_TEST_BACKEND");
     const bool expect_vulkan_route_stats = requested_backend != nullptr &&
         std::strncmp(requested_backend, "Vulkan", 6) == 0;
+    const uint32_t route_stats_abi_version = expect_vulkan_route_stats ? 1u : 2u;
+    bool hip_safe_first = false;
+    int hip_physical_wave_size = 0;
     require(!expect_vulkan_route_stats ||
             (route_stats_reset != nullptr && route_stats_get != nullptr),
-            "Vulkan KVarN backend omitted ABI-v1 route telemetry");
+            "Vulkan KVarN backend omitted ABI-v2 route telemetry");
     if (expect_vulkan_route_stats) {
         ggml_backend_dev_t dev = ggml_backend_get_device(gpu_backend);
         ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
@@ -2837,13 +2857,14 @@ static void test_native_flash_attention_gpu() {
     }
     if (route_stats_reset != nullptr && route_stats_get != nullptr) {
         route_stats_get(nullptr);
-        test_kvarn_route_stats undersized = make_test_kvarn_route_stats();
-        undersized.struct_size -= sizeof(undersized.compact_tail_entry);
+        test_kvarn_route_stats undersized = make_test_kvarn_route_stats(route_stats_abi_version);
+        undersized.struct_size -= expect_vulkan_route_stats ?
+            2 * sizeof(undersized.compact_tail_entry) : sizeof(undersized.generic_shape_rejected);
         undersized.route_families = 0xa5a5a5a5u;
         route_stats_get(&undersized);
         require(undersized.route_families == 0xa5a5a5a5u,
                 "KVarN route telemetry wrote an undersized caller structure");
-        test_kvarn_route_stats wrong_version = make_test_kvarn_route_stats();
+        test_kvarn_route_stats wrong_version = make_test_kvarn_route_stats(route_stats_abi_version);
         wrong_version.abi_version += 1;
         wrong_version.route_families = 0x5a5a5a5au;
         route_stats_get(&wrong_version);
@@ -2862,47 +2883,130 @@ static void test_native_flash_attention_gpu() {
                 "native KVarN backend omitted its rotated query-batch capability");
         require(rotated_max_query_tokens(dev) >= 16,
                 "native KVarN backend does not cover a complete DFlash verification block");
-        require(get_capabilities != nullptr,
-                "native KVarN backend omitted its versioned capability record");
-        ggml_backend_kvarn_capabilities undersized_capabilities = {};
-        undersized_capabilities.struct_size =
-            sizeof(undersized_capabilities) - sizeof(undersized_capabilities.minimum_dynamic_shared_bytes);
-        undersized_capabilities.abi_version = GGML_BACKEND_KVARN_CAPABILITIES_ABI_VERSION;
-        undersized_capabilities.route_families = 0xa5a5a5a5u;
-        require(!get_capabilities(dev, &undersized_capabilities) &&
-                undersized_capabilities.route_families == 0xa5a5a5a5u,
-                "KVarN capability query wrote an undersized caller structure");
-        ggml_backend_kvarn_capabilities wrong_capability_version = {};
-        wrong_capability_version.struct_size = sizeof(wrong_capability_version);
-        wrong_capability_version.abi_version =
-            GGML_BACKEND_KVARN_CAPABILITIES_ABI_VERSION + 1;
-        wrong_capability_version.route_families = 0x5a5a5a5au;
-        require(!get_capabilities(dev, &wrong_capability_version) &&
-                wrong_capability_version.route_families == 0x5a5a5a5au,
-                "KVarN capability query accepted an unknown ABI version");
-        ggml_backend_kvarn_capabilities capabilities = {};
-        capabilities.struct_size = sizeof(capabilities);
-        capabilities.abi_version = GGML_BACKEND_KVARN_CAPABILITIES_ABI_VERSION;
-        require(get_capabilities(dev, &capabilities),
-                "native KVarN backend rejected the current capability ABI");
-        require(capabilities.store_materialize &&
-                capabilities.portable_direct_body &&
-                capabilities.portable_integrated_tail_f16 &&
-                capabilities.portable_integrated_tail_bf16 &&
-                capabilities.minimum_dynamic_shared_bytes > 0,
-                "native KVarN backend capability record omitted its portable body-plus-tail contract");
-        if (std::getenv("GGML_KVARN_TEST_FORCE_PORTABLE_CAPABILITY") != nullptr) {
-            require(!capabilities.specialized_generic_mma &&
-                    !capabilities.specialized_decode_split &&
-                    !capabilities.specialized_decode_vector &&
-                    !capabilities.original_v_domain &&
-                    capabilities.rotated_query_max_portable == UINT32_MAX &&
-                    capabilities.rotated_query_max_specialized == 0 &&
-                    rotated_max_query_tokens(dev) == UINT32_MAX,
-                    "simulated pre-Turing CUDA capability did not remain portable-only");
+        require(get_capabilities != nullptr || expect_vulkan_route_stats,
+                "native CUDA/HIP KVarN backend omitted its versioned capability record");
+        if (get_capabilities != nullptr) {
+            ggml_backend_kvarn_capabilities undersized_capabilities = {};
+            undersized_capabilities.struct_size =
+                sizeof(undersized_capabilities) - sizeof(undersized_capabilities.minimum_dynamic_shared_bytes);
+            undersized_capabilities.abi_version = GGML_BACKEND_KVARN_CAPABILITIES_ABI_VERSION;
+            undersized_capabilities.route_families = 0xa5a5a5a5u;
+            require(!get_capabilities(dev, &undersized_capabilities) &&
+                    undersized_capabilities.route_families == 0xa5a5a5a5u,
+                    "KVarN capability query wrote an undersized caller structure");
+            ggml_backend_kvarn_capabilities wrong_capability_version = {};
+            wrong_capability_version.struct_size = sizeof(wrong_capability_version);
+            wrong_capability_version.abi_version =
+                GGML_BACKEND_KVARN_CAPABILITIES_ABI_VERSION + 1;
+            wrong_capability_version.route_families = 0x5a5a5a5au;
+            require(!get_capabilities(dev, &wrong_capability_version) &&
+                    wrong_capability_version.route_families == 0x5a5a5a5au,
+                    "KVarN capability query accepted an unknown ABI version");
+            ggml_backend_kvarn_capabilities capabilities = {};
+            capabilities.struct_size = sizeof(capabilities);
+            capabilities.abi_version = GGML_BACKEND_KVARN_CAPABILITIES_ABI_VERSION;
+            require(get_capabilities(dev, &capabilities),
+                    "native KVarN backend rejected the current capability ABI");
+            require(capabilities.store_materialize &&
+                    capabilities.portable_direct_body &&
+                    capabilities.portable_integrated_tail_f16 &&
+                    capabilities.portable_integrated_tail_bf16 &&
+                    capabilities.minimum_dynamic_shared_bytes > 0,
+                    "native KVarN backend capability record omitted its portable body-plus-tail contract");
+            hip_safe_first = capabilities.specialized_generic_mma &&
+                !capabilities.original_v_domain;
+            hip_physical_wave_size = capabilities.physical_warp_size;
+            if (std::getenv("GGML_KVARN_TEST_FORCE_PORTABLE_CAPABILITY") != nullptr) {
+                require(!capabilities.specialized_generic_mma &&
+                        !capabilities.specialized_decode_split &&
+                        !capabilities.specialized_decode_vector &&
+                        !capabilities.original_v_domain &&
+                        capabilities.rotated_query_max_portable == UINT32_MAX &&
+                        capabilities.rotated_query_max_specialized == 0 &&
+                        rotated_max_query_tokens(dev) == UINT32_MAX,
+                        "simulated pre-Turing CUDA capability did not remain portable-only");
+            }
         }
     }
     test_native_flash_attention_portable_backend(gpu_backend, cpu_backend, "GPU");
+    if (std::getenv("GGML_KVARN_TEST_AMD_ROUTE_BOUNDARIES_ONLY") != nullptr) {
+        require(route_stats_reset != nullptr && route_stats_get != nullptr,
+                "AMD route-boundary validation requires KVarN route telemetry");
+        require(hip_safe_first &&
+                (hip_physical_wave_size == 32 || hip_physical_wave_size == 64),
+                "AMD route-boundary validation did not find a safe-first HIP wave32/wave64 device");
+
+        const char * attestation = std::getenv("GGML_KVARN_AMD_RUNTIME_ATTESTATION");
+        const bool attested_wave = attestation != nullptr &&
+            ((hip_physical_wave_size == 32 && std::strcmp(attestation, "rdna-wave32") == 0) ||
+             (hip_physical_wave_size == 64 && std::strcmp(attestation, "cdna-wave64") == 0));
+        require(attested_wave,
+                "AMD runtime attestation does not match the physical wave reported by the backend");
+
+        const auto require_amd_case = [&](int head_dim, int n_q, int gqa,
+                                          int tail_tokens, ggml_type exact_type,
+                                          const char * message) {
+            const std::vector<float> expected = test_native_flash_attention_output(
+                    cpu_backend, false, false, head_dim, 4, 3, n_q,
+                    gqa, 1, 513, 5, false, nullptr, false,
+                    tail_tokens, false, exact_type);
+            route_stats_reset();
+            const std::vector<float> actual = test_native_flash_attention_output(
+                    gpu_backend, true, true, head_dim, 4, 3, n_q,
+                    gqa, 1, 513, 5, false, nullptr, true,
+                    tail_tokens, false, exact_type);
+            test_kvarn_route_stats stats = make_test_kvarn_route_stats(route_stats_abi_version);
+            route_stats_get(&stats);
+
+            require_close_f32_rmse(actual, expected, 1e-2f, message);
+            require(stats.materialize_fallback == 0,
+                    "AMD route-boundary case materialized the KVarN body");
+            const bool known_invalid_generic = hip_physical_wave_size == 32 ?
+                head_dim > 128 : head_dim > 256;
+            if (known_invalid_generic) {
+                require(stats.generic_shape_rejected > 0 && stats.portable_native > 0 &&
+                        stats.generic_mma == 0 && stats.prompt_prefill == 0,
+                        "known-invalid AMD MMA shape did not fall through to portable KVarN attention");
+            } else {
+                require(stats.generic_mma + stats.prompt_prefill + stats.portable_native > 0,
+                        "AMD route-boundary case did not execute an optimized or portable native route");
+                require(stats.generic_shape_rejected == 0 || stats.portable_native > 0,
+                        "AMD generic rejection did not continue to portable KVarN attention");
+            }
+        };
+
+        for (int head_dim : { 128, 256, 512 }) {
+            for (int n_q : { 1, 2, 4, 8, 16, 17, 256, 511, 512 }) {
+                require_amd_case(head_dim, n_q, 6, 0, GGML_TYPE_F16,
+                        "AMD KVarN route-boundary output differs from the materialized oracle");
+            }
+        }
+        for (int gqa : { 1, 2, 4, 6, 8, 16 }) {
+            require_amd_case(128, 17, gqa, 0, GGML_TYPE_F16,
+                    "AMD D128 GQA route-boundary output differs from the materialized oracle");
+        }
+        for (int head_dim : { 256, 512 }) {
+            for (int n_q : { 17, 256 }) {
+                for (ggml_type exact_type : { GGML_TYPE_F16, GGML_TYPE_BF16 }) {
+                    require_amd_case(head_dim, n_q, 6, 128, exact_type,
+                            "AMD KVarN body-plus-tail output differs from the materialized oracle");
+                }
+            }
+        }
+        std::printf("test-kvarn: AMD runtime validation attestation=%s physical_wave=%d OK\n",
+                attestation, hip_physical_wave_size);
+        ggml_backend_free(cpu_backend);
+        ggml_backend_free(gpu_backend);
+        return;
+    }
+    if (hip_safe_first) {
+        // The general suite below contains CUDA's validated original-V window
+        // and specialized-route assertions. HIP remains in the rotated domain;
+        // its complete shape matrix is exercised by the attested subset above.
+        ggml_backend_free(cpu_backend);
+        ggml_backend_free(gpu_backend);
+        return;
+    }
     if (route_stats_reset == nullptr || route_stats_get == nullptr ||
             std::getenv("GGML_KVARN_TEST_FORCE_PORTABLE_FATTN") != nullptr) {
         // Vulkan and other portable GPU backends intentionally do not expose
@@ -2912,7 +3016,7 @@ static void test_native_flash_attention_gpu() {
         ggml_backend_free(gpu_backend);
         return;
     }
-    test_kvarn_route_stats route_capabilities = make_test_kvarn_route_stats();
+    test_kvarn_route_stats route_capabilities = make_test_kvarn_route_stats(route_stats_abi_version);
     route_stats_get(&route_capabilities);
     require(route_capabilities.direct_entry > 0,
             "KVarN route telemetry did not observe the direct attention entry");
@@ -2949,13 +3053,13 @@ static void test_native_flash_attention_gpu() {
         const std::vector<float> generic = test_native_flash_attention_output(
                 gpu_backend, true, true, head_dim, bits, bits, n_q, n_q_heads, n_kv_heads,
                 1024, 5, swa, &generic_meta, true);
-        test_kvarn_route_stats generic_stats = make_test_kvarn_route_stats();
+        test_kvarn_route_stats generic_stats = make_test_kvarn_route_stats(route_stats_abi_version);
         route_stats_get(&generic_stats);
         route_stats_reset();
         const std::vector<float> actual = test_native_flash_attention_output(
                 gpu_backend, true, true, head_dim, bits, bits, n_q, n_q_heads, n_kv_heads,
                 1024, 5, swa, &actual_meta);
-        test_kvarn_route_stats stats = make_test_kvarn_route_stats();
+        test_kvarn_route_stats stats = make_test_kvarn_route_stats(route_stats_abi_version);
         route_stats_get(&stats);
 
         if (!swa) {
@@ -3009,13 +3113,13 @@ static void test_native_flash_attention_gpu() {
         const std::vector<float> generic = test_native_flash_attention_output(
                 gpu_backend, true, true, head_dim, 4, 4, n_q, n_q_heads, n_kv_heads,
                 1024, 5, swa, nullptr, true, tail_tokens);
-        test_kvarn_route_stats generic_stats = make_test_kvarn_route_stats();
+        test_kvarn_route_stats generic_stats = make_test_kvarn_route_stats(route_stats_abi_version);
         route_stats_get(&generic_stats);
         route_stats_reset();
         const std::vector<float> actual = test_native_flash_attention_output(
                 gpu_backend, true, true, head_dim, 4, 4, n_q, n_q_heads, n_kv_heads,
                 1024, 5, swa, nullptr, false, tail_tokens);
-        test_kvarn_route_stats stats = make_test_kvarn_route_stats();
+        test_kvarn_route_stats stats = make_test_kvarn_route_stats(route_stats_abi_version);
         route_stats_get(&stats);
 
         require_close_f32_rmse(actual, generic, 1e-4f, message);
@@ -3334,6 +3438,21 @@ static void test_native_flash_attention_prefill_route_parity() {
     if (!backend_supports_kvarn_flash_attention_shape(gpu_backend, 256)) {
         ggml_backend_free(gpu_backend);
         return;
+    }
+
+    ggml_backend_dev_t dev = ggml_backend_get_device(gpu_backend);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    auto get_capabilities = reg ? reinterpret_cast<test_kvarn_capabilities_fn>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_kvarn_capabilities")) : nullptr;
+    if (get_capabilities != nullptr) {
+        ggml_backend_kvarn_capabilities capabilities = {};
+        capabilities.struct_size = sizeof(capabilities);
+        capabilities.abi_version = GGML_BACKEND_KVARN_CAPABILITIES_ABI_VERSION;
+        if (get_capabilities(dev, &capabilities) &&
+                capabilities.specialized_generic_mma && !capabilities.original_v_domain) {
+            ggml_backend_free(gpu_backend);
+            return;
+        }
     }
 
     const auto require_route_parity = [&](int bits, int n_kv, int tail_candidates, const char * message) {
@@ -4414,6 +4533,13 @@ static void test_meta_kvarn_zero_head_shard() {
 
 int main() {
     ggml_backend_load_all();
+
+    if (std::getenv("GGML_KVARN_TEST_AMD_ROUTE_BOUNDARIES_ONLY") != nullptr) {
+        test_native_flash_attention_support_gates();
+        test_native_flash_attention_gpu();
+        std::printf("test-kvarn: AMD route-boundary matrix OK\n");
+        return 0;
+    }
 
     if (std::getenv("GGML_KVARN_TEST_PORTABLE_NATIVE_ONLY") != nullptr) {
         test_native_flash_attention_support_gates();

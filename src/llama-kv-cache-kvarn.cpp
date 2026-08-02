@@ -209,10 +209,10 @@ uint32_t llama_kvarn_backend_native_rotated_max_query_tokens(ggml_backend_dev_t 
         if (!query_kvarn_capabilities(dev, capabilities_fn, capabilities)) {
             return 0;
         }
-        const bool specialized =
-            capabilities.specialized_generic_mma ||
-            capabilities.specialized_decode_split ||
-            capabilities.specialized_decode_vector;
+        const bool specialized = capabilities.original_v_domain &&
+            (capabilities.specialized_generic_mma ||
+             capabilities.specialized_decode_split ||
+             capabilities.specialized_decode_vector);
         return specialized ?
             capabilities.rotated_query_max_specialized :
             capabilities.rotated_query_max_portable;

@@ -1680,6 +1680,7 @@ struct test {
     uint64_t                 kvarn_route_split_reduce = 0;
     uint64_t                 kvarn_route_direct = 0;
     uint64_t                 kvarn_route_compact_tail = 0;
+    uint64_t                 kvarn_route_generic_rejected = 0;
     uint64_t                 kv_k_payload_bytes = 0;
     uint64_t                 kv_v_payload_bytes = 0;
     uint64_t                 kv_exact_tail_bytes = 0;
@@ -1717,10 +1718,13 @@ struct test {
     uint64_t                 cuda_used_peak_bytes = 0;
     uint64_t                 cuda_used_after_context_bytes = 0;
     uint64_t                 cuda_total_bytes = 0;
+    uint64_t                 cuda_context_buffer_bytes = 0;
+    uint64_t                 cuda_non_kv_context_buffer_bytes = 0;
     uint64_t                 cuda_compute_buffer_bytes = 0;
     int64_t                  cuda_context_delta_bytes = 0;
     int64_t                  cuda_peak_delta_bytes = 0;
     int64_t                  cuda_reconciliation_delta_bytes = 0;
+    int64_t                  cuda_runtime_overhead_bytes = 0;
     int64_t                  cuda_teardown_delta_bytes = 0;
     int                      n_gpu_layers;
     int                      n_cpu_moe;
@@ -1845,6 +1849,7 @@ struct test {
             "kvarn_route_families", "kvarn_route_portable", "kvarn_route_amd_generic",
             "kvarn_route_amd_split", "kvarn_route_amd_vector", "kvarn_route_materialize",
             "kvarn_route_split_reduce", "kvarn_route_direct", "kvarn_route_compact_tail",
+            "kvarn_route_generic_rejected",
             "kv_k_payload_bytes", "kv_v_payload_bytes", "kv_exact_tail_bytes", "kv_exact_history_bytes",
             "kv_exact_overlay_bytes", "kv_native_exact_bytes", "kv_rollback_reserve_bytes",
             "kv_transient_estimate_bytes", "kv_staging_bytes",
@@ -1856,8 +1861,9 @@ struct test {
             "kv_tail_pack_bytes", "kv_tail_body_output_bytes", "kv_tail_exact_output_bytes", "kv_tail_plan_input_bytes",
             "kv_transient_bytes", "kv_peak_bytes", "cuda_used_model_bytes", "cuda_used_context_bytes",
             "cuda_used_prefill_bytes", "cuda_used_peak_bytes", "cuda_used_after_context_bytes", "cuda_total_bytes",
-            "cuda_compute_buffer_bytes", "cuda_context_delta_bytes", "cuda_peak_delta_bytes",
-            "cuda_reconciliation_delta_bytes", "cuda_teardown_delta_bytes",
+            "cuda_context_buffer_bytes", "cuda_non_kv_context_buffer_bytes", "cuda_compute_buffer_bytes",
+            "cuda_context_delta_bytes", "cuda_peak_delta_bytes", "cuda_reconciliation_delta_bytes",
+            "cuda_runtime_overhead_bytes", "cuda_teardown_delta_bytes",
             "n_gpu_layers",  "n_cpu_moe",      "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "load_mode",     "embeddings",
@@ -1887,7 +1893,7 @@ struct test {
             field == "kvarn_route_amd_generic" || field == "kvarn_route_amd_split" ||
             field == "kvarn_route_amd_vector" || field == "kvarn_route_materialize" ||
             field == "kvarn_route_split_reduce" || field == "kvarn_route_direct" ||
-            field == "kvarn_route_compact_tail" ||
+            field == "kvarn_route_compact_tail" || field == "kvarn_route_generic_rejected" ||
             field == "kv_tail_native_bodyless_layers" || field == "kv_tail_native_mixed_layers" ||
             field == "kv_tail_device_fallback_layers" || field == "kv_tail_cpu_layers") {
             return INT;
@@ -1975,6 +1981,7 @@ struct test {
                                              std::to_string(kvarn_route_split_reduce),
                                              std::to_string(kvarn_route_direct),
                                              std::to_string(kvarn_route_compact_tail),
+                                             std::to_string(kvarn_route_generic_rejected),
                                              std::to_string(kv_k_payload_bytes),
                                              std::to_string(kv_v_payload_bytes),
                                              std::to_string(kv_exact_tail_bytes),
@@ -2012,10 +2019,13 @@ struct test {
                                              std::to_string(cuda_used_peak_bytes),
                                              std::to_string(cuda_used_after_context_bytes),
                                              std::to_string(cuda_total_bytes),
+                                             std::to_string(cuda_context_buffer_bytes),
+                                             std::to_string(cuda_non_kv_context_buffer_bytes),
                                              std::to_string(cuda_compute_buffer_bytes),
                                              std::to_string(cuda_context_delta_bytes),
                                              std::to_string(cuda_peak_delta_bytes),
                                              std::to_string(cuda_reconciliation_delta_bytes),
+                                             std::to_string(cuda_runtime_overhead_bytes),
                                              std::to_string(cuda_teardown_delta_bytes),
                                              std::to_string(n_gpu_layers),
                                             std::to_string(n_cpu_moe),
@@ -2583,12 +2593,13 @@ struct bench_kvarn_route_stats {
     uint64_t split_reduce;
     uint64_t direct_entry;
     uint64_t compact_tail_entry;
+    uint64_t generic_shape_rejected;
 };
 
-static bench_kvarn_route_stats make_bench_kvarn_route_stats() {
+static bench_kvarn_route_stats make_bench_kvarn_route_stats(uint32_t abi_version) {
     bench_kvarn_route_stats stats = {};
     stats.struct_size = sizeof(stats);
-    stats.abi_version = 1;
+    stats.abi_version = abi_version;
     return stats;
 }
 
@@ -2785,6 +2796,9 @@ int llama_bench(int argc, char ** argv) {
         uint64_t cuda_free_model = 0;
         uint64_t cuda_total = 0;
         ggml_backend_dev_t memory_dev = bench_memory_device(inst);
+        const char * memory_device_name = memory_dev != nullptr ? ggml_backend_dev_name(memory_dev) : nullptr;
+        const uint32_t route_stats_abi_version = memory_device_name != nullptr &&
+            strncmp(memory_device_name, "Vulkan", 6) == 0 ? 1u : 2u;
         ggml_backend_reg_t memory_reg =
             memory_dev != nullptr ? ggml_backend_dev_backend_reg(memory_dev) : nullptr;
         auto kvarn_route_stats_reset = memory_reg != nullptr ?
@@ -2859,9 +2873,18 @@ int llama_bench(int argc, char ** argv) {
             for (const auto & [buft, memory] : breakdown) {
                 ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
                 if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    t.cuda_context_buffer_bytes += memory.context;
                     t.cuda_compute_buffer_bytes += memory.compute;
                 }
             }
+            if (t.cuda_context_buffer_bytes < t.kv_resident_bytes) {
+                fprintf(stderr, "%s: error: GPU context buffers are smaller than categorized resident KV storage\n", __func__);
+                llama_free(ctx);
+                llama_model_free(lmodel);
+                return 1;
+            }
+            t.cuda_non_kv_context_buffer_bytes =
+                t.cuda_context_buffer_bytes - t.kv_resident_bytes;
 
             uint64_t cuda_free_context = 0;
             uint64_t cuda_total_context = 0;
@@ -3045,7 +3068,7 @@ int llama_bench(int argc, char ** argv) {
         }
 
         if (kvarn_route_stats_get != nullptr) {
-            bench_kvarn_route_stats stats = make_bench_kvarn_route_stats();
+            bench_kvarn_route_stats stats = make_bench_kvarn_route_stats(route_stats_abi_version);
             kvarn_route_stats_get(&stats);
             t.kvarn_route_split = stats.decode_split;
             t.kvarn_route_vector = stats.decode_vector;
@@ -3060,6 +3083,7 @@ int llama_bench(int argc, char ** argv) {
             t.kvarn_route_split_reduce = stats.split_reduce;
             t.kvarn_route_direct = stats.direct_entry;
             t.kvarn_route_compact_tail = stats.compact_tail_entry;
+            t.kvarn_route_generic_rejected = stats.generic_shape_rejected;
         }
 
         if (params.kv_memory) {
@@ -3078,7 +3102,11 @@ int llama_bench(int argc, char ** argv) {
             t.kv_peak_bytes = t.kv_resident_bytes + t.kv_transient_bytes;
             t.cuda_peak_delta_bytes = int64_t(t.cuda_used_peak_bytes) - int64_t(t.cuda_used_model_bytes);
             t.cuda_reconciliation_delta_bytes = t.cuda_peak_delta_bytes -
-                    int64_t(t.kv_resident_bytes + t.kv_transient_bytes + t.cuda_compute_buffer_bytes);
+                    int64_t(t.cuda_context_buffer_bytes + t.cuda_compute_buffer_bytes);
+            // cudaMemGetInfo includes driver/runtime allocations and VMM pool
+            // granularity that are not owned by a llama context buffer. Keep
+            // that residual explicit instead of attributing it to KVarN.
+            t.cuda_runtime_overhead_bytes = t.cuda_reconciliation_delta_bytes;
 
             llama_perf_context_print(ctx);
             llama_free(ctx);

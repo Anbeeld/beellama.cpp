@@ -1842,6 +1842,8 @@ static __global__ void flash_attn_ext_f16(
 #endif // __CUDA_ARCH__ == GGML_CUDA_CC_TURING
 
 #if defined(AMD_WMMA_AVAILABLE)
+    // Mirrored by ggml_cuda_fattn_kvarn_amd_mma_eligibility on the host.
+    // Keep this final invariant for callers outside the KVarN dispatcher.
     if (ncols1*ncols2 < 16 || ncols2 == 1 || DKQ > 128) {
         NO_DEVICE_CODE;
         return;
@@ -1849,6 +1851,7 @@ static __global__ void flash_attn_ext_f16(
 #endif // defined(AMD_WMMA_AVAILABLE)
 
 #if defined(AMD_MFMA_AVAILABLE)
+    // Mirrored by ggml_cuda_fattn_kvarn_amd_mma_eligibility on the host.
     if (ncols1*ncols2 < 16 || DKQ > 256) {
         NO_DEVICE_CODE;
         return;

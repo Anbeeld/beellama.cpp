@@ -598,7 +598,12 @@ def main() -> None:
         raise AssertionError("the CUDA checkpoint must remain the preferred synchronized CUDA route")
     for required in (
         "struct_size = sizeof(stats)",
-        "abi_version = 1",
+        "route_stats_abi_version",
+        "generic_shape_rejected",
+        '"kvarn_route_generic_rejected"',
+        "cuda_context_buffer_bytes",
+        "cuda_non_kv_context_buffer_bytes",
+        "cuda_runtime_overhead_bytes",
         "ggml_backend_dev_backend_reg(memory_dev)",
         '"kvarn_route_portable"',
         '"kvarn_route_materialize"',
@@ -608,7 +613,7 @@ def main() -> None:
     ):
         if required not in bench:
             raise AssertionError(
-                f"llama-bench backend telemetry is not device-matched and ABI-v1 safe: missing {required}"
+                f"llama-bench backend telemetry is not device-matched and version-safe: missing {required}"
             )
     for required in (
         "struct ggml_vk_kv_memory_transient_stats",
