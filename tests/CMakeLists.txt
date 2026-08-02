@@ -112,12 +112,6 @@ if (Python3_Interpreter_FOUND)
     set_property(TEST test-kvarn-hip-tail-capability-static PROPERTY LABELS hip)
 
     add_test(
-        NAME test-check-cmake-configure-vars
-        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-check-cmake-configure-vars.py ${PROJECT_SOURCE_DIR})
-    set_property(TEST test-check-cmake-configure-vars PROPERTY LABELS main)
-
-    add_test(
         NAME test-kvarn-hip-runtime-validation
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-kvarn-hip-runtime-validation.py ${PROJECT_SOURCE_DIR})

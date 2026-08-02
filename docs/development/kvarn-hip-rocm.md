@@ -98,9 +98,8 @@ the omitted repository tests and qualifies only the KVarN gate.
 
 ## Validation status
 
-The release workflow compiles a fat ROCm build for RDNA, CDNA, and older AMD
-targets with the default pair matrix, and Windows HIP compiles both KVarN and
-host route-policy tests. Neither job is an AMD runtime claim. Publish the two
+The existing release jobs provide multi-architecture ROCm compile and Windows
+HIP package coverage. Neither job is an AMD runtime claim. Publish the two
 `evidence.json` artifacts before describing HIP KVarN as runtime-qualified or
 re-enabling the bounded original-V window path. Until then, HIP stays on the
 portable-safe rotated domain and specialized routes are optional acceleration.

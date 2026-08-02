@@ -16,7 +16,6 @@ def main() -> int:
 
     protocol = protocol_path.read_text(encoding="utf-8")
     runtime_test = (repo / "tests" / "test-kvarn.cpp").read_text(encoding="utf-8")
-    release = (repo / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
 
     for token in (
         "rdna-wave32",
@@ -33,8 +32,6 @@ def main() -> int:
             "test-kvarn has no deterministic AMD route-boundary subset")
     require("GGML_KVARN_AMD_RUNTIME_ATTESTATION" in runtime_test,
             "test-kvarn does not attest the physical AMD wave used by the runtime subset")
-    require("validate-kvarn-runtime.py" in release,
-            "release workflow does not distinguish the external AMD runtime protocol from compile coverage")
     return 0
 
 

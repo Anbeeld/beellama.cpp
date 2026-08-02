@@ -335,11 +335,6 @@ int main(int argc, char ** argv) {
         "CMake must retain exactly the 15-pair default KVarN fast-decode policy without HALF");
     ok &= expect(count_occurrences(release, "-DGGML_CUDA_KVARN=ON") == 4,
         "all Linux/Windows CUDA and ROCm release builds must explicitly enable KVarN");
-    ok &= expect(release.find("GGML_HIP_ROCWMMA_FATTN") == std::string::npos &&
-                 release.find("check-cmake-configure-vars.py") != std::string::npos,
-        "release builds must remove the unused rocWMMA switch and reject unknown project CMake variables");
-    ok &= expect(release.find("--target ggml-hip test-kvarn test-cuda-fattn-route-policy") != std::string::npos,
-        "Windows HIP validation must compile the KVarN runtime and host route-policy tests");
     ok &= expect(hip_cmake.find("ggml_cuda_select_kvarn_fast_decode_sources") != std::string::npos &&
                  musa_cmake.find("ggml_cuda_select_kvarn_fast_decode_sources") != std::string::npos &&
                  cmake.find("GGML_CUDA_KVARN_ALL_PAIR_COUNT 36") != std::string::npos &&

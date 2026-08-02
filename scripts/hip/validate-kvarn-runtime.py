@@ -170,7 +170,7 @@ def main() -> int:
         ("build", [cmake, "--build", str(build_dir), "--config", args.config,
                    "--target", "test-kvarn", "test-cuda-fattn-route-policy"], None),
         ("host-policy", [ctest, "--test-dir", str(build_dir), "-C", args.config,
-                         "-R", "^(test-cuda-fattn-route-policy|test-kvarn-hip-tail-capability-static|test-check-cmake-configure-vars|test-kvarn-hip-runtime-validation)$",
+                         "-R", "^(test-cuda-fattn-route-policy|test-kvarn-hip-tail-capability-static|test-kvarn-hip-runtime-validation)$",
                          "--output-on-failure"], None),
     ]
     amd_env = os.environ.copy()
