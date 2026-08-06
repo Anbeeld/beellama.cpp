@@ -777,8 +777,33 @@ void ggml_cuda_fattn_kvarn_decode_launch(const ggml_cuda_fattn_kvarn_decode_args
     CUDA_CHECK(cudaGetLastError());
 
     const dim3 blocks_combine((uint32_t) args.n_q_heads, (uint32_t) args.n_q, (uint32_t) args.n_stream);
+
+    // KVarN decode combine reduction holds n_splits partials in dynamic shared
+    // memory. n_splits = ceil(n_kv / SPLIT_TOKENS) grows with context, so once
+    // n_splits*sizeof(float) exceeds CUDA's 48KB default per-block dynamic-shared-
+    // mem ceiling (~786K tokens), the launch fails with cudaErrorInvalidConfiguration
+    // ("invalid argument"). Opt the kernel into the device's larger opt-in limit,
+    // mirroring the sibling MMA kernels in fattn-mma-kvarn-case.cuh. (sm_120/5090
+    // exposes ~228KB, which covers 1M+: 64KB at n_kv=1M.)
+    const int nbytes_shared_combine = args.n_splits * (int) sizeof(float);
+    int smem_optin = nbytes_shared_combine;
+    {
+        const int device = ggml_cuda_get_device();
+        int smem_max = 0;
+        if (device >= 0) {
+            cudaDeviceGetAttribute(&smem_max, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+        }
+        if (smem_max > 0 && smem_optin > smem_max) {
+            smem_optin = smem_max;  // clamp the opt-in ceiling to the device max
+        }
+    }
+#if !defined(GGML_USE_MUSA)
+    CUDA_CHECK(cudaFuncSetAttribute(
+        reinterpret_cast<const void *>(ggml_cuda_fattn_kvarn_decode_combine_kernel<D>),
+        cudaFuncAttributeMaxDynamicSharedMemorySize, smem_optin));
+#endif
     ggml_cuda_fattn_kvarn_decode_combine_kernel<D>
-        <<<blocks_combine, GGML_CUDA_FATTN_KVARN_DECODE_THREADS, args.n_splits * sizeof(float), args.stream>>>(
+        <<<blocks_combine, GGML_CUDA_FATTN_KVARN_DECODE_THREADS, nbytes_shared_combine, args.stream>>>(
             args.partial, args.partial_meta, args.dst, args.dst_meta,
             args.n_splits, args.n_q, args.n_q_heads);
     CUDA_CHECK(cudaGetLastError());
