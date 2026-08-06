@@ -331,9 +331,13 @@ void ggml_cuda_fattn_kvarn_vec_launch(const ggml_cuda_fattn_kvarn_decode_args & 
 
     const dim3 blocks_combine(
         (uint32_t) args.n_q_heads, 1, (uint32_t) args.n_stream);
+    const int nbytes_shared_combine = args.n_splits * (int) sizeof(float);
+    // Same combine kernel as the MMA decode path: raise the dynamic-shared-mem
+    // limit to the device opt-in max so larger n_splits launches succeed.
+    ggml_cuda_fattn_kvarn_decode_combine_prepare<D>(nbytes_shared_combine);
     ggml_cuda_fattn_kvarn_decode_combine_kernel<D>
         <<<blocks_combine, GGML_CUDA_FATTN_KVARN_DECODE_THREADS,
-            args.n_splits * sizeof(float), args.stream>>>(
+            nbytes_shared_combine, args.stream>>>(
             args.partial, args.partial_meta, args.dst, args.dst_meta,
             args.n_splits, 1, args.n_q_heads);
     CUDA_CHECK(cudaGetLastError());
