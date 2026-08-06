@@ -1749,9 +1749,13 @@ Listing all models in cache. The model metadata will also include a field to ind
 ```
 
 `GET /models` is read-only. Query parameters cannot refresh, load, unload, or
-autoload models. Its response omits raw presets, filesystem paths, child argv,
-and sensitive options. When a model is loaded, non-conflicting public metadata
-from the child `/v1/models` response may be included.
+autoload models. Matching upstream, each entry's `status` exposes the child
+argv (`status.args`) and, for preset-backed models, the resolved INI preset
+(`status.preset`); sensitive options such as `--hf-token` and `--api-key` are
+stripped from both. Note that `status.args`/`status.preset` may contain local
+filesystem paths for preset models defined with custom paths. When a model is
+loaded, non-conflicting public metadata from the child `/v1/models` response
+may be included.
 
 To rescan model sources, use `POST /models/reload`. This may unload a running
 model whose source was updated or removed and add or update unloaded models.

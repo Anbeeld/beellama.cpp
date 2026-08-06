@@ -1649,7 +1649,17 @@ void server_models_routes::init_routes() {
         for (const auto & meta : all_models) {
             json status {
                 {"value",  server_model_status_to_string(meta.status)},
+                {"args",   meta.args},
             };
+            if (!meta.preset.name.empty()) {
+                common_preset preset_copy = meta.preset;
+                unset_reserved_args(preset_copy, false);
+                preset_copy.unset_option("LLAMA_ARG_HOST");
+                preset_copy.unset_option("LLAMA_ARG_PORT");
+                preset_copy.unset_option("LLAMA_ARG_ALIAS");
+                preset_copy.unset_option("LLAMA_ARG_TAGS");
+                status["preset"] = preset_copy.to_ini();
+            }
             if (meta.is_failed()) {
                 status["exit_code"] = meta.exit_code;
                 status["failed"]    = true;

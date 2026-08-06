@@ -278,6 +278,49 @@ def test_router_reload_models():
         os.remove(preset_path)
 
 
+def test_router_models_status_args_preset():
+    """GET /models exposes status.args and status.preset per model (upstream parity).
+
+    Clients such as pi-llama-cpp parse status.args to learn e.g. --ctx-size of
+    unloaded router models; dropping these fields breaks them (issue #117).
+    """
+    global server
+
+    preset_path = os.path.join(TMP_DIR, "test_args_preset.ini")
+    with open(preset_path, "w") as f:
+        f.write(
+            "[model-args-a]\n"
+            "hf-repo = ggml-org/test-model-stories260K\n"
+            # note: the fork overlays router CLI args on top of every preset, so
+            # use an option the test fixture does not pass on the command line
+            "top-k = 17\n"
+        )
+
+    server.models_preset = preset_path
+    server.start()
+
+    try:
+        res = server.make_request("GET", "/models")
+        assert res.status_code == 200
+        data = {item["id"]: item for item in res.body.get("data", [])}
+        assert "model-args-a" in data
+
+        status = data["model-args-a"].get("status", {})
+
+        args = status.get("args")
+        assert isinstance(args, list) and args, "status.args must be exposed (upstream parity)"
+        assert "ggml-org/test-model-stories260K" in args
+        assert "--top-k" in args
+        assert args[args.index("--top-k") + 1] == "17"
+
+        preset_ini = status.get("preset")
+        assert preset_ini is not None, "status.preset must be exposed (upstream parity)"
+        assert "[model-args-a]" in preset_ini
+        assert "top-k = 17" in preset_ini
+    finally:
+        os.remove(preset_path)
+
+
 def test_router_remote_preset():
     global server
     server.model_hf_repo = "ggml-org/test-preset-ci"

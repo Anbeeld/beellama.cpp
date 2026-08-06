@@ -185,9 +185,12 @@ behavior. The `--spec-dm-*` rows are Bee server additions.
 | Preset key `load-on-startup` | Preset-only | False when absent | A truthy value autoloads that model when router mode starts; the number of startup models may not exceed `--models-max`. |
 | Preset key `stop-timeout` | Preset-only | `10` seconds | Force-kills a child model process after this many seconds of graceful shutdown. Invalid values fall back to 10. |
 
-`GET /models` only lists sanitized model identity, status, source, aliases,
-tags, and capabilities. It never returns child argv, raw presets, model paths,
-or tokens and ignores former reload query parameters. Refresh model sources
+`GET /models` lists model identity, status, source, aliases, tags, and
+capabilities. Matching upstream, each entry's `status` exposes the child argv
+(`status.args`) and, for preset-backed models, the resolved INI preset
+(`status.preset`) with sensitive options stripped; these may contain local
+paths for custom-path preset models. It ignores former reload query parameters.
+Refresh model sources
 with `POST /models/reload`; when `--api-key` is configured this mutation
 requires the same `Authorization: Bearer ...` or `X-Api-Key` authentication as
 other non-public routes. `--hf-token` is a sensitive option: router children
