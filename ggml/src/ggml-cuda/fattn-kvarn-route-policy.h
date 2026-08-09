@@ -151,9 +151,10 @@ inline ggml_cuda_fattn_kvarn_capabilities ggml_cuda_fattn_kvarn_select_capabilit
     } else if (input.backend == GGML_CUDA_FATTN_KVARN_BACKEND_HIP) {
         result.generic_mma =
             input.matrix_mma && result.store_materialize && physical_wave_supported;
-        result.decode_split = result.generic_mma;
-        // The SWA vector kernel is still CUDA-warp tuned. HIP uses split decode
-        // or generic MMA until a physical-wave vector route proves worthwhile.
+        // Split decode uses NVIDIA ldmatrix plus m16n8 MMA fragments, and the
+        // SWA vector kernel is CUDA-warp tuned. HIP uses shape-gated generic
+        // WMMA/MFMA or portable direct-record attention instead.
+        result.decode_split = false;
         result.decode_vector = false;
     }
     // MUSA intentionally remains portable-native. Its compiler consumes these

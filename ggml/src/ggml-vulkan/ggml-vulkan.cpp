@@ -9166,6 +9166,9 @@ static void ggml_vk_cpy_to_contiguous(ggml_backend_vk_context * ctx, vk_context&
     }
 
     vk_op_unary_push_constants pc = vk_op_unary_push_constants_init(tensor, tensor, ne);
+    const uint32_t src_offset = get_misalign_bytes(ctx, tensor) / ggml_type_size(tensor->type);
+    GGML_ASSERT(src_offset < (1u << 16));
+    pc.misalign_offsets = src_offset << 16;
     pc.nb10 = 1;
     pc.nb11 = (uint32_t)tensor->ne[0];
     pc.nb12 = (uint32_t)(tensor->ne[0] * tensor->ne[1]);
@@ -9196,6 +9199,9 @@ static void ggml_vk_cpy_to_strided(
     }
 
     vk_op_unary_push_constants pc = vk_op_unary_push_constants_init(tensor, tensor, ne);
+    const uint32_t src_offset = get_misalign_bytes(ctx, tensor) / ggml_type_size(tensor->type);
+    GGML_ASSERT(src_offset < (1u << 16));
+    pc.misalign_offsets = src_offset << 16;
     pc.nb10 = nb10;
     pc.nb11 = nb11;
     pc.nb12 = nb12;
@@ -9297,7 +9303,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
                               !ggml_vk_dim01_contiguous(src0);
     const bool y_non_contig = (ctx->device->coopmat2 && src1->type == GGML_TYPE_F32) ||
                               (src0->type == GGML_TYPE_BF16 && src1->type != GGML_TYPE_BF16) ||
-                              !ggml_vk_dim01_contiguous(src1);
+                              !ggml_vk_dim01_contiguous(src1) ||
+                              get_misalign_bytes(ctx, src1) != 0;
 
     // If src0 is BF16, try to use a BF16 x BF16 multiply
     ggml_type f16_type = src0->type == GGML_TYPE_BF16 ? GGML_TYPE_BF16 : GGML_TYPE_F16;
@@ -9467,7 +9474,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
             if (ctx->prealloc_y_need_sync) {
                 ggml_vk_sync_buffers(ctx, subctx);
             }
-            ggml_vk_cpy_to_contiguous(ctx, subctx, to_fp16_vk_1, src1, ggml_vk_subbuffer(ctx, d_Qy, qy_buf_offset), ggml_vk_subbuffer(ctx, d_Y, 0));
+            ggml_vk_cpy_to_contiguous(ctx, subctx, to_fp16_vk_1, src1, ggml_vk_tensor_subbuffer(ctx, src1, true), ggml_vk_subbuffer(ctx, d_Y, 0));
             ctx->prealloc_y_last_pipeline_used = to_fp16_vk_1.get();
             ctx->prealloc_y_last_tensor_used = src1;
             ctx->prealloc_y_last_decode_vector_staging = false;
@@ -9634,7 +9641,10 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     bool batch_n = ne11 > 1;
 
     const bool x_non_contig = !ggml_vk_dim01_contiguous(src0);
-    const bool y_non_contig = !ggml_vk_dim01_contiguous(src1);
+    // A tensor can be logically contiguous while its view begins between Vulkan
+    // storage-buffer binding boundaries. Stage that case through the generic
+    // copy shader, which applies the element offset above, before mat-vec reads it.
+    const bool y_non_contig = !ggml_vk_dim01_contiguous(src1) || get_misalign_bytes(ctx, src1) != 0;
 
     const bool f16_f32_kernel = src1->type == GGML_TYPE_F32;
     bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && ggml_vk_should_use_mmvq(ctx->device, ne01, ne11, ne10, src0->type);
@@ -9715,7 +9725,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
 
     vk_subbuffer d_D = ggml_vk_tensor_subbuffer(ctx, cgraph->nodes[node_idx + ctx->num_additional_fused_ops]);
     vk_subbuffer d_Qx = ggml_vk_tensor_subbuffer(ctx, src0);
-    vk_subbuffer d_Qy = ggml_vk_tensor_subbuffer(ctx, src1);
+    vk_subbuffer d_Qy = ggml_vk_tensor_subbuffer(ctx, src1, y_non_contig);
     vk_subbuffer d_X, d_Y;
 
     if (qx_needs_dequant) {
@@ -10637,7 +10647,8 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     const bool y_non_contig = y_decode_vector_staging ||
                               (ctx->device->coopmat2 && src1->type == GGML_TYPE_F32) ||
                               (src0->type == GGML_TYPE_BF16 && src1->type != GGML_TYPE_BF16) ||
-                              !ggml_vk_dim01_contiguous(src1);
+                              !ggml_vk_dim01_contiguous(src1) ||
+                              get_misalign_bytes(ctx, src1) != 0;
 
     const uint32_t y_staged_row_stride = y_decode_vector_staging ? (uint32_t)ggml_vk_align_size(ne10, 4) : (uint32_t)ne10;
 
@@ -10843,13 +10854,13 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                 const uint32_t y_staged_dst_type_size = ggml_type_size(y_staged_dst.type);
                 ggml_vk_cpy_to_strided(
                     ctx, subctx, to_fp16_vk_1, src1,
-                    ggml_vk_subbuffer(ctx, d_Qy, qy_buf_offset), ggml_vk_subbuffer(ctx, d_Y, 0),
+                    ggml_vk_tensor_subbuffer(ctx, src1, true), ggml_vk_subbuffer(ctx, d_Y, 0),
                     (uint32_t)(y_staged_dst.nb[0] / y_staged_dst_type_size),
                     (uint32_t)(y_staged_dst.nb[1] / y_staged_dst_type_size),
                     (uint32_t)(y_staged_dst.nb[2] / y_staged_dst_type_size),
                     (uint32_t)(y_staged_dst.nb[3] / y_staged_dst_type_size));
             } else {
-                ggml_vk_cpy_to_contiguous(ctx, subctx, to_fp16_vk_1, src1, ggml_vk_subbuffer(ctx, d_Qy, qy_buf_offset), ggml_vk_subbuffer(ctx, d_Y, 0));
+                ggml_vk_cpy_to_contiguous(ctx, subctx, to_fp16_vk_1, src1, ggml_vk_tensor_subbuffer(ctx, src1, true), ggml_vk_subbuffer(ctx, d_Y, 0));
             }
             ctx->prealloc_y_last_pipeline_used = to_fp16_vk_1.get();
             ctx->prealloc_y_last_tensor_used = src1;
@@ -10936,7 +10947,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     // const uint64_t ne23 = dst->ne[3];
 
     const bool x_non_contig = !ggml_vk_dim01_contiguous(src0);
-    const bool y_non_contig = !ggml_vk_dim01_contiguous(src1);
+    const bool y_non_contig = !ggml_vk_dim01_contiguous(src1) || get_misalign_bytes(ctx, src1) != 0;
 
     const bool f16_f32_kernel = src1->type == GGML_TYPE_F32;
     bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && ggml_vk_should_use_mmvq(ctx->device, ne01, ne12, ne10, src0->type);
@@ -11017,7 +11028,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
 
     vk_subbuffer d_D = ggml_vk_tensor_subbuffer(ctx, cgraph->nodes[node_idx + ctx->num_additional_fused_ops]);
     vk_subbuffer d_Qx = ggml_vk_tensor_subbuffer(ctx, src0);
-    vk_subbuffer d_Qy = ggml_vk_tensor_subbuffer(ctx, src1);
+    vk_subbuffer d_Qy = ggml_vk_tensor_subbuffer(ctx, src1, y_non_contig);
     vk_subbuffer d_ids = ggml_vk_tensor_subbuffer(ctx, ids);
     vk_subbuffer d_F0 = d_D;
     vk_subbuffer d_X, d_Y;
@@ -19543,8 +19554,18 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_REPEAT_BACK:
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_ROPE:
-            return ggml_is_contiguous_rows(op) && ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_ROPE_BACK:
+            {
+                if (!ggml_is_contiguous_rows(op) || !ggml_is_contiguous_rows(op->src[0])) {
+                    return false;
+                }
+                const int mode = ((const int32_t *) op->op_params)[2];
+                const bool is_vision = mode == GGML_ROPE_TYPE_VISION;
+                const bool same_f32 = op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+                const bool same_f16 = op->src[0]->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F16;
+                const bool f32_to_f16 = op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F16;
+                return same_f32 || same_f16 || (!is_vision && f32_to_f16);
+            }
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
         case GGML_OP_VIEW:

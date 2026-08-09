@@ -2826,9 +2826,10 @@ static void test_native_flash_attention_gpu() {
     ggml_backend_t cpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_CPU, true);
 
     const auto [route_stats_reset, route_stats_get] = get_kvarn_route_stats_fns(gpu_backend);
-    const char * requested_backend = std::getenv("GGML_KVARN_TEST_BACKEND");
-    const bool expect_vulkan_route_stats = requested_backend != nullptr &&
-        std::strncmp(requested_backend, "Vulkan", 6) == 0;
+    const ggml_backend_dev_t gpu_device = ggml_backend_get_device(gpu_backend);
+    const char * actual_backend = gpu_device ? ggml_backend_dev_name(gpu_device) : nullptr;
+    const bool expect_vulkan_route_stats = actual_backend != nullptr &&
+        std::strncmp(actual_backend, "Vulkan", 6) == 0;
     const uint32_t route_stats_abi_version = expect_vulkan_route_stats ? 1u : 2u;
     bool hip_safe_first = false;
     int hip_physical_wave_size = 0;
@@ -2936,6 +2937,11 @@ static void test_native_flash_attention_gpu() {
             hip_safe_first = capabilities.specialized_generic_mma &&
                 !capabilities.original_v_domain;
             hip_physical_wave_size = capabilities.physical_warp_size;
+            if (hip_safe_first) {
+                require(!capabilities.specialized_decode_split &&
+                        !capabilities.specialized_decode_vector,
+                        "HIP advertised a CUDA-only specialized KVarN decode route");
+            }
             if (std::getenv("GGML_KVARN_TEST_FORCE_PORTABLE_CAPABILITY") != nullptr) {
                 require(!capabilities.specialized_generic_mma &&
                         !capabilities.specialized_decode_split &&
@@ -2981,6 +2987,9 @@ static void test_native_flash_attention_gpu() {
             require_close_f32_rmse(actual, expected, 1e-2f, message);
             require(stats.materialize_fallback == 0,
                     "AMD route-boundary case materialized the KVarN body");
+            require(stats.decode_split == 0 && stats.amd_decode_split == 0 &&
+                    stats.decode_vector == 0 && stats.amd_decode_vector == 0,
+                    "AMD route-boundary case entered a CUDA-only specialized decode route");
             const bool known_invalid_generic = hip_physical_wave_size == 32 ?
                 head_dim > 128 : head_dim > 256;
             if (known_invalid_generic) {

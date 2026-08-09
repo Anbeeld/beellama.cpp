@@ -624,6 +624,14 @@ static bool ggml_cuda_flash_attn_ext_kvarn_vec(
 static bool ggml_cuda_flash_attn_ext_kvarn_decode_supported(
         const ggml_cuda_fattn_kvarn_plan & plan,
         const ggml_tensor * dst) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    // This route is built from NVIDIA ldmatrix and m16n8 MMA fragments. Keep a
+    // local fail-closed guard in addition to the capability policy so a future
+    // caller cannot accidentally launch it on another compiler backend.
+    (void) plan;
+    (void) dst;
+    return false;
+#else
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
@@ -652,6 +660,7 @@ static bool ggml_cuda_flash_attn_ext_kvarn_decode_supported(
     }
     const int gqa_ratio = (int) (Q->ne[2] / plan.n_kv_heads);
     return gqa_ratio > 0 && ggml_cuda_fattn_kvarn_fast_decode_pair_enabled(plan.k.bits, plan.v.bits);
+#endif
 }
 
 template<int D>

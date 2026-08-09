@@ -171,20 +171,26 @@ int main(int argc, char ** argv) {
     const auto rdna_caps = ggml_cuda_fattn_kvarn_select_capabilities({
         GGML_CUDA_FATTN_KVARN_BACKEND_HIP, 32, true, true, 1024, 48*1024, 4*1024,
     });
-    ok &= expect(rdna_caps.generic_mma && rdna_caps.decode_split && !rdna_caps.decode_vector &&
-                 rdna_caps.portable_native && rdna_caps.specialized_routes &&
-                 !rdna_caps.original_v_domain &&
-                 rdna_caps.rotated_query_max_portable == UINT32_MAX,
-        "RDNA wave32 must keep broad prompt/prefill on the rotated portable domain");
+    ok &= expect(rdna_caps.generic_mma && !rdna_caps.decode_split && !rdna_caps.decode_vector &&
+                  rdna_caps.portable_native && rdna_caps.specialized_routes &&
+                  !rdna_caps.original_v_domain &&
+                  rdna_caps.route_families ==
+                      (GGML_CUDA_FATTN_KVARN_FAMILY_PORTABLE_NATIVE |
+                       GGML_CUDA_FATTN_KVARN_FAMILY_GENERIC_MMA) &&
+                  rdna_caps.rotated_query_max_portable == UINT32_MAX,
+        "RDNA wave32 must expose generic/portable KVarN routes without NVIDIA-only split decode");
 
     const auto cdna_caps = ggml_cuda_fattn_kvarn_select_capabilities({
         GGML_CUDA_FATTN_KVARN_BACKEND_HIP, 64, true, true, 1024, 48*1024, 4*1024,
     });
-    ok &= expect(cdna_caps.generic_mma && cdna_caps.decode_split && !cdna_caps.decode_vector &&
-                 cdna_caps.portable_native && cdna_caps.specialized_routes &&
-                 !cdna_caps.original_v_domain &&
-                 cdna_caps.rotated_query_max_portable == UINT32_MAX,
-        "CDNA wave64 must keep broad prompt/prefill on the rotated portable domain");
+    ok &= expect(cdna_caps.generic_mma && !cdna_caps.decode_split && !cdna_caps.decode_vector &&
+                  cdna_caps.portable_native && cdna_caps.specialized_routes &&
+                  !cdna_caps.original_v_domain &&
+                  cdna_caps.route_families ==
+                      (GGML_CUDA_FATTN_KVARN_FAMILY_PORTABLE_NATIVE |
+                       GGML_CUDA_FATTN_KVARN_FAMILY_GENERIC_MMA) &&
+                  cdna_caps.rotated_query_max_portable == UINT32_MAX,
+        "CDNA wave64 must expose generic/portable KVarN routes without NVIDIA-only split decode");
 
 #if defined(GGML_CUDA_FATTN_KVARN_OPERATION_POLICY)
     const auto mma_eligibility = [&](ggml_cuda_fattn_kvarn_amd_mma_arch arch,
@@ -373,16 +379,15 @@ int main(int argc, char ** argv) {
     ok &= expect(kvarn_mma_case.find("cudaOccupancyMaxActiveBlocksPerMultiprocessor") != std::string::npos &&
                  kvarn_mma_case.find("smpbo") != std::string::npos,
         "wide KVarN MMA eligibility must be based on actual device resources and kernel occupancy");
-    ok &= expect(kvarn_decode.find("ggml_cuda_get_physical_warp_size()") != std::string::npos &&
-                 kvarn_decode.find("static_assert(WARP_SIZE == 32") == std::string::npos &&
-                 kvarn_decode.find("devices[device].warp_size") != std::string::npos,
-        "KVarN split decode must launch and index physical RDNA/CDNA waves");
-    const std::string decode_softmax = slice_between(
-        kvarn_decode, "half * p_h = (half *) p_sh;", "if (v_from_record)");
-    ok &= expect(decode_softmax.find("#if defined(GGML_USE_HIP) && defined(CDNA)") != std::string::npos &&
-                 decode_softmax.find("const int lane_h = tid % 16;") != std::string::npos &&
-                 count_occurrences(decode_softmax, "__shfl_xor_sync") >= 2,
-        "CDNA softmax fallback must not serialize the mature CUDA/RDNA subgroup path");
+    const std::string split_decode_support = slice_between(kvarn,
+        "static bool ggml_cuda_flash_attn_ext_kvarn_decode_supported(",
+        "template<int D>");
+    ok &= expect(split_decode_support.find(
+                      "#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)") != std::string::npos &&
+                  split_decode_support.find("return false;") != std::string::npos &&
+                  kvarn_decode.find("load_ldmatrix(q_b") != std::string::npos &&
+                  kvarn_decode.find("load_ldmatrix(p_b") != std::string::npos,
+        "NVIDIA-fragment KVarN split decode must fail closed on HIP and MUSA");
     ok &= expect(kvarn_wht.find("__shfl_xor_sync") != std::string::npos &&
                  kvarn_wht.find("ggml_cuda_get_physical_warp_size()") != std::string::npos &&
                  kvarn_wht.find("GGML_KVARN_TEST_FORCE_SHARED_WHT") != std::string::npos,
