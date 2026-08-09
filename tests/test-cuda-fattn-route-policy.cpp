@@ -64,6 +64,7 @@ int main(int argc, char ** argv) {
     const std::string hip_cmake = read_file(root + "/ggml/src/ggml-hip/CMakeLists.txt");
     const std::string musa_cmake = read_file(root + "/ggml/src/ggml-musa/CMakeLists.txt");
     const std::string kvarn_mma = read_file(root + "/ggml/src/ggml-cuda/fattn-mma-kvarn-impl.cuh");
+    const std::string kvarn_view = read_file(root + "/ggml/src/ggml-cuda/fattn-mma-kvarn.cuh");
     const std::string kvarn_mma_case = read_file(root + "/ggml/src/ggml-cuda/fattn-mma-kvarn-case.cuh");
     const std::string fattn_mma_f16 = read_file(root + "/ggml/src/ggml-cuda/fattn-mma-f16.cuh");
     const std::string kvarn_decode = read_file(root + "/ggml/src/ggml-cuda/fattn-mma-kvarn-decode.cuh");
@@ -300,6 +301,13 @@ int main(int argc, char ** argv) {
                  cuda_native_ops.find("turing_mma_available") == std::string::npos &&
                  cuda_native_ops.find("ggml_cuda_fattn_kvarn_device_capabilities") != std::string::npos,
         "CUDA backend native KVarN support must use route capabilities instead of requiring Turing MMA");
+    const std::string kvarn_view_support = slice_between(kvarn_view,
+            "static inline bool ggml_cuda_fattn_kvarn_view_supported(",
+            "static inline bool ggml_cuda_fattn_kvarn_supported(");
+    ok &= expect(!kvarn_view_support.empty() &&
+                 kvarn_view_support.find("turing_mma_available") == std::string::npos &&
+                 kvarn_view_support.find("ggml_cuda_info") == std::string::npos,
+        "structural KVarN view validation must not reject portable pre-Turing CUDA routes");
     ok &= expect(cuda_backend.find("\"ggml_backend_kvarn_capabilities\"") != std::string::npos,
         "CUDA must expose the versioned KVarN capability record through the backend registry");
     ok &= expect(kvarn.find("GGML_KVARN_TEST_FORCE_PORTABLE_CAPABILITY") != std::string::npos,

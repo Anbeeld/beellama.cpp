@@ -2776,6 +2776,24 @@ static void test_native_flash_attention_portable_backend(
             require_close_f32_rmse(actual, expected, 1e-2f,
                     "portable prompt-sized KVarN body-plus-tail attention differs from materialized reference");
         }
+
+        for (ggml_type exact_type : { GGML_TYPE_F16, GGML_TYPE_BF16 }) {
+            if (trace) {
+                std::fprintf(stderr, "native trace: %s portable compact body-plus-current tail %s\n",
+                        backend_label, ggml_type_name(exact_type));
+                std::fflush(stderr);
+            }
+            const std::vector<float> expected = test_native_flash_attention_output(
+                    reference_backend, false, false, 256, 5, 4, 4,
+                    16, 2, 512, 3, false, nullptr, false, 128,
+                    false, exact_type, 4, false, true);
+            const std::vector<float> actual = test_native_flash_attention_output(
+                    backend, true, true, 256, 5, 4, 4,
+                    16, 2, 512, 3, false, nullptr, false, 128,
+                    false, exact_type, 4, false, true);
+            require_close_f32_rmse(actual, expected, 1e-2f,
+                    "portable compact KVarN body-plus-current tail differs from materialized reference");
+        }
     }
 
     for (int head_dim : { 128, 256, 512 }) {
@@ -3059,6 +3077,8 @@ static void test_native_flash_attention_gpu() {
                 "portable-only KVarN backend did not report its native route");
         require(route_capabilities.direct_entry > 0,
                 "portable-only KVarN backend did not report its direct body-plus-tail entry");
+        require(route_capabilities.compact_tail_entry > 0,
+                "portable-only KVarN backend did not report its compact body-plus-current-tail entry");
         require(route_capabilities.materialize_fallback == 0,
                 "portable-only compact KVarN tail unexpectedly materialized");
         ggml_backend_free(cpu_backend);

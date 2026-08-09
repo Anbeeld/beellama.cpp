@@ -22,6 +22,20 @@ F32 score tensor is:
 Multiple live score buffers explain the multi-gigabyte compute allocation.
 The persistent KVarN records and exact suffix do not.
 
+The first capability remediation removed that requirement from backend
+advertising but left the same Turing check in the shared KVarN view parser.
+Pre-Turing devices then advertised portable native attention and failed the
+final operation-level support check during graph reservation. View parsing is
+now architecture-neutral; hardware eligibility belongs exclusively to the
+capability record and route dispatcher.
+
+The portable kernel also failed to emit the per-row softmax maximum and
+denominator requested by the segmented tail coordinator. That metadata is
+needed when the exact suffix is split between persistent history and current
+tokens: without it, the final merge discarded the compressed body and kept
+only the current exact rows. Portable body passes now implement the same
+metadata contract as the specialized CUDA kernels.
+
 ## Capability contract
 
 CUDA now reports a versioned KVarN capability record through
@@ -75,9 +89,10 @@ build-win-cuda-13.1-sm_86\bin\test-kvarn.exe
 
 The portable-only suite compares D128, D256, and D512 output with the
 materialized CPU reference. It covers mixed K/V widths, F16/BF16 exact tails,
-SWA, masks, sinks, compact bodyless input, and D256 prompt batches at 64, 256,
-and 1,024 queries. Route telemetry must report portable-native and direct
-body-plus-tail entries with zero materialization fallback.
+SWA, masks, sinks, compact bodyless input, compact body-plus-current input, and
+D256 prompt batches at 64, 256, and 1,024 queries. Route telemetry must report
+portable-native direct and compact-tail entries with zero materialization
+fallback.
 
 The pure policy test supplies SM 5.x/6.x/7.0-like device facts and verifies
 that removing matrix MMA removes only specialized routes. It also rejects

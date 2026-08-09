@@ -29,6 +29,7 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
         const char * tail_mask_data,
         const int32_t * query_order,
         const int32_t * run_desc,
+        float2 * body_meta,
         char * dst_data,
         float scale,
         float max_bias,
@@ -267,6 +268,10 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
         } else {
             old_scale_shared = 1.0f;
         }
+        if (body_meta != nullptr) {
+            const size_t row = ((size_t) stream * n_query + query) * n_query_heads + query_head;
+            body_meta[row] = make_float2(maximum, denominator);
+        }
         weight_shared = denominator > 0.0f ? 1.0f / denominator : 0.0f;
     }
     __syncthreads();
@@ -289,9 +294,13 @@ static inline bool ggml_cuda_fattn_kvarn_portable_supported(
     const ggml_tensor * kt = dst->src[5];
     const ggml_tensor * vt = dst->src[6];
     const ggml_tensor * mt = dst->src[7];
-    const ggml_tensor * qo = dst->src[8];
+    const ggml_tensor * aux = dst->src[8];
     const ggml_tensor * rd = dst->src[9];
     const bool tail_attached = kt != nullptr;
+    // Source 8 is query ordering for an attached exact tail, or the optional
+    // body softmax metadata output for a standalone/coordinator body pass.
+    const ggml_tensor * qo = tail_attached ? aux : nullptr;
+    const ggml_tensor * body_meta = tail_attached ? nullptr : aux;
     const bool tail_ok = !tail_attached ||
         (vt != nullptr && mt != nullptr && qo != nullptr && rd != nullptr &&
          (kt->type == GGML_TYPE_F16 || kt->type == GGML_TYPE_BF16) &&
@@ -301,6 +310,10 @@ static inline bool ggml_cuda_fattn_kvarn_portable_supported(
          vt->ne[0] == q->ne[0] && kt->ne[2] == plan.n_kv_heads &&
          vt->ne[2] == plan.n_kv_heads && qo->ne[1] == rd->ne[1] &&
          rd->ne[0] >= 6 + mt->ne[0]);
+    const bool body_meta_ok = body_meta == nullptr ||
+        (body_meta->type == GGML_TYPE_F32 && body_meta->ne[0] == 2 &&
+         body_meta->ne[1] == q->ne[2] && body_meta->ne[2] == q->ne[1] &&
+         body_meta->ne[3] == q->ne[3] && ggml_is_contiguous(body_meta));
     return ggml_cuda_fattn_kvarn_rotated_decode_domain(dst) &&
         (q->ne[0] == 128 || q->ne[0] == 256 || q->ne[0] == 512) &&
         q->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
@@ -309,7 +322,7 @@ static inline bool ggml_cuda_fattn_kvarn_portable_supported(
         q->ne[2] % plan.n_kv_heads == 0 &&
         (mask == nullptr || mask->type == GGML_TYPE_F16) &&
         (sinks == nullptr || sinks->type == GGML_TYPE_F32) &&
-        tail_ok;
+        tail_ok && body_meta_ok;
 }
 
 template<int D>
@@ -323,8 +336,11 @@ static void ggml_cuda_fattn_kvarn_portable_launch(
     const ggml_tensor * kt = dst->src[5];
     const ggml_tensor * vt = dst->src[6];
     const ggml_tensor * mt = dst->src[7];
-    const ggml_tensor * qo = dst->src[8];
+    const ggml_tensor * aux = dst->src[8];
     const ggml_tensor * rd = dst->src[9];
+    const bool tail_attached = kt != nullptr;
+    const ggml_tensor * qo = tail_attached ? aux : nullptr;
+    const ggml_tensor * body_meta = tail_attached ? nullptr : aux;
     float scale = 1.0f;
     float max_bias = 0.0f;
     float logit_softcap = 0.0f;
@@ -359,6 +375,7 @@ static void ggml_cuda_fattn_kvarn_portable_launch(
             mt ? (const char *) mt->data : nullptr,
             qo ? (const int32_t *) qo->data : nullptr,
             rd ? (const int32_t *) rd->data : nullptr,
+            body_meta ? (float2 *) body_meta->data : nullptr,
             (char *) dst->data,
             scale, max_bias, logit_softcap,
             q->nb[1], q->nb[2], q->nb[3],
