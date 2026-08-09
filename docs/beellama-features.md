@@ -263,7 +263,11 @@ stream, physical cell, and generation. Sequence copies share exact rows within
 one stream and copy them into context-local slots across streams. Position
 shifts rotate exact K rows together with the quantized body. CUDA can read the
 compact pool and current K/V directly through per-query descriptors and merge
-against ordinary FlashAttention normalization metadata. The generic graph
+against ordinary FlashAttention normalization metadata. Vulkan has a bounded
+direct operation for standard quantized bodies plus F16/BF16 history and
+current segments at head dimensions 128, 256, and 512. It evaluates the body,
+history, and current keys with one online FP32 softmax and reports zero private
+workspace for that route. The generic graph
 composes persistent history and current K/V on the owning device, then gathers
 the bounded per-query source union needed by the ordinary attention operators.
 That fallback can duplicate graph-local source rows across a physical ubatch,
@@ -302,6 +306,16 @@ and denominator to the same tail merge used by ordinary FlashAttention. Sink,
 body, and suffix masks therefore contribute each key exactly once. F16/BF16
 canonical K/V rows are stored after RoPE for K and in the original V domain;
 the compressed body retains KVarN's rotated-domain records.
+
+Vulkan KVarN route reservation also queries the backend's own store and
+split-K workspace planners. The resulting per-backend high-water is included in
+the context compute breakdown before fit evaluates a candidate; runtime and
+estimation therefore use the same sizing functions. With KVarN or a precision
+tail active, fit performs an exact no-allocation validation of the upstream
+candidate against the original device-memory snapshot. A measured shortfall is
+fed back only as a guarded margin and upstream fit is restarted from pristine
+inputs; repeated non-fitting candidates fail deterministically. Tail-disabled
+ordinary caches take the unchanged single-call upstream fit path.
 
 Standard unified and non-unified prompt caches preserve one continuous suffix
 across requests and message boundaries. KVarN trims divergence in its live
@@ -348,6 +362,7 @@ is the quality or performance optimum for a particular model.
 - [`--kv-tail-tokens`](beellama-args.md#kv-cache-precision-tail-for-quantized-caches)
 - [`--kv-tail-type`](beellama-args.md#kv-cache-precision-tail-for-quantized-caches)
 - `llama_kv_tail_config_*` for model-bound group discovery and overrides
+- `llama_kv_tail_request_*` for immutable model-independent fit/final requests
 - `llama_kv_tail_get_coverage` for per-sequence, per-group coverage
 - `llama_kv_tail_get_coverage_aggregate` for context/server aggregation
 - `LLAMA_STATE_SEQ_FLAGS_BODY_ONLY` for an intentional lower-precision state export

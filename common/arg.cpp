@@ -456,50 +456,9 @@ static void parse_target_kvarn_swa_cache_type(common_params & params, bool key, 
 }
 
 static void parse_kv_tail_tokens(common_params & params, const std::string & value) {
-    if (value == "auto") {
-        params.kv_tail_tokens = value;
-        return;
-    }
-
-    const std::regex number("0|[1-9][0-9]*");
-    const std::regex group_id("[A-Za-z][A-Za-z0-9-]*(?:@l[0-9]+)?");
-    std::set<std::string> names;
-    bool named = false;
-    bool positional = false;
-    size_t begin = 0;
-
-    do {
-        const size_t end = value.find(',', begin);
-        const std::string item = value.substr(begin, end == std::string::npos ? end : end - begin);
-        if (item.empty()) {
-            throw std::invalid_argument("invalid empty --kv-tail-tokens entry");
-        }
-
-        const size_t eq = item.find('=');
-        if (eq == std::string::npos) {
-            positional = true;
-            if (!std::regex_match(item, number)) {
-                throw std::invalid_argument("invalid --kv-tail-tokens value: " + item);
-            }
-            (void) std::stoul(item);
-        } else {
-            named = true;
-            const std::string name = item.substr(0, eq);
-            const std::string count = item.substr(eq + 1);
-            if (!std::regex_match(name, group_id) || !std::regex_match(count, number)) {
-                throw std::invalid_argument("invalid --kv-tail-tokens group entry: " + item);
-            }
-            if (!names.insert(name).second) {
-                throw std::invalid_argument("duplicate --kv-tail-tokens group: " + name);
-            }
-            (void) std::stoul(count);
-        }
-        begin = end == std::string::npos ? value.size() + 1 : end + 1;
-    } while (begin <= value.size());
-
-    if (named && positional) {
-        throw std::invalid_argument("--kv-tail-tokens cannot mix positional and named entries");
-    }
+    // Preserve the immutable spelling here. The Bee request descriptor is the
+    // single parser, and every fit probe and final context binds it against
+    // that probe's model manifest.
     params.kv_tail_tokens = value;
 }
 

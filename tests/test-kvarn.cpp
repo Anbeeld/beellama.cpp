@@ -1720,6 +1720,22 @@ static std::vector<float> test_native_flash_attention_output(
     stored_v->op_params[3] = n_kv;
     stored_k->op_params[5] = slices;
     stored_v->op_params[5] = slices;
+    if (native_view && n_kv >= 3*128) {
+        using workspace_fn = size_t (*)(ggml_backend_dev_t, const ggml_tensor *);
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        auto * workspace_y = reg ? reinterpret_cast<workspace_fn>(
+                ggml_backend_reg_get_proc_address(
+                    reg, "ggml_backend_kvarn_workspace_y_size")) : nullptr;
+        require(workspace_y == nullptr || workspace_y(dev, stored_k) > 0,
+                "KVarN eager-store backend workspace estimate is missing");
+        if (workspace_y != nullptr) {
+            stored_k->op_params[3] = 0;
+            require(workspace_y(dev, stored_k) > 0,
+                    "KVarN reserve estimate must cover a full ubatch without runtime slot hints");
+            stored_k->op_params[3] = n_kv;
+        }
+    }
     if (swa) {
         stored_k->op_params[4] = 1;
         stored_v->op_params[4] = 1;
@@ -2847,13 +2863,13 @@ static void test_native_flash_attention_gpu() {
                         "Vulkan compact segmented and KVarN capability predicates disagree");
             }
         }
-        require(!segmented_supported(
+        require(segmented_supported(
                     GGML_TYPE_Q4_0, GGML_TYPE_Q4_0,
                     GGML_TYPE_F16, GGML_TYPE_F16, 256, 256) &&
                 !segmented_supported(
                     GGML_TYPE_F16, GGML_TYPE_F16,
                     GGML_TYPE_F16, GGML_TYPE_F16, 384, 384),
-                "Vulkan compact segmented capability accepted an unsupported standard/body shape");
+                "Vulkan compact segmented capability disagrees with the bounded standard-tail matrix");
     }
     if (route_stats_reset != nullptr && route_stats_get != nullptr) {
         route_stats_get(nullptr);
@@ -2883,6 +2899,10 @@ static void test_native_flash_attention_gpu() {
                 "native KVarN backend omitted its rotated query-batch capability");
         require(rotated_max_query_tokens(dev) >= 16,
                 "native KVarN backend does not cover a complete DFlash verification block");
+        if (expect_vulkan_route_stats) {
+            require(rotated_max_query_tokens(dev) == UINT32_MAX,
+                    "Vulkan must advertise the query widths accepted by its final portable KVarN operation");
+        }
         require(get_capabilities != nullptr || expect_vulkan_route_stats,
                 "native CUDA/HIP KVarN backend omitted its versioned capability record");
         if (get_capabilities != nullptr) {

@@ -8,6 +8,7 @@
 #include "llama-io.h"
 #include "llama-kv-cache-kvarn.h"
 #include "llama-kv-cache-tail.h"
+#include "llama-kv-tail-request.h"
 #include "llama-kvarn.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
@@ -327,7 +328,51 @@ llama_context::llama_context(
         throw std::invalid_argument("KV tail type must be F16, BF16, or the cache-family default");
     }
     cparams.kv_tail_type = params.kv_tail_type;
-    if (params.kv_tail_config) {
+    bool tail_request_resolved = false;
+    if (params.kv_tail_request && params.kv_tail_config) {
+        throw std::invalid_argument("KV tail request and model-bound config are mutually exclusive");
+    }
+    if (params.kv_tail_request) {
+        std::unique_ptr<llama_kv_tail_config, decltype(&llama_kv_tail_config_free)> manifest(
+                llama_kv_tail_config_init(&model), llama_kv_tail_config_free);
+        if (!manifest) {
+            throw std::runtime_error("failed to build model-bound KV tail group manifest");
+        }
+        std::vector<llama_kv_tail_request_group> groups;
+        groups.reserve(manifest->groups.size());
+        for (const auto & group : manifest->groups) {
+            groups.push_back({ group.id, group.role,
+                    std::min(group.effective_window, cparams.n_ctx),
+                    model.arch != LLM_ARCH_DEEPSEEK4 });
+        }
+        const auto resolution = llama_kv_tail_request_resolve(
+                *params.kv_tail_request, groups,
+                params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED);
+        if (!resolution.valid) {
+            throw std::invalid_argument("invalid model-bound KV tail request: " + resolution.error);
+        }
+        cparams.kv_tail_tokens = 0;
+        cparams.kv_tail_tokens_swa = 0;
+        cparams.kv_tail_tokens_requested = 0;
+        cparams.kv_tail_tokens_swa_requested = 0;
+        for (const auto & group : resolution.groups) {
+            if (group.role == "swa") {
+                cparams.kv_tail_tokens_swa_requested = group.requested_tokens;
+                cparams.kv_tail_tokens_swa = group.effective_tokens;
+                cparams.kv_tail_native_exact_swa = group.native_exact;
+            } else {
+                cparams.kv_tail_tokens_requested = group.requested_tokens;
+                cparams.kv_tail_tokens = group.effective_tokens;
+                cparams.kv_tail_native_exact = group.native_exact;
+            }
+            cparams.kv_tail_type = group.exact_type;
+            LLAMA_LOG_INFO("KV tail: group=%s raw=%u requested=%u effective=%u type=%s representation=%s\n",
+                    group.id.c_str(), group.raw_requested_tokens, group.requested_tokens,
+                    group.effective_tokens, ggml_type_name(group.exact_type),
+                    group.native_exact ? "native_exact" : "overlay");
+        }
+        tail_request_resolved = true;
+    } else if (params.kv_tail_config) {
         const auto & config = *params.kv_tail_config;
         if (config.model != &model) {
             throw std::invalid_argument("KV tail config was created for a different model");
@@ -369,7 +414,7 @@ llama_context::llama_context(
         }
     }
 
-    if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
+    if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED && !tail_request_resolved) {
         const uint32_t full_window = cparams.n_ctx;
         const uint32_t swa_window = std::min(cparams.n_ctx,
                 hparams.n_swa > 0 ? hparams.n_swa : cparams.n_ctx);
@@ -706,6 +751,8 @@ llama_context::llama_context(
         backend_buft.clear();
         backend_ptrs.clear();
         backend_buf_exp_size.clear();
+        backend_kvarn_workspace_y_size.clear();
+        backend_kvarn_workspace_split_k_size.clear();
 
         for (auto & backend : backends) {
             auto * buft = ggml_backend_get_default_buffer_type(backend.get());
@@ -723,6 +770,8 @@ llama_context::llama_context(
             backend_buft.push_back(buft);
             backend_ptrs.push_back(backend.get());
             backend_buf_exp_size.push_back(0);
+            backend_kvarn_workspace_y_size.push_back(0);
+            backend_kvarn_workspace_split_k_size.push_back(0);
         }
 
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
@@ -901,6 +950,10 @@ void llama_context::sched_reserve() {
 
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
+    std::fill(backend_kvarn_workspace_y_size.begin(),
+            backend_kvarn_workspace_y_size.end(), 0);
+    std::fill(backend_kvarn_workspace_split_k_size.begin(),
+            backend_kvarn_workspace_split_k_size.end(), 0);
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
 
@@ -944,6 +997,7 @@ void llama_context::sched_reserve() {
                 throw std::runtime_error("failed to allocate compute pp buffers");
             }
         }
+        record_backend_private_workspace(gf);
 
         n_splits_pp = ggml_backend_sched_get_n_splits(sched.get());
         n_nodes_pp  = ggml_graph_n_nodes(gf);
@@ -955,6 +1009,7 @@ void llama_context::sched_reserve() {
         if (!gf) {
             throw std::runtime_error("failed to allocate compute tg buffers");
         }
+        record_backend_private_workspace(gf);
 
         n_splits_tg = ggml_backend_sched_get_n_splits(sched.get());
         n_nodes_tg  = ggml_graph_n_nodes(gf);
@@ -970,6 +1025,7 @@ void llama_context::sched_reserve() {
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
         }
+        record_backend_private_workspace(gf);
     }
 
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -982,6 +1038,15 @@ void llama_context::sched_reserve() {
             LLAMA_LOG_INFO("%s: %10s compute buffer size = %8.2f MiB\n", __func__,
                     ggml_backend_buft_name(buft),
                     backend_buf_exp_size[i] / 1024.0 / 1024.0);
+        }
+        const size_t private_size = backend_kvarn_workspace_y_size[i] +
+                backend_kvarn_workspace_split_k_size[i];
+        if (private_size > 0) {
+            LLAMA_LOG_INFO("%s: %10s KVarN backend workspace = %8.2f MiB "
+                    "(y %.2f MiB, split-k %.2f MiB)\n", __func__,
+                    ggml_backend_buft_name(buft), private_size / 1024.0 / 1024.0,
+                    backend_kvarn_workspace_y_size[i] / 1024.0 / 1024.0,
+                    backend_kvarn_workspace_split_k_size[i] / 1024.0 / 1024.0);
         }
     }
 
@@ -1001,6 +1066,51 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+}
+
+void llama_context::record_backend_private_workspace(ggml_cgraph * gf) {
+    using workspace_size_fn = size_t (*)(ggml_backend_dev_t, const ggml_tensor *);
+    if (gf == nullptr) {
+        return;
+    }
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), node);
+        const auto found = std::find(backend_ptrs.begin(), backend_ptrs.end(), backend);
+        if (found == backend_ptrs.end()) {
+            continue;
+        }
+        const size_t index = size_t(found - backend_ptrs.begin());
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (reg == nullptr) {
+            continue;
+        }
+        auto * y_fn = (workspace_size_fn) ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_kvarn_workspace_y_size");
+        auto * split_fn = (workspace_size_fn) ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_kvarn_workspace_split_k_size");
+        if (y_fn) {
+            const size_t size = y_fn(dev, node);
+            backend_kvarn_workspace_y_size[index] = std::max(
+                    backend_kvarn_workspace_y_size[index], size);
+            if (size > 0) {
+                LLAMA_LOG_DEBUG("%s: backend=%s op=%s KVarN y workspace=%.2f MiB\n",
+                        __func__, ggml_backend_dev_name(dev), ggml_op_name(node->op),
+                        size / 1024.0 / 1024.0);
+            }
+        }
+        if (split_fn) {
+            const size_t size = split_fn(dev, node);
+            backend_kvarn_workspace_split_k_size[index] = std::max(
+                    backend_kvarn_workspace_split_k_size[index], size);
+            if (size > 0) {
+                LLAMA_LOG_DEBUG("%s: backend=%s op=%s KVarN split-k workspace=%.2f MiB\n",
+                        __func__, ggml_backend_dev_name(dev), ggml_op_name(node->op),
+                        size / 1024.0 / 1024.0);
+            }
+        }
+    }
 }
 
 void llama_context::synchronize() {
@@ -2669,8 +2779,13 @@ void llama_context::output_reorder() {
 //
 
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+    // A generic precision-tail oracle can add compact-current staging, two
+    // indexed gathers, body/tail score branches, and ordered tail writes per
+    // attention layer. Keep this feature-only graph allowance independent of
+    // the upstream base heuristic; 32 nodes was insufficient for the complete
+    // compact route on otherwise small transformer graphs.
     const uint32_t tail_nodes = (cparams.kv_tail_tokens > 0 || cparams.kv_tail_tokens_swa > 0) ?
-            32u*model.hparams.n_layer_all : 0;
+            64u*model.hparams.n_layer_all : 0;
     if (model.arch == LLM_ARCH_QWEN3NEXT ||
         model.arch == LLM_ARCH_KIMI_LINEAR ||
         model.arch == LLM_ARCH_QWEN35 ||
@@ -3744,13 +3859,17 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
         for (size_t i = 0; i < backends.size(); ++i) {
             ggml_backend_t             backend = backends[i].get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
-            ret[buft].compute += backend_buf_exp_size[i];
+            ret[buft].compute += backend_buf_exp_size[i] +
+                    backend_kvarn_workspace_y_size[i] +
+                    backend_kvarn_workspace_split_k_size[i];
         }
     } else {
-        for (const auto & backend_ptr : backends) {
-            ggml_backend_t             backend = backend_ptr.get();
+        for (size_t i = 0; i < backends.size(); ++i) {
+            ggml_backend_t             backend = backends[i].get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
-            ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend);
+            ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend) +
+                    backend_kvarn_workspace_y_size[i] +
+                    backend_kvarn_workspace_split_k_size[i];
         }
     }
     return ret;
@@ -4020,6 +4139,7 @@ llama_context_params llama_context_default_params() {
         /*.kv_tail_tokens              =*/ 0,
         /*.kv_tail_type                =*/ GGML_TYPE_COUNT,
         /*.kv_tail_config              =*/ nullptr,
+        /*.kv_tail_request             =*/ nullptr,
     };
 
     return result;

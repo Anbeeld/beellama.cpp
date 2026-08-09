@@ -1,14 +1,17 @@
 #include "fit.h"
+#include "fit-kvarn-tail.h"
 
 #include "log.h"
 
 #include "../src/llama-ext.h"
+#include "../src/llama-kv-tail-request.h"
 
 #include <array>
 #include <cassert>
 #include <stdexcept>
 #include <cinttypes>
 #include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -785,6 +788,58 @@ static void common_params_fit_impl(
     set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
 }
 
+static std::string common_bee_fit_candidate_identity(
+        const llama_model_params & mparams,
+        const llama_context_params & cparams,
+        const float * tensor_split,
+        const llama_model_tensor_buft_override * tensor_buft_overrides,
+        const std::vector<llama_device_memory_data> & measured) {
+    std::ostringstream out;
+    out << "ctx=" << cparams.n_ctx << ";ngl=" << mparams.n_gpu_layers
+        << ";split=" << int(mparams.split_mode) << ";main=" << mparams.main_gpu
+        << ";ts=";
+    for (size_t i = 0; i < llama_max_devices(); ++i) {
+        out << tensor_split[i] << ',';
+    }
+    out << ";tbo=";
+    for (size_t i = 0; i < llama_max_tensor_buft_overrides(); ++i) {
+        const auto & buft_override = tensor_buft_overrides[i];
+        if (buft_override.pattern == nullptr) {
+            break;
+        }
+        out << buft_override.pattern << '=' << ggml_backend_buft_name(buft_override.buft) << ',';
+    }
+    const llama_kv_tail_request * request = cparams.kv_tail_request;
+    if (request) {
+        out << ";tail=" << int(request->mode) << ':' << int(request->exact_type) << ':';
+        for (const auto & entry : request->entries) {
+            out << entry.group << '=' << entry.tokens << ',';
+        }
+    }
+    out << ";measured=";
+    for (const auto & device : measured) {
+        out << device.mb.model << ':' << device.mb.context << ':' << device.mb.compute << ',';
+    }
+    return out.str();
+}
+
+static void common_bee_fit_restore_inputs(
+        llama_model_params * mparams,
+        llama_context_params * cparams,
+        float * tensor_split,
+        llama_model_tensor_buft_override * tensor_buft_overrides,
+        const llama_model_params & pristine_mparams,
+        const llama_context_params & pristine_cparams,
+        const std::vector<float> & pristine_tensor_split,
+        const std::vector<llama_model_tensor_buft_override> & pristine_overrides) {
+    *mparams = pristine_mparams;
+    *cparams = pristine_cparams;
+    std::copy(pristine_tensor_split.begin(), pristine_tensor_split.end(), tensor_split);
+    std::copy(pristine_overrides.begin(), pristine_overrides.end(), tensor_buft_overrides);
+    mparams->tensor_split = tensor_split;
+    mparams->tensor_buft_overrides = tensor_buft_overrides;
+}
+
 enum common_params_fit_status common_fit_params(
         const char * path_model,
         llama_model_params * mparams,
@@ -797,7 +852,110 @@ enum common_params_fit_status common_fit_params(
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     try {
-        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, log_level);
+        // Preserve the upstream path exactly when no immutable Bee request is
+        // attached. Only KVarN/precision-tail callers pay for exact validation.
+        if (cparams->kv_tail_request == nullptr) {
+            common_params_fit_impl(path_model, mparams, cparams, tensor_split,
+                    tensor_buft_overrides, margins, n_ctx_min, log_level);
+        } else {
+            const llama_model_params pristine_mparams = *mparams;
+            const llama_context_params pristine_cparams = *cparams;
+            const std::vector<float> pristine_tensor_split(
+                    tensor_split, tensor_split + llama_max_devices());
+            const std::vector<llama_model_tensor_buft_override> pristine_overrides(
+                    tensor_buft_overrides,
+                    tensor_buft_overrides + llama_max_tensor_buft_overrides());
+            const std::vector<size_t> pristine_margins(
+                    margins, margins + llama_max_devices());
+            std::vector<size_t> adjusted_margins = pristine_margins;
+            std::vector<int64_t> original_free;
+            common_bee_fit_retry_state retry_state;
+
+            {
+                std::vector<ggml_backend_dev_t> target_devs;
+                uint32_t target_ngl = 0;
+                uint32_t target_nct = 0;
+                uint32_t target_nex = 0;
+                const auto target_snapshot = common_get_device_memory_data_impl(
+                        path_model, &pristine_mparams, &pristine_cparams,
+                        target_devs, target_ngl, target_nct, target_nex, log_level);
+                if (target_snapshot.empty()) {
+                    throw std::runtime_error("Bee fit target snapshot returned no memory data");
+                }
+                const size_t nd = target_snapshot.size() - 1;
+                if (nd > llama_max_devices()) {
+                    throw std::runtime_error("Bee fit target snapshot returned too many devices");
+                }
+                original_free.reserve(nd);
+                for (size_t i = 0; i < nd; ++i) {
+                    original_free.push_back(target_snapshot[i].free);
+                }
+            }
+
+            for (;;) {
+                common_bee_fit_restore_inputs(mparams, cparams, tensor_split,
+                        tensor_buft_overrides, pristine_mparams, pristine_cparams,
+                        pristine_tensor_split, pristine_overrides);
+                common_params_fit_impl(path_model, mparams, cparams, tensor_split,
+                        tensor_buft_overrides, adjusted_margins.data(), n_ctx_min, log_level);
+
+                std::vector<ggml_backend_dev_t> devs;
+                uint32_t hp_ngl = 0;
+                uint32_t hp_nct = 0;
+                uint32_t hp_nex = 0;
+                const auto exact = common_get_device_memory_data_impl(
+                        path_model, mparams, cparams, devs,
+                        hp_ngl, hp_nct, hp_nex, log_level);
+                if (exact.empty()) {
+                    throw std::runtime_error("Bee exact fit validation returned no memory data");
+                }
+                const size_t nd = exact.size() - 1;
+                if (nd > llama_max_devices()) {
+                    throw std::runtime_error("Bee exact fit validation returned too many devices");
+                }
+                if (original_free.size() != nd) {
+                    throw std::runtime_error("Bee exact fit validation device set changed during retry");
+                }
+
+                std::vector<int64_t> shortfalls(llama_max_devices(), 0);
+                for (size_t i = 0; i < nd; ++i) {
+                    const uint64_t projected = uint64_t(exact[i].mb.total()) +
+                            uint64_t(pristine_margins[i]);
+                    const uint64_t available = original_free[i] > 0 ?
+                            uint64_t(original_free[i]) : 0;
+                    if (projected > available) {
+                        const uint64_t shortfall = projected - available;
+                        shortfalls[i] = shortfall > uint64_t(INT64_MAX) ?
+                                INT64_MAX : int64_t(shortfall);
+                        LOG_WRN("%s: exact Bee validation shortfall on %s is %.2f MiB "
+                                "(model %.2f, context %.2f, compute %.2f MiB)\n",
+                                __func__, ggml_backend_dev_name(devs[i]),
+                                shortfalls[i] / 1024.0 / 1024.0,
+                                exact[i].mb.model / 1024.0 / 1024.0,
+                                exact[i].mb.context / 1024.0 / 1024.0,
+                                exact[i].mb.compute / 1024.0 / 1024.0);
+                    }
+                }
+                const std::string identity = common_bee_fit_candidate_identity(
+                        *mparams, *cparams, tensor_split, tensor_buft_overrides, exact);
+                const auto action = retry_state.observe(
+                        identity, shortfalls, adjusted_margins);
+                if (action == COMMON_BEE_FIT_ACCEPT) {
+                    LOG_TRC("%s: exact Bee post-fit validation passed\n", __func__);
+                    break;
+                }
+                if (action == COMMON_BEE_FIT_RETRY) {
+                    LOG_TRC("%s: retrying upstream fit from pristine inputs with "
+                            "measured Bee shortfall\n", __func__);
+                    continue;
+                }
+                if (action == COMMON_BEE_FIT_REPEATED_CANDIDATE) {
+                    throw common_params_fit_exception(
+                            "exact Bee validation rejected a repeated non-fitting candidate");
+                }
+                throw std::runtime_error("invalid Bee exact-fit shortfall or margin overflow");
+            }
+        }
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());

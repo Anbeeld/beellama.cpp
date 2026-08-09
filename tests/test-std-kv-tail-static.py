@@ -377,9 +377,9 @@ def main() -> None:
         raise AssertionError("KV-cache graph interface exposes only component-wide body presence")
     if graph.count("has_kv_body(il)") < 4:
         raise AssertionError("standard and iSWA graph builders do not consume per-layer body presence")
-    if graph.count("mixed_tail_native_preferred(il)") != 2:
+    if "mixed_tail_native_preferred(il)" in graph:
         raise AssertionError(
-            "KVarN full/iSWA graph builders do not honor the backend's mixed-tail route preference")
+            "backend implementation preference must not veto a validated KVarN attention operation")
     if graph.count("!mctx_cur->has_kv_body(il)") < 4:
         raise AssertionError(
             "KVarN full/iSWA graph builders do not distinguish bodyless native tails")
@@ -432,13 +432,8 @@ def main() -> None:
     )[0]
     if "ggml_vk_kvarn_attn_tail_sources_supported(op)" not in vulkan_fattn_support:
         raise AssertionError("Vulkan KVarN final-node support does not validate compact current operands")
-    if not re.search(
-        r"if \(op->src\[10\] != nullptr \|\| op->src\[11\] != nullptr\).*"
-        r"Standard compact-tail attention remains.*return false",
-        vulkan_fattn_support,
-        re.DOTALL,
-    ):
-        raise AssertionError("Vulkan standard attention no longer fails closed for compact current operands")
+    if "pipeline_flash_attn_tail" not in vulkan or "descriptor_offsets_ab" not in vulkan:
+        raise AssertionError("Vulkan standard attention does not own compact-current operands and descriptor offsets")
     vulkan_proc = vulkan.split("static void * ggml_backend_vk_reg_get_proc_address", 1)[1]
     if "ggml_backend_kv_tail_segmented_attention_supported" not in vulkan_proc:
         raise AssertionError("Vulkan does not advertise its implemented segmented KVarN attention matrix")

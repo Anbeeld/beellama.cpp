@@ -36,7 +36,7 @@ contexts remain on standard cache types and do not inherit the target tail.
 
 | Argument | Env var | Default | Behavior |
 |---|---|---|---|
-| `--kv-tail-tokens SPEC` | `LLAMA_ARG_KV_TAIL_TOKENS` | `0` | For standard caches, `0` keeps the ordinary cache path. For KVarN, omitted or `0` retains the intrinsic 128-token exact suffix. A number applies to every canonical group; KVarN rounds positive values upward to complete 128-token groups. `N0,N1` follows canonical group order, while `full=N,swa=N` accepts unique role aliases or structural IDs such as `full@l0`. Invalid, duplicate, incomplete, or wrong-length specifications resolve additional coverage to zero, while KVarN still retains its intrinsic suffix. `auto` requests 1024 exact tokens per applicable target-cache group, capped by that group's effective context or attention window. |
+| `--kv-tail-tokens SPEC` | `LLAMA_ARG_KV_TAIL_TOKENS` | `0` | For standard caches, `0` keeps the ordinary cache path. For KVarN, omitted or `0` retains the intrinsic 128-token exact suffix. A number applies to every canonical group; KVarN rounds positive values upward to complete 128-token groups. `N0,N1` follows canonical group order, while `full=N,swa=N` accepts unique role aliases or structural IDs such as `full@l0`. Invalid, duplicate, incomplete, ambiguous, or wrong-length specifications fail context creation. `auto` requests 1024 exact tokens per applicable target-cache group, capped by that group's effective context or attention window. |
 | `--kv-tail-type TYPE` | `LLAMA_ARG_KV_TAIL_TYPE` | `bf16` for standard caches; `f16` for KVarN | Selects `f16` or `bf16` exact storage for compact history and compact-native SWA. An explicit value overrides the cache-family default in either direction. Other types are rejected. |
 
 An omitted tail type remains automatic until context placement. If the standard
@@ -53,6 +53,15 @@ rows, graph-local body execution rows, owner backend, current-segment
 presence, transient estimate, and memory increments. Native routes are checked
 again against the final constructed operation. A mismatch fails context/graph
 construction instead of allowing the scheduler to move that layer silently.
+
+The CLI is parsed once into an immutable, model-independent request. Fit probes
+and the final context bind that same request to the model's canonical cache
+groups, so `auto`, positional, named, and KVarN-minimum policies cannot diverge
+between estimation and allocation. Public callers that need the same behavior
+can create a request with `llama_kv_tail_request_init`, keep it alive through
+context creation, assign the borrowed pointer to
+`llama_context_params::kv_tail_request`, and then free it with
+`llama_kv_tail_request_free`.
 
 Let `N` be the resolved exact length, `U` the physical ubatch limit, `R` the
 advertised suffix-rollback horizon, and `S` the number of exact streams. Compact

@@ -987,6 +987,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_kvarn_store;
     vk_pipeline pipeline_kvarn_materialize;
     vk_pipeline pipeline_kvarn_flash_attn;
+    vk_pipeline pipeline_flash_attn_tail;
     vk_pipeline pipeline_kvarn_wht;
     vk_pipeline pipeline_kvarn_wht_d256;
     vk_pipeline pipeline_kvarn_wht_d512;
@@ -1379,6 +1380,43 @@ struct vk_op_kvarn_flash_attn_push_constants {
 };
 static_assert(sizeof(vk_op_kvarn_flash_attn_push_constants) == 128,
         "sizeof(vk_op_kvarn_flash_attn_push_constants) must be 128");
+
+struct vk_op_flash_attn_tail_push_constants {
+    uint32_t n_query;
+    uint32_t n_kv;
+    uint32_t head_dim;
+    uint32_t heads;
+    uint32_t streams;
+    uint32_t q_nb1;
+    uint32_t q_nb2;
+    uint32_t k_nb1;
+    uint32_t k_nb2;
+    uint32_t k_nb3;
+    uint32_t v_nb1;
+    uint32_t v_nb2;
+    uint32_t v_nb3;
+    uint32_t tail_mask_stride;
+    uint32_t query_order_ne0;
+    uint32_t query_order_elements;
+    uint32_t run_desc_ne0;
+    uint32_t history_slots;
+    uint32_t kt_nb1;
+    uint32_t kt_nb2;
+    uint32_t vt_nb1;
+    uint32_t vt_nb2;
+    uint32_t flags;
+    float scale;
+    float max_bias;
+    float logit_softcap;
+    uint32_t descriptor_offsets_01;
+    uint32_t descriptor_offsets_23;
+    uint32_t descriptor_offsets_45;
+    uint32_t descriptor_offsets_67;
+    uint32_t descriptor_offsets_89;
+    uint32_t descriptor_offsets_ab;
+};
+static_assert(sizeof(vk_op_flash_attn_tail_push_constants) == 128,
+        "sizeof(vk_op_flash_attn_tail_push_constants) must be 128");
 
 struct vk_op_count_experts_push_constants {
     uint32_t ne00;
@@ -5860,6 +5898,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     "kvarn_flash_attn", kvarn_flash_attn_len, kvarn_flash_attn_data, "main", 12,
                     sizeof(vk_op_kvarn_flash_attn_push_constants), {1, 1, 1}, {}, 1);
         }
+        ggml_vk_create_pipeline(device, device->pipeline_flash_attn_tail,
+                "flash_attn_tail", flash_attn_tail_len, flash_attn_tail_data, "main", 12,
+                sizeof(vk_op_flash_attn_tail_push_constants), {1, 1, 1}, {}, 1);
     }
 
     const uint32_t cumsum_elem_per_thread = (device->vendor_id == VK_VENDOR_ID_AMD || device->vendor_id == VK_VENDOR_ID_INTEL) ? 2 : 4;
@@ -10089,6 +10130,82 @@ static void ggml_vk_kvarn_wht(
         pc, { pc.n_rows, 1, 1 });
 }
 
+struct ggml_vk_kvarn_store_workspace_plan {
+    bool use_workspace;
+    uint32_t tokens_per_stream;
+    uint32_t active_streams;
+    uint32_t flush_candidates;
+    size_t size;
+};
+
+static ggml_vk_kvarn_store_workspace_plan ggml_vk_kvarn_store_workspace_plan_for(
+        const ggml_tensor * dst,
+        size_t alignment,
+        bool reserve_worst_case = false) {
+    const ggml_tensor * current = dst->src[0];
+    const ggml_tensor * stage = dst->src[2];
+    const ggml_tensor * records = dst->src[3];
+    const int head_slices_param = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_HEAD_SLICES);
+    const int head_slices = head_slices_param > 0 ? head_slices_param : 1;
+    const bool swa = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_STORE_SWA) != 0;
+    const int stage_groups = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_STAGE_GROUPS);
+    const int tokens_per_stream_hint =
+        ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_TOKENS_PER_STREAM);
+    if (current == nullptr || stage == nullptr || records == nullptr ||
+            head_slices <= 0 || stage_groups < 2 ||
+            stage->ne[2] % (KVAR_N_GROUP * stage_groups) != 0) {
+        return {};
+    }
+    const int n_stream = int(stage->ne[2] / (KVAR_N_GROUP * stage_groups));
+    if (n_stream <= 0 || records->ne[2] % n_stream != 0) {
+        return {};
+    }
+    const int groups_per_stream = int(records->ne[2] / n_stream);
+    const int n_tokens = int(current->ne[2]);
+    const bool hint_well_formed =
+        tokens_per_stream_hint > 0 &&
+        tokens_per_stream_hint <= n_tokens &&
+        n_tokens % tokens_per_stream_hint == 0;
+    const int active_streams =
+        hint_well_formed ? n_tokens / tokens_per_stream_hint : 0;
+    const bool runtime_workspace =
+        hint_well_formed &&
+        tokens_per_stream_hint >= 3 * KVAR_N_GROUP &&
+        active_streams > 0 && active_streams <= n_stream &&
+        (!swa || (n_stream == 1 &&
+                  tokens_per_stream_hint <= groups_per_stream * KVAR_N_GROUP));
+    // Synthetic reserve graphs do not carry real cache slot indices, so their
+    // contiguous-run hint can be zero even though a first full ubatch can use
+    // the workspace-parallel store route. Reserve the largest workspace that
+    // this exact operation shape can request at runtime. The allocation size
+    // remains shared with the runtime planner below.
+    const bool reserve_workspace =
+        reserve_worst_case &&
+        n_tokens >= 3 * KVAR_N_GROUP &&
+        (!swa || (n_stream == 1 &&
+                  n_tokens <= groups_per_stream * KVAR_N_GROUP));
+    const bool use_workspace = runtime_workspace || reserve_workspace;
+    if (!use_workspace) {
+        return {};
+    }
+    const int planned_tokens_per_stream = runtime_workspace ?
+        tokens_per_stream_hint : n_tokens;
+    const int planned_active_streams = runtime_workspace ? active_streams : 1;
+    const int flush_candidates =
+        (planned_tokens_per_stream + KVAR_N_GROUP - 1) / KVAR_N_GROUP + stage_groups;
+    const size_t workspace_bytes =
+        size_t(current->ne[0]) * size_t(current->ne[1]) *
+        size_t(current->ne[2]) * sizeof(ggml_fp16_t);
+    const size_t valid_offset = ROUNDUP_POW2(workspace_bytes, alignment);
+    return {
+        true,
+        uint32_t(planned_tokens_per_stream),
+        uint32_t(planned_active_streams),
+        uint32_t(flush_candidates),
+        valid_offset + sizeof(uint32_t),
+    };
+}
+
 static void ggml_vk_kvarn_store(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
     const ggml_tensor * current = dst->src[0];
     const ggml_tensor * indices = dst->src[1];
@@ -10113,8 +10230,6 @@ static void ggml_vk_kvarn_store(ggml_backend_vk_context * ctx, vk_context& subct
     const int tail_groups_param = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_TAIL_GROUPS);
     const int tail_groups = tail_groups_param > 0 ? tail_groups_param : stage_groups - 1;
     const bool eager_records = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_EAGER_RECORDS) != 0;
-    const int tokens_per_stream_hint =
-        ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_TOKENS_PER_STREAM);
     GGML_ASSERT(ggml_vk_kvarn_valid_bits(bits));
     GGML_ASSERT(head_slices == 1 || head_slices == 2 || head_slices == 4);
     GGML_ASSERT(current->ne[1] % head_slices == 0);
@@ -10128,25 +10243,8 @@ static void ggml_vk_kvarn_store(ggml_backend_vk_context * ctx, vk_context& subct
     if (swa) {
         GGML_ASSERT(n_stream == 1 && "SWA KVarN ring requires a single stream");
     }
-    const int n_tokens = (int) current->ne[2];
-    const bool hint_well_formed =
-        tokens_per_stream_hint > 0 &&
-        tokens_per_stream_hint <= n_tokens &&
-        n_tokens % tokens_per_stream_hint == 0;
-    const int active_streams =
-        hint_well_formed ? n_tokens / tokens_per_stream_hint : 0;
-    const bool use_workspace =
-        hint_well_formed &&
-        tokens_per_stream_hint >= 3 * KVAR_N_GROUP &&
-        active_streams > 0 &&
-        active_streams <= n_stream &&
-        (!swa ||
-         (n_stream == 1 &&
-          tokens_per_stream_hint <= groups_per_stream * KVAR_N_GROUP));
-    const int flush_candidates = use_workspace ?
-        (tokens_per_stream_hint + KVAR_N_GROUP - 1) / KVAR_N_GROUP +
-            stage_groups :
-        0;
+    const auto workspace = ggml_vk_kvarn_store_workspace_plan_for(
+        dst, size_t(ctx->device->properties.limits.minStorageBufferOffsetAlignment));
 
     vk_op_kvarn_store_push_constants pc = {
         (uint32_t) current->ne[1],
@@ -10162,9 +10260,9 @@ static void ggml_vk_kvarn_store(ggml_backend_vk_context * ctx, vk_context& subct
         (uint32_t) stage_groups,
         (uint32_t) tail_groups,
         eager_records ? 1u : 0u,
-        use_workspace ? (uint32_t) tokens_per_stream_hint : 0u,
-        use_workspace ? (uint32_t) active_streams : 0u,
-        use_workspace ? (uint32_t) flush_candidates : 0u,
+        workspace.tokens_per_stream,
+        workspace.active_streams,
+        workspace.flush_candidates,
         0u,
     };
 
@@ -10173,7 +10271,7 @@ static void ggml_vk_kvarn_store(ggml_backend_vk_context * ctx, vk_context& subct
     const vk_subbuffer stage_buf = ggml_vk_tensor_subbuffer(ctx, stage);
     const vk_subbuffer records_buf = ggml_vk_tensor_subbuffer(ctx, records);
 
-    if (!use_workspace) {
+    if (!workspace.use_workspace) {
         ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
         ggml_vk_dispatch_pipeline(
             ctx, subctx, pipeline,
@@ -10186,10 +10284,8 @@ static void ggml_vk_kvarn_store(ggml_backend_vk_context * ctx, vk_context& subct
     const size_t workspace_bytes =
         size_t(current->ne[0]) * size_t(current->ne[1]) *
         size_t(current->ne[2]) * sizeof(ggml_fp16_t);
-    const size_t valid_offset = ROUNDUP_POW2(
-        workspace_bytes,
-        size_t(ctx->device->properties.limits.minStorageBufferOffsetAlignment));
-    const size_t workspace_total = valid_offset + sizeof(uint32_t);
+    const size_t valid_offset = workspace.size - sizeof(uint32_t);
+    const size_t workspace_total = workspace.size;
     if (workspace_total > ctx->device->properties.limits.maxStorageBufferRange) {
         GGML_ABORT("Requested KVarN store workspace is too large");
     }
@@ -10282,6 +10378,18 @@ static void ggml_vk_kvarn_store(ggml_backend_vk_context * ctx, vk_context& subct
     }
 }
 
+static size_t ggml_vk_kvarn_materialize_workspace_size(const ggml_tensor * dst) {
+    if (dst == nullptr || dst->src[1] == nullptr) {
+        return 0;
+    }
+    const int stage_groups = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_STAGE_GROUPS);
+    if (stage_groups < 2 || dst->src[1]->ne[2] % (KVAR_N_GROUP * stage_groups) != 0) {
+        return 0;
+    }
+    const int64_t n_stream = dst->src[1]->ne[2] / (KVAR_N_GROUP * stage_groups);
+    return n_stream > 0 ? size_t(2) * size_t(n_stream) * sizeof(uint32_t) : 0;
+}
+
 static void ggml_vk_kvarn_materialize(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
     ggml_vk_fattn_kvarn_materialize_fallback.fetch_add(1, std::memory_order_relaxed);
     const char * debug_routes = getenv("GGML_KVARN_DEBUG_ROUTES");
@@ -10341,7 +10449,7 @@ static void ggml_vk_kvarn_materialize(ggml_backend_vk_context * ctx, vk_context&
             total_blocks, ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
     const uint32_t blocks_y = 1 + (total_blocks - 1) / blocks_x;
     GGML_ASSERT(blocks_y <= ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
-    const size_t live_bytes = size_t(2) * size_t(n_stream) * sizeof(uint32_t);
+    const size_t live_bytes = ggml_vk_kvarn_materialize_workspace_size(dst);
     if (live_bytes > ctx->device->properties.limits.maxStorageBufferRange) {
         GGML_ABORT("Requested KVarN materialization live descriptor is too large");
     }
@@ -11283,7 +11391,8 @@ static bool ggml_vk_kvarn_attn_tail_sources_supported(const ggml_tensor * dst) {
             tail_mask->ne[2] != 1 ||
             tail_mask->ne[3] != q->ne[3] ||
             q->ne[3] > UINT16_MAX ||
-            run_desc->ne[0] != 6 + tail_mask->ne[0] ||
+            run_desc->ne[0] < 6 + tail_mask->ne[0] ||
+            run_desc->ne[0] > UINT32_MAX ||
             k_tail->nb[0] != sizeof(uint16_t) ||
             v_tail->nb[0] != sizeof(uint16_t) ||
             k_tail->nb[1] % sizeof(uint16_t) != 0 ||
@@ -11303,9 +11412,19 @@ static bool ggml_vk_kvarn_attn_tail_sources_supported(const ggml_tensor * dst) {
         return true;
     }
 
-    const int history_slots = ggml_get_op_params_i32(
+    const int configured_history_slots = ggml_get_op_params_i32(
             dst, GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_HISTORY_SLOTS);
+    const int history_slots = configured_history_slots > 0 ?
+            configured_history_slots : int(k_tail->ne[1]);
     constexpr int max_encoded_history_slots = (1 << 22) - 1;
+    const bool current_matches_history_layout =
+        k_current->nb[1] == k_tail->nb[1] &&
+        k_current->nb[2] == k_tail->nb[2] &&
+        v_current->nb[1] == v_tail->nb[1] &&
+        v_current->nb[2] == v_tail->nb[2];
+    const bool current_is_contiguous =
+        ggml_is_contiguous(k_current) && ggml_is_contiguous(v_current) &&
+        k_current->ne[1] == q->ne[1] && v_current->ne[1] == q->ne[1];
     const bool supported = history_slots > 0 && history_slots <= max_encoded_history_slots &&
         history_slots <= k_tail->ne[1] &&
         history_slots <= v_tail->ne[1] &&
@@ -11321,10 +11440,7 @@ static bool ggml_vk_kvarn_attn_tail_sources_supported(const ggml_tensor * dst) {
         v_current->ne[3] == 1 &&
         k_current->nb[0] == sizeof(uint16_t) &&
         v_current->nb[0] == sizeof(uint16_t) &&
-        k_current->nb[1] == k_tail->nb[1] &&
-        k_current->nb[2] == k_tail->nb[2] &&
-        v_current->nb[1] == v_tail->nb[1] &&
-        v_current->nb[2] == v_tail->nb[2] &&
+        (current_matches_history_layout || current_is_contiguous) &&
         history_slots + k_current->ne[1] >= tail_mask->ne[0] &&
         history_slots + v_current->ne[1] >= tail_mask->ne[0];
     const char * debug_routes = getenv("GGML_KVARN_DEBUG_ROUTES");
@@ -11351,6 +11467,40 @@ static bool ggml_vk_kvarn_attn_tail_sources_supported(const ggml_tensor * dst) {
                   << std::endl;
     }
     return supported;
+}
+
+static size_t ggml_vk_kvarn_attention_split_workspace_size(
+        const vk_device & device,
+        const ggml_tensor * dst) {
+    if (dst == nullptr || dst->op != GGML_OP_FLASH_ATTN_EXT ||
+            dst->src[0] == nullptr || dst->src[1] == nullptr || dst->src[2] == nullptr) {
+        return 0;
+    }
+    vk_kvarn_attn_side k_side = {};
+    vk_kvarn_attn_side v_side = {};
+    if (!ggml_vk_kvarn_attn_parse_side(dst->src[1], k_side) ||
+            !ggml_vk_kvarn_attn_parse_side(dst->src[2], v_side)) {
+        return 0;
+    }
+    const ggml_tensor * q = dst->src[0];
+    if (q->ne[2] <= 0 || dst->src[1]->ne[2] <= 0 ||
+            q->ne[2] % dst->src[1]->ne[2] != 0) {
+        return 0;
+    }
+    const auto route = ggml_vk_fattn_kvarn_plan({
+        uint32_t(dst->src[1]->ne[1]),
+        uint32_t(q->ne[1]),
+        uint32_t(q->ne[2]),
+        uint32_t(dst->src[1]->ne[2]),
+        uint32_t(q->ne[3]),
+        device->shader_core_count ? device->shader_core_count : 16u,
+    });
+    if (route.split_k <= 1) {
+        return 0;
+    }
+    return (size_t(q->ne[0]) * size_t(q->ne[1]) * sizeof(float) +
+            size_t(q->ne[1]) * sizeof(float) * 2) *
+        size_t(route.split_k) * size_t(q->ne[2]) * size_t(q->ne[3]);
 }
 
 static bool ggml_vk_flash_attn_kvarn(
@@ -11511,9 +11661,8 @@ static bool ggml_vk_flash_attn_kvarn(
     GGML_ASSERT(pipeline != nullptr);
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
-    const uint64_t split_k_size = route.split_k > 1 ?
-        (q->ne[0] * q->ne[1] * sizeof(float) + q->ne[1] * sizeof(float) * 2) *
-            route.split_k * q->ne[2] * q->ne[3] : 0;
+    const uint64_t split_k_size = ggml_vk_kvarn_attention_split_workspace_size(
+        ctx->device, dst);
     const uint64_t split_k_output_size = route.split_k > 1 ?
         q->ne[0] * q->ne[1] * sizeof(float) *
             route.split_k * q->ne[2] * q->ne[3] : 0;
@@ -11615,8 +11764,168 @@ static bool ggml_vk_flash_attn_kvarn(
     return true;
 }
 
+static bool ggml_vk_flash_attn_tail(
+        ggml_backend_vk_context * ctx,
+        vk_context & subctx,
+        const ggml_tensor * q,
+        const ggml_tensor * k,
+        const ggml_tensor * v,
+        const ggml_tensor * mask,
+        const ggml_tensor * sinks,
+        ggml_tensor * dst) {
+    const ggml_tensor * k_tail = dst->src[5];
+    if (k_tail == nullptr || ggml_backend_vk_kvarn_view_base(k) != nullptr) {
+        return false;
+    }
+    const ggml_tensor * v_tail = dst->src[6];
+    const ggml_tensor * tail_mask = dst->src[7];
+    const ggml_tensor * query_order = dst->src[8];
+    const ggml_tensor * run_desc = dst->src[9];
+    const ggml_tensor * k_current = dst->src[10];
+    const ggml_tensor * v_current = dst->src[11];
+    GGML_ASSERT(v_tail && tail_mask && query_order && run_desc && sinks == nullptr);
+    GGML_ASSERT(ggml_vk_kvarn_attn_tail_sources_supported(dst));
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+            q->ne[0] == k->ne[0] && q->ne[0] == v->ne[0] &&
+            q->ne[2] % k->ne[2] == 0 && k->ne[2] == v->ne[2] &&
+            q->ne[3] == k->ne[3] && q->ne[3] == v->ne[3] &&
+            q->ne[0] <= 512 && q->ne[0] % 128 == 0 &&
+            q->ne[1] <= UINT32_MAX && k->ne[1] <= UINT32_MAX &&
+            q->ne[2] <= UINT16_MAX && k->ne[2] <= UINT16_MAX && q->ne[3] <= UINT16_MAX &&
+            q->nb[0] == sizeof(float) && q->nb[1] <= UINT32_MAX && q->nb[2] <= UINT32_MAX &&
+            (q->ne[3] == 1 || q->nb[3] == size_t(q->ne[0] * q->ne[1] * q->ne[2]) * sizeof(float)) &&
+            k->nb[1] <= UINT32_MAX && k->nb[2] <= UINT32_MAX && k->nb[3] <= UINT32_MAX &&
+            v->nb[1] <= UINT32_MAX && v->nb[2] <= UINT32_MAX && v->nb[3] <= UINT32_MAX &&
+            k_tail->nb[1] <= UINT32_MAX && k_tail->nb[2] <= UINT32_MAX &&
+            v_tail->nb[1] <= UINT32_MAX && v_tail->nb[2] <= UINT32_MAX &&
+            k_tail->nb[3] == k_tail->nb[1] * size_t(k_tail->ne[1]) &&
+            v_tail->nb[3] == v_tail->nb[1] * size_t(v_tail->ne[1]) &&
+            ggml_is_contiguous(dst));
+
+    float scale = 1.0f;
+    float max_bias = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&scale,         (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    if (logit_softcap != 0.0f) {
+        scale /= logit_softcap;
+    }
+
+    uint32_t flags = uint32_t(k->type) | (uint32_t(v->type) << 8u);
+    flags |= k_tail->type == GGML_TYPE_BF16 ? 1u << 16u : 0u;
+    flags |= v_tail->type == GGML_TYPE_BF16 ? 1u << 17u : 0u;
+    flags |= k_current != nullptr ? 1u << 18u : 0u;
+    flags |= ggml_get_op_params_i32(
+            dst, GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_BODYLESS) != 0 ? 1u << 19u : 0u;
+    flags |= mask != nullptr ? 1u << 20u : 0u;
+    const bool current_contiguous_layout = k_current != nullptr &&
+            (k_current->nb[1] != k_tail->nb[1] ||
+             k_current->nb[2] != k_tail->nb[2] ||
+             v_current->nb[1] != v_tail->nb[1] ||
+             v_current->nb[2] != v_tail->nb[2]);
+    flags |= current_contiguous_layout ? 1u << 21u : 0u;
+    const int configured_history_slots = ggml_get_op_params_i32(
+            dst, GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_HISTORY_SLOTS);
+    const uint32_t history_slots = k_current ? uint32_t(
+            configured_history_slots > 0 ? configured_history_slots : k_tail->ne[1]) : 0u;
+    const auto descriptor_offset = [ctx](const ggml_tensor * tensor) {
+        return tensor ? get_misalign_bytes(ctx, tensor) : 0u;
+    };
+    const auto pack_offsets = [](uint32_t low, uint32_t high) {
+        GGML_ASSERT(low <= UINT16_MAX && high <= UINT16_MAX);
+        return low | (high << 16u);
+    };
+
+    vk_op_flash_attn_tail_push_constants pc = {
+        uint32_t(q->ne[1]),
+        uint32_t(k->ne[1]),
+        uint32_t(q->ne[0]),
+        uint32_t(q->ne[2]) | (uint32_t(k->ne[2]) << 16u),
+        uint32_t(q->ne[3]) | (uint32_t(mask ? mask->ne[3] : 1) << 16u),
+        uint32_t(q->nb[1]),
+        uint32_t(q->nb[2]),
+        uint32_t(k->nb[1]),
+        uint32_t(k->nb[2]),
+        uint32_t(k->nb[3]),
+        uint32_t(v->nb[1]),
+        uint32_t(v->nb[2]),
+        uint32_t(v->nb[3]),
+        uint32_t(tail_mask->ne[0]),
+        uint32_t(query_order->ne[0]),
+        uint32_t(ggml_nelements(query_order)),
+        uint32_t(run_desc->ne[0]),
+        history_slots,
+        uint32_t(k_tail->nb[1]),
+        uint32_t(k_tail->nb[2]),
+        uint32_t(v_tail->nb[1]),
+        uint32_t(v_tail->nb[2]),
+        flags,
+        scale,
+        max_bias,
+        logit_softcap,
+        pack_offsets(descriptor_offset(q),          descriptor_offset(k)),
+        pack_offsets(descriptor_offset(v),          descriptor_offset(mask)),
+        pack_offsets(descriptor_offset(dst),        descriptor_offset(k_tail)),
+        pack_offsets(descriptor_offset(v_tail),     descriptor_offset(tail_mask)),
+        pack_offsets(descriptor_offset(query_order), descriptor_offset(run_desc)),
+        pack_offsets(descriptor_offset(k_current),  descriptor_offset(v_current)),
+    };
+
+    const vk_subbuffer q_buf = ggml_vk_tensor_subbuffer(ctx, q, true);
+    const vk_subbuffer dummy = q_buf;
+    ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_tail, 1);
+    ggml_vk_dispatch_pipeline(
+        ctx, subctx, ctx->device->pipeline_flash_attn_tail,
+        {
+            q_buf,
+            ggml_vk_tensor_subbuffer(ctx, k, true),
+            ggml_vk_tensor_subbuffer(ctx, v, true),
+            mask ? ggml_vk_tensor_subbuffer(ctx, mask, true) : dummy,
+            ggml_vk_tensor_subbuffer(ctx, dst, true),
+            ggml_vk_tensor_subbuffer(ctx, k_tail, true),
+            ggml_vk_tensor_subbuffer(ctx, v_tail, true),
+            ggml_vk_tensor_subbuffer(ctx, tail_mask, true),
+            ggml_vk_tensor_subbuffer(ctx, query_order, true),
+            ggml_vk_tensor_subbuffer(ctx, run_desc, true),
+            k_current ? ggml_vk_tensor_subbuffer(ctx, k_current, true) : dummy,
+            v_current ? ggml_vk_tensor_subbuffer(ctx, v_current, true) : dummy,
+        },
+        pc,
+        { uint32_t(q->ne[1]), uint32_t(q->ne[2]), uint32_t(q->ne[3]) });
+    const char * debug_routes = getenv("GGML_KVARN_DEBUG_ROUTES");
+    if (debug_routes != nullptr && atoi(debug_routes) != 0) {
+        std::ostringstream route_key;
+        route_key << ctx->device->name << ":tail:" << q->ne[0] << ':' <<
+            k->type << ':' << v->type << ':' << k_tail->type << ':' <<
+            v_tail->type << ':' << q->ne[1] << ':' << k->ne[1] << ':' <<
+            q->ne[2] << ':' << q->ne[3] << ':' << history_slots;
+        static std::mutex debug_routes_mutex;
+        static std::set<std::string> reported_routes;
+        std::lock_guard<std::mutex> lock(debug_routes_mutex);
+        if (reported_routes.insert(route_key.str()).second) {
+            std::cerr << "kv-tail-route backend=Vulkan device=\"" <<
+                ctx->device->name << "\" route=bounded-online-softmax" <<
+                " body-k=" << ggml_type_name(k->type) <<
+                " body-v=" << ggml_type_name(v->type) <<
+                " tail-k=" << ggml_type_name(k_tail->type) <<
+                " tail-v=" << ggml_type_name(v_tail->type) <<
+                " D=" << q->ne[0] << " nq=" << q->ne[1] <<
+                " nkv=" << k->ne[1] << " heads=" << q->ne[2] <<
+                " streams=" << q->ne[3] <<
+                " tail-history=" << history_slots <<
+                " tail-current=" << (k_current ? k_current->ne[1] : 0) <<
+                " workspace-bytes=0 fallback=none" << std::endl;
+        }
+    }
+    return true;
+}
+
 static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
     if (ggml_vk_flash_attn_kvarn(ctx, subctx, q, k, v, mask, sinks, dst)) {
+        return;
+    }
+    if (ggml_vk_flash_attn_tail(ctx, subctx, q, k, v, mask, sinks, dst)) {
         return;
     }
     VK_LOG_DEBUG("ggml_vk_flash_attn((" << q << ", name=" << q->name << ", type=" << q->type << ", ne0=" << q->ne[0] << ", ne1=" << q->ne[1] << ", ne2=" << q->ne[2] << ", ne3=" << q->ne[3] << ", nb0=" << q->nb[0] << ", nb1=" << q->nb[1] << ", nb2=" << q->nb[2] << ", nb3=" << q->nb[3];
@@ -18928,12 +19237,6 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     }
                     return supported;
                 }
-                if (op->src[10] != nullptr || op->src[11] != nullptr) {
-                    // Standard compact-tail attention remains on its explicit
-                    // body/exact/merge fallback because the measured portable
-                    // native route is slower for q4_0 and q5_0.
-                    return false;
-                }
                 bool coopmat2 = device->coopmat2;
                 uint32_t HSK = op->src[1]->ne[0];
                 uint32_t HSV = op->src[2]->ne[0];
@@ -18969,6 +19272,75 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                         return false;
                     }
                 };
+                if (op->src[5] != nullptr) {
+                    const bool tail_ok = ggml_vk_kvarn_attn_tail_sources_supported(op);
+                    // Descriptor offsets are carried in 16-bit packed push
+                    // constants and interpreted by the shader after Vulkan's
+                    // required alignment is applied to the bound range.
+                    const auto descriptor_offset_supported = [&device](const ggml_tensor * tensor) {
+                        if (tensor == nullptr) {
+                            return true;
+                        }
+                        const void * base = tensor->view_src != nullptr ?
+                                tensor->view_src->data : tensor->data;
+                        const uintptr_t offset = uintptr_t(base) + tensor->view_offs;
+                        const uintptr_t mask =
+                                device->properties.limits.minStorageBufferOffsetAlignment - 1;
+                        return (offset & mask) <= UINT16_MAX;
+                    };
+                    bool descriptor_offsets_supported = descriptor_offset_supported(op);
+                    for (int i = 0; i < GGML_MAX_SRC && descriptor_offsets_supported; ++i) {
+                        descriptor_offsets_supported = descriptor_offset_supported(op->src[i]);
+                    }
+                    const bool supported = tail_ok && descriptor_offsets_supported && HSK == HSV &&
+                        (HSK == 128 || HSK == 256 || HSK == 512) &&
+                        fa_kv_ok(op->src[1]->type) && fa_kv_ok(op->src[2]->type) &&
+                        op->src[1]->type != GGML_TYPE_Q1_0 &&
+                        op->src[2]->type != GGML_TYPE_Q1_0 &&
+                        op->src[0]->ne[0] == HSK && op->src[0]->ne[2] % op->src[1]->ne[2] == 0 &&
+                        op->src[1]->ne[2] == op->src[2]->ne[2] &&
+                        op->src[0]->ne[3] == op->src[1]->ne[3] &&
+                        op->src[0]->ne[3] == op->src[2]->ne[3] &&
+                        op->src[0]->ne[1] <= UINT32_MAX && op->src[1]->ne[1] <= UINT32_MAX &&
+                        op->src[0]->ne[2] <= UINT16_MAX && op->src[1]->ne[2] <= UINT16_MAX &&
+                        op->src[0]->ne[3] <= UINT16_MAX &&
+                        op->src[4] == nullptr &&
+                        op->src[0]->nb[0] == sizeof(float) &&
+                        op->src[0]->nb[1] <= UINT32_MAX && op->src[0]->nb[2] <= UINT32_MAX &&
+                        (op->src[0]->ne[3] == 1 ||
+                         op->src[0]->nb[3] == size_t(op->src[0]->ne[0] * op->src[0]->ne[1] * op->src[0]->ne[2]) * sizeof(float)) &&
+                        op->src[1]->nb[1] <= UINT32_MAX && op->src[1]->nb[2] <= UINT32_MAX && op->src[1]->nb[3] <= UINT32_MAX &&
+                        op->src[2]->nb[1] <= UINT32_MAX && op->src[2]->nb[2] <= UINT32_MAX && op->src[2]->nb[3] <= UINT32_MAX &&
+                        op->src[5]->nb[3] == op->src[5]->nb[1] * size_t(op->src[5]->ne[1]) &&
+                        op->src[6]->nb[3] == op->src[6]->nb[1] * size_t(op->src[6]->ne[1]) &&
+                        ggml_is_contiguous(op) &&
+                        (op->src[3] == nullptr ||
+                         (op->src[3]->type == GGML_TYPE_F16 && ggml_is_contiguous(op->src[3]) &&
+                          op->src[3]->ne[0] == op->src[1]->ne[1] &&
+                          op->src[3]->ne[1] == op->src[0]->ne[1] && op->src[3]->ne[2] == 1 &&
+                          (op->src[3]->ne[3] == 1 || op->src[3]->ne[3] == op->src[0]->ne[3])));
+                    const char * debug_routes = getenv("GGML_KVARN_DEBUG_ROUTES");
+                    if (!supported && debug_routes != nullptr && atoi(debug_routes) != 0) {
+                        std::cerr << "kv-tail-support-reject"
+                                  << " tail-ok=" << tail_ok
+                                  << " offsets-ok=" << descriptor_offsets_supported
+                                  << " q=[" << op->src[0]->ne[0] << ',' << op->src[0]->ne[1] << ','
+                                  << op->src[0]->ne[2] << ',' << op->src[0]->ne[3] << "]"
+                                  << " k=[" << op->src[1]->ne[0] << ',' << op->src[1]->ne[1] << ','
+                                  << op->src[1]->ne[2] << ',' << op->src[1]->ne[3] << "]"
+                                  << " v=[" << op->src[2]->ne[0] << ',' << op->src[2]->ne[1] << ','
+                                  << op->src[2]->ne[2] << ',' << op->src[2]->ne[3] << "]"
+                                  << " mask=" << (op->src[3] != nullptr)
+                                  << " sinks=" << (op->src[4] != nullptr)
+                                  << " out-contiguous=" << ggml_is_contiguous(op)
+                                  << " kt-nb3=" << op->src[5]->nb[3]
+                                  << " kt-packed=" << op->src[5]->nb[1] * size_t(op->src[5]->ne[1])
+                                  << " vt-nb3=" << op->src[6]->nb[3]
+                                  << " vt-packed=" << op->src[6]->nb[1] * size_t(op->src[6]->ne[1])
+                                  << std::endl;
+                    }
+                    return supported;
+                }
                 if (!fa_kv_ok(op->src[1]->type) || !fa_kv_ok(op->src[2]->type)) {
                     return false;
                 }
@@ -19696,10 +20068,14 @@ static bool ggml_backend_vk_kv_tail_segmented_attention_supported(
     const bool exact_types =
         (tail_k == GGML_TYPE_F16 || tail_k == GGML_TYPE_BF16) &&
         (tail_v == GGML_TYPE_F16 || tail_v == GGML_TYPE_BF16);
-    const bool kvarn_virtual_body =
-        body_k == GGML_TYPE_F16 && body_v == GGML_TYPE_F16;
+    const auto body_type = [](ggml_type type) {
+        return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 ||
+            type == GGML_TYPE_BF16 || type == GGML_TYPE_Q4_0 ||
+            type == GGML_TYPE_Q4_1 || type == GGML_TYPE_Q5_0 ||
+            type == GGML_TYPE_Q5_1 || type == GGML_TYPE_Q8_0;
+    };
     return exact_types &&
-        kvarn_virtual_body &&
+        body_type(body_k) && body_type(body_v) &&
         d_k == d_v && (d_k == 128 || d_k == 256 || d_k == 512);
 }
 
@@ -19723,12 +20099,45 @@ static bool ggml_backend_vk_kvarn_tail_attention_supported(
 }
 
 static uint32_t ggml_backend_vk_kvarn_native_rotated_max_query_tokens(ggml_backend_dev_t dev) {
-    return ggml_backend_vk_kvarn_native_ops(dev) ? 16u : 0u;
+    // The portable shader and final supports_op predicate accept all query
+    // widths representable by the operation. Optimized decode policy remains
+    // internal to the shader route planner.
+    return ggml_backend_vk_kvarn_native_ops(dev) ? UINT32_MAX : 0u;
 }
 
 static bool ggml_backend_vk_kvarn_mixed_tail_native_preferred(ggml_backend_dev_t dev) {
     GGML_UNUSED(dev);
     return false;
+}
+
+static size_t ggml_backend_vk_kvarn_workspace_y_size(
+        ggml_backend_dev_t dev,
+        const ggml_tensor * op) {
+    if (dev == nullptr || dev->context == nullptr || op == nullptr) {
+        return 0;
+    }
+    const auto * ctx = (const ggml_backend_vk_device_context *) dev->context;
+    const auto & device = ggml_vk_get_device(ctx->device);
+    switch (op->op) {
+        case GGML_OP_KVARN_STORE:
+            return ggml_vk_kvarn_store_workspace_plan_for(
+                op, size_t(device->properties.limits.minStorageBufferOffsetAlignment), true).size;
+        case GGML_OP_KVARN_MATERIALIZE:
+            return ggml_vk_kvarn_materialize_workspace_size(op);
+        default:
+            return 0;
+    }
+}
+
+static size_t ggml_backend_vk_kvarn_workspace_split_k_size(
+        ggml_backend_dev_t dev,
+        const ggml_tensor * op) {
+    if (dev == nullptr || dev->context == nullptr || op == nullptr) {
+        return 0;
+    }
+    const auto * ctx = (const ggml_backend_vk_device_context *) dev->context;
+    return ggml_vk_kvarn_attention_split_workspace_size(
+        ggml_vk_get_device(ctx->device), op);
 }
 
 static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
@@ -19750,6 +20159,12 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     }
     if (strcmp(name, "ggml_backend_kvarn_mixed_tail_native_preferred") == 0) {
         return (void *) ggml_backend_vk_kvarn_mixed_tail_native_preferred;
+    }
+    if (strcmp(name, "ggml_backend_kvarn_workspace_y_size") == 0) {
+        return (void *) ggml_backend_vk_kvarn_workspace_y_size;
+    }
+    if (strcmp(name, "ggml_backend_kvarn_workspace_split_k_size") == 0) {
+        return (void *) ggml_backend_vk_kvarn_workspace_split_k_size;
     }
     if (strcmp(name, "ggml_backend_kvarn_route_stats_reset") == 0) {
         return (void *) ggml_backend_vk_kvarn_route_stats_reset;

@@ -1041,6 +1041,7 @@ void process_shaders() {
     string_to_spv("kvarn_store", "kvarn_store.comp", {});
     string_to_spv("kvarn_materialize", "kvarn_materialize.comp", {});
     string_to_spv("kvarn_flash_attn", "kvarn_flash_attn.comp", {});
+    string_to_spv("flash_attn_tail", "flash_attn_tail.comp", {});
     string_to_spv("kvarn_wht", "kvarn_wht.comp", {});
     string_to_spv("kvarn_wht_d256", "kvarn_wht_parallel.comp", {{"HEAD_WIDTH", "256"}});
     string_to_spv("kvarn_wht_d512", "kvarn_wht_parallel.comp", {{"HEAD_WIDTH", "512"}});

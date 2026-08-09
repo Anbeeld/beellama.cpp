@@ -54,6 +54,7 @@ struct llama_context {
     //   - changing attention type
     //   - etc.
     void sched_reserve();
+    void record_backend_private_workspace(ggml_cgraph * gf);
 
     void synchronize();
 
@@ -363,6 +364,8 @@ private:
     std::vector<ggml_backend_t>             backend_ptrs;
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
+    std::vector<size_t>                     backend_kvarn_workspace_y_size;
+    std::vector<size_t>                     backend_kvarn_workspace_split_k_size;
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;

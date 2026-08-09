@@ -3295,11 +3295,11 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto * mctx_cur = inp->mctx;
     const auto * kvarn_ctx = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur);
     const bool use_kvarn = kvarn_ctx != nullptr;
+    // Backend preferences choose an implementation inside the final operation;
+    // they must not veto direct KVarN attention and force full materialization.
+    // validate_native_tail_operation() proves the actual attached-tail shape.
     const bool kvarn_native_attention = use_kvarn &&
-        kvarn_ctx->uses_native_attention(il) &&
-        (!mctx_cur->has_compact_tail() ||
-         !mctx_cur->has_kv_body(il) ||
-         kvarn_ctx->mixed_tail_native_preferred(il));
+        kvarn_ctx->uses_native_attention(il);
     const auto kvarn_plan = use_kvarn ? llama_kvarn_plan_attention(
         kvarn_native_attention,
         kvarn_ctx->native_attention_uses_original_v(il),
@@ -3726,10 +3726,7 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto * kvarn_ctx = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur);
     const bool use_kvarn = kvarn_ctx != nullptr;
     const bool kvarn_native_attention = use_kvarn &&
-        kvarn_ctx->uses_native_attention(il) &&
-        (!mctx_cur->has_compact_tail() ||
-         !mctx_cur->has_kv_body(il) ||
-         kvarn_ctx->mixed_tail_native_preferred(il));
+        kvarn_ctx->uses_native_attention(il);
     const auto kvarn_plan = use_kvarn ? llama_kvarn_plan_attention(
         kvarn_native_attention,
         kvarn_ctx->native_attention_uses_original_v(il),

@@ -385,6 +385,7 @@ extern "C" {
     };
 
     typedef struct llama_kv_tail_config llama_kv_tail_config;
+    typedef struct llama_kv_tail_request llama_kv_tail_request;
 
     struct llama_kv_tail_group_info {
         const char * id;
@@ -494,6 +495,7 @@ extern "C" {
         uint32_t       kv_tail_tokens;
         enum ggml_type kv_tail_type;
         const struct llama_kv_tail_config * kv_tail_config; // borrowed only during context creation
+        const struct llama_kv_tail_request * kv_tail_request; // model-independent; borrowed during context creation
     };
 
     struct llama_model_tensor_override {
@@ -564,6 +566,11 @@ extern "C" {
             const char * group_id,
             uint32_t n_tokens);
     LLAMA_API const char * llama_kv_tail_config_last_error(const struct llama_kv_tail_config * config);
+    LLAMA_API struct llama_kv_tail_request * llama_kv_tail_request_init(
+            const char * specification,
+            enum ggml_type exact_type);
+    LLAMA_API void llama_kv_tail_request_free(struct llama_kv_tail_request * request);
+    LLAMA_API const char * llama_kv_tail_request_last_error(const struct llama_kv_tail_request * request);
     LLAMA_API bool llama_kv_tail_get_coverage(
             const struct llama_context * ctx,
                          llama_seq_id   seq_id,

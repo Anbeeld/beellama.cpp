@@ -76,6 +76,8 @@ add_library(${TARGET}
     download.h
     fit.cpp
     fit.h
+    fit-kvarn-tail.cpp
+    fit-kvarn-tail.h
     hf-cache.cpp
     hf-cache.h
     http.h
