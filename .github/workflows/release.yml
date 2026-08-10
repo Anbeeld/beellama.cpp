@@ -1198,8 +1198,7 @@ jobs:
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache ^
             -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache ^
             -DGGML_CUDA_CUB_3DOT2=ON
-          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
-          cmake --build build --config Release -j %NINJA_JOBS% --target ggml-cuda
+          cmake --build build --config Release -j %NUMBER_OF_PROCESSORS% --target ggml-cuda
 
       - name: ccache stats
         if: always()
@@ -1323,10 +1322,7 @@ jobs:
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `
             -DCMAKE_HIP_COMPILER_LAUNCHER=ccache `
             -DLLAMA_BUILD_BORINGSSL=ON
-          # Cap at 2 jobs: 3 concurrent cold ROCm clang++ compiles still exhaust
-          # the 16 GB runner (std::bad_alloc on ggml.cpp/ggml.c). 2 keeps ~6 GB
-          # compiler RSS with headroom; matches the observed OOM at -j 3.
-          $buildJobs = 2
+          $buildJobs = [int]$env:NUMBER_OF_PROCESSORS
           cmake --build build --target ggml-hip -j $buildJobs
           New-Item -ItemType Directory -Force -Path "build\bin\rocblas\library" | Out-Null
           New-Item -ItemType Directory -Force -Path "build\bin\hipblaslt\library" | Out-Null
