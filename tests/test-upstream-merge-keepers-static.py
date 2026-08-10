@@ -92,6 +92,23 @@ def main() -> None:
     if "GGML_CUDA_FATTN_KVARN_ORIGINAL_TYPE, GGML_CUDA_FATTN_KVARN_TYPE>" in kvarn_case:
         raise AssertionError("KVarN MMA selection still instantiates the impossible original-K/rotated-V domain")
 
+    sycl_set_rows = (ROOT / "ggml/src/ggml-sycl/set_rows.cpp").read_text(encoding="utf-8")
+    require(
+        sycl_set_rows,
+        "convert<sycl::ext::oneapi::bfloat16, sycl::half>",
+        "SYCL SET_ROWS must specialize the unsupported direct bfloat16-to-half conversion",
+    )
+
+    metal_device = (ROOT / "ggml/src/ggml-metal/ggml-metal-device.m").read_text(encoding="utf-8")
+    rsets_init = metal_device.split(
+        "ggml_metal_rsets_t ggml_metal_rsets_init(ggml_metal_device_t dev)", 1
+    )[1].split("\n}", 1)[0]
+    require(
+        rsets_init,
+        "GGML_UNUSED(dev);",
+        "Metal residency-set initialization must tolerate SDKs without residency-set support",
+    )
+
     kvarn_cache = (ROOT / "src/llama-kv-cache-kvarn.h").read_text(encoding="utf-8")
     require(
         kvarn_cache,

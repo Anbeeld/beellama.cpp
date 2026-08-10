@@ -32,6 +32,16 @@ inline void convert<sycl::half, sycl::ext::oneapi::bfloat16>(const char* src, ch
                           .template convert<float, sycl::rounding_mode::automatic>()[0];
     *reinterpret_cast<sycl::ext::oneapi::bfloat16*>(dst) = sycl::ext::oneapi::bfloat16(tmp);
 }
+
+// sycl::vec::convert does not provide a bfloat16 -> half path, so route through float.
+template<>
+inline void convert<sycl::ext::oneapi::bfloat16, sycl::half>(const char* src, char* dst) {
+    const float tmp = sycl::vec<sycl::ext::oneapi::bfloat16, 1>(
+                          *reinterpret_cast<const sycl::ext::oneapi::bfloat16*>(src))
+                          .template convert<float, sycl::rounding_mode::automatic>()[0];
+    *reinterpret_cast<sycl::half*>(dst) =
+        sycl::vec<float, 1>(tmp).template convert<sycl::half, sycl::rounding_mode::automatic>()[0];
+}
 #endif
 
 template <typename TIn, typename TIdx, typename blockType, int qk, cpy_kernel_t cpyblck>

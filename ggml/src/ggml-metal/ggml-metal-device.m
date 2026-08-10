@@ -584,6 +584,8 @@ static void ggml_metal_dummy_work(ggml_metal_device_t dev) {
 #endif
 
 ggml_metal_rsets_t ggml_metal_rsets_init(ggml_metal_device_t dev) {
+    GGML_UNUSED(dev);
+
     ggml_metal_rsets_t res = calloc(1, sizeof(struct ggml_metal_rsets));
 
     res->lock = [[NSLock alloc] init];
