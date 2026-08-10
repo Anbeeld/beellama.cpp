@@ -7,7 +7,6 @@
 - Made KVarN and precision-tail memory fitting exact and bounded. The CLI, fit probes, and final context share one immutable tail request; invalid group specifications fail context creation; Vulkan uses backend workspace planners during fit; and final no-allocation validation restarts fit from pristine inputs or fails deterministically. Vulkan also gains a native one-softmax route for standard quantized bodies with F16/BF16 history and current segments.
 - Fixed CUDA KVarN attention at both ends of the hardware range. Pre-Turing portable attention now passes architecture-neutral capability checks and exports the softmax metadata required to merge exact tails correctly. Split and vector decode share a once-per-device dynamic shared-memory opt-in, preventing configuration failures and extending the vector combine path beyond the default 48 KiB limit. KVarN MMA warning fixes keep fatal-warning builds clean.
 - Restored `status.args` and `status.preset` in router `/v1/models` responses for upstream-compatible clients while continuing to strip sensitive options.
-- Restored the existing release workflows, enabled stable-release ccache saves, removed the obsolete rocWMMA option and exhaustive CUDA-architecture release gate, and kept release regression checks aligned with the resulting build matrix.
 
 ## v0.4.2
 
