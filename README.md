@@ -18,78 +18,93 @@ BeeLlama.cpp (or just Bee) is a performance-focused llama.cpp fork for squeezing
 
 For the full feature and public-repo comparison, read [docs/beellama-features.md](docs/beellama-features.md). For the complete argument reference, read [docs/beellama-args.md](docs/beellama-args.md).
 
-### Migrating from v0.3.1 to v0.4.0
-
-v0.4.0 replaced the fork's DFlash implementation in favor of upstream one for maintainability, and removed TurboQuant/TCQ due to benchmarks failing to prove any benefit over the standard quants. Use the newly added `kvarn2`…`kvarn8` types as the "better precision at same bits" KV cache, or fall back to the usual types with the fork now expanding the ladder to the full `q2_0`…`q8_0` range.
-
 ## KV Cache Quantization
 
-K and V cache types are set independently with `--cache-type-k` and `--cache-type-v`. See [KV Cache Quantization Benchmarks for Long Context](https://anbeeld.com/articles/kv-cache-quantization-benchmarks-for-long-context) for the established asymmetric standard-cache ladder, and [KV Cache Precision Tail: Implementation and Benchmarks](https://anbeeld.com/articles/kv-cache-precision-tail-implementation-and-benchmarks) for the current KVarN and precision-tail results.
+K and V cache types are set independently with `--cache-type-k` and `--cache-type-v`. The research is covered in articles: [KVarN KV Cache: Implementation and Benchmarks](https://anbeeld.com/articles/kvarn-kv-cache-implementation-and-benchmarks), [KV Cache Precision Tail: Implementation and Benchmarks](https://anbeeld.com/articles/kv-cache-precision-tail-implementation-and-benchmarks), and [KV Cache Quantization Benchmarks: KVarN, Precision Tail](https://anbeeld.com/articles/kv-cache-quantization-benchmarks-kvarn-precision-tail).
 
-### Qwen 3.6 KVarN And Precision-Tail Starting Points
+### KV Cache Recommenation Ladder
 
-The current Qwen 3.6 27B results use median KLD as the primary quality metric. A 1024-token precision tail is the recommended starting point: it captures most of the measured gain while adding 48 MiB to a symmetric KVarN cache or 96 MiB to the tested standard caches at 64K context. Tail-0 standard and KVarN rows provide comparison anchors; bold rows are the recommended starting points.
+The measurements come from Qwen 3.6 27B Q5_K_S at 64K context on Wikitext-2 raw with `-b 2048 -ub 512` on an RTX 3090. Median KLD is the primary quality metric; lower is better.
 
-| Profile | K / V | Tail | Size vs bf16 | Median KLD |
-| --- | --- | ---: | ---: | ---: |
-| Full baseline | `bf16 / bf16` | 0 | 100.0% | 0.000000 |
-| Standard q8 | `q8_0 / q8_0` | 0 | 53.1% | 0.000909 |
-| KVarN6, no tail | `kvarn6 / kvarn6` | 0 | 41.4% | 0.000889 |
-| **High fidelity** | **`kvarn6 / kvarn6`** | **1024** | **42.6%** | **0.000879** |
-| Standard q6 | `q6_0 / q6_0` | 0 | 40.6% | 0.000960 |
-| KVarN5, no tail | `kvarn5 / kvarn5` | 0 | 35.2% | 0.000927 |
-| **Balanced** | **`kvarn5 / kvarn5`** | **1024** | **36.3%** | **0.000897** |
-| Standard q5 | `q5_0 / q5_0` | 0 | 34.4% | 0.001154 |
-| **Standard q5 + tail** | **`q5_0 / q5_0`** | **1024** | **36.7%** | **0.000938** |
-| KVarN4, no tail | `kvarn4 / kvarn4` | 0 | 28.9% | 0.001111 |
-| **Value** | **`kvarn4 / kvarn4`** | **1024** | **30.1%** | **0.000994** |
-| Standard q4 | `q4_0 / q4_0` | 0 | 28.1% | 0.001846 |
-| **Standard + tail** | **`q4_0 / q4_0`** | **1024** | **30.5%** | **0.001057** |
-| **Compact** | **`kvarn3 / kvarn3`** | **1024** | **23.8%** | **0.001316** |
+| K / V | Tail | KV cache | Size vs bf16 (%) | Median KLD | 99.9% KLD | What it is for |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `bf16 / bf16` | 0 | 4096 MiB | 100.0% | 0 | 0.000050 | Reference |
+| `q8_0 / q8_0` | 1024 | 2272 MiB | 55.5% | 0.000897 | 0.087699 | Standard fidelity with a precision tail |
+| `kvarn8 / kvarn8` | 1024 | 2256 MiB | 55.1% | 0.000871 | 0.087639 | Best measured quality below BF16 |
+| `q8_0 / q8_0` | 0 | 2176 MiB | 53.1% | 0.000909 | 0.093029 | Standard fidelity |
+| `q8_0 / q6_0` | 1024 | 2016 MiB | 49.2% | 0.000894 | 0.091098 | q8_0 quality within noise, 256 MiB less |
+| `kvarn6 / kvarn6` | 1024 | 1744 MiB | 42.6% | 0.000879 | 0.084629 | High-end value pick |
+| `kvarn6 / kvarn5` | 1024 | 1616 MiB | 39.5% | 0.000886 | 0.092778 | Much cheaper, almost as good |
+| `kvarn5 / kvarn5` | 1024 | 1488 MiB | 36.3% | 0.000897 | 0.087666 | Highest value in the mid-range |
+| `q5_0 / q4_1` | 1024 | 1440 MiB | 35.2% | 0.000966 | 0.089128 | Standard option when VRAM-constrained |
+| `kvarn5 / kvarn4` | 1024 | 1360 MiB | 33.2% | 0.000936 | 0.089469 | Balanced default |
+| `q4_0 / q4_0` | 1024 | 1248 MiB | 30.5% | 0.001057 | 0.104486 | Compact standard cache |
+| `kvarn4 / kvarn4` | 1024 | 1232 MiB | 30.1% | 0.000994 | 0.090391 | Cleaner than q4_0 for less memory |
+| `kvarn4 / kvarn3` | 1024 | 1104 MiB | 27.0% | 0.001112 | 0.113968 | Smallest recommended tier |
+| `kvarn3 / kvarn3` | 1024 | 976 MiB | 23.8% | 0.001316 | 0.139558 | When the context must fit |
+| `kvarn3 / kvarn2` | 1024 | 848 MiB | 20.7% | 0.002424 | 0.238780 | Emergency compression |
+| `kvarn2 / kvarn2` | 1024 | 720 MiB | 17.6% | 0.003811 | 0.450496 | Last resort |
 
-At tail 0, KVarN preserves the precision-per-VRAM progression established by the earlier benchmarks: KVarN4 approaches standard q5 quality, KVarN5 reaches the q6 tier, and KVarN6 reaches the practical q8 median-KLD floor.
+A 1024-token tail is a useful starting point for low-bit Qwen caches. Prefer more body precision when old and recent tokens matter equally; consider 2048 only when the newest two thousand tokens are genuinely the privileged working set. Standard caches generally have slightly faster prefill.
 
-Use 2048 primarily with q2/q3 caches or when the workload specifically needs about 2K recent tokens kept exact. At q5 and above, the Wikitext result mostly saturates after 1024, while larger tails can cost several percent of throughput.
+Gemma 4 needs a separate decision. Its 1024-token sliding window makes a 1024 tail exact across most layers, sharply changing memory and throughput. Standard `q8_0 / q8_0` without a tail is the safer Gemma default when throughput and older-context coverage matter, and the benchmark results recommend avoiding quantized KV cache when Gemma quality is non-negotiable.
 
-These are Qwen results, not universal presets. Gemma 4's 1024-token sliding window makes a 1024 tail promote its entire SWA ring to BF16/F16, erasing much of the memory advantage; KVarN and precision tails are not recommended as a general Gemma optimization in this release.
+### Standard-Only KV Cache Ladder
 
-*Benchmark basis: Qwen 3.6 27B Q5_K_S, 64K context, Wikitext-2 raw, `-b 2048 -ub 512`, RTX 3090. The [linked article](https://anbeeld.com/articles/kv-cache-precision-tail-implementation-and-benchmarks) contains the exact commands, artifact hashes, mean KLD, percentiles, and full results.*
+Use this generic fallback ladder when KVarN or precision tails are unavailable. It is based on the same Qwen 3.6 27B benchmark, with every standard cache row using tail 0.
 
-### Standard-Quant Preset Ladder
+| K / V | KV cache | Size vs bf16 (%) | Median KLD | 99.9% KLD | What it is for |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `bf16 / bf16` | 4096 MiB | 100.0% | 0 | 0.000050 | Reference |
+| `q8_0 / q8_0` | 2176 MiB | 53.1% | 0.000909 | 0.093029 | Compression with minimal losses |
+| `q8_0 / q6_0` | 1920 MiB | 46.9% | 0.000937 | 0.093575 | 256 MiB below q8_0 |
+| `q6_0 / q6_0` | 1664 MiB | 40.6% | 0.000960 | 0.091134 | High-end value pick |
+| `q6_0 / q5_0` | 1536 MiB | 37.5% | 0.001054 | 0.094670 | Balanced default |
+| `q5_0 / q5_0` | 1408 MiB | 34.4% | 0.001154 | 0.097070 | Last tier before the cliff |
+| `q5_0 / q4_1` | 1344 MiB | 32.8% | 0.001433 | 0.122096 | Default when VRAM-constrained |
+| `q5_0 / q4_0` | 1280 MiB | 31.3% | 0.001516 | 0.121068 | 64 MiB cheaper, worse median |
+| `q4_0 / q4_0` | 1152 MiB | 28.1% | 0.001846 | 0.154408 | Smallest recommended tier |
+| `q4_0 / q3_0` | 1024 MiB | 25.0% | 0.003313 | 0.218912 | When the context must fit |
+| `q3_0 / q3_0` | 896 MiB | 21.9% | 0.004696 | 0.304186 | Emergency compression |
+| `q2_0 / q2_0` | 640 MiB | 15.6% | 0.019374 | 1.198902 | Last resort |
 
-| K / V | % of bf16 size | 99.9% exp(-ΔKLD) | What it is for |
-| --- | ---: | ---: | --- |
-| bf16 / bf16 | 100.0 | 100.00% | Preserving full quality |
-| q8_0 / q8_0 | 53.1 | 94.62% | Validation and blame-isolation mode |
-| **q8_0 / q6_0** | **46.9** | **94.33%** | **Recommended high-end preset** |
-| q8_0 / q5_1 | 45.3 | 94.21% | Fallback if q6_0 V is unavailable |
-| q8_0 / q5_0 | 43.8 | 93.69% | If the high-end rows miss the fit by a narrow margin |
-| q6_0 / q5_0 | 37.5 | 93.29% | Optional headroom tier between q5 and q8 K |
-| q5_0 / q5_0 | 34.4 | 93.16% | Normal quality preset |
-| **q5_0 / q4_1** | **32.8** | **92.65%** | **Best default if VRAM-constrained** |
-| q5_0 / q4_0 | 31.3 | 91.39% | If q5_0 / q4_1 misses the fit by a narrow margin |
-| q4_0 / q4_0 | 28.1 | 88.87% | Memory saving with visible precision loss |
+### KV Cache Type Reference
 
-*`exp(-ΔKLD)` is a derived distribution-similarity proxy, not task accuracy. The current KVarN and precision-tail analysis uses median KLD for primary ranking because high-end mean KLD and extreme percentiles are outlier-sensitive.*
+<details>
+<summary><strong>All KV cache types available in BeeLlama</strong></summary>
 
-### Type Reference
+| Type | Origin | bpv | Size vs bf16 (%) |
+| --- | --- | ---: | ---: |
+| `q8_0` | upstream | 8.5 | 53.1% |
+| `kvarn8` | Huawei / fork | 8.375 | ~52.3% |
+| `q6_1` | fork | 7.0 | 43.8% |
+| `q6_0` | fork | 6.5 | 40.6% |
+| `kvarn6` | Huawei / fork | 6.375 | ~39.8% |
+| `q5_1` | upstream | 6.0 | 37.5% |
+| `q5_0` | upstream | 5.5 | 34.4% |
+| `kvarn5` | Huawei / fork | 5.375 | ~33.6% |
+| `q4_1` | upstream | 5.0 | 31.3% |
+| `q4_0` | upstream | 4.5 | 28.1% |
+| `iq4_nl` | upstream | 4.5 | 28.1% |
+| `kvarn4` | Huawei / fork | 4.375 | ~27.3% |
+| `q3_1` | fork | 4.0 | 25.0% |
+| `q3_0` | fork | 3.5 | 21.9% |
+| `kvarn3` | Huawei / fork | 3.375 | ~21.1% |
+| `q2_1` | fork | 3.0 | 18.8% |
+| `q2_0` | fork | 2.5 | 15.6% |
+| `kvarn2` | Huawei / fork | 2.375 | ~14.8% |
 
-| Type | Origin | bpv | Diff vs bf16 | Notes |
-| --- | --- | ---: | ---: | --- |
-| q8_0 | upstream | 8.5 | 1.88× | High-fidelity K or V |
-| q6_0 | fork | 6.5 | 2.46× | Robust type for high-end presets |
-| q5_1 | upstream | 6 | 2.67× | Conservative, might be better for V than q5_0 |
-| q5_0 | upstream | 5.5 | 2.91× | Strong K type for VRAM constrained configs |
-| q4_1 | upstream | 5 | 3.2× | Smaller than q5_0, but weaker in the tail. Prefer q5_0 for K |
-| q4_0 | upstream | 4.5 | 3.56× | Default high compression type, decent at its size |
+Standard ratios come directly from each block format. KVarN ratios describe the compressed record body, including scale and zero-point metadata; the permanent exact sink, exact suffix, staging, and alignment add context-dependent overhead.
+
+</details>
 
 ## Installation
 
 ### Prebuilt
 
-Current release binaries are on the [releases page](https://github.com/Anbeeld/beellama.cpp/releases):
+Current release binaries are on the [releases page](https://github.com/Anbeeld/beellama.cpp/releases). Release asset names use the `beellama-<version>-<asset-suffix>` pattern:
 
-| Platform | Backend | Archive |
+| Platform | Backend | Asset suffix |
 | --- | --- | --- |
 | macOS arm64 | Metal | `bin-macos-arm64.tar.gz` |
 | Ubuntu x64 | CPU | `bin-ubuntu-x64.tar.gz` |
@@ -100,12 +115,13 @@ Current release binaries are on the [releases page](https://github.com/Anbeeld/b
 | Ubuntu x64 | ROCm 7.2 | `bin-ubuntu-rocm-7.2-x64.tar.gz` |
 | Ubuntu x64 | SYCL | `bin-ubuntu-sycl-x64.tar.gz` |
 | Windows x64 | CPU | `bin-win-cpu-x64.zip` |
+| Windows x64 | Vulkan | `bin-win-vulkan-x64.zip` |
 | Windows x64 | SYCL | `bin-win-sycl-x64.zip` |
 | Windows x64 | CUDA 12.4 | `bin-win-cuda-12.4-x64.zip` |
 | Windows x64 | CUDA 13.1 | `bin-win-cuda-13.1-x64.zip` |
 | Windows x64 | HIP/Radeon | `bin-win-hip-radeon-x64.zip` |
 
-Windows CUDA archives contain a `ggml-cuda.dll` backend; download the matching `cudart-win-cuda-*-x64.zip` runtime archive and extract it into the same folder. Windows SYCL and HIP archives ship as standalone packages with all required runtime DLLs bundled.
+Windows CUDA archives contain a `ggml-cuda.dll` backend; download the matching `beellama-<version>-cudart-win-cuda-*-x64.zip` runtime archive and extract it into the same folder. Windows SYCL and HIP archives ship as standalone packages with all required runtime DLLs bundled.
 
 Docker images are published to `ghcr.io/anbeeld/beellama.cpp`:
 
@@ -179,9 +195,9 @@ Keep the draft context on a standard cache type; KVarN is target-cache only.
 ### KVarN Target Cache
 
 ```sh
-# Qwen 3.6 starting point
+# Balanced general starting point from the benchmark ladder
 llama-server -m model.gguf --flash-attn on \
-  --cache-type-k kvarn4 --cache-type-v kvarn4 \
+  --cache-type-k kvarn5 --cache-type-v kvarn4 \
   --kv-tail-tokens 1024
 ```
 
@@ -209,12 +225,11 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) for inherited llama.cpp contribution con
 
 ## Dependencies
 
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - single-header HTTP server used by `llama-server` - MIT
+- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - HTTP client/server library used by `llama-server` - MIT
 - [stb-image](https://github.com/nothings/stb) - single-header image decoder used by multimodal code - public domain
 - [nlohmann/json](https://github.com/nlohmann/json) - single-header JSON library - MIT
 - [miniaudio.h](https://github.com/mackron/miniaudio) - single-header audio decoder - public domain
 - [subprocess.h](https://github.com/sheredom/subprocess.h) - process launching helper - public domain
-- [Snowflake ArcticInference](https://github.com/snowflakedb/ArcticInference) - suffix tree and int32 map used in speculative decoding (`common/suffix-tree.*`, `common/int32-map.h`) - Apache-2.0
 - [Intel OpenVINO](https://github.com/openvinotoolkit/openvino) - frontend header used in OpenVINO backend (`ggml/src/ggml-openvino/openvino/frontend.h`) - Apache-2.0
 - Intel SYCL/oneAPI - SYCL backend (`ggml/src/ggml-sycl/`) - Apache-2.0 WITH LLVM-exception
 

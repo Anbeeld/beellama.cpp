@@ -1,4 +1,4 @@
-# BeeLlama v0.4.0 argument reference
+# BeeLlama v0.4.3 argument reference
 
 This page covers Bee-owned arguments and the upstream arguments whose behavior
 BeeLlama extends. Run `llama-server --help` or `llama-cli --help` for the full
@@ -224,12 +224,14 @@ Use the same corpus, context, logical batch, and physical ubatch for both KLD le
 | `-DGGML_CUDA_FA_ALL_QUANTS=ON` | — | Off | Expands the CUDA vector matrix from 50 to all 169 standard cache pairs and, when `GGML_CUDA_KVARN=ON`, KVarN fast-decode instances from 15 balanced pairs to all 36 ordered bit pairs. Valid KVarN pairs outside the fast matrix use descriptor-native MMA. |
 | `-DGGML_CUDA_KVARN=ON/OFF` | — | On | Compiles or omits the shared CUDA/HIP KVarN kernels and CUDA native-attention template instances. When enabled, `GGML_CUDA_FA_ALL_QUANTS` selects 15 default or all 36 CUDA fast-decode pairs. CUDA devices without the specialized Turing MMA contract use the portable direct-record route when their warp, thread-block, shared-memory, head-dimension, and tail-type capabilities pass. |
 
-CUDA 12.4 is the release lane for Maxwell, Pascal, and Volta. CUDA 13.1 covers
-Turing and newer architectures. The architecture CI compiles SM 5.0, 5.2,
-5.3, 6.0, 6.1, 6.2, 7.0, 7.2, and 7.5 separately with CUDA 12.4, and SM 7.5
-through the current Blackwell targets with CUDA 13.1. These are compile gates;
-pre-Turing support remains runtime-unqualified until matching real devices pass
-the KVarN parity, memory, and model-smoke tests.
+Release packages are built with CUDA 12.4 and 13.1. CUDA 12.4 can emit the
+Maxwell, Pascal, and Volta PTX targets used by the portable KVarN route; CUDA
+13.1 covers Turing and newer architectures. The release workflow no longer has
+an exhaustive per-architecture CUDA compile gate. For a local or CI build,
+select the intended target explicitly with `CMAKE_CUDA_ARCHITECTURES` when the
+build host cannot detect it. Pre-Turing support remains runtime-unqualified
+until matching real devices pass the KVarN parity, memory, and model-smoke
+tests.
 
 ## Migration from earlier versions
 

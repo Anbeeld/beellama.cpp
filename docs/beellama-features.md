@@ -1,6 +1,6 @@
-# BeeLlama v0.4.0 features
+# BeeLlama v0.4.3 features
 
-BeeLlama v0.4.0 keeps a small fork surface on top of upstream llama.cpp. Use
+BeeLlama v0.4.3 keeps a small fork surface on top of upstream llama.cpp. Use
 this page to choose a feature; use the [argument reference](beellama-args.md)
 for exact names, environment variables, defaults, and validation ranges.
 
@@ -8,19 +8,28 @@ for exact names, environment variables, defaults, and validation ranges.
 
 ### What it is
 
-KVarN compresses a target model's K and V cache into structured 2-, 3-, 4-,
-5-, 6-, or 8-bit records. K and V widths are independent, and supported Qwen
-3.6 and Gemma 4 SWA layers can use a separate KVarN pair. Every KVarN group
-keeps the paper-defined exact 128-token sink and newest 128-token suffix around
-its compressed body. The physical ubatch controls only temporary workspace; it
-never enlarges that logical exact suffix.
+KVarN is Huawei's calibration-free, variance-normalized KV-cache quantizer,
+adapted here for llama.cpp. It applies a per-head Hadamard rotation after RoPE,
+normalizes both axes of each 128-token tile, and stores structured 2-, 3-, 4-,
+5-, 6-, or 8-bit records with scale metadata. K and V widths are independent,
+and supported Qwen 3.6 and Gemma 4 SWA layers can use a separate KVarN pair.
+Non-SWA layers keep the first 128 attention-sink tokens exact. Bee also keeps at
+least the newest 128 tokens exact, unlike the reference implementation's
+partially filled suffix. The physical ubatch controls only temporary workspace;
+it never enlarges that logical exact suffix.
 
 ### When to use it
 
 Use KVarN when persistent KV-cache memory is the limiting resource and the model
-has a supported attention layout. Start with `kvarn4` on both sides, then
-measure the quality and speed of the exact model, backend, and context you plan
-to serve.
+has a supported attention layout. The general benchmark ladder starts with
+`kvarn5 / kvarn4` and a 1024-token tail as its balanced default, with
+`kvarn6 / kvarn5` as the more conservative body and `kvarn4 / kvarn3` as the
+smallest recommended tier. These presets come from Qwen 3.6 27B measurements,
+not a universal model guarantee. Measure the quality, prefill speed, generation
+speed, and memory use of the exact model, backend, and context you plan to
+serve.
+
+See [KVarN KV Cache: Implementation and Benchmarks](https://anbeeld.com/articles/kvarn-kv-cache-implementation-and-benchmarks) for the algorithm, Bee's exact-tail deviation, and matched-format comparisons. The current combined recommendation ladder is in the [README](../README.md#general-kv-cache-ladder).
 
 ### Key arguments
 
@@ -122,17 +131,16 @@ directly for D128, D256, and D512 heads. Its correctness limit is not the
 specialized decode threshold of 16 queries, so prompt-sized query batches stay
 native instead of creating a full F32 KQ tensor.
 
-ROCm/HIP selects between record-tiled split decode, generic descriptor-native
-WMMA/MFMA, and the same portable direct-record kernel. CPU has a backend-native
-direct-record attention path. Vulkan directly consumes compressed records for
-body-only inputs and compact bodyless F16/BF16 tails for head dimensions 128,
-256, and 512 with query batches through 16 rows. A Vulkan layer with both a
-compressed body and an exact tail instead materializes the body and uses the
-backend's standard tiled FlashAttention path. That policy is intentional:
-hardware measurements found the mixed direct shader slower than the
-materialized upstream-style route. Matrix-capable HIP and CUDA retain
-descriptor-native large-batch prefill. Other portable backends retain their
-advertised query limits. Vulkan requires shader Int64 and
+ROCm/HIP selects between record-tiled split decode, eligible descriptor-native
+WMMA/MFMA, and the same portable direct-record kernel. Unsupported AMD matrix
+shapes remain on portable native attention instead of materializing the cache.
+CPU has a backend-native direct-record attention path. Vulkan directly consumes
+KVarN records and exact tails for supported D128, D256, and D512 shapes. Its
+standard-cache segmented route likewise consumes a quantized body, F16/BF16
+history, and current K/V with one online FP32 softmax. Explicit materialization
+remains a fallback for unsupported placements or shapes. Matrix-capable HIP and
+CUDA retain descriptor-native large-batch prefill. Other portable backends
+retain their advertised query limits. Vulkan requires shader Int64 and
 buffer-device-address support. CPU placement is valid with KV offload disabled.
 
 | NVIDIA architecture | Toolkit and package | Native KVarN route | Qualification |
@@ -346,11 +354,18 @@ Positive K-only MLA and DSA overlays are rejected during context creation.
 
 ### When to use it
 
-Use the precision tail when a quantized cache saves needed context memory but recent-token
-quantization changes quality. For standard q2 through q8 caches, start with 64,
-128, or 256 tokens. For KVarN, the starting point is its intrinsic 128-token
-suffix; try 512 or 1024 only after measuring the exact model and workload.
-Larger values read more F16/BF16 data and are not performance-neutral.
+Use the precision tail when a quantized cache saves needed context memory but
+recent-token quantization changes quality. In the Qwen 3.6 27B measurements, a
+1024-token tail captured most of the gain for low-bit bodies and was the balanced
+starting point for both KVarN and standard caches. Prefer body precision when
+old and recent tokens matter equally. A 2048-token tail is most persuasive when
+the newest two thousand tokens are genuinely the privileged working set; larger
+tails read more F16/BF16 data and are not performance-neutral.
+
+Gemma 4 needs a separate policy. Its 1024-token sliding window makes a 1024 tail
+exact across most layers, causing a sharp memory and throughput transition.
+Standard q8 without a tail is the safer general default when throughput and
+older-context coverage matter. See [KV Cache Precision Tail: Implementation and Benchmarks](https://anbeeld.com/articles/kv-cache-precision-tail-implementation-and-benchmarks) and the [combined benchmark review](https://anbeeld.com/articles/kv-cache-quantization-benchmarks-kvarn-precision-tail) for the quality, memory, and throughput tradeoffs.
 
 `auto` requests 1024 exact tokens for every applicable canonical target-cache
 group and caps each request by that group's effective context or attention
@@ -425,12 +440,12 @@ attention can be substantially slower.
 
 For compact current sources, CUDA and HIP share the segmented history/current
 implementation. CPU has the dense one-softmax reference route. Vulkan consumes
-the compact history/current buffers through buffer device addresses and
-validates every source before native dispatch. Supported bodyless exact tails
-remain native; mixed compressed/exact layers use explicit device
-materialization and standard FlashAttention. Unsupported shapes or source
-layouts fail closed instead of ignoring current rows or relying on an
-accidental scheduler fallback.
+the quantized body, compact history, and current buffers through buffer device
+addresses, validates every source before native dispatch, and evaluates them
+with one online FP32 softmax. Supported mixed and bodyless exact routes remain
+native; unsupported shapes or source layouts fail closed or use the explicit
+device materialization fallback instead of ignoring current rows or relying on
+an accidental scheduler fallback.
 
 ### July 2026 compact-tail correction
 
