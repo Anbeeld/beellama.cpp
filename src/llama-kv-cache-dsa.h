@@ -26,11 +26,13 @@ public:
                      uint32_t   n_pad,
                      uint32_t   n_swa,
                llama_swa_type   swa_type,
-        const layer_filter_cb & filter,
+        const layer_filter_cb & filter_mla,
+        const layer_filter_cb & filter_lid,
         const  layer_reuse_cb & reuse,
                      uint32_t   n_ubatch = 0,
                      uint32_t   tail_tokens = 0,
                     ggml_type   tail_type = GGML_TYPE_F16,
+                     uint32_t   tail_tokens_requested = UINT32_MAX,
                      uint32_t   tail_rollback_tokens = 0);
 
     ~llama_kv_cache_dsa() = default;

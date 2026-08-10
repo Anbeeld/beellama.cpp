@@ -1095,6 +1095,23 @@ bool fs_is_directory(const std::string & path) {
     return std::filesystem::exists(dir) && std::filesystem::is_directory(dir);
 }
 
+std::string common_get_env(const std::string & name) {
+    const char * value = std::getenv(name.c_str());
+    return value == nullptr ? "" : value;
+}
+
+void common_set_env(const std::string & name, const std::string & value) {
+#if defined(_WIN32)
+    _putenv_s(name.c_str(), value.c_str());
+#else
+    if (value.empty()) {
+        unsetenv(name.c_str());
+    } else {
+        setenv(name.c_str(), value.c_str(), 1);
+    }
+#endif
+}
+
 std::string fs_get_cache_directory() {
     std::string cache_directory = "";
     auto ensure_trailing_slash = [](std::string p) {
@@ -1401,16 +1418,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 params.sampling.logit_bias_eog.begin(), params.sampling.logit_bias_eog.end());
     }
 
-    //if (params.sampling.penalty_last_n == -1) {
-    //    LOG_TRC("%s: setting penalty_last_n to ctx_size = %d\n", __func__, llama_n_ctx(lctx));
-    //    params.sampling.penalty_last_n = llama_n_ctx(lctx);
-    //}
-
-    //if (params.sampling.dry_penalty_last_n == -1) {
-    //    LOG_TRC("%s: setting dry_penalty_last_n to ctx_size = %d\n", __func__, llama_n_ctx(lctx));
-    //    params.sampling.dry_penalty_last_n = llama_n_ctx(lctx);
-    //}
-
     // init the backend samplers as part of the context creation
     pimpl->samplers.resize(cparams.n_seq_max);
     pimpl->samplers_seq_config.resize(cparams.n_seq_max);
@@ -1578,18 +1585,32 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 common_init_result::~common_init_result() = default;
 
 std::string common_get_model_endpoint() {
-    const char * model_endpoint_env = getenv("MODEL_ENDPOINT");
-    // We still respect the use of environment-variable "HF_ENDPOINT" for backward-compatibility.
-    const char * hf_endpoint_env = getenv("HF_ENDPOINT");
-    const char * endpoint_env = model_endpoint_env ? model_endpoint_env : hf_endpoint_env;
-    std::string model_endpoint = "https://huggingface.co/";
-    if (endpoint_env) {
-        model_endpoint = endpoint_env;
-        if (model_endpoint.back() != '/') {
-            model_endpoint += '/';
-        }
+    std::string endpoint = common_get_env("MODEL_ENDPOINT");
+    if (endpoint.empty()) {
+        // the HF_ENDPOINT variable is respected for backward compatibility
+        endpoint = common_get_env("HF_ENDPOINT");
     }
-    return model_endpoint;
+    if (endpoint.empty()) {
+        return "https://huggingface.co/";
+    }
+    if (endpoint.back() != '/') {
+        endpoint += '/';
+    }
+    return endpoint;
+}
+
+char * common_get_model_or_exit(int argc, char * argv[]) {
+    if (argc > 1) {
+        return argv[1];
+    }
+
+    char * path = getenv("LLAMACPP_TEST_MODELFILE");
+    if (!path || strlen(path) == 0) {
+        fprintf(stderr, "\033[33mWARNING: No model file provided. Skipping this test. Set LLAMACPP_TEST_MODELFILE=<gguf_model_path> to silence this warning and run this test.\n\033[0m");
+        exit(EXIT_SUCCESS);
+    }
+
+    return path;
 }
 
 common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
@@ -1623,21 +1644,126 @@ uint32_t common_context_seq_rm_max_rollback(llama_context * ctx) {
     return capability.arbitrary_ranges ? UINT32_MAX : capability.suffix_rollback_tokens;
 }
 
-void common_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+static void common_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     auto * mem = llama_get_memory(ctx);
     if (!llama_memory_seq_rm(mem, seq_id, p0, p1)) {
         GGML_ABORT("%s", string_format("failed to remove sequence %d with p0=%d, p1=%d\n", seq_id, p0, p1).c_str());
     }
 }
 
-void common_context_seq_cp(llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+static void common_context_seq_cp(llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     auto * mem = llama_get_memory(ctx);
     llama_memory_seq_cp(mem, seq_id_src, seq_id_dst, p0, p1);
 }
 
-void common_context_seq_add(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) {
+static void common_context_seq_add(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) {
     auto * mem = llama_get_memory(ctx);
     llama_memory_seq_add(mem, seq_id, p0, p1, delta);
+}
+
+void common_memory::init(llama_context * ctx_tgt, llama_context * ctx_dft) {
+    this->ctx_tgt = ctx_tgt;
+    this->ctx_dft = ctx_dft;
+}
+
+void common_memory::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+    common_context_seq_rm(ctx_tgt, seq_id, p0, p1);
+    if (ctx_dft) {
+        common_context_seq_rm(ctx_dft, seq_id, p0, p1);
+    }
+}
+
+common_memory_seq_rm_result common_memory_seq_rm_suffix(
+        llama_seq_id seq_id,
+        llama_pos requested_p0,
+        const common_memory_seq_rm_io & io,
+        const std::function<llama_pos(llama_pos)> & normalize_p0,
+        llama_pos & planned_p0) {
+    const auto clear_complete_sequences = [&]() {
+        const bool clear_target = io.remove(COMMON_MEMORY_CONTEXT_TARGET, seq_id, -1, -1);
+        const bool clear_draft = !io.has_draft ||
+                io.remove(COMMON_MEMORY_CONTEXT_DRAFT, seq_id, -1, -1);
+        if (!clear_target || !clear_draft) {
+            GGML_ABORT("sequence-removal recovery failed to clear a complete slot sequence");
+        }
+        planned_p0 = 0;
+    };
+
+    llama_pos target_p0 = requested_p0;
+    llama_pos target_p1 = -1;
+    llama_pos draft_p0 = requested_p0;
+    llama_pos draft_p1 = -1;
+    const bool target_planned = io.plan(
+            COMMON_MEMORY_CONTEXT_TARGET, seq_id, requested_p0, -1, target_p0, target_p1);
+    const bool draft_planned = !io.has_draft || io.plan(
+            COMMON_MEMORY_CONTEXT_DRAFT, seq_id, requested_p0, -1, draft_p0, draft_p1);
+    if (!target_planned || !draft_planned || target_p1 >= 0 || (io.has_draft && draft_p1 >= 0)) {
+        clear_complete_sequences();
+        return COMMON_MEMORY_SEQ_RM_FULL_REPROCESS;
+    }
+
+    planned_p0 = io.has_draft ? std::min(target_p0, draft_p0) : target_p0;
+    planned_p0 = normalize_p0(planned_p0);
+    const bool target_accepts = io.can_remove(
+            COMMON_MEMORY_CONTEXT_TARGET, seq_id, planned_p0, -1);
+    const bool draft_accepts = !io.has_draft || io.can_remove(
+            COMMON_MEMORY_CONTEXT_DRAFT, seq_id, planned_p0, -1);
+    if (!target_accepts || !draft_accepts) {
+        clear_complete_sequences();
+        return COMMON_MEMORY_SEQ_RM_FULL_REPROCESS;
+    }
+
+    const bool target_removed = io.remove(
+            COMMON_MEMORY_CONTEXT_TARGET, seq_id, planned_p0, -1);
+    const bool draft_removed = target_removed && (!io.has_draft || io.remove(
+            COMMON_MEMORY_CONTEXT_DRAFT, seq_id, planned_p0, -1));
+    if (!target_removed || !draft_removed) {
+        clear_complete_sequences();
+        return COMMON_MEMORY_SEQ_RM_MUTATION_FAILED;
+    }
+
+    return COMMON_MEMORY_SEQ_RM_APPLIED;
+}
+
+common_memory_seq_rm_result common_memory::seq_rm_suffix(
+        llama_seq_id seq_id,
+        llama_pos requested_p0,
+        const std::function<llama_pos(llama_pos)> & normalize_p0,
+        llama_pos & planned_p0) const {
+    common_memory_seq_rm_io io {
+        /*.has_draft =*/ ctx_dft != nullptr,
+        /*.plan =*/ [&](common_memory_context_kind kind, llama_seq_id seq_id,
+                        llama_pos p0, llama_pos p1, llama_pos & plan_p0, llama_pos & plan_p1) {
+            llama_context * ctx = kind == COMMON_MEMORY_CONTEXT_TARGET ? ctx_tgt : ctx_dft;
+            return ctx != nullptr && llama_memory_seq_rm_plan(
+                    llama_get_memory(ctx), seq_id, p0, p1, &plan_p0, &plan_p1);
+        },
+        /*.can_remove =*/ [&](common_memory_context_kind kind, llama_seq_id seq_id,
+                              llama_pos p0, llama_pos p1) {
+            llama_context * ctx = kind == COMMON_MEMORY_CONTEXT_TARGET ? ctx_tgt : ctx_dft;
+            return ctx != nullptr && llama_memory_can_seq_rm(llama_get_memory(ctx), seq_id, p0, p1);
+        },
+        /*.remove =*/ [&](common_memory_context_kind kind, llama_seq_id seq_id,
+                          llama_pos p0, llama_pos p1) {
+            llama_context * ctx = kind == COMMON_MEMORY_CONTEXT_TARGET ? ctx_tgt : ctx_dft;
+            return ctx != nullptr && llama_memory_seq_rm(llama_get_memory(ctx), seq_id, p0, p1);
+        },
+    };
+    return common_memory_seq_rm_suffix(seq_id, requested_p0, io, normalize_p0, planned_p0);
+}
+
+void common_memory::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const {
+    common_context_seq_cp(ctx_tgt, seq_id_src, seq_id_dst, p0, p1);
+    if (ctx_dft) {
+        common_context_seq_cp(ctx_dft, seq_id_src, seq_id_dst, p0, p1);
+    }
+}
+
+void common_memory::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const {
+    common_context_seq_add(ctx_tgt, seq_id, p0, p1, delta);
+    if (ctx_dft) {
+        common_context_seq_add(ctx_dft, seq_id, p0, p1, delta);
+    }
 }
 
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora) {
@@ -1685,6 +1811,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback           = params.load_progress_callback;
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
+    mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
     return mparams;
 }

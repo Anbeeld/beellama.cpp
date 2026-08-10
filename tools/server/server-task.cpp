@@ -1595,6 +1595,10 @@ json server_task_result_metrics::to_json() {
         { "kv_tail_partial_groups",          kv_tail_partial_groups },
         { "kv_tail_none_groups",             kv_tail_none_groups },
         { "kv_tail_degraded_sequences",      kv_tail_degraded_sequences },
+        { "n_draft_tokens_total",            n_draft_tokens_total },
+        { "n_draft_accepted_total",          n_draft_accepted_total },
+        { "n_draft_verif_steps_total",       n_draft_verif_steps_total },
+        { "n_accepted_per_pos_total",        n_accepted_per_pos_total },
 
         { "slots",                           slots_data },
     };
@@ -1667,61 +1671,6 @@ json server_task_result_get_lora::to_json() {
 
 json server_task_result_apply_lora::to_json() {
     return json {{ "success", true }};
-}
-
-//
-// server_prompt_cache
-//
-server_seq_rm_result server_plan_and_remove_suffix(
-        llama_seq_id seq_id,
-        llama_pos requested_p0,
-        const server_tokens & prompt_tokens,
-        const server_seq_rm_io & io,
-        llama_pos & planned_p0) {
-    const auto clear_complete_sequences = [&]() {
-        const bool clear_main = io.remove(SERVER_PROMPT_STATE_MAIN, seq_id, -1, -1);
-        const bool clear_draft = !io.has_draft ||
-                io.remove(SERVER_PROMPT_STATE_DRAFT, seq_id, -1, -1);
-        if (!clear_main || !clear_draft) {
-            GGML_ABORT("sequence-removal recovery failed to clear a complete slot sequence");
-        }
-        planned_p0 = 0;
-    };
-
-    llama_pos main_p0 = requested_p0;
-    llama_pos main_p1 = -1;
-    llama_pos draft_p0 = requested_p0;
-    llama_pos draft_p1 = -1;
-    const bool main_planned = io.plan(
-            SERVER_PROMPT_STATE_MAIN, seq_id, requested_p0, -1, main_p0, main_p1);
-    const bool draft_planned = !io.has_draft || io.plan(
-            SERVER_PROMPT_STATE_DRAFT, seq_id, requested_p0, -1, draft_p0, draft_p1);
-    if (!main_planned || !draft_planned || main_p1 >= 0 || (io.has_draft && draft_p1 >= 0)) {
-        clear_complete_sequences();
-        return SERVER_SEQ_RM_FULL_REPROCESS;
-    }
-
-    planned_p0 = io.has_draft ? std::min(main_p0, draft_p0) : main_p0;
-    planned_p0 = planned_p0 > 0 ? prompt_tokens.pos_next(prompt_tokens.size_up_to_pos(planned_p0)) : planned_p0;
-    const bool main_accepts = io.can_remove(
-            SERVER_PROMPT_STATE_MAIN, seq_id, planned_p0, -1);
-    const bool draft_accepts = !io.has_draft || io.can_remove(
-            SERVER_PROMPT_STATE_DRAFT, seq_id, planned_p0, -1);
-    if (!main_accepts || !draft_accepts) {
-        clear_complete_sequences();
-        return SERVER_SEQ_RM_FULL_REPROCESS;
-    }
-
-    const bool main_removed = io.remove(
-            SERVER_PROMPT_STATE_MAIN, seq_id, planned_p0, -1);
-    const bool draft_removed = main_removed && (!io.has_draft || io.remove(
-            SERVER_PROMPT_STATE_DRAFT, seq_id, planned_p0, -1));
-    if (!main_removed || !draft_removed) {
-        clear_complete_sequences();
-        return SERVER_SEQ_RM_MUTATION_FAILED;
-    }
-
-    return SERVER_SEQ_RM_APPLIED;
 }
 
 size_t server_prompt_cache::size() const {
@@ -1843,9 +1792,9 @@ bool server_prompt_cache::load(
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
-    float sim_best    = float(lcp_best) / tokens_new.size();
+    float f_sim_best  = float(lcp_best) / tokens_new.size();
 
-    SRV_TRC(" - looking for better prompt, base f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
+    SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
     auto it_best = states.end();
 
@@ -1854,25 +1803,25 @@ bool server_prompt_cache::load(
         const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
 
         const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
-        const float sim_cur    = float(lcp_cur) / tokens_new.size();
+        const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
 
-        SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, sim_cur);
+        SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
 
         // don't trash large prompts
         if (f_keep_cur < 0.25f) {
             continue;
         }
 
-        if (f_keep_best < f_keep_cur && sim_best < sim_cur) {
+        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
             f_keep_best = f_keep_cur;
-            sim_best    = sim_cur;
+            f_sim_best  = f_sim_cur;
 
             it_best = it;
         }
     }
 
     if (it_best != states.end()) {
-        SRV_TRC(" - found better prompt with f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
+        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
         const auto fail_load = [&]() {
             const bool clear_main = io.clear(SERVER_PROMPT_STATE_MAIN);

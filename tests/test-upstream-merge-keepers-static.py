@@ -36,6 +36,13 @@ def main() -> None:
         "KVarN's bufferless proxy allocation handling was lost during an upstream merge",
     )
 
+    backend = (ROOT / "ggml/src/ggml-backend.cpp").read_text(encoding="utf-8")
+    set_2d = backend.split("void ggml_backend_tensor_set_2d_async", 1)[1].split(
+        "void ggml_backend_tensor_get_2d_async", 1
+    )[0]
+    require(set_2d, "iface.set_tensor_2d_async == NULL", "2D async writes must test the write callback")
+    require(set_2d, "tensor write out of bounds", "2D async writes must report write bounds")
+
     vulkan = (ROOT / "ggml/src/ggml-vulkan/ggml-vulkan.cpp").read_text(encoding="utf-8")
     for needle in (
         "pipeline_kvarn_store",
@@ -139,6 +146,27 @@ def main() -> None:
         "the atomic DSA cache removal preflight was lost during an upstream merge",
     )
 
+    generic_kv = (ROOT / "src/llama-kv-cache.cpp").read_text(encoding="utf-8")
+    generic_kv_h = (ROOT / "src/llama-kv-cache.h").read_text(encoding="utf-8")
+    if generic_kv.count("dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);") < 4:
+        raise AssertionError("standard KV-tail routes must retain a concrete CPU owner for CPU buffer types")
+    for retired_generic_msa in ("msa_strict_slots", "get_k_idx", "cpy_k_idx", "n_embd_k_idx"):
+        if retired_generic_msa in generic_kv or retired_generic_msa in generic_kv_h:
+            raise AssertionError("MiniMax MSA index ownership must not return to the generic KV cache")
+
+    msa_h = (ROOT / "src/llama-kv-cache-msa.h").read_text(encoding="utf-8")
+    msa = (ROOT / "src/llama-kv-cache-msa.cpp").read_text(encoding="utf-8")
+    for needle in ("tail_tokens", "tail_type", "tail_tokens_requested", "tail_rollback_tokens"):
+        require(msa_h, needle, "MiniMax MSA must expose exact-tail configuration for its base cache")
+    require(msa, "if (!can_seq_rm(seq_id, p0, p1))", "MSA base/index removal must preflight atomically")
+    require(msa, "GGML_TYPE_F32, GGML_TYPE_F32", "the MSA index cache must remain ordinary F32 storage")
+    base_ctor = msa.split("kv_base = std::make_unique<llama_kv_cache>", 1)[1].split("kv_idx =", 1)[0]
+    for needle in ("n_ubatch", "tail_tokens", "tail_type", "tail_tokens_requested", "tail_rollback_tokens"):
+        require(base_ctor, needle, "MSA exact-tail configuration must be applied to kv_base")
+    idx_ctor = msa.split("kv_idx = std::make_unique<llama_kv_cache>", 1)[1].split("void llama_kv_cache_msa::clear", 1)[0]
+    if "tail_tokens" in idx_ctor or "tail_type" in idx_ctor:
+        raise AssertionError("MSA index storage must not receive a precision-tail configuration")
+
     model = (ROOT / "src/llama-model.cpp").read_text(encoding="utf-8")
     create_memory = model.split("llama_memory_i * llama_model::create_memory", 1)[1]
     null_memory_arches = create_memory.split("case LLM_ARCH_DEEPSEEK32:", 1)[0]
@@ -157,6 +185,15 @@ def main() -> None:
     output_size_pos = load_model.find("params_base.n_outputs_max = server_n_outputs_max(params_base)")
     if resolve_pos < 0 or output_size_pos < 0 or resolve_pos > output_size_pos:
         raise AssertionError("the omitted DFlash draft maximum must resolve before server output-buffer sizing")
+
+    common_h = (ROOT / "common/common.h").read_text(encoding="utf-8")
+    common_cpp = (ROOT / "common/common.cpp").read_text(encoding="utf-8")
+    require(common_h, "seq_rm_suffix", "common_memory must own transactional target/draft suffix removal")
+    require(common_cpp, "common_memory::seq_rm_suffix", "common_memory suffix removal implementation is missing")
+    require(server_context, "slot.mem.seq_rm_suffix(", "the server must use common_memory for suffix transactions")
+    suffix_path = server_context.split("cached n_tokens =", 1)[1].split("If using an alora", 1)[0]
+    if "llama_memory_seq_rm_plan(" in suffix_path or "server_plan_and_remove_suffix(" in suffix_path:
+        raise AssertionError("the server still duplicates target/draft suffix planning outside common_memory")
 
     release = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
     require(release, "name: Build / Release", "the Bee release workflow was replaced by upstream's generic workflow")

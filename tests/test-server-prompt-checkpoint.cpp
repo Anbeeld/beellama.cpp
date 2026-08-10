@@ -23,6 +23,18 @@ static server_prompt make_prompt(const llama_tokens & tokens) {
     return prompt;
 }
 
+static common_memory_seq_rm_result test_seq_rm_suffix(
+        llama_seq_id seq_id,
+        llama_pos requested_p0,
+        const server_tokens & prompt_tokens,
+        const common_memory_seq_rm_io & io,
+        llama_pos & planned_p0) {
+    const auto normalize_p0 = [&](llama_pos value) {
+        return value > 0 ? prompt_tokens.pos_next(prompt_tokens.size_up_to_pos(value)) : value;
+    };
+    return common_memory_seq_rm_suffix(seq_id, requested_p0, io, normalize_p0, planned_p0);
+}
+
 static void prompt_cache_load_target_success_draft_failure_is_atomic() {
     server_prompt_cache cache(1, 0);
     server_prompt_cache_state saved;
@@ -68,19 +80,19 @@ static void server_unsupported_removal_falls_back_to_full_reprocess() {
     server_tokens prompt_tokens(llama_tokens(5626, 1), false);
     int partial_removals = 0;
     int full_clears = 0;
-    server_seq_rm_io io {
+    common_memory_seq_rm_io io {
         /*.has_draft =*/ true,
-        /*.plan =*/ [](server_prompt_state_kind kind, llama_seq_id, llama_pos, llama_pos,
+        /*.plan =*/ [](common_memory_context_kind kind, llama_seq_id, llama_pos, llama_pos,
                        llama_pos & planned_p0, llama_pos & planned_p1) {
-            if (kind == SERVER_PROMPT_STATE_DRAFT) {
+            if (kind == COMMON_MEMORY_CONTEXT_DRAFT) {
                 return false;
             }
             planned_p0 = 5504;
             planned_p1 = -1;
             return true;
         },
-        /*.can_remove =*/ [](server_prompt_state_kind, llama_seq_id, llama_pos, llama_pos) { return true; },
-        /*.remove =*/ [&](server_prompt_state_kind, llama_seq_id, llama_pos p0, llama_pos p1) {
+        /*.can_remove =*/ [](common_memory_context_kind, llama_seq_id, llama_pos, llama_pos) { return true; },
+        /*.remove =*/ [&](common_memory_context_kind, llama_seq_id, llama_pos p0, llama_pos p1) {
             if (p0 == -1 && p1 == -1) {
                 ++full_clears;
             } else {
@@ -90,8 +102,8 @@ static void server_unsupported_removal_falls_back_to_full_reprocess() {
         },
     };
     llama_pos planned_p0 = -1;
-    const auto result = server_plan_and_remove_suffix(0, 5626, prompt_tokens, io, planned_p0);
-    assert(result == SERVER_SEQ_RM_FULL_REPROCESS);
+    const auto result = test_seq_rm_suffix(0, 5626, prompt_tokens, io, planned_p0);
+    assert(result == COMMON_MEMORY_SEQ_RM_FULL_REPROCESS);
     assert(planned_p0 == 0);
     assert(partial_removals == 0);
     assert(full_clears == 2);
@@ -103,21 +115,21 @@ static void server_post_preflight_mutation_failure_clears_both_contexts() {
     bool draft_partial = false;
     bool main_cleared = false;
     bool draft_cleared = false;
-    server_seq_rm_io io {
+    common_memory_seq_rm_io io {
         /*.has_draft =*/ true,
-        /*.plan =*/ [](server_prompt_state_kind, llama_seq_id, llama_pos p0, llama_pos p1,
+        /*.plan =*/ [](common_memory_context_kind, llama_seq_id, llama_pos p0, llama_pos p1,
                        llama_pos & planned_p0, llama_pos & planned_p1) {
             planned_p0 = p0;
             planned_p1 = p1;
             return true;
         },
-        /*.can_remove =*/ [](server_prompt_state_kind, llama_seq_id, llama_pos, llama_pos) { return true; },
-        /*.remove =*/ [&](server_prompt_state_kind kind, llama_seq_id, llama_pos p0, llama_pos p1) {
+        /*.can_remove =*/ [](common_memory_context_kind, llama_seq_id, llama_pos, llama_pos) { return true; },
+        /*.remove =*/ [&](common_memory_context_kind kind, llama_seq_id, llama_pos p0, llama_pos p1) {
             if (p0 == -1 && p1 == -1) {
-                (kind == SERVER_PROMPT_STATE_MAIN ? main_cleared : draft_cleared) = true;
+                (kind == COMMON_MEMORY_CONTEXT_TARGET ? main_cleared : draft_cleared) = true;
                 return true;
             }
-            if (kind == SERVER_PROMPT_STATE_MAIN) {
+            if (kind == COMMON_MEMORY_CONTEXT_TARGET) {
                 main_partial = true;
                 return true;
             }
@@ -126,8 +138,8 @@ static void server_post_preflight_mutation_failure_clears_both_contexts() {
         },
     };
     llama_pos planned_p0 = -1;
-    const auto result = server_plan_and_remove_suffix(0, 5626, prompt_tokens, io, planned_p0);
-    assert(result == SERVER_SEQ_RM_MUTATION_FAILED);
+    const auto result = test_seq_rm_suffix(0, 5626, prompt_tokens, io, planned_p0);
+    assert(result == COMMON_MEMORY_SEQ_RM_MUTATION_FAILED);
     assert(main_partial && draft_partial);
     assert(main_cleared && draft_cleared);
 }
@@ -142,24 +154,24 @@ static void server_planned_removal_preserves_atomic_media_chunks() {
     assert(media_end > inside_media);
 
     llama_pos removed_p0 = -1;
-    server_seq_rm_io io {
+    common_memory_seq_rm_io io {
         /*.has_draft =*/ false,
-        /*.plan =*/ [&](server_prompt_state_kind, llama_seq_id, llama_pos, llama_pos,
+        /*.plan =*/ [&](common_memory_context_kind, llama_seq_id, llama_pos, llama_pos,
                        llama_pos & planned_p0, llama_pos & planned_p1) {
             planned_p0 = inside_media;
             planned_p1 = -1;
             return true;
         },
-        /*.can_remove =*/ [](server_prompt_state_kind, llama_seq_id, llama_pos, llama_pos) { return true; },
-        /*.remove =*/ [&](server_prompt_state_kind, llama_seq_id, llama_pos p0, llama_pos) {
+        /*.can_remove =*/ [](common_memory_context_kind, llama_seq_id, llama_pos, llama_pos) { return true; },
+        /*.remove =*/ [&](common_memory_context_kind, llama_seq_id, llama_pos p0, llama_pos) {
             removed_p0 = p0;
             return true;
         },
     };
 
     llama_pos planned_p0 = -1;
-    const auto result = server_plan_and_remove_suffix(0, requested_p0, prompt_tokens, io, planned_p0);
-    assert(result == SERVER_SEQ_RM_APPLIED);
+    const auto result = test_seq_rm_suffix(0, requested_p0, prompt_tokens, io, planned_p0);
+    assert(result == COMMON_MEMORY_SEQ_RM_APPLIED);
     assert(planned_p0 == media_end);
     assert(removed_p0 == media_end);
 }

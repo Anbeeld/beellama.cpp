@@ -129,10 +129,10 @@ def main() -> None:
     suffix_block = server_context.split(
         "// truncate any tokens that are beyond n_past for this slot", 1
     )[1].split("// If using an alora", 1)[0]
-    if "server_plan_and_remove_suffix(" not in suffix_block:
-        raise AssertionError("server prompt suffix trimming bypasses the atomic removal transaction")
-    if "common_context_seq_rm" in suffix_block:
-        raise AssertionError("server prompt suffix trimming still uses the aborting removal wrapper")
+    if "slot.mem.seq_rm_suffix(" not in suffix_block:
+        raise AssertionError("server prompt suffix trimming bypasses the common_memory transaction")
+    if "llama_memory_seq_rm" in suffix_block or "common_context_seq_rm" in suffix_block:
+        raise AssertionError("server prompt suffix trimming still duplicates raw memory removal")
 
     server_tests = (ROOT / "tests/test-server-prompt-checkpoint.cpp").read_text(encoding="utf-8")
     for regression in (
@@ -142,6 +142,10 @@ def main() -> None:
     ):
         if regression not in server_tests:
             raise AssertionError(f"server checkpoint tests lack {regression}")
+
+    context_source = (ROOT / "src/llama-context.cpp").read_text(encoding="utf-8")
+    if "96u*model.hparams.n_layer_all" not in context_source:
+        raise AssertionError("precision-tail graphs lack the post-upstream per-layer node allowance")
 
     state_cache_source = (ROOT / "src/llama-kv-cache.cpp").read_text(encoding="utf-8")
     state_tail_reader = state_cache_source.split("void llama_kv_cache::state_read_tail(", 1)[1].split(

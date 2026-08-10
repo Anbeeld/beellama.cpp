@@ -60,7 +60,12 @@ layout(push_constant) uniform parameter {
 #define TYPE_Q5_0 6u
 #define TYPE_Q5_1 7u
 #define TYPE_Q8_0 8u
+#define TYPE_IQ4_NL 20u
 #define TYPE_BF16 30u
+
+const float IQ4_NL_VALUES[16] = float[16](
+    -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0,
+       1.0,   13.0,  25.0,  38.0,  53.0,  69.0,  89.0, 113.0);
 
 #define FLAG_TAIL_K_BF16 (1u << 16u)
 #define FLAG_TAIL_V_BF16 (1u << 17u)
@@ -132,6 +137,12 @@ float load_body_k(uint base, uint dim) {
         const uint packed = byte_at_k(off + 4u + (iq & 15u));
         return d * float((packed >> (iq < 16u ? 0u : 4u)) & 15u) + m;
     }
+    if (type == TYPE_IQ4_NL) {
+        const uint off = base + ib * 18u;
+        const float d = fp16_bits(u16_at_k(off));
+        const uint packed = byte_at_k(off + 2u + (iq & 15u));
+        return d * IQ4_NL_VALUES[(packed >> (iq < 16u ? 0u : 4u)) & 15u];
+    }
     if (type == TYPE_Q5_0 || type == TYPE_Q5_1) {
         const bool affine = type == TYPE_Q5_1;
         const uint off = base + ib * (affine ? 24u : 22u);
@@ -166,6 +177,12 @@ float load_body_v(uint base, uint dim) {
         const float m = fp16_bits(u16_at_v(off + 2u));
         const uint packed = byte_at_v(off + 4u + (iq & 15u));
         return d * float((packed >> (iq < 16u ? 0u : 4u)) & 15u) + m;
+    }
+    if (type == TYPE_IQ4_NL) {
+        const uint off = base + ib * 18u;
+        const float d = fp16_bits(u16_at_v(off));
+        const uint packed = byte_at_v(off + 2u + (iq & 15u));
+        return d * IQ4_NL_VALUES[(packed >> (iq < 16u ? 0u : 4u)) & 15u];
     }
     if (type == TYPE_Q5_0 || type == TYPE_Q5_1) {
         const bool affine = type == TYPE_Q5_1;

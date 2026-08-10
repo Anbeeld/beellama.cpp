@@ -156,6 +156,9 @@ if ($Target) {
         ForEach-Object { if ($_ -match "^(test-[A-Za-z0-9_.-]+):") { $matches[1] } } |
         Where-Object { $_ -notlike "*.exe" } |
         Sort-Object -Unique
+    if ($ninjaTargets -match "(?m)^llama-eval-callback:") {
+        $testTargets += "llama-eval-callback"
+    }
 
     if ($testTargets) {
         Write-Host "[TESTS] Building $($testTargets.Count) test targets: $($testTargets -join ', ')"

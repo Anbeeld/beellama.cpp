@@ -2,7 +2,26 @@
 
 #include "json-schema-to-grammar.h"
 
+#include <algorithm>
+#include <cctype>
+
 namespace server_schema {
+
+static llama_tokens tokenize_reasoning_marker(const llama_vocab * vocab, const std::string & marker) {
+    llama_tokens tokens = common_tokenize(vocab, marker, false, true);
+    if (marker.empty() || std::isspace((unsigned char) marker.front())) {
+        return tokens;
+    }
+
+    while (!tokens.empty()) {
+        const std::string piece = common_token_to_piece(vocab, tokens.front(), true);
+        if (piece.empty() || !std::all_of(piece.begin(), piece.end(), [](unsigned char ch) { return std::isspace(ch); })) {
+            break;
+        }
+        tokens.erase(tokens.begin());
+    }
+    return tokens;
+}
 
 //
 // llama.cpp-specific completion schema
@@ -124,8 +143,8 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_desc("Dynamic temperature exponent, controls how entropy maps to temperature"));
 
     add((new field_num("repeat_last_n", params.sampling.penalty_last_n))
-        ->set_hard_limits(-1, INT32_MAX)
-        ->set_desc("Last n tokens to consider for penalizing repetition (0 = disabled, -1 = ctx-size)"));
+        ->set_hard_limits(0, INT32_MAX)
+        ->set_desc("Last n tokens to consider for penalizing repetition (0 = disabled)"));
 
     add((new field_num("repeat_penalty", params.sampling.penalty_repeat))
         ->set_desc("Control the repetition of token sequences in the generated text (1.0 = disabled)"));
@@ -151,8 +170,8 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_desc("Tokens that extend repetition beyond this length receive exponentially increasing penalty: multiplier * base ^ (sequence_length - allowed_length)"));
 
     add((new field_num("dry_penalty_last_n", params.sampling.dry_penalty_last_n))
-        ->set_hard_limits(-1, INT32_MAX)
-        ->set_desc("How many tokens to scan for repetitions (0 = disabled, -1 = context size)"));
+        ->set_hard_limits(0, INT32_MAX)
+        ->set_desc("How many tokens to scan for repetitions (0 = disabled)"));
 
     add((new field_num("mirostat", params.sampling.mirostat))
         ->set_limits(0, 2)
@@ -208,6 +227,7 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_num("speculative.p_min", params.speculative.draft.p_min))
         ->set_hard_limits(0.0f, 1.0f)
         ->set_desc("Minimum speculative decoding probability for draft tokens (0 = greedy)"));
+
 
     add((new field_str("speculative.type"))
         ->set_desc("Speculative decoding method (for debugging and research purposes)")
@@ -418,7 +438,8 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_desc("Token string marking the start of the reasoning budget section")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
             GGML_ASSERT(ctx.vocab != nullptr);
-            ctx.params.sampling.reasoning_budget_start = common_tokenize(ctx.vocab, data.at("reasoning_budget_start_tag").get<std::string>(), false, true);
+            ctx.params.sampling.reasoning_budget_start = tokenize_reasoning_marker(
+                ctx.vocab, data.at("reasoning_budget_start_tag").get<std::string>());
         }));
 
     add((new field_json("reasoning_budget_end_tags"))
@@ -427,18 +448,22 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_handler([&](field_eval_context & ctx, const json & data) {
             GGML_ASSERT(ctx.vocab != nullptr);
             ctx.params.sampling.reasoning_budget_end.clear();
+            ctx.params.sampling.reasoning_budget_forced.clear();
             if (data.contains("reasoning_budget_end_tags")) {
                 for (const auto & t : data.at("reasoning_budget_end_tags")) {
                     std::string tag = t.get<std::string>();
                     if (!tag.empty()) {
-                        ctx.params.sampling.reasoning_budget_end.push_back(common_tokenize(ctx.vocab, tag, false, true));
+                        ctx.params.sampling.reasoning_budget_end.push_back(tokenize_reasoning_marker(ctx.vocab, tag));
                     }
                 }
             } else if (data.contains("reasoning_budget_end_tag")) {
                 std::string tag = data.at("reasoning_budget_end_tag").get<std::string>();
                 if (!tag.empty()) {
-                    ctx.params.sampling.reasoning_budget_end.push_back(common_tokenize(ctx.vocab, tag, false, true));
+                    ctx.params.sampling.reasoning_budget_end.push_back(tokenize_reasoning_marker(ctx.vocab, tag));
                 }
+            }
+            if (!ctx.params.sampling.reasoning_budget_end.empty()) {
+                ctx.params.sampling.reasoning_budget_forced = ctx.params.sampling.reasoning_budget_end.front();
             }
         }));
 
@@ -545,12 +570,11 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
 task_params eval_llama_cmpl_schema(
                 const llama_vocab * vocab,
                 const common_params & params_base,
-                const int n_ctx_slot,
                 const std::vector<llama_logit_bias> & logit_bias_eog,
                 const json & data) {
     task_params params;
 
-    // Sampling parameter defaults are loaded from the global server context (but individual requests can still them)
+    // Sampling parameter defaults are loaded from the global server context (but individual requests can still override them)
     params.sampling      = params_base.sampling;
     params.speculative   = params_base.speculative;
     params.reasoning_loop_guard = params_base.reasoning_loop_guard;
@@ -580,15 +604,6 @@ task_params eval_llama_cmpl_schema(
 
     // post-processing
     {
-        if (params.sampling.penalty_last_n == -1) {
-            // note: should be the slot's context and not the full context, but it's ok
-            params.sampling.penalty_last_n = n_ctx_slot;
-        }
-
-        if (params.sampling.dry_penalty_last_n == -1) {
-            params.sampling.dry_penalty_last_n = n_ctx_slot;
-        }
-
         // if "reasoning_format" is not provided, its handler will not be called, we will need to handle it here
         auto reasoning_format = params.chat_parser_params.reasoning_format;
         params.chat_parser_params.reasoning_in_content = params.stream && (reasoning_format == COMMON_REASONING_FORMAT_DEEPSEEK_LEGACY);

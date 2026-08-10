@@ -558,6 +558,10 @@ struct server_task_result_metrics : server_task_result {
     uint64_t kv_tail_partial_groups     = 0;
     uint64_t kv_tail_none_groups        = 0;
     uint64_t kv_tail_degraded_sequences = 0;
+    uint64_t n_draft_tokens_total      = 0;
+    uint64_t n_draft_accepted_total    = 0;
+    uint64_t n_draft_verif_steps_total = 0;
+    std::vector<uint64_t> n_accepted_per_pos_total;
 
     // while we can also use std::vector<server_slot> this requires copying the slot object which can be quite messy
     // therefore, we use json to temporarily store the slot.to_json() result
@@ -644,27 +648,6 @@ struct server_prompt_cache_state_io {
     std::function<bool(server_prompt_state_kind, const std::vector<uint8_t> &)> restore;
     std::function<bool(server_prompt_state_kind)> clear;
 };
-
-enum server_seq_rm_result {
-    SERVER_SEQ_RM_APPLIED,
-    SERVER_SEQ_RM_FULL_REPROCESS,
-    SERVER_SEQ_RM_MUTATION_FAILED,
-};
-
-struct server_seq_rm_io {
-    bool has_draft;
-    std::function<bool(server_prompt_state_kind, llama_seq_id, llama_pos, llama_pos,
-                       llama_pos &, llama_pos &)> plan;
-    std::function<bool(server_prompt_state_kind, llama_seq_id, llama_pos, llama_pos)> can_remove;
-    std::function<bool(server_prompt_state_kind, llama_seq_id, llama_pos, llama_pos)> remove;
-};
-
-server_seq_rm_result server_plan_and_remove_suffix(
-        llama_seq_id seq_id,
-        llama_pos requested_p0,
-        const server_tokens & prompt_tokens,
-        const server_seq_rm_io & io,
-        llama_pos & planned_p0);
 
 struct server_prompt_data {
     std::vector<uint8_t> main;
