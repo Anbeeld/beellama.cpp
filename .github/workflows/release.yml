@@ -300,7 +300,11 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        if: ${{ always() }}
+        # Skip on failure: a crashed build stores nothing and refreshes no entry
+        # mtimes, so evict-old-files could cull healthy entries and save a
+        # degraded cache. Cancelled (e.g. 6h timeout) jobs keep their partial
+        # progress so the next run resumes from it.
+        if: ${{ success() || cancelled() }}
         uses: ./.github/actions/save-rolling-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-macos-arm64
@@ -388,7 +392,11 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        if: ${{ always() }}
+        # Skip on failure: a crashed build stores nothing and refreshes no entry
+        # mtimes, so evict-old-files could cull healthy entries and save a
+        # degraded cache. Cancelled (e.g. 6h timeout) jobs keep their partial
+        # progress so the next run resumes from it.
+        if: ${{ success() || cancelled() }}
         uses: ./.github/actions/save-rolling-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-${{ matrix.os }}-cpu
@@ -465,7 +473,11 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        if: ${{ always() }}
+        # Skip on failure: a crashed build stores nothing and refreshes no entry
+        # mtimes, so evict-old-files could cull healthy entries and save a
+        # degraded cache. Cancelled (e.g. 6h timeout) jobs keep their partial
+        # progress so the next run resumes from it.
+        if: ${{ success() || cancelled() }}
         uses: ./.github/actions/save-rolling-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-ubuntu-vulkan-x64
@@ -557,7 +569,6 @@ jobs:
             -DGGML_CUDA_KVARN=ON \
             -DGGML_CUDA_FA=ON \
             -DHIP_PLATFORM=amd \
-            -DGGML_HIP_ROCWMMA_FATTN=ON \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_HIP_COMPILER_LAUNCHER=ccache \
@@ -569,7 +580,11 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        if: ${{ always() }}
+        # Skip on failure: a crashed build stores nothing and refreshes no entry
+        # mtimes, so evict-old-files could cull healthy entries and save a
+        # degraded cache. Cancelled (e.g. 6h timeout) jobs keep their partial
+        # progress so the next run resumes from it.
+        if: ${{ success() || cancelled() }}
         uses: ./.github/actions/save-rolling-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-ubuntu-rocm-${{ env.ROCM_VERSION }}-x64
@@ -677,7 +692,11 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        if: ${{ always() }}
+        # Skip on failure: a crashed build stores nothing and refreshes no entry
+        # mtimes, so evict-old-files could cull healthy entries and save a
+        # degraded cache. Cancelled (e.g. 6h timeout) jobs keep their partial
+        # progress so the next run resumes from it.
+        if: ${{ success() || cancelled() }}
         uses: ./.github/actions/save-rolling-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-ubuntu-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
@@ -769,7 +788,11 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        if: ${{ always() }}
+        # Skip on failure: a crashed build stores nothing and refreshes no entry
+        # mtimes, so evict-old-files could cull healthy entries and save a
+        # degraded cache. Cancelled (e.g. 6h timeout) jobs keep their partial
+        # progress so the next run resumes from it.
+        if: ${{ success() || cancelled() }}
         uses: ./.github/actions/save-rolling-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-ubuntu-cuda-${{ matrix.cuda }}-x64
@@ -855,7 +878,11 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        if: ${{ always() }}
+        # Skip on failure: a crashed build stores nothing and refreshes no entry
+        # mtimes, so evict-old-files could cull healthy entries and save a
+        # degraded cache. Cancelled (e.g. 6h timeout) jobs keep their partial
+        # progress so the next run resumes from it.
+        if: ${{ success() || cancelled() }}
         uses: ./.github/actions/save-rolling-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-cpu-x64
@@ -954,7 +981,11 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        if: ${{ always() }}
+        # Skip on failure: a crashed build stores nothing and refreshes no entry
+        # mtimes, so evict-old-files could cull healthy entries and save a
+        # degraded cache. Cancelled (e.g. 6h timeout) jobs keep their partial
+        # progress so the next run resumes from it.
+        if: ${{ success() || cancelled() }}
         uses: ./.github/actions/save-rolling-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
@@ -1074,7 +1105,11 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        if: ${{ always() }}
+        # Skip on failure: a crashed build stores nothing and refreshes no entry
+        # mtimes, so evict-old-files could cull healthy entries and save a
+        # degraded cache. Cancelled (e.g. 6h timeout) jobs keep their partial
+        # progress so the next run resumes from it.
+        if: ${{ success() || cancelled() }}
         uses: ./.github/actions/save-rolling-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-vulkan-${{ env.VULKAN_VERSION }}-x64
@@ -1171,7 +1206,11 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        if: ${{ always() }}
+        # Skip on failure: a crashed build stores nothing and refreshes no entry
+        # mtimes, so evict-old-files could cull healthy entries and save a
+        # degraded cache. Cancelled (e.g. 6h timeout) jobs keep their partial
+        # progress so the next run resumes from it.
+        if: ${{ success() || cancelled() }}
         uses: ./.github/actions/save-rolling-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-cuda-${{ matrix.cuda }}
@@ -1277,7 +1316,6 @@ jobs:
             -DGGML_NATIVE=OFF `
             -DGGML_CPU=OFF `
             -DGPU_TARGETS="${env:GPU_TARGETS}" `
-            -DGGML_HIP_ROCWMMA_FATTN=ON `
             -DGGML_HIP=ON `
             -DGGML_CUDA_KVARN=ON `
             -DGGML_CUDA_FA=ON `
@@ -1285,7 +1323,10 @@ jobs:
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `
             -DCMAKE_HIP_COMPILER_LAUNCHER=ccache `
             -DLLAMA_BUILD_BORINGSSL=ON
-          cmake --build build --target ggml-hip -j ${env:NUMBER_OF_PROCESSORS}
+          # Leave one core free: 4 parallel ROCm clang instances exhaust the
+          # 16 GB runner and die with std::bad_alloc on cold ccache builds.
+          $buildJobs = [Math]::Max(1, [int]$env:NUMBER_OF_PROCESSORS - 1)
+          cmake --build build --target ggml-hip -j $buildJobs
           New-Item -ItemType Directory -Force -Path "build\bin\rocblas\library" | Out-Null
           New-Item -ItemType Directory -Force -Path "build\bin\hipblaslt\library" | Out-Null
           Copy-Item "${env:HIP_PATH}\bin\libhipblas.dll" "build\bin\"
@@ -1299,7 +1340,11 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        if: ${{ always() }}
+        # Skip on failure: a crashed build stores nothing and refreshes no entry
+        # mtimes, so evict-old-files could cull healthy entries and save a
+        # degraded cache. Cancelled (e.g. 6h timeout) jobs keep their partial
+        # progress so the next run resumes from it.
+        if: ${{ success() || cancelled() }}
         uses: ./.github/actions/save-rolling-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-hip-${{ env.HIPSDK_INSTALLER_VERSION }}-x64

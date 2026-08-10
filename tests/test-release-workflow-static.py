@@ -25,6 +25,15 @@ def main() -> None:
         "release workflow inventory diverged: "
         f"added={sorted(actual - expected)}, missing={sorted(expected - actual)}",
     )
+    stale_rocwmma = [
+        path.name
+        for path in WORKFLOWS.glob("*.y*ml")
+        if "GGML_HIP_ROCWMMA_FATTN" in path.read_text(encoding="utf-8")
+    ]
+    require(
+        not stale_rocwmma,
+        f"release workflows still pass removed GGML_HIP_ROCWMMA_FATTN: {stale_rocwmma}",
+    )
 
     release = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
     preview_dispatch = (WORKFLOWS / "release-preview-dispatch.yml").read_text(encoding="utf-8")
@@ -79,9 +88,10 @@ def main() -> None:
         "every release cache must fall back to the same backend/toolchain key in the parent channel",
     )
     require(
-        release.count("if: ${{ always() }}")
+        release.count("if: ${{ success() || cancelled() }}")
         == save_count,
-        "every rolling-cache save must run for preview and stable release builds",
+        "every rolling-cache save must run for successful and cancelled builds, "
+        "but skip failed builds so a crash cannot evict healthy entries",
     )
     require(
         "always() && needs.release-meta.outputs.preview == 'true'" not in release,
