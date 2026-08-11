@@ -849,11 +849,44 @@ static bool test_kvarn_partial_checkpoint_history(
         LOG_ERR("%s: historical checkpoint A continuation changed\n", __func__);
         return false;
     }
+    // Partial state references the still-live ordinary-cache body. Restore the
+    // self-contained anchor before testing another historical checkpoint;
+    // checkpoint A legitimately removed B's later reference cells.
+    if (llama_state_seq_set_data_ext(
+                context.get(), live_self.data(), live_self.size(), 0, self_flags) != live_self.size()) {
+        LOG_ERR("%s: failed to reestablish live anchor before checkpoint B\n", __func__);
+        return false;
+    }
     std::vector<float> restored_b;
     if (!restore_partial(checkpoint_b) || !decode_probe(probe_b, checkpoint_b_past, restored_b) ||
             !logits_match(oracle_b, restored_b)) {
         LOG_ERR("%s: historical checkpoint B continuation changed\n", __func__);
         return false;
+    }
+
+    // Establish the byte baseline immediately before prepare/free so the
+    // lifetime contract is isolated from unrelated state captures above.
+    std::vector<uint8_t> before_abandon;
+    if (!save_partial(before_abandon)) {
+        LOG_ERR("%s: failed to save abandoned-plan destination baseline\n", __func__);
+        return false;
+    }
+    {
+        const llama_pos pos_before = llama_memory_seq_pos_max(llama_get_memory(context.get()), 0);
+        std::unique_ptr<llama_state_seq_restore_plan, decltype(&llama_state_seq_restore_plan_free)> abandoned(
+                llama_state_seq_prepare_data_ext(
+                        context.get(), checkpoint_b.data(), checkpoint_b.size(), 0, partial_flags),
+                llama_state_seq_restore_plan_free);
+        if (!abandoned || llama_memory_seq_pos_max(llama_get_memory(context.get()), 0) != pos_before) {
+            LOG_ERR("%s: abandoned restore preparation mutated the live destination\n", __func__);
+            return false;
+        }
+        abandoned.reset();
+        std::vector<uint8_t> after_abandon;
+        if (!save_partial(after_abandon) || after_abandon != before_abandon) {
+            LOG_ERR("%s: destroying an uncommitted restore plan changed the destination\n", __func__);
+            return false;
+        }
     }
 
     LOG("\nKVarN partial checkpoint bytes: A=%zu B=%zu live=%zu\n",
@@ -867,7 +900,58 @@ static bool test_kvarn_partial_checkpoint_history(
         LOG(" %.3f", time_ms);
     }
     LOG("\n");
-    LOG("\nPASS: KVarN v15 host partial checkpoints are independent and transactional\n");
+    LOG("\nPASS: KVarN v15 host partial checkpoints are transactional with a live body anchor\n");
+    return true;
+}
+
+static bool test_kvarn_striped_capacity(
+        llama_model * model, const common_params & params, const llama_tokens & tokens) {
+    if (params.kvarn.type == LLAMA_KVARN_TYPE_DISABLED) {
+        return true;
+    }
+
+    auto context_params = common_context_params_to_llama(params);
+    context_params.n_ctx = 512;
+    context_params.n_batch = 128;
+    context_params.n_ubatch = 128;
+    context_params.n_seq_max = 2;
+    context_params.kv_unified = true;
+    context_params.kv_tail_tokens = 0;
+    context_params.kv_tail_config = nullptr;
+    auto context = llama_context_ptr{llama_init_from_model(model, context_params)};
+    if (!context) {
+        LOG_ERR("%s: failed to create striped KVarN capacity context\n", __func__);
+        return false;
+    }
+
+    constexpr int32_t stripe_capacity = 256;
+    for (int32_t offset = 0; offset < stripe_capacity; offset += 128) {
+        llama_batch_ptr batch(128, 0, 1);
+        for (int32_t i = 0; i < 128; ++i) {
+            const llama_token token = tokens.empty() ? llama_token(1) : tokens[(offset + i) % tokens.size()];
+            common_batch_add(batch.get(), token, offset + i, { 0 }, false);
+        }
+        if (llama_decode(context.get(), batch.get())) {
+            LOG_ERR("%s: sequence 0 failed before its equal-share stripe capacity\n", __func__);
+            return false;
+        }
+    }
+
+    llama_batch_ptr overflow(1, 0, 1);
+    common_batch_add(overflow.get(), tokens.empty() ? llama_token(1) : tokens.front(), stripe_capacity, { 0 }, false);
+    if (llama_decode(context.get(), overflow.get()) == 0) {
+        LOG_ERR("%s: sequence 0 borrowed capacity beyond its fixed stripe\n", __func__);
+        return false;
+    }
+
+    llama_batch_ptr other(1, 0, 1);
+    common_batch_add(other.get(), tokens.empty() ? llama_token(1) : tokens.front(), 0, { 1 }, false);
+    if (llama_decode(context.get(), other.get())) {
+        LOG_ERR("%s: sequence 0 stripe overflow aliased sequence 1 capacity\n", __func__);
+        return false;
+    }
+
+    LOG("\nPASS: KVarN fixed stripes enforce 256-token equal shares without cross-sequence aliasing\n");
     return true;
 }
 
@@ -1302,6 +1386,9 @@ int main(int argc, char ** argv) {
     if (!test_kvarn_partial_checkpoint_history(model, params, tokens)) {
         return 1;
     }
+    if (!test_kvarn_striped_capacity(model, params, tokens)) {
+        return 1;
+    }
 
     if (!test_tail_state_contract(model, params, tokens)) {
         return 1;
@@ -1330,14 +1417,22 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // Test 4: seq copy (host)
-    if (!test_seq_cp_host(model, params, tokens, result_baseline)) {
-        return 1;
-    }
+    // Generic full-context session state assumes the physical layout is
+    // unchanged when n_seq_max grows from 1 to 2. Fixed-stripe KVarN changes
+    // that layout by design; its host/on-device cross-sequence contracts are
+    // covered by the dedicated selective-state tests above.
+    if (params.kvarn.type == LLAMA_KVARN_TYPE_DISABLED) {
+        // Test 4: seq copy (host)
+        if (!test_seq_cp_host(model, params, tokens, result_baseline)) {
+            return 1;
+        }
 
-    // Test 5: seq copy (device)
-    if (!test_seq_cp_device(model, params, tokens, result_baseline)) {
-        return 1;
+        // Test 5: seq copy (device)
+        if (!test_seq_cp_device(model, params, tokens, result_baseline)) {
+            return 1;
+        }
+    } else {
+        LOG("\nSKIP: generic full-context seq copy changes fixed-stripe KVarN topology\n");
     }
 
     LOG("\nAll tests passed.\n");

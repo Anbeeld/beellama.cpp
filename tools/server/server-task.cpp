@@ -1606,7 +1606,7 @@ json server_task_result_metrics::to_json() {
         { "prompt_cache_restore_attempts",    prompt_cache_restore_attempts },
         { "prompt_cache_restore_successes",   prompt_cache_restore_successes },
         { "prompt_cache_restore_failures",    prompt_cache_restore_failures },
-        { "prompt_cache_resident_bytes",      prompt_cache_resident_bytes },
+        { "prompt_cache_accounted_bytes",     prompt_cache_accounted_bytes },
         { "n_draft_tokens_total",            n_draft_tokens_total },
         { "n_draft_accepted_total",          n_draft_accepted_total },
         { "n_draft_verif_steps_total",       n_draft_verif_steps_total },
@@ -1685,7 +1685,7 @@ json server_task_result_apply_lora::to_json() {
     return json {{ "success", true }};
 }
 
-size_t server_prompt_cache::size() const {
+size_t server_prompt_cache::accounted_size() const {
     size_t res = 0;
     std::unordered_set<const void *> checkpoint_storage;
 
@@ -1753,7 +1753,7 @@ server_prompt_cache_state * server_prompt_cache::admit(server_prompt_cache_state
     }
 
     const size_t state_size_new = candidate.data.size() + checkpoints_size;
-    const size_t standalone_size = candidate.size();
+    const size_t standalone_size = candidate.accounted_size();
 
     // skip over-limit entries to avoid disturbing the cache
     if (limit_size > 0 && (state_size_new > limit_size || standalone_size > limit_size)) {
@@ -1794,10 +1794,10 @@ server_prompt_cache_state * server_prompt_cache::admit(server_prompt_cache_state
 
     if (limit_size > 0) {
         // The candidate is already present and fully materialized. Evict only
-        // older entries until unique resident accounting is within budget.
-        while (!states.empty() && size() > limit_size) {
+        // older entries until unique payload accounting is within budget.
+        while (!states.empty() && accounted_size() > limit_size) {
             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
-                    states.front().size() / (1024.0 * 1024.0));
+                    states.front().accounted_size() / (1024.0 * 1024.0));
 
             states.pop_front();
         }
@@ -1843,15 +1843,107 @@ bool server_prompt_cache::erase(const server_prompt_cache_state * entry) {
     return false;
 }
 
+bool server_prompt_restore_transaction(
+        server_prompt_state_view target,
+        server_prompt_state_view draft,
+        server_prompt_state_view speculative,
+        const server_prompt_restore_transaction_io & io) {
+    if ((io.restore_target && target.size == 0) ||
+            (io.restore_draft && draft.size == 0) ||
+            !io.prepare || !io.commit) {
+        return false;
+    }
+
+    if ((io.restore_target && !io.prepare(SERVER_PROMPT_STATE_MAIN, target)) ||
+            (io.restore_draft && !io.prepare(SERVER_PROMPT_STATE_DRAFT, draft)) ||
+            (io.restore_speculative && !io.prepare(SERVER_PROMPT_STATE_SPECULATIVE, speculative))) {
+        return false;
+    }
+
+    // Speculative apply is prepared and no-fail. Memory commits likewise only
+    // publish already-validated backend writes and metadata.
+    if (io.restore_speculative) {
+        io.commit(SERVER_PROMPT_STATE_SPECULATIVE);
+    }
+    if (io.restore_target) {
+        io.commit(SERVER_PROMPT_STATE_MAIN);
+    }
+    if (io.restore_draft) {
+        io.commit(SERVER_PROMPT_STATE_DRAFT);
+    }
+    return true;
+}
+
+bool server_prompt_restore_transaction(
+        llama_context * target,
+        llama_context * draft,
+        common_speculative * speculative,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags,
+        server_prompt_state_view target_state,
+        server_prompt_state_view draft_state,
+        server_prompt_state_view speculative_state,
+        bool restore_target,
+        bool restore_draft,
+        bool restore_speculative) {
+    using memory_plan_ptr = std::unique_ptr<
+            llama_state_seq_restore_plan,
+            decltype(&llama_state_seq_restore_plan_free)>;
+    using speculative_plan_ptr = std::unique_ptr<
+            common_speculative_state_restore_plan,
+            decltype(&common_speculative_state_restore_plan_free)>;
+
+    memory_plan_ptr target_plan(nullptr, llama_state_seq_restore_plan_free);
+    memory_plan_ptr draft_plan(nullptr, llama_state_seq_restore_plan_free);
+    speculative_plan_ptr speculative_plan(nullptr, common_speculative_state_restore_plan_free);
+
+    server_prompt_restore_transaction_io io {
+        /*.restore_target =*/ restore_target,
+        /*.restore_draft =*/ restore_draft,
+        /*.restore_speculative =*/ restore_speculative,
+        /*.prepare =*/ [&](server_prompt_state_kind kind, server_prompt_state_view state) {
+            if (kind == SERVER_PROMPT_STATE_SPECULATIVE) {
+                speculative_plan.reset(common_speculative_prepare_state(
+                        speculative, seq_id, state.data, state.size));
+                return speculative_plan != nullptr;
+            }
+
+            llama_context * ctx = kind == SERVER_PROMPT_STATE_MAIN ? target : draft;
+            memory_plan_ptr & plan = kind == SERVER_PROMPT_STATE_MAIN ? target_plan : draft_plan;
+            if (ctx == nullptr) {
+                return false;
+            }
+            plan.reset(llama_state_seq_prepare_data_ext(
+                    ctx, state.data, state.size, seq_id, flags));
+            return plan != nullptr;
+        },
+        /*.commit =*/ [&](server_prompt_state_kind kind) {
+            if (kind == SERVER_PROMPT_STATE_SPECULATIVE) {
+                common_speculative_state_restore_plan_commit(speculative_plan.get());
+                return;
+            }
+            memory_plan_ptr & plan = kind == SERVER_PROMPT_STATE_MAIN ? target_plan : draft_plan;
+            const size_t expected = kind == SERVER_PROMPT_STATE_MAIN ? target_state.size : draft_state.size;
+            GGML_ASSERT(llama_state_seq_restore_plan_commit(plan.get()) == expected);
+        },
+    };
+    return server_prompt_restore_transaction(
+            target_state, draft_state, speculative_state, io);
+}
+
 bool server_prompt_cache::load(
         server_prompt & prompt,
         const server_tokens & tokens_new,
+        size_t live_native_restorable_tokens,
+        int32_t reuse_alignment,
         const server_prompt_cache_state_io & io) {
-    const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+    const auto live_plan = server_prompt_plan_reuse(
+            prompt, tokens_new, reuse_alignment, live_native_restorable_tokens, false);
 
-    int restorable_best = lcp_best;
-    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
-    float f_sim_best  = float(lcp_best) / tokens_new.size();
+    size_t restorable_best = live_plan.restorable_tokens;
+    float f_keep_best = prompt.tokens.size() > 0 ?
+            float(restorable_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
+    float f_sim_best  = float(restorable_best) / tokens_new.size();
 
     SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
@@ -1859,21 +1951,24 @@ bool server_prompt_cache::load(
 
     // find the most similar cached prompt, that would also preserve the most context
     for (auto it = states.begin(); it != states.end(); ++it) {
-        const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
+        const auto plan_cur = server_prompt_plan_reuse(
+                it->prompt, tokens_new, reuse_alignment, 0, true);
+        const size_t lcp_cur = plan_cur.lexical_tokens;
+        const size_t restorable_cur = plan_cur.restorable_tokens;
 
         const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
         const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
 
-        SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
+        SRV_TRC("   - prompt with length %7zu, lcp = %7zu, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
 
         // don't trash large prompts
         if (f_keep_cur < 0.25f) {
             continue;
         }
 
-        if (lcp_cur > restorable_best ||
-                (lcp_cur == restorable_best && f_keep_cur > f_keep_best)) {
-            restorable_best = lcp_cur;
+        if (restorable_cur > restorable_best ||
+                (restorable_cur == restorable_best && f_keep_cur > f_keep_best)) {
+            restorable_best = restorable_cur;
             f_keep_best = f_keep_cur;
             f_sim_best  = f_sim_cur;
 
@@ -1883,53 +1978,22 @@ bool server_prompt_cache::load(
 
     if (it_best != states.end()) {
         ++restore_attempts;
-        SRV_TRC(" - found better restorable prompt with n = %d, f_keep = %.3f, f_sim = %.3f\n",
+        SRV_TRC(" - found better restorable prompt with n = %zu, f_keep = %.3f, f_sim = %.3f\n",
                 restorable_best, f_keep_best, f_sim_best);
-
-        const auto fail_load = [&]() {
-            const bool clear_main = io.clear(SERVER_PROMPT_STATE_MAIN);
-            const bool clear_draft = !io.has_draft || io.clear(SERVER_PROMPT_STATE_DRAFT);
-            const bool clear_spec = !io.has_speculative || io.clear(SERVER_PROMPT_STATE_SPECULATIVE);
-            if (!clear_main || !clear_draft || !clear_spec) {
-                GGML_ABORT("prompt-cache recovery failed to clear a complete slot sequence");
-            }
-            prompt.clear();
-            ++restore_failures;
-            return false;
-        };
 
         auto & data = it_best->data;
         if (data.main.empty() ||
                 io.has_draft != !data.drft.empty() ||
                 (!io.has_speculative && !data.spec.empty()) ||
-                !io.can_restore(SERVER_PROMPT_STATE_MAIN) ||
-                (io.has_draft && !io.can_restore(SERVER_PROMPT_STATE_DRAFT)) ||
-                (io.has_speculative && !io.can_restore(SERVER_PROMPT_STATE_SPECULATIVE))) {
+                !io.restore_transaction) {
             ++restore_failures;
             return false;
         }
 
-        server_prompt_data preimage;
-        if (!io.snapshot(SERVER_PROMPT_STATE_MAIN, preimage.main) ||
-                (io.has_draft && !io.snapshot(SERVER_PROMPT_STATE_DRAFT, preimage.drft)) ||
-                (io.has_speculative && !io.snapshot(SERVER_PROMPT_STATE_SPECULATIVE, preimage.spec))) {
-            ++restore_failures;
-            return false;
-        }
-
-        const bool restore_main = io.restore(SERVER_PROMPT_STATE_MAIN, data.main);
-        const bool restore_draft = restore_main &&
-                (!io.has_draft || io.restore(SERVER_PROMPT_STATE_DRAFT, data.drft));
-        const bool restore_spec = restore_draft &&
-                (!io.has_speculative || io.restore(SERVER_PROMPT_STATE_SPECULATIVE, data.spec));
-        if (!restore_main || !restore_draft || !restore_spec) {
-            const bool rollback_main = io.restore(SERVER_PROMPT_STATE_MAIN, preimage.main);
-            const bool rollback_draft = !io.has_draft || io.restore(SERVER_PROMPT_STATE_DRAFT, preimage.drft);
-            const bool rollback_spec = !io.has_speculative ||
-                    io.restore(SERVER_PROMPT_STATE_SPECULATIVE, preimage.spec);
-            if (!rollback_main || !rollback_draft || !rollback_spec) {
-                return fail_load();
-            }
+        if (!io.restore_transaction(
+                    data.main.data(), data.main.size(),
+                    data.drft.data(), data.drft.size(),
+                    data.spec.data(), data.spec.size())) {
             ++restore_failures;
             return false;
         }
@@ -1947,73 +2011,38 @@ bool server_prompt_cache::load(
         llama_context * ctx_tgt,
         llama_context * ctx_dft,
         common_speculative * spec,
-        int32_t id_slot) {
+        int32_t id_slot,
+        size_t live_native_restorable_tokens,
+        int32_t reuse_alignment) {
     constexpr llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED;
     server_prompt_cache_state_io io {
         /*.has_draft =*/ ctx_dft != nullptr,
         /*.has_speculative =*/ spec != nullptr,
-        /*.can_restore =*/ [&](server_prompt_state_kind kind) {
-            if (kind == SERVER_PROMPT_STATE_SPECULATIVE) {
-                return spec != nullptr;
-            }
-            llama_context * ctx = kind == SERVER_PROMPT_STATE_MAIN ? ctx_tgt : ctx_dft;
-            return ctx != nullptr && llama_memory_state_seq_can_restore_ext(
-                    llama_get_memory(ctx), id_slot, flags);
-        },
-        /*.snapshot =*/ [&](server_prompt_state_kind kind, std::vector<uint8_t> & data) {
-            if (kind == SERVER_PROMPT_STATE_SPECULATIVE) {
-                data.clear();
-                common_speculative_get_state(spec, id_slot, data);
-                return true;
-            }
-            llama_context * ctx = kind == SERVER_PROMPT_STATE_MAIN ? ctx_tgt : ctx_dft;
-            if (ctx == nullptr || !llama_memory_state_seq_can_save_ext(
-                    llama_get_memory(ctx), id_slot, flags)) {
-                return false;
-            }
-            const size_t size = llama_state_seq_get_size_ext(ctx, id_slot, flags);
-            if (size == 0) {
-                return false;
-            }
-            try {
-                data.resize(size);
-            } catch (const std::bad_alloc &) {
-                return false;
-            }
-            return llama_state_seq_get_data_ext(
-                    ctx, data.data(), data.size(), id_slot, flags) == data.size();
-        },
-        /*.restore =*/ [&](server_prompt_state_kind kind, const std::vector<uint8_t> & data) {
-            if (kind == SERVER_PROMPT_STATE_SPECULATIVE) {
-                return common_speculative_set_state(spec, id_slot, data);
-            }
-            llama_context * ctx = kind == SERVER_PROMPT_STATE_MAIN ? ctx_tgt : ctx_dft;
-            return ctx != nullptr &&
-                   llama_state_seq_set_data_ext(ctx, data.data(), data.size(), id_slot, flags) == data.size();
-        },
-        /*.clear =*/ [&](server_prompt_state_kind kind) {
-            if (kind == SERVER_PROMPT_STATE_SPECULATIVE) {
-                return common_speculative_set_state(spec, id_slot, {});
-            }
-            llama_context * ctx = kind == SERVER_PROMPT_STATE_MAIN ? ctx_tgt : ctx_dft;
-            return ctx != nullptr && llama_memory_seq_rm(llama_get_memory(ctx), id_slot, -1, -1);
+        /*.restore_transaction =*/ [&](const uint8_t * main, size_t main_size,
+                                       const uint8_t * drft, size_t drft_size,
+                                       const uint8_t * speculative_state, size_t speculative_size) {
+            return server_prompt_restore_transaction(
+                    ctx_tgt, ctx_dft, spec, id_slot, flags,
+                    { main, main_size }, { drft, drft_size },
+                    { speculative_state, speculative_size },
+                    true, ctx_dft != nullptr, spec != nullptr);
         },
     };
 
-    return load(prompt, tokens_new, io);
+    return load(prompt, tokens_new, live_native_restorable_tokens, reuse_alignment, io);
 }
 
 void server_prompt_cache::update() {
     if (limit_size > 0) {
-        while (!states.empty() && size() > limit_size) {
-            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
+        while (!states.empty() && accounted_size() > limit_size) {
+            SRV_WRN(" - cache accounted-payload limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().accounted_size() / (1024.0 * 1024.0));
 
             states.pop_front();
         }
     }
 
     // average size per token
-    const float size_per_token = std::max<float>(1.0f, float(size()) / (std::max<size_t>(1, n_tokens())));
+    const float size_per_token = std::max<float>(1.0f, float(accounted_size()) / (std::max<size_t>(1, n_tokens())));
 
     // dynamically increase the token limit if it can fit in the memory limit
     const size_t limit_tokens_cur = limit_size > 0 ? std::max<size_t>(limit_tokens, limit_size/size_per_token) : limit_tokens;
@@ -2021,17 +2050,17 @@ void server_prompt_cache::update() {
     if (limit_tokens > 0) {
         while (!states.empty() && n_tokens() > limit_tokens_cur) {
             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
-                    limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
+                    limit_tokens, limit_tokens_cur, states.front().accounted_size() / (1024.0 * 1024.0));
 
             states.pop_front();
         }
     }
 
     SRV_TRC(" - cache state: %zu prompts, %.3f MiB (limits: %.3f MiB, %zu tokens, %zu est)\n",
-            states.size(), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
+            states.size(), accounted_size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
 
     for (const auto & state : states) {
         SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
-                (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0));
+                (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.accounted_size() / (1024.0 * 1024.0));
     }
 }

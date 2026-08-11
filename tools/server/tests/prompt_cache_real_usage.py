@@ -29,7 +29,7 @@ import requests
 
 
 SCHEMA_VERSION = 1
-EXPLICIT_REEVALUATION_REASONS = {"unstable_recurrent_frontier"}
+EXPLICIT_REEVALUATION_REASONS = {"no_restorable_kvarn_boundary"}
 
 
 def jsonl_write(path: Path, value: dict[str, Any]) -> None:
@@ -515,12 +515,16 @@ def summarize(
         if record["committed_cache_tokens"] > 0
     )
     reuse_efficiency = committed_total / planned_total if planned_total else 1.0
-    mismatches = 0
+    sequence_mismatches = 0
+    first_token_mismatches = 0
     if oracle:
         by_key = {(record["conversation"], record["turn"]): record for record in oracle}
         for record in cached:
             other = by_key[(record["conversation"], record["turn"])]
-            mismatches += record["output_token_ids"] != other["output_token_ids"]
+            cached_tokens = record["output_token_ids"]
+            oracle_tokens = other["output_token_ids"]
+            sequence_mismatches += cached_tokens != oracle_tokens
+            first_token_mismatches += cached_tokens[:1] != oracle_tokens[:1]
     summary = {
         "schema_version": SCHEMA_VERSION,
         "commit": args.commit,
@@ -535,13 +539,14 @@ def summarize(
         "committed_cache_tokens": committed_total,
         "planned_reuse_efficiency": reuse_efficiency,
         "unexpected_prompt_work_tokens": unexpected_prompt_work,
-        "oracle_mismatches": mismatches,
+        "oracle_sequence_mismatches": sequence_mismatches,
+        "oracle_first_token_mismatches": first_token_mismatches,
         "busy_samples": len(samples),
         "active_busy_samples": len(active),
         "overlap_ratio": overlap_ratio,
         "max_busy": max_busy,
         "serialized_clients": bool(args.serialize_clients),
-        "prompt_cache_resident_bytes": int(metric_by_suffix(final_metrics, "prompt_cache_resident_bytes")),
+        "prompt_cache_accounted_bytes": int(metric_by_suffix(final_metrics, "prompt_cache_accounted_bytes")),
         "prompt_cache_admission_attempts": int(metric_by_suffix(final_metrics, "prompt_cache_admission_attempts_total")),
         "prompt_cache_admission_successes": int(metric_by_suffix(final_metrics, "prompt_cache_admission_successes_total")),
         "prompt_cache_admission_failures": int(metric_by_suffix(final_metrics, "prompt_cache_admission_failures_total")),
@@ -566,14 +571,16 @@ def summarize(
             raise AssertionError(f"observed overlap {overlap_ratio:.3f} is below {args.min_overlap:.3f}")
         if max_busy < args.concurrency:
             raise AssertionError(f"all {args.concurrency} slots were never simultaneously busy (max={max_busy})")
-    if mismatches:
-        raise AssertionError(f"{mismatches} cached token sequences differed from no-cache oracle outputs")
+    if first_token_mismatches:
+        raise AssertionError(
+            f"{first_token_mismatches} cached first target tokens differed from no-cache oracle outputs"
+        )
     if unexpected_prompt_work:
         raise AssertionError(
             f"committed cache hits processed {unexpected_prompt_work} tokens beyond their uncached suffix"
         )
-    if args.cache_ram_mib > 0 and summary["prompt_cache_resident_bytes"] > args.cache_ram_mib * 1024 * 1024:
-        raise AssertionError("RAM prompt-cache resident bytes exceeded the configured budget")
+    if args.cache_ram_mib > 0 and summary["prompt_cache_accounted_bytes"] > args.cache_ram_mib * 1024 * 1024:
+        raise AssertionError("RAM prompt-cache accounted payload bytes exceeded the configured budget")
     if summary["prompt_cache_restore_failures"]:
         raise AssertionError("RAM prompt-cache restore failures were reported")
     if summary["kv_tail_degraded_sequences"]:

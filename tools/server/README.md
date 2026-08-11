@@ -1077,6 +1077,13 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 | `llamacpp:n_tokens_max` | Counter | High watermark of the context size observed. |
 | `llamacpp:n_decode_total` | Counter | Total Number of llama_decode() calls. |
 | `llamacpp:n_busy_slots_per_decode` | Gauge | Average number of busy slots per llama_decode() call. |
+| `llamacpp:prompt_cache_accounted_bytes` | Gauge | Serialized prompt-cache payload bytes, deduplicating shared checkpoint buffers; excludes container capacity and allocator overhead. |
+| `llamacpp:prompt_cache_admission_attempts_total` | Counter | Prompt-cache RAM admission attempts. |
+| `llamacpp:prompt_cache_admission_successes_total` | Counter | Prompt-cache RAM admissions committed. |
+| `llamacpp:prompt_cache_admission_failures_total` | Counter | Prompt-cache RAM admissions rejected or failed. |
+| `llamacpp:prompt_cache_restore_attempts_total` | Counter | Prompt-cache RAM restore attempts. |
+| `llamacpp:prompt_cache_restore_successes_total` | Counter | Prompt-cache RAM restores committed. |
+| `llamacpp:prompt_cache_restore_failures_total` | Counter | Prompt-cache RAM restores rejected during preparation. |
 | `llamacpp:spec_decode_num_draft_tokens_total` | Counter | Total draft tokens generated (0 when spec-decode is off). |
 | `llamacpp:spec_decode_num_accepted_tokens_total` | Counter | Total draft tokens accepted by the target model (0 when spec-decode is off). |
 | `llamacpp:spec_decode_num_drafts_total` | Counter | Total speculative decoding verification steps (0 when spec-decode is off). |

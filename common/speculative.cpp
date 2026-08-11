@@ -930,7 +930,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         std::memcpy(&pos, data.data(), sizeof(llama_pos));
 
         pending_pos_last[seq_id] = pos;
-        pending_g_last[seq_id].resize(n_embd_dec);
+        GGML_ASSERT(pending_g_last[seq_id].size() == (size_t) n_embd_dec);
         std::memcpy(pending_g_last[seq_id].data(), data.data() + sizeof(llama_pos), (size_t) n_embd_dec * sizeof(float));
         return true;
     }
@@ -2853,13 +2853,14 @@ struct common_speculative_state_view {
 
 bool common_speculative_parse_state(
         llama_seq_id seq_id,
-        const std::vector<uint8_t> & data,
+        const uint8_t * data,
+        size_t data_size,
         common_speculative_state_view & view) {
     constexpr size_t header_size = sizeof(uint32_t)*3 + sizeof(llama_seq_id) + sizeof(uint64_t)*2;
-    if (data.size() < header_size) {
+    if (data_size < header_size || data == nullptr) {
         return false;
     }
-    const uint8_t * src = data.data();
+    const uint8_t * src = data;
     const auto read = [&](auto & value) {
         std::memcpy(&value, src, sizeof(value));
         src += sizeof(value);
@@ -2879,7 +2880,7 @@ bool common_speculative_parse_state(
     // be restored into a different server slot, so the envelope must not bind
     // otherwise portable implementation state to its source slot number.
     if (magic != 0x43455053 || version != 1 || saved_seq_id < 0 || seq_id < 0 ||
-            payload_size != data.size() - header_size) {
+            payload_size != data_size - header_size) {
         return false;
     }
     uint64_t actual_checksum = 1469598103934665603ULL;
@@ -2920,7 +2921,7 @@ bool common_speculative_validate_state(
     }
 
     common_speculative_state_view view;
-    if (!common_speculative_parse_state(seq_id, data, view)) {
+    if (!common_speculative_parse_state(seq_id, data.data(), data.size(), view)) {
         return false;
     }
     const std::vector<uint8_t> payload(view.payload, view.payload + view.payload_size);
@@ -2932,30 +2933,88 @@ bool common_speculative_validate_state(
     return false;
 }
 
+struct common_speculative_state_restore_plan {
+    common_speculative * spec = nullptr;
+    common_speculative_impl * impl = nullptr;
+    llama_seq_id seq_id = -1;
+    std::vector<uint8_t> payload;
+    bool clear_all = false;
+};
+
+common_speculative_state_restore_plan * common_speculative_prepare_state(
+        common_speculative * spec,
+        llama_seq_id seq_id,
+        const uint8_t * data,
+        size_t size) {
+    try {
+        auto plan = std::make_unique<common_speculative_state_restore_plan>();
+        plan->spec = spec;
+        plan->seq_id = seq_id;
+
+        if (spec == nullptr) {
+            return size == 0 ? plan.release() : nullptr;
+        }
+        if (size == 0) {
+            const std::vector<uint8_t> empty;
+            if (!std::all_of(spec->impls.begin(), spec->impls.end(), [&](const auto & impl) {
+                        return impl->validate_state(seq_id, empty);
+                    })) {
+                return nullptr;
+            }
+            plan->clear_all = true;
+            return plan.release();
+        }
+
+        common_speculative_state_view view;
+        if (!common_speculative_parse_state(seq_id, data, size, view)) {
+            return nullptr;
+        }
+        plan->payload.assign(view.payload, view.payload + view.payload_size);
+        for (auto & impl : spec->impls) {
+            if (uint32_t(impl->type) == view.type) {
+                if (!impl->validate_state(seq_id, plan->payload)) {
+                    return nullptr;
+                }
+                plan->impl = impl.get();
+                return plan.release();
+            }
+        }
+    } catch (const std::bad_alloc &) {
+        return nullptr;
+    }
+    return nullptr;
+}
+
+void common_speculative_state_restore_plan_commit(common_speculative_state_restore_plan * plan) {
+    GGML_ASSERT(plan != nullptr);
+    if (plan->spec == nullptr) {
+        return;
+    }
+    if (plan->clear_all) {
+        const std::vector<uint8_t> empty;
+        for (auto & impl : plan->spec->impls) {
+            GGML_ASSERT(impl->set_state(plan->seq_id, empty));
+        }
+        return;
+    }
+    GGML_ASSERT(plan->impl != nullptr);
+    GGML_ASSERT(plan->impl->set_state(plan->seq_id, plan->payload));
+}
+
+void common_speculative_state_restore_plan_free(common_speculative_state_restore_plan * plan) {
+    delete plan;
+}
+
 bool common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data) {
-    if (!common_speculative_validate_state(spec, seq_id, data)) {
+    std::unique_ptr<common_speculative_state_restore_plan,
+            decltype(&common_speculative_state_restore_plan_free)> plan(
+        common_speculative_prepare_state(spec, seq_id, data.data(), data.size()),
+        common_speculative_state_restore_plan_free);
+    if (!plan) {
         return false;
     }
-    if (spec == nullptr) {
-        return true;
-    }
-    if (data.empty()) {
-        bool cleared = true;
-        for (auto & impl : spec->impls) {
-            cleared = impl->set_state(seq_id, data) && cleared;
-        }
-        return cleared;
-    }
-
-    common_speculative_state_view view;
-    GGML_ASSERT(common_speculative_parse_state(seq_id, data, view));
-    const std::vector<uint8_t> payload(view.payload, view.payload + view.payload_size);
-    for (auto & impl : spec->impls) {
-        if (uint32_t(impl->type) == view.type) {
-            return impl->set_state(seq_id, payload);
-        }
-    }
-    return false;
+    common_speculative_state_restore_plan_commit(plan.get());
+    return true;
 }
 
 void common_speculative_print_stats(const common_speculative * spec) {

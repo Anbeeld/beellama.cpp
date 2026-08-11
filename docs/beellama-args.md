@@ -145,31 +145,34 @@ save and subsequent decode instead of being reported as successful.
 Prompt-cache message boundaries do not reset the suffix. Standard and KVarN
 state is sequence-selective in unified and non-unified layouts. The planner
 records lexical, restorable, and committed token counts and restores target,
-draft, and speculative state as one transaction. Hybrid/recurrent targets use
-stable durable checkpoint boundaries; work from the preceding checkpoint to an
-arbitrary lexical frontier is explicitly reported as
-`unstable_recurrent_frontier`. RAM entries use self-contained immutable state,
-are repeatably restorable, and clear an idle unified slot only after successful
-admission. Tail length affects quality, memory, and transfer cost, not logical
-prompt-cache eligibility.
+draft, and speculative state as one prepared transaction. Live slots and RAM
+entries are compared by safe restorable tokens before existing tie-breaks.
+Standard and recurrent caches keep upstream prompt batching; KVarN alone adds
+its descriptor-boundary eligibility rule. RAM entries use self-contained
+immutable state, are repeatably restorable, and clear an idle unified slot only
+after successful admission. Tail length affects quality, memory, and transfer
+cost, not logical prompt-cache eligibility.
 
-KVarN durable prompt checkpoints compose the recurrent cadence with the active
-descriptor group and therefore remain on complete 128-token boundaries for the
-current G128 presets. The transient live exact frontier may still service the
+KVarN durable prompt checkpoints remain on complete 128-token descriptor
+boundaries for the current G128 presets. The transient live exact frontier may still service the
 existing bounded speculative micro-rollback contract; it does not turn sealed
 history into arbitrary-position records. Standard KV has no KVarN group
 constraint and may restore any validated logical position. For standard caches
 with a precision tail, a hot partial checkpoint references the still-live body
-and transfers only its logical manifest and exact overlay. Self-contained RAM
+and transfers its logical manifest and exact overlay. The manifest remains
+proportional to the logical prefix, so this is not a native sealed-block arena
+or a strictly frontier-only operation. Copy-on-write sharing applies to
+serialized checkpoint byte buffers, not native KV blocks. Self-contained RAM
 state continues to own and transfer the body because it must survive source
 removal.
 
 Completion timing JSON includes `cache_lcp_n`, `cache_planned_n`,
 `cache_reprocessed_n`, `cache_source`, and `cache_reason`. Prometheus exports
 `prompt_cache_admission_*_total`, `prompt_cache_restore_*_total`,
-`prompt_cache_resident_bytes`, `n_busy_slots_per_decode`, and the
+`prompt_cache_accounted_bytes`, `n_busy_slots_per_decode`, and the
 `kv_tail_*` coverage/degradation gauges. A nonzero restore-failure or degraded
-tail metric is actionable rather than silently counted as a hit.
+tail metric is actionable rather than silently counted as a hit. Accounted
+bytes are serialized payload accounting, not exact process-resident memory.
 
 ## DFlash and adaptive draft depth
 

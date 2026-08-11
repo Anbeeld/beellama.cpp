@@ -75,6 +75,17 @@ bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id
 bool common_speculative_validate_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
 bool common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
 
+// Prepare validates and owns the decoded implementation payload. Commit has no
+// remaining parsing or allocation and cannot fail.
+struct common_speculative_state_restore_plan;
+common_speculative_state_restore_plan * common_speculative_prepare_state(
+        common_speculative * spec,
+        llama_seq_id seq_id,
+        const uint8_t * data,
+        size_t size);
+void common_speculative_state_restore_plan_commit(common_speculative_state_restore_plan * plan);
+void common_speculative_state_restore_plan_free(common_speculative_state_restore_plan * plan);
+
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
 

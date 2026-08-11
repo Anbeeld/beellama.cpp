@@ -90,6 +90,7 @@ $commonFlags = @(
     "-DGGML_CCACHE=ON",
     "-DGGML_NATIVE=OFF",
     "-DGGML_BACKEND_DL=$(if ($AllTests) { 'OFF' } else { 'ON' })",
+    "-DBUILD_SHARED_LIBS=$(if ($AllTests) { 'OFF' } else { 'ON' })",
     "-DGGML_RPC=ON",
     "-DLLAMA_BUILD_BORINGSSL=ON",
     "-DLLAMA_BUILD_EXAMPLES=ON",
@@ -98,10 +99,6 @@ $commonFlags = @(
     "-DLLAMA_BUILD_TOOLS=ON",
     "-DCMAKE_CUDA_ARCHITECTURES=$cudaArch"
 )
-
-if ($AllTests) {
-    $commonFlags += "-DBUILD_SHARED_LIBS=OFF"
-}
 
 Write-Host "========================================"
 Write-Host "BeeLlama.cpp Windows CUDA 13.1 sm_86 Default-Pairs Build"

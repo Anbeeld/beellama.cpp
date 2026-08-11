@@ -519,19 +519,10 @@ static void test_remove_policy() {
 }
 
 static void iswa_nonunified_multislot_kvarn_policy() {
-    require(llama_kvarn_iswa_policy_for(true, true, 2, false, false) ==
+    require(llama_kvarn_iswa_policy_for(true, true, 2) ==
                     LLAMA_KVARN_ISWA_STANDARD_SWA_FALLBACK,
             "non-unified multi-slot iSWA did not select the standard-SWA fallback");
-    require(llama_kvarn_iswa_policy_for(true, true, 2, false, true) ==
-                    LLAMA_KVARN_ISWA_STANDARD_SWA_FALLBACK,
-            "explicit KVarN did not retain the sequence-safe standard-SWA fallback");
-    require(llama_kvarn_iswa_policy_for(true, true, 2, true, false) ==
-                    LLAMA_KVARN_ISWA_STANDARD_SWA_FALLBACK,
-            "unified multi-slot iSWA did not select the sequence-safe standard-SWA fallback");
-    require(llama_kvarn_iswa_policy_for(true, true, 2, true, true) ==
-                    LLAMA_KVARN_ISWA_STANDARD_SWA_FALLBACK,
-            "explicit unified KVarN did not retain the sequence-safe standard-SWA fallback");
-    require(llama_kvarn_iswa_policy_for(true, true, 1, false, true) ==
+    require(llama_kvarn_iswa_policy_for(true, true, 1) ==
                     LLAMA_KVARN_ISWA_ALL_LAYERS,
             "single-slot non-unified iSWA KVarN was rejected");
 }

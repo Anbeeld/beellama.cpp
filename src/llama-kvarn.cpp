@@ -230,14 +230,10 @@ const char * llama_kvarn_validate_runtime(
 llama_kvarn_iswa_policy llama_kvarn_iswa_policy_for(
         bool enabled,
         bool has_swa,
-        uint32_t n_seq_max,
-        bool unified,
-        bool fail_if_unsupported) {
+        uint32_t n_seq_max) {
     if (!enabled) {
         return LLAMA_KVARN_ISWA_DISABLED;
     }
-    GGML_UNUSED(unified);
-    GGML_UNUSED(fail_if_unsupported);
     if (!has_swa || n_seq_max <= 1) {
         return LLAMA_KVARN_ISWA_ALL_LAYERS;
     }

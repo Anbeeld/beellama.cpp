@@ -343,20 +343,24 @@ are neither gathered nor overwritten.
 
 Prompt-cache planning distinguishes the lexical LCP, the boundary that all
 target/draft/speculative components can restore, and the boundary actually
-committed. For hybrid/recurrent targets, durable prompt checkpoints are created
-at stable recurrent prefill boundaries. An arbitrary lexical frontier may be
-reevaluated from the preceding stable checkpoint with reason
-`unstable_recurrent_frontier`; this is a bounded, explicit adjustment rather
-than a silent full reset. `cache_prompt=false`, slot eviction, corrupt or
-incompatible state, and the absence of one common target/draft/speculative plan
-remain reason-coded misses.
+committed. Live slots and RAM entries are ranked by that safe restorable prefix,
+not lexical similarity alone. KVarN durable checkpoints are eligible only on
+complete descriptor boundaries; standard and recurrent caches retain upstream
+batching and impose no Bee-specific 64-token cadence. `cache_prompt=false`,
+slot eviction, corrupt or incompatible state, and the absence of one common
+target/draft/speculative plan remain reason-coded misses.
 
 RAM entries are immutable and repeatably restorable. Admission serializes a
 self-contained target/draft/speculative candidate before publishing it and
-clears an idle unified slot only after admission succeeds. Restore snapshots a
-destination preimage and rolls all components back if any component fails.
-Resident-byte accounting includes entry payloads and counts shared immutable
-checkpoint buffers once.
+clears an idle unified slot only after admission succeeds. Restore prepares and
+validates every component without mutation, then commits the complete prepared
+transaction; failed preparation leaves the destination unchanged without a
+full-state preimage. Serialized checkpoint byte buffers use copy-on-write
+sharing, but native KV blocks are not reference-counted or shared. Hot partial
+state still emits logical-prefix manifests, so its work is not strictly
+frontier-only. Accounted bytes include serialized entry payloads and count
+shared immutable checkpoint buffers once; container capacity and allocator
+overhead are intentionally excluded.
 
 For hybrid iSWA with multiple slots, eligible non-SWA layers keep KVarN while
 SWA layers use the explicit, warned, bit-width-matched standard-cache fallback.

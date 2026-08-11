@@ -43,15 +43,12 @@ enum llama_kvarn_iswa_policy {
     LLAMA_KVARN_ISWA_DISABLED,
     LLAMA_KVARN_ISWA_ALL_LAYERS,
     LLAMA_KVARN_ISWA_STANDARD_SWA_FALLBACK,
-    LLAMA_KVARN_ISWA_UNSUPPORTED,
 };
 
 llama_kvarn_iswa_policy llama_kvarn_iswa_policy_for(
         bool enabled,
         bool has_swa,
-        uint32_t n_seq_max,
-        bool unified,
-        bool fail_if_unsupported);
+        uint32_t n_seq_max);
 
 size_t llama_kvarn_type_count();
 

@@ -135,12 +135,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         size_swa = size_base;
     }
     const llama_kvarn_iswa_policy kvarn_policy = llama_kvarn_iswa_policy_for(
-            use_kvarn, hparams.n_swa > 0, n_seq_max, unified, kvarn.fail_if_unsupported);
-    if (kvarn_policy == LLAMA_KVARN_ISWA_UNSUPPORTED) {
-        throw std::invalid_argument(
-                "KVarN SWA ring is unsupported with " + std::to_string(n_seq_max) +
-                " logical sequences; disable fail_if_unsupported to use the standard-SWA fallback");
-    }
+            use_kvarn, hparams.n_swa > 0, n_seq_max);
     if (kvarn_policy == LLAMA_KVARN_ISWA_ALL_LAYERS) {
         LLAMA_LOG_INFO("%s: KVarN enabled for all layers (non-SWA %s, SWA %s sliding-window ring)\n",
                 __func__, llama_kvarn_type_name(kvarn.type), llama_kvarn_type_name(kvarn_swa.type));

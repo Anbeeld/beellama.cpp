@@ -126,6 +126,14 @@ def main() -> None:
             raise AssertionError(f"public memory API lacks {query}")
 
     server_context = (ROOT / "tools/server/server-context.cpp").read_text(encoding="utf-8")
+    for removed_policy in (
+        "recurrent_prompt_slot",
+        "checkpoint_min_step_effective",
+        "prompt_add_limit",
+        "numerically unstable recurrent checkpoint boundary",
+    ):
+        if removed_policy in server_context:
+            raise AssertionError(f"server retains over-scoped prompt policy: {removed_policy}")
     suffix_block = server_context.split(
         "// truncate any tokens that are beyond n_past for this slot", 1
     )[1].split("// If using an alora", 1)[0]
