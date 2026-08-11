@@ -890,6 +890,34 @@ int main() {
     CHECK(duplicate.commit(0, id(30), 0, 3) == LLAMA_KV_TAIL_BODY_SLOT);
     CHECK(duplicate.build_source_plan(0, { id(30), id(31), id(32) })[0] == LLAMA_KV_TAIL_BODY_SLOT);
 
+    // State restore preserves the physical ring phase. Reallocating logically
+    // identical exact rows from a later live cursor permutes the dense tail
+    // reduction and can change a near-tied token on GPU backends.
+    llama_kv_tail_store ring_source(4, 1, 6);
+    ring_source.commit(0, id(40), 40, 40);
+    ring_source.commit(0, id(41), 41, 41);
+    ring_source.commit(0, id(42), 42, 42);
+    const auto ring_snapshot = ring_source.snapshot(0);
+    const uint32_t ring_cursor = ring_source.state_write_cursor(0);
+
+    llama_kv_tail_store ring_restored(4, 1, 6);
+    ring_restored.commit(0, id(90), 90, 90);
+    ring_restored.commit(0, id(91), 91, 91);
+    ring_restored.commit(0, id(92), 92, 92);
+    ring_restored.seq_rm(0, -1, -1);
+    for (const auto & entry : ring_snapshot) {
+        CHECK(ring_restored.restore(
+                0, entry.identity, entry.position, entry.insertion_ordinal,
+                uint32_t(entry.slot)) == entry.slot);
+    }
+    ring_restored.restore_write_cursor(0, ring_cursor);
+    CHECK(ring_restored.snapshot(0).size() == ring_snapshot.size());
+    for (size_t i = 0; i < ring_snapshot.size(); ++i) {
+        CHECK(ring_restored.snapshot(0)[i].slot == ring_snapshot[i].slot);
+    }
+    CHECK(ring_source.commit(0, id(43), 43, 43) ==
+            ring_restored.commit(0, id(43), 43, 43));
+
     // The reference attention performs one global normalization while choosing
     // body or exact data independently for every visible entry.
     const std::vector<float> q = { 1.0f, 0.5f };

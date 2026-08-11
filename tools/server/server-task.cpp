@@ -258,6 +258,11 @@ common_chat_msg task_result_state::update_chat_msg(
 json result_timings::to_json() const {
     json base = {
         {"cache_n",                cache_n},
+        {"cache_lcp_n",            cache_lcp_n},
+        {"cache_planned_n",        cache_planned_n},
+        {"cache_reprocessed_n",    cache_reprocessed_n},
+        {"cache_source",           cache_source},
+        {"cache_reason",           cache_reason},
 
         {"prompt_n",               prompt_n},
         {"prompt_ms",              prompt_ms},
@@ -1595,6 +1600,13 @@ json server_task_result_metrics::to_json() {
         { "kv_tail_partial_groups",          kv_tail_partial_groups },
         { "kv_tail_none_groups",             kv_tail_none_groups },
         { "kv_tail_degraded_sequences",      kv_tail_degraded_sequences },
+        { "prompt_cache_admission_attempts",  prompt_cache_admission_attempts },
+        { "prompt_cache_admission_successes", prompt_cache_admission_successes },
+        { "prompt_cache_admission_failures",  prompt_cache_admission_failures },
+        { "prompt_cache_restore_attempts",    prompt_cache_restore_attempts },
+        { "prompt_cache_restore_successes",   prompt_cache_restore_successes },
+        { "prompt_cache_restore_failures",    prompt_cache_restore_failures },
+        { "prompt_cache_resident_bytes",      prompt_cache_resident_bytes },
         { "n_draft_tokens_total",            n_draft_tokens_total },
         { "n_draft_accepted_total",          n_draft_accepted_total },
         { "n_draft_verif_steps_total",       n_draft_verif_steps_total },
@@ -1675,9 +1687,21 @@ json server_task_result_apply_lora::to_json() {
 
 size_t server_prompt_cache::size() const {
     size_t res = 0;
+    std::unordered_set<const void *> checkpoint_storage;
 
     for (const auto & state : states) {
-        res += state.size();
+        res += state.data.size();
+        for (const auto & checkpoint : state.prompt.checkpoints) {
+            if (!checkpoint.data_tgt.empty() &&
+                    checkpoint_storage.insert(checkpoint.data_tgt.storage_id()).second) {
+                res += checkpoint.data_tgt.size();
+            }
+            if (!checkpoint.data_dft.empty() &&
+                    checkpoint_storage.insert(checkpoint.data_dft.storage_id()).second) {
+                res += checkpoint.data_dft.size();
+            }
+            res += checkpoint.data_spec.size();
+        }
     }
 
     return res;
@@ -1693,35 +1717,71 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+server_prompt_cache_state * server_prompt_cache::admit(server_prompt_cache_state && candidate) {
+    ++admission_attempts;
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
-        const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
+        const int cur_lcp_len = it->prompt.tokens.get_common_prefix(candidate.prompt.tokens);
 
-        if (cur_lcp_len == (int) prompt.tokens.size()) {
+        if (cur_lcp_len == (int) candidate.prompt.tokens.size()) {
             SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
+            ++admission_failures;
             return nullptr;
         }
     }
 
-    // calculate checkpoints size to see if it will fit with the prompt
+    // Count retained immutable checkpoint buffers once across cache entries.
+    // Copying a server_prompt shares these buffers and detaches on mutation.
+    std::unordered_set<const void *> retained_checkpoint_storage;
+    for (const auto & state : states) {
+        for (const auto & checkpoint : state.prompt.checkpoints) {
+            retained_checkpoint_storage.insert(checkpoint.data_tgt.storage_id());
+            retained_checkpoint_storage.insert(checkpoint.data_dft.storage_id());
+        }
+    }
     size_t checkpoints_size = 0;
-    for (const auto & ckpt : prompt.checkpoints) {
-        checkpoints_size += ckpt.size();
+    for (const auto & ckpt : candidate.prompt.checkpoints) {
+        if (!ckpt.data_tgt.empty() &&
+                retained_checkpoint_storage.insert(ckpt.data_tgt.storage_id()).second) {
+            checkpoints_size += ckpt.data_tgt.size();
+        }
+        if (!ckpt.data_dft.empty() &&
+                retained_checkpoint_storage.insert(ckpt.data_dft.storage_id()).second) {
+            checkpoints_size += ckpt.data_dft.size();
+        }
+        checkpoints_size += ckpt.data_spec.size();
     }
 
-    const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
+    const size_t state_size_new = candidate.data.size() + checkpoints_size;
+    const size_t standalone_size = candidate.size();
 
     // skip over-limit entries to avoid disturbing the cache
-    if (limit_size > 0 && state_size_new > limit_size) {
+    if (limit_size > 0 && (state_size_new > limit_size || standalone_size > limit_size)) {
         SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
-                state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
+                standalone_size / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
+        ++admission_failures;
         return nullptr;
     }
 
+    // Publish the already-materialized candidate node before touching existing
+    // entries.  list node allocation is the last fallible admission step; if it
+    // fails, the cache is unchanged.
+    try {
+        states.push_back(std::move(candidate));
+    } catch (const std::bad_alloc & e) {
+        SRV_ERR("failed to allocate prompt cache entry: %s\n", e.what());
+        ++admission_failures;
+        return nullptr;
+    }
+    auto admitted = std::prev(states.end());
+
     // remove any cached prompts that are fully contained in the current prompt
     for (auto it = states.begin(); it != states.end();) {
-        const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
+        if (it == admitted) {
+            ++it;
+            continue;
+        }
+        const int len = it->prompt.tokens.get_common_prefix(admitted->prompt.tokens);
 
         if (len == (int) it->prompt.tokens.size()) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
@@ -1733,8 +1793,9 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     }
 
     if (limit_size > 0) {
-        // make room before allocating the new vectors to avoid breaching the limit
-        while (!states.empty() && size() + state_size_new > limit_size) {
+        // The candidate is already present and fully materialized. Evict only
+        // older entries until unique resident accounting is within budget.
+        while (!states.empty() && size() > limit_size) {
             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
                     states.front().size() / (1024.0 * 1024.0));
 
@@ -1742,37 +1803,34 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
-    std::vector<uint8_t> state_data_tgt;
-    std::vector<uint8_t> state_data_dft;
+    ++admission_successes;
+    return &*admitted;
+}
 
-    // check if we can allocate enough memory for the new state
+server_prompt_cache_state * server_prompt_cache::insert(
+        const server_prompt & prompt,
+        server_prompt_data && data) {
+    server_prompt_cache_state candidate;
+    candidate.prompt = prompt.clone();
+    candidate.data = std::move(data);
+    return admit(std::move(candidate));
+}
+
+server_prompt_cache_state * server_prompt_cache::alloc(
+        const server_prompt & prompt,
+        size_t state_size_tgt,
+        size_t state_size_dft) {
+    server_prompt_data data;
     try {
-        state_data_tgt.resize(state_size_tgt);
-        state_data_dft.resize(state_size_dft);
+        data.main.resize(state_size_tgt);
+        data.drft.resize(state_size_dft);
     } catch (const std::bad_alloc & e) {
+        ++admission_attempts;
+        ++admission_failures;
         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
-
-        limit_size = std::max<size_t>(1, 0.4*size());
-
-        SRV_WRN(" - cache size limit reduced to %.3f MiB\n", limit_size / (1024.0 * 1024.0));
-
-        update();
-
         return nullptr;
     }
-
-    states.push_back({
-        /*.prompt =*/ {
-            /*.tokens      =*/ prompt.tokens.clone(),
-            /*.checkpoints =*/ prompt.checkpoints,
-        },
-        /*.data   =*/ {
-            /*.main =*/ std::move(state_data_tgt),
-            /*.drft =*/ std::move(state_data_dft),
-        },
-    });
-
-    return &states.back();
+    return insert(prompt, std::move(data));
 }
 
 bool server_prompt_cache::erase(const server_prompt_cache_state * entry) {
@@ -1791,6 +1849,7 @@ bool server_prompt_cache::load(
         const server_prompt_cache_state_io & io) {
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
+    int restorable_best = lcp_best;
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
     float f_sim_best  = float(lcp_best) / tokens_new.size();
 
@@ -1812,7 +1871,9 @@ bool server_prompt_cache::load(
             continue;
         }
 
-        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
+        if (lcp_cur > restorable_best ||
+                (lcp_cur == restorable_best && f_keep_cur > f_keep_best)) {
+            restorable_best = lcp_cur;
             f_keep_best = f_keep_cur;
             f_sim_best  = f_sim_cur;
 
@@ -1821,60 +1882,119 @@ bool server_prompt_cache::load(
     }
 
     if (it_best != states.end()) {
-        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+        ++restore_attempts;
+        SRV_TRC(" - found better restorable prompt with n = %d, f_keep = %.3f, f_sim = %.3f\n",
+                restorable_best, f_keep_best, f_sim_best);
 
         const auto fail_load = [&]() {
             const bool clear_main = io.clear(SERVER_PROMPT_STATE_MAIN);
             const bool clear_draft = !io.has_draft || io.clear(SERVER_PROMPT_STATE_DRAFT);
-            if (!clear_main || !clear_draft) {
+            const bool clear_spec = !io.has_speculative || io.clear(SERVER_PROMPT_STATE_SPECULATIVE);
+            if (!clear_main || !clear_draft || !clear_spec) {
                 GGML_ABORT("prompt-cache recovery failed to clear a complete slot sequence");
             }
             prompt.clear();
+            ++restore_failures;
             return false;
-        };
-
-        const auto fail_and_evict = [&]() {
-            states.erase(it_best);
-            return fail_load();
         };
 
         auto & data = it_best->data;
         if (data.main.empty() ||
                 io.has_draft != !data.drft.empty() ||
+                (!io.has_speculative && !data.spec.empty()) ||
                 !io.can_restore(SERVER_PROMPT_STATE_MAIN) ||
-                (io.has_draft && !io.can_restore(SERVER_PROMPT_STATE_DRAFT))) {
-            return fail_and_evict();
+                (io.has_draft && !io.can_restore(SERVER_PROMPT_STATE_DRAFT)) ||
+                (io.has_speculative && !io.can_restore(SERVER_PROMPT_STATE_SPECULATIVE))) {
+            ++restore_failures;
+            return false;
         }
 
-        if (!io.restore(SERVER_PROMPT_STATE_MAIN, data.main) ||
-                (io.has_draft && !io.restore(SERVER_PROMPT_STATE_DRAFT, data.drft))) {
-            return fail_and_evict();
+        server_prompt_data preimage;
+        if (!io.snapshot(SERVER_PROMPT_STATE_MAIN, preimage.main) ||
+                (io.has_draft && !io.snapshot(SERVER_PROMPT_STATE_DRAFT, preimage.drft)) ||
+                (io.has_speculative && !io.snapshot(SERVER_PROMPT_STATE_SPECULATIVE, preimage.spec))) {
+            ++restore_failures;
+            return false;
         }
 
-        data.main.clear();
-        data.main.shrink_to_fit();
-        data.drft.clear();
-        data.drft.shrink_to_fit();
-        prompt = std::move(it_best->prompt);
-        states.erase(it_best);
+        const bool restore_main = io.restore(SERVER_PROMPT_STATE_MAIN, data.main);
+        const bool restore_draft = restore_main &&
+                (!io.has_draft || io.restore(SERVER_PROMPT_STATE_DRAFT, data.drft));
+        const bool restore_spec = restore_draft &&
+                (!io.has_speculative || io.restore(SERVER_PROMPT_STATE_SPECULATIVE, data.spec));
+        if (!restore_main || !restore_draft || !restore_spec) {
+            const bool rollback_main = io.restore(SERVER_PROMPT_STATE_MAIN, preimage.main);
+            const bool rollback_draft = !io.has_draft || io.restore(SERVER_PROMPT_STATE_DRAFT, preimage.drft);
+            const bool rollback_spec = !io.has_speculative ||
+                    io.restore(SERVER_PROMPT_STATE_SPECULATIVE, preimage.spec);
+            if (!rollback_main || !rollback_draft || !rollback_spec) {
+                return fail_load();
+            }
+            ++restore_failures;
+            return false;
+        }
+
+        prompt = it_best->prompt.clone();
+        ++restore_successes;
     }
 
     return true;
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+bool server_prompt_cache::load(
+        server_prompt & prompt,
+        const server_tokens & tokens_new,
+        llama_context * ctx_tgt,
+        llama_context * ctx_dft,
+        common_speculative * spec,
+        int32_t id_slot) {
+    constexpr llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED;
     server_prompt_cache_state_io io {
         /*.has_draft =*/ ctx_dft != nullptr,
+        /*.has_speculative =*/ spec != nullptr,
         /*.can_restore =*/ [&](server_prompt_state_kind kind) {
+            if (kind == SERVER_PROMPT_STATE_SPECULATIVE) {
+                return spec != nullptr;
+            }
             llama_context * ctx = kind == SERVER_PROMPT_STATE_MAIN ? ctx_tgt : ctx_dft;
-            return ctx != nullptr && llama_memory_state_seq_can_restore(llama_get_memory(ctx), id_slot);
+            return ctx != nullptr && llama_memory_state_seq_can_restore_ext(
+                    llama_get_memory(ctx), id_slot, flags);
+        },
+        /*.snapshot =*/ [&](server_prompt_state_kind kind, std::vector<uint8_t> & data) {
+            if (kind == SERVER_PROMPT_STATE_SPECULATIVE) {
+                data.clear();
+                common_speculative_get_state(spec, id_slot, data);
+                return true;
+            }
+            llama_context * ctx = kind == SERVER_PROMPT_STATE_MAIN ? ctx_tgt : ctx_dft;
+            if (ctx == nullptr || !llama_memory_state_seq_can_save_ext(
+                    llama_get_memory(ctx), id_slot, flags)) {
+                return false;
+            }
+            const size_t size = llama_state_seq_get_size_ext(ctx, id_slot, flags);
+            if (size == 0) {
+                return false;
+            }
+            try {
+                data.resize(size);
+            } catch (const std::bad_alloc &) {
+                return false;
+            }
+            return llama_state_seq_get_data_ext(
+                    ctx, data.data(), data.size(), id_slot, flags) == data.size();
         },
         /*.restore =*/ [&](server_prompt_state_kind kind, const std::vector<uint8_t> & data) {
+            if (kind == SERVER_PROMPT_STATE_SPECULATIVE) {
+                return common_speculative_set_state(spec, id_slot, data);
+            }
             llama_context * ctx = kind == SERVER_PROMPT_STATE_MAIN ? ctx_tgt : ctx_dft;
             return ctx != nullptr &&
-                   llama_state_seq_set_data_ext(ctx, data.data(), data.size(), id_slot, 0) == data.size();
+                   llama_state_seq_set_data_ext(ctx, data.data(), data.size(), id_slot, flags) == data.size();
         },
         /*.clear =*/ [&](server_prompt_state_kind kind) {
+            if (kind == SERVER_PROMPT_STATE_SPECULATIVE) {
+                return common_speculative_set_state(spec, id_slot, {});
+            }
             llama_context * ctx = kind == SERVER_PROMPT_STATE_MAIN ? ctx_tgt : ctx_dft;
             return ctx != nullptr && llama_memory_seq_rm(llama_get_memory(ctx), id_slot, -1, -1);
         },

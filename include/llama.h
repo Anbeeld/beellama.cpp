@@ -1080,6 +1080,21 @@ extern "C" {
 // tail-enabled context starts with degraded exact-tail coverage.
 #define LLAMA_STATE_SEQ_FLAGS_BODY_ONLY 4
 
+// Export a self-contained logical sequence from a shared physical cache.
+// Unlike PARTIAL_ONLY, this representation owns every payload required after
+// the source sequence is removed and may remap physical cells on restore.
+#define LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED 8
+
+    LLAMA_API bool llama_memory_state_seq_can_save_ext(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+     llama_state_seq_flags flags);
+
+    LLAMA_API bool llama_memory_state_seq_can_restore_ext(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+     llama_state_seq_flags flags);
+
     LLAMA_API size_t llama_state_seq_get_size_ext(
             struct llama_context * ctx,
                     llama_seq_id   seq_id,
@@ -1098,6 +1113,26 @@ extern "C" {
                           size_t   size,
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
+
+    // Prepare a sequence-state restore without mutating the destination. The
+    // source buffer must remain valid until the plan is committed or freed.
+    // Commit performs only already-validated backend writes and metadata
+    // publication; it has no remaining allocation or parsing step.
+    struct llama_state_seq_restore_plan;
+
+    LLAMA_API struct llama_state_seq_restore_plan * llama_state_seq_prepare_data_ext(
+            struct llama_context * ctx,
+                   const uint8_t * src,
+                          size_t   size,
+                    llama_seq_id   dest_seq_id,
+           llama_state_seq_flags   flags);
+
+    // Returns the committed byte count, or zero for an invalid/consumed plan.
+    LLAMA_API size_t llama_state_seq_restore_plan_commit(
+            struct llama_state_seq_restore_plan * plan);
+
+    LLAMA_API void llama_state_seq_restore_plan_free(
+            struct llama_state_seq_restore_plan * plan);
 
     //
     // Decoding

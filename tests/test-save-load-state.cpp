@@ -2,6 +2,7 @@
 #include "common.h"
 #include "log.h"
 #include "llama-cpp.h"
+#include "../src/llama-memory.h"
 
 #include <clocale>
 #include <algorithm>
@@ -90,6 +91,24 @@ static bool test_tail_state_contract(
     const auto body_flag = llama_state_seq_flags(LLAMA_STATE_SEQ_FLAGS_BODY_ONLY);
     const size_t body_size = llama_state_get_size_ext(source.get(), body_flag);
     const bool has_overlay_state = exact_size > body_size;
+
+    if (params.kvarn.type == LLAMA_KVARN_TYPE_DISABLED && has_overlay_state &&
+            !llama_get_memory(source.get())->requires_state_for_partial_restore()) {
+        LOG_ERR("%s: standard precision tail does not participate in partial checkpoints\n", __func__);
+        return false;
+    }
+
+    if (params.kvarn.type == LLAMA_KVARN_TYPE_DISABLED && has_overlay_state) {
+        const auto partial_flag = llama_state_seq_flags(LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        const auto exact_flag = llama_state_seq_flags(LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED);
+        const size_t partial_size = llama_state_seq_get_size_ext(source.get(), 0, partial_flag);
+        const size_t self_contained_size = llama_state_seq_get_size_ext(source.get(), 0, exact_flag);
+        if (partial_size == 0 || partial_size >= self_contained_size) {
+            LOG_ERR("%s: standard precision-tail partial checkpoint copied the body (%zu >= %zu)\n",
+                    __func__, partial_size, self_contained_size);
+            return false;
+        }
+    }
 
     if (has_overlay_state) {
         auto mismatch_params = source_params;
@@ -307,8 +326,8 @@ static bool test_tail_copy_is_immediately_saveable(
             break;
         }
     }
-    if (frame == std::string::npos || read_u32(state, frame + 4) != 3) {
-        LOG_ERR("%s: could not locate standard tail state v3 frame\n", __func__);
+    if (frame == std::string::npos || read_u32(state, frame + 4) != 5) {
+        LOG_ERR("%s: could not locate standard tail state v5 frame\n", __func__);
         return false;
     }
     const uint32_t group_size = read_u32(state, frame + 28);
@@ -325,6 +344,7 @@ static bool test_tail_copy_is_immediately_saveable(
         body_cell_counts.push_back(cell_count);
         cursor += 8 + size_t(run_count)*sizeof(uint32_t);
         for (uint32_t i = 0; i < cell_count; ++i) {
+            cursor += sizeof(uint32_t) + sizeof(uint64_t); // source cell + generation
             cursor += sizeof(llama_pos);
             if (n_pos_per_embd > 1) {
                 cursor += sizeof(llama_pos)*2;
@@ -337,7 +357,7 @@ static bool test_tail_copy_is_immediately_saveable(
     const uint32_t record_count = read_u32(state, tail_header + 8);
     const uint32_t payload_count = read_u32(state, tail_header + 12);
     const size_t record_begin = tail_header + 24;
-    const size_t record_size = 36;
+    const size_t record_size = 40;
     const size_t tail_layer_begin = record_begin + size_t(record_count)*record_size;
     if (record_count < 2 || payload_count < 2 || body_cell_counts.empty()) {
         LOG_ERR("%s: tail state fixture did not contain enough records for corruption tests\n", __func__);
@@ -376,6 +396,11 @@ static bool test_tail_copy_is_immediately_saveable(
         auto corrupt = state;
         write_u32(corrupt, record_begin + 32, payload_count);
         if (!expect_rejected(std::move(corrupt), state.size(), "payload ordinal")) return false;
+    }
+    {
+        auto corrupt = state;
+        write_u32(corrupt, record_begin + 36, UINT32_MAX);
+        if (!expect_rejected(std::move(corrupt), state.size(), "tail ring slot")) return false;
     }
     {
         auto corrupt = state;
@@ -712,6 +737,29 @@ static bool test_kvarn_partial_checkpoint_history(
         return false;
     }
 
+    const auto self_flags = llama_state_seq_flags(LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED);
+    std::vector<uint8_t> live_self(llama_state_seq_get_size_ext(context.get(), 0, self_flags));
+    if (live_self.empty() || llama_state_seq_get_data_ext(
+                context.get(), live_self.data(), live_self.size(), 0, self_flags) != live_self.size()) {
+        LOG_ERR("%s: failed to save self-contained restore anchor\n", __func__);
+        return false;
+    }
+    std::unique_ptr<llama_state_seq_restore_plan, decltype(&llama_state_seq_restore_plan_free)> prepared(
+            llama_state_seq_prepare_data_ext(
+                    context.get(), checkpoint_b.data(), checkpoint_b.size(), 0, partial_flags),
+            llama_state_seq_restore_plan_free);
+    if (!prepared || llama_memory_seq_pos_max(llama_get_memory(context.get()), 0) != live_past - 1) {
+        LOG_ERR("%s: prepared restore mutated the live destination\n", __func__);
+        return false;
+    }
+    if (llama_state_seq_restore_plan_commit(prepared.get()) != checkpoint_b.size() ||
+            llama_memory_seq_pos_max(llama_get_memory(context.get()), 0) != checkpoint_b_past - 1 ||
+            llama_state_seq_set_data_ext(
+                    context.get(), live_self.data(), live_self.size(), 0, self_flags) != live_self.size()) {
+        LOG_ERR("%s: prepared restore commit or anchor recovery failed\n", __func__);
+        return false;
+    }
+
     const uint32_t kvarn_magic = 0x4e52564b;
     size_t kvarn_frame = std::string::npos;
     for (size_t i = 0; i + 2*sizeof(uint32_t) <= checkpoint_b.size(); ++i) {
@@ -726,17 +774,25 @@ static bool test_kvarn_partial_checkpoint_history(
     if (kvarn_frame != std::string::npos) {
         std::memcpy(&version, checkpoint_b.data() + kvarn_frame + sizeof(uint32_t), sizeof(version));
     }
-    if (kvarn_frame == std::string::npos || version != 13) {
-        LOG_ERR("%s: expected KVarN partial checkpoint format v13, found v%u\n", __func__, version);
+    if (kvarn_frame == std::string::npos || version != 15) {
+        LOG_ERR("%s: expected KVarN partial checkpoint format v15, found v%u\n", __func__, version);
         return false;
     }
 
     auto corrupt = checkpoint_b;
-    const uint32_t unsupported_version = 14;
+    const uint32_t unsupported_version = 16;
     std::memcpy(corrupt.data() + kvarn_frame + sizeof(uint32_t), &unsupported_version, sizeof(unsupported_version));
+    std::unique_ptr<llama_state_seq_restore_plan, decltype(&llama_state_seq_restore_plan_free)> corrupt_plan(
+            llama_state_seq_prepare_data_ext(
+                    context.get(), corrupt.data(), corrupt.size(), 0, partial_flags),
+            llama_state_seq_restore_plan_free);
+    if (corrupt_plan) {
+        LOG_ERR("%s: corrupt KVarN v15 frame produced a restore plan\n", __func__);
+        return false;
+    }
     if (llama_state_seq_set_data_ext(
             context.get(), corrupt.data(), corrupt.size(), 0, partial_flags) != 0) {
-        LOG_ERR("%s: corrupt KVarN v13 frame was accepted\n", __func__);
+        LOG_ERR("%s: corrupt KVarN v15 frame was accepted\n", __func__);
         return false;
     }
     if (llama_memory_seq_pos_max(llama_get_memory(context.get()), 0) != live_past - 1) {
@@ -811,7 +867,7 @@ static bool test_kvarn_partial_checkpoint_history(
         LOG(" %.3f", time_ms);
     }
     LOG("\n");
-    LOG("\nPASS: KVarN v13 host partial checkpoints are independent and transactional\n");
+    LOG("\nPASS: KVarN v15 host partial checkpoints are independent and transactional\n");
     return true;
 }
 

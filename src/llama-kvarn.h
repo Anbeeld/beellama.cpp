@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 constexpr uint32_t KVAR_N_GROUP = 128;
 
@@ -96,6 +97,23 @@ bool llama_kvarn_plan_remove_range(
         bool stream_owned,
         llama_pos & planned_p0,
         llama_pos & planned_p1);
+
+struct llama_kvarn_state_stage_cell {
+    uint32_t source_cell;
+    uint32_t stage_row;
+};
+
+std::vector<llama_kvarn_state_stage_cell> llama_kvarn_select_state_stage_cells(
+        const std::vector<uint32_t> & source_cells,
+        uint32_t live_cell_max_p1,
+        uint32_t stage_groups,
+        uint32_t tail_groups,
+        bool swa);
+
+std::vector<uint32_t> llama_kvarn_select_state_record_groups(
+        const std::vector<uint32_t> & source_cells,
+        const std::vector<llama_kvarn_state_stage_cell> & stage_cells,
+        uint32_t groups_per_stream);
 
 template<typename SeqPosMax>
 bool llama_kvarn_stream_is_exclusive_for(

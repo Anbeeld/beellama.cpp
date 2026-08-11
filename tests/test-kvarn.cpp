@@ -299,6 +299,36 @@ static void kvarn_unified_restore_requires_exclusive_stream() {
             "non-unified KVarN restore rejected a sequence-owned stream");
 }
 
+static void kvarn_selective_state_owns_only_live_stage_rows() {
+    const std::vector<uint32_t> selected = { 0, 3, 127, 128, 255, 256, 383, 384, 511, 640 };
+    const auto rows = llama_kvarn_select_state_stage_cells(selected, 641, 3, 2, false);
+    require(rows.size() == 4, "selective KVarN state copied sealed history rows");
+    const std::array<llama_kvarn_state_stage_cell, 4> expected = {{
+        { 0, 0 }, { 3, 3 }, { 127, 127 },
+        { 640, 128 },
+    }};
+    for (size_t i = 0; i < expected.size(); ++i) {
+        require(rows[i].source_cell == expected[i].source_cell &&
+                rows[i].stage_row == expected[i].stage_row,
+                "selective KVarN state stage mapping mismatch");
+    }
+
+    const auto swa_rows = llama_kvarn_select_state_stage_cells(
+            { 0, 127, 128, 255, 256, 383, 384 }, 385, 3, 3, true);
+    require(swa_rows.size() == 5 && swa_rows.front().source_cell == 128 &&
+            swa_rows.back().source_cell == 384 && swa_rows.back().stage_row == 0,
+            "selective SWA state did not retain exactly the live ring rows");
+
+    const auto record_groups = llama_kvarn_select_state_record_groups(selected, rows, 8);
+    require(record_groups == std::vector<uint32_t>({ 1, 2, 3 }),
+            "selective KVarN state serialized a staged or stale record group");
+
+    const std::vector<uint32_t> short_cells = { 0, 1, 127, 128 };
+    const auto short_stage = llama_kvarn_select_state_stage_cells(short_cells, 129, 3, 2, false);
+    require(llama_kvarn_select_state_record_groups(short_cells, short_stage, 8).empty(),
+            "short selective KVarN state serialized stale compressed records");
+}
+
 static void test_stage_policy() {
     // The reference keeps one incomplete group in F16, but the suffix-removal
     // contract advertised by llama_kvarn_can_remove_range reaches back into the
@@ -493,11 +523,14 @@ static void iswa_nonunified_multislot_kvarn_policy() {
                     LLAMA_KVARN_ISWA_STANDARD_SWA_FALLBACK,
             "non-unified multi-slot iSWA did not select the standard-SWA fallback");
     require(llama_kvarn_iswa_policy_for(true, true, 2, false, true) ==
-                    LLAMA_KVARN_ISWA_UNSUPPORTED,
-            "fail_if_unsupported did not reject non-unified multi-slot iSWA KVarN");
+                    LLAMA_KVARN_ISWA_STANDARD_SWA_FALLBACK,
+            "explicit KVarN did not retain the sequence-safe standard-SWA fallback");
+    require(llama_kvarn_iswa_policy_for(true, true, 2, true, false) ==
+                    LLAMA_KVARN_ISWA_STANDARD_SWA_FALLBACK,
+            "unified multi-slot iSWA did not select the sequence-safe standard-SWA fallback");
     require(llama_kvarn_iswa_policy_for(true, true, 2, true, true) ==
-                    LLAMA_KVARN_ISWA_ALL_LAYERS,
-            "unified multi-slot iSWA KVarN was rejected");
+                    LLAMA_KVARN_ISWA_STANDARD_SWA_FALLBACK,
+            "explicit unified KVarN did not retain the sequence-safe standard-SWA fallback");
     require(llama_kvarn_iswa_policy_for(true, true, 1, false, true) ==
                     LLAMA_KVARN_ISWA_ALL_LAYERS,
             "single-slot non-unified iSWA KVarN was rejected");
@@ -4608,6 +4641,7 @@ int main() {
     kvarn_composite_removal_plan_forwards();
     kvarn_unified_save_requires_exclusive_stream();
     kvarn_unified_restore_requires_exclusive_stream();
+    kvarn_selective_state_owns_only_live_stage_rows();
     test_type_table();
     test_attention_domain_policy();
     test_vulkan_decode_route_policy();

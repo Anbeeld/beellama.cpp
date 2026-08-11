@@ -3498,6 +3498,11 @@ private:
     const llama_memory_buffers & mbufs;
 };
 
+struct llama_state_seq_restore_plan {
+    std::unique_ptr<llama_io_read_i> io;
+    size_t bytes = 0;
+};
+
 size_t llama_context::state_get_size(llama_state_seq_flags flags) {
     llama_io_write_dummy io(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
     try {
@@ -3545,7 +3550,7 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size, llama_sta
 static constexpr uint32_t io_magic = 0xaf143cd8;
 
 size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags) {
-    if (seq_id < 0 || uint32_t(seq_id) >= cparams.n_seq_max || !memory || !memory->state_seq_can_save(seq_id)) {
+    if (seq_id < 0 || uint32_t(seq_id) >= cparams.n_seq_max || !memory || !memory->state_seq_can_save(seq_id, flags)) {
         static std::atomic_flag warned = ATOMIC_FLAG_INIT;
         if (!warned.test_and_set()) {
             LLAMA_LOG_WARN("%s: sequence %d cannot be saved while its physical KV stream is shared\n", __func__, seq_id);
@@ -3565,7 +3570,7 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
 }
 
 size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
-    if (seq_id < 0 || uint32_t(seq_id) >= cparams.n_seq_max || !memory || !memory->state_seq_can_save(seq_id)) {
+    if (seq_id < 0 || uint32_t(seq_id) >= cparams.n_seq_max || !memory || !memory->state_seq_can_save(seq_id, flags)) {
         static std::atomic_flag warned = ATOMIC_FLAG_INIT;
         if (!warned.test_and_set()) {
             LLAMA_LOG_WARN("%s: sequence %d cannot be saved while its physical KV stream is shared\n", __func__, seq_id);
@@ -3594,7 +3599,7 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
 }
 
 size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
-    if (seq_id < 0 || uint32_t(seq_id) >= cparams.n_seq_max || !memory || !memory->state_seq_can_restore(seq_id)) {
+    if (seq_id < 0 || uint32_t(seq_id) >= cparams.n_seq_max || !memory || !memory->state_seq_can_restore(seq_id, flags)) {
         static std::atomic_flag warned = ATOMIC_FLAG_INIT;
         if (!warned.test_and_set()) {
             LLAMA_LOG_WARN("%s: sequence %d cannot be restored while its physical KV stream is shared\n", __func__, seq_id);
@@ -3637,6 +3642,40 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
         return 0;
+    }
+}
+
+llama_state_seq_restore_plan * llama_context::state_seq_prepare_data(
+        llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
+    if (src == nullptr || size == 0 ||
+            (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) != 0 ||
+            seq_id < 0 || uint32_t(seq_id) >= cparams.n_seq_max ||
+            !memory || !memory->state_seq_can_restore(seq_id, flags)) {
+        return nullptr;
+    }
+
+    try {
+        auto plan = std::make_unique<llama_state_seq_restore_plan>();
+        plan->io = std::make_unique<llama_io_read_host>(src, size);
+
+        uint32_t magic_read;
+        plan->io->read(&magic_read, sizeof(magic_read));
+        if (io_magic != magic_read) {
+            throw std::runtime_error("wrong sequence state magic");
+        }
+
+        llama_seq_id seq_id_read;
+        plan->io->read(&seq_id_read, sizeof(seq_id_read));
+        GGML_UNUSED(seq_id_read);
+
+        plan->bytes = state_seq_read_data(*plan->io, seq_id, flags);
+        if (plan->bytes != size) {
+            throw std::runtime_error("sequence state contains trailing or missing bytes");
+        }
+        return plan.release();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error preparing state: %s\n", __func__, err.what());
+        return nullptr;
     }
 }
 
@@ -4625,6 +4664,16 @@ bool llama_memory_state_seq_can_restore(llama_memory_t mem, llama_seq_id seq_id)
     return mem != nullptr && mem->state_seq_can_restore(seq_id);
 }
 
+bool llama_memory_state_seq_can_save_ext(
+        llama_memory_t mem, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    return mem != nullptr && mem->state_seq_can_save(seq_id, flags);
+}
+
+bool llama_memory_state_seq_can_restore_ext(
+        llama_memory_t mem, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    return mem != nullptr && mem->state_seq_can_restore(seq_id, flags);
+}
+
 bool llama_memory_seq_rm(
         llama_memory_t mem,
           llama_seq_id seq_id,
@@ -4821,6 +4870,33 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
     ctx->synchronize();
 
     return ctx->state_seq_set_data(seq_id, src, size, flags);
+}
+
+llama_state_seq_restore_plan * llama_state_seq_prepare_data_ext(
+        llama_context * ctx,
+        const uint8_t * src,
+        size_t size,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags) {
+    if (ctx == nullptr) {
+        return nullptr;
+    }
+
+    ctx->synchronize();
+    return ctx->state_seq_prepare_data(seq_id, src, size, flags);
+}
+
+size_t llama_state_seq_restore_plan_commit(llama_state_seq_restore_plan * plan) {
+    if (plan == nullptr || !plan->io) {
+        return 0;
+    }
+    plan->io->commit();
+    plan->io.reset();
+    return plan->bytes;
+}
+
+void llama_state_seq_restore_plan_free(llama_state_seq_restore_plan * plan) {
+    delete plan;
 }
 
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {

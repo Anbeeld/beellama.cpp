@@ -15,6 +15,16 @@ static void speculative_rollback_checkpoint_boundary() {
     assert(!server_speculative_rollback_requires_checkpoint(COMMON_CONTEXT_SEQ_RM_TYPE_RS, reserve, reserve));
     assert( server_speculative_rollback_requires_checkpoint(COMMON_CONTEXT_SEQ_RM_TYPE_RS, reserve, reserve + 1));
     assert( server_speculative_rollback_requires_checkpoint(COMMON_CONTEXT_SEQ_RM_TYPE_RS, 0, 1));
+
+    assert(!server_prompt_reuse_requires_checkpoint_search(1, 0, 528));
+    assert( server_prompt_reuse_requires_checkpoint_search(1, 512, 512));
+    assert( server_prompt_reuse_requires_checkpoint_search(64, 0, 528));
+
+    assert(server_prompt_reuse_alignment(false, 0) == 1);
+    assert(server_prompt_reuse_alignment(true,  0) == 64);
+    assert(server_prompt_reuse_alignment(false, 128) == 128);
+    assert(server_prompt_reuse_alignment(true,  128) == 128);
+    assert(server_prompt_reuse_alignment(true,  192) == 192);
 }
 
 static server_prompt make_prompt(const llama_tokens & tokens) {
@@ -51,16 +61,30 @@ static void prompt_cache_load_target_success_draft_failure_is_atomic() {
     bool restored_draft = false;
     bool cleared_main = false;
     bool cleared_draft = false;
+    int main_state = 90;
+    int draft_state = 80;
+    bool fail_cached_draft_once = true;
     server_prompt_cache_state_io io {
         /*.has_draft =*/ true,
+        /*.has_speculative =*/ false,
         /*.can_restore =*/ [](server_prompt_state_kind) { return true; },
-        /*.restore =*/ [&](server_prompt_state_kind kind, const std::vector<uint8_t> &) {
+        /*.snapshot =*/ [&](server_prompt_state_kind kind, std::vector<uint8_t> & data) {
+            data.resize(kind == SERVER_PROMPT_STATE_MAIN ? size_t(main_state) : size_t(draft_state));
+            return true;
+        },
+        /*.restore =*/ [&](server_prompt_state_kind kind, const std::vector<uint8_t> & data) {
             if (kind == SERVER_PROMPT_STATE_MAIN) {
                 restored_main = true;
+                main_state = int(data.size());
                 return true;
             }
             restored_draft = true;
-            return false;
+            draft_state = int(data.size());
+            if (data.size() == 8 && fail_cached_draft_once) {
+                fail_cached_draft_once = false;
+                return false;
+            }
+            return true;
         },
         /*.clear =*/ [&](server_prompt_state_kind kind) {
             (kind == SERVER_PROMPT_STATE_MAIN ? cleared_main : cleared_draft) = true;
@@ -70,10 +94,22 @@ static void prompt_cache_load_target_success_draft_failure_is_atomic() {
 
     assert(!cache.load(current, requested, io));
     assert(restored_main && restored_draft);
-    assert(cleared_main && cleared_draft);
-    assert(cache.states.empty());
-    assert(current.tokens.empty());
-    assert(current.checkpoints.empty());
+    assert(!cleared_main && !cleared_draft);
+    assert(main_state == 90 && draft_state == 80);
+    assert(cache.states.size() == 1);
+    assert(current.tokens.size() == 1);
+    assert(current.tokens[0] == 9);
+    assert(current.checkpoints.size() == 1);
+}
+
+static void checkpoint_failed_target_save_cannot_reuse_stale_bytes() {
+    common_prompt_checkpoint checkpoint;
+    checkpoint.data_tgt.resize(32, 0x5a);
+
+    checkpoint.update_tgt(nullptr, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+    assert(checkpoint.data_tgt.empty());
+    assert(checkpoint.empty());
 }
 
 static void server_unsupported_removal_falls_back_to_full_reprocess() {
@@ -176,12 +212,61 @@ static void server_planned_removal_preserves_atomic_media_chunks() {
     assert(removed_p0 == media_end);
 }
 
+static void prompt_cache_snapshot_restore_evict_stress() {
+    server_prompt_cache cache(0, 0);
+
+    int logical_state = 0;
+    server_prompt_cache_state_io io {
+        /*.has_draft =*/ false,
+        /*.has_speculative =*/ false,
+        /*.can_restore =*/ [](server_prompt_state_kind) { return true; },
+        /*.snapshot =*/ [&](server_prompt_state_kind, std::vector<uint8_t> & data) {
+            data.assign(1, uint8_t(logical_state));
+            return true;
+        },
+        /*.restore =*/ [&](server_prompt_state_kind, const std::vector<uint8_t> & data) {
+            assert(!data.empty());
+            logical_state = data.front();
+            return true;
+        },
+        /*.clear =*/ [](server_prompt_state_kind) { return true; },
+    };
+
+    for (int i = 0; i < 10000; ++i) {
+        server_prompt source = make_prompt({i + 1, i + 20001});
+        auto & checkpoint = source.checkpoints.emplace_back();
+        checkpoint.n_tokens = 2;
+        checkpoint.data_tgt.resize(4*KIB);
+
+        auto * admitted = cache.alloc(source, 32*KIB, 0);
+        assert(admitted != nullptr);
+        admitted->data.main.front() = uint8_t(i);
+
+        server_prompt destination;
+        server_tokens requested(llama_tokens {i + 1, i + 20001, i + 40001}, false);
+        assert(cache.load(destination, requested, io));
+        assert(destination.tokens.size() == source.tokens.size());
+        assert(logical_state == uint8_t(i));
+        assert(cache.states.size() == 1);
+        assert(cache.erase(admitted));
+        assert(cache.states.empty());
+        assert(cache.size() == 0);
+    }
+
+    assert(cache.admission_successes == 10000);
+    assert(cache.restore_successes == 10000);
+    assert(cache.admission_failures == 0);
+    assert(cache.restore_failures == 0);
+}
+
 int main() {
     speculative_rollback_checkpoint_boundary();
     prompt_cache_load_target_success_draft_failure_is_atomic();
+    checkpoint_failed_target_save_cannot_reuse_stale_bytes();
     server_unsupported_removal_falls_back_to_full_reprocess();
     server_post_preflight_mutation_failure_clears_both_contexts();
     server_planned_removal_preserves_atomic_media_chunks();
+    prompt_cache_snapshot_restore_evict_stress();
     {
         common_prompt_checkpoint ckpt;
         ckpt.n_tokens = 3;
@@ -210,6 +295,13 @@ int main() {
         const server_prompt clone = prompt.clone();
         assert(clone.n_tokens() == 3);
         assert(clone.checkpoints.size() == 1);
+        assert(clone.checkpoints.front().data_tgt.storage_id() ==
+                prompt.checkpoints.front().data_tgt.storage_id());
+
+        const void * shared_storage = clone.checkpoints.front().data_tgt.storage_id();
+        prompt.checkpoints.front().data_tgt.resize(24);
+        assert(prompt.checkpoints.front().data_tgt.storage_id() != shared_storage);
+        assert(clone.checkpoints.front().data_tgt.size() == 16);
 
         server_prompt_cache_state state {
             /*.prompt =*/ std::move(prompt),
@@ -218,7 +310,7 @@ int main() {
                 /*.drft =*/ std::vector<uint8_t>(32),
             },
         };
-        assert(state.size() == 120);
+        assert(state.size() == 128);
     }
 
     {
@@ -274,6 +366,21 @@ int main() {
         assert(cache.alloc(current, 100*KIB, 0) != nullptr);
         assert(cache.alloc(current, 100*KIB, 0) == nullptr);
         assert(cache.states.size() == 1);
+    }
+
+    {
+        server_prompt source = make_prompt({7, 8, 9});
+        source.checkpoints.emplace_back().data_tgt.resize(200*KIB);
+        server_prompt_cache cache(0, 0);
+        server_prompt_cache_state first;
+        first.prompt = source.clone();
+        first.data.main.resize(10*KIB);
+        server_prompt_cache_state second;
+        second.prompt = source.clone();
+        second.data.main.resize(20*KIB);
+        cache.states.push_back(std::move(first));
+        cache.states.push_back(std::move(second));
+        assert(cache.size() == 230*KIB);
     }
 
     return 0;

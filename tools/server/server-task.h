@@ -8,11 +8,14 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <numeric>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
 
 using json = nlohmann::ordered_json;
+
+struct common_speculative;
 
 // A rollback-capable recurrent/compact KV implementation can truncate a
 // speculative suffix in-place up to its advertised reserve.  Beyond that
@@ -23,6 +26,24 @@ static inline bool server_speculative_rollback_requires_checkpoint(
         size_t                     proposed_rollback) {
     return type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
           (type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && proposed_rollback > max_rollback);
+}
+
+// Recurrent/hybrid prompt state is reusable only at a durable, numerically
+// stable checkpoint. This remains true when ordinary attention retains the
+// complete prefix (pos_min == 0), so its live suffix test alone would not enter
+// checkpoint selection.
+static inline bool server_prompt_reuse_requires_checkpoint_search(
+        int32_t   reuse_alignment,
+        llama_pos pos_min,
+        llama_pos pos_min_threshold) {
+    return reuse_alignment > 1 || pos_min >= pos_min_threshold;
+}
+
+// Compose the numerical prefill cadence with the structured-cache descriptor
+// boundary. A zero KVarN group means ordinary standard KV.
+static inline int32_t server_prompt_reuse_alignment(bool recurrent_or_hybrid, int32_t kvarn_group) {
+    const int32_t recurrent_alignment = recurrent_or_hybrid ? 64 : 1;
+    return kvarn_group > 0 ? std::lcm(recurrent_alignment, kvarn_group) : recurrent_alignment;
 }
 
 enum server_task_type {
@@ -274,6 +295,11 @@ struct server_task {
 
 struct result_timings {
     int32_t cache_n = -1;
+    int32_t cache_lcp_n = 0;
+    int32_t cache_planned_n = 0;
+    int32_t cache_reprocessed_n = 0;
+    std::string cache_source = "none";
+    std::string cache_reason = "none";
 
     int32_t prompt_n = -1;
     double prompt_ms = 0.0;
@@ -558,6 +584,13 @@ struct server_task_result_metrics : server_task_result {
     uint64_t kv_tail_partial_groups     = 0;
     uint64_t kv_tail_none_groups        = 0;
     uint64_t kv_tail_degraded_sequences = 0;
+    uint64_t prompt_cache_admission_attempts = 0;
+    uint64_t prompt_cache_admission_successes = 0;
+    uint64_t prompt_cache_admission_failures = 0;
+    uint64_t prompt_cache_restore_attempts = 0;
+    uint64_t prompt_cache_restore_successes = 0;
+    uint64_t prompt_cache_restore_failures = 0;
+    uint64_t prompt_cache_resident_bytes = 0;
     uint64_t n_draft_tokens_total      = 0;
     uint64_t n_draft_accepted_total    = 0;
     uint64_t n_draft_verif_steps_total = 0;
@@ -640,11 +673,14 @@ struct server_prompt {
 enum server_prompt_state_kind {
     SERVER_PROMPT_STATE_MAIN,
     SERVER_PROMPT_STATE_DRAFT,
+    SERVER_PROMPT_STATE_SPECULATIVE,
 };
 
 struct server_prompt_cache_state_io {
     bool has_draft;
+    bool has_speculative;
     std::function<bool(server_prompt_state_kind)> can_restore;
+    std::function<bool(server_prompt_state_kind, std::vector<uint8_t> &)> snapshot;
     std::function<bool(server_prompt_state_kind, const std::vector<uint8_t> &)> restore;
     std::function<bool(server_prompt_state_kind)> clear;
 };
@@ -652,9 +688,10 @@ struct server_prompt_cache_state_io {
 struct server_prompt_data {
     std::vector<uint8_t> main;
     std::vector<uint8_t> drft;
+    std::vector<uint8_t> spec;
 
     size_t size() const {
-        return main.size() + drft.size();
+        return main.size() + drft.size() + spec.size();
     }
 };
 
@@ -687,19 +724,37 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
+    uint64_t admission_attempts = 0;
+    uint64_t admission_successes = 0;
+    uint64_t admission_failures = 0;
+    uint64_t restore_attempts = 0;
+    uint64_t restore_successes = 0;
+    uint64_t restore_failures = 0;
+
     size_t size() const;
 
     size_t n_tokens() const;
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
+    server_prompt_cache_state * insert(const server_prompt & prompt, server_prompt_data && data);
+
     bool erase(const server_prompt_cache_state * entry);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, const server_prompt_cache_state_io & io);
 
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    bool load(
+            server_prompt & prompt,
+            const server_tokens & tokens_new,
+            llama_context * ctx_tgt,
+            llama_context * ctx_dft,
+            common_speculative * spec,
+            int32_t id_slot);
 
     void update();
+
+private:
+    server_prompt_cache_state * admit(server_prompt_cache_state && candidate);
 };
 
 // used exclusively by router mode

@@ -170,7 +170,12 @@ struct common_speculative_impl {
 
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
-    virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
+    virtual bool validate_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & data) const {
+        return data.empty();
+    }
+    virtual bool set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & data) {
+        return data.empty();
+    }
 
     // true if this implementation requires the target context to extract post-norm embeddings
     virtual bool need_embd() const = 0;
@@ -889,15 +894,36 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         return true;
     }
 
-    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+    bool validate_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) const override {
         if (!need_boundary_stash()) {
-            return;
+            return data.empty();
         }
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
-            return;
+            return false;
+        }
+        if (data.empty()) {
+            return true;
         }
         if (data.size() != sizeof(llama_pos) + (size_t) n_embd_dec * sizeof(float)) {
-            return;
+            return false;
+        }
+
+        llama_pos pos = -1;
+        std::memcpy(&pos, data.data(), sizeof(llama_pos));
+        return pos >= 0;
+    }
+
+    bool set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (!validate_state(seq_id, data)) {
+            return false;
+        }
+        if (!need_boundary_stash()) {
+            return true;
+        }
+        if (data.empty()) {
+            pending_pos_last[seq_id] = -1;
+            std::fill(pending_g_last[seq_id].begin(), pending_g_last[seq_id].end(), 0.0f);
+            return true;
         }
 
         llama_pos pos = -1;
@@ -906,6 +932,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         pending_pos_last[seq_id] = pos;
         pending_g_last[seq_id].resize(n_embd_dec);
         std::memcpy(pending_g_last[seq_id].data(), data.data() + sizeof(llama_pos), (size_t) n_embd_dec * sizeof(float));
+        return true;
     }
 
     bool need_embd() const override {
@@ -1681,6 +1708,73 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+    }
+
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq ||
+                pending_h[seq_id].size() != (size_t) n_embd) {
+            return false;
+        }
+
+        constexpr uint32_t magic   = 0x3150544d; // MTP1
+        constexpr uint32_t version = 1;
+        const uint32_t width = uint32_t(n_embd);
+        const size_t header_size = sizeof(magic) + sizeof(version) + sizeof(width);
+        const size_t row_size = (size_t) n_embd * sizeof(float);
+
+        data.resize(header_size + row_size);
+        uint8_t * dst = data.data();
+        std::memcpy(dst, &magic, sizeof(magic));
+        dst += sizeof(magic);
+        std::memcpy(dst, &version, sizeof(version));
+        dst += sizeof(version);
+        std::memcpy(dst, &width, sizeof(width));
+        dst += sizeof(width);
+        std::memcpy(dst, pending_h[seq_id].data(), row_size);
+        return true;
+    }
+
+    bool validate_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return false;
+        }
+        if (data.empty()) {
+            return true;
+        }
+
+        constexpr uint32_t expected_magic   = 0x3150544d; // MTP1
+        constexpr uint32_t expected_version = 1;
+        constexpr size_t header_size = sizeof(uint32_t) * 3;
+        if (data.size() != header_size + (size_t) n_embd * sizeof(float)) {
+            return false;
+        }
+
+        uint32_t magic;
+        uint32_t version;
+        uint32_t width;
+        std::memcpy(&magic,   data.data(),                      sizeof(magic));
+        std::memcpy(&version, data.data() + sizeof(uint32_t),   sizeof(version));
+        std::memcpy(&width,   data.data() + sizeof(uint32_t)*2, sizeof(width));
+        return magic == expected_magic && version == expected_version && width == uint32_t(n_embd);
+    }
+
+    bool set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (!validate_state(seq_id, data)) {
+            return false;
+        }
+
+        verify_h[seq_id].clear();
+        verify_h_rows[seq_id] = 0;
+        i_last[seq_id] = -1;
+        if (data.empty()) {
+            std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+            return true;
+        }
+
+        constexpr size_t header_size = sizeof(uint32_t) * 3;
+        std::memcpy(pending_h[seq_id].data(), data.data() + header_size,
+                (size_t) n_embd * sizeof(float));
+        return true;
     }
 
     bool need_embd() const override {
@@ -2702,12 +2796,47 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
 
 // TODO: support the case of more than one speculative implementations having a state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data) {
+    data.clear();
     if (spec == nullptr) {
         return false;
     }
 
     for (auto & impl : spec->impls) {
-        if (impl->get_state(seq_id, data)) {
+        std::vector<uint8_t> payload;
+        if (impl->get_state(seq_id, payload)) {
+            constexpr uint32_t magic = 0x43455053; // SPEC
+            constexpr uint32_t version = 1;
+            const uint32_t type = uint32_t(impl->type);
+            const uint64_t payload_size = payload.size();
+            uint64_t checksum = 1469598103934665603ULL;
+            const auto hash_bytes = [&](const void * ptr, size_t size) {
+                const auto * bytes = static_cast<const uint8_t *>(ptr);
+                for (size_t i = 0; i < size; ++i) {
+                    checksum = (checksum ^ bytes[i])*1099511628211ULL;
+                }
+            };
+            hash_bytes(&magic, sizeof(magic));
+            hash_bytes(&version, sizeof(version));
+            hash_bytes(&type, sizeof(type));
+            hash_bytes(&seq_id, sizeof(seq_id));
+            hash_bytes(&payload_size, sizeof(payload_size));
+            for (uint8_t byte : payload) {
+                checksum = (checksum ^ byte)*1099511628211ULL;
+            }
+            data.resize(sizeof(magic) + sizeof(version) + sizeof(type) + sizeof(seq_id) +
+                    sizeof(payload_size) + sizeof(checksum) + payload.size());
+            uint8_t * dst = data.data();
+            const auto append = [&](const auto & value) {
+                std::memcpy(dst, &value, sizeof(value));
+                dst += sizeof(value);
+            };
+            append(magic);
+            append(version);
+            append(type);
+            append(seq_id);
+            append(payload_size);
+            append(checksum);
+            std::memcpy(dst, payload.data(), payload.size());
             return true;
         }
     }
@@ -2715,14 +2844,118 @@ bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id
     return false;
 }
 
-void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data) {
+namespace {
+struct common_speculative_state_view {
+    uint32_t type = 0;
+    const uint8_t * payload = nullptr;
+    size_t payload_size = 0;
+};
+
+bool common_speculative_parse_state(
+        llama_seq_id seq_id,
+        const std::vector<uint8_t> & data,
+        common_speculative_state_view & view) {
+    constexpr size_t header_size = sizeof(uint32_t)*3 + sizeof(llama_seq_id) + sizeof(uint64_t)*2;
+    if (data.size() < header_size) {
+        return false;
+    }
+    const uint8_t * src = data.data();
+    const auto read = [&](auto & value) {
+        std::memcpy(&value, src, sizeof(value));
+        src += sizeof(value);
+    };
+    uint32_t magic;
+    uint32_t version;
+    llama_seq_id saved_seq_id;
+    uint64_t payload_size;
+    uint64_t checksum;
+    read(magic);
+    read(version);
+    read(view.type);
+    read(saved_seq_id);
+    read(payload_size);
+    read(checksum);
+    // The saved sequence ID is provenance, not ownership.  RAM snapshots can
+    // be restored into a different server slot, so the envelope must not bind
+    // otherwise portable implementation state to its source slot number.
+    if (magic != 0x43455053 || version != 1 || saved_seq_id < 0 || seq_id < 0 ||
+            payload_size != data.size() - header_size) {
+        return false;
+    }
+    uint64_t actual_checksum = 1469598103934665603ULL;
+    const auto hash_bytes = [&](const void * ptr, size_t size) {
+        const auto * bytes = static_cast<const uint8_t *>(ptr);
+        for (size_t i = 0; i < size; ++i) {
+            actual_checksum = (actual_checksum ^ bytes[i])*1099511628211ULL;
+        }
+    };
+    hash_bytes(&magic, sizeof(magic));
+    hash_bytes(&version, sizeof(version));
+    hash_bytes(&view.type, sizeof(view.type));
+    hash_bytes(&saved_seq_id, sizeof(saved_seq_id));
+    hash_bytes(&payload_size, sizeof(payload_size));
+    for (size_t i = 0; i < payload_size; ++i) {
+        actual_checksum = (actual_checksum ^ src[i])*1099511628211ULL;
+    }
+    if (actual_checksum != checksum) {
+        return false;
+    }
+    view.payload = src;
+    view.payload_size = size_t(payload_size);
+    return true;
+}
+}
+
+bool common_speculative_validate_state(
+        common_speculative * spec,
+        llama_seq_id seq_id,
+        const std::vector<uint8_t> & data) {
     if (spec == nullptr) {
-        return;
+        return data.empty();
+    }
+    if (data.empty()) {
+        return std::all_of(spec->impls.begin(), spec->impls.end(), [&](const auto & impl) {
+            return impl->validate_state(seq_id, data);
+        });
     }
 
-    for (auto & impl : spec->impls) {
-        impl->set_state(seq_id, data);
+    common_speculative_state_view view;
+    if (!common_speculative_parse_state(seq_id, data, view)) {
+        return false;
     }
+    const std::vector<uint8_t> payload(view.payload, view.payload + view.payload_size);
+    for (const auto & impl : spec->impls) {
+        if (uint32_t(impl->type) == view.type) {
+            return impl->validate_state(seq_id, payload);
+        }
+    }
+    return false;
+}
+
+bool common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data) {
+    if (!common_speculative_validate_state(spec, seq_id, data)) {
+        return false;
+    }
+    if (spec == nullptr) {
+        return true;
+    }
+    if (data.empty()) {
+        bool cleared = true;
+        for (auto & impl : spec->impls) {
+            cleared = impl->set_state(seq_id, data) && cleared;
+        }
+        return cleared;
+    }
+
+    common_speculative_state_view view;
+    GGML_ASSERT(common_speculative_parse_state(seq_id, data, view));
+    const std::vector<uint8_t> payload(view.payload, view.payload + view.payload_size);
+    for (auto & impl : spec->impls) {
+        if (uint32_t(impl->type) == view.type) {
+            return impl->set_state(seq_id, payload);
+        }
+    }
+    return false;
 }
 
 void common_speculative_print_stats(const common_speculative * spec) {

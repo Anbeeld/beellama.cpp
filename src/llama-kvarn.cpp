@@ -6,6 +6,8 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <set>
+#include <stdexcept>
 #include <vector>
 
 #define LLAMA_KVARN_DESC(KB, VB) { LLAMA_KVARN_K##KB##V##VB##_G128, "kvarn_k" #KB "v" #VB "_g128", KB, VB, 128 }
@@ -234,11 +236,12 @@ llama_kvarn_iswa_policy llama_kvarn_iswa_policy_for(
     if (!enabled) {
         return LLAMA_KVARN_ISWA_DISABLED;
     }
-    if (!has_swa || n_seq_max <= 1 || unified) {
+    GGML_UNUSED(unified);
+    GGML_UNUSED(fail_if_unsupported);
+    if (!has_swa || n_seq_max <= 1) {
         return LLAMA_KVARN_ISWA_ALL_LAYERS;
     }
-    return fail_if_unsupported ?
-        LLAMA_KVARN_ISWA_UNSUPPORTED : LLAMA_KVARN_ISWA_STANDARD_SWA_FALLBACK;
+    return LLAMA_KVARN_ISWA_STANDARD_SWA_FALLBACK;
 }
 
 bool llama_kvarn_can_remove_range(llama_pos pos_max, llama_pos p0, llama_pos p1, uint32_t group) {
@@ -285,6 +288,65 @@ bool llama_kvarn_plan_remove_range(
     planned_p0 = (p0 / llama_pos(group)) * llama_pos(group);
     planned_p1 = -1;
     return true;
+}
+
+std::vector<llama_kvarn_state_stage_cell> llama_kvarn_select_state_stage_cells(
+        const std::vector<uint32_t> & source_cells,
+        uint32_t live_cell_max_p1,
+        uint32_t stage_groups,
+        uint32_t tail_groups,
+        bool swa) {
+    if (live_cell_max_p1 == 0) {
+        return {};
+    }
+    if (stage_groups < 2 || tail_groups == 0 || tail_groups > stage_groups ||
+            (!swa && tail_groups >= stage_groups)) {
+        throw std::invalid_argument("invalid KVarN state stage layout");
+    }
+
+    const uint32_t live_group = (live_cell_max_p1 - 1)/KVAR_N_GROUP;
+    const uint32_t stage_begin = live_group >= tail_groups - 1 ?
+            live_group - (tail_groups - 1) : 0;
+    std::vector<llama_kvarn_state_stage_cell> result;
+    result.reserve(std::min<size_t>(source_cells.size(), size_t(KVAR_N_GROUP)*(tail_groups + 1u)));
+    for (uint32_t cell : source_cells) {
+        if (cell >= live_cell_max_p1) {
+            throw std::invalid_argument("KVarN state source cell exceeds the live stream extent");
+        }
+        const uint32_t group = cell/KVAR_N_GROUP;
+        const uint32_t pos = cell%KVAR_N_GROUP;
+        const bool staged = swa ? group >= stage_begin && group <= live_group :
+                group == 0 || (group > 0 && group >= stage_begin && group <= live_group);
+        if (!staged) {
+            continue;
+        }
+        const uint32_t slot = swa ? group%stage_groups :
+                (group == 0 ? 0 : 1 + ((group - 1)%tail_groups));
+        result.push_back({ cell, slot*KVAR_N_GROUP + pos });
+    }
+    return result;
+}
+
+std::vector<uint32_t> llama_kvarn_select_state_record_groups(
+        const std::vector<uint32_t> & source_cells,
+        const std::vector<llama_kvarn_state_stage_cell> & stage_cells,
+        uint32_t groups_per_stream) {
+    std::set<uint32_t> staged_groups;
+    for (const auto & cell : stage_cells) {
+        staged_groups.insert(cell.source_cell/KVAR_N_GROUP);
+    }
+
+    std::set<uint32_t> sealed_groups;
+    for (const uint32_t cell : source_cells) {
+        const uint32_t group = cell/KVAR_N_GROUP;
+        if (group >= groups_per_stream) {
+            throw std::invalid_argument("KVarN state source cell exceeds the record arena");
+        }
+        if (staged_groups.count(group) == 0) {
+            sealed_groups.insert(group);
+        }
+    }
+    return { sealed_groups.begin(), sealed_groups.end() };
 }
 
 llama_kvarn_tile_layout llama_kvarn_make_layout(int head_dim, int group, int key_bits, int value_bits) {

@@ -270,6 +270,18 @@ bool llama_memory_hybrid_iswa::state_seq_can_restore(llama_seq_id seq_id) const 
            mem_recr->state_seq_can_restore(seq_id);
 }
 
+bool llama_memory_hybrid_iswa::state_seq_can_save(
+        llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    return mem_attn->state_seq_can_save(seq_id, flags) &&
+           mem_recr->state_seq_can_save(seq_id, flags);
+}
+
+bool llama_memory_hybrid_iswa::state_seq_can_restore(
+        llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    return mem_attn->state_seq_can_restore(seq_id, flags) &&
+           mem_recr->state_seq_can_restore(seq_id, flags);
+}
+
 void llama_memory_hybrid_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     const bool include_attn = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0 ||
                               mem_attn->requires_state_for_partial_restore();

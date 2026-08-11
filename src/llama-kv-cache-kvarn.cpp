@@ -12,7 +12,9 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <set>
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -118,6 +120,8 @@ bool kvarn_backend_supports_tail_write(
 // records. Keep this low enough that KVarN remains a KV-memory win over q5_0.
 constexpr uint32_t KVAR_N_SWA_TAIL_GROUPS = 2;
 constexpr uint32_t KVAR_N_STATE_MAGIC = 0x4e52564b; // "KVRN"
+// Version 15 adds self-contained selective record groups with cell remapping.
+// Version 14 stores selective per-sequence stage rows by logical source cell.
 // Version 13 stores exact-tail payloads component-major in contiguous physical
 // slot runs. Version 12 stores canonical exact-tail payloads interleaved by row
 // and remaps SWA record rings across physical ubatch layouts. Version 11: tail_groups is explicit and SWA
@@ -127,9 +131,10 @@ constexpr uint32_t KVAR_N_STATE_MAGIC = 0x4e52564b; // "KVRN"
 // otherwise be restored in the wrong domain. Version 5 added stage_groups
 // validation. Version 10 rejects states with the pre-dedup SWA record-ring layout.
 constexpr uint32_t KVAR_N_STATE_VERSION_MIN = 12;
-constexpr uint32_t KVAR_N_STATE_VERSION = 13;
+constexpr uint32_t KVAR_N_STATE_VERSION = 15;
 constexpr uint32_t KVAR_N_STATE_RECORDS_FULL = 0;
 constexpr uint32_t KVAR_N_STATE_STAGE_ONLY_PARTIAL = 1;
+constexpr uint32_t KVAR_N_STATE_RECORDS_SELECTIVE = 2;
 
 } // namespace
 
@@ -598,12 +603,13 @@ const std::vector<float> & kvarn_hadamard(int n) {
     }
 }
 
-uint32_t kvarn_stage_tail_groups(uint32_t n_batch, uint32_t n_ubatch, bool is_swa) {
+uint32_t kvarn_stage_tail_groups(
+        uint32_t n_batch, uint32_t n_ubatch, bool is_swa, uint32_t n_seq_max) {
     if (is_swa) {
         return KVAR_N_SWA_TAIL_GROUPS;
     }
 
-    return llama_kvarn_non_swa_tail_groups(n_batch, n_ubatch);
+    return llama_kvarn_non_swa_tail_groups(n_batch, n_ubatch)*std::max(1u, n_seq_max);
 }
 
 uint32_t kvarn_swa_visible_groups(uint32_t kv_size, uint32_t n_swa) {
@@ -1078,7 +1084,8 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     // Non-SWA keeps a permanent sink slot plus the scheduler-span tail. SWA has
     // no sink, so every stage slot is part of the local tail.
     tail_groups(kvarn_stage_tail_groups(
-        n_batch, n_ubatch, n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE)),
+        n_batch, n_ubatch, n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE,
+        unified ? n_seq_max : 1u)),
     stage_groups((n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE) ? tail_groups : tail_groups + 1u),
     swa(n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE),
     // SWA: the metadata window may span one more 128-token tile than its nominal
@@ -1123,6 +1130,9 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     GGML_ASSERT(tail_groups >= 1 && tail_groups <= stage_groups &&
         "KVarN tail depth must fit within the F16 stage");
     exact_tail_type = metadata->get_tail_type();
+    if (!swa) {
+        metadata->set_allocation_group_size(KVAR_N_GROUP, n_stream == 1 ? n_seq_max : 1u);
+    }
     if (swa) {
         GGML_ASSERT(n_stream == 1 && "SWA KVarN ring requires a single-stream cache");
         const uint32_t in_flight_groups = std::max<uint32_t>(1u, (n_ubatch + KVAR_N_GROUP - 1u) / KVAR_N_GROUP);
@@ -1565,6 +1575,9 @@ std::unique_ptr<llama_kv_cache> llama_kv_cache_kvarn::make_metadata_cache() cons
     if (!routes.empty()) {
         result->finalize_tail_overlay_metadata();
     }
+    if (!swa) {
+        result->set_allocation_group_size(KVAR_N_GROUP, n_stream == 1 ? n_seq_max : 1u);
+    }
     return result;
 }
 
@@ -1801,6 +1814,32 @@ bool llama_kv_cache_kvarn::state_seq_can_restore(llama_seq_id seq_id) const {
     return stream_is_exclusive_for(seq_id);
 }
 
+bool llama_kv_cache_kvarn::state_seq_can_save(
+        llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    if (seq_id < 0) {
+        return false;
+    }
+    const bool selective = (flags & (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY |
+                                     LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED)) != 0;
+    if (swa && (flags & LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED) != 0 && !stream_is_exclusive_for(seq_id)) {
+        return false;
+    }
+    return !has_pending_stream_copies() && (selective || stream_is_exclusive_for(seq_id));
+}
+
+bool llama_kv_cache_kvarn::state_seq_can_restore(
+        llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    if (seq_id < 0) {
+        return false;
+    }
+    const bool selective = (flags & (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY |
+                                     LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED)) != 0;
+    if (swa && (flags & LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED) != 0 && !stream_is_exclusive_for(seq_id)) {
+        return false;
+    }
+    return !has_pending_stream_copies() && (selective || stream_is_exclusive_for(seq_id));
+}
+
 bool llama_kv_cache_kvarn::has_pending_stream_copies() const {
     return !pending_stream_copies.empty();
 }
@@ -1940,6 +1979,13 @@ uint64_t llama_kv_cache_kvarn::get_kv_tail_planner_timing_ns() const {
 void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     metadata->state_write(io, seq_id, flags);
     const bool partial_state = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0 && seq_id >= 0;
+    const bool self_contained = (flags & LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED) != 0 && seq_id >= 0;
+    if (partial_state && self_contained) {
+        throw std::invalid_argument("KVarN state cannot be partial-only and self-contained");
+    }
+    if (self_contained && swa && !stream_is_exclusive_for(seq_id)) {
+        throw std::runtime_error("self-contained KVarN SWA state requires an exclusive stream");
+    }
     const bool body_only = (flags & LLAMA_STATE_SEQ_FLAGS_BODY_ONLY) != 0;
 
     std::vector<uint32_t> saved_streams;
@@ -1965,7 +2011,10 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
     for (const uint32_t stream : saved_streams) {
         io.write(&stream, sizeof(stream));
     }
-    const uint32_t state_kind = partial_state ? KVAR_N_STATE_STAGE_ONLY_PARTIAL : KVAR_N_STATE_RECORDS_FULL;
+    // A single-sequence SWA ring is already self-contained as a complete
+    // position-addressed ring. Multi-slot iSWA uses the standard-SWA fallback.
+    const uint32_t state_kind = self_contained && !swa ? KVAR_N_STATE_RECORDS_SELECTIVE :
+            (partial_state ? KVAR_N_STATE_STAGE_ONLY_PARTIAL : KVAR_N_STATE_RECORDS_FULL);
     io.write(&state_kind, sizeof(state_kind));
     // Record both stage and workspace depth so SWA no-sink stages and
     // non-SWA sink stages cannot be restored into each other's layout.
@@ -1999,13 +2048,11 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
     // per-stream.
     uint32_t n_groups_used = n_groups_per_stream;
     if (seq_id >= 0 && !swa) {
-        const llama_pos pos_max = metadata->seq_pos_max(seq_id);
-        if (pos_max >= 0) {
-            // ceil((pos_max + 1) / KVAR_N_GROUP) — covers all groups that the
-            // native view might read. After restore the next store will
-            // compute live_group ≤ pos_max / KVAR_N_GROUP < n_groups_used, so
-            // every accessed group stays within the restored range.
-            n_groups_used = std::min(n_groups_per_stream, (uint32_t) ((pos_max + KVAR_N_GROUP) / KVAR_N_GROUP));
+        const auto source_cells = metadata->state_source_cells(seq_id);
+        if (!source_cells.empty()) {
+            n_groups_used = std::min(
+                    n_groups_per_stream,
+                    *std::max_element(source_cells.begin(), source_cells.end())/KVAR_N_GROUP + 1u);
         }
     }
     // SWA ring: always serialize all ring slots — the live window may wrap around
@@ -2021,7 +2068,48 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
     }
     io.write(&saved_pos_max, sizeof(saved_pos_max));
 
+    std::vector<llama_kvarn_state_stage_cell> selective_stage_cells;
+    if (partial_state || state_kind == KVAR_N_STATE_RECORDS_SELECTIVE) {
+        const auto source_cells = metadata->state_source_cells(seq_id);
+        const uint32_t source_max_p1 = source_cells.empty() ? 0 :
+                *std::max_element(source_cells.begin(), source_cells.end()) + 1u;
+        selective_stage_cells = llama_kvarn_select_state_stage_cells(
+                source_cells,
+                source_max_p1,
+                stage_groups,
+                tail_groups,
+                swa);
+    }
+    if (selective_stage_cells.size() > std::numeric_limits<uint32_t>::max()) {
+        throw std::overflow_error("KVarN selective stage row count overflows uint32_t");
+    }
+    const uint32_t n_selective_stage_cells = uint32_t(selective_stage_cells.size());
+    io.write(&n_selective_stage_cells, sizeof(n_selective_stage_cells));
+    for (const auto & cell : selective_stage_cells) {
+        io.write(&cell.source_cell, sizeof(cell.source_cell));
+        io.write(&cell.stage_row, sizeof(cell.stage_row));
+    }
+
+    std::vector<uint32_t> selective_record_groups;
+    if (state_kind == KVAR_N_STATE_RECORDS_SELECTIVE) {
+        selective_record_groups = llama_kvarn_select_state_record_groups(
+                metadata->state_source_cells(seq_id), selective_stage_cells,
+                n_groups_per_stream);
+    }
+    if (selective_record_groups.size() > std::numeric_limits<uint32_t>::max()) {
+        throw std::overflow_error("KVarN selective record group count overflows uint32_t");
+    }
+    const uint32_t n_selective_record_groups = uint32_t(selective_record_groups.size());
+    io.write(&n_selective_record_groups, sizeof(n_selective_record_groups));
+    for (const uint32_t group : selective_record_groups) {
+        if (group >= n_groups_per_stream) {
+            throw std::runtime_error("KVarN selective record group is out of range");
+        }
+        io.write(&group, sizeof(group));
+    }
+
     uint64_t exact_payload_bytes = 0;
+    uint64_t selective_stage_bytes = 0;
     size_t exact_tensor_ops = 0;
     for (const auto & layer : layers) {
         io.write(&layer.il, sizeof(layer.il));
@@ -2034,8 +2122,34 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
                 write_kvarn_tensor_slice(io, layer.k_records_stream[stream], 0, k_records_used);
                 write_kvarn_tensor_slice(io, layer.v_records_stream[stream], 0, v_records_used);
             }
-            write_kvarn_tensor(io, layer.k_stage_stream[stream]);
-            write_kvarn_tensor(io, layer.v_stage_stream[stream]);
+            if (state_kind == KVAR_N_STATE_RECORDS_SELECTIVE) {
+                for (const uint32_t group : selective_record_groups) {
+                    write_kvarn_tensor_slice(
+                            io, layer.k_records_stream[stream],
+                            size_t(group)*layer.k_records_stream[stream]->nb[2],
+                            layer.k_records_stream[stream]->nb[2]);
+                    write_kvarn_tensor_slice(
+                            io, layer.v_records_stream[stream],
+                            size_t(group)*layer.v_records_stream[stream]->nb[2],
+                            layer.v_records_stream[stream]->nb[2]);
+                }
+            }
+            if (state_kind == KVAR_N_STATE_STAGE_ONLY_PARTIAL ||
+                    state_kind == KVAR_N_STATE_RECORDS_SELECTIVE) {
+                for (const auto & cell : selective_stage_cells) {
+                    const size_t k_offset = size_t(cell.stage_row)*layer.k_stage_stream[stream]->nb[2];
+                    const size_t v_offset = size_t(cell.stage_row)*layer.v_stage_stream[stream]->nb[2];
+                    write_kvarn_tensor_slice(
+                            io, layer.k_stage_stream[stream], k_offset, layer.k_stage_stream[stream]->nb[2]);
+                    write_kvarn_tensor_slice(
+                            io, layer.v_stage_stream[stream], v_offset, layer.v_stage_stream[stream]->nb[2]);
+                    selective_stage_bytes += layer.k_stage_stream[stream]->nb[2] +
+                            layer.v_stage_stream[stream]->nb[2];
+                }
+            } else {
+                write_kvarn_tensor(io, layer.k_stage_stream[stream]);
+                write_kvarn_tensor(io, layer.v_stage_stream[stream]);
+            }
         }
         const uint64_t k_tail_row = layer.k_tail ? ggml_row_size(layer.k_tail->type, layer.k_tail->ne[0]) : 0;
         const uint64_t v_tail_row = layer.v_tail ? ggml_row_size(layer.v_tail->type, layer.v_tail->ne[0]) : 0;
@@ -2078,8 +2192,10 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
     }
 
     LLAMA_LOG_DEBUG(
-            "%s: KVarN state save: kind=%s version=%u payloads=%u tail_bytes=%llu runs=%zu tensor_ops=%zu device=%s\n",
-            __func__, partial_state ? "partial" : "full", KVAR_N_STATE_VERSION, n_exact_payloads,
+            "%s: KVarN state save: kind=%s version=%u stage_rows=%u stage_bytes=%llu "
+            "payloads=%u tail_bytes=%llu runs=%zu tensor_ops=%zu device=%s\n",
+            __func__, partial_state ? "partial" : (self_contained ? "selective" : "full"), KVAR_N_STATE_VERSION,
+            n_selective_stage_cells, (unsigned long long) selective_stage_bytes, n_exact_payloads,
             (unsigned long long) exact_payload_bytes, exact_payload_runs.size(), exact_tensor_ops,
             on_device ? "true" : "false");
 }
@@ -2109,7 +2225,17 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
     // untouched until every KVarN descriptor and payload has validated and the
     // outer state reader commits its queued tensor writes.
     auto metadata_prepared = make_metadata_cache();
+    const bool self_contained = (flags & LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED) != 0;
+    if (seq_id >= 0 && ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0 || self_contained)) {
+        metadata_prepared->clone_logical_state_from(*metadata);
+    }
+    if (self_contained) {
+        metadata_prepared->set_state_remap_group_size(KVAR_N_GROUP);
+    }
     metadata_prepared->state_read(io, seq_id, flags);
+    const auto & state_cell_remap_pairs = metadata_prepared->get_state_cell_remap();
+    std::unordered_map<uint32_t, uint32_t> state_cell_remap(
+            state_cell_remap_pairs.begin(), state_cell_remap_pairs.end());
     std::vector<std::vector<int32_t>> exact_destinations = metadata_prepared->take_restored_tail_payload_slots();
     const bool on_device = (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) != 0;
 
@@ -2147,8 +2273,13 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
 
     uint32_t state_kind;
     io.read(&state_kind, sizeof(state_kind));
-    if (state_kind != KVAR_N_STATE_RECORDS_FULL && state_kind != KVAR_N_STATE_STAGE_ONLY_PARTIAL) {
+    if (state_kind != KVAR_N_STATE_RECORDS_FULL &&
+            state_kind != KVAR_N_STATE_STAGE_ONLY_PARTIAL &&
+            state_kind != KVAR_N_STATE_RECORDS_SELECTIVE) {
         throw std::runtime_error("invalid KVarN cache state kind");
+    }
+    if (state_kind == KVAR_N_STATE_RECORDS_SELECTIVE && version < 15) {
+        throw std::runtime_error("KVarN selective record state predates its format version");
     }
 
     // The stage contains only the fixed sink/incomplete-group workspace. It is
@@ -2215,6 +2346,44 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
     llama_pos saved_pos_max;
     io.read(&saved_pos_max, sizeof(saved_pos_max));
 
+    std::vector<llama_kvarn_state_stage_cell> selective_stage_cells;
+    if (version >= 14) {
+        uint32_t n_selective_stage_cells;
+        io.read(&n_selective_stage_cells, sizeof(n_selective_stage_cells));
+        if (n_selective_stage_cells > uint64_t(stage_groups)*KVAR_N_GROUP) {
+            throw std::runtime_error("invalid KVarN selective stage row count");
+        }
+        selective_stage_cells.resize(n_selective_stage_cells);
+        std::set<uint32_t> source_cells;
+        std::set<uint32_t> stage_rows;
+        for (auto & cell : selective_stage_cells) {
+            io.read(&cell.source_cell, sizeof(cell.source_cell));
+            io.read(&cell.stage_row, sizeof(cell.stage_row));
+            if (cell.stage_row >= stage_groups*KVAR_N_GROUP ||
+                    !source_cells.insert(cell.source_cell).second ||
+                    !stage_rows.insert(cell.stage_row).second) {
+                throw std::runtime_error("invalid KVarN selective stage cell mapping");
+            }
+        }
+    }
+
+    std::vector<uint32_t> selective_record_groups;
+    if (version >= 15) {
+        uint32_t n_selective_record_groups;
+        io.read(&n_selective_record_groups, sizeof(n_selective_record_groups));
+        if (n_selective_record_groups > n_groups_per_stream) {
+            throw std::runtime_error("invalid KVarN selective record group count");
+        }
+        selective_record_groups.resize(n_selective_record_groups);
+        std::set<uint32_t> unique_groups;
+        for (uint32_t & group : selective_record_groups) {
+            io.read(&group, sizeof(group));
+            if (group >= n_groups_per_stream || !unique_groups.insert(group).second) {
+                throw std::runtime_error("invalid KVarN selective record group mapping");
+            }
+        }
+    }
+
     const uint32_t seq_stream = seq_id == -1 ? 0 : metadata_prepared->get_stream_for_seq(seq_id);
     if (seq_id != -1 && seq_stream >= n_stream) {
         throw std::runtime_error("invalid KVarN sequence stream");
@@ -2223,9 +2392,79 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
         if (seq_id < 0) {
             throw std::runtime_error("KVarN stage-only state requires a destination sequence");
         }
+        if (version < 14 && !stream_is_exclusive_for(seq_id)) {
+            throw std::runtime_error(
+                    "legacy KVarN partial state cannot restore into a shared physical stream");
+        }
+    } else if (state_kind == KVAR_N_STATE_RECORDS_SELECTIVE) {
+        if (seq_id < 0 || !self_contained) {
+            throw std::runtime_error("KVarN selective record state requires a self-contained sequence restore");
+        }
+        if (swa) {
+            throw std::runtime_error("KVarN selective record state does not support SWA ring remapping");
+        }
+    } else if (!selective_stage_cells.empty() || !selective_record_groups.empty()) {
+        throw std::runtime_error("full KVarN state contains selective stage rows");
+    }
+
+    std::unordered_map<uint32_t, uint32_t> desired_stage_rows;
+    std::unordered_map<uint32_t, uint32_t> install_stage_rows;
+    if ((state_kind == KVAR_N_STATE_STAGE_ONLY_PARTIAL ||
+            state_kind == KVAR_N_STATE_RECORDS_SELECTIVE) && version >= 14) {
+        const auto destination_cells = metadata_prepared->state_source_cells(seq_id);
+        const uint32_t destination_max_p1 = destination_cells.empty() ? 0 :
+                *std::max_element(destination_cells.begin(), destination_cells.end()) + 1u;
+        const auto desired = llama_kvarn_select_state_stage_cells(
+                destination_cells,
+                destination_max_p1,
+                stage_groups,
+                tail_groups,
+                swa);
+        for (const auto & cell : desired) {
+            desired_stage_rows.emplace(cell.source_cell, cell.stage_row);
+        }
+        for (const auto & saved : selective_stage_cells) {
+            const auto remapped = state_cell_remap.find(saved.source_cell);
+            const uint32_t destination_cell = remapped != state_cell_remap.end() ?
+                    remapped->second : saved.source_cell;
+            const auto desired_row = desired_stage_rows.find(destination_cell);
+            if (desired_row != desired_stage_rows.end()) {
+                install_stage_rows.emplace(saved.source_cell, desired_row->second);
+            }
+        }
+        if (install_stage_rows.size() != desired_stage_rows.size()) {
+            throw std::runtime_error("KVarN selective state is missing a required live stage row");
+        }
+        if (on_device && state_kind == KVAR_N_STATE_STAGE_ONLY_PARTIAL &&
+                desired_stage_rows.size() != selective_stage_cells.size()) {
+            throw std::runtime_error(
+                    "on-device KVarN selective restore cannot discard superseded stage rows");
+        }
+    }
+
+    std::unordered_map<uint32_t, uint32_t> selective_record_destinations;
+    if (state_kind == KVAR_N_STATE_RECORDS_SELECTIVE) {
+        for (const auto & [source_cell, destination_cell] : state_cell_remap) {
+            const uint32_t source_group = source_cell/KVAR_N_GROUP;
+            const uint32_t source_offset = source_cell%KVAR_N_GROUP;
+            const uint32_t destination_group = destination_cell/KVAR_N_GROUP;
+            if (destination_cell%KVAR_N_GROUP != source_offset) {
+                throw std::runtime_error("KVarN selective state did not preserve record row offsets");
+            }
+            const auto [it, inserted] = selective_record_destinations.emplace(source_group, destination_group);
+            if (!inserted && it->second != destination_group) {
+                throw std::runtime_error("KVarN selective record group remapped inconsistently");
+            }
+        }
+        for (const uint32_t source_group : selective_record_groups) {
+            if (selective_record_destinations.count(source_group) == 0) {
+                throw std::runtime_error("KVarN selective record group has no destination mapping");
+            }
+        }
     }
 
     uint64_t exact_payload_bytes = 0;
+    uint64_t selective_stage_bytes = 0;
     size_t exact_tensor_ops = 0;
     for (const auto & layer : layers) {
         uint32_t il;
@@ -2263,8 +2502,55 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
                 }
             }
 
-            read_kvarn_tensor(io, layer.k_stage_stream[stream_dst]);
-            read_kvarn_tensor(io, layer.v_stage_stream[stream_dst]);
+            if (state_kind == KVAR_N_STATE_RECORDS_SELECTIVE) {
+                for (const uint32_t source_group : selective_record_groups) {
+                    const uint32_t destination_group = selective_record_destinations.at(source_group);
+                    read_kvarn_tensor_slice(
+                            io, layer.k_records_stream[stream_dst],
+                            size_t(destination_group)*layer.k_records_stream[stream_dst]->nb[2],
+                            layer.k_records_stream[stream_dst]->nb[2]);
+                    read_kvarn_tensor_slice(
+                            io, layer.v_records_stream[stream_dst],
+                            size_t(destination_group)*layer.v_records_stream[stream_dst]->nb[2],
+                            layer.v_records_stream[stream_dst]->nb[2]);
+                }
+            }
+
+            if ((state_kind == KVAR_N_STATE_STAGE_ONLY_PARTIAL ||
+                    state_kind == KVAR_N_STATE_RECORDS_SELECTIVE) && version >= 14) {
+                const auto read_selective_row = [&](ggml_tensor * tensor,
+                                                     const llama_kvarn_state_stage_cell & cell) {
+                    const size_t row_size = tensor->nb[2];
+                    uint64_t saved_size;
+                    io.read(&saved_size, sizeof(saved_size));
+                    if (saved_size != row_size) {
+                        throw std::runtime_error("mismatched KVarN selective stage row size");
+                    }
+                    const auto desired = install_stage_rows.find(cell.source_cell);
+                    const bool install = desired != install_stage_rows.end();
+                    const size_t offset = install ? size_t(desired->second)*row_size : 0;
+                    if (on_device) {
+                        if (!install) {
+                            throw std::runtime_error("on-device KVarN selective stage row became stale");
+                        }
+                        io.read_tensor(tensor, offset, row_size);
+                    } else {
+                        std::vector<uint8_t> row(row_size);
+                        io.read(row.data(), row.size());
+                        if (install) {
+                            io.stage_tensor_set(tensor, row.data(), offset, row_size);
+                        }
+                    }
+                    selective_stage_bytes += install ? row_size : 0;
+                };
+                for (const auto & cell : selective_stage_cells) {
+                    read_selective_row(layer.k_stage_stream[stream_dst], cell);
+                    read_selective_row(layer.v_stage_stream[stream_dst], cell);
+                }
+            } else {
+                read_kvarn_tensor(io, layer.k_stage_stream[stream_dst]);
+                read_kvarn_tensor(io, layer.v_stage_stream[stream_dst]);
+            }
         }
         uint64_t k_tail_row;
         uint64_t v_tail_row;
@@ -2281,7 +2567,7 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
             exact_tensor_ops += read_kvarn_exact_tail_v12_interleaved(
                     io, layer.k_tail, layer.v_tail, k_tail_row, v_tail_row,
                     exact_destinations, on_device);
-        } else if (version == 13) {
+        } else if (version >= 13) {
             exact_tensor_ops += read_kvarn_exact_tail_v13_component(
                     io, layer.k_tail, k_tail_row, exact_destinations, on_device);
             exact_tensor_ops += read_kvarn_exact_tail_v13_component(
@@ -2294,14 +2580,19 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
     auto prepared_owner = std::make_shared<std::unique_ptr<llama_kv_cache>>(std::move(metadata_prepared));
     const size_t exact_destination_runs = kvarn_exact_tail_destination_runs(exact_destinations);
     const char * log_function = __func__;
+    const uint32_t n_selective_stage_cells = uint32_t(selective_stage_cells.size());
     io.on_commit([this, prepared_owner, state_kind, version, n_exact_payloads,
+                  n_selective_stage_cells, selective_stage_bytes,
                   log_function,
                   exact_payload_bytes, exact_destination_runs, exact_tensor_ops, on_device]() mutable {
         metadata.swap(*prepared_owner);
         LLAMA_LOG_DEBUG(
-                "%s: KVarN state restore: kind=%s version=%u payloads=%u tail_bytes=%llu runs=%zu tensor_ops=%zu device=%s\n",
-                log_function, state_kind == KVAR_N_STATE_STAGE_ONLY_PARTIAL ? "partial" : "full",
-                version, n_exact_payloads, (unsigned long long) exact_payload_bytes,
+                "%s: KVarN state restore: kind=%s version=%u stage_rows=%u stage_bytes=%llu "
+                "payloads=%u tail_bytes=%llu runs=%zu tensor_ops=%zu device=%s\n",
+                log_function, state_kind == KVAR_N_STATE_STAGE_ONLY_PARTIAL ? "partial" :
+                        (state_kind == KVAR_N_STATE_RECORDS_SELECTIVE ? "selective" : "full"),
+                version, n_selective_stage_cells, (unsigned long long) selective_stage_bytes,
+                n_exact_payloads, (unsigned long long) exact_payload_bytes,
                 exact_destination_runs, exact_tensor_ops, on_device ? "true" : "false");
     });
 }

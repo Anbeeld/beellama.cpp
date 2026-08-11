@@ -138,8 +138,8 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
             use_kvarn, hparams.n_swa > 0, n_seq_max, unified, kvarn.fail_if_unsupported);
     if (kvarn_policy == LLAMA_KVARN_ISWA_UNSUPPORTED) {
         throw std::invalid_argument(
-                "KVarN SWA group is unsupported with " + std::to_string(n_seq_max) +
-                " slots and --no-kv-unified; use --kv-unified or disable fail_if_unsupported");
+                "KVarN SWA ring is unsupported with " + std::to_string(n_seq_max) +
+                " logical sequences; disable fail_if_unsupported to use the standard-SWA fallback");
     }
     if (kvarn_policy == LLAMA_KVARN_ISWA_ALL_LAYERS) {
         LLAMA_LOG_INFO("%s: KVarN enabled for all layers (non-SWA %s, SWA %s sliding-window ring)\n",
@@ -147,7 +147,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     } else if (kvarn_policy == LLAMA_KVARN_ISWA_STANDARD_SWA_FALLBACK) {
         LLAMA_LOG_WARN(
                 "%s: KVarN enabled for non-SWA layers (%s); SWA layers use standard %s/%s "
-                "because KVarN SWA requires --kv-unified with %u slots\n",
+                "because the position-addressed KVarN SWA ring is single-sequence with %u slots\n",
                 __func__, llama_kvarn_type_name(kvarn.type),
                 ggml_type_name(type_k), ggml_type_name(type_v), n_seq_max);
     }
@@ -467,6 +467,18 @@ bool llama_kv_cache_iswa::state_seq_can_save(llama_seq_id seq_id) const {
 bool llama_kv_cache_iswa::state_seq_can_restore(llama_seq_id seq_id) const {
     return kv_base->state_seq_can_restore(seq_id) &&
            kv_swa->state_seq_can_restore(seq_id);
+}
+
+bool llama_kv_cache_iswa::state_seq_can_save(
+        llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    return kv_base->state_seq_can_save(seq_id, flags) &&
+           kv_swa->state_seq_can_save(seq_id, flags);
+}
+
+bool llama_kv_cache_iswa::state_seq_can_restore(
+        llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    return kv_base->state_seq_can_restore(seq_id, flags) &&
+           kv_swa->state_seq_can_restore(seq_id, flags);
 }
 
 void llama_kv_cache_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {

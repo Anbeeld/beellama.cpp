@@ -118,17 +118,22 @@ that state into a tail-enabled context is valid, but the coverage API reports
 window. Server metrics expose requested/exact token totals, complete/partial/no
 coverage group counts, and degraded-sequence counts.
 
-KVarN state version 13 stores logical compressed records and compact exact payloads
+KVarN state version 15 stores sequence-selective logical compressed record
+groups, compact exact payloads, selected stage rows, and destination remapping
 independently of ubatch workspace, so state may move between `ub=128` and
-`ub=512`. Version 12 remains readable where its logical representation is
-compatible; version 11 is rejected rather than reinterpreting its old physical
+`ub=512`. Live checkpoint state may retain sealed history already owned by the
+context; `LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED` exports every payload needed
+after the source is removed. Compatible version 12 and 13 state remains
+readable; version 11 is rejected rather than reinterpreting its old physical
 workspace layout. Tail length, type, preset, rollback horizon, representation,
 and structural-group mismatches fail closed.
 
-Sequence state writes precision-tail manifest version 3, including the compact
-representation and rollback horizon, and supports host or on-device tensor
-transfer. Manifest version 2 remains readable for non-compact layouts; version
-1 restores conservative degraded provenance. Immediate body
+Sequence state writes precision-tail manifest version 5, including exact source
+cell/generation identities, exact-tail local slots, insertion order, the
+per-sequence write cursor, the compact representation, and rollback horizon,
+and supports host or on-device tensor transfer. Version 4 remains readable;
+manifest version 2 remains readable for non-compact layouts, while version 1
+restores conservative degraded provenance. Immediate body
 membership and position changes after sequence copy are preserved; pending
 exact rows materialize as one batch when state data is requested.
 
@@ -137,14 +142,34 @@ has validated. A truncated, corrupt, mismatched, or failed backend transfer is
 cancelled. Deferred precision-tail copy failures propagate through immediate state
 save and subsequent decode instead of being reported as successful.
 
-Prompt-cache message boundaries do not reset the suffix. Standard unified and
-non-unified slots reuse continuously. KVarN precision-tail divergence trims
-exactly; eligible older divergence reuses from the overlapping 128-token group
-boundary on a non-unified or exclusive unified stream. Unified contention, an
-unsupported recurrent rollback, `cache_prompt=false`, slot eviction, or no
-common target/draft plan produces a safe full reevaluation. Unified KVarN RAM
-save and restore require stream exclusivity; contended save is skipped without
-clearing the slot, and contended restore is a miss.
+Prompt-cache message boundaries do not reset the suffix. Standard and KVarN
+state is sequence-selective in unified and non-unified layouts. The planner
+records lexical, restorable, and committed token counts and restores target,
+draft, and speculative state as one transaction. Hybrid/recurrent targets use
+stable durable checkpoint boundaries; work from the preceding checkpoint to an
+arbitrary lexical frontier is explicitly reported as
+`unstable_recurrent_frontier`. RAM entries use self-contained immutable state,
+are repeatably restorable, and clear an idle unified slot only after successful
+admission. Tail length affects quality, memory, and transfer cost, not logical
+prompt-cache eligibility.
+
+KVarN durable prompt checkpoints compose the recurrent cadence with the active
+descriptor group and therefore remain on complete 128-token boundaries for the
+current G128 presets. The transient live exact frontier may still service the
+existing bounded speculative micro-rollback contract; it does not turn sealed
+history into arbitrary-position records. Standard KV has no KVarN group
+constraint and may restore any validated logical position. For standard caches
+with a precision tail, a hot partial checkpoint references the still-live body
+and transfers only its logical manifest and exact overlay. Self-contained RAM
+state continues to own and transfer the body because it must survive source
+removal.
+
+Completion timing JSON includes `cache_lcp_n`, `cache_planned_n`,
+`cache_reprocessed_n`, `cache_source`, and `cache_reason`. Prometheus exports
+`prompt_cache_admission_*_total`, `prompt_cache_restore_*_total`,
+`prompt_cache_resident_bytes`, `n_busy_slots_per_decode`, and the
+`kv_tail_*` coverage/degradation gauges. A nonzero restore-failure or degraded
+tail metric is actionable rather than silently counted as a hit.
 
 ## DFlash and adaptive draft depth
 

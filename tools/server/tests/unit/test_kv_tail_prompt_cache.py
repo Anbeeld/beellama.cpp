@@ -18,6 +18,7 @@ import gguf  # noqa: E402
 
 
 NO_PRELOAD_SERVER_PRESETS = True
+MAX_UNIFIED_BATCHING_TIE_LOGPROB_GAP = 0.05
 
 
 def _field(reader: gguf.GGUFReader, key: str):
@@ -100,6 +101,7 @@ def _complete(server: ServerProcess, prompt: Sequence[int], slot: int, *, cache:
         "id_slot": slot,
         "cache_prompt": cache,
         "n_predict": 4,
+        "n_probs": 5,
         "return_tokens": True,
         "seed": 12345,
         "temperature": 0.0,
@@ -109,6 +111,35 @@ def _complete(server: ServerProcess, prompt: Sequence[int], slot: int, *, cache:
     assert timings["prompt_n"] > 0
     assert timings["cache_n"] >= 0
     return response.body
+
+
+def _assert_tokens_or_unified_batching_tie(
+    expected_tokens: Sequence[int],
+    expected_probs: Sequence[dict],
+    actual_tokens: Sequence[int],
+    actual_probs: Sequence[dict],
+) -> None:
+    """Accept only exact IDs or a predeclared near-tie flipped by unified layout.
+
+    Unified KV keeps other live sequences in the masked attention extent. That
+    upstream-aligned layout can reverse a greedy choice when two candidates are
+    already numerically tied, even without state restore. Both executions must
+    contain the other's selected token and put it within 0.05 natural-log units
+    of their own winner; any material ranking change remains a hard failure.
+    """
+    assert len(actual_tokens) == len(expected_tokens)
+    assert len(actual_probs) == len(expected_probs) == len(expected_tokens)
+    for index, (expected, actual) in enumerate(zip(expected_tokens, actual_tokens)):
+        if expected == actual:
+            continue
+        expected_rank = {item["id"]: item["logprob"] for item in expected_probs[index]["top_logprobs"]}
+        actual_rank = {item["id"]: item["logprob"] for item in actual_probs[index]["top_logprobs"]}
+        assert expected in expected_rank and actual in expected_rank
+        assert expected in actual_rank and actual in actual_rank
+        expected_gap = expected_rank[expected] - expected_rank[actual]
+        actual_gap = actual_rank[actual] - actual_rank[expected]
+        assert 0.0 <= expected_gap <= MAX_UNIFIED_BATCHING_TIE_LOGPROB_GAP
+        assert 0.0 <= actual_gap <= MAX_UNIFIED_BATCHING_TIE_LOGPROB_GAP
 
 
 def _tokenize(server: ServerProcess, text: str, *, add_special: bool) -> list[int]:
@@ -154,15 +185,26 @@ def test_standard_two_slot_cumulative_prompt_reuse(unified: bool):
                 assert body["timings"]["cache_n"] == 0
             else:
                 assert body["timings"]["cache_n"] > 128
-            records.append((list(prompt), body["content"], body["timings"]["prompt_n"]))
+            records.append((
+                list(prompt), turn, slot, body["tokens"], body["timings"]["prompt_n"],
+                body["completion_probabilities"],
+            ))
             prompts[slot] = prompt + body["tokens"] + _tokenize(server, "\n", add_special=False)
 
     server.stop()
     oracle = _server(model, unified=unified, kvarn=False, log_tag=f"std-oracle-{unified}")
     oracle.start(timeout_seconds=180)
-    for prompt, expected, cached_prompt_n in records:
-        body = _complete(oracle, prompt, 0, cache=False)
-        assert body["content"] == expected
+    for prompt, turn, slot, expected_tokens, cached_prompt_n, expected_probs in records:
+        body = _complete(oracle, prompt, slot, cache=False)
+        if unified:
+            _assert_tokens_or_unified_batching_tie(
+                expected_tokens,
+                expected_probs,
+                body["tokens"],
+                body["completion_probabilities"],
+            )
+        else:
+            assert body["tokens"] == expected_tokens, (turn, slot, expected_tokens, body["tokens"])
         assert body["timings"]["cache_n"] == 0
         assert body["timings"]["prompt_n"] >= cached_prompt_n
 
@@ -179,17 +221,24 @@ def test_kvarn_nonunified_hybrid_reuse_and_safe_divergence():
     divergent = common + _tokenize(server, "new historical branch.\nAssistant:", add_special=False)
     _complete(server, original, 0, cache=True)
     reprocessed = _complete(server, divergent, 0, cache=True)
-    # Qwen3.6 is a hybrid recurrent model. With n_rs_seq=0 the recurrent
-    # child cannot reconstruct an older state, so its truthful composite plan
-    # must reject even though the KVarN attention child can round to a group.
-    assert reprocessed["timings"]["cache_n"] == 0
+    # Durable hybrid checkpoints carry the recurrent tensors independently of
+    # the short live n_rs_seq window, so the old branch can now restore the
+    # latest exact checkpoint instead of falling back to a full replay.
+    assert 0 < reprocessed["timings"]["cache_n"] <= common_n
     oracle = _complete(server, divergent, 0, cache=False)
     assert reprocessed["tokens"] == oracle["tokens"]
     assert oracle["timings"]["cache_n"] == 0
 
     continued_prompt = divergent + oracle["tokens"] + _tokenize(server, "\nContinue:\n", add_special=False)
     continued = _complete(server, continued_prompt, 0, cache=True)
-    assert continued["timings"]["cache_n"] > common_n
+    timings = continued["timings"]
+    assert timings["cache_reason"] == "committed"
+    assert timings["cache_n"] == timings["cache_planned_n"]
+    assert timings["cache_n"] % 128 == 0
+    assert 0 <= timings["cache_lcp_n"] - timings["cache_n"] < 128
+    assert timings["cache_reprocessed_n"] == timings["prompt_n"]
+    continued_oracle = _complete(server, continued_prompt, 0, cache=False)
+    assert continued["tokens"] == continued_oracle["tokens"]
 
     exact_common, exact_n = _prefix_near(server, 690, "nonunified exact common prefix")
     exact_original = exact_common + _tokenize(server, "old exact suffix " * 30 + "\nAssistant:", add_special=False)
@@ -198,13 +247,13 @@ def test_kvarn_nonunified_hybrid_reuse_and_safe_divergence():
     exact = _complete(server, exact_divergent, 0, cache=True)
     assert exact_n > 512
     assert 0 < exact["timings"]["cache_n"] <= exact_n
-    assert exact["timings"]["cache_n"] % 128 != 0
+    assert exact["timings"]["cache_n"] % 128 == 0
     exact_oracle = _complete(server, exact_divergent, 0, cache=False)
     assert exact["tokens"] == exact_oracle["tokens"]
 
 
 @pytest.mark.kvarn_local
-def test_kvarn_unified_contention_and_exclusive_state_reuse():
+def test_kvarn_unified_contention_and_repeatable_state_reuse():
     model = _model_from_env("KV_TAIL_TEST_KVARN_MODEL", kvarn=True)
     server = _server(model, unified=True, kvarn=True, log_tag="kvarn-unified")
     server.cache_ram = 0
@@ -219,30 +268,59 @@ def test_kvarn_unified_contention_and_exclusive_state_reuse():
     _complete(server, original, 0, cache=True)
     other_first = _complete(server, other, 1, cache=True)
     contended = _complete(server, divergent, 0, cache=True)
-    assert contended["timings"]["cache_n"] == 0
+    assert 0 < contended["timings"]["cache_n"] <= common_n
     other_next = other + other_first["tokens"] + _tokenize(server, "\nContinue:\n", add_special=False)
     other_again = _complete(server, other_next, 1, cache=True)
     assert other_again["timings"]["cache_n"] > common_n
     server.stop()
 
-    # Exercise RAM state independently from the live-contention case. Build a
-    # sequence while exclusive; starting slot 1 saves slot 0, but restoring it
-    # while slot 1 is live must be a safe miss and full reevaluation.
+    # Force slot 0 to park two unrelated conversations while slot 1 remains
+    # live. The durable entries must use the self-contained selective KVarN
+    # representation, which is safe to restore after their source cells move.
     cache_server = _server(model, unified=True, kvarn=True, log_tag="kvarn-unified-ram")
+    cache_server.cache_ram = 8192
     cache_server.start(timeout_seconds=600)
-    exclusive_base = _complete(cache_server, original, 0, cache=True)
+    original_base = _complete(cache_server, original, 0, cache=True)
     blocker, _ = _prefix_near(cache_server, 160, "unified restore blocker")
     _complete(cache_server, blocker, 1, cache=True)
-    exclusive_next = original + exclusive_base["tokens"] + _tokenize(cache_server, "\nContinue:\n", add_special=False)
-    refused = _complete(cache_server, exclusive_next, 0, cache=True)
-    assert refused["timings"]["cache_n"] == 0
 
-    # Starting slot 1 again saves the now-exclusive slot 0 state. Once slot 1
-    # is erased, the exact same RAM entry is safe to restore and append to.
-    _complete(cache_server, blocker, 1, cache=True)
-    erased = cache_server.make_request("POST", "/slots/1?action=erase")
-    assert erased.status_code == 200, erased.body
-    refused_next = exclusive_next + refused["tokens"] + _tokenize(cache_server, "\nContinue again:\n", add_special=False)
-    restored = _complete(cache_server, refused_next, 0, cache=True)
-    assert restored["timings"]["cache_n"] > common_n
+    unrelated, unrelated_n = _prefix_near(cache_server, 510, "unified parked unrelated branch")
+    unrelated += _tokenize(cache_server, "different parked suffix.\nAssistant:", add_special=False)
+    unrelated_base = _complete(cache_server, unrelated, 0, cache=True)
+
+    original_next = original + original_base["tokens"] + _tokenize(
+        cache_server, "\nContinue original:\n", add_special=False)
+    restored_original = _complete(cache_server, original_next, 0, cache=True)
+    assert restored_original["timings"]["cache_n"] > common_n
+    assert restored_original["timings"]["cache_source"] == "ram"
+
+    unrelated_next = unrelated + unrelated_base["tokens"] + _tokenize(
+        cache_server, "\nContinue unrelated:\n", add_special=False)
+    restored_unrelated = _complete(cache_server, unrelated_next, 0, cache=True)
+    # Hybrid/recurrent RAM anchors restore through the latest numerically stable
+    # 64-token checkpoint. The unaligned lexical frontier is deliberately
+    # reevaluated and must not be reported as committed cache work.
+    assert restored_unrelated["timings"]["cache_n"] == unrelated_n - unrelated_n % 64
+    assert restored_unrelated["timings"]["cache_source"] == "ram"
+
+    # Revisit the original branch again without clearing the still-live blocker
+    # in slot 1. The longer continuation parked after the first RAM restore may
+    # supersede the shorter RAM entry, so its local checkpoint is also a valid
+    # winning source; either way, the branch must not reset.
+    original_alternate = original + original_base["tokens"] + _tokenize(
+        cache_server, "\nTake an alternate continuation:\n", add_special=False)
+    restored_again = _complete(cache_server, original_alternate, 0, cache=True)
+    assert restored_again["timings"]["cache_n"] > common_n
+    assert restored_again["timings"]["cache_source"] in {"ram", "checkpoint"}
     cache_server.stop()
+
+    oracle_server = _server(model, unified=True, kvarn=True, log_tag="kvarn-unified-ram-oracle")
+    oracle_server.cache_ram = 0
+    oracle_server.start(timeout_seconds=600)
+    original_oracle = _complete(oracle_server, original_next, 0, cache=False)
+    unrelated_oracle = _complete(oracle_server, unrelated_next, 0, cache=False)
+    assert original_oracle["timings"]["cache_n"] == 0
+    assert unrelated_oracle["timings"]["cache_n"] == 0
+    assert restored_original["tokens"] == original_oracle["tokens"]
+    assert restored_unrelated["tokens"] == unrelated_oracle["tokens"]
+    oracle_server.stop()

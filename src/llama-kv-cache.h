@@ -181,6 +181,7 @@ public:
 
     // state write/load
 
+    bool requires_state_for_partial_restore() const override;
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
@@ -261,7 +262,12 @@ public:
     void commit_pending_tail_copy();
     void cancel_pending_tail_copy();
     std::vector<int32_t> state_tail_payload_slots(llama_seq_id seq_id) const;
+    std::vector<uint32_t> state_source_cells(llama_seq_id seq_id) const;
     std::vector<std::vector<int32_t>> take_restored_tail_payload_slots();
+    void clone_logical_state_from(const llama_kv_cache & source);
+    void set_allocation_group_size(uint32_t group_size, uint32_t stripes = 1);
+    void set_state_remap_group_size(uint32_t group_size);
+    const std::vector<std::pair<uint32_t, uint32_t>> & get_state_cell_remap() const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
@@ -341,6 +347,8 @@ public:
 
 private:
     bool seq_rm_unchecked(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
+    void reset_allocation_head(llama_seq_id seq_id);
+    void rebuild_allocation_head(llama_seq_id seq_id);
 
     const llama_model & model;
     const llama_hparams & hparams;
@@ -413,6 +421,16 @@ private:
     uint64_t tail_ordinal = 0;
     std::vector<int64_t> tail_write_slots;
     std::vector<std::vector<int32_t>> restored_tail_payload_slots;
+    uint32_t allocation_group_size = 1;
+    uint32_t allocation_group_stripes = 1;
+    // Structured unified caches reserve whole record groups for one logical
+    // sequence. A stream-global cursor can make one sequence resume in the
+    // middle of its physical ring after another sequence advances the stream,
+    // which aliases KVarN's cyclic frontier rows. Keep an independent cursor
+    // for every logical sequence whenever striped group allocation is active.
+    std::vector<uint32_t> allocation_seq_heads;
+    uint32_t state_remap_group_size = 1;
+    std::vector<std::pair<uint32_t, uint32_t>> state_cell_remap;
     uint32_t tail_write_levels = 0;
     bool tail_preparing = false;
     bool tail_graph_started = false;
@@ -499,7 +517,8 @@ private:
     state_v2_manifest state_v2_read_manifest(
             llama_io_read_i & io,
             llama_seq_id seq_id,
-            bool body_only) const;
+            bool body_only,
+            uint32_t version) const;
     void state_v2_write_body_payload(llama_io_write_i & io, const state_v2_manifest & manifest) const;
     void state_v2_write_tail_payload(llama_io_write_i & io, const state_v2_manifest & manifest) const;
     void state_v2_read_payload_and_install(
@@ -508,10 +527,12 @@ private:
             llama_state_seq_flags flags,
             state_v2_manifest & manifest,
             uint64_t body_payload_size,
-            uint64_t tail_payload_size);
+            uint64_t tail_payload_size,
+            uint32_t version);
     void materialize_pending_copies();
     std::vector<std::vector<uint32_t>> state_read_body(
             llama_io_read_i & io, llama_seq_id seq_id, uint32_t n_stream_cur);
+    void state_read_impl(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags);
     void state_read_tail(
             llama_io_read_i & io,
             llama_seq_id seq_id,

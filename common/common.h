@@ -1219,6 +1219,65 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 // prompt utils
 //
 
+enum common_prompt_checkpoint_status {
+    COMMON_PROMPT_CHECKPOINT_SUCCESS,
+    COMMON_PROMPT_CHECKPOINT_SKIPPED,
+    COMMON_PROMPT_CHECKPOINT_INVALID_CONTEXT,
+    COMMON_PROMPT_CHECKPOINT_UNSUPPORTED,
+    COMMON_PROMPT_CHECKPOINT_SIZE_MISMATCH,
+    COMMON_PROMPT_CHECKPOINT_ALLOCATION_FAILED,
+};
+
+struct common_prompt_checkpoint_result {
+    common_prompt_checkpoint_status status = COMMON_PROMPT_CHECKPOINT_SUCCESS;
+    size_t bytes = 0;
+
+    bool ok() const {
+        return status == COMMON_PROMPT_CHECKPOINT_SUCCESS ||
+                status == COMMON_PROMPT_CHECKPOINT_SKIPPED;
+    }
+};
+
+class common_prompt_checkpoint_buffer {
+public:
+    common_prompt_checkpoint_buffer() : storage(empty_storage()) {}
+
+    size_t size() const { return storage->size(); }
+    bool empty() const { return storage->empty(); }
+    const uint8_t * data() const { return storage->data(); }
+    const void * storage_id() const { return storage.get(); }
+
+    uint8_t * data() {
+        detach();
+        return storage->data();
+    }
+    void resize(size_t size) {
+        detach();
+        storage->resize(size);
+    }
+    void resize(size_t size, uint8_t value) {
+        detach();
+        storage->resize(size, value);
+    }
+    void clear() {
+        storage = empty_storage();
+    }
+
+private:
+    static const std::shared_ptr<std::vector<uint8_t>> & empty_storage() {
+        static const auto empty = std::make_shared<std::vector<uint8_t>>();
+        return empty;
+    }
+
+    void detach() {
+        if (!storage.unique()) {
+            storage = std::make_shared<std::vector<uint8_t>>(*storage);
+        }
+    }
+
+    std::shared_ptr<std::vector<uint8_t>> storage;
+};
+
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
@@ -1228,8 +1287,8 @@ struct common_prompt_checkpoint {
     llama_pos pos_min;
     llama_pos pos_max;
 
-    std::vector<uint8_t> data_tgt;
-    std::vector<uint8_t> data_dft;
+    common_prompt_checkpoint_buffer data_tgt;
+    common_prompt_checkpoint_buffer data_dft;
 
     // (optional) speculative-decoding implementation state stashed with the checkpoint
     // (e.g. eagle3's deferred-boundary g_embd row)
@@ -1245,22 +1304,22 @@ struct common_prompt_checkpoint {
             llama_pos pos_min,
             llama_pos pos_max);
 
-    void update_tgt(
+    common_prompt_checkpoint_result update_tgt(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags);
 
-    void update_dft(
+    common_prompt_checkpoint_result update_dft(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags);
 
-    void load_tgt(
+    common_prompt_checkpoint_result load_tgt(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags) const;
 
-    void load_dft(
+    common_prompt_checkpoint_result load_dft(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags) const;

@@ -52,6 +52,14 @@ allocating compressed records plus a redundant exact overlay. For SWA this is
 a compact `W + R` ring; it does not retain the physical `W + U` execution
 reserve as persistent exact payload.
 
+KVarN durable prompt-cache reuse remains descriptor-group aligned: current G128
+presets publish and restore checkpoints only at complete 128-token boundaries.
+The bounded live exact frontier still supports the existing speculative
+micro-rollback path, but sealed compressed history is never split into an
+arbitrary-position record. Standard KV is not subject to this group boundary;
+its precision-tail state can restore a validated logical position while a hot
+partial checkpoint references the still-resident body instead of rereading it.
+
 ### Measurement and validation
 
 Run KLD or perplexity with the same corpus, context, batch size, and cache pair
@@ -326,24 +334,34 @@ inputs; repeated non-fitting candidates fail deterministically. Tail-disabled
 ordinary caches take the unchanged single-call upstream fit path.
 
 Standard unified and non-unified prompt caches preserve one continuous suffix
-across requests and message boundaries. KVarN trims divergence in its live
-exact suffix exactly. Older KVarN divergence retains all complete groups before
-the overlapping 128-token group only on a non-unified or otherwise exclusive
-unified stream; at most 127 positions before the requested trim are
-reevaluated. Unified contention rejects partial rollback, fully reevaluates the
-requesting slot, and leaves the other slot unchanged. Every hybrid child must
-accept the boundary, so a recurrent component without retained rollback states
-can still require a safe full reevaluation. `cache_prompt=false`, slot eviction,
-or the absence of one common target/draft plan can also force a miss.
+across requests and message boundaries. KVarN state is sequence-selective: live
+checkpoints retain only the selected sequence's mutable frontier, exact-tail
+rows, and logical metadata, while self-contained RAM state also owns that
+sequence's sealed record groups. Restore validates the complete state before it
+publishes remapped destination records. Other live sequences in a unified cache
+are neither gathered nor overwritten.
 
-Unified KVarN per-sequence RAM save and restore require an exclusive structured
-stream. Contended save creates no cache entry and does not clear the slot;
-contended restore is a cache miss. Non-unified KVarN is the configuration where
-multi-slot RAM caching and group-aligned historical reuse are unconditional.
-For hybrid iSWA with multiple non-unified slots, eligible non-SWA layers keep
-KVarN while SWA layers use a warned standard-cache fallback; a fail-closed
-preset rejects the context instead. Unified or single-slot layouts can retain
-KVarN in both groups when otherwise eligible.
+Prompt-cache planning distinguishes the lexical LCP, the boundary that all
+target/draft/speculative components can restore, and the boundary actually
+committed. For hybrid/recurrent targets, durable prompt checkpoints are created
+at stable recurrent prefill boundaries. An arbitrary lexical frontier may be
+reevaluated from the preceding stable checkpoint with reason
+`unstable_recurrent_frontier`; this is a bounded, explicit adjustment rather
+than a silent full reset. `cache_prompt=false`, slot eviction, corrupt or
+incompatible state, and the absence of one common target/draft/speculative plan
+remain reason-coded misses.
+
+RAM entries are immutable and repeatably restorable. Admission serializes a
+self-contained target/draft/speculative candidate before publishing it and
+clears an idle unified slot only after admission succeeds. Restore snapshots a
+destination preimage and rolls all components back if any component fails.
+Resident-byte accounting includes entry payloads and counts shared immutable
+checkpoint buffers once.
+
+For hybrid iSWA with multiple slots, eligible non-SWA layers keep KVarN while
+SWA layers use the explicit, warned, bit-width-matched standard-cache fallback.
+This is a supported hybrid placement rather than record reinterpretation;
+single-slot layouts can retain KVarN in both groups when otherwise eligible.
 
 Partial SWA storage retains its upstream-aligned compressed `W + U` body, but
 its persistent exact history is `(N + R) * S` rows. Full-window SWA omits that
@@ -361,6 +379,11 @@ starting point for both KVarN and standard caches. Prefer body precision when
 old and recent tokens matter equally. A 2048-token tail is most persuasive when
 the newest two thousand tokens are genuinely the privileged working set; larger
 tails read more F16/BF16 data and are not performance-neutral.
+
+Tail length is a quality, memory, and throughput choice. It is not a
+prompt-cache correctness switch: state restore carries the exact rows and
+coverage metadata required by the configured tail, including a zero-length
+standard tail and KVarN's intrinsic minimum suffix.
 
 Gemma 4 needs a separate policy. Its 1024-token sliding window makes a 1024 tail
 exact across most layers, causing a sharp memory and throughput transition.
@@ -392,8 +415,11 @@ KVarN-specific workspace, attention, and state decisions are in
 
 For standard caches, the default length is zero and preserves the ordinary
 topology. KVarN always resolves at least its intrinsic 128-token suffix.
-Sequence state writes validated KV-tail manifest version 3 and can
+Sequence state writes validated KV-tail manifest version 5 and can
 transfer tail tensors through host buffers or the on-device tensor protocol.
+Version 5 records exact source cells and generations, local tail slots,
+insertion order, and the per-sequence write cursor so selective unified-cache
+restore cannot alias an unrelated sequence or reorder its exact frontier.
 Overlay states reject a different structural group, resolved length,
 representation, rollback horizon, KVarN preset, or F16/BF16 type before
 mutation. Manifest version 2 remains readable for legacy non-compact layouts;
@@ -404,11 +430,19 @@ body-only compatibility state and explicit body-only state begin with
 observable degraded coverage and refill from original activations on later
 writes. Sequence copies publish body membership and positions immediately;
 deferred exact rows materialize in one batch when state data or another direct
-consumer needs them. KVarN state version 13 stores logical compressed records
-plus compact exact payloads and remaps transient workspace on restore; version 11 is
-rejected because it serialized the old workspace-dependent layout. Dequantized
+consumer needs them. KVarN state version 15 stores sequence-selective logical
+record groups, compact exact payloads, selected stage rows, and destination
+record remapping independently of transient workspace. Partial live checkpoint
+state omits sealed records already retained by the context; self-contained RAM
+state owns them. Compatible version 12 and 13 state remains readable; version 11
+is rejected because it serialized the old workspace-dependent layout. Dequantized
 body rows are never labeled exact. Server metrics report requested and exact
 tokens, coverage group states, and degraded sequences.
+
+Completion timings expose `cache_lcp_n`, `cache_planned_n`,
+`cache_reprocessed_n`, `cache_source`, and `cache_reason`; API cached-token usage
+is the committed count. Prometheus metrics expose RAM admission/restore totals,
+resident bytes, busy-slot overlap, and precision-tail coverage/degradation.
 
 BeeLlama v0.3.x sessions and its v11 KVarN state are intentionally incompatible
 with the v0.4.0 cache type IDs and logical-record format. Restore fails closed;
