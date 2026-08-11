@@ -12,7 +12,8 @@ KVarN is Huawei's calibration-free, variance-normalized KV-cache quantizer,
 adapted here for llama.cpp. It applies a per-head Hadamard rotation after RoPE,
 normalizes both axes of each 128-token tile, and stores structured 2-, 3-, 4-,
 5-, 6-, or 8-bit records with scale metadata. K and V widths are independent,
-and supported Qwen 3.6 and Gemma 4 SWA layers can use a separate KVarN pair.
+and supported Qwen 3.6, Gemma 4, and Muse Glimmer SWA layers can use a separate
+KVarN pair.
 Non-SWA layers keep the first 128 attention-sink tokens exact. Bee also keeps at
 least the newest 128 tokens exact, unlike the reference implementation's
 partially filled suffix. The physical ubatch controls only temporary workspace;

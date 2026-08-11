@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- Added Muse Glimmer support, ported from upstream llama.cpp commit `62bf73d25`
+  (PR #26841). Includes the `muse-glimmer` architecture (52-layer 30B and
+  smaller variants, 131K context, interleaved `[L,L,L,G]` sliding-window
+  attention, QK-norm with folded `qk_scale_factor`, attention output gate, final
+  logit tanh softcap), the 50-block ViT vision encoder with sparse block-window
+  attention and pixel-shuffle downsample, the GPT-2 chat template with reasoning
+  and ATEM tool-call grammar, and the `convert_hf_to_gguf.py` conversion script
+  for the target, vision, and DFlash-drafter checkpoints. KVarN and DFlash
+  (block-16 drafter) were verified on an RTX 3090 with the 30B Q4_K model,
+  mmproj, and 131K context; see the PR for the full benchmark set.
+- Fixed DFlash drafting on embedding-bearing target prefills. The draft's KV
+  cache is now seeded from target-layer features during multimodal image
+  prefill, which previously skipped embedding batches and left the draft cache
+  with a hole at the next injection.
+
 ## v0.4.3
 
 - Updated the llama.cpp base through upstream commit `74ce15741`. Notable inherited changes include Qwen3-TTS, DeepSeek V4 and DSpark, MTP support for GLM-4.7-Flash, GLM-5.2, Qwen3-Next, and DeepSeek V3.2, router LRU scheduling, initial Docker tool isolation, working-directory and filesystem tools in the server and Web UI, speculative metrics, and broad CUDA, Metal, Vulkan, SYCL, WebGPU, multimodal, conversion, and UI updates. ggml is now 0.19.0 and the RPC protocol is 5.0.1.

@@ -74,6 +74,17 @@ llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DFlash.gguf \
 
 `--spec-draft-n-max` is clamped to the draft model's trained block size.
 
+Muse Glimmer targets are supported as well. The DFlash drafter trained for a
+Muse Glimmer target exposes the upstream `dflash` metadata (`block_size`,
+`target_layers`) and is converted with `--target-model-dir` like any other
+drafter. The target prefill may carry token IDs or multimodal image embeddings;
+both seed the draft's KV cache, so image-carrying prompts draft normally:
+
+```bash
+llama-server -m MuseGlimmer-30B.gguf -mmproj MuseGlimmer-mmproj.gguf \
+    -md MuseGlimmer-DFlash.gguf --spec-type draft-dflash --spec-draft-n-max 15 -fa on
+```
+
 See:
 
 - #22105
