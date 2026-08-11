@@ -327,10 +327,18 @@ public:
     void set_input_k_shift_tail(ggml_tensor * dst) const;
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_mask_mapped(
+            ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn,
+            const std::vector<int64_t> & read_cells) const;
     void set_input_kq_mask_tail(
             ggml_tensor * body, ggml_tensor * exact,
             ggml_tensor * read_idxs, ggml_tensor * body_read_idxs, ggml_tensor * bias_read_idxs,
             const llama_ubatch * ubatch, uint32_t n_kv, bool causal_attn) const;
+    void set_input_kq_mask_tail_mapped(
+            ggml_tensor * body, ggml_tensor * exact,
+            ggml_tensor * read_idxs, ggml_tensor * body_read_idxs, ggml_tensor * bias_read_idxs,
+            const llama_ubatch * ubatch, bool causal_attn,
+            const std::vector<int64_t> & read_cells) const;
     bool can_pack_tail_body(const llama_ubatch & ubatch) const;
     void set_input_tail_body_plan(
             ggml_tensor * query_order, ggml_tensor * run_desc,

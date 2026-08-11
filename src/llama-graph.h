@@ -387,6 +387,7 @@ public:
     ggml_tensor * self_kvarn_rot_128 = nullptr;
     ggml_tensor * self_kvarn_rot_256 = nullptr;
     ggml_tensor * self_kvarn_rot_512 = nullptr;
+    ggml_tensor * self_kvarn_mat_idxs = nullptr; // I64 [n_kv] dense KVarN physical read cells
 
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
@@ -549,6 +550,7 @@ public:
     ggml_tensor * self_kvarn_rot_128 = nullptr;
     ggml_tensor * self_kvarn_rot_256 = nullptr;
     ggml_tensor * self_kvarn_rot_512 = nullptr;
+    ggml_tensor * self_kvarn_mat_idxs = nullptr; // I64 [n_kv] dense base KVarN physical read cells
     ggml_tensor * self_kvarn_mat_idxs_swa = nullptr; // I64 [n_kv] SWA ring absolute positions
 
     ggml_tensor * self_k_rot_swa = nullptr;

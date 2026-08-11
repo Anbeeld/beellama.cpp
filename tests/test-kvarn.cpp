@@ -329,6 +329,33 @@ static void kvarn_selective_state_owns_only_live_stage_rows() {
             "short selective KVarN state serialized stale compressed records");
 }
 
+static void kvarn_compact_read_plan_skips_stripe_holes() {
+    std::vector<uint32_t> occupied;
+    for (uint32_t group : { 3u, 7u, 11u }) {
+        for (uint32_t cell = group*128u; cell < (group + 1u)*128u; ++cell) {
+            occupied.push_back(cell);
+        }
+    }
+
+    const std::vector<uint32_t> pending = { 15u*128u, 15u*128u + 1u };
+    const auto plan = llama_kvarn_compact_read_plan(occupied, pending, 4096, 256);
+
+    require(plan.size() == 512,
+            "compact KVarN read plan retained the striped physical span");
+    require(plan.front() == 3*128 && plan[383] == 12*128 - 1,
+            "compact KVarN read plan changed occupied-cell ordering");
+    require(plan[384] == 15*128 && plan[385] == 15*128 + 1,
+            "compact KVarN read plan omitted pending cells");
+    require(std::all_of(plan.begin() + 386, plan.end(),
+                    [](int64_t cell) { return cell == -1; }),
+            "compact KVarN read plan did not mark padding rows empty");
+
+    const auto deduped = llama_kvarn_compact_read_plan(
+            { 1, 2, 3 }, { 2, 3, 4 }, 128, 256);
+    require(deduped.size() == 128 && deduped[0] == 1 && deduped[3] == 4 && deduped[4] == -1,
+            "compact KVarN read plan did not deduplicate pending cells");
+}
+
 static void test_stage_policy() {
     // The reference keeps one incomplete group in F16, but the suffix-removal
     // contract advertised by llama_kvarn_can_remove_range reaches back into the
@@ -1448,7 +1475,9 @@ static std::vector<ggml_fp16_t> test_store_reference_output(
         bool           discontinuous_indices = false,
         bool           seed_stage = true,
         int            stage_groups = 3,
-        int            head_slices = 1) {
+        int            head_slices = 1,
+        int            striped_group_stride = 0,
+        bool           eager_records = false) {
     ggml_init_params params = {
         /*.mem_size   =*/ 16 * 1024 * 1024,
         /*.mem_buffer =*/ nullptr,
@@ -1457,7 +1486,11 @@ static std::vector<ggml_fp16_t> test_store_reference_output(
     ggml_context * ctx = ggml_init(params);
     require(ctx != nullptr, "failed to initialize KVarN store parity context");
 
-    const int n_kv = start_idx + n_tokens_per_stream + (discontinuous_indices ? 1 : 0);
+    const int logical_last = start_idx + n_tokens_per_stream - 1;
+    const int striped_last = striped_group_stride > 0 ?
+            ((logical_last / 128) * striped_group_stride + striped_group_stride - 1) * 128 +
+                    logical_last % 128 : logical_last;
+    const int n_kv = striped_last + 1 + (discontinuous_indices ? 1 : 0);
     const int n_groups_per_stream = std::max(4, (n_kv + 127) / 128);
     const int n_tokens = n_tokens_per_stream * n_stream;
     const int record_bytes = int(llama_kvarn_packed_bytes(128 * 128, bits) + 3 * 128 * sizeof(ggml_fp16_t));
@@ -1470,6 +1503,7 @@ static std::vector<ggml_fp16_t> test_store_reference_output(
     ggml_tensor * stored = ggml_kvarn_store(ctx, current, indices, stage, records, bits, 16, value, stage_groups);
     stored->op_params[3] = n_tokens_per_stream;
     stored->op_params[5] = head_slices;
+    stored->op_params[9] = eager_records ? 1 : 0;
 
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, stored);
@@ -1494,7 +1528,11 @@ static std::vector<ggml_fp16_t> test_store_reference_output(
     std::vector<int64_t> idx(n_tokens);
     for (int s = 0; s < n_stream; ++s) {
         for (int t = 0; t < n_tokens_per_stream; ++t) {
-            const int local_idx = start_idx + t + (discontinuous_indices && t >= n_tokens_per_stream / 2 ? 1 : 0);
+            const int logical_idx = start_idx + t;
+            const int local_idx = striped_group_stride > 0 ?
+                    ((logical_idx / 128) * striped_group_stride + striped_group_stride - 1) * 128 +
+                            logical_idx % 128 :
+                    logical_idx + (discontinuous_indices && t >= n_tokens_per_stream / 2 ? 1 : 0);
             idx[s * n_tokens_per_stream + t] = int64_t(s * n_groups_per_stream * 128 + local_idx);
         }
     }
@@ -3647,6 +3685,15 @@ static void test_store_paths_gpu() {
 
     for (bool value : { false, true }) {
         const std::vector<ggml_fp16_t> cuda_output = test_store_reference_output(
+                gpu_backend, 4, value, 1, 2, 512, 0, false, false, 9, 2, 4, true);
+        const std::vector<ggml_fp16_t> cpu_output = test_store_reference_output(
+                cpu_backend, 4, value, 1, 2, 512, 0, false, false, 9, 2, 4, true);
+        require_close_f16_rmse(cuda_output, cpu_output, 1e-1f,
+                "KVarN CUDA striped-group workspace store output differs from CPU reference");
+    }
+
+    for (bool value : { false, true }) {
+        const std::vector<ggml_fp16_t> cuda_output = test_store_reference_output(
                 gpu_backend, 4, value, 1, 2, 385, 64, true, false);
         const std::vector<ggml_fp16_t> cpu_output = test_store_reference_output(
                 cpu_backend, 4, value, 1, 2, 385, 64, true, false);
@@ -4633,6 +4680,7 @@ int main() {
     kvarn_unified_save_requires_exclusive_stream();
     kvarn_unified_restore_requires_exclusive_stream();
     kvarn_selective_state_owns_only_live_stage_rows();
+    kvarn_compact_read_plan_skips_stripe_holes();
     test_type_table();
     test_attention_domain_policy();
     test_vulkan_decode_route_policy();

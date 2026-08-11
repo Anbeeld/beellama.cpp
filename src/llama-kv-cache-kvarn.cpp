@@ -535,7 +535,7 @@ size_t kvarn_exact_tail_destination_runs(
     return runs;
 }
 
-int32_t kvarn_contiguous_tokens_per_stream_hint(const llama_kv_cache::slot_info & sinfo) {
+int32_t kvarn_workspace_tokens_per_stream_hint(const llama_kv_cache::slot_info & sinfo) {
     if (sinfo.empty() || sinfo.idxs.empty() || sinfo.idxs[0].empty()) {
         return 0;
     }
@@ -549,9 +549,11 @@ int32_t kvarn_contiguous_tokens_per_stream_hint(const llama_kv_cache::slot_info 
         if (idxs.size() != n_tokens || idxs.empty()) {
             return 0;
         }
-        const uint32_t first = idxs[0];
         for (size_t i = 1; i < idxs.size(); ++i) {
-            if (idxs[i] != first + (uint32_t) i) {
+            const uint32_t prev = idxs[i - 1];
+            const uint32_t cur = idxs[i];
+            if (cur != prev + 1u &&
+                    (cur <= prev || prev % KVAR_N_GROUP != KVAR_N_GROUP - 1u || cur % KVAR_N_GROUP != 0u)) {
                 return 0;
             }
         }
@@ -677,7 +679,42 @@ const llama_ubatch & llama_kv_cache_kvarn_context::get_ubatch() const {
 }
 
 uint32_t llama_kv_cache_kvarn_context::get_n_kv() const {
-    return base()->get_n_kv();
+    return cache->uses_compact_read_indices() ?
+            uint32_t(compact_read_plan().size()) : base()->get_n_kv();
+}
+
+bool llama_kv_cache_kvarn_context::uses_compact_read_indices() const {
+    return cache->uses_compact_read_indices();
+}
+
+const std::vector<int64_t> & llama_kv_cache_kvarn_context::compact_read_plan() const {
+    GGML_ASSERT(cache->uses_compact_read_indices());
+    if (!compact_read_plan_cache.empty()) {
+        return compact_read_plan_cache;
+    }
+    const auto * kv = cache->get_metadata_cache();
+    const auto & cells = kv->get_cells(0);
+    uint32_t scan_end = std::min<uint32_t>(cells.size(), base()->get_n_kv());
+    if (!current_sinfo().empty()) {
+        GGML_ASSERT(current_sinfo().n_stream() == 1);
+        for (const uint32_t cell : current_sinfo().idxs[0]) {
+            scan_end = std::max(scan_end, cell + 1u);
+        }
+    }
+    std::vector<uint32_t> occupied;
+    occupied.reserve(cells.get_used());
+    for (uint32_t cell = 0; cell < scan_end; ++cell) {
+        if (!cells.is_empty(cell)) {
+            occupied.push_back(cell);
+        }
+    }
+    std::vector<uint32_t> pending;
+    if (!current_sinfo().empty()) {
+        GGML_ASSERT(current_sinfo().n_stream() == 1);
+        pending.assign(current_sinfo().idxs[0].begin(), current_sinfo().idxs[0].end());
+    }
+    compact_read_plan_cache = llama_kvarn_compact_read_plan(occupied, pending, cells.size(), 256);
+    return compact_read_plan_cache;
 }
 
 llama_kv_cache * llama_kv_cache_kvarn_context::get_kv() const {
@@ -897,13 +934,21 @@ ggml_tensor * llama_kv_cache_kvarn_context::build_input_kvarn_mat_idxs(ggml_cont
     const uint32_t n_kv = get_n_kv();
     ggml_tensor * res = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_kv);
     ggml_set_input(res);
-    ggml_set_name(res, "attn_inp_kvarn_mat_idxs_swa");
+    ggml_set_name(res, cache->is_swa() ?
+            "attn_inp_kvarn_mat_idxs_swa" : "attn_inp_kvarn_read_idxs");
     return res;
 }
 
 void llama_kv_cache_kvarn_context::set_input_kvarn_mat_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     GGML_ASSERT(dst->type == GGML_TYPE_I64);
+
+    if (cache->uses_compact_read_indices()) {
+        const auto & plan = compact_read_plan();
+        GGML_ASSERT(plan.size() == size_t(dst->ne[0]));
+        std::memcpy(dst->data, plan.data(), plan.size()*sizeof(plan[0]));
+        return;
+    }
 
     const auto * kv = cache->get_metadata_cache();
     const uint32_t n_kv = (uint32_t) dst->ne[0];
@@ -1009,15 +1054,26 @@ void llama_kv_cache_kvarn_context::set_input_kq_mask(
         ggml_tensor * dst,
         const llama_ubatch * ubatch,
         bool causal_attn) const {
-    base()->set_input_kq_mask(dst, ubatch, causal_attn);
+    if (cache->uses_compact_read_indices()) {
+        cache->get_metadata_cache()->set_input_kq_mask_mapped(
+                dst, ubatch, causal_attn, compact_read_plan());
+    } else {
+        base()->set_input_kq_mask(dst, ubatch, causal_attn);
+    }
 }
 
 void llama_kv_cache_kvarn_context::set_input_kq_mask_tail(
         ggml_tensor * body, ggml_tensor * exact,
         ggml_tensor * read_idxs, ggml_tensor * body_read_idxs, ggml_tensor * bias_read_idxs,
         const llama_ubatch * ubatch, bool causal_attn) const {
-    base()->set_input_kq_mask_tail(
-            body, exact, read_idxs, body_read_idxs, bias_read_idxs, ubatch, causal_attn);
+    if (cache->uses_compact_read_indices()) {
+        cache->get_metadata_cache()->set_input_kq_mask_tail_mapped(
+                body, exact, read_idxs, body_read_idxs, bias_read_idxs,
+                ubatch, causal_attn, compact_read_plan());
+    } else {
+        base()->set_input_kq_mask_tail(
+                body, exact, read_idxs, body_read_idxs, bias_read_idxs, ubatch, causal_attn);
+    }
 }
 
 void llama_kv_cache_kvarn_context::set_input_tail_body_plan(
@@ -2706,7 +2762,7 @@ ggml_tensor * llama_kv_cache_kvarn::store(
         params.sinkhorn_iters,
         value,
         int32_t(stage_groups));
-    result->op_params[3] = kvarn_contiguous_tokens_per_stream_hint(sinfo);
+    result->op_params[3] = kvarn_workspace_tokens_per_stream_hint(sinfo);
     result->op_params[4] = swa ? 1 : 0; // SWA sliding-window ring store
     result->op_params[5] = (int32_t) slices; // KVarN head-wide Hadamard slice count
     result->op_params[8] = int32_t(tail_groups);
@@ -2725,7 +2781,7 @@ ggml_tensor * llama_kv_cache_kvarn::view(
     const auto & layer = layer_for(il);
     const uint32_t stream_start = sinfo.s0;
     const uint32_t stream_count = sinfo.s1 - sinfo.s0 + 1;
-    ggml_tensor * indices = swa ? mat_idxs : stored->src[1];
+    ggml_tensor * indices = mat_idxs ? mat_idxs : stored->src[1];
 
     ggml_tensor * result = ggml_kvarn_view(
         ctx,
@@ -2741,6 +2797,7 @@ ggml_tensor * llama_kv_cache_kvarn::view(
     result->op_params[6] = swa ? 1 : 0;
     result->op_params[8] = int32_t(tail_groups);
     result->op_params[9] = 1;
+    result->op_params[10] = !swa && mat_idxs ? 1 : 0;
     const uint32_t slices = value ? layer.v_slices : layer.k_slices;
     if (slices > 1) {
         result = ggml_reshape_4d(
@@ -2766,7 +2823,7 @@ ggml_tensor * llama_kv_cache_kvarn::materialize(
     const auto & layer = layer_for(il);
     const uint32_t stream_start = sinfo.s0;
     const uint32_t stream_count = sinfo.s1 - sinfo.s0 + 1;
-    ggml_tensor * indices = swa ? mat_idxs : stored->src[1];
+    ggml_tensor * indices = mat_idxs ? mat_idxs : stored->src[1];
     GGML_ASSERT(indices != nullptr);
 
     ggml_tensor * result = ggml_kvarn_materialize(
@@ -2787,6 +2844,7 @@ ggml_tensor * llama_kv_cache_kvarn::materialize(
     result->op_params[6] = swa ? 1 : 0;
     result->op_params[8] = int32_t(tail_groups);
     result->op_params[9] = 1;
+    result->op_params[10] = !swa && mat_idxs ? 1 : 0;
     const uint32_t slices = value ? layer.v_slices : layer.k_slices;
     if (slices > 1) {
         result = ggml_reshape_4d(

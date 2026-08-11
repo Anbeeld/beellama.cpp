@@ -11578,6 +11578,7 @@ static constexpr int KVAR_N_OP_PARAM_MAT_SWA = 6;
 static constexpr int KVAR_N_OP_PARAM_STAGE_GROUPS = 7;
 static constexpr int KVAR_N_OP_PARAM_TAIL_GROUPS = 8;
 static constexpr int KVAR_N_OP_PARAM_EAGER_RECORDS = 9;
+static constexpr int KVAR_N_OP_PARAM_READ_INDIRECT = 10;
 
 static void kvarn_cpu_hadamard(float * values) {
     for (int stride = 1; stride < KVAR_N_GROUP; stride *= 2) {
@@ -11966,6 +11967,7 @@ void ggml_compute_forward_kvarn_materialize(const ggml_compute_params * params, 
     const int tail_groups_param = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_TAIL_GROUPS);
     const int tail_groups = tail_groups_param > 0 ? tail_groups_param : stage_groups - 1;
     const bool eager_records = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_EAGER_RECORDS) != 0;
+    const bool read_indirect = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_READ_INDIRECT) != 0;
     const int head_slices_param = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_HEAD_SLICES);
     const int head_slices = head_slices_param > 0 ? head_slices_param : 1;
     GGML_ASSERT(stage_groups >= 2 && tail_groups >= 1 && tail_groups <= stage_groups);
@@ -11986,7 +11988,7 @@ void ggml_compute_forward_kvarn_materialize(const ggml_compute_params * params, 
     for (int64_t i = 0; i < indices->ne[0]; ++i) {
         const int64_t idx = idx_data[i];
         if (idx < 0) {
-            GGML_ASSERT(swa);
+            GGML_ASSERT(swa || read_indirect);
             continue;
         }
         const int64_t group_global = idx / KVAR_N_GROUP;
@@ -12014,7 +12016,7 @@ void ggml_compute_forward_kvarn_materialize(const ggml_compute_params * params, 
         const int64_t cell = cell_stream % n_kv;
         const int64_t out_stream = cell_stream / n_kv;
         const int64_t stream = stream_start + out_stream;
-        const int64_t abs_pos = swa ? idx_data[cell] : cell;
+        const int64_t abs_pos = (swa || read_indirect) ? idx_data[cell] : cell;
         std::array<std::array<float, KVAR_N_GROUP>, 4> rows = {};
         if (abs_pos >= 0) {
             const int64_t group = abs_pos / KVAR_N_GROUP;
@@ -12098,6 +12100,7 @@ struct kvarn_cpu_attn_side {
     bool value = false;
     bool swa = false;
     bool eager_records = false;
+    bool read_indirect = false;
     std::vector<int64_t> live_groups;
     std::vector<int64_t> live_positions;
 };
@@ -12137,6 +12140,7 @@ static bool kvarn_cpu_attn_parse_side(const ggml_tensor * tensor, kvarn_cpu_attn
     const int tail_groups = ggml_get_op_params_i32(side.view, KVAR_N_OP_PARAM_TAIL_GROUPS);
     side.tail_groups = tail_groups > 0 ? tail_groups : side.stage_groups - 1;
     side.eager_records = ggml_get_op_params_i32(side.view, KVAR_N_OP_PARAM_EAGER_RECORDS) != 0;
+    side.read_indirect = ggml_get_op_params_i32(side.view, KVAR_N_OP_PARAM_READ_INDIRECT) != 0;
     const int head_slices = ggml_get_op_params_i32(side.view, KVAR_N_OP_PARAM_HEAD_SLICES);
     side.head_slices = head_slices > 0 ? head_slices : 1;
 
@@ -12175,7 +12179,7 @@ static bool kvarn_cpu_attn_parse_side(const ggml_tensor * tensor, kvarn_cpu_attn
     for (int64_t i = 0; i < side.indices->ne[0]; ++i) {
         const int64_t index = indices[i];
         if (index < 0) {
-            if (!side.swa) {
+            if (!side.swa && !side.read_indirect) {
                 return false;
             }
             continue;
@@ -12214,7 +12218,7 @@ static float kvarn_cpu_attn_load(
     const int64_t local_dim = dim % KVAR_N_GROUP;
     const int64_t head = logical_head * side.head_slices + slice;
     const int64_t * indices = (const int64_t *) side.indices->data;
-    const int64_t absolute_pos = side.swa ? indices[token] : token;
+    const int64_t absolute_pos = (side.swa || side.read_indirect) ? indices[token] : token;
     if (absolute_pos < 0) {
         return 0.0f;
     }

@@ -1456,6 +1456,7 @@ struct vk_op_kvarn_materialize_push_constants {
     uint32_t stage_groups;
     uint32_t tail_groups;
     uint32_t eager_records;
+    uint32_t read_indirect;
     uint32_t blocks_x;
     uint32_t total_blocks;
     uint32_t mode;
@@ -4419,6 +4420,7 @@ static constexpr int KVAR_N_OP_PARAM_MAT_SWA = 6;
 static constexpr int KVAR_N_OP_PARAM_STAGE_GROUPS = 7;
 static constexpr int KVAR_N_OP_PARAM_TAIL_GROUPS = 8;
 static constexpr int KVAR_N_OP_PARAM_EAGER_RECORDS = 9;
+static constexpr int KVAR_N_OP_PARAM_READ_INDIRECT = 10;
 
 static bool ggml_vk_kvarn_stage_shape_valid(const ggml_tensor * stage, const ggml_tensor * records, int stage_groups) {
     if (stage_groups < 2 || stage->ne[2] % (KVAR_N_GROUP * stage_groups) != 0) {
@@ -10684,6 +10686,7 @@ static void ggml_vk_kvarn_materialize(ggml_backend_vk_context * ctx, vk_context&
     const int tail_groups_param = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_TAIL_GROUPS);
     const int tail_groups = tail_groups_param > 0 ? tail_groups_param : stage_groups - 1;
     const bool eager_records = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_EAGER_RECORDS) != 0;
+    const bool read_indirect = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_READ_INDIRECT) != 0;
     GGML_ASSERT(ggml_vk_kvarn_valid_bits(bits) && stage_groups >= 2);
     GGML_ASSERT(head_slices == 1 || head_slices == 2 || head_slices == 4);
     GGML_ASSERT(dst->ne[1] % head_slices == 0);
@@ -10723,7 +10726,7 @@ static void ggml_vk_kvarn_materialize(ggml_backend_vk_context * ctx, vk_context&
         uint32_t(groups_per_stream), uint32_t(records->ne[0] / 4), uint32_t(bits), value ? 1u : 0u,
         uint32_t(indices->ne[0]), emit_rotated ? 1u : 0u, uint32_t(head_slices), swa ? 1u : 0u,
         uint32_t(stage_groups), uint32_t(tail_groups), eager_records ? 1u : 0u,
-        blocks_x, total_blocks, 1u,
+        read_indirect ? 1u : 0u, blocks_x, total_blocks, 1u,
     };
     const vk_subbuffer records_buf = ggml_vk_tensor_subbuffer(ctx, records);
     const vk_subbuffer stage_buf = ggml_vk_tensor_subbuffer(ctx, stage);
@@ -11541,6 +11544,7 @@ struct vk_kvarn_attn_side {
     bool value;
     bool swa;
     bool eager_records;
+    bool read_indirect;
 };
 
 static bool ggml_vk_kvarn_attn_parse_side(
@@ -11602,6 +11606,7 @@ static bool ggml_vk_kvarn_attn_parse_side(
         ggml_get_op_params_i32(view, 1) != 0,
         ggml_get_op_params_i32(view, 6) != 0,
         ggml_get_op_params_i32(view, 9) != 0,
+        ggml_get_op_params_i32(view, 10) != 0,
     };
     return true;
 }
@@ -11794,6 +11799,7 @@ static bool ggml_vk_flash_attn_kvarn(
         k_side.tail_groups == v_side.tail_groups &&
         k_side.swa == v_side.swa &&
         k_side.eager_records == v_side.eager_records &&
+        k_side.read_indirect == v_side.read_indirect &&
         k_side.indices->ne[0] == v_side.indices->ne[0]);
     GGML_ASSERT(q->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
     GGML_ASSERT(q->ne[0] == k->ne[0] && q->ne[0] == v->ne[0]);
@@ -11890,7 +11896,8 @@ static bool ggml_vk_flash_attn_kvarn(
         k_side.stream_start | (k_side.groups_per_stream << 16u),
         k_side.bits | (v_side.bits << 16u),
         uint32_t(k_side.indices->ne[0]),
-        k_side.head_slices | (k_side.stage_groups << 8u) | (k_side.tail_groups << 16u),
+        k_side.head_slices | (k_side.stage_groups << 8u) | (k_side.tail_groups << 16u) |
+            (uint32_t(k_side.read_indirect) << 24u),
         flags,
         (mask ? uint32_t(mask->ne[3]) : 1u) |
             ((has_tail ? uint32_t(query_order->ne[0]) : 0u) << 16u),

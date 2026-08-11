@@ -694,6 +694,11 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
     mctx->set_input_tail_idxs(self_tail_idxs, ubatch);
     set_tail_query_plan(self_tail_query_order, self_tail_run_desc, *ubatch);
+    if (self_kvarn_mat_idxs && self_kvarn_mat_idxs->buffer) {
+        const auto * kvarn = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx);
+        GGML_ASSERT(kvarn != nullptr);
+        kvarn->set_input_kvarn_mat_idxs(self_kvarn_mat_idxs, ubatch);
+    }
 
     // the mask is left unallocated when the graph only stores K/V without attending
     // (e.g. DFlash's KV-injection pass)
@@ -743,6 +748,7 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
 
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
     res &= self_tail_idxs == nullptr || self_tail_idxs->ne[0] == params.ubatch.n_tokens;
+    res &= self_kvarn_mat_idxs == nullptr || self_kvarn_mat_idxs->ne[0] == mctx->get_n_kv();
     res &= self_tail_read_idxs == nullptr ||
             (self_tail_read_idxs->ne[0] == tail_attention_stride &&
              self_tail_read_idxs->ne[1] == params.ubatch.n_tokens);
@@ -759,6 +765,12 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
             (self_kq_mask_tail->ne[0] == tail_attention_stride &&
              self_kq_mask_tail->ne[1] == self_kq_mask->ne[1] &&
              self_kq_mask_tail->ne[3] == self_kq_mask->ne[3]);
+
+    if (self_kvarn_mat_idxs && self_kvarn_mat_idxs->buffer) {
+        const auto * kvarn = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx);
+        GGML_ASSERT(kvarn != nullptr);
+        kvarn->set_mat_idxs(self_kvarn_mat_idxs);
+    }
 
     return res;
 }
@@ -853,6 +865,7 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
         ggml_tensor * v_idxs = swa ? self_v_idxs_swa : self_v_idxs;
         ggml_tensor * tail_idxs = get_tail_idxs(swa);
         ggml_tensor * mask = swa ? self_kq_mask_swa : self_kq_mask;
+        ggml_tensor * kvarn_mat_idxs = swa ? self_kvarn_mat_idxs_swa : self_kvarn_mat_idxs;
         if (k_idxs && k_idxs->buffer) {
             group->set_input_k_idxs(k_idxs, ubatch);
             if (v_idxs) {
@@ -861,6 +874,11 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
         }
         if (tail_idxs && tail_idxs->buffer) {
             group->set_input_tail_idxs(tail_idxs, ubatch);
+        }
+        if (kvarn_mat_idxs && kvarn_mat_idxs->buffer) {
+            const auto * kvarn = dynamic_cast<const llama_kv_cache_kvarn_context *>(group);
+            GGML_ASSERT(kvarn != nullptr);
+            kvarn->set_input_kvarn_mat_idxs(kvarn_mat_idxs, ubatch);
         }
         if (mask && mask->buffer) {
             group->set_input_kq_mask(mask, ubatch, cparams.causal_attn);
@@ -976,6 +994,11 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
     if (self_kvarn_mat_idxs_swa && self_kvarn_mat_idxs_swa->buffer) {
         if (const auto * kvarn_swa = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx->get_swa())) {
             kvarn_swa->set_mat_idxs(self_kvarn_mat_idxs_swa);
+        }
+    }
+    if (self_kvarn_mat_idxs && self_kvarn_mat_idxs->buffer) {
+        if (const auto * kvarn_base = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx->get_base())) {
+            kvarn_base->set_mat_idxs(self_kvarn_mat_idxs);
         }
     }
 
@@ -3368,6 +3391,10 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_kvarn_rot_128 = kvarn->build_input_kvarn_rot(ctx0, 128);
         inp->self_kvarn_rot_256 = kvarn->build_input_kvarn_rot(ctx0, 256);
         inp->self_kvarn_rot_512 = kvarn->build_input_kvarn_rot(ctx0, 512);
+        if (kvarn->uses_compact_read_indices()) {
+            inp->self_kvarn_mat_idxs = kvarn->build_input_kvarn_mat_idxs(ctx0);
+            kvarn->set_mat_idxs(inp->self_kvarn_mat_idxs);
+        }
     }
 
     return inp;
@@ -4299,6 +4326,10 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
         inp->self_kvarn_rot_128 = kvarn_base->build_input_kvarn_rot(ctx0, 128);
         inp->self_kvarn_rot_256 = kvarn_base->build_input_kvarn_rot(ctx0, 256);
         inp->self_kvarn_rot_512 = kvarn_base->build_input_kvarn_rot(ctx0, 512);
+        if (kvarn_base->uses_compact_read_indices()) {
+            inp->self_kvarn_mat_idxs = kvarn_base->build_input_kvarn_mat_idxs(ctx0);
+            kvarn_base->set_mat_idxs(inp->self_kvarn_mat_idxs);
+        }
     }
 
     inp->self_k_rot_swa = mctx_cur->get_swa()->build_input_k_rot(ctx0);

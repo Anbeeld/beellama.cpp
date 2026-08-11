@@ -3420,6 +3420,7 @@ struct args_set_input_kq_mask {
     int64_t n_kv;
     int64_t n_stream;
     int64_t n_tps;
+    const std::vector<int64_t> * read_cells;
 };
 
 template<typename T, bool causal, bool swa, bool is_2d, bool alibi>
@@ -3512,16 +3513,21 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                     }
                 }
 
-                if (cells.is_empty(j)) {
+                const int64_t mapped = args.read_cells ? args.read_cells->at(j) : int64_t(j);
+                if (mapped < 0) {
+                    goto skip;
+                }
+                const uint32_t cell = uint32_t(mapped);
+                if (cell >= cells.size() || cells.is_empty(cell)) {
                     goto skip;
                 }
 
                 // mask the token if not the same sequence
-                if (!cells.seq_has(j, seq_id)) {
+                if (!cells.seq_has(cell, seq_id)) {
                     goto skip;
                 }
 
-                p0 = cells.pos_get(j);
+                p0 = cells.pos_get(cell);
 
                 if (!alibi) {
                     if (!prev) {
@@ -3541,7 +3547,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                     // M-RoPE causal mask
                     if (is_2d) {
                         if (p0 == p1) {
-                            const auto & p0_ext = cells.ext_get(j);
+                            const auto & p0_ext = cells.ext_get(cell);
 
                             if (p0_ext.is_2d_gt(p1_x, p1_y)) {
                                 goto skip;
@@ -3611,12 +3617,19 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 }
 
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+    set_input_kq_mask_mapped(dst, ubatch, causal_attn, {});
+}
+
+void llama_kv_cache::set_input_kq_mask_mapped(
+        ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn,
+        const std::vector<int64_t> & read_cells) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
     const int64_t n_kv     = dst->ne[0];
     const int64_t n_stream = dst->ne[3]; // num streams in the current ubatch
+    GGML_ASSERT(read_cells.empty() || (n_stream == 1 && int64_t(read_cells.size()) == n_kv));
 
     GGML_ASSERT(n_tokens%n_stream == 0);
 
@@ -3635,6 +3648,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.n_kv             =*/ n_kv,
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
+        /*.read_cells       =*/ read_cells.empty() ? nullptr : &read_cells,
     };
 
     if (dst->type == GGML_TYPE_F16) {
@@ -6621,7 +6635,8 @@ static void set_input_kq_mask_tail_impl(
         const llama_ubatch * ubatch,
         uint32_t n_kv,
         uint32_t attention_stride,
-        bool causal_attn) {
+        bool causal_attn,
+        const std::vector<int32_t> * physical_to_read) {
     const T drop = llama_cast<T>(-INFINITY);
     std::fill(exact_data, exact_data + uint64_t(attention_stride)*ubatch->n_tokens, drop);
     if (read_data) {
@@ -6681,15 +6696,20 @@ static void set_input_kq_mask_tail_impl(
             for (size_t j = first; j < candidates.size(); ++j) {
                 const auto & candidate = candidates[j];
                 const auto & identity = candidate.identity;
-                if (identity.stream != stream || identity.cell >= n_kv ||
+                if (identity.stream != stream ||
                         identity.cell >= generations.at(stream).size() ||
                         generations.at(stream)[identity.cell] != identity.generation) {
                     continue;
                 }
-                const uint64_t body_row = uint64_t(stream)*n_kv + identity.cell;
+                const int32_t read_cell = physical_to_read ?
+                        physical_to_read->at(identity.cell) : int32_t(identity.cell);
+                if (read_cell < 0 || uint32_t(read_cell) >= n_kv) {
+                    continue;
+                }
+                const uint64_t body_row = uint64_t(stream)*n_kv + uint32_t(read_cell);
                 GGML_ASSERT(body_row <= uint64_t(INT32_MAX));
                 const llama_kv_tail_mask_entry mask_entry {
-                    uint32_t(j - first), identity.cell, candidate.position,
+                    uint32_t(j - first), uint32_t(read_cell), candidate.position,
                 };
                 plan.entries.push_back({ mask_entry, candidate.slot, int32_t(body_row) });
                 plan.mask_entries.push_back(mask_entry);
@@ -6750,6 +6770,17 @@ void llama_kv_cache::set_input_kq_mask_tail(
         ggml_tensor * body, ggml_tensor * exact,
         ggml_tensor * read_idxs, ggml_tensor * body_read_idxs, ggml_tensor * bias_read_idxs,
         const llama_ubatch * ubatch, uint32_t n_kv, bool causal_attn) const {
+    set_input_kq_mask_tail_mapped(
+            body, exact, read_idxs, body_read_idxs, bias_read_idxs,
+            ubatch, causal_attn, {});
+}
+
+void llama_kv_cache::set_input_kq_mask_tail_mapped(
+        ggml_tensor * body, ggml_tensor * exact,
+        ggml_tensor * read_idxs, ggml_tensor * body_read_idxs, ggml_tensor * bias_read_idxs,
+        const llama_ubatch * ubatch, bool causal_attn,
+        const std::vector<int64_t> & read_cells) const {
+    const uint32_t n_kv = uint32_t(body ? body->ne[0] : read_cells.size());
     if (!tail || !exact || !exact->buffer) {
         return;
     }
@@ -6779,13 +6810,25 @@ void llama_kv_cache::set_input_kq_mask_tail(
     GGML_ASSERT(!bias_read_idxs ||
             (bias_read_idxs->type == GGML_TYPE_I32 && bias_read_idxs->ne[0] == attention_stride));
     GGML_ASSERT(body->ne[0] == n_kv);
+    std::vector<int32_t> physical_to_read;
+    if (!read_cells.empty()) {
+        GGML_ASSERT(n_stream == 1 && read_cells.size() == n_kv);
+        physical_to_read.assign(v_cells[0].size(), -1);
+        for (uint32_t read = 0; read < n_kv; ++read) {
+            if (read_cells[read] >= 0) {
+                GGML_ASSERT(uint64_t(read_cells[read]) < physical_to_read.size());
+                physical_to_read[size_t(read_cells[read])] = int32_t(read);
+            }
+        }
+    }
     if (body->type == GGML_TYPE_F16) {
         set_input_kq_mask_tail_impl(*tail, tail_generations, seq_to_stream,
                 static_cast<ggml_fp16_t *>(body->data), static_cast<ggml_fp16_t *>(exact->data),
                 read_idxs && read_idxs->buffer ? static_cast<int32_t *>(read_idxs->data) : nullptr,
                 body_read_idxs && body_read_idxs->buffer ? static_cast<int32_t *>(body_read_idxs->data) : nullptr,
                 bias_read_idxs && bias_read_idxs->buffer ? static_cast<int32_t *>(bias_read_idxs->data) : nullptr,
-                ubatch, n_kv, attention_stride, causal_attn);
+                ubatch, n_kv, attention_stride, causal_attn,
+                physical_to_read.empty() ? nullptr : &physical_to_read);
     } else {
         GGML_ASSERT(body->type == GGML_TYPE_F32);
         set_input_kq_mask_tail_impl(*tail, tail_generations, seq_to_stream,
@@ -6793,7 +6836,8 @@ void llama_kv_cache::set_input_kq_mask_tail(
                 read_idxs && read_idxs->buffer ? static_cast<int32_t *>(read_idxs->data) : nullptr,
                 body_read_idxs && body_read_idxs->buffer ? static_cast<int32_t *>(body_read_idxs->data) : nullptr,
                 bias_read_idxs && bias_read_idxs->buffer ? static_cast<int32_t *>(bias_read_idxs->data) : nullptr,
-                ubatch, n_kv, attention_stride, causal_attn);
+                ubatch, n_kv, attention_stride, causal_attn,
+                physical_to_read.empty() ? nullptr : &physical_to_read);
     }
 }
 

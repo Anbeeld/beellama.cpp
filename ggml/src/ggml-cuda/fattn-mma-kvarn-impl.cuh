@@ -34,7 +34,7 @@ static __device__ __forceinline__ ggml_cuda_fattn_kvarn_mma_tile ggml_cuda_fattn
         return tile;
     }
 
-    if (desc.swa) {
+    if (desc.swa || desc.read_indirect) {
         const int64_t first_idx = desc.indices[k_start];
         const int64_t last_idx  = desc.indices[k_start + valid_count - 1];
         if (first_idx < 0 || last_idx != first_idx + valid_count - 1) {
@@ -49,15 +49,21 @@ static __device__ __forceinline__ ggml_cuda_fattn_kvarn_mma_tile ggml_cuda_fattn
         const bool from_record = ggml_cuda_fattn_kvarn_group_from_record(desc, group0);
         tile.pos_begin = (int) (first_idx - (int64_t) group0 * GGML_CUDA_FATTN_KVARN_DIM);
         if (from_stage) {
+            const int stage_base = desc.stream * GGML_CUDA_FATTN_KVARN_DIM * desc.stage_groups;
             tile.stage = true;
-            tile.stage_pos_begin = (group0 % desc.stage_groups) * GGML_CUDA_FATTN_KVARN_DIM + tile.pos_begin;
+            tile.stage_pos_begin = desc.swa ?
+                (group0 % desc.stage_groups) * GGML_CUDA_FATTN_KVARN_DIM + tile.pos_begin :
+                stage_base + (group0 == 0 ? tile.pos_begin :
+                    GGML_CUDA_FATTN_KVARN_DIM +
+                    ((group0 - 1) % desc.tail_groups) * GGML_CUDA_FATTN_KVARN_DIM + tile.pos_begin);
             return tile;
         }
         if (!from_record) {
             return tile;
         }
         tile.fast = true;
-        tile.record_group = group0 % desc.groups_per_stream;
+        tile.record_group = desc.swa ? group0 % desc.groups_per_stream :
+            desc.stream * desc.groups_per_stream + group0;
         return tile;
     }
 
@@ -130,15 +136,20 @@ static __device__ __forceinline__ bool ggml_cuda_fattn_kvarn_load_rotated_slice_
     bool from_record = false;
 
     if (valid_row) {
-        if (desc.swa) {
+        if (desc.swa || desc.read_indirect) {
             const int64_t abs_pos = desc.indices[token];
             if (abs_pos >= 0) {
                 const int group = (int) (abs_pos / GGML_CUDA_FATTN_KVARN_DIM);
                 pos = (int) (abs_pos - (int64_t) group * GGML_CUDA_FATTN_KVARN_DIM);
                 from_stage  = ggml_cuda_fattn_kvarn_group_from_stage(desc, group);
                 from_record = ggml_cuda_fattn_kvarn_group_from_record(desc, group);
-                stage_pos = (group % desc.stage_groups) * GGML_CUDA_FATTN_KVARN_DIM + pos;
-                record_group = group % desc.groups_per_stream;
+                const int stage_base = desc.stream * GGML_CUDA_FATTN_KVARN_DIM * desc.stage_groups;
+                stage_pos = desc.swa ?
+                    (group % desc.stage_groups) * GGML_CUDA_FATTN_KVARN_DIM + pos :
+                    stage_base + (group == 0 ? pos : GGML_CUDA_FATTN_KVARN_DIM +
+                        ((group - 1) % desc.tail_groups) * GGML_CUDA_FATTN_KVARN_DIM + pos);
+                record_group = desc.swa ? group % desc.groups_per_stream :
+                    desc.stream * desc.groups_per_stream + group;
             }
         } else {
             const int group = token / GGML_CUDA_FATTN_KVARN_DIM;

@@ -96,6 +96,10 @@ uint tail_groups() {
     return (p.kvarn_shape_packed >> 16u) & 0xffu;
 }
 
+bool read_indirect() {
+    return (p.kvarn_shape_packed >> 24u) != 0u;
+}
+
 uint mask_ne3() {
     return p.mask_query_packed & 0xffffu;
 }
@@ -231,7 +235,8 @@ float load_kvarn(
         uint slice,
         uint dim) {
     const bool swa = (p.flags & FLAG_SWA) != 0u;
-    const int absolute_pos = swa ? int(read_index_low(value, token)) : int(token);
+    const int absolute_pos = (swa || read_indirect()) ?
+        int(read_index_low(value, token)) : int(token);
     if (absolute_pos < 0) {
         return 0.0;
     }

@@ -18,6 +18,7 @@ layout(push_constant) uniform parameter {
     uint stage_groups;
     uint tail_groups;
     uint eager_records;
+    uint read_indirect;
     uint blocks_x;
     uint total_blocks;
     uint mode;
@@ -134,7 +135,8 @@ float load_materialized(
         uint live_group,
         uint live_pos,
         uint lane) {
-    const int abs_pos_i = p.swa != 0u ? int(read_index_low(token)) : int(token);
+    const int abs_pos_i = (p.swa != 0u || p.read_indirect != 0u) ?
+        int(read_index_low(token)) : int(token);
     if (abs_pos_i < 0) {
         return 0.0;
     }

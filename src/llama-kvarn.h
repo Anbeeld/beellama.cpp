@@ -112,6 +112,15 @@ std::vector<uint32_t> llama_kvarn_select_state_record_groups(
         const std::vector<llama_kvarn_state_stage_cell> & stage_cells,
         uint32_t groups_per_stream);
 
+// Builds the dense physical-cell index used by KVarN attention. Fixed
+// per-sequence record stripes deliberately leave holes in the physical arena;
+// those holes are storage ownership, not attention rows.
+std::vector<int64_t> llama_kvarn_compact_read_plan(
+        const std::vector<uint32_t> & occupied_cells,
+        const std::vector<uint32_t> & pending_cells,
+        uint32_t capacity,
+        uint32_t padding);
+
 template<typename SeqPosMax>
 bool llama_kvarn_stream_is_exclusive_for(
         uint32_t n_stream,

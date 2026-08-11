@@ -345,6 +345,33 @@ std::vector<uint32_t> llama_kvarn_select_state_record_groups(
     return { sealed_groups.begin(), sealed_groups.end() };
 }
 
+std::vector<int64_t> llama_kvarn_compact_read_plan(
+        const std::vector<uint32_t> & occupied_cells,
+        const std::vector<uint32_t> & pending_cells,
+        uint32_t capacity,
+        uint32_t padding) {
+    if (capacity == 0 || padding == 0) {
+        throw std::invalid_argument("invalid KVarN compact read-plan extent");
+    }
+
+    std::vector<uint32_t> cells;
+    cells.reserve(occupied_cells.size() + pending_cells.size());
+    cells.insert(cells.end(), occupied_cells.begin(), occupied_cells.end());
+    cells.insert(cells.end(), pending_cells.begin(), pending_cells.end());
+    std::sort(cells.begin(), cells.end());
+    cells.erase(std::unique(cells.begin(), cells.end()), cells.end());
+    if (!cells.empty() && cells.back() >= capacity) {
+        throw std::invalid_argument("KVarN compact read-plan cell exceeds cache capacity");
+    }
+
+    const uint32_t used = uint32_t(cells.size());
+    const uint32_t padded = std::min(capacity,
+            std::max(padding, ((used + padding - 1u)/padding)*padding));
+    std::vector<int64_t> result(padded, -1);
+    std::copy(cells.begin(), cells.end(), result.begin());
+    return result;
+}
+
 llama_kvarn_tile_layout llama_kvarn_make_layout(int head_dim, int group, int key_bits, int value_bits) {
     assert(head_dim > 0);
     assert(group > 0);

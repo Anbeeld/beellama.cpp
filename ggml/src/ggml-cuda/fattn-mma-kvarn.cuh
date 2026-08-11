@@ -38,6 +38,7 @@ struct ggml_cuda_fattn_kvarn_desc {
     int swa;
     int head_slices;
     int eager_records;
+    int read_indirect;
     // Large prefill can reconstruct one side in the original domain in the MMA tile loader.
     // Decode-width paths keep rotated-domain K/V and rotate Q/output in the graph.
     int original_domain;
@@ -106,6 +107,7 @@ struct ggml_cuda_fattn_kvarn_plan_side {
     bool value        = false;
     bool swa          = false;
     bool eager_records = false;
+    bool read_indirect = false;
 };
 
 struct ggml_cuda_fattn_kvarn_plan {
@@ -197,6 +199,7 @@ static inline bool ggml_cuda_fattn_kvarn_unwrap_view(
     side.n_stream = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_VIEW_N_STREAM);
     side.swa = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_VIEW_SWA) != 0;
     side.eager_records = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_EAGER_RECORDS) != 0;
+    side.read_indirect = ggml_get_op_params_i32(cur, 10) != 0;
     const int head_slices_param = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_HEAD_SLICES);
     side.head_slices = head_slices_param > 0 ? head_slices_param : 1;
     side.stage_groups = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_STAGE_GROUPS);

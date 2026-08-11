@@ -2998,9 +2998,66 @@ public:
             uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
 
     ~llama_io_write_host() {
-        // TODO: add backend support to batch tensor_get? or some other way to speed this up
+        // State layouts often interleave regularly-strided slices from several
+        // tensors. Group those slices by source tensor so backends with native
+        // 2D transfers can copy each run with one synchronization while keeping
+        // the serialized byte layout unchanged.
+        std::vector<const write_info *> sorted;
+        sorted.reserve(winfos.size());
         for (const auto & winfo : winfos) {
-            ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+            sorted.push_back(&winfo);
+        }
+        std::sort(sorted.begin(), sorted.end(), [](const write_info * a, const write_info * b) {
+            if (a->tensor != b->tensor) {
+                return std::less<ggml_tensor *>{}(a->tensor, b->tensor);
+            }
+            if (a->size != b->size) {
+                return a->size < b->size;
+            }
+            if (a->offset != b->offset) {
+                return a->offset < b->offset;
+            }
+            return a->ptr < b->ptr;
+        });
+
+        size_t i = 0;
+        while (i < sorted.size()) {
+            size_t group_end = i + 1;
+            while (group_end < sorted.size() &&
+                    sorted[group_end]->tensor == sorted[i]->tensor &&
+                    sorted[group_end]->size == sorted[i]->size) {
+                ++group_end;
+            }
+
+            while (i < group_end) {
+                const write_info & first = *sorted[i];
+                size_t run = 1;
+                size_t source_stride = 0;
+                size_t destination_stride = 0;
+                if (i + 1 < group_end &&
+                        sorted[i + 1]->offset > first.offset &&
+                        sorted[i + 1]->ptr > first.ptr) {
+                    source_stride = sorted[i + 1]->offset - first.offset;
+                    destination_stride = size_t(sorted[i + 1]->ptr - first.ptr);
+                    if (source_stride >= first.size && destination_stride >= first.size) {
+                        run = 2;
+                        while (i + run < group_end &&
+                                sorted[i + run]->offset == first.offset + run*source_stride &&
+                                sorted[i + run]->ptr == first.ptr + run*destination_stride) {
+                            ++run;
+                        }
+                    }
+                }
+
+                if (run > 1) {
+                    ggml_backend_tensor_get_2d(
+                            first.tensor, first.ptr, first.offset, first.size,
+                            run, source_stride, destination_stride);
+                } else {
+                    ggml_backend_tensor_get(first.tensor, first.ptr, first.offset, first.size);
+                }
+                i += run;
+            }
         }
     }
 

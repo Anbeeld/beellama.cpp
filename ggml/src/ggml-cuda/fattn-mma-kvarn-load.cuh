@@ -73,7 +73,7 @@ static __device__ __forceinline__ float ggml_cuda_fattn_kvarn_load_rotated(
     int stage_pos;
     int record_group;
 
-    if (desc.swa) {
+    if (desc.swa || desc.read_indirect) {
         const int64_t abs_pos = desc.indices[token];
         if (abs_pos < 0) {
             return 0.0f;
@@ -82,8 +82,13 @@ static __device__ __forceinline__ float ggml_cuda_fattn_kvarn_load_rotated(
         pos   = (int) (abs_pos - (int64_t) group * GGML_CUDA_FATTN_KVARN_DIM);
         from_stage  = ggml_cuda_fattn_kvarn_group_from_stage(desc, group);
         from_record = ggml_cuda_fattn_kvarn_group_from_record(desc, group);
-        stage_pos = (group % desc.stage_groups) * GGML_CUDA_FATTN_KVARN_DIM + pos;
-        record_group = group % desc.groups_per_stream;
+        const int stage_base = desc.stream * GGML_CUDA_FATTN_KVARN_DIM * desc.stage_groups;
+        stage_pos = desc.swa ?
+            (group % desc.stage_groups) * GGML_CUDA_FATTN_KVARN_DIM + pos :
+            stage_base + (group == 0 ? pos : GGML_CUDA_FATTN_KVARN_DIM +
+                ((group - 1) % desc.tail_groups) * GGML_CUDA_FATTN_KVARN_DIM + pos);
+        record_group = desc.swa ? group % desc.groups_per_stream :
+            desc.stream * desc.groups_per_stream + group;
     } else {
         group = token / GGML_CUDA_FATTN_KVARN_DIM;
         pos   = token - group * GGML_CUDA_FATTN_KVARN_DIM;
