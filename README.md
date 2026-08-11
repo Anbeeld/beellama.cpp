@@ -26,7 +26,7 @@ K and V cache types are set independently with `--cache-type-k` and `--cache-typ
 
 The measurements come from Qwen 3.6 27B Q5_K_S at 64K context on Wikitext-2 raw with `-b 2048 -ub 512` on an RTX 3090. Median KLD is the primary quality metric; lower is better.
 
-| K / V | Tail | KV cache | Size vs bf16 (%) | Median KLD | 99.9% KLD | What it is for |
+| K / V | Tail | Size | Size vs bf16 | Median KLD | 99.9% KLD | What it is for |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
 | `bf16 / bf16` | 0 | 4096 MiB | 100.0% | 0 | 0.000050 | Reference |
 | `q8_0 / q8_0` | 1024 | 2272 MiB | 55.5% | 0.000897 | 0.087699 | Standard fidelity with a precision tail |
@@ -53,7 +53,7 @@ Gemma 4 needs a separate decision. Its 1024-token sliding window makes a 1024 ta
 
 Use this generic fallback ladder when KVarN or precision tails are unavailable. It is based on the same Qwen 3.6 27B benchmark, with every standard cache row using tail 0.
 
-| K / V | KV cache | Size vs bf16 (%) | Median KLD | 99.9% KLD | What it is for |
+| K / V | Size | Size vs bf16 | Median KLD | 99.9% KLD | What it is for |
 | --- | ---: | ---: | ---: | ---: | --- |
 | `bf16 / bf16` | 4096 MiB | 100.0% | 0 | 0.000050 | Reference |
 | `q8_0 / q8_0` | 2176 MiB | 53.1% | 0.000909 | 0.093029 | Compression with minimal losses |
@@ -73,28 +73,28 @@ Use this generic fallback ladder when KVarN or precision tails are unavailable. 
 <details>
 <summary><strong>All KV cache types available in BeeLlama</strong></summary>
 
-| Type | Origin | bpv | Size vs bf16 (%) |
+| Type | Origin | bpv | Size vs bf16 |
 | --- | --- | ---: | ---: |
 | `q8_0` | upstream | 8.5 | 53.1% |
-| `kvarn8` | Huawei / fork | 8.375 | ~52.3% |
+| `kvarn8` | Huawei / fork | 8.375 | 52.3% |
 | `q6_1` | fork | 7.0 | 43.8% |
 | `q6_0` | fork | 6.5 | 40.6% |
-| `kvarn6` | Huawei / fork | 6.375 | ~39.8% |
+| `kvarn6` | Huawei / fork | 6.375 | 39.8% |
 | `q5_1` | upstream | 6.0 | 37.5% |
 | `q5_0` | upstream | 5.5 | 34.4% |
-| `kvarn5` | Huawei / fork | 5.375 | ~33.6% |
+| `kvarn5` | Huawei / fork | 5.375 | 33.6% |
 | `q4_1` | upstream | 5.0 | 31.3% |
 | `q4_0` | upstream | 4.5 | 28.1% |
 | `iq4_nl` | upstream | 4.5 | 28.1% |
-| `kvarn4` | Huawei / fork | 4.375 | ~27.3% |
+| `kvarn4` | Huawei / fork | 4.375 | 27.3% |
 | `q3_1` | fork | 4.0 | 25.0% |
 | `q3_0` | fork | 3.5 | 21.9% |
-| `kvarn3` | Huawei / fork | 3.375 | ~21.1% |
+| `kvarn3` | Huawei / fork | 3.375 | 21.1% |
 | `q2_1` | fork | 3.0 | 18.8% |
 | `q2_0` | fork | 2.5 | 15.6% |
-| `kvarn2` | Huawei / fork | 2.375 | ~14.8% |
+| `kvarn2` | Huawei / fork | 2.375 | 14.8% |
 
-Standard ratios come directly from each block format. KVarN ratios describe the compressed record body, including scale and zero-point metadata; the permanent exact sink, exact suffix, staging, and alignment add context-dependent overhead.
+Standard ratios come directly from each block format. KVarN ratios describe the compressed record body, including scale and zero-point metadata; the permanent exact sink, exact suffix, staging, and alignment add overhead.
 
 </details>
 
@@ -102,7 +102,7 @@ Standard ratios come directly from each block format. KVarN ratios describe the 
 
 ### Prebuilt
 
-Current release binaries are on the [releases page](https://github.com/Anbeeld/beellama.cpp/releases). Release asset names use the `beellama-<version>-<asset-suffix>` pattern:
+Current release binaries are on the [releases page](https://github.com/Anbeeld/beellama.cpp/releases).
 
 | Platform | Backend | Asset suffix |
 | --- | --- | --- |
@@ -156,7 +156,7 @@ cmake -B build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-The default CUDA FlashAttention build covers 50 standard cache pairs and 15 KVarN fast-decode pairs, including the homogeneous F16 and BF16 pairs needed by precision tails. Add `-DGGML_CUDA_FA_ALL_QUANTS=ON` to compile all 169 standard and 36 KVarN pairs, or `-DGGML_CUDA_KVARN=OFF` to build without the shared CUDA/HIP KVarN kernels and CUDA template instances. CUDA, ROCm/HIP, Vulkan, and CPU consume compressed KVarN records directly in native FlashAttention paths; materialization is reserved for an explicitly supported fallback route. Vulkan native attention requires shader Int64 and buffer-device-address support. Add `-DCMAKE_CUDA_ARCHITECTURES=86` for RTX 3090, or `-DCMAKE_CUDA_ARCHITECTURES=89` for RTX 4090, if cross-compiling or building in CI without a GPU.
+The default CUDA FlashAttention build covers 50 standard cache pairs and 15 KVarN fast-decode pairs, including the homogeneous F16 and BF16 pairs needed by precision tails. Add `-DGGML_CUDA_FA_ALL_QUANTS=ON` to compile all 169 standard and 36 KVarN pairs, or `-DGGML_CUDA_KVARN=OFF` to build without KVarN kernels.
 
 ### Other Backends
 
