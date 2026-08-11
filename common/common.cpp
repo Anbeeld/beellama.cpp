@@ -1350,17 +1350,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     if (params.fit_params) {
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
-        const common_params_fit_status fit_status = common_fit_params(
-            params.model.path.c_str(), &mparams, &cparams,
+        common_fit_params(params.model.path.c_str(), &mparams, &cparams,
             params.tensor_split,
             params.tensor_buft_overrides.data(),
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
-        if (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
-            COM_ERR("%s", "failed to fit parameters with exact Bee validation\n");
-            return;
-        }
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);

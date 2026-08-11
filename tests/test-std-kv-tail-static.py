@@ -142,6 +142,15 @@ def main() -> None:
     if "llama_memory_seq_rm" in suffix_block or "common_context_seq_rm" in suffix_block:
         raise AssertionError("server prompt suffix trimming still duplicates raw memory removal")
 
+    common_source = (ROOT / "common/common.cpp").read_text(encoding="utf-8")
+    fit_callsite = common_source.split(
+        "if (params.fit_params) {", 1
+    )[1].split("llama_model * model = llama_model_load_from_file", 1)[0]
+    if "common_fit_params(" not in fit_callsite:
+        raise AssertionError("common init no longer invokes upstream parameter fitting")
+    if "fit_status" in fit_callsite or "failed to fit parameters with exact Bee validation" in fit_callsite:
+        raise AssertionError("common init hard-fails an advisory upstream fit conflict")
+
     server_tests = (ROOT / "tests/test-server-prompt-checkpoint.cpp").read_text(encoding="utf-8")
     for regression in (
         "server_unsupported_removal_falls_back_to_full_reprocess",
