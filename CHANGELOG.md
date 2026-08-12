@@ -2,7 +2,7 @@
 
 ## v0.4.4
 
-- Updated the llama.cpp base through upstream commit `84e908c6`.
+- Updated the llama.cpp base through upstream commit `84e908c6`. Notable inherited changes include Granite-Switch and Muse Glimmer model support, MTP support for Nemotron and DFlash support for Nemotron 3.5, Pocket TTS audio generation, multi-output backend sampling for speculative decoding, media-aware server slot save/restore, the Web UI `read_media` tool, and expanded tool isolation through SSH and rootless Podman. The merge also adds the default `load-mode auto` policy that avoids memory mapping on integrated GPUs, Vulkan TQ2_0 support, a warp-per-row CUDA WKV7 kernel for single-token decode, narrower CUDA-graph synchronization, hardened GGUF loading, semantic versioning, and version-aware CMake package metadata.
 
 ## v0.4.3
 
