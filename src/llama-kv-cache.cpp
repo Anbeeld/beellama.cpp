@@ -3545,11 +3545,12 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                     }
                 }
 
+                uint32_t cell;
                 const int64_t mapped = args.read_cells ? args.read_cells->at(j) : int64_t(j);
                 if (mapped < 0) {
                     goto skip;
                 }
-                const uint32_t cell = uint32_t(mapped);
+                cell = uint32_t(mapped);
                 if (cell >= cells.size() || cells.is_empty(cell)) {
                     goto skip;
                 }

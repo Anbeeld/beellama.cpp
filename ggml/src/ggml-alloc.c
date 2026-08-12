@@ -599,7 +599,7 @@ static bool ggml_alloc_is_zero_alloc_proxy(const struct ggml_tensor * t) {
     return t->op == GGML_OP_KVARN_VIEW;
 }
 
-static struct ggml_tensor * ggml_alloc_zero_alloc_proxy_base(struct ggml_tensor * t) {
+static const struct ggml_tensor * ggml_alloc_zero_alloc_proxy_base(const struct ggml_tensor * t) {
     while (t != NULL && t->view_src != NULL) {
         t = t->view_src;
     }
@@ -607,7 +607,7 @@ static struct ggml_tensor * ggml_alloc_zero_alloc_proxy_base(struct ggml_tensor 
 }
 
 static bool ggml_alloc_is_zero_alloc_proxy_view(const struct ggml_tensor * t) {
-    return ggml_alloc_zero_alloc_proxy_base((struct ggml_tensor *) t) != NULL;
+    return ggml_alloc_zero_alloc_proxy_base(t) != NULL;
 }
 
 // free the extra space at the end if the new tensor is smaller
@@ -777,7 +777,7 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
             // is visited. Extend those source lifetimes for every downstream
             // proxy edge so the final attention operation cannot reuse a
             // compute-allocated indirect read plan before it executes.
-            struct ggml_tensor * proxy = ggml_alloc_zero_alloc_proxy_base(src);
+            const struct ggml_tensor * proxy = ggml_alloc_zero_alloc_proxy_base(src);
             if (proxy != NULL) {
                 for (int k = 0; k < GGML_MAX_SRC; ++k) {
                     if (proxy->src[k] != NULL) {
@@ -851,7 +851,7 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
                 }
             }
 
-            struct ggml_tensor * proxy = ggml_alloc_zero_alloc_proxy_base(parent);
+            const struct ggml_tensor * proxy = ggml_alloc_zero_alloc_proxy_base(parent);
             if (proxy != NULL) {
                 for (int k = 0; k < GGML_MAX_SRC; ++k) {
                     struct ggml_tensor * dependency = proxy->src[k];
