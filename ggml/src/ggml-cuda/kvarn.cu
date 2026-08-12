@@ -33,6 +33,17 @@ static constexpr int KVAR_N_OP_PARAM_STAGE_GROUPS = 7;  // dynamic F16 stage dep
 static constexpr int KVAR_N_OP_PARAM_TAIL_GROUPS = 8;   // lossless tail groups within the stage
 static constexpr int KVAR_N_OP_PARAM_EAGER_RECORDS = 9; // materialize a record when its closing token is stored
 static constexpr int KVAR_N_OP_PARAM_READ_INDIRECT = 10;
+static __device__ __forceinline__ int64_t kvarn_read_cell(
+        int64_t encoded, bool read_indirect, bool swa, bool & explicitly_staged) {
+    GGML_UNUSED(read_indirect);
+    GGML_UNUSED(swa);
+    explicitly_staged = false;
+    if (encoded >= -1) {
+        return encoded;
+    }
+    explicitly_staged = true;
+    return -encoded - 2;
+}
 
 static std::atomic<uint64_t> g_kvarn_store_headwide_workspace{0};
 static std::atomic<uint64_t> g_kvarn_store_headwide_monolithic{0};
@@ -2084,7 +2095,8 @@ static __global__ void kvarn_materialize_live_kernel(
         int stream_start,
         int n_stream,
         int groups_per_stream,
-        bool swa) {
+        bool swa,
+        bool read_indirect) {
     const int out_stream = blockIdx.x;
     if (out_stream >= n_stream || threadIdx.x != 0) {
         return;
@@ -2093,10 +2105,12 @@ static __global__ void kvarn_materialize_live_kernel(
     int64_t live_pos = 0;
     const int stream = stream_start + out_stream;
     for (int i = 0; i < n_indices; ++i) {
-        const int64_t idx = indices[i];
-        if (idx < 0) {
+        const int64_t encoded = indices[i];
+        if (encoded == -1) {
             continue;
         }
+        bool explicitly_staged;
+        const int64_t idx = kvarn_read_cell(encoded, read_indirect, swa, explicitly_staged);
         const int64_t group_global = idx / KVAR_N_DIM;
         const int idx_stream = swa ? stream : int(group_global / groups_per_stream);
         if (idx_stream != stream) {
@@ -2161,8 +2175,10 @@ static __global__ void kvarn_materialize_kernel(
     }
     extern __shared__ float shared_rows[];
     float values[4] = {};
-    const int64_t abs_pos = (swa || read_indirect) ? indices[cell] : cell;
-    if (abs_pos >= 0) {
+    const int64_t encoded = (swa || read_indirect) ? indices[cell] : cell;
+    if (encoded != -1) {
+        bool explicitly_staged;
+        const int64_t abs_pos = kvarn_read_cell(encoded, read_indirect, swa, explicitly_staged);
         const int64_t group = abs_pos / KVAR_N_DIM;
         const int64_t pos = abs_pos % KVAR_N_DIM;
         const int64_t live_group = live[2*out_stream + 0];
@@ -2173,7 +2189,17 @@ static __global__ void kvarn_materialize_kernel(
         bool from_record = false;
         int64_t stage_pos = 0;
         int64_t record_group = 0;
-        if (eager_records) {
+        if (explicitly_staged) {
+            from_stage = true;
+            stage_pos = stage_base + (group == 0 ? pos :
+                KVAR_N_DIM + ((group - 1) % tail_groups) * KVAR_N_DIM + pos);
+        } else if (read_indirect && !swa) {
+            from_stage = explicitly_staged;
+            from_record = !from_stage;
+            stage_pos = stage_base + (group == 0 ? pos :
+                KVAR_N_DIM + ((group - 1) % tail_groups) * KVAR_N_DIM + pos);
+            record_group = int64_t(stream) * groups_per_stream + group;
+        } else if (eager_records) {
             from_stage = (!swa && group == 0) || (group == live_group && live_pos < KVAR_N_DIM - 1);
             const bool completed = group < live_group || (group == live_group && live_pos == KVAR_N_DIM - 1);
             from_record = !from_stage && completed && (swa ?
@@ -2252,7 +2278,7 @@ void ggml_cuda_op_kvarn_materialize(ggml_backend_cuda_context & ctx, ggml_tensor
     cudaStream_t stream = ctx.stream();
     kvarn_materialize_live_kernel<<<n_stream, 1, 0, stream>>>(
         (const int64_t *) indices->data, int(indices->ne[0]), live.get(), stream_start,
-        n_stream, groups_per_stream, swa);
+        n_stream, groups_per_stream, swa, read_indirect);
     const dim3 blocks(n_kv, n_heads / head_slices, n_stream);
     kvarn_materialize_kernel<<<blocks, KVAR_N_DIM, size_t(head_slices) * KVAR_N_DIM * sizeof(float), stream>>>(
         (const uint8_t *) records->data, (const half *) stage->data, (const int64_t *) indices->data,

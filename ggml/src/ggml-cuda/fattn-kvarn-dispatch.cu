@@ -240,10 +240,13 @@ static __device__ __forceinline__ int ggml_cuda_fattn_kvarn_live_index_for_threa
         const int n_indices,
         const int stream,
         const int groups_per_stream,
-        const bool swa) {
+        const bool swa,
+        const bool read_indirect) {
     int live_index = 0;
     for (int i = threadIdx.x; i < n_indices; i += blockDim.x) {
-        const int64_t idx = indices[i];
+        const int64_t encoded = indices[i];
+        GGML_UNUSED(read_indirect);
+        const int64_t idx = encoded < -1 ? -encoded - 2 : encoded;
         if (swa) {
             if (idx >= 0) {
                 live_index = max(live_index, (int) idx);
@@ -309,9 +312,9 @@ static __global__ void ggml_cuda_fattn_kvarn_init_descs_kernel(
     __shared__ int k_partial[GGML_CUDA_FATTN_KVARN_DIM];
     __shared__ int v_partial[GGML_CUDA_FATTN_KVARN_DIM];
     k_partial[threadIdx.x] = ggml_cuda_fattn_kvarn_live_index_for_thread(
-        k_indices, k_n_indices, k_stream, k_groups_per_stream, k_swa);
+        k_indices, k_n_indices, k_stream, k_groups_per_stream, k_swa, k_read_indirect);
     v_partial[threadIdx.x] = ggml_cuda_fattn_kvarn_live_index_for_thread(
-        v_indices, v_n_indices, v_stream, v_groups_per_stream, v_swa);
+        v_indices, v_n_indices, v_stream, v_groups_per_stream, v_swa, v_read_indirect);
     __syncthreads();
 
     for (int stride = GGML_CUDA_FATTN_KVARN_DIM / 2; stride > 0; stride >>= 1) {

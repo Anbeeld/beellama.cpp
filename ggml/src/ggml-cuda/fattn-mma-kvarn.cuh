@@ -44,6 +44,18 @@ struct ggml_cuda_fattn_kvarn_desc {
     int original_domain;
 };
 
+static __device__ __forceinline__ int64_t ggml_cuda_fattn_kvarn_read_cell(
+        const ggml_cuda_fattn_kvarn_desc & desc,
+        const int64_t encoded,
+        bool & explicitly_staged) {
+    explicitly_staged = false;
+    if (encoded >= -1) {
+        return encoded;
+    }
+    explicitly_staged = true;
+    return -encoded - 2;
+}
+
 static __device__ __forceinline__ bool ggml_cuda_fattn_kvarn_group_from_stage(
         const ggml_cuda_fattn_kvarn_desc & desc,
         const int group) {

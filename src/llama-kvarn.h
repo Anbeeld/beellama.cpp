@@ -7,6 +7,12 @@
 #include <vector>
 
 constexpr uint32_t KVAR_N_GROUP = 128;
+// Non-SWA compact read indices encode staged cells below the -1 padding value.
+// Explicit provenance decouples reads from physical group order so unified
+// allocation can reuse holes after wrapping around the shared arena.
+constexpr int64_t llama_kvarn_encode_stage_cell(uint32_t cell) {
+    return -int64_t(cell) - 2;
+}
 
 struct llama_kvarn_type_desc {
     llama_kvarn_type type;
@@ -105,16 +111,17 @@ std::vector<llama_kvarn_state_stage_cell> llama_kvarn_select_state_stage_cells(
         uint32_t live_cell_max_p1,
         uint32_t stage_groups,
         uint32_t tail_groups,
-        bool swa);
+        bool swa,
+        const std::vector<uint32_t> * staged_groups = nullptr);
 
 std::vector<uint32_t> llama_kvarn_select_state_record_groups(
         const std::vector<uint32_t> & source_cells,
         const std::vector<llama_kvarn_state_stage_cell> & stage_cells,
         uint32_t groups_per_stream);
 
-// Builds the dense physical-cell index used by KVarN attention. Fixed
-// per-sequence record stripes deliberately leave holes in the physical arena;
-// those holes are storage ownership, not attention rows.
+// Builds the dense physical-cell index used by KVarN attention. Unified record
+// ownership can leave holes in the physical arena; those holes are storage
+// ownership, not attention rows.
 std::vector<int64_t> llama_kvarn_compact_read_plan(
         const std::vector<uint32_t> & occupied_cells,
         const std::vector<uint32_t> & pending_cells,

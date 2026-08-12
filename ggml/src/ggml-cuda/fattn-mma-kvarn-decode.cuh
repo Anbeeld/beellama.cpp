@@ -57,14 +57,18 @@ ggml_cuda_fattn_kvarn_decode_plan_tile(
         const int group_pos_begin) {
     ggml_cuda_fattn_kvarn_decode_tile tile;
     if (desc.swa || desc.read_indirect) {
-        const int64_t a0 = desc.indices[token_begin];
-        const int64_t a1 = desc.indices[token_end - 1];
+        const int64_t e0 = desc.indices[token_begin];
+        const int64_t e1 = desc.indices[token_end - 1];
+        bool stage0;
+        bool stage1;
+        const int64_t a0 = ggml_cuda_fattn_kvarn_read_cell(desc, e0, stage0);
+        const int64_t a1 = ggml_cuda_fattn_kvarn_read_cell(desc, e1, stage1);
         const int span = (token_end - 1) - token_begin;
-        const int g0 = a0 >= 0 ? (int) (a0 / GGML_CUDA_FATTN_KVARN_DIM) : -1;
-        const bool contiguous = a0 >= 0 && a1 >= 0 && (int) (a1 - a0) == span;
+        const int g0 = e0 != -1 ? (int) (a0 / GGML_CUDA_FATTN_KVARN_DIM) : -1;
+        const bool contiguous = e0 != -1 && e1 != -1 && stage0 == stage1 && (int) (a1 - a0) == span;
         const bool rec0 = desc.swa ?
             ggml_cuda_fattn_kvarn_decode_swa_record_backed(desc, g0) :
-            ggml_cuda_fattn_kvarn_decode_group_from_record(desc, g0);
+            (!stage0 && (desc.read_indirect || ggml_cuda_fattn_kvarn_decode_group_from_record(desc, g0)));
         tile.fast = contiguous && rec0;
         tile.pos_begin = tile.fast ? (int) (a0 % GGML_CUDA_FATTN_KVARN_DIM) : 0;
         tile.record_group = tile.fast ? (desc.swa ?

@@ -28,20 +28,26 @@ ggml_cuda_fattn_kvarn_vec_resolve(
 
     int group;
     if (desc.swa || desc.read_indirect) {
-        const int64_t abs_pos = desc.indices[token];
-        if (abs_pos < 0) {
+        const int64_t encoded = desc.indices[token];
+        if (encoded == -1) {
             return ref;
         }
+        bool explicitly_staged;
+        const int64_t abs_pos = ggml_cuda_fattn_kvarn_read_cell(desc, encoded, explicitly_staged);
         group = (int) (abs_pos / GGML_CUDA_FATTN_KVARN_DIM);
         ref.pos = (int) (abs_pos - (int64_t) group * GGML_CUDA_FATTN_KVARN_DIM);
-        if (ggml_cuda_fattn_kvarn_group_from_stage(desc, group)) {
+        const bool from_stage = explicitly_staged ||
+            (!(desc.read_indirect && !desc.swa) && ggml_cuda_fattn_kvarn_group_from_stage(desc, group));
+        const bool from_record = !explicitly_staged && (desc.read_indirect && !desc.swa ? true :
+            ggml_cuda_fattn_kvarn_group_from_record(desc, group));
+        if (from_stage) {
             ref.source = GGML_CUDA_FATTN_KVARN_VEC_STAGE;
             const int stage_base = desc.stream * GGML_CUDA_FATTN_KVARN_DIM * desc.stage_groups;
             ref.stage_pos = desc.swa ?
                 (group % desc.stage_groups) * GGML_CUDA_FATTN_KVARN_DIM + ref.pos :
                 stage_base + (group == 0 ? ref.pos : GGML_CUDA_FATTN_KVARN_DIM +
                     ((group - 1) % desc.tail_groups) * GGML_CUDA_FATTN_KVARN_DIM + ref.pos);
-        } else if (ggml_cuda_fattn_kvarn_group_from_record(desc, group)) {
+        } else if (from_record) {
             ref.source = GGML_CUDA_FATTN_KVARN_VEC_RECORD;
             ref.record_group = desc.swa ? group % desc.groups_per_stream :
                 desc.stream * desc.groups_per_stream + group;

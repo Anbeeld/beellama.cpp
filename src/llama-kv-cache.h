@@ -265,7 +265,8 @@ public:
     std::vector<uint32_t> state_source_cells(llama_seq_id seq_id) const;
     std::vector<std::vector<int32_t>> take_restored_tail_payload_slots();
     void clone_logical_state_from(const llama_kv_cache & source);
-    void set_allocation_group_size(uint32_t group_size, uint32_t stripes = 1);
+    void set_allocation_group_size(uint32_t group_size, uint32_t stage_groups = 1);
+    bool allocation_cell_uses_stage(uint32_t cell) const;
     void set_state_remap_group_size(uint32_t group_size);
     const std::vector<std::pair<uint32_t, uint32_t>> & get_state_cell_remap() const;
 
@@ -430,12 +431,12 @@ private:
     std::vector<int64_t> tail_write_slots;
     std::vector<std::vector<int32_t>> restored_tail_payload_slots;
     uint32_t allocation_group_size = 1;
-    uint32_t allocation_group_stripes = 1;
-    // Structured unified caches reserve whole record groups for one logical
-    // sequence. A stream-global cursor can make one sequence resume in the
-    // middle of its physical ring after another sequence advances the stream,
-    // which aliases KVarN's cyclic frontier rows. Keep an independent cursor
-    // for every logical sequence whenever striped group allocation is active.
+    uint32_t allocation_stage_groups = 1;
+    // Structured unified caches reserve whole record groups for one exact
+    // sequence-id set. Completed records remain freely shareable capacity;
+    // only incomplete groups contend for the small cyclic F16 stage. Keep an
+    // independent cursor per logical sequence and select new groups whose
+    // stage slot is not occupied by another live frontier.
     std::vector<uint32_t> allocation_seq_heads;
     uint32_t state_remap_group_size = 1;
     std::vector<std::pair<uint32_t, uint32_t>> state_cell_remap;

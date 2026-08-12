@@ -388,6 +388,29 @@ static void test_view_inplace() {
     GGML_ASSERT(backend.context->allocated_total() <= 24);
 }
 
+static void test_kvarn_view_keeps_indirect_plan_alive() {
+    dummy_backend backend      = dummy_backend_init(SIZE_MAX);
+    auto [ctx, graph, ctx_ptr] = make_context();
+
+    constexpr int64_t n_kv = 128;
+    ggml_tensor * records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, 64, 1, 1);
+    ggml_tensor * stage = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, 1, 256);
+    ggml_tensor * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_kv);
+    ggml_set_input(records);
+    ggml_set_input(stage);
+
+    ggml_tensor * view = ggml_kvarn_view(ctx, records, stage, indices, n_kv, 0, 1, 4, false, 2);
+    ggml_tensor * reshaped = ggml_reshape_4d(ctx, view, 128, n_kv, 1, 1);
+    ggml_tensor * out = ggml_mean(ctx, reshaped);
+    assign_names(ctx);
+
+    ggml_gallocr_ptr galloc = allocate_graph(graph, out, &backend.buffer_type);
+    check_no_overlap(graph);
+    GGML_ASSERT(indices->data != nullptr);
+    GGML_ASSERT(out->data != nullptr);
+    GGML_ASSERT(!memory_overlap(indices, out));
+}
+
 static void test_reuse_and_free() {
     dummy_backend backend      = dummy_backend_init(40);
     auto [ctx, graph, ctx_ptr] = make_context();
@@ -597,6 +620,7 @@ int main() {
     run("test_not_enough_chunks", test_not_enough_chunks);
     run("test_fill_leftover_space", test_fill_leftover_space);
     run("test_view_inplace", test_view_inplace);
+    run("test_kvarn_view_keeps_indirect_plan_alive", test_kvarn_view_keeps_indirect_plan_alive);
     run("test_reuse_and_free", test_reuse_and_free);
     run("test_merge_free_block(32)", []() { test_merge_free_block(32); });
     run("test_merge_free_block(SIZE_MAX)", []() { test_merge_free_block(SIZE_MAX); });

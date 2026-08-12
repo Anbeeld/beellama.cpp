@@ -334,12 +334,16 @@ inputs; repeated non-fitting candidates fail deterministically. Tail-disabled
 ordinary caches take the unchanged single-call upstream fit path.
 
 Standard unified and non-unified prompt caches preserve one continuous suffix
-across requests and message boundaries. KVarN state is sequence-selective: live
-checkpoints retain only the selected sequence's mutable frontier, exact-tail
-rows, and logical metadata, while self-contained RAM state also owns that
-sequence's sealed record groups. Restore validates the complete state before it
-publishes remapped destination records. Other live sequences in a unified cache
-are neither gathered nor overwritten.
+across requests and message boundaries. Unified KVarN uses the same shared
+capacity model: completed 128-token record groups can be borrowed by any slot
+instead of partitioning the context into fixed per-slot stripes. Only incomplete
+record groups reserve cyclic F16 staging rows.
+
+KVarN state is sequence-selective: live checkpoints retain only the selected
+sequence's mutable frontier, exact-tail rows, and logical metadata, while
+self-contained RAM state also owns that sequence's sealed record groups. Restore
+validates the complete state before it publishes remapped destination records.
+Other live sequences in a unified cache are neither gathered nor overwritten.
 
 Prompt-cache planning distinguishes the lexical LCP, the boundary that all
 target/draft/speculative components can restore, and the boundary actually

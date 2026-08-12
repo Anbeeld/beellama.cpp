@@ -904,7 +904,7 @@ static bool test_kvarn_partial_checkpoint_history(
     return true;
 }
 
-static bool test_kvarn_striped_capacity(
+static bool test_kvarn_unified_capacity(
         llama_model * model, const common_params & params, const llama_tokens & tokens) {
     if (params.kvarn.type == LLAMA_KVARN_TYPE_DISABLED) {
         return true;
@@ -920,38 +920,102 @@ static bool test_kvarn_striped_capacity(
     context_params.kv_tail_config = nullptr;
     auto context = llama_context_ptr{llama_init_from_model(model, context_params)};
     if (!context) {
-        LOG_ERR("%s: failed to create striped KVarN capacity context\n", __func__);
+        LOG_ERR("%s: failed to create unified KVarN capacity context\n", __func__);
         return false;
     }
 
-    constexpr int32_t stripe_capacity = 256;
-    for (int32_t offset = 0; offset < stripe_capacity; offset += 128) {
+    constexpr int32_t borrowed_capacity = 384;
+    for (int32_t offset = 0; offset < borrowed_capacity; offset += 128) {
         llama_batch_ptr batch(128, 0, 1);
         for (int32_t i = 0; i < 128; ++i) {
             const llama_token token = tokens.empty() ? llama_token(1) : tokens[(offset + i) % tokens.size()];
             common_batch_add(batch.get(), token, offset + i, { 0 }, false);
         }
         if (llama_decode(context.get(), batch.get())) {
-            LOG_ERR("%s: sequence 0 failed before its equal-share stripe capacity\n", __func__);
+            LOG_ERR("%s: sequence 0 could not borrow unused unified KVarN capacity\n", __func__);
             return false;
         }
     }
 
-    llama_batch_ptr overflow(1, 0, 1);
-    common_batch_add(overflow.get(), tokens.empty() ? llama_token(1) : tokens.front(), stripe_capacity, { 0 }, false);
-    if (llama_decode(context.get(), overflow.get()) == 0) {
-        LOG_ERR("%s: sequence 0 borrowed capacity beyond its fixed stripe\n", __func__);
-        return false;
+    llama_batch_ptr other(128, 0, 1);
+    for (int32_t i = 0; i < 128; ++i) {
+        const llama_token token = tokens.empty() ? llama_token(1) : tokens[i % tokens.size()];
+        common_batch_add(other.get(), token, i, { 1 }, false);
     }
-
-    llama_batch_ptr other(1, 0, 1);
-    common_batch_add(other.get(), tokens.empty() ? llama_token(1) : tokens.front(), 0, { 1 }, false);
     if (llama_decode(context.get(), other.get())) {
-        LOG_ERR("%s: sequence 0 stripe overflow aliased sequence 1 capacity\n", __func__);
+        LOG_ERR("%s: borrowing sequence aliased the remaining unified KVarN capacity\n", __func__);
         return false;
     }
 
-    LOG("\nPASS: KVarN fixed stripes enforce 256-token equal shares without cross-sequence aliasing\n");
+    LOG("\nPASS: unified KVarN capacity is borrowed between sequences without cross-sequence aliasing\n");
+    return true;
+}
+
+static bool test_kvarn_unified_reuses_freed_groups(
+        llama_model * model, const common_params & params, const llama_tokens & tokens) {
+    if (params.kvarn.type == LLAMA_KVARN_TYPE_DISABLED) {
+        return true;
+    }
+
+    auto context_params = common_context_params_to_llama(params);
+    context_params.n_ctx = 512;
+    context_params.n_batch = 128;
+    context_params.n_ubatch = 128;
+    context_params.n_seq_max = 2;
+    context_params.kv_unified = true;
+    context_params.kv_tail_tokens = 0;
+    context_params.kv_tail_config = nullptr;
+    auto context = llama_context_ptr{llama_init_from_model(model, context_params)};
+    if (!context) {
+        LOG_ERR("%s: failed to create unified KVarN reuse context\n", __func__);
+        return false;
+    }
+
+    const auto decode = [&](llama_seq_id seq_id, int32_t pos0, int32_t count) {
+        for (int32_t offset = 0; offset < count; offset += 128) {
+            const int32_t n_tokens = std::min(128, count - offset);
+            llama_batch_ptr batch(n_tokens, 0, 1);
+            for (int32_t i = 0; i < n_tokens; ++i) {
+                const int32_t pos = pos0 + offset + i;
+                const llama_token token = tokens.empty() ? llama_token(1) : tokens[pos % tokens.size()];
+                common_batch_add(batch.get(), token, pos, { seq_id }, offset + n_tokens == count && i + 1 == n_tokens);
+            }
+            if (llama_decode(context.get(), batch.get())) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    // Sequence 1 temporarily owns physical group 1 while sequence 0 advances
+    // through groups 0, 2, and 3. Once sequence 1 is removed, sequence 0 must
+    // wrap into the freed group without corrupting either sequence's metadata.
+    if (!decode(0, 0, 128) || !decode(1, 0, 128) || !decode(0, 128, 256)) {
+        LOG_ERR("%s: failed to exercise freed unified KVarN groups\n", __func__);
+        return false;
+    }
+
+    auto * memory = llama_get_memory(context.get());
+    if (!llama_memory_seq_rm(memory, 1, -1, -1)) {
+        LOG_ERR("%s: failed to release the temporary sequence\n", __func__);
+        return false;
+    }
+    if (!decode(0, 384, 1)) {
+        LOG_ERR("%s: failed to reuse a freed unified KVarN group\n", __func__);
+        return false;
+    }
+    if (llama_memory_seq_pos_max(memory, 0) != 384 || llama_memory_seq_pos_max(memory, 1) != -1) {
+        LOG_ERR("%s: freed-group reuse corrupted sequence positions\n", __func__);
+        return false;
+    }
+    const float * logits = llama_get_logits_ith(context.get(), -1);
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    if (!logits || !std::all_of(logits, logits + n_vocab, [](float value) { return std::isfinite(value); })) {
+        LOG_ERR("%s: freed-group reuse produced invalid continuation logits\n", __func__);
+        return false;
+    }
+
+    LOG("\nPASS: unified KVarN reuses freed groups with valid sequence state and logits\n");
     return true;
 }
 
@@ -1386,7 +1450,10 @@ int main(int argc, char ** argv) {
     if (!test_kvarn_partial_checkpoint_history(model, params, tokens)) {
         return 1;
     }
-    if (!test_kvarn_striped_capacity(model, params, tokens)) {
+    if (!test_kvarn_unified_capacity(model, params, tokens)) {
+        return 1;
+    }
+    if (!test_kvarn_unified_reuses_freed_groups(model, params, tokens)) {
         return 1;
     }
 
@@ -1417,22 +1484,14 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // Generic full-context session state assumes the physical layout is
-    // unchanged when n_seq_max grows from 1 to 2. Fixed-stripe KVarN changes
-    // that layout by design; its host/on-device cross-sequence contracts are
-    // covered by the dedicated selective-state tests above.
-    if (params.kvarn.type == LLAMA_KVARN_TYPE_DISABLED) {
-        // Test 4: seq copy (host)
-        if (!test_seq_cp_host(model, params, tokens, result_baseline)) {
-            return 1;
-        }
+    // Test 4: seq copy (host)
+    if (!test_seq_cp_host(model, params, tokens, result_baseline)) {
+        return 1;
+    }
 
-        // Test 5: seq copy (device)
-        if (!test_seq_cp_device(model, params, tokens, result_baseline)) {
-            return 1;
-        }
-    } else {
-        LOG("\nSKIP: generic full-context seq copy changes fixed-stripe KVarN topology\n");
+    // Test 5: seq copy (device)
+    if (!test_seq_cp_device(model, params, tokens, result_baseline)) {
+        return 1;
     }
 
     LOG("\nAll tests passed.\n");

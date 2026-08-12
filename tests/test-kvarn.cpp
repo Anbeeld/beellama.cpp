@@ -327,9 +327,22 @@ static void kvarn_selective_state_owns_only_live_stage_rows() {
     const auto short_stage = llama_kvarn_select_state_stage_cells(short_cells, 129, 3, 2, false);
     require(llama_kvarn_select_state_record_groups(short_cells, short_stage, 8).empty(),
             "short selective KVarN state serialized stale compressed records");
+
+    const std::vector<uint32_t> wrapped_cells = { 128, 255, 768, 769 };
+    const std::vector<uint32_t> wrapped_stage_groups = { 6 };
+    const auto wrapped_stage = llama_kvarn_select_state_stage_cells(
+            wrapped_cells, 770, 3, 2, false, &wrapped_stage_groups);
+    require(wrapped_stage.size() == 2 && wrapped_stage[0].source_cell == 768 &&
+            wrapped_stage[1].source_cell == 769 && wrapped_stage[0].stage_row == 256,
+            "selective KVarN state inferred stage provenance from physical record order");
+
+    const std::vector<uint32_t> no_stage_groups;
+    require(llama_kvarn_select_state_stage_cells(
+                wrapped_cells, 770, 3, 2, false, &no_stage_groups).empty(),
+            "selective KVarN state treated sealed records as live stage rows");
 }
 
-static void kvarn_compact_read_plan_skips_stripe_holes() {
+static void kvarn_compact_read_plan_skips_ownership_holes() {
     std::vector<uint32_t> occupied;
     for (uint32_t group : { 3u, 7u, 11u }) {
         for (uint32_t cell = group*128u; cell < (group + 1u)*128u; ++cell) {
@@ -341,7 +354,7 @@ static void kvarn_compact_read_plan_skips_stripe_holes() {
     const auto plan = llama_kvarn_compact_read_plan(occupied, pending, 4096, 256);
 
     require(plan.size() == 512,
-            "compact KVarN read plan retained the striped physical span");
+            "compact KVarN read plan retained the sparse physical span");
     require(plan.front() == 3*128 && plan[383] == 12*128 - 1,
             "compact KVarN read plan changed occupied-cell ordering");
     require(plan[384] == 15*128 && plan[385] == 15*128 + 1,
@@ -349,6 +362,12 @@ static void kvarn_compact_read_plan_skips_stripe_holes() {
     require(std::all_of(plan.begin() + 386, plan.end(),
                     [](int64_t cell) { return cell == -1; }),
             "compact KVarN read plan did not mark padding rows empty");
+
+    const auto reordered = llama_kvarn_compact_read_plan(
+            { 0, 128, 256, 384 }, { 1 }, 512, 256);
+    require(reordered[0] == 0 && reordered[1] == 128 && reordered[2] == 256 &&
+            reordered[3] == 384 && reordered[4] == 1,
+            "compact KVarN read plan discarded logical caller ordering");
 
     const auto deduped = llama_kvarn_compact_read_plan(
             { 1, 2, 3 }, { 2, 3, 4 }, 128, 256);
@@ -4680,7 +4699,7 @@ int main() {
     kvarn_unified_save_requires_exclusive_stream();
     kvarn_unified_restore_requires_exclusive_stream();
     kvarn_selective_state_owns_only_live_stage_rows();
-    kvarn_compact_read_plan_skips_stripe_holes();
+    kvarn_compact_read_plan_skips_ownership_holes();
     test_type_table();
     test_attention_domain_policy();
     test_vulkan_decode_route_policy();

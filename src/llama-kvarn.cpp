@@ -291,7 +291,8 @@ std::vector<llama_kvarn_state_stage_cell> llama_kvarn_select_state_stage_cells(
         uint32_t live_cell_max_p1,
         uint32_t stage_groups,
         uint32_t tail_groups,
-        bool swa) {
+        bool swa,
+        const std::vector<uint32_t> * staged_groups) {
     if (live_cell_max_p1 == 0) {
         return {};
     }
@@ -303,6 +304,8 @@ std::vector<llama_kvarn_state_stage_cell> llama_kvarn_select_state_stage_cells(
     const uint32_t live_group = (live_cell_max_p1 - 1)/KVAR_N_GROUP;
     const uint32_t stage_begin = live_group >= tail_groups - 1 ?
             live_group - (tail_groups - 1) : 0;
+    const std::set<uint32_t> explicit_staged = staged_groups == nullptr ? std::set<uint32_t>{} :
+            std::set<uint32_t>(staged_groups->begin(), staged_groups->end());
     std::vector<llama_kvarn_state_stage_cell> result;
     result.reserve(std::min<size_t>(source_cells.size(), size_t(KVAR_N_GROUP)*(tail_groups + 1u)));
     for (uint32_t cell : source_cells) {
@@ -312,7 +315,8 @@ std::vector<llama_kvarn_state_stage_cell> llama_kvarn_select_state_stage_cells(
         const uint32_t group = cell/KVAR_N_GROUP;
         const uint32_t pos = cell%KVAR_N_GROUP;
         const bool staged = swa ? group >= stage_begin && group <= live_group :
-                group == 0 || (group > 0 && group >= stage_begin && group <= live_group);
+                (staged_groups != nullptr ? explicit_staged.count(group) != 0 :
+                    group == 0 || (group > 0 && group >= stage_begin && group <= live_group));
         if (!staged) {
             continue;
         }
@@ -358,10 +362,15 @@ std::vector<int64_t> llama_kvarn_compact_read_plan(
     cells.reserve(occupied_cells.size() + pending_cells.size());
     cells.insert(cells.end(), occupied_cells.begin(), occupied_cells.end());
     cells.insert(cells.end(), pending_cells.begin(), pending_cells.end());
-    std::sort(cells.begin(), cells.end());
-    cells.erase(std::unique(cells.begin(), cells.end()), cells.end());
-    if (!cells.empty() && cells.back() >= capacity) {
-        throw std::invalid_argument("KVarN compact read-plan cell exceeds cache capacity");
+    std::set<uint32_t> seen;
+    cells.erase(std::remove_if(cells.begin(), cells.end(), [&](uint32_t cell) {
+        if (cell >= capacity) {
+            throw std::invalid_argument("KVarN compact read-plan cell exceeds cache capacity");
+        }
+        return !seen.insert(cell).second;
+    }), cells.end());
+    if (cells.size() > capacity) {
+        throw std::invalid_argument("KVarN compact read plan exceeds cache capacity");
     }
 
     const uint32_t used = uint32_t(cells.size());

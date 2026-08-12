@@ -2356,22 +2356,48 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
         const auto & cells = v_cells[0];
         std::vector<uint32_t> heads = allocation_seq_heads;
         std::vector<bool> reserved(cells.size(), false);
+        const uint32_t n_groups = uint32_t(cells.size()/allocation_group_size);
+        std::vector<uint32_t> group_used(n_groups, 0);
+        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+            group_used[cell/allocation_group_size] += !cells.is_empty(cell);
+        }
+        std::vector<int32_t> stage_owners(allocation_stage_groups + 1u, -1);
+        auto stage_slot = [&](uint32_t group) {
+            return group == 0 ? 0u : 1u + ((group - 1u)%allocation_stage_groups);
+        };
+        if (!cells.is_empty(0)) {
+            stage_owners[0] = 0;
+        }
+        for (llama_seq_id seq_id = 0; uint32_t(seq_id) < n_seq_max; ++seq_id) {
+            const uint32_t head = heads[size_t(seq_id)];
+            if (head == 0 || head%allocation_group_size == 0) {
+                continue;
+            }
+            const uint32_t group = (head - 1u)/allocation_group_size;
+            if (group > 0) {
+                const uint32_t slot = stage_slot(group);
+                if (stage_owners[slot] >= 0 && uint32_t(stage_owners[slot]) != group) {
+                    throw std::runtime_error("structured KV live groups alias one F16 stage slot");
+                }
+                stage_owners[slot] = int32_t(group);
+            }
+        }
         for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
             const int32_t n_cell_seqs = ubatch.n_seq_id[i];
             if (n_cell_seqs <= 0) {
                 throw std::runtime_error("structured KV allocation token has no sequence owner");
             }
             const llama_seq_id * cell_seqs = ubatch.seq_id[i];
-            llama_seq_id stripe_seq = cell_seqs[0];
+            llama_seq_id owner_seq = cell_seqs[0];
             for (int32_t j = 0; j < n_cell_seqs; ++j) {
                 const llama_seq_id owner = cell_seqs[j];
                 if (owner < 0 || uint32_t(owner) >= n_seq_max) {
                     throw std::runtime_error("structured KV allocation token has an invalid sequence owner");
                 }
-                stripe_seq = std::min(stripe_seq, owner);
+                owner_seq = std::min(owner_seq, owner);
             }
 
-            uint32_t head_cur = heads[size_t(stripe_seq)];
+            uint32_t head_cur = heads[size_t(owner_seq)];
             bool found = false;
             for (uint32_t tested = 0; tested < cells.size(); ++tested) {
                 if (head_cur >= cells.size()) {
@@ -2379,9 +2405,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                 }
                 const uint32_t idx = head_cur++;
                 const uint32_t group = idx/allocation_group_size;
-                if (group%allocation_group_stripes !=
-                        uint32_t(stripe_seq)%allocation_group_stripes ||
-                        reserved[idx] || !cells.is_empty(idx)) {
+                if (reserved[idx] || !cells.is_empty(idx)) {
                     continue;
                 }
 
@@ -2409,8 +2433,20 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                     continue;
                 }
 
+                const uint32_t slot = stage_slot(group);
+                if (group_used[group] == 0 && stage_owners[slot] >= 0 &&
+                        uint32_t(stage_owners[slot]) != group) {
+                    continue;
+                }
+                if (group_used[group] == 0) {
+                    stage_owners[slot] = int32_t(group);
+                }
+
                 res.idxs[0].push_back(idx);
                 reserved[idx] = true;
+                if (++group_used[group] == allocation_group_size && group > 0) {
+                    stage_owners[slot] = -1;
+                }
                 for (int32_t j = 0; j < n_cell_seqs; ++j) {
                     heads[size_t(cell_seqs[j])] = head_cur;
                 }
@@ -2503,16 +2539,12 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                     }
                     const llama_seq_id * cell_seqs = n_stream == 1 ?
                             ubatch.seq_id[token_index] : &seq_id;
-                    llama_seq_id stripe_seq = cell_seqs[0];
+                    llama_seq_id owner_seq = cell_seqs[0];
                     for (int32_t cell_seq = 1; cell_seq < n_cell_seqs; ++cell_seq) {
-                        stripe_seq = std::min(stripe_seq, cell_seqs[cell_seq]);
+                        owner_seq = std::min(owner_seq, cell_seqs[cell_seq]);
                     }
-                    if (stripe_seq < 0) {
+                    if (owner_seq < 0) {
                         throw std::runtime_error("structured KV allocation token has an invalid sequence owner");
-                    }
-                    const uint32_t group = idx/allocation_group_size;
-                    if (group%allocation_group_stripes != uint32_t(stripe_seq)%allocation_group_stripes) {
-                        can_use = false;
                     }
                     const uint32_t group_begin = (idx/allocation_group_size)*allocation_group_size;
                     const uint32_t group_end = std::min<uint32_t>(
@@ -4645,9 +4677,7 @@ void llama_kv_cache::state_v2_read_payload_and_install(
                 for (uint32_t candidate = 0; candidate < n_groups; ++candidate) {
                     if ((pass == 0 && candidate != source_group) ||
                             (pass == 1 && candidate == source_group) ||
-                            reserved_groups.count(candidate) != 0 ||
-                            candidate%allocation_group_stripes !=
-                                    uint32_t(seq_id)%allocation_group_stripes) {
+                            reserved_groups.count(candidate) != 0) {
                         continue;
                     }
                     bool empty = true;
@@ -5594,24 +5624,40 @@ void llama_kv_cache::set_state_remap_group_size(uint32_t group_size) {
     state_remap_group_size = group_size;
 }
 
-void llama_kv_cache::set_allocation_group_size(uint32_t group_size, uint32_t stripes) {
-    if (group_size == 0 || stripes == 0 || get_size() % group_size != 0 ||
-            get_size()/group_size < stripes) {
+void llama_kv_cache::set_allocation_group_size(uint32_t group_size, uint32_t stage_groups) {
+    if (group_size == 0 || stage_groups == 0 || get_size() % group_size != 0 ||
+            get_size()/group_size < stage_groups) {
         throw std::invalid_argument("invalid KV allocation group size");
     }
     allocation_group_size = group_size;
-    allocation_group_stripes = stripes;
+    allocation_stage_groups = stage_groups;
     for (llama_seq_id seq_id = 0; uint32_t(seq_id) < n_seq_max; ++seq_id) {
         reset_allocation_head(seq_id);
     }
+}
+
+bool llama_kv_cache::allocation_cell_uses_stage(uint32_t cell) const {
+    if (allocation_group_size <= 1 || n_stream != 1 || cell >= get_size()) {
+        return false;
+    }
+    const uint32_t group = cell/allocation_group_size;
+    if (group == 0) {
+        return true;
+    }
+    for (const uint32_t head : allocation_seq_heads) {
+        if (head != 0 && head%allocation_group_size != 0 &&
+                (head - 1u)/allocation_group_size == group) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void llama_kv_cache::reset_allocation_head(llama_seq_id seq_id) {
     if (seq_id < 0 || uint32_t(seq_id) >= n_seq_max || allocation_seq_heads.empty()) {
         return;
     }
-    allocation_seq_heads[size_t(seq_id)] = allocation_group_size > 1 && n_stream == 1 ?
-            (uint32_t(seq_id)%allocation_group_stripes)*allocation_group_size : 0;
+    allocation_seq_heads[size_t(seq_id)] = 0;
 }
 
 void llama_kv_cache::rebuild_allocation_head(llama_seq_id seq_id) {

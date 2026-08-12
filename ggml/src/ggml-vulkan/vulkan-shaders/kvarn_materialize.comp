@@ -40,6 +40,12 @@ shared uint sh_live_pos[128];
 
 uint read_index_low(uint token) { return data_indices[2 * token]; }
 
+int read_cell(uint token, out bool explicitly_staged) {
+    const int encoded = int(read_index_low(token));
+    explicitly_staged = encoded < -1;
+    return explicitly_staged ? -encoded - 2 : encoded;
+}
+
 float load_stage_value(uint stage_pos, uint head, uint dim) {
     const uint word = data_stage[(stage_pos * p.n_heads + head) * 64 + (dim >> 1)];
     const vec2 v = unpackHalf2x16(word);
@@ -66,8 +72,9 @@ void compute_live(uint stream, uint lane, out uint group_out, out uint pos_out) 
     uint live_group = 0u;
     uint live_pos = 0u;
     for (uint i = lane; i < p.n_indices; i += KVAR_N_DIM) {
-        const int idx = int(read_index_low(i));
-        if (idx < 0) { continue; }
+        bool explicitly_staged;
+        const int idx = read_cell(i, explicitly_staged);
+        if (idx == -1) { continue; }
         const uint group_global = uint(idx) / KVAR_N_DIM;
         const uint idx_stream = p.swa != 0u ? stream : group_global / p.groups_per_stream;
         if (idx_stream != stream) { continue; }
@@ -135,9 +142,10 @@ float load_materialized(
         uint live_group,
         uint live_pos,
         uint lane) {
+    bool explicitly_staged = false;
     const int abs_pos_i = (p.swa != 0u || p.read_indirect != 0u) ?
-        int(read_index_low(token)) : int(token);
-    if (abs_pos_i < 0) {
+        read_cell(token, explicitly_staged) : int(token);
+    if (abs_pos_i == -1) {
         return 0.0;
     }
 
@@ -145,7 +153,12 @@ float load_materialized(
     const uint pos = uint(abs_pos_i) % KVAR_N_DIM;
     bool from_stage = false;
     bool from_record = false;
-    if (p.eager_records != 0u) {
+    if (explicitly_staged) {
+        from_stage = true;
+    } else if (p.read_indirect != 0u && p.swa == 0u) {
+        from_stage = explicitly_staged;
+        from_record = !from_stage;
+    } else if (p.eager_records != 0u) {
         from_stage = (p.swa == 0u && group == 0u) || (group == live_group && live_pos < 127u);
         const bool completed = group < live_group || (group == live_group && live_pos == 127u);
         from_record = !from_stage && completed && (p.swa != 0u ?

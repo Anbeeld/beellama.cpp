@@ -146,6 +146,12 @@ uint read_index_low(bool value, uint token) {
         data_vindex[2u * token] : data_kindex[2u * token];
 }
 
+int read_cell(bool value, uint token, bool swa, out bool explicitly_staged) {
+    const int encoded = int(read_index_low(value, token));
+    explicitly_staged = encoded < -1;
+    return explicitly_staged ? -encoded - 2 : encoded;
+}
+
 float load_stage(bool value, uint stage_pos, uint head, uint dim) {
     const uint index = (stage_pos * p.n_heads + head) * 64u + (dim >> 1u);
     const vec2 pair = unpackHalf2x16(value ? data_vstage[index] : data_kstage[index]);
@@ -187,8 +193,10 @@ void compute_live(
     uint group_best = 0u;
     uint pos_best = 0u;
     for (uint i = lane; i < p.n_indices; i += KVAR_N_DIM) {
-        const int index = int(read_index_low(value, i));
-        if (index < 0) {
+        const bool swa = (p.flags & FLAG_SWA) != 0u;
+        bool explicitly_staged;
+        const int index = read_cell(value, i, swa, explicitly_staged);
+        if (index == -1) {
             continue;
         }
         const uint global_group = uint(index) / KVAR_N_DIM;
@@ -235,9 +243,10 @@ float load_kvarn(
         uint slice,
         uint dim) {
     const bool swa = (p.flags & FLAG_SWA) != 0u;
+    bool explicitly_staged = false;
     const int absolute_pos = (swa || read_indirect()) ?
-        int(read_index_low(value, token)) : int(token);
-    if (absolute_pos < 0) {
+        read_cell(value, token, swa, explicitly_staged) : int(token);
+    if (absolute_pos == -1) {
         return 0.0;
     }
 
@@ -245,7 +254,12 @@ float load_kvarn(
     const uint pos = uint(absolute_pos) % KVAR_N_DIM;
     bool from_stage = false;
     bool from_record = false;
-    if ((p.flags & FLAG_EAGER) != 0u) {
+    if (explicitly_staged) {
+        from_stage = true;
+    } else if (read_indirect() && !swa) {
+        from_stage = explicitly_staged;
+        from_record = !from_stage;
+    } else if ((p.flags & FLAG_EAGER) != 0u) {
         from_stage = (!swa && group == 0u) ||
             (group == live_group && live_pos < 127u);
         const bool completed = group < live_group ||
