@@ -135,6 +135,7 @@ public:
     bool mixed_tail_native_preferred(int32_t il) const;
     bool native_attention_uses_original_v(int32_t il) const;
     uint32_t native_rotated_max_query_tokens(int32_t il) const;
+    bool uses_compact_read_indices() const;
 
     // SWA sliding-window ring: per-cell absolute positions for KVarN reads.
     // Built as a graph input sized [n_kv]; set on the host from cells.pos_get(cell).
@@ -189,9 +190,11 @@ public:
 
 private:
     llama_kv_cache_context * base() const;
+    const std::vector<int64_t> & compact_read_plan() const;
 
     llama_kv_cache_kvarn * cache;
     llama_memory_context_ptr base_ctx;
+    mutable std::vector<int64_t> compact_read_plan_cache;
     llama_context * update_lctx;
 
     mutable std::unordered_map<int32_t, ggml_tensor *> stored_k;
@@ -264,6 +267,8 @@ public:
     bool requires_state_for_partial_restore() const override;
     bool state_seq_can_save(llama_seq_id seq_id) const override;
     bool state_seq_can_restore(llama_seq_id seq_id) const override;
+    bool state_seq_can_save(llama_seq_id seq_id, llama_state_seq_flags flags) const override;
+    bool state_seq_can_restore(llama_seq_id seq_id, llama_state_seq_flags flags) const override;
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read(llama_io_read_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
@@ -276,6 +281,7 @@ public:
     bool stream_is_exclusive_for(llama_seq_id seq_id) const;
     bool apply_pending_stream_copies(llama_context * lctx);
     bool is_swa() const { return swa; }
+    bool uses_compact_read_indices() const { return !swa && n_stream == 1 && n_seq_max > 1; }
     bool uses_native_attention(int32_t il) const;
     bool mixed_tail_native_preferred(int32_t il) const;
     bool native_attention_uses_original_v(int32_t il) const;

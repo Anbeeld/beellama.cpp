@@ -497,6 +497,141 @@ static void set_matrix_data(
     fail("unsupported mixed-side test type");
 }
 
+static std::vector<float> run_attached_tail_attention(
+        ggml_backend_t backend,
+        int64_t n_query,
+        ggml_type body_type,
+        ggml_type tail_type,
+        bool segmented = false) {
+    constexpr int64_t d = 128;
+    constexpr int64_t n_q_head = 2;
+    constexpr int64_t n_kv_head = 1;
+    constexpr int64_t n_tail = 8;
+    constexpr int64_t n_current = 4;
+    const int64_t n_history = segmented ? n_tail - n_current : n_tail;
+    const int64_t n_kv = std::max<int64_t>(64, n_query);
+    ggml_init_params params = { 64*1024*1024, nullptr, true };
+    ggml_context * ctx = ggml_init(params);
+
+    ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, n_query, n_q_head, 1);
+    ggml_tensor * k = ggml_new_tensor_4d(ctx, body_type, d, n_kv, n_kv_head, 1);
+    ggml_tensor * v = ggml_new_tensor_4d(ctx, body_type, d, n_kv, n_kv_head, 1);
+    ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_query, 1, 1);
+    ggml_tensor * kt_storage = ggml_new_tensor_4d(ctx, tail_type, d, n_kv_head, n_history, 1);
+    ggml_tensor * vt_storage = ggml_new_tensor_4d(ctx, tail_type, d, n_kv_head, n_history, 1);
+    ggml_tensor * kt = ggml_permute(ctx, kt_storage, 0, 2, 1, 3);
+    ggml_tensor * vt = ggml_permute(ctx, vt_storage, 0, 2, 1, 3);
+    ggml_tensor * kt_current_storage = segmented ?
+            ggml_new_tensor_4d(ctx, tail_type, d, n_kv_head, n_current, 1) : nullptr;
+    ggml_tensor * vt_current_storage = segmented ?
+            ggml_new_tensor_4d(ctx, tail_type, d, n_kv_head, n_current, 1) : nullptr;
+    ggml_tensor * kt_current = segmented ?
+            ggml_permute(ctx, kt_current_storage, 0, 2, 1, 3) : nullptr;
+    ggml_tensor * vt_current = segmented ?
+            ggml_permute(ctx, vt_current_storage, 0, 2, 1, 3) : nullptr;
+    ggml_tensor * tail_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_tail, n_query, 1, 1);
+    ggml_tensor * query_order = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_query, 1);
+    ggml_tensor * run_desc = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 6 + n_tail, 1);
+    ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, mask, 1.0f/std::sqrt(float(d)), 0.0f, 0.0f);
+    if (segmented) {
+        out = ggml_kv_tail_attention_merge_segmented(
+                ctx, out, kt, vt, kt_current, vt_current,
+                tail_mask, query_order, run_desc);
+        ggml_flash_attn_ext_set_kv_tail_history_slots(out, int32_t(n_history));
+    } else {
+        out = ggml_kv_tail_attention_merge(
+                ctx, out, kt, vt, tail_mask, query_order, run_desc);
+    }
+    ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+
+    if (!ggml_backend_supports_op(backend, out)) {
+        fail("backend rejected bounded standard quantized body-plus-tail attention");
+    }
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, out);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buffer) fail("attached-tail graph allocation failed");
+
+    std::vector<float> q_data(ggml_nelements(q));
+    std::vector<float> k_data(ggml_nelements(k));
+    std::vector<float> v_data(ggml_nelements(v));
+    std::vector<float> kt_data(ggml_nelements(kt_storage));
+    std::vector<float> vt_data(ggml_nelements(vt_storage));
+    std::vector<float> kt_current_data(segmented ? ggml_nelements(kt_current_storage) : 0);
+    std::vector<float> vt_current_data(segmented ? ggml_nelements(vt_current_storage) : 0);
+    for (size_t i = 0; i < q_data.size(); ++i) q_data[i] = 0.002f*float(1 + i%19);
+    for (size_t i = 0; i < k_data.size(); ++i) k_data[i] = 0.003f*float(int(i%17) - 8);
+    for (size_t i = 0; i < v_data.size(); ++i) v_data[i] = 0.004f*float(int(i%23) - 11);
+    for (size_t i = 0; i < kt_data.size(); ++i) kt_data[i] = 0.005f*float(int(i%13) - 6);
+    for (size_t i = 0; i < vt_data.size(); ++i) vt_data[i] = 0.006f*float(int(i%11) - 5);
+    for (size_t i = 0; i < kt_current_data.size(); ++i) kt_current_data[i] = 0.007f*float(int(i%17) - 8);
+    for (size_t i = 0; i < vt_current_data.size(); ++i) vt_current_data[i] = 0.008f*float(int(i%19) - 9);
+    set_matrix_data(q, q_data, n_query*n_q_head, d);
+    set_matrix_data(k, k_data, n_kv*n_kv_head, d);
+    set_matrix_data(v, v_data, n_kv*n_kv_head, d);
+    set_matrix_data(kt_storage, kt_data, n_history*n_kv_head, d);
+    set_matrix_data(vt_storage, vt_data, n_history*n_kv_head, d);
+    if (segmented) {
+        set_matrix_data(kt_current_storage, kt_current_data, n_current*n_kv_head, d);
+        set_matrix_data(vt_current_storage, vt_current_data, n_current*n_kv_head, d);
+    }
+    std::vector<ggml_fp16_t> mask_data(ggml_nelements(mask), ggml_fp32_to_fp16(0.0f));
+    std::vector<ggml_fp16_t> tail_mask_data(ggml_nelements(tail_mask), ggml_fp32_to_fp16(0.0f));
+    std::vector<int32_t> query_order_data(n_query);
+    for (int32_t i = 0; i < n_query; ++i) query_order_data[size_t(i)] = i;
+    std::vector<int32_t> run_data(6 + n_tail, -1);
+    run_data[4] = int32_t(n_tail);
+    for (int32_t i = 0; i < n_tail; ++i) run_data[size_t(6 + i)] = i;
+    ggml_backend_tensor_set(mask, mask_data.data(), 0, mask_data.size()*sizeof(mask_data[0]));
+    ggml_backend_tensor_set(tail_mask, tail_mask_data.data(), 0, tail_mask_data.size()*sizeof(tail_mask_data[0]));
+    ggml_backend_tensor_set(query_order, query_order_data.data(), 0, query_order_data.size()*sizeof(int32_t));
+    ggml_backend_tensor_set(run_desc, run_data.data(), 0, run_data.size()*sizeof(int32_t));
+    if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+        fail("attached-tail graph compute failed");
+    }
+    std::vector<float> result(ggml_nelements(out));
+    ggml_backend_tensor_get(out, result.data(), 0, result.size()*sizeof(float));
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    return result;
+}
+
+static void test_bounded_attached_tail_attention(ggml_backend_t gpu, ggml_backend_t cpu) {
+    for (int64_t n_query : { 1, 16, 17, 512 }) {
+        for (ggml_type tail_type : { GGML_TYPE_F16, GGML_TYPE_BF16 }) {
+            if (n_query == 512 && tail_type == GGML_TYPE_BF16) continue;
+            const auto expected = run_attached_tail_attention(cpu, n_query, GGML_TYPE_Q4_0, tail_type);
+            const auto actual = run_attached_tail_attention(gpu, n_query, GGML_TYPE_Q4_0, tail_type);
+            if (actual.size() != expected.size()) fail("attached-tail result size mismatch");
+            double mse = 0.0;
+            for (size_t i = 0; i < actual.size(); ++i) {
+                const double diff = double(actual[i]) - expected[i];
+                mse += diff*diff;
+            }
+            const double rmse = std::sqrt(mse/std::max<size_t>(actual.size(), 1));
+            if (rmse > 2e-3) {
+                std::fprintf(stderr, "attached-tail nq=%lld type=%s RMSE %.8f\n",
+                        (long long) n_query, ggml_type_name(tail_type), rmse);
+                std::exit(1);
+            }
+        }
+    }
+    for (int64_t n_query : { 17, 512 }) {
+        const auto expected = run_attached_tail_attention(
+                cpu, n_query, GGML_TYPE_Q4_0, GGML_TYPE_F16, true);
+        const auto actual = run_attached_tail_attention(
+                gpu, n_query, GGML_TYPE_Q4_0, GGML_TYPE_F16, true);
+        double mse = 0.0;
+        for (size_t i = 0; i < actual.size(); ++i) {
+            const double diff = double(actual[i]) - expected[i];
+            mse += diff*diff;
+        }
+        if (std::sqrt(mse/std::max<size_t>(actual.size(), 1)) > 2e-3) {
+            fail("segmented current standard tail differs from CPU oracle");
+        }
+    }
+}
+
 static void test_mixed_side_generic_attention(
         ggml_backend_t backend,
         ggml_type body_k_type,
@@ -807,6 +942,9 @@ int main() {
 
     backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
     if (backend) {
+        ggml_backend_t reference = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+        test_bounded_attached_tail_attention(backend, reference);
+        ggml_backend_free(reference);
         test_attention_graph(backend);
         test_shadow_roundtrip(backend);
         test_fully_masked_quant_body(backend, GGML_TYPE_Q4_0);

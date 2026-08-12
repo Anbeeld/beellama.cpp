@@ -1298,6 +1298,90 @@ void llama_kv_tail_store::restore_provenance(
     }
 }
 
+void llama_kv_tail_store::clone_logical_state_from(const llama_kv_tail_store & source) {
+    if (n_tokens != source.n_tokens || rollback_tokens != source.rollback_tokens ||
+            history_limit != source.history_limit || arena_stride != source.arena_stride ||
+            n_slots != source.n_slots || compact_storage != source.compact_storage ||
+            sequences.size() != source.sequences.size()) {
+        throw std::runtime_error("cannot clone incompatible KV tail logical state");
+    }
+    if (source.in_batch || source.pending_seq_cp || source.batch_transaction) {
+        throw std::runtime_error("cannot clone KV tail logical state during a transaction");
+    }
+
+    sequences = source.sequences;
+    slot_used = source.slot_used;
+    write_cursors = source.write_cursors;
+    degradation = source.degradation;
+    recovery_commits = source.recovery_commits;
+    pending_seq_cp.reset();
+    batch_transaction.reset();
+    in_batch = false;
+    for (llama_seq_id seq_id = 0; size_t(seq_id) < sequences.size(); ++seq_id) {
+        rebuild_index(seq_id);
+    }
+}
+
+std::unique_ptr<llama_kv_tail_store> llama_kv_tail_store::clone_logical_state() const {
+    const uint32_t n_seq_max = uint32_t(sequences.size());
+    const uint32_t sink_slots = n_slots - arena_stride*n_seq_max;
+    std::unique_ptr<llama_kv_tail_store> result;
+    if (compact_storage) {
+        result = std::make_unique<llama_kv_tail_store>(
+                n_tokens, rollback_tokens, n_seq_max, arena_stride, sink_slots);
+    } else {
+        result = std::make_unique<llama_kv_tail_store>(
+                n_tokens, n_seq_max, arena_stride, sink_slots);
+    }
+    result->clone_logical_state_from(*this);
+    return result;
+}
+
+int32_t llama_kv_tail_store::restore(
+        llama_seq_id seq_id,
+        llama_kv_tail_identity identity,
+        llama_pos position,
+        uint64_t insertion_ordinal,
+        uint32_t local_slot) {
+    if (!valid_seq(seq_id) || local_slot >= arena_stride || in_batch ||
+            pending_seq_cp || batch_transaction) {
+        throw std::invalid_argument("invalid KV tail state restore destination");
+    }
+    auto & entries = sequences[size_t(seq_id)];
+    auto & index = entry_by_cell[size_t(seq_id)];
+    auto & used = slot_used[size_t(seq_id)];
+    if (entries.size() >= history_limit || used[local_slot] ||
+            index.count(cell_key(identity.stream, identity.cell)) != 0) {
+        throw std::runtime_error("conflicting KV tail state restore destination");
+    }
+
+    const int32_t slot = int32_t(uint32_t(seq_id)*arena_stride + local_slot);
+    exact_entry restored { identity, position, insertion_ordinal, slot };
+    auto inserted = std::find_if(entries.begin(), entries.end(), [&](const exact_entry & entry) {
+        return position < entry.position ||
+                (position == entry.position && insertion_ordinal < entry.insertion_ordinal);
+    });
+    inserted = entries.insert(inserted, restored);
+    index[cell_key(identity.stream, identity.cell)] = inserted;
+    used[local_slot] = true;
+    return slot;
+}
+
+uint32_t llama_kv_tail_store::state_write_cursor(llama_seq_id seq_id) const {
+    if (!valid_seq(seq_id)) {
+        throw std::out_of_range("invalid KV tail sequence cursor");
+    }
+    return write_cursors[size_t(seq_id)];
+}
+
+void llama_kv_tail_store::restore_write_cursor(llama_seq_id seq_id, uint32_t cursor) {
+    if (!valid_seq(seq_id) || cursor >= arena_stride || in_batch ||
+            pending_seq_cp || batch_transaction) {
+        throw std::invalid_argument("invalid KV tail restored write cursor");
+    }
+    write_cursors[size_t(seq_id)] = cursor;
+}
+
 std::vector<float> llama_kv_tail_attention_reference(
         const std::vector<float> & query,
         const std::vector<float> & body_k,

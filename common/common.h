@@ -16,6 +16,7 @@
 #include <map>
 #include <algorithm>
 #include <fstream>
+#include <functional>
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
 #define _WIN32_WINNT 0x0A00
@@ -173,6 +174,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,  // Eagle3 speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_MTP,     // Multi-token prediction
     COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,  // DFlash speculative decoding
+    COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,  // DSpark speculative decoding (DFlash + Markov head)
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding based on n-grams
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,   // self-speculative decoding with n-gram keys only
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
@@ -234,14 +236,14 @@ struct common_params_sampling {
     float   temp               = 0.80f;  // <= 0.0 to sample greedily, 0.0 to not output probabilities
     float   dynatemp_range     = 0.00f;  // 0.0 = disabled
     float   dynatemp_exponent  = 1.00f;  // controls how entropy maps to temperature in dynamic temperature sampler
-    int32_t penalty_last_n     = 64;     // last n tokens to penalize (0 = disable penalty, -1 = context size)
+    int32_t penalty_last_n     = 64;     // last n tokens to penalize (0 = disable penalty)
     float   penalty_repeat     = 1.00f;  // 1.0 = disabled
     float   penalty_freq       = 0.00f;  // 0.0 = disabled
     float   penalty_present    = 0.00f;  // 0.0 = disabled
     float   dry_multiplier     = 0.0f;   // 0.0 = disabled;      DRY repetition penalty for tokens extending repetition:
     float   dry_base           = 1.75f;  // 0.0 = disabled;      multiplier * base ^ (length of sequence before token - allowed length)
     int32_t dry_allowed_length = 2;      // tokens extending repetitions beyond this receive penalty
-    int32_t dry_penalty_last_n = -1;     // how many tokens to scan for repetitions (0 = disable penalty, -1 = context size)
+    int32_t dry_penalty_last_n = 64;     // how many tokens to scan for repetitions (0 = disable penalty)
     float   adaptive_target    = -1.0f;  // select tokens near this probability (valid range 0.0 to 1.0; negative = disabled)
     float   adaptive_decay     = 0.90f;  // EMA decay for adaptation; history ≈ 1/(1-decay) tokens (0.0 - 0.99)
     int32_t mirostat           = 0;      // 0 = disabled, 1 = mirostat, 2 = mirostat 2.0
@@ -293,10 +295,6 @@ struct common_params_sampling {
     bool                      reasoning_control = false;       // create the budget sampler on demand so reasoning can be ended at runtime
 
     bool backend_sampling = false;
-
-    bool has_logit_bias() const {
-        return !logit_bias.empty();
-    }
 
     // print the parameters into a string
     std::string print() const;
@@ -410,7 +408,7 @@ struct common_params_speculative {
 
     uint32_t need_n_rs_seq() const {
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
         return needs_rs_seq ? draft.n_max : 0u;
@@ -422,15 +420,6 @@ struct common_params_speculative {
 bool common_speculative_resolve_dflash_draft_n_max(
         common_params_speculative & params,
         const std::string & draft_model_path);
-
-struct common_params_vocoder {
-    struct common_params_model model;
-
-    std::string speaker_file; // speaker file path
-
-    bool use_guide_tokens = false; // enable guide tokens to improve TTS accuracy
-};
-
 struct common_params_diffusion {
     int32_t steps         = 128;
     bool    visual_mode   = false;
@@ -548,7 +537,6 @@ struct common_params {
 
     struct common_params_sampling    sampling;
     struct common_params_speculative speculative;
-    struct common_params_vocoder     vocoder;
     struct common_params_diffusion   diffusion;
 
     struct common_params_model model;
@@ -739,6 +727,7 @@ struct common_params {
 
     // enable built-in tools
     std::vector<std::string> server_tools;
+    std::string server_tools_runtime;
 
     // MCP server configs (Cursor-compatible JSON)
     std::string mcp_servers_config;   // path to JSON file with MCP server definitions
@@ -816,6 +805,12 @@ struct common_params {
     llama_progress_callback load_progress_callback = NULL;
     void *                  load_progress_callback_user_data = NULL;
     bool no_alloc = false; // Don't allocate model buffers
+
+    // TTS params
+    std::string tts_lang = "";
+    std::string tts_speaker_file = "";
+
+    bool is_gen_docs = false; // whether we are running inside llama-gen-docs
 };
 
 // call once at the start of a program if it uses libcommon
@@ -941,6 +936,15 @@ std::string string_from(const struct llama_context * ctx, const struct llama_bat
 bool glob_match(const std::string & pattern, const std::string & str);
 
 //
+// Environment utils
+//
+
+// portable environment access, an unset variable reads as an empty string
+// and setting an empty value unsets the variable
+std::string common_get_env(const std::string & name);
+void        common_set_env(const std::string & name, const std::string & value);
+
+//
 // Filesystem utils
 //
 
@@ -1007,6 +1011,9 @@ void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adap
 // model endpoint from env
 std::string common_get_model_endpoint();
 
+// for testing purposes
+char * common_get_model_or_exit(int, char*[]);
+
 //
 // Context utils
 //
@@ -1022,10 +1029,52 @@ enum common_context_seq_rm_type {
 common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx);
 uint32_t common_context_seq_rm_max_rollback(llama_context * ctx);
 
-// aborts execution on failure
-void common_context_seq_rm (llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1);
-void common_context_seq_add(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta);
-void common_context_seq_cp (llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1);
+enum common_memory_context_kind {
+    COMMON_MEMORY_CONTEXT_TARGET,
+    COMMON_MEMORY_CONTEXT_DRAFT,
+};
+
+enum common_memory_seq_rm_result {
+    COMMON_MEMORY_SEQ_RM_APPLIED,
+    COMMON_MEMORY_SEQ_RM_FULL_REPROCESS,
+    COMMON_MEMORY_SEQ_RM_MUTATION_FAILED,
+};
+
+// Injectable memory operations used by the transactional suffix-removal helper.
+// The concrete common_memory overload below supplies these from llama_context;
+// the explicit form keeps failure recovery independently testable.
+struct common_memory_seq_rm_io {
+    bool has_draft;
+    std::function<bool(common_memory_context_kind, llama_seq_id, llama_pos, llama_pos,
+                       llama_pos &, llama_pos &)> plan;
+    std::function<bool(common_memory_context_kind, llama_seq_id, llama_pos, llama_pos)> can_remove;
+    std::function<bool(common_memory_context_kind, llama_seq_id, llama_pos, llama_pos)> remove;
+};
+
+common_memory_seq_rm_result common_memory_seq_rm_suffix(
+        llama_seq_id seq_id,
+        llama_pos requested_p0,
+        const common_memory_seq_rm_io & io,
+        const std::function<llama_pos(llama_pos)> & normalize_p0,
+        llama_pos & planned_p0);
+
+struct common_memory {
+    llama_context * ctx_tgt = nullptr;
+    llama_context * ctx_dft = nullptr;
+
+    void init(llama_context * ctx_tgt, llama_context * ctx_dft = nullptr);
+
+    // aborts execution on failure
+    void seq_rm (llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
+    void seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const;
+    void seq_cp (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const;
+
+    common_memory_seq_rm_result seq_rm_suffix(
+            llama_seq_id seq_id,
+            llama_pos requested_p0,
+            const std::function<llama_pos(llama_pos)> & normalize_p0,
+            llama_pos & planned_p0) const;
+};
 
 //
 // Batch utils
@@ -1170,6 +1219,65 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 // prompt utils
 //
 
+enum common_prompt_checkpoint_status {
+    COMMON_PROMPT_CHECKPOINT_SUCCESS,
+    COMMON_PROMPT_CHECKPOINT_SKIPPED,
+    COMMON_PROMPT_CHECKPOINT_INVALID_CONTEXT,
+    COMMON_PROMPT_CHECKPOINT_UNSUPPORTED,
+    COMMON_PROMPT_CHECKPOINT_SIZE_MISMATCH,
+    COMMON_PROMPT_CHECKPOINT_ALLOCATION_FAILED,
+};
+
+struct common_prompt_checkpoint_result {
+    common_prompt_checkpoint_status status = COMMON_PROMPT_CHECKPOINT_SUCCESS;
+    size_t bytes = 0;
+
+    bool ok() const {
+        return status == COMMON_PROMPT_CHECKPOINT_SUCCESS ||
+                status == COMMON_PROMPT_CHECKPOINT_SKIPPED;
+    }
+};
+
+class common_prompt_checkpoint_buffer {
+public:
+    common_prompt_checkpoint_buffer() : storage(empty_storage()) {}
+
+    size_t size() const { return storage->size(); }
+    bool empty() const { return storage->empty(); }
+    const uint8_t * data() const { return storage->data(); }
+    const void * storage_id() const { return storage.get(); }
+
+    uint8_t * data() {
+        detach();
+        return storage->data();
+    }
+    void resize(size_t size) {
+        detach();
+        storage->resize(size);
+    }
+    void resize(size_t size, uint8_t value) {
+        detach();
+        storage->resize(size, value);
+    }
+    void clear() {
+        storage = empty_storage();
+    }
+
+private:
+    static const std::shared_ptr<std::vector<uint8_t>> & empty_storage() {
+        static const auto empty = std::make_shared<std::vector<uint8_t>>();
+        return empty;
+    }
+
+    void detach() {
+        if (!storage.unique()) {
+            storage = std::make_shared<std::vector<uint8_t>>(*storage);
+        }
+    }
+
+    std::shared_ptr<std::vector<uint8_t>> storage;
+};
+
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
@@ -1179,8 +1287,8 @@ struct common_prompt_checkpoint {
     llama_pos pos_min;
     llama_pos pos_max;
 
-    std::vector<uint8_t> data_tgt;
-    std::vector<uint8_t> data_dft;
+    common_prompt_checkpoint_buffer data_tgt;
+    common_prompt_checkpoint_buffer data_dft;
 
     // (optional) speculative-decoding implementation state stashed with the checkpoint
     // (e.g. eagle3's deferred-boundary g_embd row)
@@ -1196,22 +1304,22 @@ struct common_prompt_checkpoint {
             llama_pos pos_min,
             llama_pos pos_max);
 
-    void update_tgt(
+    common_prompt_checkpoint_result update_tgt(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags);
 
-    void update_dft(
+    common_prompt_checkpoint_result update_dft(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags);
 
-    void load_tgt(
+    common_prompt_checkpoint_result load_tgt(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags) const;
 
-    void load_dft(
+    common_prompt_checkpoint_result load_dft(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags) const;

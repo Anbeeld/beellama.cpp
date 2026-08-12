@@ -421,8 +421,10 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
     }
 
 #if !defined(GGML_USE_MUSA)
+    // The partial kernel does not share the FlashAttention signature, so it is
+    // passed as an opaque entry pointer instead of being cast to fattn_kernel_t.
     CUDA_CHECK(cudaFuncSetAttribute(
-        reinterpret_cast<ggml_cuda_fattn_kernel_attr_ptr_t>(
+        reinterpret_cast<const void *>(
             ggml_cuda_fattn_kvarn_window_f16_partial_kernel<DKQ, DV, ncols1, ncols2, use_logit_softcap>),
         cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
 #endif
@@ -837,4 +839,4 @@ void ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, gg
 
 #define DECL_FATTN_MMA_KVARN_CASE(DKQ, DV, ncols1, ncols2)                         \
     template void ggml_cuda_flash_attn_ext_mma_kvarn_case                          \
-    <DKQ, DV, ncols1, ncols2>(ggml_backend_cuda_context & ctx, ggml_tensor * dst)  \
+    <DKQ, DV, ncols1, ncols2>(ggml_backend_cuda_context & ctx, ggml_tensor * dst)

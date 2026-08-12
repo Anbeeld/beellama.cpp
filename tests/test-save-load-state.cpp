@@ -2,6 +2,7 @@
 #include "common.h"
 #include "log.h"
 #include "llama-cpp.h"
+#include "../src/llama-memory.h"
 
 #include <clocale>
 #include <algorithm>
@@ -90,6 +91,24 @@ static bool test_tail_state_contract(
     const auto body_flag = llama_state_seq_flags(LLAMA_STATE_SEQ_FLAGS_BODY_ONLY);
     const size_t body_size = llama_state_get_size_ext(source.get(), body_flag);
     const bool has_overlay_state = exact_size > body_size;
+
+    if (params.kvarn.type == LLAMA_KVARN_TYPE_DISABLED && has_overlay_state &&
+            !llama_get_memory(source.get())->requires_state_for_partial_restore()) {
+        LOG_ERR("%s: standard precision tail does not participate in partial checkpoints\n", __func__);
+        return false;
+    }
+
+    if (params.kvarn.type == LLAMA_KVARN_TYPE_DISABLED && has_overlay_state) {
+        const auto partial_flag = llama_state_seq_flags(LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        const auto exact_flag = llama_state_seq_flags(LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED);
+        const size_t partial_size = llama_state_seq_get_size_ext(source.get(), 0, partial_flag);
+        const size_t self_contained_size = llama_state_seq_get_size_ext(source.get(), 0, exact_flag);
+        if (partial_size == 0 || partial_size >= self_contained_size) {
+            LOG_ERR("%s: standard precision-tail partial checkpoint copied the body (%zu >= %zu)\n",
+                    __func__, partial_size, self_contained_size);
+            return false;
+        }
+    }
 
     if (has_overlay_state) {
         auto mismatch_params = source_params;
@@ -307,8 +326,8 @@ static bool test_tail_copy_is_immediately_saveable(
             break;
         }
     }
-    if (frame == std::string::npos || read_u32(state, frame + 4) != 3) {
-        LOG_ERR("%s: could not locate standard tail state v3 frame\n", __func__);
+    if (frame == std::string::npos || read_u32(state, frame + 4) != 5) {
+        LOG_ERR("%s: could not locate standard tail state v5 frame\n", __func__);
         return false;
     }
     const uint32_t group_size = read_u32(state, frame + 28);
@@ -325,6 +344,7 @@ static bool test_tail_copy_is_immediately_saveable(
         body_cell_counts.push_back(cell_count);
         cursor += 8 + size_t(run_count)*sizeof(uint32_t);
         for (uint32_t i = 0; i < cell_count; ++i) {
+            cursor += sizeof(uint32_t) + sizeof(uint64_t); // source cell + generation
             cursor += sizeof(llama_pos);
             if (n_pos_per_embd > 1) {
                 cursor += sizeof(llama_pos)*2;
@@ -337,7 +357,7 @@ static bool test_tail_copy_is_immediately_saveable(
     const uint32_t record_count = read_u32(state, tail_header + 8);
     const uint32_t payload_count = read_u32(state, tail_header + 12);
     const size_t record_begin = tail_header + 24;
-    const size_t record_size = 36;
+    const size_t record_size = 40;
     const size_t tail_layer_begin = record_begin + size_t(record_count)*record_size;
     if (record_count < 2 || payload_count < 2 || body_cell_counts.empty()) {
         LOG_ERR("%s: tail state fixture did not contain enough records for corruption tests\n", __func__);
@@ -376,6 +396,11 @@ static bool test_tail_copy_is_immediately_saveable(
         auto corrupt = state;
         write_u32(corrupt, record_begin + 32, payload_count);
         if (!expect_rejected(std::move(corrupt), state.size(), "payload ordinal")) return false;
+    }
+    {
+        auto corrupt = state;
+        write_u32(corrupt, record_begin + 36, UINT32_MAX);
+        if (!expect_rejected(std::move(corrupt), state.size(), "tail ring slot")) return false;
     }
     {
         auto corrupt = state;
@@ -712,6 +737,29 @@ static bool test_kvarn_partial_checkpoint_history(
         return false;
     }
 
+    const auto self_flags = llama_state_seq_flags(LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED);
+    std::vector<uint8_t> live_self(llama_state_seq_get_size_ext(context.get(), 0, self_flags));
+    if (live_self.empty() || llama_state_seq_get_data_ext(
+                context.get(), live_self.data(), live_self.size(), 0, self_flags) != live_self.size()) {
+        LOG_ERR("%s: failed to save self-contained restore anchor\n", __func__);
+        return false;
+    }
+    std::unique_ptr<llama_state_seq_restore_plan, decltype(&llama_state_seq_restore_plan_free)> prepared(
+            llama_state_seq_prepare_data_ext(
+                    context.get(), checkpoint_b.data(), checkpoint_b.size(), 0, partial_flags),
+            llama_state_seq_restore_plan_free);
+    if (!prepared || llama_memory_seq_pos_max(llama_get_memory(context.get()), 0) != live_past - 1) {
+        LOG_ERR("%s: prepared restore mutated the live destination\n", __func__);
+        return false;
+    }
+    if (llama_state_seq_restore_plan_commit(prepared.get()) != checkpoint_b.size() ||
+            llama_memory_seq_pos_max(llama_get_memory(context.get()), 0) != checkpoint_b_past - 1 ||
+            llama_state_seq_set_data_ext(
+                    context.get(), live_self.data(), live_self.size(), 0, self_flags) != live_self.size()) {
+        LOG_ERR("%s: prepared restore commit or anchor recovery failed\n", __func__);
+        return false;
+    }
+
     const uint32_t kvarn_magic = 0x4e52564b;
     size_t kvarn_frame = std::string::npos;
     for (size_t i = 0; i + 2*sizeof(uint32_t) <= checkpoint_b.size(); ++i) {
@@ -726,17 +774,25 @@ static bool test_kvarn_partial_checkpoint_history(
     if (kvarn_frame != std::string::npos) {
         std::memcpy(&version, checkpoint_b.data() + kvarn_frame + sizeof(uint32_t), sizeof(version));
     }
-    if (kvarn_frame == std::string::npos || version != 13) {
-        LOG_ERR("%s: expected KVarN partial checkpoint format v13, found v%u\n", __func__, version);
+    if (kvarn_frame == std::string::npos || version != 15) {
+        LOG_ERR("%s: expected KVarN partial checkpoint format v15, found v%u\n", __func__, version);
         return false;
     }
 
     auto corrupt = checkpoint_b;
-    const uint32_t unsupported_version = 14;
+    const uint32_t unsupported_version = 16;
     std::memcpy(corrupt.data() + kvarn_frame + sizeof(uint32_t), &unsupported_version, sizeof(unsupported_version));
+    std::unique_ptr<llama_state_seq_restore_plan, decltype(&llama_state_seq_restore_plan_free)> corrupt_plan(
+            llama_state_seq_prepare_data_ext(
+                    context.get(), corrupt.data(), corrupt.size(), 0, partial_flags),
+            llama_state_seq_restore_plan_free);
+    if (corrupt_plan) {
+        LOG_ERR("%s: corrupt KVarN v15 frame produced a restore plan\n", __func__);
+        return false;
+    }
     if (llama_state_seq_set_data_ext(
             context.get(), corrupt.data(), corrupt.size(), 0, partial_flags) != 0) {
-        LOG_ERR("%s: corrupt KVarN v13 frame was accepted\n", __func__);
+        LOG_ERR("%s: corrupt KVarN v15 frame was accepted\n", __func__);
         return false;
     }
     if (llama_memory_seq_pos_max(llama_get_memory(context.get()), 0) != live_past - 1) {
@@ -793,11 +849,44 @@ static bool test_kvarn_partial_checkpoint_history(
         LOG_ERR("%s: historical checkpoint A continuation changed\n", __func__);
         return false;
     }
+    // Partial state references the still-live ordinary-cache body. Restore the
+    // self-contained anchor before testing another historical checkpoint;
+    // checkpoint A legitimately removed B's later reference cells.
+    if (llama_state_seq_set_data_ext(
+                context.get(), live_self.data(), live_self.size(), 0, self_flags) != live_self.size()) {
+        LOG_ERR("%s: failed to reestablish live anchor before checkpoint B\n", __func__);
+        return false;
+    }
     std::vector<float> restored_b;
     if (!restore_partial(checkpoint_b) || !decode_probe(probe_b, checkpoint_b_past, restored_b) ||
             !logits_match(oracle_b, restored_b)) {
         LOG_ERR("%s: historical checkpoint B continuation changed\n", __func__);
         return false;
+    }
+
+    // Establish the byte baseline immediately before prepare/free so the
+    // lifetime contract is isolated from unrelated state captures above.
+    std::vector<uint8_t> before_abandon;
+    if (!save_partial(before_abandon)) {
+        LOG_ERR("%s: failed to save abandoned-plan destination baseline\n", __func__);
+        return false;
+    }
+    {
+        const llama_pos pos_before = llama_memory_seq_pos_max(llama_get_memory(context.get()), 0);
+        std::unique_ptr<llama_state_seq_restore_plan, decltype(&llama_state_seq_restore_plan_free)> abandoned(
+                llama_state_seq_prepare_data_ext(
+                        context.get(), checkpoint_b.data(), checkpoint_b.size(), 0, partial_flags),
+                llama_state_seq_restore_plan_free);
+        if (!abandoned || llama_memory_seq_pos_max(llama_get_memory(context.get()), 0) != pos_before) {
+            LOG_ERR("%s: abandoned restore preparation mutated the live destination\n", __func__);
+            return false;
+        }
+        abandoned.reset();
+        std::vector<uint8_t> after_abandon;
+        if (!save_partial(after_abandon) || after_abandon != before_abandon) {
+            LOG_ERR("%s: destroying an uncommitted restore plan changed the destination\n", __func__);
+            return false;
+        }
     }
 
     LOG("\nKVarN partial checkpoint bytes: A=%zu B=%zu live=%zu\n",
@@ -811,7 +900,122 @@ static bool test_kvarn_partial_checkpoint_history(
         LOG(" %.3f", time_ms);
     }
     LOG("\n");
-    LOG("\nPASS: KVarN v13 host partial checkpoints are independent and transactional\n");
+    LOG("\nPASS: KVarN v15 host partial checkpoints are transactional with a live body anchor\n");
+    return true;
+}
+
+static bool test_kvarn_unified_capacity(
+        llama_model * model, const common_params & params, const llama_tokens & tokens) {
+    if (params.kvarn.type == LLAMA_KVARN_TYPE_DISABLED) {
+        return true;
+    }
+
+    auto context_params = common_context_params_to_llama(params);
+    context_params.n_ctx = 512;
+    context_params.n_batch = 128;
+    context_params.n_ubatch = 128;
+    context_params.n_seq_max = 2;
+    context_params.kv_unified = true;
+    context_params.kv_tail_tokens = 0;
+    context_params.kv_tail_config = nullptr;
+    auto context = llama_context_ptr{llama_init_from_model(model, context_params)};
+    if (!context) {
+        LOG_ERR("%s: failed to create unified KVarN capacity context\n", __func__);
+        return false;
+    }
+
+    constexpr int32_t borrowed_capacity = 384;
+    for (int32_t offset = 0; offset < borrowed_capacity; offset += 128) {
+        llama_batch_ptr batch(128, 0, 1);
+        for (int32_t i = 0; i < 128; ++i) {
+            const llama_token token = tokens.empty() ? llama_token(1) : tokens[(offset + i) % tokens.size()];
+            common_batch_add(batch.get(), token, offset + i, { 0 }, false);
+        }
+        if (llama_decode(context.get(), batch.get())) {
+            LOG_ERR("%s: sequence 0 could not borrow unused unified KVarN capacity\n", __func__);
+            return false;
+        }
+    }
+
+    llama_batch_ptr other(128, 0, 1);
+    for (int32_t i = 0; i < 128; ++i) {
+        const llama_token token = tokens.empty() ? llama_token(1) : tokens[i % tokens.size()];
+        common_batch_add(other.get(), token, i, { 1 }, false);
+    }
+    if (llama_decode(context.get(), other.get())) {
+        LOG_ERR("%s: borrowing sequence aliased the remaining unified KVarN capacity\n", __func__);
+        return false;
+    }
+
+    LOG("\nPASS: unified KVarN capacity is borrowed between sequences without cross-sequence aliasing\n");
+    return true;
+}
+
+static bool test_kvarn_unified_reuses_freed_groups(
+        llama_model * model, const common_params & params, const llama_tokens & tokens) {
+    if (params.kvarn.type == LLAMA_KVARN_TYPE_DISABLED) {
+        return true;
+    }
+
+    auto context_params = common_context_params_to_llama(params);
+    context_params.n_ctx = 512;
+    context_params.n_batch = 128;
+    context_params.n_ubatch = 128;
+    context_params.n_seq_max = 2;
+    context_params.kv_unified = true;
+    context_params.kv_tail_tokens = 0;
+    context_params.kv_tail_config = nullptr;
+    auto context = llama_context_ptr{llama_init_from_model(model, context_params)};
+    if (!context) {
+        LOG_ERR("%s: failed to create unified KVarN reuse context\n", __func__);
+        return false;
+    }
+
+    const auto decode = [&](llama_seq_id seq_id, int32_t pos0, int32_t count) {
+        for (int32_t offset = 0; offset < count; offset += 128) {
+            const int32_t n_tokens = std::min(128, count - offset);
+            llama_batch_ptr batch(n_tokens, 0, 1);
+            for (int32_t i = 0; i < n_tokens; ++i) {
+                const int32_t pos = pos0 + offset + i;
+                const llama_token token = tokens.empty() ? llama_token(1) : tokens[pos % tokens.size()];
+                common_batch_add(batch.get(), token, pos, { seq_id }, offset + n_tokens == count && i + 1 == n_tokens);
+            }
+            if (llama_decode(context.get(), batch.get())) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    // Sequence 1 temporarily owns physical group 1 while sequence 0 advances
+    // through groups 0, 2, and 3. Once sequence 1 is removed, sequence 0 must
+    // wrap into the freed group without corrupting either sequence's metadata.
+    if (!decode(0, 0, 128) || !decode(1, 0, 128) || !decode(0, 128, 256)) {
+        LOG_ERR("%s: failed to exercise freed unified KVarN groups\n", __func__);
+        return false;
+    }
+
+    auto * memory = llama_get_memory(context.get());
+    if (!llama_memory_seq_rm(memory, 1, -1, -1)) {
+        LOG_ERR("%s: failed to release the temporary sequence\n", __func__);
+        return false;
+    }
+    if (!decode(0, 384, 1)) {
+        LOG_ERR("%s: failed to reuse a freed unified KVarN group\n", __func__);
+        return false;
+    }
+    if (llama_memory_seq_pos_max(memory, 0) != 384 || llama_memory_seq_pos_max(memory, 1) != -1) {
+        LOG_ERR("%s: freed-group reuse corrupted sequence positions\n", __func__);
+        return false;
+    }
+    const float * logits = llama_get_logits_ith(context.get(), -1);
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    if (!logits || !std::all_of(logits, logits + n_vocab, [](float value) { return std::isfinite(value); })) {
+        LOG_ERR("%s: freed-group reuse produced invalid continuation logits\n", __func__);
+        return false;
+    }
+
+    LOG("\nPASS: unified KVarN reuses freed groups with valid sequence state and logits\n");
     return true;
 }
 
@@ -1244,6 +1448,12 @@ int main(int argc, char ** argv) {
         return 1;
     }
     if (!test_kvarn_partial_checkpoint_history(model, params, tokens)) {
+        return 1;
+    }
+    if (!test_kvarn_unified_capacity(model, params, tokens)) {
+        return 1;
+    }
+    if (!test_kvarn_unified_reuses_freed_groups(model, params, tokens)) {
         return 1;
     }
 

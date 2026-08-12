@@ -377,6 +377,7 @@ extern "C" {
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
+        bool load_mtp;        // whether to load MTP layers
     };
 
     struct llama_sampler_seq_config {
@@ -385,6 +386,7 @@ extern "C" {
     };
 
     typedef struct llama_kv_tail_config llama_kv_tail_config;
+    typedef struct llama_kv_tail_request llama_kv_tail_request;
 
     struct llama_kv_tail_group_info {
         const char * id;
@@ -494,6 +496,7 @@ extern "C" {
         uint32_t       kv_tail_tokens;
         enum ggml_type kv_tail_type;
         const struct llama_kv_tail_config * kv_tail_config; // borrowed only during context creation
+        const struct llama_kv_tail_request * kv_tail_request; // model-independent; borrowed during context creation
     };
 
     struct llama_model_tensor_override {
@@ -564,6 +567,11 @@ extern "C" {
             const char * group_id,
             uint32_t n_tokens);
     LLAMA_API const char * llama_kv_tail_config_last_error(const struct llama_kv_tail_config * config);
+    LLAMA_API struct llama_kv_tail_request * llama_kv_tail_request_init(
+            const char * specification,
+            enum ggml_type exact_type);
+    LLAMA_API void llama_kv_tail_request_free(struct llama_kv_tail_request * request);
+    LLAMA_API const char * llama_kv_tail_request_last_error(const struct llama_kv_tail_request * request);
     LLAMA_API bool llama_kv_tail_get_coverage(
             const struct llama_context * ctx,
                          llama_seq_id   seq_id,
@@ -1072,6 +1080,21 @@ extern "C" {
 // tail-enabled context starts with degraded exact-tail coverage.
 #define LLAMA_STATE_SEQ_FLAGS_BODY_ONLY 4
 
+// Export a self-contained logical sequence from a shared physical cache.
+// Unlike PARTIAL_ONLY, this representation owns every payload required after
+// the source sequence is removed and may remap physical cells on restore.
+#define LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED 8
+
+    LLAMA_API bool llama_memory_state_seq_can_save_ext(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+     llama_state_seq_flags flags);
+
+    LLAMA_API bool llama_memory_state_seq_can_restore_ext(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+     llama_state_seq_flags flags);
+
     LLAMA_API size_t llama_state_seq_get_size_ext(
             struct llama_context * ctx,
                     llama_seq_id   seq_id,
@@ -1090,6 +1113,26 @@ extern "C" {
                           size_t   size,
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
+
+    // Prepare a sequence-state restore without mutating the destination. The
+    // source buffer must remain valid until the plan is committed or freed.
+    // Commit performs only already-validated backend writes and metadata
+    // publication; it has no remaining allocation or parsing step.
+    struct llama_state_seq_restore_plan;
+
+    LLAMA_API struct llama_state_seq_restore_plan * llama_state_seq_prepare_data_ext(
+            struct llama_context * ctx,
+                   const uint8_t * src,
+                          size_t   size,
+                    llama_seq_id   dest_seq_id,
+           llama_state_seq_flags   flags);
+
+    // Returns the committed byte count, or zero for an invalid/consumed plan.
+    LLAMA_API size_t llama_state_seq_restore_plan_commit(
+            struct llama_state_seq_restore_plan * plan);
+
+    LLAMA_API void llama_state_seq_restore_plan_free(
+            struct llama_state_seq_restore_plan * plan);
 
     //
     // Decoding
@@ -1271,6 +1314,9 @@ extern "C" {
     LLAMA_API bool llama_vocab_get_add_bos(const struct llama_vocab * vocab);
     LLAMA_API bool llama_vocab_get_add_eos(const struct llama_vocab * vocab);
     LLAMA_API bool llama_vocab_get_add_sep(const struct llama_vocab * vocab);
+
+    // model-specific suppress tokens (gguf key: tokenizer.ggml.suppress_tokens)
+    LLAMA_API const llama_token * llama_vocab_get_suppress_tokens(const struct llama_vocab * vocab, int32_t * n_suppress_tokens);
 
     LLAMA_API llama_token llama_vocab_fim_pre(const struct llama_vocab * vocab);
     LLAMA_API llama_token llama_vocab_fim_suf(const struct llama_vocab * vocab);
@@ -1589,19 +1635,19 @@ extern "C" {
 
     /// NOTE: Avoid using on the full vocabulary as searching for repeated tokens can become slow. For example, apply top-k or top-p sampling first.
     LLAMA_API struct llama_sampler * llama_sampler_init_penalties(
-                             int32_t   penalty_last_n,   // last n tokens to penalize (0 = disable penalty, -1 = context size)
-                               float   penalty_repeat,   // 1.0 = disabled
-                               float   penalty_freq,     // 0.0 = disabled
-                               float   penalty_present); // 0.0 = disabled
+                             int32_t   n_vocab,
+                             int32_t   penalty_last_n,   // last n tokens to penalize (0 = disable penalty)
+                               float   penalty_repeat,   // must be > 0.0, 1.0 = disabled
+                               float   penalty_freq,     // must be finite, 0.0 = disabled
+                               float   penalty_present); // must be finite, 0.0 = disabled
 
     ///  @details DRY sampler, designed by p-e-w, as described in: https://github.com/oobabooga/text-generation-webui/pull/5677, porting Koboldcpp implementation authored by pi6am: https://github.com/LostRuins/koboldcpp/pull/982
     LLAMA_API struct llama_sampler * llama_sampler_init_dry(
             const struct llama_vocab *  vocab,
-                             int32_t    n_ctx_train,
                                float    dry_multiplier,
                                float    dry_base,
                              int32_t    dry_allowed_length,
-                             int32_t    dry_penalty_last_n,
+                             int32_t    dry_penalty_last_n, // last n tokens to penalize (0 = disable penalty)
                           const char ** seq_breakers,
                               size_t    num_breakers);
 

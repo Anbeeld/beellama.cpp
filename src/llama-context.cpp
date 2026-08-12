@@ -8,6 +8,7 @@
 #include "llama-io.h"
 #include "llama-kv-cache-kvarn.h"
 #include "llama-kv-cache-tail.h"
+#include "llama-kv-tail-request.h"
 #include "llama-kvarn.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
@@ -300,8 +301,9 @@ llama_context::llama_context(
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 
-    cparams.embeddings_layer_inp.resize(hparams.n_layer(), false);
-    embd_layer_inp.resize(hparams.n_layer());
+    // +1: id n_layer() taps the output of the last layer ("input" of the head)
+    cparams.embeddings_layer_inp.resize(hparams.n_layer() + 1, false);
+    embd_layer_inp.resize(hparams.n_layer() + 1);
 
     cparams.ctx_type     = params.ctx_type;
     cparams.pooling_type = params.pooling_type;
@@ -327,7 +329,51 @@ llama_context::llama_context(
         throw std::invalid_argument("KV tail type must be F16, BF16, or the cache-family default");
     }
     cparams.kv_tail_type = params.kv_tail_type;
-    if (params.kv_tail_config) {
+    bool tail_request_resolved = false;
+    if (params.kv_tail_request && params.kv_tail_config) {
+        throw std::invalid_argument("KV tail request and model-bound config are mutually exclusive");
+    }
+    if (params.kv_tail_request) {
+        std::unique_ptr<llama_kv_tail_config, decltype(&llama_kv_tail_config_free)> manifest(
+                llama_kv_tail_config_init(&model), llama_kv_tail_config_free);
+        if (!manifest) {
+            throw std::runtime_error("failed to build model-bound KV tail group manifest");
+        }
+        std::vector<llama_kv_tail_request_group> groups;
+        groups.reserve(manifest->groups.size());
+        for (const auto & group : manifest->groups) {
+            groups.push_back({ group.id, group.role,
+                    std::min(group.effective_window, cparams.n_ctx),
+                    model.arch != LLM_ARCH_DEEPSEEK4 });
+        }
+        const auto resolution = llama_kv_tail_request_resolve(
+                *params.kv_tail_request, groups,
+                params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED);
+        if (!resolution.valid) {
+            throw std::invalid_argument("invalid model-bound KV tail request: " + resolution.error);
+        }
+        cparams.kv_tail_tokens = 0;
+        cparams.kv_tail_tokens_swa = 0;
+        cparams.kv_tail_tokens_requested = 0;
+        cparams.kv_tail_tokens_swa_requested = 0;
+        for (const auto & group : resolution.groups) {
+            if (group.role == "swa") {
+                cparams.kv_tail_tokens_swa_requested = group.requested_tokens;
+                cparams.kv_tail_tokens_swa = group.effective_tokens;
+                cparams.kv_tail_native_exact_swa = group.native_exact;
+            } else {
+                cparams.kv_tail_tokens_requested = group.requested_tokens;
+                cparams.kv_tail_tokens = group.effective_tokens;
+                cparams.kv_tail_native_exact = group.native_exact;
+            }
+            cparams.kv_tail_type = group.exact_type;
+            LLAMA_LOG_INFO("KV tail: group=%s raw=%u requested=%u effective=%u type=%s representation=%s\n",
+                    group.id.c_str(), group.raw_requested_tokens, group.requested_tokens,
+                    group.effective_tokens, ggml_type_name(group.exact_type),
+                    group.native_exact ? "native_exact" : "overlay");
+        }
+        tail_request_resolved = true;
+    } else if (params.kv_tail_config) {
         const auto & config = *params.kv_tail_config;
         if (config.model != &model) {
             throw std::invalid_argument("KV tail config was created for a different model");
@@ -369,7 +415,7 @@ llama_context::llama_context(
         }
     }
 
-    if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
+    if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED && !tail_request_resolved) {
         const uint32_t full_window = cparams.n_ctx;
         const uint32_t swa_window = std::min(cparams.n_ctx,
                 hparams.n_swa > 0 ? hparams.n_swa : cparams.n_ctx);
@@ -706,6 +752,8 @@ llama_context::llama_context(
         backend_buft.clear();
         backend_ptrs.clear();
         backend_buf_exp_size.clear();
+        backend_kvarn_workspace_y_size.clear();
+        backend_kvarn_workspace_split_k_size.clear();
 
         for (auto & backend : backends) {
             auto * buft = ggml_backend_get_default_buffer_type(backend.get());
@@ -723,6 +771,8 @@ llama_context::llama_context(
             backend_buft.push_back(buft);
             backend_ptrs.push_back(backend.get());
             backend_buf_exp_size.push_back(0);
+            backend_kvarn_workspace_y_size.push_back(0);
+            backend_kvarn_workspace_split_k_size.push_back(0);
         }
 
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
@@ -783,6 +833,9 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    // wait for any pending asynchronous copies into the output buffers before they are freed
+    synchronize();
+
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -901,6 +954,10 @@ void llama_context::sched_reserve() {
 
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
+    std::fill(backend_kvarn_workspace_y_size.begin(),
+            backend_kvarn_workspace_y_size.end(), 0);
+    std::fill(backend_kvarn_workspace_split_k_size.begin(),
+            backend_kvarn_workspace_split_k_size.end(), 0);
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
 
@@ -944,6 +1001,7 @@ void llama_context::sched_reserve() {
                 throw std::runtime_error("failed to allocate compute pp buffers");
             }
         }
+        record_backend_private_workspace(gf);
 
         n_splits_pp = ggml_backend_sched_get_n_splits(sched.get());
         n_nodes_pp  = ggml_graph_n_nodes(gf);
@@ -955,6 +1013,7 @@ void llama_context::sched_reserve() {
         if (!gf) {
             throw std::runtime_error("failed to allocate compute tg buffers");
         }
+        record_backend_private_workspace(gf);
 
         n_splits_tg = ggml_backend_sched_get_n_splits(sched.get());
         n_nodes_tg  = ggml_graph_n_nodes(gf);
@@ -970,6 +1029,7 @@ void llama_context::sched_reserve() {
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
         }
+        record_backend_private_workspace(gf);
     }
 
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -982,6 +1042,15 @@ void llama_context::sched_reserve() {
             LLAMA_LOG_INFO("%s: %10s compute buffer size = %8.2f MiB\n", __func__,
                     ggml_backend_buft_name(buft),
                     backend_buf_exp_size[i] / 1024.0 / 1024.0);
+        }
+        const size_t private_size = backend_kvarn_workspace_y_size[i] +
+                backend_kvarn_workspace_split_k_size[i];
+        if (private_size > 0) {
+            LLAMA_LOG_INFO("%s: %10s KVarN backend workspace = %8.2f MiB "
+                    "(y %.2f MiB, split-k %.2f MiB)\n", __func__,
+                    ggml_backend_buft_name(buft), private_size / 1024.0 / 1024.0,
+                    backend_kvarn_workspace_y_size[i] / 1024.0 / 1024.0,
+                    backend_kvarn_workspace_split_k_size[i] / 1024.0 / 1024.0);
         }
     }
 
@@ -1001,6 +1070,51 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+}
+
+void llama_context::record_backend_private_workspace(ggml_cgraph * gf) {
+    using workspace_size_fn = size_t (*)(ggml_backend_dev_t, const ggml_tensor *);
+    if (gf == nullptr) {
+        return;
+    }
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), node);
+        const auto found = std::find(backend_ptrs.begin(), backend_ptrs.end(), backend);
+        if (found == backend_ptrs.end()) {
+            continue;
+        }
+        const size_t index = size_t(found - backend_ptrs.begin());
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (reg == nullptr) {
+            continue;
+        }
+        auto * y_fn = (workspace_size_fn) ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_kvarn_workspace_y_size");
+        auto * split_fn = (workspace_size_fn) ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_kvarn_workspace_split_k_size");
+        if (y_fn) {
+            const size_t size = y_fn(dev, node);
+            backend_kvarn_workspace_y_size[index] = std::max(
+                    backend_kvarn_workspace_y_size[index], size);
+            if (size > 0) {
+                LLAMA_LOG_DEBUG("%s: backend=%s op=%s KVarN y workspace=%.2f MiB\n",
+                        __func__, ggml_backend_dev_name(dev), ggml_op_name(node->op),
+                        size / 1024.0 / 1024.0);
+            }
+        }
+        if (split_fn) {
+            const size_t size = split_fn(dev, node);
+            backend_kvarn_workspace_split_k_size[index] = std::max(
+                    backend_kvarn_workspace_split_k_size[index], size);
+            if (size > 0) {
+                LLAMA_LOG_DEBUG("%s: backend=%s op=%s KVarN split-k workspace=%.2f MiB\n",
+                        __func__, ggml_backend_dev_name(dev), ggml_op_name(node->op),
+                        size / 1024.0 / 1024.0);
+            }
+        }
+    }
 }
 
 void llama_context::synchronize() {
@@ -1481,7 +1595,7 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     LLAMA_LOG_DEBUG("%s: lid = %d, enable = %d\n", __func__, lid, enable);
 
-    GGML_ASSERT(lid < model.hparams.n_layer());
+    GGML_ASSERT(lid <= model.hparams.n_layer());
 
     cparams.embeddings_layer_inp[lid] = enable;
 
@@ -1749,12 +1863,16 @@ int llama_context::encode(const llama_batch & batch_inp) {
     // micro-batching is not possible for non-causal encoding, so we process the batch in a single shot
     GGML_ASSERT(cparams.n_ubatch >= n_tokens && "encoder requires n_ubatch >= n_tokens");
 
+    // TODO: this clear of the buffer can easily be forgotten - need something better
+    // sync first so any in-flight async copies into embd_seq complete before it is freed
+    if (!embd_seq.empty()) {
+        synchronize();
+    }
+    embd_seq.clear();
+
     if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();
     }
-
-    // TODO: this clear of the buffer can easily be forgotten - need something better
-    embd_seq.clear();
 
     sched_reserve();
 
@@ -2041,7 +2159,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const auto & hparams = model.hparams;
 
     const int64_t n_vocab = vocab.n_tokens();
-    const int64_t n_embd  = hparams.n_embd_inp();
+    const bool    mtp_embd = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && batch_inp.embd;
+    const int64_t n_embd  = mtp_embd ? hparams.n_embd_out() : hparams.n_embd_inp();
 
     // when computing embeddings, all tokens are output
     const bool output_all   = cparams.embeddings;
@@ -2094,13 +2213,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch >= n_tokens_all) && "non-causal attention requires n_ubatch >= n_tokens");
 
+    // TODO: this clear of the buffer can easily be forgotten - need something better
+    // sync first so any in-flight async copies into embd_seq complete before it is freed
+    if (!embd_seq.empty()) {
+        synchronize();
+    }
+    embd_seq.clear();
+
     if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();
     }
     n_queued_tokens += n_tokens_all;
 
-    // TODO: this clear of the buffer can easily be forgotten - need something better
-    embd_seq.clear();
     output_swaps.clear();
 
     sched_reserve();
@@ -2598,8 +2722,9 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
 }
 
 void llama_context::output_reorder() {
-    const uint64_t n_vocab = model.vocab.n_tokens();
-    const uint64_t n_embd  = model.hparams.n_embd;
+    const uint64_t n_vocab     = model.vocab.n_tokens();
+    const uint64_t n_embd      = model.hparams.n_embd;
+    const uint64_t n_embd_out  = model.hparams.n_embd_out();
 
     for (size_t s = 0; s < output_swaps.size(); ++s) {
         const uint64_t i0 = output_swaps[s].i0;
@@ -2612,14 +2737,14 @@ void llama_context::output_reorder() {
         }
 
         if (embd.size > 0) {
-            for (uint64_t k = 0; k < n_embd; k++) {
-                std::swap(embd.data[i0*n_embd + k], embd.data[i1*n_embd + k]);
+            for (uint64_t k = 0; k < n_embd_out; k++) {
+                std::swap(embd.data[i0*n_embd_out + k], embd.data[i1*n_embd_out + k]);
             }
         }
 
         if (embd_nextn.size > 0) {
-            for (uint64_t k = 0; k < n_embd; k++) {
-                std::swap(embd_nextn.data[i0*n_embd + k], embd_nextn.data[i1*n_embd + k]);
+            for (uint64_t k = 0; k < n_embd_out; k++) {
+                std::swap(embd_nextn.data[i0*n_embd_out + k], embd_nextn.data[i1*n_embd_out + k]);
             }
         }
 
@@ -2669,13 +2794,20 @@ void llama_context::output_reorder() {
 //
 
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+    // A generic precision-tail oracle can add compact-current staging, two
+    // indexed gathers, body/tail score branches, and ordered tail writes per
+    // attention layer. Keep this feature-only graph allowance independent of
+    // the upstream base heuristic. Upstream's post-v0.4.3 attention graph adds
+    // more per-layer staging nodes; 64 nodes per layer no longer contains the
+    // complete compact route exercised by state restore.
     const uint32_t tail_nodes = (cparams.kv_tail_tokens > 0 || cparams.kv_tail_tokens_swa > 0) ?
-            32u*model.hparams.n_layer_all : 0;
+            96u*model.hparams.n_layer_all : 0;
     if (model.arch == LLM_ARCH_QWEN3NEXT ||
         model.arch == LLM_ARCH_KIMI_LINEAR ||
         model.arch == LLM_ARCH_QWEN35 ||
         model.arch == LLM_ARCH_QWEN35MOE ||
         model.arch == LLM_ARCH_DEEPSEEK4 ||
+        (model.arch == LLM_ARCH_DFLASH && model.hparams.dsv4_hc_mult > 0) ||
         model.arch == LLM_ARCH_NANBEIGE ||
         model.arch == LLM_ARCH_MINIMAX_M3) {
         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors()) + tail_nodes;
@@ -2866,9 +2998,66 @@ public:
             uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
 
     ~llama_io_write_host() {
-        // TODO: add backend support to batch tensor_get? or some other way to speed this up
+        // State layouts often interleave regularly-strided slices from several
+        // tensors. Group those slices by source tensor so backends with native
+        // 2D transfers can copy each run with one synchronization while keeping
+        // the serialized byte layout unchanged.
+        std::vector<const write_info *> sorted;
+        sorted.reserve(winfos.size());
         for (const auto & winfo : winfos) {
-            ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+            sorted.push_back(&winfo);
+        }
+        std::sort(sorted.begin(), sorted.end(), [](const write_info * a, const write_info * b) {
+            if (a->tensor != b->tensor) {
+                return std::less<ggml_tensor *>{}(a->tensor, b->tensor);
+            }
+            if (a->size != b->size) {
+                return a->size < b->size;
+            }
+            if (a->offset != b->offset) {
+                return a->offset < b->offset;
+            }
+            return a->ptr < b->ptr;
+        });
+
+        size_t i = 0;
+        while (i < sorted.size()) {
+            size_t group_end = i + 1;
+            while (group_end < sorted.size() &&
+                    sorted[group_end]->tensor == sorted[i]->tensor &&
+                    sorted[group_end]->size == sorted[i]->size) {
+                ++group_end;
+            }
+
+            while (i < group_end) {
+                const write_info & first = *sorted[i];
+                size_t run = 1;
+                size_t source_stride = 0;
+                size_t destination_stride = 0;
+                if (i + 1 < group_end &&
+                        sorted[i + 1]->offset > first.offset &&
+                        sorted[i + 1]->ptr > first.ptr) {
+                    source_stride = sorted[i + 1]->offset - first.offset;
+                    destination_stride = size_t(sorted[i + 1]->ptr - first.ptr);
+                    if (source_stride >= first.size && destination_stride >= first.size) {
+                        run = 2;
+                        while (i + run < group_end &&
+                                sorted[i + run]->offset == first.offset + run*source_stride &&
+                                sorted[i + run]->ptr == first.ptr + run*destination_stride) {
+                            ++run;
+                        }
+                    }
+                }
+
+                if (run > 1) {
+                    ggml_backend_tensor_get_2d(
+                            first.tensor, first.ptr, first.offset, first.size,
+                            run, source_stride, destination_stride);
+                } else {
+                    ggml_backend_tensor_get(first.tensor, first.ptr, first.offset, first.size);
+                }
+                i += run;
+            }
         }
     }
 
@@ -3366,6 +3555,11 @@ private:
     const llama_memory_buffers & mbufs;
 };
 
+struct llama_state_seq_restore_plan {
+    std::unique_ptr<llama_io_read_i> io;
+    size_t bytes = 0;
+};
+
 size_t llama_context::state_get_size(llama_state_seq_flags flags) {
     llama_io_write_dummy io(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
     try {
@@ -3413,7 +3607,7 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size, llama_sta
 static constexpr uint32_t io_magic = 0xaf143cd8;
 
 size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags) {
-    if (seq_id < 0 || uint32_t(seq_id) >= cparams.n_seq_max || !memory || !memory->state_seq_can_save(seq_id)) {
+    if (seq_id < 0 || uint32_t(seq_id) >= cparams.n_seq_max || !memory || !memory->state_seq_can_save(seq_id, flags)) {
         static std::atomic_flag warned = ATOMIC_FLAG_INIT;
         if (!warned.test_and_set()) {
             LLAMA_LOG_WARN("%s: sequence %d cannot be saved while its physical KV stream is shared\n", __func__, seq_id);
@@ -3433,7 +3627,7 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
 }
 
 size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
-    if (seq_id < 0 || uint32_t(seq_id) >= cparams.n_seq_max || !memory || !memory->state_seq_can_save(seq_id)) {
+    if (seq_id < 0 || uint32_t(seq_id) >= cparams.n_seq_max || !memory || !memory->state_seq_can_save(seq_id, flags)) {
         static std::atomic_flag warned = ATOMIC_FLAG_INIT;
         if (!warned.test_and_set()) {
             LLAMA_LOG_WARN("%s: sequence %d cannot be saved while its physical KV stream is shared\n", __func__, seq_id);
@@ -3462,7 +3656,7 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
 }
 
 size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
-    if (seq_id < 0 || uint32_t(seq_id) >= cparams.n_seq_max || !memory || !memory->state_seq_can_restore(seq_id)) {
+    if (seq_id < 0 || uint32_t(seq_id) >= cparams.n_seq_max || !memory || !memory->state_seq_can_restore(seq_id, flags)) {
         static std::atomic_flag warned = ATOMIC_FLAG_INIT;
         if (!warned.test_and_set()) {
             LLAMA_LOG_WARN("%s: sequence %d cannot be restored while its physical KV stream is shared\n", __func__, seq_id);
@@ -3505,6 +3699,40 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
         return 0;
+    }
+}
+
+llama_state_seq_restore_plan * llama_context::state_seq_prepare_data(
+        llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
+    if (src == nullptr || size == 0 ||
+            (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) != 0 ||
+            seq_id < 0 || uint32_t(seq_id) >= cparams.n_seq_max ||
+            !memory || !memory->state_seq_can_restore(seq_id, flags)) {
+        return nullptr;
+    }
+
+    try {
+        auto plan = std::make_unique<llama_state_seq_restore_plan>();
+        plan->io = std::make_unique<llama_io_read_host>(src, size);
+
+        uint32_t magic_read;
+        plan->io->read(&magic_read, sizeof(magic_read));
+        if (io_magic != magic_read) {
+            throw std::runtime_error("wrong sequence state magic");
+        }
+
+        llama_seq_id seq_id_read;
+        plan->io->read(&seq_id_read, sizeof(seq_id_read));
+        GGML_UNUSED(seq_id_read);
+
+        plan->bytes = state_seq_read_data(*plan->io, seq_id, flags);
+        if (plan->bytes != size) {
+            throw std::runtime_error("sequence state contains trailing or missing bytes");
+        }
+        return plan.release();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error preparing state: %s\n", __func__, err.what());
+        return nullptr;
     }
 }
 
@@ -3744,13 +3972,17 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
         for (size_t i = 0; i < backends.size(); ++i) {
             ggml_backend_t             backend = backends[i].get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
-            ret[buft].compute += backend_buf_exp_size[i];
+            ret[buft].compute += backend_buf_exp_size[i] +
+                    backend_kvarn_workspace_y_size[i] +
+                    backend_kvarn_workspace_split_k_size[i];
         }
     } else {
-        for (const auto & backend_ptr : backends) {
-            ggml_backend_t             backend = backend_ptr.get();
+        for (size_t i = 0; i < backends.size(); ++i) {
+            ggml_backend_t             backend = backends[i].get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
-            ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend);
+            ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend) +
+                    backend_kvarn_workspace_y_size[i] +
+                    backend_kvarn_workspace_split_k_size[i];
         }
     }
     return ret;
@@ -4020,6 +4252,7 @@ llama_context_params llama_context_default_params() {
         /*.kv_tail_tokens              =*/ 0,
         /*.kv_tail_type                =*/ GGML_TYPE_COUNT,
         /*.kv_tail_config              =*/ nullptr,
+        /*.kv_tail_request             =*/ nullptr,
     };
 
     return result;
@@ -4120,6 +4353,22 @@ llama_context * llama_init_from_model(
         }
     }
 
+    if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4) && params.type_k != params.type_v) {
+        LLAMA_LOG_ERROR("%s: model does not support different K (%s) and V (%s) cache types\n", __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
+        return nullptr;
+    }
+
+    if (ggml_is_quantized(params.type_v) && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
+        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
+            LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for quantized V cache\n", __func__);
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        }
+        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+            LLAMA_LOG_ERROR("%s: quantized V cache requires flash_attn to be enabled\n", __func__);
+            return nullptr;
+        }
+    }
+
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_k)) {
         const uint32_t blck_size = ggml_blck_size(params.type_k);
         for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
@@ -4140,11 +4389,6 @@ llama_context * llama_init_from_model(
                 return nullptr;
             }
         }
-    }
-
-    if (ggml_is_quantized(params.type_v) && params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
-        LLAMA_LOG_ERROR("%s: V cache quantization requires flash_attn\n", __func__);
-        return nullptr;
     }
 
     if (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED &&
@@ -4477,6 +4721,16 @@ bool llama_memory_state_seq_can_restore(llama_memory_t mem, llama_seq_id seq_id)
     return mem != nullptr && mem->state_seq_can_restore(seq_id);
 }
 
+bool llama_memory_state_seq_can_save_ext(
+        llama_memory_t mem, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    return mem != nullptr && mem->state_seq_can_save(seq_id, flags);
+}
+
+bool llama_memory_state_seq_can_restore_ext(
+        llama_memory_t mem, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    return mem != nullptr && mem->state_seq_can_restore(seq_id, flags);
+}
+
 bool llama_memory_seq_rm(
         llama_memory_t mem,
           llama_seq_id seq_id,
@@ -4673,6 +4927,33 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
     ctx->synchronize();
 
     return ctx->state_seq_set_data(seq_id, src, size, flags);
+}
+
+llama_state_seq_restore_plan * llama_state_seq_prepare_data_ext(
+        llama_context * ctx,
+        const uint8_t * src,
+        size_t size,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags) {
+    if (ctx == nullptr) {
+        return nullptr;
+    }
+
+    ctx->synchronize();
+    return ctx->state_seq_prepare_data(seq_id, src, size, flags);
+}
+
+size_t llama_state_seq_restore_plan_commit(llama_state_seq_restore_plan * plan) {
+    if (plan == nullptr || !plan->io) {
+        return 0;
+    }
+    plan->io->commit();
+    plan->io.reset();
+    return plan->bytes;
+}
+
+void llama_state_seq_restore_plan_free(llama_state_seq_restore_plan * plan) {
+    delete plan;
 }
 
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {

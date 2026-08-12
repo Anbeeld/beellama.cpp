@@ -599,11 +599,15 @@ static bool ggml_alloc_is_zero_alloc_proxy(const struct ggml_tensor * t) {
     return t->op == GGML_OP_KVARN_VIEW;
 }
 
-static bool ggml_alloc_is_zero_alloc_proxy_view(const struct ggml_tensor * t) {
+static const struct ggml_tensor * ggml_alloc_zero_alloc_proxy_base(const struct ggml_tensor * t) {
     while (t != NULL && t->view_src != NULL) {
         t = t->view_src;
     }
-    return t != NULL && ggml_alloc_is_zero_alloc_proxy(t);
+    return t != NULL && ggml_alloc_is_zero_alloc_proxy(t) ? t : NULL;
+}
+
+static bool ggml_alloc_is_zero_alloc_proxy_view(const struct ggml_tensor * t) {
+    return ggml_alloc_zero_alloc_proxy_base(t) != NULL;
 }
 
 // free the extra space at the end if the new tensor is smaller
@@ -767,6 +771,21 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
 
             ggml_gallocr_hash_get(galloc, src)->n_children += 1;
 
+            // KVARN_VIEW is a bufferless descriptor proxy. Its sources are
+            // consumed by operations that reference the proxy (usually
+            // through reshape/permute views), not when the proxy node itself
+            // is visited. Extend those source lifetimes for every downstream
+            // proxy edge so the final attention operation cannot reuse a
+            // compute-allocated indirect read plan before it executes.
+            const struct ggml_tensor * proxy = ggml_alloc_zero_alloc_proxy_base(src);
+            if (proxy != NULL) {
+                for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                    if (proxy->src[k] != NULL) {
+                        ggml_gallocr_hash_get(galloc, proxy->src[k])->n_children += 1;
+                    }
+                }
+            }
+
             // allocate explicit inputs
             if (src->flags & GGML_TENSOR_FLAG_INPUT) {
                 ggml_gallocr_allocate_node(galloc, src, get_node_buffer_id(node_buffer_ids, i));
@@ -829,6 +848,22 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
                 }
                 else if (p_hn->allocated) {
                     ggml_gallocr_free_node(galloc, parent);
+                }
+            }
+
+            const struct ggml_tensor * proxy = ggml_alloc_zero_alloc_proxy_base(parent);
+            if (proxy != NULL) {
+                for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                    struct ggml_tensor * dependency = proxy->src[k];
+                    if (dependency == NULL) {
+                        continue;
+                    }
+                    struct hash_node * d_hn = ggml_gallocr_hash_get(galloc, dependency);
+                    d_hn->n_children -= 1;
+                    GGML_ASSERT(d_hn->n_children >= 0);
+                    if (d_hn->n_children == 0 && d_hn->n_views == 0 && d_hn->allocated) {
+                        ggml_gallocr_free_node(galloc, dependency);
+                    }
                 }
             }
             AT_PRINTF("\n");

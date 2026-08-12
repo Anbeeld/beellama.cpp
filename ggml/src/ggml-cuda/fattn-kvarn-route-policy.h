@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <limits>
 
+#define GGML_CUDA_FATTN_KVARN_OPERATION_POLICY 1
+
 constexpr int GGML_CUDA_FATTN_KVARN_SPECIALIZED_DECODE_MAX_Q = 16;
 constexpr int GGML_CUDA_FATTN_KVARN_PORTABLE_THREADS = 128;
 constexpr uint32_t GGML_CUDA_FATTN_KVARN_PORTABLE_MAX_Q =
@@ -19,7 +21,68 @@ enum ggml_cuda_fattn_kvarn_route {
     GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_VECTOR,
     GGML_CUDA_FATTN_KVARN_ROUTE_GENERIC_MMA,
     GGML_CUDA_FATTN_KVARN_ROUTE_PROMPT_PREFILL,
+    GGML_CUDA_FATTN_KVARN_ROUTE_PORTABLE_NATIVE,
+    GGML_CUDA_FATTN_KVARN_ROUTE_UNAVAILABLE,
 };
+
+enum ggml_cuda_fattn_kvarn_amd_mma_arch {
+    GGML_CUDA_FATTN_KVARN_AMD_NONE,
+    GGML_CUDA_FATTN_KVARN_AMD_RDNA_WMMA,
+    GGML_CUDA_FATTN_KVARN_AMD_CDNA_MFMA,
+};
+
+enum ggml_cuda_fattn_kvarn_mma_eligibility {
+    GGML_CUDA_FATTN_KVARN_MMA_ELIGIBLE,
+    GGML_CUDA_FATTN_KVARN_MMA_NO_FAMILY,
+    GGML_CUDA_FATTN_KVARN_MMA_INVALID_COLUMNS,
+    GGML_CUDA_FATTN_KVARN_MMA_TILE_TOO_SMALL,
+    GGML_CUDA_FATTN_KVARN_MMA_RDNA_SINGLE_GQA_COLUMN,
+    GGML_CUDA_FATTN_KVARN_MMA_HEAD_DIM_UNSUPPORTED,
+};
+
+struct ggml_cuda_fattn_kvarn_amd_mma_input {
+    ggml_cuda_fattn_kvarn_amd_mma_arch arch;
+    int head_dim;
+    int ncols1;
+    int ncols2;
+};
+
+// Host mirror of the final device-side invariants in flash_attn_ext_f16.
+// Device guards remain in place so a future caller cannot turn an invalid
+// AMD template into executable code by bypassing this route policy.
+inline ggml_cuda_fattn_kvarn_mma_eligibility ggml_cuda_fattn_kvarn_amd_mma_eligibility(
+        const ggml_cuda_fattn_kvarn_amd_mma_input & input) {
+    if (input.arch == GGML_CUDA_FATTN_KVARN_AMD_NONE) {
+        return GGML_CUDA_FATTN_KVARN_MMA_NO_FAMILY;
+    }
+    if (input.ncols1 <= 0 || input.ncols2 <= 0) {
+        return GGML_CUDA_FATTN_KVARN_MMA_INVALID_COLUMNS;
+    }
+    if (input.head_dim <= 0 ||
+            (input.arch == GGML_CUDA_FATTN_KVARN_AMD_RDNA_WMMA && input.head_dim > 128) ||
+            (input.arch == GGML_CUDA_FATTN_KVARN_AMD_CDNA_MFMA && input.head_dim > 256)) {
+        return GGML_CUDA_FATTN_KVARN_MMA_HEAD_DIM_UNSUPPORTED;
+    }
+    if (input.ncols1 * input.ncols2 < 16) {
+        return GGML_CUDA_FATTN_KVARN_MMA_TILE_TOO_SMALL;
+    }
+    if (input.arch == GGML_CUDA_FATTN_KVARN_AMD_RDNA_WMMA && input.ncols2 == 1) {
+        return GGML_CUDA_FATTN_KVARN_MMA_RDNA_SINGLE_GQA_COLUMN;
+    }
+    return GGML_CUDA_FATTN_KVARN_MMA_ELIGIBLE;
+}
+
+inline ggml_cuda_fattn_kvarn_route ggml_cuda_fattn_kvarn_select_fallback_route(
+        bool prompt_prefill,
+        bool generic_shape_eligible,
+        bool portable_eligible) {
+    if (generic_shape_eligible) {
+        return prompt_prefill ? GGML_CUDA_FATTN_KVARN_ROUTE_PROMPT_PREFILL :
+            GGML_CUDA_FATTN_KVARN_ROUTE_GENERIC_MMA;
+    }
+    return portable_eligible ? GGML_CUDA_FATTN_KVARN_ROUTE_PORTABLE_NATIVE :
+        GGML_CUDA_FATTN_KVARN_ROUTE_UNAVAILABLE;
+}
 
 enum ggml_cuda_fattn_kvarn_backend {
     GGML_CUDA_FATTN_KVARN_BACKEND_CUDA,
@@ -88,9 +151,10 @@ inline ggml_cuda_fattn_kvarn_capabilities ggml_cuda_fattn_kvarn_select_capabilit
     } else if (input.backend == GGML_CUDA_FATTN_KVARN_BACKEND_HIP) {
         result.generic_mma =
             input.matrix_mma && result.store_materialize && physical_wave_supported;
-        result.decode_split = result.generic_mma;
-        // The SWA vector kernel is still CUDA-warp tuned. HIP uses split decode
-        // or generic MMA until a physical-wave vector route proves worthwhile.
+        // Split decode uses NVIDIA ldmatrix plus m16n8 MMA fragments, and the
+        // SWA vector kernel is CUDA-warp tuned. HIP uses shape-gated generic
+        // WMMA/MFMA or portable direct-record attention instead.
+        result.decode_split = false;
         result.decode_vector = false;
     }
     // MUSA intentionally remains portable-native. Its compiler consumes these
@@ -99,7 +163,13 @@ inline ggml_cuda_fattn_kvarn_capabilities ggml_cuda_fattn_kvarn_select_capabilit
 
     result.specialized_routes =
         result.generic_mma || result.decode_split || result.decode_vector;
-    result.original_v_domain = result.generic_mma;
+    // On CUDA, generic MMA is valid for every graph-admitted original-V
+    // shape. HIP's family bit is only an inventory claim: RDNA/CDNA template
+    // support is operation-specific, so HIP stays on the unbounded rotated
+    // portable domain until the bounded original-V window matrix is proven on
+    // both physical wave sizes.
+    result.original_v_domain =
+        input.backend == GGML_CUDA_FATTN_KVARN_BACKEND_CUDA && result.generic_mma;
     result.route_families =
         (result.portable_native ? GGML_CUDA_FATTN_KVARN_FAMILY_PORTABLE_NATIVE : 0u) |
         (result.generic_mma ? GGML_CUDA_FATTN_KVARN_FAMILY_GENERIC_MMA : 0u) |
@@ -114,6 +184,24 @@ inline ggml_cuda_fattn_kvarn_capabilities ggml_cuda_fattn_kvarn_select_capabilit
         GGML_CUDA_FATTN_KVARN_HEAD_DIM_256 |
         GGML_CUDA_FATTN_KVARN_HEAD_DIM_512 : 0u;
     return result;
+}
+
+inline bool ggml_cuda_fattn_kvarn_body_shape_supported(
+        const ggml_cuda_fattn_kvarn_capabilities & capabilities,
+        int64_t d_k,
+        int64_t d_v) {
+    uint32_t head_dim = 0;
+    if (d_k != d_v) {
+        return false;
+    }
+    switch (d_k) {
+        case 128: head_dim = GGML_CUDA_FATTN_KVARN_HEAD_DIM_128; break;
+        case 256: head_dim = GGML_CUDA_FATTN_KVARN_HEAD_DIM_256; break;
+        case 512: head_dim = GGML_CUDA_FATTN_KVARN_HEAD_DIM_512; break;
+        default: return false;
+    }
+    return capabilities.portable_native &&
+        (capabilities.supported_head_dims & head_dim) != 0;
 }
 
 struct ggml_cuda_fattn_kvarn_route_input {

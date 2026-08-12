@@ -181,6 +181,7 @@ public:
 
     // state write/load
 
+    bool requires_state_for_partial_restore() const override;
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
@@ -202,6 +203,8 @@ public:
 
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
+
+    const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
     //
     // graph_build API
@@ -259,8 +262,13 @@ public:
     void commit_pending_tail_copy();
     void cancel_pending_tail_copy();
     std::vector<int32_t> state_tail_payload_slots(llama_seq_id seq_id) const;
+    std::vector<uint32_t> state_source_cells(llama_seq_id seq_id) const;
     std::vector<std::vector<int32_t>> take_restored_tail_payload_slots();
-    ggml_tensor * get_k_idx(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    void clone_logical_state_from(const llama_kv_cache & source);
+    void set_allocation_group_size(uint32_t group_size, uint32_t stage_groups = 1);
+    bool allocation_cell_uses_stage(uint32_t cell) const;
+    void set_state_remap_group_size(uint32_t group_size);
+    const std::vector<std::pair<uint32_t, uint32_t>> & get_state_cell_remap() const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
@@ -278,7 +286,6 @@ public:
             ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * tail_idxs,
             int32_t il, ggml_tensor * dependency = nullptr) const;
     void finish_tail_batch(bool success, bool payload_may_be_modified);
-    ggml_tensor * cpy_k_idx(ggml_context * ctx, ggml_tensor * k_idx_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
 
     //
     // preparation API
@@ -321,10 +328,18 @@ public:
     void set_input_k_shift_tail(ggml_tensor * dst) const;
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_mask_mapped(
+            ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn,
+            const std::vector<int64_t> & read_cells) const;
     void set_input_kq_mask_tail(
             ggml_tensor * body, ggml_tensor * exact,
             ggml_tensor * read_idxs, ggml_tensor * body_read_idxs, ggml_tensor * bias_read_idxs,
-            const llama_ubatch * ubatch, uint32_t n_kv, bool causal_attn) const;
+            const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_mask_tail_mapped(
+            ggml_tensor * body, ggml_tensor * exact,
+            ggml_tensor * read_idxs, ggml_tensor * body_read_idxs, ggml_tensor * bias_read_idxs,
+            const llama_ubatch * ubatch, bool causal_attn,
+            const std::vector<int64_t> & read_cells) const;
     bool can_pack_tail_body(const llama_ubatch & ubatch) const;
     void set_input_tail_body_plan(
             ggml_tensor * query_order, ggml_tensor * run_desc,
@@ -341,6 +356,8 @@ public:
 
 private:
     bool seq_rm_unchecked(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
+    void reset_allocation_head(llama_seq_id seq_id);
+    void rebuild_allocation_head(llama_seq_id seq_id);
 
     const llama_model & model;
     const llama_hparams & hparams;
@@ -354,11 +371,9 @@ private:
         ggml_tensor * v;
         ggml_tensor * k_tail;
         ggml_tensor * v_tail;
-        ggml_tensor * k_idx;   // MSA single-head indexer keys, F32
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
-        std::vector<ggml_tensor *> k_idx_stream;
     };
 
     bool v_trans = true;  // the value tensor is transposed
@@ -415,6 +430,16 @@ private:
     uint64_t tail_ordinal = 0;
     std::vector<int64_t> tail_write_slots;
     std::vector<std::vector<int32_t>> restored_tail_payload_slots;
+    uint32_t allocation_group_size = 1;
+    uint32_t allocation_stage_groups = 1;
+    // Structured unified caches reserve whole record groups for one exact
+    // sequence-id set. Completed records remain freely shareable capacity;
+    // only incomplete groups contend for the small cyclic F16 stage. Keep an
+    // independent cursor per logical sequence and select new groups whose
+    // stage slot is not occupied by another live frontier.
+    std::vector<uint32_t> allocation_seq_heads;
+    uint32_t state_remap_group_size = 1;
+    std::vector<std::pair<uint32_t, uint32_t>> state_cell_remap;
     uint32_t tail_write_levels = 0;
     bool tail_preparing = false;
     bool tail_graph_started = false;
@@ -435,9 +460,6 @@ private:
 
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
-
-    // set when a k_idx (indexer) cache exists and the stream layout supports MSA (single seq, or one stream per seq)
-    bool msa_strict_slots = false;
 
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
@@ -471,7 +493,6 @@ private:
 
     size_t size_k_bytes() const;
     size_t size_v_bytes() const;
-    size_t size_k_idx_bytes() const;
 
     ggml_tensor * build_rope_shift(
             const llama_cparams & cparams,
@@ -505,7 +526,8 @@ private:
     state_v2_manifest state_v2_read_manifest(
             llama_io_read_i & io,
             llama_seq_id seq_id,
-            bool body_only) const;
+            bool body_only,
+            uint32_t version) const;
     void state_v2_write_body_payload(llama_io_write_i & io, const state_v2_manifest & manifest) const;
     void state_v2_write_tail_payload(llama_io_write_i & io, const state_v2_manifest & manifest) const;
     void state_v2_read_payload_and_install(
@@ -514,10 +536,12 @@ private:
             llama_state_seq_flags flags,
             state_v2_manifest & manifest,
             uint64_t body_payload_size,
-            uint64_t tail_payload_size);
+            uint64_t tail_payload_size,
+            uint32_t version);
     void materialize_pending_copies();
     std::vector<std::vector<uint32_t>> state_read_body(
             llama_io_read_i & io, llama_seq_id seq_id, uint32_t n_stream_cur);
+    void state_read_impl(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags);
     void state_read_tail(
             llama_io_read_i & io,
             llama_seq_id seq_id,
@@ -604,7 +628,6 @@ public:
     virtual const llama_kv_tail_layer_route * get_tail_layer_route(int32_t il) const;
     virtual bool get_tail_explicit_bias(int32_t il) const;
     virtual bool can_pack_tail_body(const llama_ubatch & ubatch) const;
-    virtual ggml_tensor * get_k_idx(ggml_context * ctx, int32_t il) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory
@@ -626,7 +649,6 @@ public:
     virtual ggml_tensor * cpy_v_tail(
             ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * tail_idxs,
             int32_t il, ggml_tensor * dependency = nullptr) const;
-    virtual ggml_tensor * cpy_k_idx(ggml_context * ctx, ggml_tensor * k_idx_cur, ggml_tensor * k_idxs, int32_t il) const;
 
     // create destination indices for each head of the current batch for where it would be written in the KV cache
     // the indices address the global KV cache (not per stream) - this is not relevant for the user of this API, but

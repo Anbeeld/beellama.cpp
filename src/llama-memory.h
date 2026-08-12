@@ -204,6 +204,14 @@ struct llama_memory_i {
     virtual bool state_seq_can_restore(llama_seq_id seq_id) const {
         return seq_id >= 0;
     }
+    virtual bool state_seq_can_save(llama_seq_id seq_id, llama_state_seq_flags flags) const {
+        GGML_UNUSED(flags);
+        return state_seq_can_save(seq_id);
+    }
+    virtual bool state_seq_can_restore(llama_seq_id seq_id, llama_state_seq_flags flags) const {
+        GGML_UNUSED(flags);
+        return state_seq_can_restore(seq_id);
+    }
 
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;

@@ -1,4 +1,4 @@
-# BeeLlama v0.4.0 argument reference
+# BeeLlama v0.4.3 argument reference
 
 This page covers Bee-owned arguments and the upstream arguments whose behavior
 BeeLlama extends. Run `llama-server --help` or `llama-cli --help` for the full
@@ -36,7 +36,7 @@ contexts remain on standard cache types and do not inherit the target tail.
 
 | Argument | Env var | Default | Behavior |
 |---|---|---|---|
-| `--kv-tail-tokens SPEC` | `LLAMA_ARG_KV_TAIL_TOKENS` | `0` | For standard caches, `0` keeps the ordinary cache path. For KVarN, omitted or `0` retains the intrinsic 128-token exact suffix. A number applies to every canonical group; KVarN rounds positive values upward to complete 128-token groups. `N0,N1` follows canonical group order, while `full=N,swa=N` accepts unique role aliases or structural IDs such as `full@l0`. Invalid, duplicate, incomplete, or wrong-length specifications resolve additional coverage to zero, while KVarN still retains its intrinsic suffix. `auto` requests 1024 exact tokens per applicable target-cache group, capped by that group's effective context or attention window. |
+| `--kv-tail-tokens SPEC` | `LLAMA_ARG_KV_TAIL_TOKENS` | `0` | For standard caches, `0` keeps the ordinary cache path. For KVarN, omitted or `0` retains the intrinsic 128-token exact suffix. A number applies to every canonical group; KVarN rounds positive values upward to complete 128-token groups. `N0,N1` follows canonical group order, while `full=N,swa=N` accepts unique role aliases or structural IDs such as `full@l0`. Invalid, duplicate, incomplete, ambiguous, or wrong-length specifications fail context creation. `auto` requests 1024 exact tokens per applicable target-cache group, capped by that group's effective context or attention window. |
 | `--kv-tail-type TYPE` | `LLAMA_ARG_KV_TAIL_TYPE` | `bf16` for standard caches; `f16` for KVarN | Selects `f16` or `bf16` exact storage for compact history and compact-native SWA. An explicit value overrides the cache-family default in either direction. Other types are rejected. |
 
 An omitted tail type remains automatic until context placement. If the standard
@@ -53,6 +53,15 @@ rows, graph-local body execution rows, owner backend, current-segment
 presence, transient estimate, and memory increments. Native routes are checked
 again against the final constructed operation. A mismatch fails context/graph
 construction instead of allowing the scheduler to move that layer silently.
+
+The CLI is parsed once into an immutable, model-independent request. Fit probes
+and the final context bind that same request to the model's canonical cache
+groups, so `auto`, positional, named, and KVarN-minimum policies cannot diverge
+between estimation and allocation. Public callers that need the same behavior
+can create a request with `llama_kv_tail_request_init`, keep it alive through
+context creation, assign the borrowed pointer to
+`llama_context_params::kv_tail_request`, and then free it with
+`llama_kv_tail_request_free`.
 
 Let `N` be the resolved exact length, `U` the physical ubatch limit, `R` the
 advertised suffix-rollback horizon, and `S` the number of exact streams. Compact
@@ -109,17 +118,22 @@ that state into a tail-enabled context is valid, but the coverage API reports
 window. Server metrics expose requested/exact token totals, complete/partial/no
 coverage group counts, and degraded-sequence counts.
 
-KVarN state version 13 stores logical compressed records and compact exact payloads
+KVarN state version 15 stores sequence-selective logical compressed record
+groups, compact exact payloads, selected stage rows, and destination remapping
 independently of ubatch workspace, so state may move between `ub=128` and
-`ub=512`. Version 12 remains readable where its logical representation is
-compatible; version 11 is rejected rather than reinterpreting its old physical
+`ub=512`. Live checkpoint state may retain sealed history already owned by the
+context; `LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED` exports every payload needed
+after the source is removed. Compatible version 12 and 13 state remains
+readable; version 11 is rejected rather than reinterpreting its old physical
 workspace layout. Tail length, type, preset, rollback horizon, representation,
 and structural-group mismatches fail closed.
 
-Sequence state writes precision-tail manifest version 3, including the compact
-representation and rollback horizon, and supports host or on-device tensor
-transfer. Manifest version 2 remains readable for non-compact layouts; version
-1 restores conservative degraded provenance. Immediate body
+Sequence state writes precision-tail manifest version 5, including exact source
+cell/generation identities, exact-tail local slots, insertion order, the
+per-sequence write cursor, the compact representation, and rollback horizon,
+and supports host or on-device tensor transfer. Version 4 remains readable;
+manifest version 2 remains readable for non-compact layouts, while version 1
+restores conservative degraded provenance. Immediate body
 membership and position changes after sequence copy are preserved; pending
 exact rows materialize as one batch when state data is requested.
 
@@ -128,14 +142,37 @@ has validated. A truncated, corrupt, mismatched, or failed backend transfer is
 cancelled. Deferred precision-tail copy failures propagate through immediate state
 save and subsequent decode instead of being reported as successful.
 
-Prompt-cache message boundaries do not reset the suffix. Standard unified and
-non-unified slots reuse continuously. KVarN precision-tail divergence trims
-exactly; eligible older divergence reuses from the overlapping 128-token group
-boundary on a non-unified or exclusive unified stream. Unified contention, an
-unsupported recurrent rollback, `cache_prompt=false`, slot eviction, or no
-common target/draft plan produces a safe full reevaluation. Unified KVarN RAM
-save and restore require stream exclusivity; contended save is skipped without
-clearing the slot, and contended restore is a miss.
+Prompt-cache message boundaries do not reset the suffix. Standard and KVarN
+state is sequence-selective in unified and non-unified layouts. The planner
+records lexical, restorable, and committed token counts and restores target,
+draft, and speculative state as one prepared transaction. Live slots and RAM
+entries are compared by safe restorable tokens before existing tie-breaks.
+Standard and recurrent caches keep upstream prompt batching; KVarN alone adds
+its descriptor-boundary eligibility rule. RAM entries use self-contained
+immutable state, are repeatably restorable, and clear an idle unified slot only
+after successful admission. Tail length affects quality, memory, and transfer
+cost, not logical prompt-cache eligibility.
+
+KVarN durable prompt checkpoints remain on complete 128-token descriptor
+boundaries for the current G128 presets. The transient live exact frontier may still service the
+existing bounded speculative micro-rollback contract; it does not turn sealed
+history into arbitrary-position records. Standard KV has no KVarN group
+constraint and may restore any validated logical position. For standard caches
+with a precision tail, a hot partial checkpoint references the still-live body
+and transfers its logical manifest and exact overlay. The manifest remains
+proportional to the logical prefix, so this is not a native sealed-block arena
+or a strictly frontier-only operation. Copy-on-write sharing applies to
+serialized checkpoint byte buffers, not native KV blocks. Self-contained RAM
+state continues to own and transfer the body because it must survive source
+removal.
+
+Completion timing JSON includes `cache_lcp_n`, `cache_planned_n`,
+`cache_reprocessed_n`, `cache_source`, and `cache_reason`. Prometheus exports
+`prompt_cache_admission_*_total`, `prompt_cache_restore_*_total`,
+`prompt_cache_accounted_bytes`, `n_busy_slots_per_decode`, and the
+`kv_tail_*` coverage/degradation gauges. A nonzero restore-failure or degraded
+tail metric is actionable rather than silently counted as a hit. Accounted
+bytes are serialized payload accounting, not exact process-resident memory.
 
 ## DFlash and adaptive draft depth
 
@@ -185,9 +222,12 @@ behavior. The `--spec-dm-*` rows are Bee server additions.
 | Preset key `load-on-startup` | Preset-only | False when absent | A truthy value autoloads that model when router mode starts; the number of startup models may not exceed `--models-max`. |
 | Preset key `stop-timeout` | Preset-only | `10` seconds | Force-kills a child model process after this many seconds of graceful shutdown. Invalid values fall back to 10. |
 
-`GET /models` only lists sanitized model identity, status, source, aliases,
-tags, and capabilities. It never returns child argv, raw presets, model paths,
-or tokens and ignores former reload query parameters. Refresh model sources
+`GET /models` lists model identity, status, source, aliases, tags, and
+capabilities. Matching upstream, each entry's `status` exposes the child argv
+(`status.args`) and, for preset-backed models, the resolved INI preset
+(`status.preset`) with sensitive options stripped; these may contain local
+paths for custom-path preset models. It ignores former reload query parameters.
+Refresh model sources
 with `POST /models/reload`; when `--api-key` is configured this mutation
 requires the same `Authorization: Bearer ...` or `X-Api-Key` authentication as
 other non-public routes. `--hf-token` is a sensitive option: router children
@@ -212,12 +252,14 @@ Use the same corpus, context, logical batch, and physical ubatch for both KLD le
 | `-DGGML_CUDA_FA_ALL_QUANTS=ON` | — | Off | Expands the CUDA vector matrix from 50 to all 169 standard cache pairs and, when `GGML_CUDA_KVARN=ON`, KVarN fast-decode instances from 15 balanced pairs to all 36 ordered bit pairs. Valid KVarN pairs outside the fast matrix use descriptor-native MMA. |
 | `-DGGML_CUDA_KVARN=ON/OFF` | — | On | Compiles or omits the shared CUDA/HIP KVarN kernels and CUDA native-attention template instances. When enabled, `GGML_CUDA_FA_ALL_QUANTS` selects 15 default or all 36 CUDA fast-decode pairs. CUDA devices without the specialized Turing MMA contract use the portable direct-record route when their warp, thread-block, shared-memory, head-dimension, and tail-type capabilities pass. |
 
-CUDA 12.4 is the release lane for Maxwell, Pascal, and Volta. CUDA 13.1 covers
-Turing and newer architectures. The architecture CI compiles SM 5.0, 5.2,
-5.3, 6.0, 6.1, 6.2, 7.0, 7.2, and 7.5 separately with CUDA 12.4, and SM 7.5
-through the current Blackwell targets with CUDA 13.1. These are compile gates;
-pre-Turing support remains runtime-unqualified until matching real devices pass
-the KVarN parity, memory, and model-smoke tests.
+Release packages are built with CUDA 12.4 and 13.1. CUDA 12.4 can emit the
+Maxwell, Pascal, and Volta PTX targets used by the portable KVarN route; CUDA
+13.1 covers Turing and newer architectures. The release workflow no longer has
+an exhaustive per-architecture CUDA compile gate. For a local or CI build,
+select the intended target explicitly with `CMAKE_CUDA_ARCHITECTURES` when the
+build host cannot detect it. Pre-Turing support remains runtime-unqualified
+until matching real devices pass the KVarN parity, memory, and model-smoke
+tests.
 
 ## Migration from earlier versions
 

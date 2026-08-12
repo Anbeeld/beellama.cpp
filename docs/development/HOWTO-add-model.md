@@ -1,9 +1,9 @@
-# Add a new model architecture to `llama.cpp`
+# Add a new model architecture to BeeLlama.cpp
 
 Adding a model requires few steps:
 
 1. Convert the model to GGUF
-2. Define the model architecture in `llama.cpp`
+2. Define the model architecture using BeeLlama's upstream-compatible conventions
 3. Build the GGML graph implementation
 4. Optional: Add multimodal encoder implementation
 
@@ -133,6 +133,7 @@ Note:
 - To debug the multimodal preprocessor and encoder, you can use [llama-mtmd-debug](tools/mtmd/debug/mtmd-debug.cpp).
 - Adding a model-specific API or CLI is an anti-pattern in `libmtmd`. The goal of `libmtmd` is to provide an easy-to-use, model-agnostic library for multimodal pipeline.
 - In most cases, `llama-mtmd-cli` should not be modified. If a model requires a specific prompt, either let the user provide it or bake it into the Jinja chat template.
+- For audio generation models, see `tools/mtmd/README-dev.md`
 
 ## Tips and tricks
 

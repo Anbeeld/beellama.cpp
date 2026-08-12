@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <limits>
 #include <list>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -453,6 +454,14 @@ public:
             llama_pos position,
             uint64_t insertion_ordinal,
             uint32_t current_row = UINT32_MAX);
+    int32_t restore(
+            llama_seq_id seq_id,
+            llama_kv_tail_identity identity,
+            llama_pos position,
+            uint64_t insertion_ordinal,
+            uint32_t local_slot);
+    uint32_t state_write_cursor(llama_seq_id seq_id) const;
+    void restore_write_cursor(llama_seq_id seq_id, uint32_t cursor);
 
     void begin_batch();
     void finish_batch(bool success, bool payload_may_be_modified);
@@ -504,6 +513,8 @@ public:
     void restore_provenance(
             const std::vector<llama_kv_tail_provenance> & provenance,
             llama_seq_id dest_seq_id = -1);
+    void clone_logical_state_from(const llama_kv_tail_store & source);
+    std::unique_ptr<llama_kv_tail_store> clone_logical_state() const;
 
 private:
     struct identity_hash {

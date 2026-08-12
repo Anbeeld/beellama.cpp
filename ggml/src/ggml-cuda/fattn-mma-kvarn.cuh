@@ -38,10 +38,23 @@ struct ggml_cuda_fattn_kvarn_desc {
     int swa;
     int head_slices;
     int eager_records;
+    int read_indirect;
     // Large prefill can reconstruct one side in the original domain in the MMA tile loader.
     // Decode-width paths keep rotated-domain K/V and rotate Q/output in the graph.
     int original_domain;
 };
+
+static __device__ __forceinline__ int64_t ggml_cuda_fattn_kvarn_read_cell(
+        const ggml_cuda_fattn_kvarn_desc & desc,
+        const int64_t encoded,
+        bool & explicitly_staged) {
+    explicitly_staged = false;
+    if (encoded >= -1) {
+        return encoded;
+    }
+    explicitly_staged = true;
+    return -encoded - 2;
+}
 
 static __device__ __forceinline__ bool ggml_cuda_fattn_kvarn_group_from_stage(
         const ggml_cuda_fattn_kvarn_desc & desc,
@@ -106,6 +119,7 @@ struct ggml_cuda_fattn_kvarn_plan_side {
     bool value        = false;
     bool swa          = false;
     bool eager_records = false;
+    bool read_indirect = false;
 };
 
 struct ggml_cuda_fattn_kvarn_plan {
@@ -197,6 +211,7 @@ static inline bool ggml_cuda_fattn_kvarn_unwrap_view(
     side.n_stream = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_VIEW_N_STREAM);
     side.swa = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_VIEW_SWA) != 0;
     side.eager_records = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_EAGER_RECORDS) != 0;
+    side.read_indirect = ggml_get_op_params_i32(cur, 10) != 0;
     const int head_slices_param = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_HEAD_SLICES);
     side.head_slices = head_slices_param > 0 ? head_slices_param : 1;
     side.stage_groups = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_STAGE_GROUPS);
@@ -229,6 +244,7 @@ static inline bool ggml_cuda_fattn_kvarn_view_supported(
         const int device,
         const ggml_tensor * dst,
         ggml_cuda_fattn_kvarn_plan * out = nullptr) {
+    GGML_UNUSED(device);
     if (dst == nullptr || dst->op != GGML_OP_FLASH_ATTN_EXT || dst->src[0] == nullptr ||
             dst->src[1] == nullptr || dst->src[2] == nullptr) {
         return false;
@@ -239,13 +255,6 @@ static inline bool ggml_cuda_fattn_kvarn_view_supported(
     if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16) {
         return false;
     }
-#if !defined(GGML_USE_HIP)
-    if (!turing_mma_available(ggml_cuda_info().devices[device].cc)) {
-        return false;
-    }
-#else
-    GGML_UNUSED(device);
-#endif
     if (!((Q->ne[0] == 128 && V->ne[0] == 128) ||
           (Q->ne[0] == 256 && V->ne[0] == 256) ||
           (Q->ne[0] == 512 && V->ne[0] == 512))) {

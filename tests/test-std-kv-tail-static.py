@@ -126,13 +126,30 @@ def main() -> None:
             raise AssertionError(f"public memory API lacks {query}")
 
     server_context = (ROOT / "tools/server/server-context.cpp").read_text(encoding="utf-8")
+    for removed_policy in (
+        "recurrent_prompt_slot",
+        "checkpoint_min_step_effective",
+        "prompt_add_limit",
+        "numerically unstable recurrent checkpoint boundary",
+    ):
+        if removed_policy in server_context:
+            raise AssertionError(f"server retains over-scoped prompt policy: {removed_policy}")
     suffix_block = server_context.split(
         "// truncate any tokens that are beyond n_past for this slot", 1
     )[1].split("// If using an alora", 1)[0]
-    if "server_plan_and_remove_suffix(" not in suffix_block:
-        raise AssertionError("server prompt suffix trimming bypasses the atomic removal transaction")
-    if "common_context_seq_rm" in suffix_block:
-        raise AssertionError("server prompt suffix trimming still uses the aborting removal wrapper")
+    if "slot.mem.seq_rm_suffix(" not in suffix_block:
+        raise AssertionError("server prompt suffix trimming bypasses the common_memory transaction")
+    if "llama_memory_seq_rm" in suffix_block or "common_context_seq_rm" in suffix_block:
+        raise AssertionError("server prompt suffix trimming still duplicates raw memory removal")
+
+    common_source = (ROOT / "common/common.cpp").read_text(encoding="utf-8")
+    fit_callsite = common_source.split(
+        "if (params.fit_params) {", 1
+    )[1].split("llama_model * model = llama_model_load_from_file", 1)[0]
+    if "common_fit_params(" not in fit_callsite:
+        raise AssertionError("common init no longer invokes upstream parameter fitting")
+    if "fit_status" in fit_callsite or "failed to fit parameters with exact Bee validation" in fit_callsite:
+        raise AssertionError("common init hard-fails an advisory upstream fit conflict")
 
     server_tests = (ROOT / "tests/test-server-prompt-checkpoint.cpp").read_text(encoding="utf-8")
     for regression in (
@@ -142,6 +159,10 @@ def main() -> None:
     ):
         if regression not in server_tests:
             raise AssertionError(f"server checkpoint tests lack {regression}")
+
+    context_source = (ROOT / "src/llama-context.cpp").read_text(encoding="utf-8")
+    if "96u*model.hparams.n_layer_all" not in context_source:
+        raise AssertionError("precision-tail graphs lack the post-upstream per-layer node allowance")
 
     state_cache_source = (ROOT / "src/llama-kv-cache.cpp").read_text(encoding="utf-8")
     state_tail_reader = state_cache_source.split("void llama_kv_cache::state_read_tail(", 1)[1].split(
@@ -377,9 +398,9 @@ def main() -> None:
         raise AssertionError("KV-cache graph interface exposes only component-wide body presence")
     if graph.count("has_kv_body(il)") < 4:
         raise AssertionError("standard and iSWA graph builders do not consume per-layer body presence")
-    if graph.count("mixed_tail_native_preferred(il)") != 2:
+    if "mixed_tail_native_preferred(il)" in graph:
         raise AssertionError(
-            "KVarN full/iSWA graph builders do not honor the backend's mixed-tail route preference")
+            "backend implementation preference must not veto a validated KVarN attention operation")
     if graph.count("!mctx_cur->has_kv_body(il)") < 4:
         raise AssertionError(
             "KVarN full/iSWA graph builders do not distinguish bodyless native tails")
@@ -432,13 +453,8 @@ def main() -> None:
     )[0]
     if "ggml_vk_kvarn_attn_tail_sources_supported(op)" not in vulkan_fattn_support:
         raise AssertionError("Vulkan KVarN final-node support does not validate compact current operands")
-    if not re.search(
-        r"if \(op->src\[10\] != nullptr \|\| op->src\[11\] != nullptr\).*"
-        r"Standard compact-tail attention remains.*return false",
-        vulkan_fattn_support,
-        re.DOTALL,
-    ):
-        raise AssertionError("Vulkan standard attention no longer fails closed for compact current operands")
+    if "pipeline_flash_attn_tail" not in vulkan or "descriptor_offsets_ab" not in vulkan:
+        raise AssertionError("Vulkan standard attention does not own compact-current operands and descriptor offsets")
     vulkan_proc = vulkan.split("static void * ggml_backend_vk_reg_get_proc_address", 1)[1]
     if "ggml_backend_kv_tail_segmented_attention_supported" not in vulkan_proc:
         raise AssertionError("Vulkan does not advertise its implemented segmented KVarN attention matrix")
@@ -598,7 +614,12 @@ def main() -> None:
         raise AssertionError("the CUDA checkpoint must remain the preferred synchronized CUDA route")
     for required in (
         "struct_size = sizeof(stats)",
-        "abi_version = 1",
+        "route_stats_abi_version",
+        "generic_shape_rejected",
+        '"kvarn_route_generic_rejected"',
+        "cuda_context_buffer_bytes",
+        "cuda_non_kv_context_buffer_bytes",
+        "cuda_runtime_overhead_bytes",
         "ggml_backend_dev_backend_reg(memory_dev)",
         '"kvarn_route_portable"',
         '"kvarn_route_materialize"',
@@ -608,7 +629,7 @@ def main() -> None:
     ):
         if required not in bench:
             raise AssertionError(
-                f"llama-bench backend telemetry is not device-matched and ABI-v1 safe: missing {required}"
+                f"llama-bench backend telemetry is not device-matched and version-safe: missing {required}"
             )
     for required in (
         "struct ggml_vk_kv_memory_transient_stats",

@@ -28,7 +28,22 @@ int llama_fit_params(int argc, char ** argv) {
     llama_numa_init(params.numa);
 
     auto mparams = common_model_params_to_llama(params);
+    const bool bee_tail_request = params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED ||
+            params.kv_tail_tokens != "0";
+    std::unique_ptr<llama_kv_tail_request, decltype(&llama_kv_tail_request_free)> tail_request(
+            bee_tail_request ? llama_kv_tail_request_init(
+                    params.kv_tail_tokens.c_str(), params.kv_tail_type) : nullptr,
+            llama_kv_tail_request_free);
+    if (tail_request && llama_kv_tail_request_last_error(tail_request.get())[0] != '\0') {
+        LOG_ERR("%s: invalid KV tail request: %s\n", __func__,
+                llama_kv_tail_request_last_error(tail_request.get()));
+        return 1;
+    }
     auto cparams = common_context_params_to_llama(params);
+    if (tail_request) {
+        cparams.kv_tail_tokens = 0;
+        cparams.kv_tail_request = tail_request.get();
+    }
 
     if (!params.fit_params_print) {
         const common_params_fit_status status = common_fit_params(params.model.path.c_str(), &mparams, &cparams,

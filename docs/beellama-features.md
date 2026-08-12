@@ -1,6 +1,6 @@
-# BeeLlama v0.4.0 features
+# BeeLlama v0.4.3 features
 
-BeeLlama v0.4.0 keeps a small fork surface on top of upstream llama.cpp. Use
+BeeLlama v0.4.3 keeps a small fork surface on top of upstream llama.cpp. Use
 this page to choose a feature; use the [argument reference](beellama-args.md)
 for exact names, environment variables, defaults, and validation ranges.
 
@@ -8,19 +8,28 @@ for exact names, environment variables, defaults, and validation ranges.
 
 ### What it is
 
-KVarN compresses a target model's K and V cache into structured 2-, 3-, 4-,
-5-, 6-, or 8-bit records. K and V widths are independent, and supported Qwen
-3.6 and Gemma 4 SWA layers can use a separate KVarN pair. Every KVarN group
-keeps the paper-defined exact 128-token sink and newest 128-token suffix around
-its compressed body. The physical ubatch controls only temporary workspace; it
-never enlarges that logical exact suffix.
+KVarN is Huawei's calibration-free, variance-normalized KV-cache quantizer,
+adapted here for llama.cpp. It applies a per-head Hadamard rotation after RoPE,
+normalizes both axes of each 128-token tile, and stores structured 2-, 3-, 4-,
+5-, 6-, or 8-bit records with scale metadata. K and V widths are independent,
+and supported Qwen 3.6 and Gemma 4 SWA layers can use a separate KVarN pair.
+Non-SWA layers keep the first 128 attention-sink tokens exact. Bee also keeps at
+least the newest 128 tokens exact, unlike the reference implementation's
+partially filled suffix. The physical ubatch controls only temporary workspace;
+it never enlarges that logical exact suffix.
 
 ### When to use it
 
 Use KVarN when persistent KV-cache memory is the limiting resource and the model
-has a supported attention layout. Start with `kvarn4` on both sides, then
-measure the quality and speed of the exact model, backend, and context you plan
-to serve.
+has a supported attention layout. The general benchmark ladder starts with
+`kvarn5 / kvarn4` and a 1024-token tail as its balanced default, with
+`kvarn6 / kvarn5` as the more conservative body and `kvarn4 / kvarn3` as the
+smallest recommended tier. These presets come from Qwen 3.6 27B measurements,
+not a universal model guarantee. Measure the quality, prefill speed, generation
+speed, and memory use of the exact model, backend, and context you plan to
+serve.
+
+See [KVarN KV Cache: Implementation and Benchmarks](https://anbeeld.com/articles/kvarn-kv-cache-implementation-and-benchmarks) for the algorithm, Bee's exact-tail deviation, and matched-format comparisons. The current combined recommendation ladder is in the [README](../README.md#general-kv-cache-ladder).
 
 ### Key arguments
 
@@ -42,6 +51,14 @@ A request covering the whole group uses one native F16/BF16 cache instead of
 allocating compressed records plus a redundant exact overlay. For SWA this is
 a compact `W + R` ring; it does not retain the physical `W + U` execution
 reserve as persistent exact payload.
+
+KVarN durable prompt-cache reuse remains descriptor-group aligned: current G128
+presets publish and restore checkpoints only at complete 128-token boundaries.
+The bounded live exact frontier still supports the existing speculative
+micro-rollback path, but sealed compressed history is never split into an
+arbitrary-position record. Standard KV is not subject to this group boundary;
+its precision-tail state can restore a validated logical position while a hot
+partial checkpoint references the still-resident body instead of rereading it.
 
 ### Measurement and validation
 
@@ -122,17 +139,16 @@ directly for D128, D256, and D512 heads. Its correctness limit is not the
 specialized decode threshold of 16 queries, so prompt-sized query batches stay
 native instead of creating a full F32 KQ tensor.
 
-ROCm/HIP selects between record-tiled split decode, generic descriptor-native
-WMMA/MFMA, and the same portable direct-record kernel. CPU has a backend-native
-direct-record attention path. Vulkan directly consumes compressed records for
-body-only inputs and compact bodyless F16/BF16 tails for head dimensions 128,
-256, and 512 with query batches through 16 rows. A Vulkan layer with both a
-compressed body and an exact tail instead materializes the body and uses the
-backend's standard tiled FlashAttention path. That policy is intentional:
-hardware measurements found the mixed direct shader slower than the
-materialized upstream-style route. Matrix-capable HIP and CUDA retain
-descriptor-native large-batch prefill. Other portable backends retain their
-advertised query limits. Vulkan requires shader Int64 and
+ROCm/HIP selects between record-tiled split decode, eligible descriptor-native
+WMMA/MFMA, and the same portable direct-record kernel. Unsupported AMD matrix
+shapes remain on portable native attention instead of materializing the cache.
+CPU has a backend-native direct-record attention path. Vulkan directly consumes
+KVarN records and exact tails for supported D128, D256, and D512 shapes. Its
+standard-cache segmented route likewise consumes a quantized body, F16/BF16
+history, and current K/V with one online FP32 softmax. Explicit materialization
+remains a fallback for unsupported placements or shapes. Matrix-capable HIP and
+CUDA retain descriptor-native large-batch prefill. Other portable backends
+retain their advertised query limits. Vulkan requires shader Int64 and
 buffer-device-address support. CPU placement is valid with KV offload disabled.
 
 | NVIDIA architecture | Toolkit and package | Native KVarN route | Qualification |
@@ -263,7 +279,11 @@ stream, physical cell, and generation. Sequence copies share exact rows within
 one stream and copy them into context-local slots across streams. Position
 shifts rotate exact K rows together with the quantized body. CUDA can read the
 compact pool and current K/V directly through per-query descriptors and merge
-against ordinary FlashAttention normalization metadata. The generic graph
+against ordinary FlashAttention normalization metadata. Vulkan has a bounded
+direct operation for standard quantized bodies plus F16/BF16 history and
+current segments at head dimensions 128, 256, and 512. It evaluates the body,
+history, and current keys with one online FP32 softmax and reports zero private
+workspace for that route. The generic graph
 composes persistent history and current K/V on the owning device, then gathers
 the bounded per-query source union needed by the ordinary attention operators.
 That fallback can duplicate graph-local source rows across a physical ubatch,
@@ -303,25 +323,53 @@ body, and suffix masks therefore contribute each key exactly once. F16/BF16
 canonical K/V rows are stored after RoPE for K and in the original V domain;
 the compressed body retains KVarN's rotated-domain records.
 
-Standard unified and non-unified prompt caches preserve one continuous suffix
-across requests and message boundaries. KVarN trims divergence in its live
-exact suffix exactly. Older KVarN divergence retains all complete groups before
-the overlapping 128-token group only on a non-unified or otherwise exclusive
-unified stream; at most 127 positions before the requested trim are
-reevaluated. Unified contention rejects partial rollback, fully reevaluates the
-requesting slot, and leaves the other slot unchanged. Every hybrid child must
-accept the boundary, so a recurrent component without retained rollback states
-can still require a safe full reevaluation. `cache_prompt=false`, slot eviction,
-or the absence of one common target/draft plan can also force a miss.
+Vulkan KVarN route reservation also queries the backend's own store and
+split-K workspace planners. The resulting per-backend high-water is included in
+the context compute breakdown before fit evaluates a candidate; runtime and
+estimation therefore use the same sizing functions. With KVarN or a precision
+tail active, fit performs an exact no-allocation validation of the upstream
+candidate against the original device-memory snapshot. A measured shortfall is
+fed back only as a guarded margin and upstream fit is restarted from pristine
+inputs; repeated non-fitting candidates fail deterministically. Tail-disabled
+ordinary caches take the unchanged single-call upstream fit path.
 
-Unified KVarN per-sequence RAM save and restore require an exclusive structured
-stream. Contended save creates no cache entry and does not clear the slot;
-contended restore is a cache miss. Non-unified KVarN is the configuration where
-multi-slot RAM caching and group-aligned historical reuse are unconditional.
-For hybrid iSWA with multiple non-unified slots, eligible non-SWA layers keep
-KVarN while SWA layers use a warned standard-cache fallback; a fail-closed
-preset rejects the context instead. Unified or single-slot layouts can retain
-KVarN in both groups when otherwise eligible.
+Standard unified and non-unified prompt caches preserve one continuous suffix
+across requests and message boundaries. Unified KVarN uses the same shared
+capacity model: completed 128-token record groups can be borrowed by any slot
+instead of partitioning the context into fixed per-slot stripes. Only incomplete
+record groups reserve cyclic F16 staging rows.
+
+KVarN state is sequence-selective: live checkpoints retain only the selected
+sequence's mutable frontier, exact-tail rows, and logical metadata, while
+self-contained RAM state also owns that sequence's sealed record groups. Restore
+validates the complete state before it publishes remapped destination records.
+Other live sequences in a unified cache are neither gathered nor overwritten.
+
+Prompt-cache planning distinguishes the lexical LCP, the boundary that all
+target/draft/speculative components can restore, and the boundary actually
+committed. Live slots and RAM entries are ranked by that safe restorable prefix,
+not lexical similarity alone. KVarN durable checkpoints are eligible only on
+complete descriptor boundaries; standard and recurrent caches retain upstream
+batching and impose no Bee-specific 64-token cadence. `cache_prompt=false`,
+slot eviction, corrupt or incompatible state, and the absence of one common
+target/draft/speculative plan remain reason-coded misses.
+
+RAM entries are immutable and repeatably restorable. Admission serializes a
+self-contained target/draft/speculative candidate before publishing it and
+clears an idle unified slot only after admission succeeds. Restore prepares and
+validates every component without mutation, then commits the complete prepared
+transaction; failed preparation leaves the destination unchanged without a
+full-state preimage. Serialized checkpoint byte buffers use copy-on-write
+sharing, but native KV blocks are not reference-counted or shared. Hot partial
+state still emits logical-prefix manifests, so its work is not strictly
+frontier-only. Accounted bytes include serialized entry payloads and count
+shared immutable checkpoint buffers once; container capacity and allocator
+overhead are intentionally excluded.
+
+For hybrid iSWA with multiple slots, eligible non-SWA layers keep KVarN while
+SWA layers use the explicit, warned, bit-width-matched standard-cache fallback.
+This is a supported hybrid placement rather than record reinterpretation;
+single-slot layouts can retain KVarN in both groups when otherwise eligible.
 
 Partial SWA storage retains its upstream-aligned compressed `W + U` body, but
 its persistent exact history is `(N + R) * S` rows. Full-window SWA omits that
@@ -332,11 +380,23 @@ Positive K-only MLA and DSA overlays are rejected during context creation.
 
 ### When to use it
 
-Use the precision tail when a quantized cache saves needed context memory but recent-token
-quantization changes quality. For standard q2 through q8 caches, start with 64,
-128, or 256 tokens. For KVarN, the starting point is its intrinsic 128-token
-suffix; try 512 or 1024 only after measuring the exact model and workload.
-Larger values read more F16/BF16 data and are not performance-neutral.
+Use the precision tail when a quantized cache saves needed context memory but
+recent-token quantization changes quality. In the Qwen 3.6 27B measurements, a
+1024-token tail captured most of the gain for low-bit bodies and was the balanced
+starting point for both KVarN and standard caches. Prefer body precision when
+old and recent tokens matter equally. A 2048-token tail is most persuasive when
+the newest two thousand tokens are genuinely the privileged working set; larger
+tails read more F16/BF16 data and are not performance-neutral.
+
+Tail length is a quality, memory, and throughput choice. It is not a
+prompt-cache correctness switch: state restore carries the exact rows and
+coverage metadata required by the configured tail, including a zero-length
+standard tail and KVarN's intrinsic minimum suffix.
+
+Gemma 4 needs a separate policy. Its 1024-token sliding window makes a 1024 tail
+exact across most layers, causing a sharp memory and throughput transition.
+Standard q8 without a tail is the safer general default when throughput and
+older-context coverage matter. See [KV Cache Precision Tail: Implementation and Benchmarks](https://anbeeld.com/articles/kv-cache-precision-tail-implementation-and-benchmarks) and the [combined benchmark review](https://anbeeld.com/articles/kv-cache-quantization-benchmarks-kvarn-precision-tail) for the quality, memory, and throughput tradeoffs.
 
 `auto` requests 1024 exact tokens for every applicable canonical target-cache
 group and caps each request by that group's effective context or attention
@@ -348,6 +408,7 @@ is the quality or performance optimum for a particular model.
 - [`--kv-tail-tokens`](beellama-args.md#kv-cache-precision-tail-for-quantized-caches)
 - [`--kv-tail-type`](beellama-args.md#kv-cache-precision-tail-for-quantized-caches)
 - `llama_kv_tail_config_*` for model-bound group discovery and overrides
+- `llama_kv_tail_request_*` for immutable model-independent fit/final requests
 - `llama_kv_tail_get_coverage` for per-sequence, per-group coverage
 - `llama_kv_tail_get_coverage_aggregate` for context/server aggregation
 - `LLAMA_STATE_SEQ_FLAGS_BODY_ONLY` for an intentional lower-precision state export
@@ -362,8 +423,11 @@ KVarN-specific workspace, attention, and state decisions are in
 
 For standard caches, the default length is zero and preserves the ordinary
 topology. KVarN always resolves at least its intrinsic 128-token suffix.
-Sequence state writes validated KV-tail manifest version 3 and can
+Sequence state writes validated KV-tail manifest version 5 and can
 transfer tail tensors through host buffers or the on-device tensor protocol.
+Version 5 records exact source cells and generations, local tail slots,
+insertion order, and the per-sequence write cursor so selective unified-cache
+restore cannot alias an unrelated sequence or reorder its exact frontier.
 Overlay states reject a different structural group, resolved length,
 representation, rollback horizon, KVarN preset, or F16/BF16 type before
 mutation. Manifest version 2 remains readable for legacy non-compact layouts;
@@ -374,11 +438,19 @@ body-only compatibility state and explicit body-only state begin with
 observable degraded coverage and refill from original activations on later
 writes. Sequence copies publish body membership and positions immediately;
 deferred exact rows materialize in one batch when state data or another direct
-consumer needs them. KVarN state version 13 stores logical compressed records
-plus compact exact payloads and remaps transient workspace on restore; version 11 is
-rejected because it serialized the old workspace-dependent layout. Dequantized
+consumer needs them. KVarN state version 15 stores sequence-selective logical
+record groups, compact exact payloads, selected stage rows, and destination
+record remapping independently of transient workspace. Partial live checkpoint
+state omits sealed records already retained by the context; self-contained RAM
+state owns them. Compatible version 12 and 13 state remains readable; version 11
+is rejected because it serialized the old workspace-dependent layout. Dequantized
 body rows are never labeled exact. Server metrics report requested and exact
 tokens, coverage group states, and degraded sequences.
+
+Completion timings expose `cache_lcp_n`, `cache_planned_n`,
+`cache_reprocessed_n`, `cache_source`, and `cache_reason`; API cached-token usage
+is the committed count. Prometheus metrics expose RAM admission/restore totals,
+resident bytes, busy-slot overlap, and precision-tail coverage/degradation.
 
 BeeLlama v0.3.x sessions and its v11 KVarN state are intentionally incompatible
 with the v0.4.0 cache type IDs and logical-record format. Restore fails closed;
@@ -410,12 +482,12 @@ attention can be substantially slower.
 
 For compact current sources, CUDA and HIP share the segmented history/current
 implementation. CPU has the dense one-softmax reference route. Vulkan consumes
-the compact history/current buffers through buffer device addresses and
-validates every source before native dispatch. Supported bodyless exact tails
-remain native; mixed compressed/exact layers use explicit device
-materialization and standard FlashAttention. Unsupported shapes or source
-layouts fail closed instead of ignoring current rows or relying on an
-accidental scheduler fallback.
+the quantized body, compact history, and current buffers through buffer device
+addresses, validates every source before native dispatch, and evaluates them
+with one online FP32 softmax. Supported mixed and bodyless exact routes remain
+native; unsupported shapes or source layouts fail closed or use the explicit
+device materialization fallback instead of ignoring current rows or relying on
+an accidental scheduler fallback.
 
 ### July 2026 compact-tail correction
 
