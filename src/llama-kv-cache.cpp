@@ -6816,7 +6816,7 @@ static void set_input_kq_mask_tail_impl(
 void llama_kv_cache::set_input_kq_mask_tail(
         ggml_tensor * body, ggml_tensor * exact,
         ggml_tensor * read_idxs, ggml_tensor * body_read_idxs, ggml_tensor * bias_read_idxs,
-        const llama_ubatch * ubatch, uint32_t n_kv, bool causal_attn) const {
+        const llama_ubatch * ubatch, bool causal_attn) const {
     set_input_kq_mask_tail_mapped(
             body, exact, read_idxs, body_read_idxs, bias_read_idxs,
             ubatch, causal_attn, {});
@@ -7122,7 +7122,7 @@ void llama_kv_cache_context::set_input_kq_mask_tail(
         ggml_tensor * read_idxs, ggml_tensor * body_read_idxs, ggml_tensor * bias_read_idxs,
         const llama_ubatch * ubatch, bool causal_attn) const {
     kv->set_input_kq_mask_tail(
-            body, exact, read_idxs, body_read_idxs, bias_read_idxs, ubatch, n_kv, causal_attn);
+            body, exact, read_idxs, body_read_idxs, bias_read_idxs, ubatch, causal_attn);
 }
 
 void llama_kv_cache_context::set_input_tail_body_plan(

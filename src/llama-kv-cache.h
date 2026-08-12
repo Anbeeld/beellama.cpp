@@ -334,7 +334,7 @@ public:
     void set_input_kq_mask_tail(
             ggml_tensor * body, ggml_tensor * exact,
             ggml_tensor * read_idxs, ggml_tensor * body_read_idxs, ggml_tensor * bias_read_idxs,
-            const llama_ubatch * ubatch, uint32_t n_kv, bool causal_attn) const;
+            const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_kq_mask_tail_mapped(
             ggml_tensor * body, ggml_tensor * exact,
             ggml_tensor * read_idxs, ggml_tensor * body_read_idxs, ggml_tensor * bias_read_idxs,

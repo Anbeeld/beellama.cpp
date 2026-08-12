@@ -2025,7 +2025,7 @@ void llama_kv_cache_dsv4_raw_context::set_input_kq_mask_tail(
         ggml_tensor * read_idxs, ggml_tensor * body_read_idxs, ggml_tensor * bias_read_idxs,
         const llama_ubatch * ubatch, bool causal_attn) const {
     kv_swa->set_input_kq_mask_tail(
-            body, exact, read_idxs, body_read_idxs, bias_read_idxs, ubatch, n_kv, causal_attn);
+            body, exact, read_idxs, body_read_idxs, bias_read_idxs, ubatch, causal_attn);
 }
 
 void llama_kv_cache_dsv4_raw_context::set_input_k_rot(ggml_tensor * dst) const {
