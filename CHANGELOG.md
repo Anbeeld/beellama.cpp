@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.4.4
+
+- Updated the llama.cpp base through upstream commit `84e908c6`.
+
 ## v0.4.3
 
 - Updated the llama.cpp base through upstream commit `74ce15741`. Notable inherited changes include Qwen3-TTS, DeepSeek V4 and DSpark, MTP support for GLM-4.7-Flash, GLM-5.2, Qwen3-Next, and DeepSeek V3.2, router LRU scheduling, initial Docker tool isolation, working-directory and filesystem tools in the server and Web UI, speculative metrics, and broad CUDA, Metal, Vulkan, SYCL, WebGPU, multimodal, conversion, and UI updates. ggml is now 0.19.0 and the RPC protocol is 5.0.1.

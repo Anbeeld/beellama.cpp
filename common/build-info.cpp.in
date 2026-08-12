@@ -32,8 +32,9 @@ const char * llama_build_info(void) {
     return s.c_str();
 }
 
-void llama_print_build_info(void) {
-    fprintf(stderr, "%s: build = %d (%s)%s\n", __func__, llama_build_number(), llama_commit(), LLAMA_BUILD_DIRTY ? "-dirty" : "");
-    fprintf(stderr, "%s: built with %s for %s\n", __func__, llama_compiler(), llama_build_target());
-    fprintf(stderr, "%s: ggml op count = %d\n", __func__, GGML_OP_COUNT);
+void llama_print_build_info(const char * llama_version) {
+    fprintf(stderr, "version: %s (build %d, commit %s%s)\n",
+            llama_version, llama_build_number(), llama_commit(), LLAMA_BUILD_DIRTY ? "-dirty" : "");
+    fprintf(stderr, "built with %s for %s\n", llama_compiler(), llama_build_target());
+    fprintf(stderr, "ggml op count: %d\n", GGML_OP_COUNT);
 }

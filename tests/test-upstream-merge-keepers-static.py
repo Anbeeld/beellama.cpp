@@ -199,9 +199,11 @@ def main() -> None:
     server_context = (ROOT / "tools/server/server-context.cpp").read_text(encoding="utf-8")
     load_model = server_context.split("bool load_model(common_params & params)", 1)[1].split("bool init()", 1)[0]
     resolve_pos = load_model.find("common_speculative_resolve_dflash_draft_n_max")
-    output_size_pos = load_model.find("params_base.n_outputs_max = server_n_outputs_max(params_base)")
+    output_size_pos = load_model.find("const auto output_limits = server_output_limits(params_base)")
     if resolve_pos < 0 or output_size_pos < 0 or resolve_pos > output_size_pos:
         raise AssertionError("the omitted DFlash draft maximum must resolve before server output-buffer sizing")
+    require(load_model, "params_base.n_outputs_max = output_limits.total;", "server output-buffer total was not applied")
+    require(load_model, "params_base.n_outputs_max_per_seq = output_limits.per_seq;", "per-sequence output limit was not applied")
 
     common_h = (ROOT / "common/common.h").read_text(encoding="utf-8")
     common_cpp = (ROOT / "common/common.cpp").read_text(encoding="utf-8")

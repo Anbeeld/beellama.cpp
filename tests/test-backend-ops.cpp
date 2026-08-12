@@ -6903,18 +6903,25 @@ struct test_roll : public test_case {
     const int shift1;
     const int shift3;
     const int shift4;
+    const bool permute;
 
     std::string vars() override {
-        return VARS_TO_STR4(shift0, shift1, shift3, shift4);
+        return VARS_TO_STR5(shift0, shift1, shift3, shift4, permute);
     }
 
-    test_roll(int shift0 = 3, int shift1 = -2, int shift3 = 1, int shift4 = -1)
-        : shift0(shift0), shift1(shift1), shift3(shift3), shift4(shift4) {}
+    test_roll(int shift0 = 3, int shift1 = -2, int shift3 = 1, int shift4 = -1, bool permute = false)
+        : shift0(shift0), shift1(shift1), shift3(shift3), shift4(shift4), permute(permute) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         int64_t ne[4] = {10, 5, 4, 3};
         ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
         ggml_set_name(a, "a");
+
+        if (permute) {
+            // ggml_roll only requires nb[0] == type size, so a permuted src is valid
+            a = ggml_permute(ctx, a, 0, 2, 1, 3);
+            ggml_set_name(a, "a_permuted");
+        }
 
         ggml_tensor * out = ggml_roll(ctx, a, shift0, shift1, shift3, shift4);
         ggml_set_name(out, "out");
@@ -8457,7 +8464,8 @@ static const ggml_type all_types[] = {
     GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
     GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
     GGML_TYPE_Q6_K,
-    // GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0, // TODO: implement for all backends
+    GGML_TYPE_TQ2_0,
+    // GGML_TYPE_TQ1_0, // TODO: implement for all backends
     GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
     GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
     GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
@@ -8484,7 +8492,8 @@ static const ggml_type other_types[] = {
     GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
     GGML_TYPE_Q5_K,
     GGML_TYPE_Q6_K,
-    // GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0, // TODO: implement for all backends
+    GGML_TYPE_TQ2_0,
+    // GGML_TYPE_TQ1_0, // TODO: implement for all backends
     GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
     GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
     GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
@@ -9318,6 +9327,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rwkv_wkv6(GGML_TYPE_F32, 32, 64, 128, 4));
 
     test_cases.emplace_back(new test_rwkv_wkv7(GGML_TYPE_F32, 32, 64, 1, 1));
+    test_cases.emplace_back(new test_rwkv_wkv7(GGML_TYPE_F32, 32, 64, 1, 4));
     test_cases.emplace_back(new test_rwkv_wkv7(GGML_TYPE_F32, 32, 64, 32, 1));
     test_cases.emplace_back(new test_rwkv_wkv7(GGML_TYPE_F32, 32, 64, 32, 4));
     test_cases.emplace_back(new test_rwkv_wkv7(GGML_TYPE_F32, 32, 64, 128, 4));
@@ -9512,6 +9522,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 64, 128, k, {12,1}, {1,1}));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 50, 200, k));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, true, 50, 200, k));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 16, 16, false, 50, 200, k));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 16, 16, true, 50, 200, k));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F32, GGML_TYPE_F32, 16, 16, false, 50, 200, k));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F32, GGML_TYPE_F32, 16, 16, true, 50, 200, k));
     }
@@ -9543,6 +9555,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, b, 32, 1024, 16));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 2, 2, b, 32, 8192, 64));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, b, 50, 200, 64));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 16, 16, b, 32, 1024, 16));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 16, 16, b, 50, 200, 64));
     }
 
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, 1));
@@ -9990,6 +10004,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_pad_reflect_1d());
     test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {3000, 384, 4, 1}));
     test_cases.emplace_back(new test_roll());
+    test_cases.emplace_back(new test_roll(3, -2, 1, -1, true));
     test_cases.emplace_back(new test_arange());
     test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 0.0f, 1048576.0f, 1.0f));
     test_cases.emplace_back(new test_timestep_embedding());

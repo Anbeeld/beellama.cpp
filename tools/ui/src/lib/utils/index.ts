@@ -240,6 +240,7 @@ export {
 	MENTION_BADGE_FOLDER_ICON_PATHS,
 	getMentionBadgeIconPaths,
 	getMentionBadgeLabel,
+	splitMentionSegments,
 	buildMentionInsertion
 } from './mention-badge';
 
@@ -247,7 +248,7 @@ export {
 export {
 	deriveAgenticSections,
 	buildAssistantRawOutput,
-	parseToolResultWithImages,
+	parseToolResultWithMedia,
 	splitSearchSummaryList,
 	hasAgenticContent,
 	classifyToolResult,
@@ -324,3 +325,6 @@ export { uuid } from './uuid';
 
 // CSS utilities
 export { remToPx } from './css';
+
+// Audio format helper (used by agentic store and chat service)
+export { getAudioInputFormat } from './audio-format';

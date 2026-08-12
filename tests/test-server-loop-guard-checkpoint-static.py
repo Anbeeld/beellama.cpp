@@ -23,7 +23,7 @@ def main() -> None:
         "const server_loop_guard loop_guard_save = slot.loop_guard;" in verify,
         "speculative verification must snapshot loop-guard state before sampler acceptance",
     )
-    sampler_restore = verify.find("slot.smpl = std::move(smpl_save);")
+    sampler_restore = verify.find("common_sampler_copy(smpl_save.get(), slot.smpl.get());")
     require(sampler_restore >= 0, "speculative checkpoint rollback must restore the sampler")
     restore = verify[sampler_restore:]
     for field in (
