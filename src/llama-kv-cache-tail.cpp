@@ -353,6 +353,25 @@ llama_kv_tail_storage_plan llama_kv_tail_storage_plan_for(
             request.compact_current_source_capable &&
             request.compact_ordered_commit_capable;
 
+    const auto select_native_exact = [&]() {
+        result.kind = LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT;
+        result.actual_body_type_k = promoted_k;
+        result.actual_body_type_v = promoted_v;
+        result.body_promoted = promoted_k != request.requested_body_type_k ||
+                promoted_v != request.requested_body_type_v;
+        if (result.promotion_increment > std::numeric_limits<uint64_t>::max() - result.requested_body_bytes) {
+            throw std::overflow_error("standard KV tail promoted body byte count overflows uint64_t");
+        }
+        result.actual_body_bytes = result.requested_body_bytes + result.promotion_increment;
+        return result;
+    };
+
+    // An exact body is already authoritative for every requested suffix. Do
+    // not create a compact overlay merely because the graph supports one.
+    if (request.already_exact) {
+        return select_native_exact();
+    }
+
     if (use_compact) {
         if (full_visibility && request.full_window_body_can_be_omitted) {
             result.kind = LLAMA_KV_TAIL_STORAGE_COMPACT_NATIVE_EXACT;
@@ -392,20 +411,11 @@ llama_kv_tail_storage_plan llama_kv_tail_storage_plan_for(
         return result;
     }
 
-    const bool use_native = request.already_exact ||
-            (full_visibility && request.native_capable &&
-             result.promotion_increment <= result.overlay_increment);
+    const bool use_native = full_visibility && request.native_capable &&
+            result.promotion_increment <= result.overlay_increment;
 
     if (use_native) {
-        result.kind = LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT;
-        result.actual_body_type_k = promoted_k;
-        result.actual_body_type_v = promoted_v;
-        result.body_promoted = promoted_k != request.requested_body_type_k ||
-                promoted_v != request.requested_body_type_v;
-        if (result.promotion_increment > std::numeric_limits<uint64_t>::max() - result.requested_body_bytes) {
-            throw std::overflow_error("standard KV tail promoted body byte count overflows uint64_t");
-        }
-        result.actual_body_bytes = result.requested_body_bytes + result.promotion_increment;
+        return select_native_exact();
     } else {
         const std::string architecture = request.architecture ? request.architecture : "unknown";
         const std::string group = request.group_id ? request.group_id : "unknown";

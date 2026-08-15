@@ -51,6 +51,9 @@ static std::atomic<uint64_t> g_kvarn_store_single_slice_workspace{0};
 static std::atomic<uint64_t> g_kvarn_store_direct_store{0};
 static std::atomic<uint64_t> g_kvarn_store_high_shared_fallback{0};
 static std::atomic<uint64_t> g_kvarn_store_low_shared_store{0};
+static std::atomic<uint64_t> g_kvarn_store_sealer_128{0};
+static std::atomic<uint64_t> g_kvarn_store_sealer_256{0};
+static std::atomic<uint64_t> g_kvarn_store_sealer_candidates{0};
 
 void ggml_cuda_kvarn_store_route_stats_reset() {
     g_kvarn_store_headwide_workspace.store(0, std::memory_order_relaxed);
@@ -59,6 +62,9 @@ void ggml_cuda_kvarn_store_route_stats_reset() {
     g_kvarn_store_direct_store.store(0, std::memory_order_relaxed);
     g_kvarn_store_high_shared_fallback.store(0, std::memory_order_relaxed);
     g_kvarn_store_low_shared_store.store(0, std::memory_order_relaxed);
+    g_kvarn_store_sealer_128.store(0, std::memory_order_relaxed);
+    g_kvarn_store_sealer_256.store(0, std::memory_order_relaxed);
+    g_kvarn_store_sealer_candidates.store(0, std::memory_order_relaxed);
 }
 
 void ggml_cuda_kvarn_store_route_stats_get(ggml_cuda_kvarn_store_route_stats * stats) {
@@ -75,6 +81,9 @@ void ggml_cuda_kvarn_store_route_stats_get(ggml_cuda_kvarn_store_route_stats * s
     stats->direct_store = g_kvarn_store_direct_store.load(std::memory_order_relaxed);
     stats->high_shared_fallback = g_kvarn_store_high_shared_fallback.load(std::memory_order_relaxed);
     stats->low_shared_store = g_kvarn_store_low_shared_store.load(std::memory_order_relaxed);
+    stats->sealer_128 = g_kvarn_store_sealer_128.load(std::memory_order_relaxed);
+    stats->sealer_256 = g_kvarn_store_sealer_256.load(std::memory_order_relaxed);
+    stats->sealer_candidates = g_kvarn_store_sealer_candidates.load(std::memory_order_relaxed);
 }
 
 // Resolve stage_groups from op_params[7]. Constructors set this explicitly;
@@ -1044,7 +1053,7 @@ static __global__ void kvarn_store_kernel_headwide(
             for (int slice = 0; slice < head_slices; ++slice) {
                 const int head = head0 + slice;
                 uint8_t * record = records + ((int64_t) flush_record_group * n_heads + head) * record_bytes;
-                kvarn_quantize_stage(stage, record, n_heads, head, stage_base, flush_group, bits, iterations, value, swa, stage_groups, tail_groups, shared);
+            kvarn_quantize_stage(stage, record, n_heads, head, stage_base, flush_group, bits, iterations, value, swa, stage_groups, tail_groups, shared);
             }
         }
 
@@ -1695,6 +1704,9 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         smpbo = std::min(smpbo, (size_t) KVAR_N_LOWSHMEM_BYTES);
     }
     cudaStream_t stream = ctx.stream();
+    // The production sealer uses one lane per 128-element format axis.
+    g_kvarn_store_sealer_candidates.fetch_add(1, std::memory_order_relaxed);
+    g_kvarn_store_sealer_128.fetch_add(1, std::memory_order_relaxed);
     const int n_heads = (int) current->ne[1];
     GGML_ASSERT(n_heads % head_slices == 0);
     const int n_tokens = (int) current->ne[2];

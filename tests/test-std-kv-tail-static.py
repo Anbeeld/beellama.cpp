@@ -284,6 +284,8 @@ def main() -> None:
         raise AssertionError("exact-shadow allocation must be guarded by the overlay storage plan")
     if "tail_plan.kind == LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT" not in cache_source:
         raise AssertionError("raw standard cache lacks the native-exact storage route")
+    if "!storage_request.already_exact" not in constructor:
+        raise AssertionError("already-exact bodies must not acquire an attached-tail execution route")
     if "model.split_mode()" in constructor:
         raise AssertionError("standard overlay placement still uses CLI split mode instead of realized body storage")
     standard_order = [
@@ -332,6 +334,12 @@ def main() -> None:
     iswa_source = (ROOT / "src/llama-kv-cache-iswa.cpp").read_text(encoding="utf-8")
     if "llama_kv_tail_storage_plan_for" in iswa_source or "LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT" in iswa_source:
         raise AssertionError("iSWA wrapper must not override raw-cache representation planning")
+    full_coverage_branch = iswa_source.split(
+        "if ((is_swa_group && tail_native_exact_swa)", 1
+    )[1].split("// Structured KVarN records", 1)[0]
+    if ("is_swa_group ? type_k : tail_type" not in full_coverage_branch or
+            "is_swa_group ? type_v : tail_type" not in full_coverage_branch):
+        raise AssertionError("fully covered non-SWA KVarN windows must use exact body storage")
 
     ggml_cmake = (ROOT / "ggml/CMakeLists.txt").read_text(encoding="utf-8")
     cuda_cmake = (ROOT / "ggml/src/ggml-cuda/CMakeLists.txt").read_text(encoding="utf-8")

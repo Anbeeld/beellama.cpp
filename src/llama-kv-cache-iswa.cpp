@@ -161,12 +161,15 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
             const uint32_t visibility_window = n_swa > 0 ? std::min(size, n_swa) : size;
             if ((is_swa_group && tail_native_exact_swa) ||
                     (!is_swa_group && exact_tokens >= visibility_window)) {
-                // A fully covered SWA group is a compact exact ring. Keep the
-                // requested body types only as planner inputs: the standard
-                // component omits them physically and allocates W + R exact
-                // rows, so no KVarN records or stage storage survive.
+                // A fully covered SWA group is a compact exact ring: its
+                // quantized types remain planner inputs and the standard cache
+                // omits them physically. A fully covered non-SWA group has no
+                // compressed body either, so represent it directly as an exact
+                // standard cache instead of requiring a compiled quant pair.
+                const ggml_type standard_type_k = is_swa_group ? type_k : tail_type;
+                const ggml_type standard_type_v = is_swa_group ? type_v : tail_type;
                 return std::make_unique<llama_kv_cache>(
-                        model, hparams, type_k, type_v,
+                        model, hparams, standard_type_k, standard_type_v,
                         v_trans, offload, unified, size, n_seq_max, n_pad,
                         n_swa, swa_type, nullptr, layer_filter, reuse, nullptr,
                         n_ubatch, exact_tokens, tail_type, exact_requested,

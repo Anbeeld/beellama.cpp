@@ -10,6 +10,10 @@ struct llama_kv_memory_component_stats {
     uint64_t rollback_reserve_bytes = 0;
     uint64_t transient_estimate_bytes = 0;
     uint64_t staging_bytes = 0;
+    // Informational subset of staging_bytes that remains in the rotated
+    // KVarN domain for record sealing and rollback. Do not add this to resident
+    // totals: the backing allocation is already counted by staging_bytes.
+    uint64_t stage_rotated_bytes = 0;
     uint64_t metadata_bytes = 0;
     uint64_t padding_bytes = 0;
     uint64_t allocated_capacity_tokens = 0;
@@ -36,6 +40,7 @@ struct llama_kv_memory_component_stats {
         rollback_reserve_bytes += other.rollback_reserve_bytes;
         transient_estimate_bytes += other.transient_estimate_bytes;
         staging_bytes += other.staging_bytes;
+        stage_rotated_bytes += other.stage_rotated_bytes;
         metadata_bytes += other.metadata_bytes;
         padding_bytes += other.padding_bytes;
         tail_native_bodyless_layers += other.tail_native_bodyless_layers;
@@ -86,6 +91,10 @@ struct llama_kv_memory_stats {
 
     uint64_t transient_estimate_bytes() const {
         return global.transient_estimate_bytes + swa.transient_estimate_bytes;
+    }
+
+    uint64_t stage_rotated_bytes() const {
+        return global.stage_rotated_bytes + swa.stage_rotated_bytes;
     }
 
     uint64_t persistent_overhead_bytes() const {

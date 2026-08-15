@@ -395,9 +395,13 @@ int main() {
     CHECK(!storage.has_owned_body && storage.has_shared_body);
 
     // An already-exact body satisfies any requested suffix without an overlay.
-    storage = llama_kv_tail_storage_plan_for(storage_request(
+    auto already_exact_compact_capable = storage_request(
             512, 1024, 1536, 0, 0, 16384, true, true, true, false,
-            true, true, GGML_TYPE_BF16, GGML_TYPE_F16));
+            true, true, GGML_TYPE_BF16, GGML_TYPE_F16);
+    already_exact_compact_capable.compact_history_capable = true;
+    already_exact_compact_capable.compact_current_source_capable = true;
+    already_exact_compact_capable.compact_ordered_commit_capable = true;
+    storage = llama_kv_tail_storage_plan_for(already_exact_compact_capable);
     CHECK(storage.kind == LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT);
     CHECK(!storage.body_promoted);
     CHECK(storage.actual_body_type_k == GGML_TYPE_BF16);

@@ -674,6 +674,7 @@ static void ggml_cuda_fattn_kvarn_decode_consider(
     if (max_blocks_per_sm <= 0 || n_splits <= 0 || n_gqa_blocks <= 0) {
         return;
     }
+    ++best.candidate_count;
 
     const int blocks_per_wave = nsm * max_blocks_per_sm;
     const int64_t blocks_total =

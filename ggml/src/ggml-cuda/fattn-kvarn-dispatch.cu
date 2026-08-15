@@ -26,6 +26,13 @@ static std::atomic<uint64_t> g_kvarn_route_split_reduce{0};
 static std::atomic<uint64_t> g_kvarn_route_direct_entry{0};
 static std::atomic<uint64_t> g_kvarn_route_compact_tail_entry{0};
 static std::atomic<uint64_t> g_kvarn_route_generic_shape_rejected{0};
+static std::atomic<uint64_t> g_kvarn_route_unified_partial{0};
+static std::atomic<uint64_t> g_kvarn_geometry_candidates{0};
+static std::atomic<uint64_t> g_kvarn_geometry_split_8{0};
+static std::atomic<uint64_t> g_kvarn_geometry_split_16{0};
+static std::atomic<uint64_t> g_kvarn_geometry_split_32{0};
+static std::atomic<uint64_t> g_kvarn_geometry_split_64{0};
+static std::atomic<uint64_t> g_kvarn_geometry_candidate_mask{0};
 
 static std::atomic<uint64_t> g_kv_mem_kvarn_descriptor{0};
 static std::atomic<uint64_t> g_kv_mem_kvarn_partial_output{0};
@@ -102,6 +109,13 @@ void ggml_cuda_fattn_kvarn_route_stats_reset() {
     g_kvarn_route_direct_entry.store(0, std::memory_order_relaxed);
     g_kvarn_route_compact_tail_entry.store(0, std::memory_order_relaxed);
     g_kvarn_route_generic_shape_rejected.store(0, std::memory_order_relaxed);
+    g_kvarn_route_unified_partial.store(0, std::memory_order_relaxed);
+    g_kvarn_geometry_candidates.store(0, std::memory_order_relaxed);
+    g_kvarn_geometry_split_8.store(0, std::memory_order_relaxed);
+    g_kvarn_geometry_split_16.store(0, std::memory_order_relaxed);
+    g_kvarn_geometry_split_32.store(0, std::memory_order_relaxed);
+    g_kvarn_geometry_split_64.store(0, std::memory_order_relaxed);
+    g_kvarn_geometry_candidate_mask.store(0, std::memory_order_relaxed);
 }
 
 void ggml_cuda_fattn_kvarn_route_stats_get(ggml_cuda_fattn_kvarn_route_stats * stats) {
@@ -129,6 +143,35 @@ void ggml_cuda_fattn_kvarn_route_stats_get(ggml_cuda_fattn_kvarn_route_stats * s
     stats->direct_entry = g_kvarn_route_direct_entry.load(std::memory_order_relaxed);
     stats->compact_tail_entry = g_kvarn_route_compact_tail_entry.load(std::memory_order_relaxed);
     stats->generic_shape_rejected = g_kvarn_route_generic_shape_rejected.load(std::memory_order_relaxed);
+    stats->unified_body_exact_partial = g_kvarn_route_unified_partial.load(std::memory_order_relaxed);
+    stats->geometry_candidates = g_kvarn_geometry_candidates.load(std::memory_order_relaxed);
+    stats->geometry_split_8 = g_kvarn_geometry_split_8.load(std::memory_order_relaxed);
+    stats->geometry_split_16 = g_kvarn_geometry_split_16.load(std::memory_order_relaxed);
+    stats->geometry_split_32 = g_kvarn_geometry_split_32.load(std::memory_order_relaxed);
+    stats->geometry_split_64 = g_kvarn_geometry_split_64.load(std::memory_order_relaxed);
+    stats->geometry_candidate_mask = g_kvarn_geometry_candidate_mask.load(std::memory_order_relaxed);
+    const auto & info = ggml_cuda_info().devices[device];
+    stats->capability_subgroup_width = (uint32_t) info.warp_size;
+    stats->capability_compute_units = (uint32_t) info.nsm;
+    stats->capability_max_threads = (uint32_t) info.max_threads_per_block;
+    stats->capability_shared_kib = (uint32_t) (info.smpbo/1024);
+    stats->capability_key = uint64_t(uint32_t(info.cc)) |
+        (uint64_t(uint32_t(info.warp_size)) << 16) |
+        (uint64_t(uint32_t(info.nsm)) << 24) |
+        (uint64_t(uint32_t(info.max_threads_per_block)) << 40) |
+        (uint64_t(uint32_t(info.smpbo/1024)) << 52);
+}
+
+static void ggml_cuda_kvarn_record_geometry(int split_tokens, int candidates, uint64_t candidate_mask) {
+    g_kvarn_geometry_candidates.fetch_add(candidates, std::memory_order_relaxed);
+    g_kvarn_geometry_candidate_mask.fetch_or(candidate_mask, std::memory_order_relaxed);
+    switch (split_tokens) {
+        case 8:  g_kvarn_geometry_split_8.fetch_add(1, std::memory_order_relaxed); break;
+        case 16: g_kvarn_geometry_split_16.fetch_add(1, std::memory_order_relaxed); break;
+        case 32: g_kvarn_geometry_split_32.fetch_add(1, std::memory_order_relaxed); break;
+        case 64: g_kvarn_geometry_split_64.fetch_add(1, std::memory_order_relaxed); break;
+        default: break;
+    }
 }
 
 void ggml_cuda_kv_memory_transient_stats_reset() {
@@ -542,6 +585,8 @@ static bool ggml_cuda_flash_attn_ext_kvarn_vec_d(
     constexpr int gqa_per_block = ggml_cuda_fattn_kvarn_vec_max_gqa<D>();
     const int n_gqa_blocks = (gqa_ratio + gqa_per_block - 1) / gqa_per_block;
     const int split_tokens = ggml_cuda_fattn_kvarn_vec_tokens_per_split();
+    ggml_cuda_kvarn_record_geometry(split_tokens, 1,
+        UINT64_C(0x2)); // bit 1 represents the retained 16-token geometry
     const int n_splits = (plan.n_kv + split_tokens - 1) / split_tokens;
     float scale = 1.0f;
     float logit_softcap = 0.0f;
@@ -694,6 +739,8 @@ static bool ggml_cuda_flash_attn_ext_kvarn_decode_d(
     if (!geometry.use_split) {
         return false;
     }
+    ggml_cuda_kvarn_record_geometry(geometry.split_tokens, geometry.candidate_count,
+        UINT64_C(0x8)); // bit 3 represents the retained 64-token geometry
 
     const int gqa_per_block = geometry.gqa_per_block;
     const int n_gqa_blocks = geometry.n_gqa_blocks;
@@ -1078,6 +1125,7 @@ bool ggml_cuda_flash_attn_ext_kvarn(
 
     if (route == GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_VECTOR) {
         if (ggml_cuda_flash_attn_ext_kvarn_vec(ctx, dst, plan)) {
+            g_kvarn_route_unified_partial.fetch_add(1, std::memory_order_relaxed);
             g_kvarn_route_decode_vector.fetch_add(1, std::memory_order_relaxed);
 #if defined(GGML_USE_HIP)
             g_kvarn_route_amd_decode_vector.fetch_add(1, std::memory_order_relaxed);
@@ -1090,6 +1138,7 @@ bool ggml_cuda_flash_attn_ext_kvarn(
     if (route == GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_SPLIT ||
             route == GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_VECTOR) {
         if (ggml_cuda_flash_attn_ext_kvarn_decode(ctx, dst, plan)) {
+            g_kvarn_route_unified_partial.fetch_add(1, std::memory_order_relaxed);
             g_kvarn_route_decode_split.fetch_add(1, std::memory_order_relaxed);
             g_kvarn_route_split_reduce.fetch_add(1, std::memory_order_relaxed);
 #if defined(GGML_USE_HIP)

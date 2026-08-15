@@ -2024,6 +2024,7 @@ llama_kv_memory_stats llama_kv_cache_kvarn::kv_memory_stats() const {
         component.k_payload_bytes += ggml_nbytes(layer.k_records);
         component.v_payload_bytes += ggml_nbytes(layer.v_records);
         component.staging_bytes += ggml_nbytes(layer.k_stage) + ggml_nbytes(layer.v_stage);
+        component.stage_rotated_bytes += ggml_nbytes(layer.k_stage) + ggml_nbytes(layer.v_stage);
         account_tail(layer.k_tail);
         account_tail(layer.v_tail);
     }

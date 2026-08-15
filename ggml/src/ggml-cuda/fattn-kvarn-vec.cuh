@@ -326,7 +326,7 @@ static void ggml_cuda_fattn_kvarn_vec_launch_tps(
 
 template<int D, int K_BITS, int V_BITS>
 void ggml_cuda_fattn_kvarn_vec_launch(const ggml_cuda_fattn_kvarn_decode_args & args) {
-    switch (ggml_cuda_fattn_kvarn_vec_tokens_per_split()) {
+    switch (args.split_tokens) {
         case 8:
             ggml_cuda_fattn_kvarn_vec_launch_tps<D, 8, K_BITS, V_BITS>(args);
             break;

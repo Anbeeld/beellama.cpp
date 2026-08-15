@@ -672,7 +672,8 @@ llama_kv_cache::llama_kv_cache(
                 llama_kv_tail_operation_name(it->capability.missing_operation));
     };
 
-    if (tail_plan.kind == LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT && !route_probe_specs.empty()) {
+    if (tail_plan.kind == LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT &&
+            !storage_request.already_exact && !route_probe_specs.empty()) {
         llama_kv_tail_route_capability failure;
         if (!resolve_native_exact_routes(tail_type, tail_plan.layer_routes, failure)) {
             if (tail_type_auto && tail_type == GGML_TYPE_BF16) {
