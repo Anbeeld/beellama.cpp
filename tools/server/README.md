@@ -178,6 +178,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-mmu, --mmproj-url URL` | URL to a multimodal projector file. see tools/mtmd/README.md<br/>(env: LLAMA_ARG_MMPROJ_URL) |
 | `--mmproj-auto, --no-mmproj, --no-mmproj-auto` | whether to use multimodal projector file (if available), useful when using -hf (default: enabled)<br/>(env: LLAMA_ARG_MMPROJ_AUTO) |
 | `--mmproj-offload, --no-mmproj-offload` | whether to enable GPU offloading for multimodal projector (default: enabled)<br/>(env: LLAMA_ARG_MMPROJ_OFFLOAD) |
+| `-mmdev, --mmproj-device DEVICE` | device to use for multimodal projector (none = don't offload, default: auto)<br/>use --list-devices to see a list of available devices<br/>(env: MTMD_BACKEND_DEVICE) |
 | `--image-min-tokens N` | minimum number of tokens each image can take, only used by vision models with dynamic resolution (default: read from model)<br/>(env: LLAMA_ARG_IMAGE_MIN_TOKENS) |
 | `--image-max-tokens N` | maximum number of tokens each image can take, only used by vision models with dynamic resolution (default: read from model)<br/>(env: LLAMA_ARG_IMAGE_MAX_TOKENS) |
 | `--mtmd-batch-max-tokens N` | maximum number of image tokens per batch when encoding images (default: 1024)<br/>(env: LLAMA_ARG_MTMD_BATCH_MAX_TOKENS) |
@@ -1704,7 +1705,7 @@ The precedence rule for preset options is as follows:
 3. **Global options** defined in the preset file (`[*]`)
 
 We also offer additional options that are exclusive to presets (these aren't treated as command-line arguments):
-- `load-on-startup` (boolean): Controls whether the model loads automatically when the server starts
+- `load-on-startup` (boolean): Controls whether the model loads automatically when the server starts. Only applies at startup: if the model list is reloaded later (for example after editing the preset file), a newly added model is listed but not loaded
 - `stop-timeout` (int, seconds): After requested unload, wait for this many seconds before forcing termination (default: 10)
 
 ### Routing requests

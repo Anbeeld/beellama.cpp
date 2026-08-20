@@ -133,7 +133,8 @@ int llama_server(common_params & params, int argc, char ** argv) {
 
     // router server never loads a model and must not touch the GPU
     const bool is_router_server = params.model.path.empty()
-                               && params.model.hf_repo.empty();
+                               && params.model.hf_repo.empty()
+                               && params.model.docker_repo.empty();
 
     // skip device enumeration so the CUDA primary context stays uncreated
     common_params_print_info(params, !is_router_server);
@@ -423,6 +424,18 @@ int llama_server(common_params & params, int argc, char ** argv) {
             mcp_mgr.shutdown();
             ctx_http.stop();
         };
+
+        try {
+            models_routes->models.load_startup_models();
+        } catch (const std::exception & e) {
+            SRV_ERR("failed to load models on startup: %s\n", e.what());
+            ctx_http.stop();
+            if (ctx_http.thread.joinable()) {
+                ctx_http.thread.join();
+            }
+            clean_up();
+            return 1;
+        }
 
     } else {
         // setup clean up function, to be called before exit

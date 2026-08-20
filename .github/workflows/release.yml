@@ -860,6 +860,7 @@ jobs:
             -DGGML_BACKEND_DL=ON ^
             -DGGML_CPU_ALL_VARIANTS=ON ^
             -DGGML_OPENMP=ON ^
+            -DGGML_OPENMP_FETCH=ON ^
             -DCMAKE_C_COMPILER_LAUNCHER=ccache ^
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache ^
             %CMAKE_ARGS%
