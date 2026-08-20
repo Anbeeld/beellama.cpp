@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "llama.h"
+#include "server-loop-guard.h"
 
 #include <string>
 #include <functional>
@@ -380,9 +381,7 @@ struct server_task_result_cmpl_final : server_task_result {
 
     int32_t reasoning_output_tokens = 0;
     int32_t visible_output_tokens = 0;
-    bool loop_guard_triggered = false;
-    std::string loop_guard_action;
-    std::string loop_guard_reason;
+    server_loop_guard_telemetry loop_guard_event;
 
     bool post_sampling_probs;
     std::vector<completion_token_output> probs_output;

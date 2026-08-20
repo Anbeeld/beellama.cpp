@@ -375,11 +375,20 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
         {"tokens_cached",       n_tokens_cached},
         {"timings",             stats.to_json()},
     };
-    if (loop_guard_triggered) {
+    if (loop_guard_event.triggered) {
         res["loop_guard"] = json {
             {"triggered", true},
-            {"action", loop_guard_action},
-            {"reason", loop_guard_reason},
+            {"region", loop_guard_event.region},
+            {"detector", loop_guard_event.detector},
+            {"period", loop_guard_event.period},
+            {"coverage", loop_guard_event.coverage},
+            {"score", loop_guard_event.score},
+            {"interventions", loop_guard_event.interventions},
+            {"action", loop_guard_event.action},
+            {"decoded_token_index", loop_guard_event.decoded_token_index},
+            {"token", loop_guard_event.token},
+            {"token_piece", loop_guard_event.token_piece},
+            {"reason", loop_guard_event.reason},
         };
     }
     if (!stream && !probs_output.empty()) {

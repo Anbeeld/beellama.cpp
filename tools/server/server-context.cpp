@@ -66,6 +66,10 @@ static std::string server_loop_guard_reason_to_string(const server_loop_guard_re
     return reason;
 }
 
+static const char * server_loop_guard_region_name(server_loop_guard_region region) {
+    return region == SERVER_LOOP_REGION_REASONING ? "reasoning" : "visible";
+}
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
@@ -281,9 +285,7 @@ struct server_slot {
 
     server_loop_guard loop_guard;
     int32_t loop_guard_interventions = 0;
-    bool loop_guard_triggered = false;
-    std::string loop_guard_action;
-    std::string loop_guard_reason;
+    server_loop_guard_telemetry loop_guard_event;
     int32_t reasoning_output_tokens = 0;
     int32_t visible_output_tokens = 0;
 
@@ -424,9 +426,7 @@ struct server_slot {
         stop_detail    = "";
         loop_guard.reset();
         loop_guard_interventions = 0;
-        loop_guard_triggered = false;
-        loop_guard_action = "";
-        loop_guard_reason = "";
+        loop_guard_event = {};
         reasoning_output_tokens = 0;
         visible_output_tokens = 0;
         stopping_word  = "";
@@ -1977,49 +1977,67 @@ private:
             return true;
         }
 
-        if (!server_accept_info_is_reasoning(info)) {
+        const bool in_reasoning = server_accept_info_is_reasoning(info);
+        const auto region = in_reasoning ? SERVER_LOOP_REGION_REASONING : SERVER_LOOP_REGION_VISIBLE;
+
+        if (in_reasoning) {
+            slot.reasoning_output_tokens++;
+        } else {
             slot.visible_output_tokens++;
-            return true;
         }
 
-        slot.reasoning_output_tokens++;
+        const bool forcing_reasoning_end = in_reasoning &&
+                (info.reasoning_state_before == REASONING_BUDGET_FORCING ||
+                 info.reasoning_state_after  == REASONING_BUDGET_FORCING);
 
-        const bool forcing_reasoning_end = info.reasoning_state_before == REASONING_BUDGET_FORCING ||
-                                           info.reasoning_state_after  == REASONING_BUDGET_FORCING;
-        if (forcing_reasoning_end) {
-            return true;
-        }
-
-        slot.loop_guard.accept(info.token, SERVER_LOOP_REGION_REASONING);
+        slot.loop_guard.accept(info.token, region);
 
         const bool token_is_eog = llama_vocab_is_eog(vocab, info.token);
-        if (!slot.loop_guard.should_check(SERVER_LOOP_REGION_REASONING, token_is_eog, forcing_reasoning_end)) {
+        if (!slot.loop_guard.should_check(region, token_is_eog, forcing_reasoning_end)) {
             return true;
         }
 
-        const auto check = slot.loop_guard.check(SERVER_LOOP_REGION_REASONING);
+        const auto check = slot.loop_guard.check(region);
         if (!check.triggered) {
             return true;
         }
 
-        slot.loop_guard_triggered = true;
-        slot.loop_guard_reason = server_loop_guard_reason_to_string(check);
+        auto & event = slot.loop_guard_event;
+        event.triggered = true;
+        event.region = server_loop_guard_region_name(region);
+        event.detector = check.kind;
+        event.period = check.period;
+        event.coverage = check.coverage;
+        event.score = check.score;
+        event.decoded_token_index = slot.reasoning_output_tokens + slot.visible_output_tokens;
+        event.token = info.token;
+        event.token_piece = check.period == 1 ? common_token_to_piece(slot.ctx_tgt, info.token, true) : "";
+        event.reason = server_loop_guard_reason_to_string(check);
 
         const auto & params = slot.task->params.reasoning_loop_guard;
-        if (params.mode == COMMON_REASONING_LOOP_GUARD_FORCE_CLOSE &&
+        if (region == SERVER_LOOP_REGION_REASONING &&
+                params.mode == COMMON_REASONING_LOOP_GUARD_FORCE_CLOSE &&
                 slot.loop_guard_interventions < params.interventions_max &&
                 common_sampler_force_reasoning_end(slot.smpl.get())) {
             slot.loop_guard_interventions++;
-            slot.loop_guard_action = "force-close";
-            SLT_WRN(slot, "reasoning loop guard force-closing hidden reasoning: %s\n", slot.loop_guard_reason.c_str());
+            event.interventions = slot.loop_guard_interventions;
+            event.action = "force-close";
+            SLT_WRN(slot,
+                    "loop guard force-closing hidden reasoning at token %d (interventions=%d token=%d piece='%s'): %s\n",
+                    event.decoded_token_index, event.interventions, event.token, event.token_piece.c_str(),
+                    event.reason.c_str());
             return false;
         }
 
-        slot.loop_guard_action = "stop";
+        event.interventions = slot.loop_guard_interventions;
+        event.action = "stop";
         slot.stop = STOP_TYPE_LIMIT;
         slot.stop_detail = "reasoning_loop_guard";
         slot.has_next_token = false;
-        SLT_WRN(slot, "reasoning loop guard stopping generation: %s\n", slot.loop_guard_reason.c_str());
+        SLT_WRN(slot,
+                "loop guard stopping %s output at token %d (interventions=%d token=%d piece='%s'): %s\n",
+                event.region.c_str(), event.decoded_token_index, event.interventions, event.token,
+                event.token_piece.c_str(), event.reason.c_str());
         return false;
     }
 
@@ -2350,9 +2368,7 @@ private:
         res->stop_detail           = slot.stop_detail;
         res->reasoning_output_tokens = slot.reasoning_output_tokens;
         res->visible_output_tokens   = slot.visible_output_tokens;
-        res->loop_guard_triggered    = slot.loop_guard_triggered;
-        res->loop_guard_action       = slot.loop_guard_action;
-        res->loop_guard_reason       = slot.loop_guard_reason;
+        res->loop_guard_event        = slot.loop_guard_event;
         res->post_sampling_probs   = slot.task->params.post_sampling_probs;
 
         res->verbose           = slot.task->params.verbose;
@@ -4387,9 +4403,7 @@ private:
                 // and any force-close/stop action must be restored with the sampler.
                 const server_loop_guard loop_guard_save = slot.loop_guard;
                 const int32_t loop_guard_interventions_save = slot.loop_guard_interventions;
-                const bool loop_guard_triggered_save = slot.loop_guard_triggered;
-                const std::string loop_guard_action_save = slot.loop_guard_action;
-                const std::string loop_guard_reason_save = slot.loop_guard_reason;
+                const server_loop_guard_telemetry loop_guard_event_save = slot.loop_guard_event;
                 const int32_t reasoning_output_tokens_save = slot.reasoning_output_tokens;
                 const int32_t visible_output_tokens_save = slot.visible_output_tokens;
                 const bool has_next_token_save = slot.has_next_token;
@@ -4438,9 +4452,7 @@ private:
                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
                         slot.loop_guard = loop_guard_save;
                         slot.loop_guard_interventions = loop_guard_interventions_save;
-                        slot.loop_guard_triggered = loop_guard_triggered_save;
-                        slot.loop_guard_action = loop_guard_action_save;
-                        slot.loop_guard_reason = loop_guard_reason_save;
+                        slot.loop_guard_event = loop_guard_event_save;
                         slot.reasoning_output_tokens = reasoning_output_tokens_save;
                         slot.visible_output_tokens = visible_output_tokens_save;
                         slot.has_next_token = has_next_token_save;
