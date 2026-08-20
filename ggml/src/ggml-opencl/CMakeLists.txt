@@ -203,6 +203,7 @@ set(GGML_OPENCL_KERNELS
     sqr
     sqrt
     ssm_conv
+    ssm_scan
     gated_delta_net
     sub
     sum_rows

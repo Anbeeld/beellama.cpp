@@ -5,14 +5,14 @@
 	import { ActionIcon, KeyboardShortcutInfo, SearchInput } from '$lib/components/app';
 	import { Button } from '$lib/components/ui/button';
 	import {
+		ICON_CLASS_DEFAULT,
 		ICON_STRIP_TRANSITION_DELAY_MULTIPLIER,
 		ICON_STRIP_TRANSITION_DURATION,
 		ROUTES,
 		SIDEBAR_ACTIONS_ITEMS
 	} from '$lib/constants';
-	import { ICON_CLASS_DEFAULT } from '$lib/constants/css-classes';
 	import { TooltipSide } from '$lib/enums';
-	import { isMobile } from '$lib/stores/viewport.svelte';
+	import { deviceStore } from '$lib/stores';
 	import type { Component } from 'svelte';
 	import { onMount } from 'svelte';
 	import { circIn } from 'svelte/easing';
@@ -42,7 +42,7 @@
 	let showIcons = $state(false);
 	let searchInputRef = $state<HTMLInputElement | null>(null);
 
-	const isOnMobile = $derived(isMobile.current);
+	const isOnMobile = $derived(deviceStore.isMobile);
 
 	$effect(() => {
 		if (isSearchModeActive && searchInputRef) {
@@ -107,7 +107,7 @@
 	>
 		{#each SIDEBAR_ACTIONS_ITEMS as item, i (item.tooltip)}
 			{@const isActive = isItemActive(item)}
-			{@const isSearchOnMobile = item.icon === Search && isMobile.current}
+			{@const isSearchOnMobile = item.icon === Search && deviceStore.isMobile}
 			{@const itemHref = isSearchOnMobile ? ROUTES.SEARCH : item.route}
 			{@const itemOnClick = item.route
 				? () => {
@@ -156,7 +156,7 @@
 	<div class="{className} flex-col gap-1 hidden md:flex">
 		{#each SIDEBAR_ACTIONS_ITEMS as item, i (item.tooltip)}
 			{@const isActive = isItemActive(item)}
-			{@const isSearchOnMobile = item.icon === Search && isMobile.current}
+			{@const isSearchOnMobile = item.icon === Search && deviceStore.isMobile}
 			{@const itemOnClick = item.route
 				? () => {
 						onNewChat?.();

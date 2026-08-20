@@ -8,8 +8,8 @@
 	} from '$lib/components/app';
 	import SettingsGroup from '$lib/components/app/settings/SettingsGroup.svelte';
 	import { ConversationSelectionMode, FileExtensionText, HtmlInputType } from '$lib/enums';
-	import { conversations, conversationsStore } from '$lib/stores/conversations.svelte';
-	import { settingsStore } from '$lib/stores/settings.svelte';
+	import { ConversationTransferService } from '$lib/services';
+	import { conversationsStore, settingsStore } from '$lib/stores';
 	import { createMessageCountMap } from '$lib/utils';
 	import { fade } from 'svelte/transition';
 	import { toast } from 'svelte-sonner';
@@ -112,7 +112,7 @@
 
 	async function handleExportClick() {
 		try {
-			const allConversations = conversations();
+			const allConversations = conversationsStore.conversations;
 
 			if (allConversations.length === 0) {
 				toast.info('No conversations to export');
@@ -148,9 +148,9 @@
 			);
 
 			if (allData.length === 1) {
-				conversationsStore.downloadConversationFile(allData[0]);
+				ConversationTransferService.downloadConversationFile(allData[0]);
 			} else {
-				conversationsStore.downloadConversationsArchive(allData);
+				ConversationTransferService.downloadConversationsArchive(allData);
 			}
 
 			exportedConversations = selectedConversations;
@@ -178,7 +178,7 @@
 				if (!file) return;
 
 				try {
-					const importedData = await conversationsStore.parseImportFile(file);
+					const importedData = await ConversationTransferService.parseImportFile(file);
 
 					if (importedData.length === 0) {
 						throw new Error('No conversations found in file');
@@ -231,7 +231,7 @@
 
 	async function handleDeleteAllClick() {
 		try {
-			const allConversations = conversations();
+			const allConversations = conversationsStore.conversations;
 
 			if (allConversations.length === 0) {
 				toast.info('No conversations to delete');

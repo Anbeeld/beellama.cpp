@@ -14,15 +14,8 @@
 	import { useKeyboardShortcuts } from '$lib/hooks/use-keyboard-shortcuts.svelte';
 	import { useMarqueeSelection } from '$lib/hooks/use-marquee-selection.svelte';
 	import { RouterService } from '$lib/services/router.service';
-	import { chatStore } from '$lib/stores/chat.svelte';
-	import {
-		buildConversationTree,
-		conversations,
-		conversationsStore
-	} from '$lib/stores/conversations.svelte';
-	import { device } from '$lib/stores/device.svelte';
-	import { config } from '$lib/stores/settings.svelte';
-	import { isMobile } from '$lib/stores/viewport.svelte';
+	import { chatStore, conversationsStore, deviceStore, settingsStore } from '$lib/stores';
+	import { buildConversationTree } from '$lib/utils';
 	import { circIn } from 'svelte/easing';
 	import { SvelteSet } from 'svelte/reactivity';
 	import { fade } from 'svelte/transition';
@@ -43,8 +36,8 @@
 	let logoHovered = $state(false);
 
 	const isStripExpanded = $derived(isExpandedMode || hoveredTooltip !== null);
-	const isOnMobile = $derived(isMobile.current);
-	const alwaysShowOnDesktop = $derived(config().alwaysShowSidebarOnDesktop as boolean);
+	const isOnMobile = $derived(deviceStore.isMobile);
+	const alwaysShowOnDesktop = $derived(settingsStore.config.alwaysShowSidebarOnDesktop as boolean);
 
 	$effect(() => {
 		if (alwaysShowOnDesktop && !isOnMobile) {
@@ -72,7 +65,7 @@
 	});
 
 	$effect(() => {
-		if (isMobile.current && page.url.hash.includes(ROUTES.SEARCH)) {
+		if (deviceStore.isMobile && page.url.hash.includes(ROUTES.SEARCH)) {
 			isExpandedMode = false;
 		}
 	});
@@ -84,7 +77,7 @@
 	let filteredConversations = $derived.by(() => {
 		if (isSearchModeActive) {
 			if (searchQuery.trim().length > 0) {
-				return conversations().filter((conversation: { name: string }) =>
+				return conversationsStore.conversations.filter((conversation: { name: string }) =>
 					conversation.name.toLowerCase().includes(searchQuery.toLowerCase())
 				);
 			}
@@ -92,7 +85,7 @@
 			return [];
 		}
 
-		return conversations();
+		return conversationsStore.conversations;
 	});
 
 	let isSelectionMode = $state(false);
@@ -110,7 +103,7 @@
 	const allSelectedArePinned = $derived.by(() => {
 		if (selectedIds.size === 0) return false;
 
-		const convs = conversations();
+		const convs = conversationsStore.conversations;
 
 		for (const id of selectedIds) {
 			const c = convs.find((conv) => conv.id === id);
@@ -124,7 +117,7 @@
 	const pinStateIsMixed = $derived.by(() => {
 		if (selectedIds.size === 0) return false;
 
-		const convs = conversations();
+		const convs = conversationsStore.conversations;
 
 		let anyPinned = false;
 		let anyUnpinned = false;
@@ -234,7 +227,7 @@
 	}
 
 	async function selectConversation(id: string) {
-		if (isMobile.current) {
+		if (deviceStore.isMobile) {
 			scheduleMobileCollapse();
 		}
 
@@ -242,7 +235,7 @@
 	}
 
 	async function handleEditConversation(id: string) {
-		const conversation = conversations().find((conv) => conv.id === id);
+		const conversation = conversationsStore.conversations.find((conv) => conv.id === id);
 
 		if (!conversation) return;
 
@@ -275,7 +268,7 @@
 	}
 
 	async function handleDeleteConversation(id: string) {
-		const conversation = conversations().find((conv) => conv.id === id);
+		const conversation = conversationsStore.conversations.find((conv) => conv.id === id);
 
 		if (!conversation) return;
 
@@ -322,9 +315,9 @@
 			'fixed md:sticky top-2 left-2 md:left-0 md:ml-2 md:mt-2 pt-2 z-10 w-[calc(100dvw-1rem)]',
 			'md:h-[calc(100dvh-1.125rem)]',
 			isExpandedMode &&
-				(device.isStandalone
+				(deviceStore.isStandalone
 					? 'h-[calc(100dvh-2rem)]'
-					: device.isIOSDevice
+					: deviceStore.isIOSDevice
 						? 'h-[calc(100dvh-0.5rem)]'
 						: 'h-[calc(100dvh-1rem)]'),
 			'rounded-3xl md:rounded-2xl',
@@ -360,7 +353,7 @@
 
 			{#if isOnMobile || (isExpandedMode && !alwaysShowOnDesktop)}
 				<div
-					class="flex items-center transition-all duration-150 ease-out {isMobile.current &&
+					class="flex items-center transition-all duration-150 ease-out {deviceStore.isMobile &&
 					!isExpandedMode
 						? 'opacity-0 h-0!'
 						: ''}"
@@ -368,7 +361,7 @@
 					out:fade={{ duration: 100 }}
 				>
 					<ActionIcon
-						icon={isMobile.current ? X : PanelLeftClose}
+						icon={deviceStore.isMobile ? X : PanelLeftClose}
 						size="lg"
 						iconSize="h-4.5 w-4.5 md:h-4 md:w-4"
 						class="backdrop-blur-none md:h-9 md:w-9 h-10 w-10 rounded-full mr-1 hover:bg-accent!"
@@ -382,9 +375,9 @@
 		</div>
 
 		<div
-			class="mt-2 flex min-h-0 flex-1 flex-col gap-4 md:gap-1 {isMobile.current
+			class="mt-2 flex min-h-0 flex-1 flex-col gap-4 md:gap-1 {deviceStore.isMobile
 				? 'transition-[opacity,height] duration-200 ease-out'
-				: ''} {isMobile.current && !isExpandedMode ? 'opacity-0 !h-0' : ''}"
+				: ''} {deviceStore.isMobile && !isExpandedMode ? 'opacity-0 !h-0' : ''}"
 			in:fade={{ duration: 200 }}
 			out:fade={{ duration: 200 }}
 		>
@@ -402,7 +395,7 @@
 					isSearchModeActive = true;
 				}}
 				onNewChat={() => {
-					if (isMobile.current) {
+					if (deviceStore.isMobile) {
 						scheduleMobileCollapse();
 					}
 				}}

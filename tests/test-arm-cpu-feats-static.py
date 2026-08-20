@@ -6,7 +6,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT / "ggml/src/ggml-cpu/arch/arm/cpu-feats.cpp").read_text(encoding="utf-8")
 
 
-feature_snapshot = "ggml_feats_arch64_runtime_t af = ggml_get_aarch64_runtime_features();"
+feature_snapshot = "ggml_feats_arch64_runtime_t af = ggml_feats_get_arch64_runtime();"
 snapshot_pos = SOURCE.find(feature_snapshot)
 if snapshot_pos < 0:
     raise AssertionError("AArch64 backend scoring must read the runtime feature snapshot")
