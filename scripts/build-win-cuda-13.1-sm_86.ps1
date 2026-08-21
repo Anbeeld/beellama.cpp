@@ -3,7 +3,7 @@ param(
     [string]$PackageName = "build-win-cuda-13.1-sm_86",
     [string]$BuildName = "build-win-cuda-13.1-sm_86",
     [string]$Target = "",
-    [int]$Parallel = 16,
+    [int]$Parallel = 24,
     [switch]$Package = $false,
     [switch]$StdQuantIteration = $false,
     [switch]$AllTests = $false,

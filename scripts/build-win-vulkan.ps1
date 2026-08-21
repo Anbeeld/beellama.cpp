@@ -3,7 +3,7 @@ param(
     [string]$PackageName = "build-win-vulkan",
     [string]$BuildName = "build-win-vulkan",
     [string]$Target = "",
-    [int]$Parallel = 16,
+    [int]$Parallel = 24,
     [switch]$Package = $false,
     [switch]$AllTests = $false,
     [switch]$SkipStage = $false,
