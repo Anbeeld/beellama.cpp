@@ -822,6 +822,21 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
+static bool ggml_cuda_can_access_peer(int device, int peer_device) {
+    // Cache the physical-device capability. Concurrent first queries are harmless,
+    // and relaxed ordering is sufficient because the cached value is immutable.
+    static std::atomic<int> peer_access[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_DEVICES] = {};
+
+    int cached = peer_access[device][peer_device].load(std::memory_order_relaxed);
+    if (cached == 0) {
+        int can_access_peer = 0;
+        CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access_peer, device, peer_device));
+        cached = can_access_peer ? 2 : 1;
+        peer_access[device][peer_device].store(cached, std::memory_order_relaxed);
+    }
+    return cached == 2;
+}
+
 static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
     if (ggml_backend_buffer_is_cuda(src->buffer)) {
         ggml_backend_cuda_buffer_context * src_ctx = (ggml_backend_cuda_buffer_context *)src->buffer->context;
@@ -836,6 +851,10 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
 #ifdef GGML_CUDA_NO_PEER_COPY
             return false;
 #else
+            if (!ggml_cuda_can_access_peer(src_physical, dst_physical) ||
+                    !ggml_cuda_can_access_peer(dst_physical, src_physical)) {
+                return false;
+            }
             CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(src), cudaStreamPerThread));
 #endif
         }
@@ -1163,6 +1182,28 @@ static void ggml_backend_cuda_comm_init_none(ggml_backend_cuda_comm_context * re
 }
 
 static void ggml_backend_cuda_comm_init_internal(ggml_backend_cuda_comm_context * ret) {
+#if defined(_WIN32)
+    // The internal provider synchronizes ranks through mapped host memory and
+    // cross-device event rings. CUDA does not guarantee forward progress for
+    // kernels that spin waiting for another kernel to run, and repeated WDDM
+    // prefill also exposes invalid pooled-event state in the copy-engine path.
+    // Use the meta backend's event-ordered butterfly on WDDM; CUDA TCC remains
+    // eligible for the internal provider.
+    for (int dev_id : ret->dev_ids) {
+        const int physical_device = ggml_cuda_get_physical_device(dev_id);
+        int tcc_driver = 0;
+        CUDA_CHECK(cudaDeviceGetAttribute(&tcc_driver, cudaDevAttrTccDriver, physical_device));
+        if (!tcc_driver) {
+            GGML_LOG_WARN(
+                    "internal CUDA AllReduce disabled on WDDM device %d; "
+                    "falling back to meta-backend butterfly\n",
+                    physical_device);
+            ggml_backend_cuda_comm_init_none(ret);
+            return;
+        }
+    }
+#endif // defined(_WIN32)
+
     ret->ar_pipeline = ggml_cuda_ar_pipeline_init(ret->dev_ids.data(), ret->dev_ids.size());
     if (ret->ar_pipeline) {
         ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_internal;
@@ -2550,6 +2591,13 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 #ifdef GGML_CUDA_NO_PEER_COPY
             return false;
 #else
+            // Without direct peer access, let the generic backend copy path
+            // synchronize both devices and stage through host memory. This
+            // avoids relying on an implicit asynchronous staging protocol.
+            if (!ggml_cuda_can_access_peer(src_physical, dst_physical) ||
+                    !ggml_cuda_can_access_peer(dst_physical, src_physical)) {
+                return false;
+            }
             CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(dst), cuda_ctx_src->stream()));
 #endif // GGML_CUDA_NO_PEER_COPY
         }
@@ -2645,13 +2693,18 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
-    bool res = false;
+    // A zero UID is the scheduler/backend contract for a graph without a
+    // stable executable identity.  Tensor-property comparison still records
+    // useful state below, but cannot cover backend-private capture parameters
+    // (for example temporary workspaces).  Such a graph must therefore refresh
+    // its CUDA executable rather than replaying a previous capture.
+    const bool has_stable_identity = cgraph->uid != 0;
+    bool res = !has_stable_identity;
 
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
-    if (cgraph->uid != 0 &&
-        cgraph->uid == graph->uid) {
+    if (has_stable_identity && cgraph->uid == graph->uid) {
         GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
         GGML_ASSERT((int)graph->node_props.size() == cgraph->n_nodes);
         return false;
@@ -4330,7 +4383,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
-            if (!graph->warmup_complete) {
+            if (cgraph->uid == 0) {
+                // Projected meta-backend graphs intentionally have no stable
+                // executable identity.  Retain CUDA graph execution, but capture
+                // and update the executable for each evaluation.
+                graph->warmup_complete = true;
+                use_cuda_graph = true;
+                cuda_graph_update_required = true;
+            } else if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
                 if (!properties_changed) {
                     graph->warmup_complete = true;

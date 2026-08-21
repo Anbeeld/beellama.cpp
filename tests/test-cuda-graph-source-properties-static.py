@@ -22,5 +22,20 @@ require(
     "prop.node_src_types[j] = cgraph->nodes[i]->src[j]->type;",
     "CUDA graph property snapshots must record each source type",
 )
+require(
+    CUDA,
+    "const bool has_stable_identity = cgraph->uid != 0;",
+    "unversioned projected graphs must be distinguished from stable graph identities",
+)
+require(
+    CUDA,
+    "bool res = !has_stable_identity;",
+    "unversioned projected graphs must request a CUDA executable refresh",
+)
+require(
+    CUDA,
+    "if (cgraph->uid == 0) {\n                // Projected meta-backend graphs intentionally have no stable",
+    "unversioned projected graphs must retain CUDA graph execution with a per-evaluation update",
+)
 
 print("CUDA graph source-property contract checks passed")
