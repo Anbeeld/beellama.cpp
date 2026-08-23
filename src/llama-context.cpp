@@ -2522,7 +2522,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
 
     // wait for the computation to finish (automatically done when obtaining the model output)
-    //synchronize();
+    synchronize();
 
     return 0;
 }

@@ -1616,6 +1616,14 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
         auto & cells = v_cells[s0];
 
         if (seq_id_src == seq_id_dst) {
+            // Do not leave the tail copy deferred: under concurrent multi-slot
+            // decoding, a pending seq_cp transaction can be observed by another
+            // slot's clone_logical_state_from() (via restorable-prefix reuse or
+            // idle-slot RAM caching) before this call's normal deferred-commit
+            // point (the next seq_cp()) is ever reached, causing spurious
+            // "cannot clone KV cache logical state during a transaction" /
+            // pos_min == -1 failures. Commit immediately instead.
+            materialize_pending_copies();
             return;
         }
 
@@ -1646,6 +1654,10 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
         }
 
         rebuild_allocation_head(seq_id_dst);
+
+        // See the seq_id_src == seq_id_dst branch above: commit the tail copy
+        // immediately rather than leaving it deferred until the next seq_cp().
+        materialize_pending_copies();
 
         return;
     }
@@ -1988,35 +2000,53 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
     bool success = true;
 
-    tail_preparing = true;
-    for (const auto & ubatch : ubatches) {
-        // only find a suitable slot for the ubatch. don't modify the cells yet
-        const auto sinfo_new = find_slot(ubatch, false);
-        if (sinfo_new.empty()) {
-            success = false;
-            break;
-        }
+    {
+        // find_slot()/apply_ubatch() below can throw (e.g. "structured KV live
+        // groups alias one F16 stage slot"). Without an RAII guard, such an
+        // exception unwinds out of this function and leaves tail_preparing
+        // stuck at true forever, since the plain assignment that used to reset
+        // it is skipped. Every subsequent clone_logical_state_from() call
+        // (restorable-prefix reuse, idle-slot RAM restore) then observes
+        // tail_preparing == true and spuriously fails with "cannot clone KV
+        // cache logical state during a transaction" until some later prepare()
+        // call happens to complete without throwing. Use the same RAII guard
+        // pattern already used elsewhere in this file (see the other
+        // tail_preparing_guard uses) so the flag is always restored.
+        struct tail_preparing_guard {
+            bool & value;
+            bool old;
+            ~tail_preparing_guard() { value = old; }
+        } guard { tail_preparing, tail_preparing };
+        tail_preparing = true;
 
-        // remember the position that we found
-        res.push_back(sinfo_new);
-
-        // store the old state of the cells in the recovery stack
-        {
-            state_t state = { sinfo_new, v_heads, {} };
-
-            for (uint32_t s = 0; s < sinfo_new.n_stream(); ++s) {
-                auto & cells = v_cells[sinfo_new.strm[s]];
-
-                state.v_cells.push_back(cells.cp(sinfo_new.idxs[s]));
+        for (const auto & ubatch : ubatches) {
+            // only find a suitable slot for the ubatch. don't modify the cells yet
+            const auto sinfo_new = find_slot(ubatch, false);
+            if (sinfo_new.empty()) {
+                success = false;
+                break;
             }
 
-            states.push_back(std::move(state));
-        }
+            // remember the position that we found
+            res.push_back(sinfo_new);
 
-        // now emplace the ubatch
-        apply_ubatch(sinfo_new, ubatch);
+            // store the old state of the cells in the recovery stack
+            {
+                state_t state = { sinfo_new, v_heads, {} };
+
+                for (uint32_t s = 0; s < sinfo_new.n_stream(); ++s) {
+                    auto & cells = v_cells[sinfo_new.strm[s]];
+
+                    state.v_cells.push_back(cells.cp(sinfo_new.idxs[s]));
+                }
+
+                states.push_back(std::move(state));
+            }
+
+            // now emplace the ubatch
+            apply_ubatch(sinfo_new, ubatch);
+        }
     }
-    tail_preparing = false;
 
     GGML_ASSERT(!states.empty() || !success);
 
@@ -2377,7 +2407,20 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
             if (group > 0) {
                 const uint32_t slot = stage_slot(group);
                 if (stage_owners[slot] >= 0 && uint32_t(stage_owners[slot]) != group) {
-                    throw std::runtime_error("structured KV live groups alias one F16 stage slot");
+                    // Two live sequences currently want the same F16 stage
+                    // slot for their in-progress (incomplete) record group.
+                    // This is a resource-contention condition, not a data
+                    // invariant violation: nothing has been written yet (this
+                    // is a pure planning pass, see the caller's separate
+                    // apply_ubatch() step). Report "no slot found" the same
+                    // way as ordinary out-of-space below, instead of throwing.
+                    // Previously this threw std::runtime_error, which
+                    // propagates out of llama_decode() and is caught by the
+                    // server as "decode() failed", triggering
+                    // abort_all_slots() -- failing every other concurrently
+                    // in-flight request (not just this one) for what is
+                    // normally just a "try again next tick" condition.
+                    return {};
                 }
                 stage_owners[slot] = int32_t(group);
             }
