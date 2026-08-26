@@ -521,7 +521,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
         if (std::regex_match(tensor_name, pattern_ffn_down_exps_bias)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_PARTIAL);
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_PARTIAL, "ffn_down_exps.weight");
         }
 
         // output
@@ -555,24 +555,29 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                     GGML_ASSERT(tensor->ne[axis] == 2*key_dim + value_dim);
                     return {{key_dim, 2}, {value_dim, 1}};
                 }
+                if (std::regex_match(tensor_name, pattern_r_cache)) {
+                    return {{key_dim * (hparams.ssm_d_conv - 1), 2}, {value_dim * (hparams.ssm_d_conv - 1), 1}};
+                }
             } else {
                 const int64_t head_ratio = n_v_heads / n_k_heads;
+                GGML_ASSERT(head_ratio >= 0 && head_ratio <= UINT32_MAX - 2);
+                const uint32_t head_ratio_u32 = uint32_t(head_ratio);
                 if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_ssm_conv1d)) {
                     GGML_ASSERT(tensor->ne[axis] == 2*key_dim + value_dim);
-                    return {{key_dim, 2 + head_ratio}};
+                    return {{key_dim, 2 + head_ratio_u32}};
                 }
                 if (std::regex_match(tensor_name, pattern_attn_gate_weight) || std::regex_match(tensor_name, pattern_ssm_out_weight)) {
-                    return {{key_dim, head_ratio}};
+                    return {{key_dim, head_ratio_u32}};
                 }
                 if (std::regex_match(tensor_name, pattern_ssm_dt) || std::regex_match(tensor_name, pattern_ssm_a) ||
                         std::regex_match(tensor_name, pattern_ssm_alpha) || std::regex_match(tensor_name, pattern_ssm_beta)) {
-                    return {{n_k_heads, head_ratio}};
+                    return {{n_k_heads, head_ratio_u32}};
                 }
                 if (std::regex_match(tensor_name, pattern_r_cache)) {
-                    return {{key_dim * (hparams.ssm_d_conv - 1), 2 + head_ratio}};
+                    return {{key_dim * (hparams.ssm_d_conv - 1), 2 + head_ratio_u32}};
                 }
                 if (std::regex_match(tensor_name, pattern_s_cache)) {
-                    return {{n_k_heads * head_v_dim * head_v_dim, head_ratio}};
+                    return {{n_k_heads * head_v_dim * head_v_dim, head_ratio_u32}};
                 }
             }
 
@@ -643,12 +648,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 blck_size_perf *= 2;
             }
 
+            const int64_t granularity_q    = std::lcm(n_embd_q, blck_size_perf);
+            const int64_t granularity_head = granularity_q / hparams.n_embd_head_k(il); // for tensors with one value per head
             if (std::regex_match(tensor_name, pattern_attn_sinks)) {
                 GGML_ASSERT(segments.size() == 1);
-                return {std::lcm(n_embd_q, blck_size_perf)/n_embd_q * n_gqa};
+                return {granularity_head};
             }
 
-            const int64_t granularity_q = std::lcm(n_embd_q, blck_size_perf);
             if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_q_bias)) {
                 GGML_ASSERT(segments.size() == 1);
                 // some models have Q gate tensors, for those cases the granularity needs to be doubled:
@@ -661,25 +667,38 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 GGML_ASSERT(segments.size() == 1);
                 return {granularity_q};
             }
+            if (std::regex_match(tensor_name, pattern_attn_gate_weight)) {
+                GGML_ASSERT(segments.size() == 1);
+                if (tensor->ne[1] == hparams.n_head(il)) {
+                    return {granularity_head};
+                }
+                return {granularity_q};
+            }
 
             const int64_t granularity_kv = granularity_q / n_gqa;
             if (cache_component.valid) {
                 GGML_ASSERT(segments.size() == 1);
+                GGML_ASSERT(granularity_kv % hparams.n_embd_head_k(il) == 0);
+                const int64_t granularity_kv_heads = granularity_kv / hparams.n_embd_head_k(il);
                 switch (cache_component.role) {
                     case LLAMA_KV_CACHE_COMPONENT_STANDARD_K:
                     case LLAMA_KV_CACHE_COMPONENT_STANDARD_K_TAIL:
-                    case LLAMA_KV_CACHE_COMPONENT_KVARN_K_TAIL:
-                        return { int64_t(hparams.n_embd_head_k(il)) };
+                    case LLAMA_KV_CACHE_COMPONENT_KVARN_K_TAIL: {
+                        return { granularity_kv };
+                    }
                     case LLAMA_KV_CACHE_COMPONENT_STANDARD_V:
                     case LLAMA_KV_CACHE_COMPONENT_STANDARD_V_TAIL:
-                    case LLAMA_KV_CACHE_COMPONENT_KVARN_V_TAIL:
-                        return { int64_t(hparams.n_embd_head_v(il)) };
+                    case LLAMA_KV_CACHE_COMPONENT_KVARN_V_TAIL: {
+                        return { granularity_kv_heads * hparams.n_embd_head_v(il) };
+                    }
                     case LLAMA_KV_CACHE_COMPONENT_KVARN_K_RECORDS:
-                    case LLAMA_KV_CACHE_COMPONENT_KVARN_K_STAGE:
-                        return { int64_t(llama_kvarn_head_slices(hparams.n_embd_head_k(il))) };
+                    case LLAMA_KV_CACHE_COMPONENT_KVARN_K_STAGE: {
+                        return { granularity_kv_heads * llama_kvarn_head_slices(hparams.n_embd_head_k(il)) };
+                    }
                     case LLAMA_KV_CACHE_COMPONENT_KVARN_V_RECORDS:
-                    case LLAMA_KV_CACHE_COMPONENT_KVARN_V_STAGE:
-                        return { int64_t(llama_kvarn_head_slices(hparams.n_embd_head_v(il))) };
+                    case LLAMA_KV_CACHE_COMPONENT_KVARN_V_STAGE: {
+                        return { granularity_kv_heads * llama_kvarn_head_slices(hparams.n_embd_head_v(il)) };
+                    }
                     case LLAMA_KV_CACHE_COMPONENT_UNKNOWN:
                         break;
                 }
@@ -740,6 +759,16 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         memset(split_state.ne, 0, sizeof(split_state.ne));
         split_state.nr[0] = 1;
         split_state.n_segments = 1;
+        if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+            GGML_ASSERT(tc.tensor_axis_0 != tensor);
+            const ggml_backend_meta_split_state source_split_state = llama_meta_device_get_split_state(tc.tensor_axis_0, userdata);
+            GGML_ASSERT(source_split_state.axis >= 0 && source_split_state.axis < GGML_MAX_DIMS);
+            for (size_t j = 0; j < ud->n_devices; j++) {
+                for (size_t is = 0; is < source_split_state.n_segments; is++) {
+                    split_state.ne[j] += source_split_state.ne[is*ud->n_devices + j] * source_split_state.nr[is];
+                }
+            }
+        }
     }
     return split_state;
     GGML_UNUSED(userdata);

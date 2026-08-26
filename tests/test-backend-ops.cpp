@@ -9817,6 +9817,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 6, 4096, 5120, {1, 1}, {1, 1}));
 
+    // Qwen3.8 recurrent ssm_alpha projection. Keep the narrow Q8_0 CUDA path
+    // covered because it is exercised at every recurrent layer transition.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 24, 1024, 5120, {1, 1}, {1, 1}));
+
     // K not a multiple of 32
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 64, 32,  65, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 64, 32,  80, {1, 1}, {1, 1}));
@@ -11031,6 +11035,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
         }
     }
+
+    // Qwen3.8 recurrent ssm_out projection at the Row-2 ubatch width. The
+    // tensor-split route projects K=6144 into K=3072 per device, so retain
+    // both the unsplit and actual projected shapes. These are intentionally
+    // performance-only: CPU reference evaluation is prohibitively expensive.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 5120, 1024, 6144, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 5120, 1024, 3072, {1, 1}, {1, 1}));
 
     // qwen3-30b-a3b
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {

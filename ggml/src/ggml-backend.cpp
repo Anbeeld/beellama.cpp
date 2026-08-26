@@ -797,6 +797,12 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+struct ggml_backend_sched_graph_node_properties {
+    const struct ggml_tensor * node;
+    const struct ggml_tensor * src[GGML_MAX_SRC];
+    const struct ggml_tensor * view_src;
+};
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -820,6 +826,8 @@ struct ggml_backend_sched {
 
     // copy of the graph with modified inputs
     struct ggml_cgraph graph;
+    struct ggml_backend_sched_graph_node_properties * graph_props;
+    int graph_props_size;
 
     // graph splits
     struct ggml_backend_sched_split * splits;
@@ -887,6 +895,41 @@ static void ggml_backend_sched_graph_inputs_grow(ggml_backend_sched_t sched) {
     }
     sched->graph_inputs = pnew;
     sched->graph_inputs_capacity = new_cap;
+}
+
+// Scheduler splits retain views of a graph after allocation.  A stable graph
+// identity does not guarantee that callers have not rewired a node source.
+// Property changes on the same tensor object remain visible through the split
+// and are handled by the backend; only topology identity is retained here.
+static bool ggml_backend_sched_graph_update_required(
+        ggml_backend_sched_t sched, const struct ggml_cgraph * graph) {
+    bool changed = sched->graph_props_size != graph->n_nodes;
+    if (changed) {
+        void * resized = realloc(
+                sched->graph_props,
+                (size_t) graph->n_nodes * sizeof(struct ggml_backend_sched_graph_node_properties));
+        if (resized == NULL && graph->n_nodes > 0) {
+            GGML_ABORT("failed to grow scheduler graph property cache");
+        }
+        sched->graph_props = (struct ggml_backend_sched_graph_node_properties *) resized;
+        sched->graph_props_size = graph->n_nodes;
+    }
+
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        struct ggml_backend_sched_graph_node_properties prop = {};
+        prop.node = graph->nodes[i];
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            prop.src[j] = graph->nodes[i]->src[j];
+        }
+        prop.view_src = graph->nodes[i]->view_src;
+
+        if (changed || memcmp(&sched->graph_props[i], &prop, sizeof(prop)) != 0) {
+            sched->graph_props[i] = prop;
+            changed = true;
+        }
+    }
+
+    return changed;
 }
 
 // returns the priority of the backend, lower id is higher priority
@@ -1980,6 +2023,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->leaf_backend_ids);
     free(sched->prev_node_backend_ids);
     free(sched->prev_leaf_backend_ids);
+    free(sched->graph_props);
     free(sched->context_buffer);
     free(sched->graph.nodes);
     free(sched->graph.leafs);
@@ -2044,6 +2088,10 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 
     sched->is_alloc = true;
+    // Allocation can assign buffers and data pointers. Record the final
+    // executable topology for both explicit callers and the automatic
+    // graph-compute path, so the first compute is not mistaken for a rewire.
+    (void) ggml_backend_sched_graph_update_required(sched, graph);
 
     return true;
 }
@@ -2056,6 +2104,12 @@ enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, st
 
 enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     GGML_ASSERT(sched);
+    if (sched->is_alloc && ggml_backend_sched_graph_update_required(sched, graph)) {
+        // Existing split executions and copies can still refer to the retained
+        // graph.  Complete them before clearing split/copy ownership.
+        ggml_backend_sched_synchronize(sched);
+        ggml_backend_sched_reset(sched);
+    }
     if (!sched->is_reset && !sched->is_alloc) {
         ggml_backend_sched_reset(sched);
     }

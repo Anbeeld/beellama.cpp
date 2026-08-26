@@ -71,6 +71,9 @@ $env:PATH = "$cudaPath\bin;$env:PATH"
 # builds or backend-dynamic-loading builds. Use a separate static build tree and skip packaging.
 if ($AllTests) {
     $SkipStage = $true
+    if (-not $PSBoundParameters.ContainsKey('BuildName')) {
+        $BuildName = "$BuildName-all-tests"
+    }
 }
 
 # Persistent Windows build/package folders. These names do not depend on git commit/hash.

@@ -1680,10 +1680,15 @@ static bool ggml_cuda_kernel_can_use_pdl(const void * kernel) {
     cudaFuncAttributes attr = {};
     CUDA_CHECK(cudaFuncGetAttributes(&attr, kernel));
 
-    // PDL device-side primitives are emitted only for PTX versions >= 90.
-    // We have to guard on a loaded kernel's PTX version so a kernel forward-JIT'ed
-    // from pre-Hopper PTX to a Hopper-or-newer GPU does not opt into PDL.
-    const bool can_use_pdl = attr.ptxVersion >= 90;
+    // PDL requires both a Hopper-or-newer device and device-side primitives in
+    // the loaded kernel.  A recent toolkit can report PTX 9.x for an sm_86
+    // kernel even though __CUDA_ARCH__ compiled the PDL primitives out; the
+    // PTX version alone must not enable programmatic stream serialization.
+    // Retain the PTX guard so a pre-Hopper kernel forward-JIT'ed on a newer GPU
+    // does not opt into PDL either.
+    const bool can_use_pdl =
+        ggml_cuda_info().devices[device].cc >= GGML_CUDA_CC_HOPPER &&
+        attr.ptxVersion >= 90;
     cache.emplace(key, can_use_pdl);
     return can_use_pdl;
 }

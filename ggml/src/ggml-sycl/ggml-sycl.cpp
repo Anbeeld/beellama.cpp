@@ -6801,8 +6801,15 @@ bool ggml_backend_sycl_comm_allreduce_tensor(void * comm_ctx_v, struct ggml_tens
 
     return true;
 }
+
 catch (const sycl::exception &) { return false; }
 catch (...)                     { return false; }
+
+static bool ggml_backend_sycl_comm_allreduce_tensor_with_batch(
+        void * comm_ctx_v, struct ggml_tensor ** tensors, int64_t graph_batch_size) {
+    GGML_UNUSED(graph_batch_size);
+    return ggml_backend_sycl_comm_allreduce_tensor(comm_ctx_v, tensors);
+}
 
 static void *ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, const char *name) {
     GGML_UNUSED(reg);
@@ -6819,7 +6826,7 @@ static void *ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, cons
         return (void *)ggml_backend_sycl_comm_free;
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
-        return (void *)ggml_backend_sycl_comm_allreduce_tensor;
+        return (void *)ggml_backend_sycl_comm_allreduce_tensor_with_batch;
     }
 
     // SYCL doesn't support registering host memory, left here for reference

@@ -7,6 +7,7 @@
 
 // Opaque pipeline context -- owns all pinned buffers, streams, and events.
 struct ggml_cuda_ar_pipeline;
+struct ggml_cuda_ar_wddm_pipeline;
 
 // Allocate a pipeline for n_devices GPUs.
 // devices[] holds the CUDA device IDs in rank order.
@@ -27,3 +28,15 @@ bool ggml_cuda_ar_allreduce(
     ggml_backend_t        * backends,
     ggml_tensor           ** tensors);
 
+// One-way mapped-publish transport for two distinct Windows WDDM devices
+// without peer access. A GPU publishes only local state; host observation and
+// same-device H2D precede the device-local add.
+ggml_cuda_ar_wddm_pipeline * ggml_cuda_ar_wddm_pipeline_init(
+    const int * devices, size_t n_devices);
+
+void ggml_cuda_ar_wddm_pipeline_free(ggml_cuda_ar_wddm_pipeline * pipeline);
+
+bool ggml_cuda_ar_wddm_allreduce(
+    ggml_cuda_ar_wddm_pipeline * pipeline,
+    ggml_backend_t             * backends,
+    ggml_tensor                ** tensors);

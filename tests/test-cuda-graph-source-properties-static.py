@@ -24,18 +24,25 @@ require(
 )
 require(
     CUDA,
-    "const bool has_stable_identity = cgraph->uid != 0;",
-    "unversioned projected graphs must be distinguished from stable graph identities",
+    "bool res = false;",
+    "stable graph reuse must be decided by the complete property snapshot",
 )
 require(
     CUDA,
-    "bool res = !has_stable_identity;",
-    "unversioned projected graphs must request a CUDA executable refresh",
+    "graph->uid = cgraph->uid;",
+    "CUDA graph diagnostics must retain the scheduler generation",
 )
-require(
-    CUDA,
-    "if (cgraph->uid == 0) {\n                // Projected meta-backend graphs intentionally have no stable",
-    "unversioned projected graphs must retain CUDA graph execution with a per-evaluation update",
-)
+update_required = CUDA[
+    CUDA.index("static bool ggml_cuda_graph_update_required"):
+    CUDA.index("static void ggml_cuda_graph_update_executable")
+]
+if "cgraph->uid == graph->uid" in update_required:
+    raise AssertionError(
+        "CUDA graph source-property validation must not be bypassed solely because the scheduler UID is unchanged"
+    )
+if "GGML_CUDA_DIAG_SYNC_STATE_WRITES" in CUDA:
+    raise AssertionError(
+        "failed state-write synchronization diagnostics must not remain in the production CUDA graph path"
+    )
 
 print("CUDA graph source-property contract checks passed")

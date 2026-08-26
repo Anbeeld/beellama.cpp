@@ -34,6 +34,42 @@ if (Python3_Interpreter_FOUND)
     set_property(TEST test-cuda-graph-source-properties-static PROPERTY LABELS cuda)
 
     add_test(
+        NAME test-cuda-context-selection-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-cuda-context-selection-static.py)
+    set_property(TEST test-cuda-context-selection-static PROPERTY LABELS cuda)
+
+    add_test(
+        NAME test-cuda-pdl-architecture-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-cuda-pdl-architecture-static.py)
+    set_property(TEST test-cuda-pdl-architecture-static PROPERTY LABELS cuda)
+
+    add_test(
+        NAME test-cuda-getrows-vector-route-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-cuda-getrows-vector-route-static.py)
+    set_property(TEST test-cuda-getrows-vector-route-static PROPERTY LABELS cuda)
+
+    add_test(
+        NAME test-cuda-internal-allreduce-copy-order-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-cuda-internal-allreduce-copy-order-static.py)
+    set_property(TEST test-cuda-internal-allreduce-copy-order-static PROPERTY LABELS cuda)
+
+    add_test(
+        NAME test-cuda-internal-allreduce-transport-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-cuda-internal-allreduce-transport-static.py)
+    set_property(TEST test-cuda-internal-allreduce-transport-static PROPERTY LABELS cuda)
+
+    add_test(
+        NAME test-meta-projected-generation-lifetime-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-meta-projected-generation-lifetime-static.py)
+    set_property(TEST test-meta-projected-generation-lifetime-static PROPERTY LABELS main)
+
+    add_test(
         NAME test-std-kv-tail-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-std-kv-tail-static.py)
@@ -426,10 +462,18 @@ llama_build_and_test(test-perplexity-plumbing.cpp ARGS ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-cuda-fattn-route-policy.cpp ARGS ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-cuda-fattn-vec-policy.cpp ARGS ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-cuda-zero-dim-gemm.cpp ARGS ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda/ggml-cuda.cu)
+llama_build_and_test(test-cuda-graph-reuse.cpp)
+set_tests_properties(test-cuda-graph-reuse PROPERTIES TIMEOUT 180)
 llama_build_and_test(test-cuda-cross-device-copy.cpp)
 set_tests_properties(test-cuda-cross-device-copy PROPERTIES TIMEOUT 180)
 llama_build_and_test(test-cuda-internal-allreduce.cpp)
 set_tests_properties(test-cuda-internal-allreduce PROPERTIES TIMEOUT 180)
+llama_build_and_test(test-cuda-internal-allreduce-graph.cpp)
+set_tests_properties(test-cuda-internal-allreduce-graph PROPERTIES TIMEOUT 180)
+llama_build_and_test(test-cuda-internal-allreduce-multi-context.cpp)
+set_tests_properties(test-cuda-internal-allreduce-multi-context PROPERTIES TIMEOUT 180)
+llama_build_and_test(test-cuda-internal-allreduce-graph-multi-context.cpp)
+set_tests_properties(test-cuda-internal-allreduce-graph-multi-context PROPERTIES TIMEOUT 180)
 llama_build_and_test(test-cpu-out-prod.cpp)
 llama_build_and_test(test-cpu-fattn-support.cpp)
 

@@ -102,6 +102,14 @@ void ggml_cuda_error(const char * stmt, const char * func, const char * file, in
     int id = -1; // in case cudaGetDevice fails
     (void)cudaGetDevice(&id);
 
+    // The normal logger can still have buffered messages when GGML_ABORT
+    // terminates the process. Mirror the actionable CUDA failure directly so
+    // crash logs retain the API, device, and source location.
+    std::fprintf(stderr, GGML_CUDA_NAME " error: %s\n", msg);
+    std::fprintf(stderr, "  current device: %d, in function %s at %s:%d\n", id, func, file, line);
+    std::fprintf(stderr, "  %s\n", stmt);
+    std::fflush(stderr);
+
     GGML_LOG_ERROR(GGML_CUDA_NAME " error: %s\n", msg);
     GGML_LOG_ERROR("  current device: %d, in function %s at %s:%d\n", id, func, file, line);
     GGML_LOG_ERROR("  %s\n", stmt);
@@ -558,6 +566,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 
     ~ggml_cuda_pool_vmm() {
         if (pool_addr != 0) {
+            ggml_cuda_set_device(device);
 #if defined(GGML_USE_HIP)
             // Workaround for https://github.com/ROCm/ROCR-Runtime/issues/285
             for (std::pair<CUdeviceptr, size_t> & mapping : mappings) {
@@ -708,17 +717,21 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
     if (copy_event != nullptr) {
+        ggml_cuda_set_device(device);
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
+                ggml_cuda_set_device(i);
                 CUDA_CHECK(cudaStreamDestroy(streams[i][j]));
             }
             if (cublas_handles[i][j] != nullptr) {
+                ggml_cuda_set_device(i);
                 CUBLAS_CHECK(cublasDestroy(cublas_handles[i][j]));
             }
             if (cublas_workspaces[i][j] != nullptr) {
+                ggml_cuda_set_device(i);
                 CUDA_CHECK(cudaFree(cublas_workspaces[i][j]));
             }
         }
@@ -739,6 +752,7 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
+        ggml_cuda_set_device(device);
         CUDA_CHECK(cudaFree(dev_ptr));
     }
 };
@@ -841,6 +855,7 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
     if (ggml_backend_buffer_is_cuda(src->buffer)) {
         ggml_backend_cuda_buffer_context * src_ctx = (ggml_backend_cuda_buffer_context *)src->buffer->context;
         ggml_backend_cuda_buffer_context * dst_ctx = (ggml_backend_cuda_buffer_context *)dst->buffer->context;
+        ggml_cuda_set_device(src_ctx->device);
         // compare the backing physical devices: distinct virtual devices may share one physical GPU,
         // in which case a same-device copy (not a peer copy) is required
         const int src_physical = ggml_cuda_get_physical_device(src_ctx->device);
@@ -984,24 +999,25 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
 
 // Communication context for multi-GPU AllReduce during tensor parallelism.
 //
-// Created once per meta backend instance.  Resources for the selected mode
+// Created once per meta backend instance. Resources for the selected mode
 // (NCCL communicators or the internal AllReduce pipeline) are initialised
 // eagerly during comm_init so any init failure surfaces at startup rather
 // than mid-run.
 struct ggml_backend_cuda_comm_context {
-    using try_allreduce_fn = bool(*)(ggml_backend_cuda_comm_context *, struct ggml_tensor **);
+    using try_allreduce_fn = bool(*)(
+        ggml_backend_cuda_comm_context *, struct ggml_tensor **, int64_t graph_batch_size);
 
     std::vector<ggml_backend_t> backends;
     std::vector<int>            dev_ids;
 
     // Set by the init chain (comm_init_{nccl, internal, none}) to one of
     // try_allreduce_{nccl, internal, butterfly}.  nccl needs `comms`,
-    // internal needs `ar_pipeline`, butterfly needs nothing.  Per-call
+    // internal needs ar_pipeline, butterfly needs nothing. Per-call
     // failures return false; the meta backend's generic implementation then
     // handles that call.
     try_allreduce_fn            try_allreduce = nullptr;
-
     ggml_cuda_ar_pipeline *     ar_pipeline = nullptr;
+    ggml_cuda_ar_wddm_pipeline * ar_wddm_pipeline = nullptr;
 
 #ifdef GGML_USE_NCCL
     std::vector<ncclComm_t>     comms;
@@ -1013,6 +1029,7 @@ struct ggml_backend_cuda_comm_context {
             NCCL_CHECK(ncclCommDestroy(comm));
         }
 #endif // GGML_USE_NCCL
+        ggml_cuda_ar_wddm_pipeline_free(ar_wddm_pipeline);
         ggml_cuda_ar_pipeline_free(ar_pipeline);
     }
 };
@@ -1021,7 +1038,8 @@ struct ggml_backend_cuda_comm_context {
 // AllReduce via NCCL. Reduces as FP32 for small tensors and BF16 for large
 // tensors (bandwidth-bound), then converts back to FP32.
 static bool ggml_backend_cuda_comm_allreduce_nccl(
-        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors, int64_t graph_batch_size) {
+    GGML_UNUSED(graph_batch_size);
     const int64_t ne = ggml_nelements(tensors[0]);
     // FIXME the input of llm_graph_context::build_in_out_ids can produce a tensor with 0 elements if n_outputs == 0
     // This then causes a crash in this function
@@ -1063,10 +1081,10 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
     ggml_cuda_pool_alloc<nv_bfloat16> tmp[GGML_CUDA_MAX_DEVICES];
     for (size_t i = 0; i < n_backends; ++i) {
         ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
+        ggml_cuda_set_device(cuda_ctx->device);
         tmp[i].pool = &cuda_ctx->pool();
         tmp[i].alloc(ne);
 
-        ggml_cuda_set_device(cuda_ctx->device);
         if (tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) {
             to_bf16(tensors[i]->data, tmp[i].get(), ne, cuda_ctx->stream());
         } else {
@@ -1097,8 +1115,8 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
 // Run the internal AR pipeline.  Returns false on unsupported / failed input
 // -- the caller decides whether to abort (env-forced) or fall back silently.
 static bool ggml_backend_cuda_comm_allreduce_internal(
-        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
-    GGML_ASSERT(comm_ctx->ar_pipeline != nullptr);
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors, int64_t graph_batch_size) {
+    GGML_ASSERT(comm_ctx->ar_pipeline != nullptr || comm_ctx->ar_wddm_pipeline != nullptr);
 
     const size_t n_backends = comm_ctx->backends.size();
     GGML_ASSERT(n_backends == 2);
@@ -1140,6 +1158,12 @@ static bool ggml_backend_cuda_comm_allreduce_internal(
         GGML_ASSERT((ggml_nbytes(tensors[i]) & 0xF) == 0);
     }
 
+    GGML_UNUSED(graph_batch_size);
+    if (comm_ctx->ar_wddm_pipeline != nullptr) {
+        return ggml_cuda_ar_wddm_allreduce(
+            comm_ctx->ar_wddm_pipeline, comm_ctx->backends.data(), tensors);
+    }
+    GGML_ASSERT(comm_ctx->ar_pipeline != nullptr);
     return ggml_cuda_ar_allreduce(comm_ctx->ar_pipeline, comm_ctx->backends.data(), tensors);
 }
 
@@ -1151,18 +1175,18 @@ static bool ggml_backend_cuda_comm_allreduce_internal(
 
 #ifdef GGML_USE_NCCL
 static bool ggml_backend_cuda_comm_try_allreduce_nccl(
-        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
-    return ggml_backend_cuda_comm_allreduce_nccl(comm_ctx, tensors);
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors, int64_t graph_batch_size) {
+    return ggml_backend_cuda_comm_allreduce_nccl(comm_ctx, tensors, graph_batch_size);
 }
 #endif // GGML_USE_NCCL
 
 static bool ggml_backend_cuda_comm_try_allreduce_internal(
-        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
-    return ggml_backend_cuda_comm_allreduce_internal(comm_ctx, tensors);
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors, int64_t graph_batch_size) {
+    return ggml_backend_cuda_comm_allreduce_internal(comm_ctx, tensors, graph_batch_size);
 }
 
 static bool ggml_backend_cuda_comm_try_allreduce_butterfly(
-        ggml_backend_cuda_comm_context *, struct ggml_tensor **) {
+        ggml_backend_cuda_comm_context *, struct ggml_tensor **, int64_t) {
     return false;
 }
 
@@ -1181,31 +1205,64 @@ static void ggml_backend_cuda_comm_init_none(ggml_backend_cuda_comm_context * re
     ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_butterfly;
 }
 
+// Native mapped-host synchronization needs an alternate producer/consumer
+// boundary only on the exact topology where neither Windows WDDM device can
+// access its peer. Other platforms and CUDA topologies retain upstream's
+// native internal AllReduce.
+static bool ggml_cuda_ar_requires_wddm_host_transport(const std::vector<int> & devices) {
+#if defined(_WIN32) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (devices.size() != 2) {
+        return false;
+    }
+
+    const int first = ggml_cuda_get_physical_device(devices[0]);
+    const int second = ggml_cuda_get_physical_device(devices[1]);
+    if (first == second) {
+        return false;
+    }
+
+    int first_tcc = 0;
+    int second_tcc = 0;
+    int first_to_second = 0;
+    int second_to_first = 0;
+    const cudaError_t tcc_first_rc = cudaDeviceGetAttribute(&first_tcc, cudaDevAttrTccDriver, first);
+    const cudaError_t tcc_second_rc = cudaDeviceGetAttribute(&second_tcc, cudaDevAttrTccDriver, second);
+    const cudaError_t first_to_second_rc = cudaDeviceCanAccessPeer(&first_to_second, first, second);
+    const cudaError_t second_to_first_rc = cudaDeviceCanAccessPeer(&second_to_first, second, first);
+    if (tcc_first_rc != cudaSuccess || tcc_second_rc != cudaSuccess ||
+        first_to_second_rc != cudaSuccess || second_to_first_rc != cudaSuccess) {
+        GGML_LOG_WARN("internal AllReduce topology probe failed; retaining the asynchronous upstream path\n");
+        (void) cudaGetLastError();
+        return false;
+    }
+
+    return first_tcc == 0 && second_tcc == 0 &&
+           first_to_second == 0 && second_to_first == 0;
+#else
+    GGML_UNUSED(devices);
+    return false;
+#endif
+}
+
 static void ggml_backend_cuda_comm_init_internal(ggml_backend_cuda_comm_context * ret) {
-#if defined(_WIN32)
-    // The internal provider synchronizes ranks through mapped host memory and
-    // cross-device event rings. CUDA does not guarantee forward progress for
-    // kernels that spin waiting for another kernel to run, and repeated WDDM
-    // prefill also exposes invalid pooled-event state in the copy-engine path.
-    // Use the meta backend's event-ordered butterfly on WDDM; CUDA TCC remains
-    // eligible for the internal provider.
-    for (int dev_id : ret->dev_ids) {
-        const int physical_device = ggml_cuda_get_physical_device(dev_id);
-        int tcc_driver = 0;
-        CUDA_CHECK(cudaDeviceGetAttribute(&tcc_driver, cudaDevAttrTccDriver, physical_device));
-        if (!tcc_driver) {
-            GGML_LOG_WARN(
-                    "internal CUDA AllReduce disabled on WDDM device %d; "
-                    "falling back to meta-backend butterfly\n",
-                    physical_device);
+    if (ggml_cuda_ar_requires_wddm_host_transport(ret->dev_ids)) {
+        ret->ar_wddm_pipeline = ggml_cuda_ar_wddm_pipeline_init(
+            ret->dev_ids.data(), ret->dev_ids.size());
+        if (ret->ar_wddm_pipeline == nullptr) {
+            (void) cudaGetLastError();
+            GGML_LOG_WARN("one-way WDDM AllReduce transport failed to initialize; "
+                          "falling back to meta-backend butterfly\n");
             ggml_backend_cuda_comm_init_none(ret);
             return;
         }
+        GGML_LOG_INFO("internal CUDA AllReduce transport: one-way mapped-publish WDDM path\n");
+        ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_internal;
+        return;
     }
-#endif // defined(_WIN32)
 
     ret->ar_pipeline = ggml_cuda_ar_pipeline_init(ret->dev_ids.data(), ret->dev_ids.size());
     if (ret->ar_pipeline) {
+        GGML_LOG_INFO("internal CUDA AllReduce transport: upstream-native\n");
         ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_internal;
         return;
     }
@@ -1316,12 +1373,13 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
 
 // Top-level dispatch -- calls the function pointer chosen by comm_init.
 // Returns false to let the meta-backend's butterfly run.
-static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct ggml_tensor ** tensors) {
+static bool ggml_backend_cuda_comm_allreduce_tensor(
+        void * comm_ctx_v, struct ggml_tensor ** tensors, int64_t graph_batch_size) {
     if (comm_ctx_v == nullptr) {
         return false;
     }
     auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
-    return comm_ctx->try_allreduce(comm_ctx, tensors);
+    return comm_ctx->try_allreduce(comm_ctx, tensors, graph_batch_size);
 }
 
 // host buffer type
@@ -2515,6 +2573,7 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
 
 static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
@@ -2524,6 +2583,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
@@ -2534,6 +2594,7 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
 static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data,
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
@@ -2545,6 +2606,7 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
 static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const struct ggml_tensor * tensor, void * data,
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
@@ -2568,6 +2630,8 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     // device -> device copy
     ggml_backend_cuda_context * cuda_ctx_src = (ggml_backend_cuda_context *) backend_src->context;
     ggml_backend_cuda_context * cuda_ctx_dst = (ggml_backend_cuda_context *) backend_dst->context;
+
+    ggml_cuda_set_device(cuda_ctx_src->device);
 
     ggml_backend_cuda_buffer_context * buf_ctx_src = (ggml_backend_cuda_buffer_context *) buf_src->context;
     ggml_backend_cuda_buffer_context * buf_ctx_dst = (ggml_backend_cuda_buffer_context *) buf_dst->context;
@@ -2611,6 +2675,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         CUDA_CHECK(cudaEventRecord(cuda_ctx_src->copy_event, cuda_ctx_src->stream()));
 
         // wait on dst stream for the copy to complete
+        ggml_cuda_set_device(cuda_ctx_dst->device);
         CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_dst->stream(), cuda_ctx_src->copy_event, 0));
     } else {
         // src and dst are on the same backend
@@ -2622,6 +2687,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
+    ggml_cuda_set_device(cuda_ctx->device);
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
 
     GGML_UNUSED(backend);
@@ -2693,23 +2759,14 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
-    // A zero UID is the scheduler/backend contract for a graph without a
-    // stable executable identity.  Tensor-property comparison still records
-    // useful state below, but cannot cover backend-private capture parameters
-    // (for example temporary workspaces).  Such a graph must therefore refresh
-    // its CUDA executable rather than replaying a previous capture.
-    const bool has_stable_identity = cgraph->uid != 0;
-    bool res = !has_stable_identity;
+    bool res = false;
 
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
-    if (has_stable_identity && cgraph->uid == graph->uid) {
-        GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
-        GGML_ASSERT((int)graph->node_props.size() == cgraph->n_nodes);
-        return false;
-    }
-
+    // The scheduler UID identifies the split graph generation. Tensor and
+    // source properties are still validated below because a retained graph can
+    // rewire sources in place.
     graph->uid = cgraph->uid;
 
     // Check if the graph size has changed
@@ -4383,14 +4440,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
-            if (cgraph->uid == 0) {
-                // Projected meta-backend graphs intentionally have no stable
-                // executable identity.  Retain CUDA graph execution, but capture
-                // and update the executable for each evaluation.
-                graph->warmup_complete = true;
-                use_cuda_graph = true;
-                cuda_graph_update_required = true;
-            } else if (!graph->warmup_complete) {
+            if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
                 if (!properties_changed) {
                     graph->warmup_complete = true;
@@ -4432,6 +4482,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 static void ggml_backend_cuda_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
+    ggml_cuda_set_device(cuda_ctx->device);
     CUDA_CHECK(cudaEventRecord((cudaEvent_t)event->context, cuda_ctx->stream()));
 }
 
@@ -4439,6 +4490,7 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     if (ggml_backend_is_cuda(backend)) {
+        ggml_cuda_set_device(cuda_ctx->device);
         CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), (cudaEvent_t)event->context, 0));
     } else {
 #if 0
@@ -5689,14 +5741,16 @@ static ggml_backend_event_t ggml_backend_cuda_device_event_new(ggml_backend_dev_
 }
 
 static void ggml_backend_cuda_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
-    GGML_UNUSED(dev);
+    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+    ggml_cuda_set_device(dev_ctx->device);
 
     CUDA_CHECK(cudaEventDestroy((cudaEvent_t)event->context));
     delete event;
 }
 
 static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
-    GGML_UNUSED(dev);
+    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+    ggml_cuda_set_device(dev_ctx->device);
     CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
 }
 
