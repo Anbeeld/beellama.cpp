@@ -2919,8 +2919,7 @@ ggml_tensor * llama_kv_cache_kvarn::store(
         params.sinkhorn_iters,
         value,
         int32_t(stage_groups));
-    result->op_params[3] = sinfo.stage_slots.empty() ?
-        kvarn_workspace_tokens_per_stream_hint(sinfo) : 0;
+    result->op_params[3] = kvarn_workspace_tokens_per_stream_hint(sinfo);
     result->op_params[4] = swa ? 1 : 0; // SWA sliding-window ring store
     result->op_params[5] = (int32_t) slices; // KVarN head-wide Hadamard slice count
     result->op_params[8] = int32_t(tail_groups);
