@@ -8,7 +8,7 @@
 #include <cstdlib>
 #include <vector>
 
-static void fail(const char * message) {
+[[noreturn]] static void fail(const char * message) {
     std::fprintf(stderr, "%s\n", message);
     std::exit(1);
 }

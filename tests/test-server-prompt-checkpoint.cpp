@@ -404,6 +404,7 @@ int main() {
             /*.data =*/ {
                 /*.main =*/ std::vector<uint8_t>(64),
                 /*.drft =*/ std::vector<uint8_t>(32),
+                /*.spec =*/ { },
             },
         };
         assert(state.accounted_size() == 128);

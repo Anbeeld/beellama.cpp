@@ -10538,7 +10538,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 40, false,
         GGML_TYPE_F16, GGML_TYPE_F16, false, false, true, false, false, 8, false));
     // Exact-tail composite contract: every ordered F16/BF16 K/V pair.
-    for (const auto tail_types : {
+    for (const auto & tail_types : {
             std::pair{ GGML_TYPE_F16,  GGML_TYPE_F16  },
             std::pair{ GGML_TYPE_BF16, GGML_TYPE_BF16 },
             std::pair{ GGML_TYPE_F16,  GGML_TYPE_BF16 },

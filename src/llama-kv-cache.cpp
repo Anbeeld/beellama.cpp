@@ -2365,8 +2365,9 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     slot_info res = {
         /*.s0   =*/ LLAMA_MAX_SEQ,
         /*.s1   =*/ 0,
-        /*.strm =*/ { },
-        /*.idxs =*/ { },
+        /*.strm        =*/ { },
+        /*.idxs        =*/ { },
+        /*.stage_slots =*/ { },
     };
 
     if (allocation_group_size > 1 && n_stream == 1 && !cont) {

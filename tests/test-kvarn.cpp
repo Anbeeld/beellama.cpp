@@ -3160,7 +3160,9 @@ static void test_native_flash_attention_gpu() {
     }
     ggml_backend_t cpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_CPU, true);
 
-    const auto [route_stats_reset, route_stats_get] = get_kvarn_route_stats_fns(gpu_backend);
+    const auto route_stats_fns = get_kvarn_route_stats_fns(gpu_backend);
+    const auto route_stats_reset = route_stats_fns.first;
+    const auto route_stats_get = route_stats_fns.second;
     const ggml_backend_dev_t gpu_device = ggml_backend_get_device(gpu_backend);
     const char * actual_backend = gpu_device ? ggml_backend_dev_name(gpu_device) : nullptr;
     const bool expect_vulkan_route_stats = actual_backend != nullptr &&
@@ -4098,7 +4100,6 @@ static void test_cache_ops_dynamic_stage(enum ggml_backend_dev_type device_type,
     constexpr int n_tokens = 768;     // 6 complete groups (0..5)
     constexpr int n_heads   = 1;
     constexpr int stage_groups = 5;   // tail_groups = 4
-    constexpr int tail_groups  = stage_groups - 1;
     // 8 record groups per stream (kv_size = 1024) — enough to hold 6 groups with
     // room for the flush ring to grow without collision.
     constexpr int n_groups_per_stream = 8;

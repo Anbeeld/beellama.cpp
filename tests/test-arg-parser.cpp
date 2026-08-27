@@ -616,7 +616,7 @@ static void test(void) {
     assert(false == dflash_parsed);
     assert(dflash_error.find("unknown speculative type: dflash") != std::string::npos);
 
-    for (const std::string & removed : {"copyspec", "suffix", "recycle"}) {
+    for (const std::string removed : {"copyspec", "suffix", "recycle"}) {
         params = common_params();
         argv = {"binary_name", "--spec-type", removed};
         bool parsed = true;

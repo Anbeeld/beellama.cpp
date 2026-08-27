@@ -4,6 +4,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 CUDA_STORE = ROOT / "ggml/src/ggml-cuda/kvarn.cu"
 KV_CACHE = ROOT / "src/llama-kv-cache-kvarn.cpp"
+KV_CACHE_BASE = ROOT / "src/llama-kv-cache.cpp"
 
 
 def function_body(source: str, signature: str) -> str:
@@ -54,6 +55,13 @@ def main() -> None:
     )
     assert "sinfo.stage_slots.empty()" not in store.split("result->op_params[3]", 1)[1].split(";", 1)[0], (
         "explicit stage ownership must not force the slower monolithic KVarN store"
+    )
+
+    allocation_source = KV_CACHE_BASE.read_text(encoding="utf-8")
+    allocation = function_body(allocation_source, "llama_kv_cache::slot_info llama_kv_cache::find_slot(")
+    initializer = allocation.split("slot_info res = {", 1)[1].split("};", 1)[0]
+    assert "/*.stage_slots =*/ { }" in initializer, (
+        "slot_info aggregate initialization must include stage_slots so warning-as-error GCC/Clang builds remain valid"
     )
 
 
