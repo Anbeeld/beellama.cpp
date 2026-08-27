@@ -2,9 +2,10 @@
 
 ## v0.4.4
 
-- Updated the llama.cpp base through upstream commit `84e908c6`. Notable inherited changes include Granite-Switch and Muse Glimmer model support, MTP support for Nemotron and DFlash support for Nemotron 3.5, Pocket TTS audio generation, multi-output backend sampling for speculative decoding, media-aware server slot save/restore, the Web UI `read_media` tool, and expanded tool isolation through SSH and rootless Podman. The merge also adds the default `load-mode auto` policy that avoids memory mapping on integrated GPUs, Vulkan TQ2_0 support, a warp-per-row CUDA WKV7 kernel for single-token decode, narrower CUDA-graph synchronization, hardened GGUF loading, semantic versioning, and version-aware CMake package metadata.
-- Optimized native KVarN SWA attention on CPU and CUDA. CPU attention resolves each token source once and loads complete K/V rows, CUDA portable attention consumes rotated stage rows directly, and the CUDA MMA path reconstructs original-domain stage tiles cooperatively only when required. CUDA route selection now records the retained split geometry and device capabilities without model- or GPU-name-specific policy.
-- Fixed fully covered non-SWA KVarN windows so they use native exact storage and bypass the compact precision-tail execution route. SWA compact rings continue to use their requested KVarN planner types.
+- Updated the llama.cpp base from `74ce15741` to `6fdd0ac89` and ggml from 0.19.0 to 0.22.0. Notable inherited changes include Qwen3.8 DFlash2 with local convolution, candidate selection, M-RoPE, converter/GGUF support, speculative `p_min`/`n_min`, and wide-row CUDA top-k; Granite Switch/SWA, Muse Glimmer, Kimi K3, MiniMax Text, BailingMoE3, Nanbeige4.2-3B, Pocket TTS, expanded MTP, DFlash, and DSpark coverage, and multi-output backend sampling; media-aware server state, Web UI tools and navigation, stronger tool isolation, automatic iGPU-safe loading, Metal kernel splitting, Vulkan TQ2_0 and Lightning Indexer support, asynchronous RPC APIs, and Apple RDMA transport.
+- Optimized native KVarN SWA attention on CPU and CUDA. Fully covered non-SWA windows now use native exact storage, and CUDA routing retains split geometry and device capabilities without model- or GPU-specific policy.
+- Hardened KV and speculative state handling with transactional target/draft restore, selective checkpoint validation, KVarN stage ownership and generation tracking, restored bulk-workspace routing, complete DSA+iSWA lifecycle forwarding, head-aligned multi-GPU placement, and correct partial sharded-buffer memset.
+- Fixed MTP multi-ubatch synchronization and extended loop detection to pathological visible output while retaining force-close behavior for hidden reasoning loops.
 
 ## v0.4.3
 
