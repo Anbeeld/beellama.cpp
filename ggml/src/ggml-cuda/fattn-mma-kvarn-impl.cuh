@@ -42,9 +42,14 @@ static __device__ __forceinline__ ggml_cuda_fattn_kvarn_mma_tile ggml_cuda_fattn
         }
         bool first_staged;
         bool last_staged;
-        const int64_t first_idx = ggml_cuda_fattn_kvarn_read_cell(desc, first_encoded, first_staged);
-        const int64_t last_idx = ggml_cuda_fattn_kvarn_read_cell(desc, last_encoded, last_staged);
-        if (last_idx != first_idx + valid_count - 1 || first_staged != last_staged) {
+        int first_slot = -1;
+        int last_slot = -1;
+        const int64_t first_idx = ggml_cuda_fattn_kvarn_read_cell(
+                desc, first_encoded, first_staged, &first_slot);
+        const int64_t last_idx = ggml_cuda_fattn_kvarn_read_cell(
+                desc, last_encoded, last_staged, &last_slot);
+        if (last_idx != first_idx + valid_count - 1 || first_staged != last_staged ||
+                first_slot != last_slot) {
             return tile;
         }
         const int group0 = (int) (first_idx / GGML_CUDA_FATTN_KVARN_DIM);
@@ -58,13 +63,9 @@ static __device__ __forceinline__ ggml_cuda_fattn_kvarn_mma_tile ggml_cuda_fattn
             ggml_cuda_fattn_kvarn_group_from_record(desc, group0));
         tile.pos_begin = (int) (first_idx - (int64_t) group0 * GGML_CUDA_FATTN_KVARN_DIM);
         if (from_stage) {
-            const int stage_base = desc.stream * GGML_CUDA_FATTN_KVARN_DIM * desc.stage_groups;
             tile.stage = true;
-            tile.stage_pos_begin = desc.swa ?
-                (group0 % desc.stage_groups) * GGML_CUDA_FATTN_KVARN_DIM + tile.pos_begin :
-                stage_base + (group0 == 0 ? tile.pos_begin :
-                    GGML_CUDA_FATTN_KVARN_DIM +
-                    ((group0 - 1) % desc.tail_groups) * GGML_CUDA_FATTN_KVARN_DIM + tile.pos_begin);
+            tile.stage_pos_begin = ggml_cuda_fattn_kvarn_stage_pos(
+                    desc, group0, tile.pos_begin, first_slot);
             return tile;
         }
         if (!from_record) {
@@ -149,18 +150,17 @@ static __device__ __forceinline__ bool ggml_cuda_fattn_kvarn_load_rotated_slice_
             const int64_t encoded = desc.indices[token];
             if (encoded != -1) {
                 bool explicitly_staged;
-                const int64_t abs_pos = ggml_cuda_fattn_kvarn_read_cell(desc, encoded, explicitly_staged);
+                int assigned_slot = -1;
+                const int64_t abs_pos = ggml_cuda_fattn_kvarn_read_cell(
+                        desc, encoded, explicitly_staged, &assigned_slot);
                 const int group = (int) (abs_pos / GGML_CUDA_FATTN_KVARN_DIM);
                 pos = (int) (abs_pos - (int64_t) group * GGML_CUDA_FATTN_KVARN_DIM);
                 from_stage = explicitly_staged ||
                     (!(desc.read_indirect && !desc.swa) && ggml_cuda_fattn_kvarn_group_from_stage(desc, group));
                 from_record = !explicitly_staged && (desc.read_indirect && !desc.swa ? true :
                     ggml_cuda_fattn_kvarn_group_from_record(desc, group));
-                const int stage_base = desc.stream * GGML_CUDA_FATTN_KVARN_DIM * desc.stage_groups;
-                stage_pos = desc.swa ?
-                    (group % desc.stage_groups) * GGML_CUDA_FATTN_KVARN_DIM + pos :
-                    stage_base + (group == 0 ? pos : GGML_CUDA_FATTN_KVARN_DIM +
-                        ((group - 1) % desc.tail_groups) * GGML_CUDA_FATTN_KVARN_DIM + pos);
+                stage_pos = ggml_cuda_fattn_kvarn_stage_pos(
+                        desc, group, pos, assigned_slot);
                 record_group = desc.swa ? group % desc.groups_per_stream :
                     desc.stream * desc.groups_per_stream + group;
             }

@@ -1935,21 +1935,41 @@ bool server_prompt_cache::erase(const server_prompt_cache_state * entry) {
     return false;
 }
 
-bool server_prompt_restore_transaction(
+server_prompt_restore_result server_prompt_restore_transaction_diagnostic(
         server_prompt_state_view target,
         server_prompt_state_view draft,
         server_prompt_state_view speculative,
         const server_prompt_restore_transaction_io & io) {
-    if ((io.restore_target && target.size == 0) ||
-            (io.restore_draft && draft.size == 0) ||
-            !io.prepare || !io.commit) {
-        return false;
+    if (!io.prepare || !io.commit) {
+        return { false, false, SERVER_PROMPT_STATE_MAIN, SERVER_PROMPT_RESTORE_INVALID_IO };
+    }
+    if (io.restore_target && target.size == 0) {
+        return { false, true, SERVER_PROMPT_STATE_MAIN, SERVER_PROMPT_RESTORE_MISSING_REQUIRED_STATE };
+    }
+    if (io.restore_draft && draft.size == 0) {
+        return { false, true, SERVER_PROMPT_STATE_DRAFT, SERVER_PROMPT_RESTORE_MISSING_REQUIRED_STATE };
     }
 
-    if ((io.restore_target && !io.prepare(SERVER_PROMPT_STATE_MAIN, target)) ||
-            (io.restore_draft && !io.prepare(SERVER_PROMPT_STATE_DRAFT, draft)) ||
-            (io.restore_speculative && !io.prepare(SERVER_PROMPT_STATE_SPECULATIVE, speculative))) {
-        return false;
+    const auto prepare = [&](bool enabled, server_prompt_state_kind kind, server_prompt_state_view state) {
+        if (enabled && !io.prepare(kind, state)) {
+            return server_prompt_restore_result {
+                false, true, kind, SERVER_PROMPT_RESTORE_PREPARE_REJECTED
+            };
+        }
+        return server_prompt_restore_result {
+            true, false, SERVER_PROMPT_STATE_MAIN, SERVER_PROMPT_RESTORE_NONE
+        };
+    };
+    for (const auto & step : {
+            std::pair { io.restore_target, SERVER_PROMPT_STATE_MAIN },
+            std::pair { io.restore_draft, SERVER_PROMPT_STATE_DRAFT },
+            std::pair { io.restore_speculative, SERVER_PROMPT_STATE_SPECULATIVE } }) {
+        const server_prompt_state_view state = step.second == SERVER_PROMPT_STATE_MAIN ? target :
+                step.second == SERVER_PROMPT_STATE_DRAFT ? draft : speculative;
+        const auto result = prepare(step.first, step.second, state);
+        if (!result.success) {
+            return result;
+        }
     }
 
     // Speculative apply is prepared and no-fail. Memory commits likewise only
@@ -1963,10 +1983,18 @@ bool server_prompt_restore_transaction(
     if (io.restore_draft) {
         io.commit(SERVER_PROMPT_STATE_DRAFT);
     }
-    return true;
+    return { true, false, SERVER_PROMPT_STATE_MAIN, SERVER_PROMPT_RESTORE_NONE };
 }
 
 bool server_prompt_restore_transaction(
+        server_prompt_state_view target,
+        server_prompt_state_view draft,
+        server_prompt_state_view speculative,
+        const server_prompt_restore_transaction_io & io) {
+    return server_prompt_restore_transaction_diagnostic(target, draft, speculative, io).success;
+}
+
+server_prompt_restore_result server_prompt_restore_transaction_diagnostic(
         llama_context * target,
         llama_context * draft,
         common_speculative * speculative,
@@ -2019,8 +2047,26 @@ bool server_prompt_restore_transaction(
             GGML_ASSERT(llama_state_seq_restore_plan_commit(plan.get()) == expected);
         },
     };
-    return server_prompt_restore_transaction(
+    return server_prompt_restore_transaction_diagnostic(
             target_state, draft_state, speculative_state, io);
+}
+
+bool server_prompt_restore_transaction(
+        llama_context * target,
+        llama_context * draft,
+        common_speculative * speculative,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags,
+        server_prompt_state_view target_state,
+        server_prompt_state_view draft_state,
+        server_prompt_state_view speculative_state,
+        bool restore_target,
+        bool restore_draft,
+        bool restore_speculative) {
+    return server_prompt_restore_transaction_diagnostic(
+            target, draft, speculative, seq_id, flags,
+            target_state, draft_state, speculative_state,
+            restore_target, restore_draft, restore_speculative).success;
 }
 
 bool server_prompt_cache::load(

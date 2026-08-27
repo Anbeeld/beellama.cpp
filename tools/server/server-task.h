@@ -708,6 +708,26 @@ struct server_prompt_restore_transaction_io {
     std::function<void(server_prompt_state_kind)> commit;
 };
 
+enum server_prompt_restore_reason {
+    SERVER_PROMPT_RESTORE_NONE,
+    SERVER_PROMPT_RESTORE_INVALID_IO,
+    SERVER_PROMPT_RESTORE_MISSING_REQUIRED_STATE,
+    SERVER_PROMPT_RESTORE_PREPARE_REJECTED,
+};
+
+struct server_prompt_restore_result {
+    bool success = false;
+    bool has_component = false;
+    server_prompt_state_kind component = SERVER_PROMPT_STATE_MAIN;
+    server_prompt_restore_reason reason = SERVER_PROMPT_RESTORE_NONE;
+};
+
+server_prompt_restore_result server_prompt_restore_transaction_diagnostic(
+        server_prompt_state_view target,
+        server_prompt_state_view draft,
+        server_prompt_state_view speculative,
+        const server_prompt_restore_transaction_io & io);
+
 bool server_prompt_restore_transaction(
         server_prompt_state_view target,
         server_prompt_state_view draft,
@@ -715,6 +735,19 @@ bool server_prompt_restore_transaction(
         const server_prompt_restore_transaction_io & io);
 
 bool server_prompt_restore_transaction(
+        llama_context * target,
+        llama_context * draft,
+        common_speculative * speculative,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags,
+        server_prompt_state_view target_state,
+        server_prompt_state_view draft_state,
+        server_prompt_state_view speculative_state,
+        bool restore_target,
+        bool restore_draft,
+        bool restore_speculative);
+
+server_prompt_restore_result server_prompt_restore_transaction_diagnostic(
         llama_context * target,
         llama_context * draft,
         common_speculative * speculative,

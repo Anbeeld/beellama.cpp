@@ -269,6 +269,49 @@ def main() -> None:
         raise AssertionError("standard-tail source is not independently listed in src/CMakeLists.txt")
 
     cache_source = (ROOT / "src/llama-kv-cache.cpp").read_text(encoding="utf-8")
+    prepare_body = cache_source.split(
+        "llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(", 1
+    )[1].split("llama_kv_memory_stats llama_kv_cache::kv_memory_stats", 1)[0]
+    if "tail_preparing_guard" not in prepare_body or "std::rethrow_exception(prepare_error)" not in prepare_body:
+        raise AssertionError("KV prepare can poison or mutate planning state when planning throws")
+
+    seq_cp_body = cache_source.split("void llama_kv_cache::seq_cp(", 1)[1].split(
+        "bool llama_kv_cache::seq_keep", 1
+    )[0]
+    if seq_cp_body.count("materialize_pending_copies();") < 3:
+        raise AssertionError("same-stream sequence copy leaves a pending tail transaction")
+
+    speculative_restore = server_context.split(
+        "// speculative decoding - main model sample and accept", 1
+    )[1].split("const int64_t t_now", 1)[0]
+    if "true, use_ckpt_dft, true" not in speculative_restore:
+        raise AssertionError("speculative rollback restores an uncaptured draft checkpoint")
+
+    lost_sequence = server_context.split("if (pos_min == -1)", 1)[1].split(
+        "// when the prompt prefix does not match", 1
+    )[0]
+    if "GGML_ABORT" in lost_sequence or "slot.release()" not in lost_sequence:
+        raise AssertionError("lost per-slot KV state can still abort or poison the server")
+
+    decode_failure = server_context.split("if (ret != 0)", 1)[1].split(
+        "// retry with half the batch size", 1
+    )[0]
+    if "batch_view.seq_id[0]" not in decode_failure or "return true" not in decode_failure:
+        raise AssertionError("attributable one-token decode failure still cancels unrelated slots")
+
+    decode_body = server_context.split("bool decode(int32_t & n_batch", 1)[1].split(
+        "void post_decode", 1
+    )[0]
+    if "llama_synchronize(ctx_tgt);" not in decode_body:
+        raise AssertionError("server exposes asynchronous target KV updates")
+
+    context_source = (ROOT / "src/llama-context.cpp").read_text(encoding="utf-8")
+    context_decode = context_source.split("llama_context::decode(const llama_batch & batch_inp)", 1)[1].split(
+        "llama_context::encode", 1
+    )[0]
+    if "cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP" not in context_decode or "synchronize();" not in context_decode:
+        raise AssertionError("MTP decode exposes asynchronous draft KV updates")
+
     constructor = cache_source.split("llama_kv_cache::llama_kv_cache(", 1)[1].split(
         "void llama_kv_cache::clear(bool data)", 1
     )[0]

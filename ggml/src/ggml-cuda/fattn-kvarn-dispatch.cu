@@ -289,7 +289,8 @@ static __device__ __forceinline__ int ggml_cuda_fattn_kvarn_live_index_for_threa
     for (int i = threadIdx.x; i < n_indices; i += blockDim.x) {
         const int64_t encoded = indices[i];
         GGML_UNUSED(read_indirect);
-        const int64_t idx = encoded < -1 ? -encoded - 2 : encoded;
+        const uint64_t payload = uint64_t(encoded < -1 ? -(encoded + 2) : encoded);
+        const int64_t idx = int64_t(uint32_t(payload));
         if (swa) {
             if (idx >= 0) {
                 live_index = max(live_index, (int) idx);

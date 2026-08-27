@@ -377,6 +377,64 @@ static void kvarn_compact_read_plan_skips_ownership_holes() {
             "compact KVarN read plan did not deduplicate pending cells");
 }
 
+static void kvarn_planning_reservations_preserve_group_ownership() {
+    const std::vector<llama_seq_id> seq0 = { 0 };
+    const std::vector<llama_seq_id> seq1 = { 1 };
+    require(llama_kvarn_group_owner_compatible(0, false, {}, seq0),
+            "fresh KVarN group rejected its first sequence owner");
+    require(llama_kvarn_group_owner_compatible(1, false, seq0, seq0),
+            "KVarN group rejected a matching same-transaction reservation");
+    require(!llama_kvarn_group_owner_compatible(1, false, seq0, seq1),
+            "KVarN planner mixed sequence owners in one fresh record group");
+    require(!llama_kvarn_group_owner_compatible(1, true, seq0, seq0),
+            "KVarN planner reused a historically mixed record group");
+}
+
+static void kvarn_stage_assignment_is_collision_free_and_stable() {
+    std::vector<int32_t> assignments;
+    require(llama_kvarn_reconcile_stage_slots({ 1, 9 }, 32, 2, assignments),
+            "explicit KVarN stage assignment rejected available capacity");
+    require(assignments.size() == 32 && assignments[1] > 0 && assignments[9] > 0 &&
+            assignments[1] != assignments[9],
+            "groups that collide under modulo still alias an explicit stage slot");
+
+    const int32_t stable_slot = assignments[1];
+    const int32_t released_slot = assignments[9];
+    require(llama_kvarn_reconcile_stage_slots({ 1, 17 }, 32, 2, assignments),
+            "released KVarN stage ownership was not reusable");
+    require(assignments[1] == stable_slot && assignments[9] == -1 &&
+            assignments[17] == released_slot,
+            "KVarN stage ownership was not stable across release/reuse");
+
+    const auto before_failure = assignments;
+    require(!llama_kvarn_reconcile_stage_slots({ 1, 9, 17 }, 32, 2, assignments),
+            "KVarN stage assignment overcommitted physical capacity");
+    require(assignments == before_failure,
+            "failed KVarN stage planning mutated live ownership");
+
+    std::vector<int32_t> remapped(32, -1);
+    remapped[9] = 7;
+    require(llama_kvarn_reconcile_stage_slots({ 9 }, 32, 1, remapped) && remapped[9] == 1,
+            "KVarN state remap retained an invalid process-local stage slot");
+}
+
+static void kvarn_stage_indices_carry_authoritative_assignment() {
+    constexpr uint32_t cell = 9*128 + 37;
+    constexpr uint32_t slot = 2;
+    const int64_t store = llama_kvarn_encode_store_cell(cell, slot);
+    require(llama_kvarn_decode_cell(store) == cell &&
+            llama_kvarn_decode_stage_slot(store) == int32_t(slot),
+            "KVarN store index lost its host-selected stage assignment");
+
+    const int64_t read = llama_kvarn_encode_stage_cell(cell, slot);
+    require(read < -1 && llama_kvarn_decode_cell(read) == cell &&
+            llama_kvarn_decode_stage_slot(read) == int32_t(slot),
+            "KVarN read index lost its host-selected stage assignment");
+    require(llama_kvarn_decode_cell(llama_kvarn_encode_stage_cell(cell)) == cell &&
+            llama_kvarn_decode_stage_slot(llama_kvarn_encode_stage_cell(cell)) == -1,
+            "legacy KVarN stage provenance no longer decodes safely");
+}
+
 static void test_stage_policy() {
     // The reference keeps one incomplete group in F16, but the suffix-removal
     // contract advertised by llama_kvarn_can_remove_range reaches back into the
@@ -1869,7 +1927,9 @@ static std::vector<float> test_native_flash_attention_output(
         ggml_type      exact_tail_type = GGML_TYPE_F16,
         int            exact_tail_current_tokens = 0,
         bool           exact_tail_bodyless = false,
-        bool           production_query_layout = false) {
+        bool           production_query_layout = false,
+        int            explicit_stage_slot = -1,
+        bool           eager_records = false) {
     ggml_init_params params = {
         /*.mem_size   =*/ 32 * 1024 * 1024,
         /*.mem_buffer =*/ nullptr,
@@ -1895,6 +1955,8 @@ static std::vector<float> test_native_flash_attention_output(
         q = ggml_permute(ctx, q, 0, 2, 1, 3);
     }
     ggml_tensor * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_kv * n_stream);
+    ggml_tensor * read_indices = explicit_stage_slot >= 0 ?
+        ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_kv * n_stream) : indices;
     ggml_tensor * current_k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, record_heads, n_kv * n_stream);
     ggml_tensor * current_v = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, record_heads, n_kv * n_stream);
     ggml_tensor * k_stage = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, record_heads, 128 * stage_groups * n_stream);
@@ -1908,6 +1970,8 @@ static std::vector<float> test_native_flash_attention_output(
     stored_v->op_params[3] = n_kv;
     stored_k->op_params[5] = slices;
     stored_v->op_params[5] = slices;
+    stored_k->op_params[9] = eager_records ? 1 : 0;
+    stored_v->op_params[9] = eager_records ? 1 : 0;
     if (native_view && n_kv >= 3*128) {
         using workspace_fn = size_t (*)(ggml_backend_dev_t, const ggml_tensor *);
         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
@@ -1932,13 +1996,17 @@ static std::vector<float> test_native_flash_attention_output(
     ggml_tensor * k_ref = native_view ? nullptr : ggml_new_tensor_4d(ctx, GGML_TYPE_F16, head_dim, n_kv_heads, n_kv, n_stream);
     ggml_tensor * v_ref = native_view ? nullptr : ggml_new_tensor_4d(ctx, GGML_TYPE_F16, head_dim, n_kv_heads, n_kv, n_stream);
     ggml_tensor * k = native_view ?
-        ggml_kvarn_view(ctx, k_records, stored_k, indices, n_kv, 0, n_stream, bits_k, false, stage_groups) : k_ref;
+        ggml_kvarn_view(ctx, k_records, stored_k, read_indices, n_kv, 0, n_stream, bits_k, false, stage_groups) : k_ref;
     ggml_tensor * v = native_view ?
-        ggml_kvarn_view(ctx, v_records, stored_v, indices, n_kv, 0, n_stream, bits_v, true,  stage_groups) : v_ref;
+        ggml_kvarn_view(ctx, v_records, stored_v, read_indices, n_kv, 0, n_stream, bits_v, true,  stage_groups) : v_ref;
 
     if (native_view && swa) {
         k->op_params[6] = 1;
         v->op_params[6] = 1;
+    }
+    if (native_view && explicit_stage_slot >= 0) {
+        k->op_params[10] = 1;
+        v->op_params[10] = 1;
     }
 
     if (native_view && slices > 1) {
@@ -2078,8 +2146,17 @@ static std::vector<float> test_native_flash_attention_output(
     }
 
     std::vector<int64_t> idx(n_kv * n_stream);
+    std::vector<int64_t> read_idx(n_kv * n_stream);
+    const int live_group = (n_kv - 1) / 128;
+    const bool live_group_incomplete = n_kv % 128 != 0;
     for (int i = 0; i < n_kv * n_stream; ++i) {
-        idx[i] = i;
+        idx[i] = explicit_stage_slot >= 0 ?
+            llama_kvarn_encode_store_cell(
+                    uint32_t(i), i/128 == 0 ? 0u : uint32_t(explicit_stage_slot)) : i;
+        read_idx[i] = explicit_stage_slot >= 0 && i/128 == 0 ?
+            llama_kvarn_encode_stage_cell(uint32_t(i), 0u) :
+            explicit_stage_slot >= 0 && live_group_incomplete && i/128 == live_group ?
+                llama_kvarn_encode_stage_cell(uint32_t(i), uint32_t(explicit_stage_slot)) : i;
     }
 
     std::vector<ggml_fp16_t> mask_data((size_t) n_kv * n_q * n_stream);
@@ -2097,6 +2174,9 @@ static std::vector<float> test_native_flash_attention_output(
 
     ggml_backend_tensor_set(q_in, q_data.data(), 0, ggml_nbytes(q_in));
     ggml_backend_tensor_set(indices, idx.data(), 0, ggml_nbytes(indices));
+    if (read_indices != indices) {
+        ggml_backend_tensor_set(read_indices, read_idx.data(), 0, ggml_nbytes(read_indices));
+    }
     ggml_backend_tensor_set(current_k, k_data.data(), 0, ggml_nbytes(current_k));
     ggml_backend_tensor_set(current_v, v_data.data(), 0, ggml_nbytes(current_v));
     ggml_backend_tensor_set(k_stage, k_stage_zeros.data(), 0, k_stage_zeros.size());
@@ -2204,6 +2284,7 @@ static std::vector<float> test_native_flash_attention_output(
 
     require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
             native_view ? "native FA: native-view graph compute failed" : "native FA: reference graph compute failed");
+    ggml_backend_synchronize(backend);
 
     std::vector<float> output(ggml_nelements(out));
     ggml_backend_tensor_get(out, output.data(), 0, ggml_nbytes(out));
@@ -2212,6 +2293,7 @@ static std::vector<float> test_native_flash_attention_output(
         body_meta_output->resize(ggml_nelements(body_meta));
         ggml_backend_tensor_get(body_meta, body_meta_output->data(), 0, ggml_nbytes(body_meta));
     }
+    ggml_backend_synchronize(backend);
 
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
@@ -2495,7 +2577,11 @@ static void require_close_f32_rmse(
     double mse = 0.0;
     double max_diff = 0.0;
     for (size_t i = 0; i < actual.size(); ++i) {
-        require(std::isfinite(actual[i]) && std::isfinite(expected[i]), "f32 parity output contained non-finite value");
+        if (!std::isfinite(actual[i]) || !std::isfinite(expected[i])) {
+            std::fprintf(stderr, "f32 parity non-finite at %zu: actual=%g expected=%g\n",
+                    i, double(actual[i]), double(expected[i]));
+            require(false, "f32 parity output contained non-finite value");
+        }
         const double diff = double(actual[i]) - double(expected[i]);
         mse += diff * diff;
         max_diff = std::max(max_diff, std::fabs(diff));
@@ -2882,6 +2968,34 @@ static void test_native_flash_attention_portable_backend(
         ggml_backend_t reference_backend,
         const char * backend_label) {
     const bool trace = std::getenv("GGML_KVARN_TEST_TRACE_NATIVE") != nullptr;
+    {
+        const std::vector<float> expected = test_native_flash_attention_output(
+                reference_backend, false, false, 256, 4, 3, 4,
+                6, 1, 350, 20, false, nullptr, false, 0, false,
+                GGML_TYPE_F16, 0, false, false, -1, true);
+        const std::vector<float> actual = test_native_flash_attention_output(
+                backend, true, true, 256, 4, 3, 4,
+                6, 1, 350, 20, false, nullptr, false, 0, false,
+                GGML_TYPE_F16, 0, false, false, 17, true);
+        require_close_f32_rmse(actual, expected, 1e-2f,
+                "authoritative high KVarN stage assignment differs from materialized reference");
+    }
+    {
+        // 535 tokens force the bulk workspace store with an unaligned final
+        // group. Its exact prefix and commit must use the host-selected slot,
+        // not reconstruct ownership with modulo arithmetic.
+        const std::vector<float> expected = test_native_flash_attention_output(
+                backend, true, true, 256, 4, 3, 4,
+                6, 1, 535, 20, false, nullptr, false, 0, false,
+                GGML_TYPE_F16, 0, false, false, 1, true);
+        const std::vector<float> actual = test_native_flash_attention_output(
+                backend, true, true, 256, 4, 3, 4,
+                6, 1, 535, 20, false, nullptr, false, 0, false,
+                GGML_TYPE_F16, 0, false, false, 17, true);
+        require_close_f32_rmse(actual, expected, 1e-2f,
+                "bulk KVarN store lost its authoritative stage assignment");
+    }
+
     for (int head_dim : { 128, 256, 512 }) {
         for (int n_q : { 1, 4, 32 }) {
             if (trace) {
@@ -4830,6 +4944,9 @@ int main() {
     kvarn_unified_restore_requires_exclusive_stream();
     kvarn_selective_state_owns_only_live_stage_rows();
     kvarn_compact_read_plan_skips_ownership_holes();
+    kvarn_planning_reservations_preserve_group_ownership();
+    kvarn_stage_assignment_is_collision_free_and_stable();
+    kvarn_stage_indices_carry_authoritative_assignment();
     test_type_table();
     test_attention_domain_policy();
     test_vulkan_decode_route_policy();

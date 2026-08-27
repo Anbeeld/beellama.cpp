@@ -46,6 +46,9 @@ shared float sh_row_std[128];
 shared float sh_best_imbalance;
 shared uint sh_better;
 shared uint sh_workspace_valid;
+shared uint sh_workspace_stage_slot;
+shared uint sh_workspace_selected_token;
+shared uint sh_workspace_selected_stream;
 
 const uint MODE_MONOLITHIC = 0u;
 const uint MODE_VALIDATE = 1u;
@@ -60,6 +63,11 @@ uint read_index_low(uint token) {
 
 uint read_index_high(uint token) {
     return data_indices[2 * token + 1];
+}
+
+uint read_stage_slot(uint token, uint fallback) {
+    const uint encoded = read_index_high(token);
+    return encoded == 0u ? fallback : encoded - 1u;
 }
 
 uint workspace_word_index(uint token, uint head, uint dim_pair) {
@@ -104,22 +112,19 @@ float wht_stage_value(float value, uint lane) {
     return value * KVAR_N_WHT_SCALE;
 }
 
-float stage_matrix_value(uint head, uint stage_base, uint stage_group, uint row, uint col) {
+float stage_matrix_value(uint head, uint stage_base, uint stage_slot, uint row, uint col) {
     const uint token = p.value != 0 ? row : col;
     const uint out_dim = p.value != 0 ? col : row;
-    // SWA: tail-only ping-pong over absolute tiles; non-SWA: tile 0 sink and
-    // tail_groups transient slots.
-    const uint stage_slot = p.swa != 0u ? (stage_group % p.stage_groups) : (1u + ((stage_group - 1u) % p.tail_groups));
     const uint stage_pos = stage_base + stage_slot * KVAR_N_DIM + token;
     return load_stage_value(stage_pos, head, out_dim);
 }
 
-float std_col(uint head, uint stage_base, uint stage_group, uint col) {
+float std_col(uint head, uint stage_base, uint stage_slot, uint col) {
     float sum = 0.0;
     float sum_sq = 0.0;
     const float sc = exp(sh_log_s_col[col]);
     for (uint row = 0; row < KVAR_N_DIM; ++row) {
-        const float raw = stage_matrix_value(head, stage_base, stage_group, row, col);
+        const float raw = stage_matrix_value(head, stage_base, stage_slot, row, col);
         const float scaled = raw / (sc * exp(sh_log_s_row[row]));
         sum += scaled;
         sum_sq += scaled * scaled;
@@ -128,12 +133,12 @@ float std_col(uint head, uint stage_base, uint stage_group, uint col) {
     return sqrt(max((sum_sq - float(KVAR_N_DIM) * mean * mean) / float(KVAR_N_DIM - 1), 0.0));
 }
 
-float std_row(uint head, uint stage_base, uint stage_group, uint row) {
+float std_row(uint head, uint stage_base, uint stage_slot, uint row) {
     float sum = 0.0;
     float sum_sq = 0.0;
     const float sr = exp(sh_log_s_row[row]);
     for (uint col = 0; col < KVAR_N_DIM; ++col) {
-        const float raw = stage_matrix_value(head, stage_base, stage_group, row, col);
+        const float raw = stage_matrix_value(head, stage_base, stage_slot, row, col);
         const float scaled = raw / (exp(sh_log_s_col[col]) * sr);
         sum += scaled;
         sum_sq += scaled * scaled;
@@ -142,9 +147,9 @@ float std_row(uint head, uint stage_base, uint stage_group, uint row) {
     return sqrt(max((sum_sq - float(KVAR_N_DIM) * mean * mean) / float(KVAR_N_DIM - 1), 0.0));
 }
 
-void update_best(uint head, uint stage_base, uint stage_group, uint lane) {
-    sh_col_std[lane] = std_col(head, stage_base, stage_group, lane);
-    sh_row_std[lane] = std_row(head, stage_base, stage_group, lane);
+void update_best(uint head, uint stage_base, uint stage_slot, uint lane) {
+    sh_col_std[lane] = std_col(head, stage_base, stage_slot, lane);
+    sh_row_std[lane] = std_row(head, stage_base, stage_slot, lane);
     barrier();
 
     if (lane == 0) {
@@ -179,7 +184,7 @@ uint quant_value(float x, float lo, float scale, uint qmax) {
     return uint(clamp(round((x - lo) / scale), 0.0, float(qmax)));
 }
 
-void write_payload_bits(uint record_base, uint row, uint qmax, float lo, float scale, uint head, uint stage_base, uint stage_group) {
+void write_payload_bits(uint record_base, uint row, uint qmax, float lo, float scale, uint head, uint stage_base, uint stage_slot) {
     const uint row_words = p.bits * 4;
     const uint row_base = record_base + row * row_words;
     for (uint w = 0; w < row_words; ++w) {
@@ -187,7 +192,7 @@ void write_payload_bits(uint record_base, uint row, uint qmax, float lo, float s
     }
 
     for (uint col = 0; col < KVAR_N_DIM; ++col) {
-        const float raw = stage_matrix_value(head, stage_base, stage_group, row, col);
+        const float raw = stage_matrix_value(head, stage_base, stage_slot, row, col);
         const float x = raw / (sh_best_col[col] * sh_best_row[row]);
         const uint q = quant_value(x, lo, scale, qmax);
         const uint bit_offset = col * p.bits;
@@ -200,15 +205,15 @@ void write_payload_bits(uint record_base, uint row, uint qmax, float lo, float s
     }
 }
 
-void quantize_stage(uint head, uint stage_base, uint stage_group, uint record_base, uint lane) {
+void quantize_stage(uint head, uint stage_base, uint stage_slot, uint record_base, uint lane) {
     sh_log_s_col[lane] = 0.0;
     sh_log_s_row[lane] = 0.0;
     sh_best_col[lane] = 1.0;
     sh_best_row[lane] = 1.0;
     barrier();
 
-    sh_col_std[lane] = std_col(head, stage_base, stage_group, lane);
-    sh_row_std[lane] = std_row(head, stage_base, stage_group, lane);
+    sh_col_std[lane] = std_col(head, stage_base, stage_slot, lane);
+    sh_row_std[lane] = std_row(head, stage_base, stage_slot, lane);
     barrier();
 
     if (lane == 0) {
@@ -229,21 +234,21 @@ void quantize_stage(uint head, uint stage_base, uint stage_group, uint record_ba
     barrier();
 
     for (uint iter = 0; iter < p.iterations; ++iter) {
-        const float col_std = clamp(std_col(head, stage_base, stage_group, lane), 1e-3, 1e3);
+        const float col_std = clamp(std_col(head, stage_base, stage_slot, lane), 1e-3, 1e3);
         sh_log_s_col[lane] = clamp(sh_log_s_col[lane] + log(col_std), -0.3, 10.0);
         barrier();
 
-        const float row_std = clamp(std_row(head, stage_base, stage_group, lane), 1e-3, 1e3);
+        const float row_std = clamp(std_row(head, stage_base, stage_slot, lane), 1e-3, 1e3);
         sh_log_s_row[lane] = clamp(sh_log_s_row[lane] + log(row_std), -0.3, 10.0);
         barrier();
 
-        update_best(head, stage_base, stage_group, lane);
+        update_best(head, stage_base, stage_slot, lane);
     }
 
     float lo = 3.402823466e+38;
     float hi = -3.402823466e+38;
     for (uint col = 0; col < KVAR_N_DIM; ++col) {
-        const float raw = stage_matrix_value(head, stage_base, stage_group, lane, col);
+        const float raw = stage_matrix_value(head, stage_base, stage_slot, lane, col);
         const float x = raw / (sh_best_col[col] * sh_best_row[lane]);
         lo = min(lo, x);
         hi = max(hi, x);
@@ -251,7 +256,7 @@ void quantize_stage(uint head, uint stage_base, uint stage_group, uint record_ba
 
     const uint qmax = (1u << p.bits) - 1u;
     const float scale = max((hi - lo) / float(qmax), 1e-10);
-    write_payload_bits(record_base, lane, qmax, lo, scale, head, stage_base, stage_group);
+    write_payload_bits(record_base, lane, qmax, lo, scale, head, stage_base, stage_slot);
 
     sh_col_std[lane] = scale;
     sh_row_std[lane] = lo;
@@ -288,10 +293,7 @@ float workspace_matrix_value(
         return load_workspace_value(
             token_base + local_pos - start_local, head, out_dim);
     }
-    const uint stage_slot = p.swa != 0u ?
-        (record_group % p.stage_groups) :
-        (1u + ((record_group - 1u) % p.tail_groups));
-    const uint stage_pos = stage_base + stage_slot * KVAR_N_DIM + token;
+    const uint stage_pos = stage_base + sh_workspace_stage_slot * KVAR_N_DIM + token;
     return load_stage_value(stage_pos, head, out_dim);
 }
 
@@ -695,6 +697,23 @@ void flush_workspace(uint lane) {
     }
 
     const uint stage_base = stream * KVAR_N_DIM * p.stage_groups;
+    const uint flush_group_global = stream * p.groups_per_stream + record_group;
+    if (lane == 0u) {
+        sh_workspace_stage_slot = p.swa != 0u ?
+            record_group % p.stage_groups :
+            1u + ((record_group - 1u) % p.tail_groups);
+        const uint flush_start = record_group * KVAR_N_DIM;
+        const uint first_store_token = flush_start > start_local ?
+            flush_start - start_local : 0u;
+        if (first_store_token < p.tokens_per_stream) {
+            const uint store_token = token_base + first_store_token;
+            if (read_index_low(store_token) / KVAR_N_DIM == flush_group_global) {
+                sh_workspace_stage_slot = read_stage_slot(
+                    store_token, sh_workspace_stage_slot);
+            }
+        }
+    }
+    barrier();
     const uint flush_record_group =
         stream * p.groups_per_stream +
         (p.swa != 0u ?
@@ -722,59 +741,48 @@ void commit_workspace(uint lane) {
         return;
     }
 
-    const uint first_idx = read_index_low(token_base);
-    const uint first_group_global = first_idx / KVAR_N_DIM;
-    const uint stream = p.swa != 0u ?
-        0u : first_group_global / p.groups_per_stream;
-    const uint first_group = p.swa != 0u ?
-        first_group_global :
-        first_group_global - stream * p.groups_per_stream;
-    const uint first_pos = first_idx % KVAR_N_DIM;
-    const uint start_local = first_group * KVAR_N_DIM + first_pos;
-    const uint end_local = start_local + p.tokens_per_stream;
-    const uint pos = stage_local % KVAR_N_DIM;
-
-    uint group = 0u;
-    if (p.swa == 0u && stage_local < KVAR_N_DIM) {
-        if (pos < start_local || pos >= end_local) {
-            return;
-        }
-    } else {
-        const uint slot = p.swa != 0u ?
-            stage_local / KVAR_N_DIM :
-            (stage_local - KVAR_N_DIM) / KVAR_N_DIM;
-        int max_group = int((end_local - 1u - pos) / KVAR_N_DIM);
-        const int min_group = p.swa != 0u ? 0 : 1;
-        while (max_group >= min_group &&
-                (p.swa != 0u ?
-                 uint(max_group) % p.stage_groups != slot :
-                 (uint(max_group) - 1u) % p.tail_groups != slot)) {
-            --max_group;
-        }
-        if (max_group < min_group) {
-            return;
-        }
-        group = uint(max_group);
-        const uint local_pos = group * KVAR_N_DIM + pos;
-        if ((p.swa == 0u && group >= p.groups_per_stream) ||
-                local_pos < start_local || local_pos >= end_local) {
-            return;
+    const uint wanted_slot = stage_local / KVAR_N_DIM;
+    const uint wanted_pos = stage_local % KVAR_N_DIM;
+    if (lane == 0u) {
+        sh_workspace_selected_token = 0xffffffffu;
+        sh_workspace_selected_stream = 0xffffffffu;
+        for (int t = int(p.tokens_per_stream) - 1; t >= 0; --t) {
+            const uint token = token_base + uint(t);
+            const uint idx = read_index_low(token);
+            if (idx % KVAR_N_DIM != wanted_pos) {
+                continue;
+            }
+            const uint group_global = idx / KVAR_N_DIM;
+            const uint stream = p.swa != 0u ?
+                0u : group_global / p.groups_per_stream;
+            const uint group = p.swa != 0u ?
+                group_global : group_global - stream * p.groups_per_stream;
+            if (stream >= p.n_stream ||
+                    (p.swa == 0u && group >= p.groups_per_stream)) {
+                continue;
+            }
+            const uint fallback_slot = p.swa != 0u ?
+                group % p.stage_groups :
+                (group == 0u ? 0u : 1u + ((group - 1u) % p.tail_groups));
+            if (read_stage_slot(token, fallback_slot) == wanted_slot) {
+                sh_workspace_selected_token = token;
+                sh_workspace_selected_stream = stream;
+                break;
+            }
         }
     }
-
-    const uint local_pos = group * KVAR_N_DIM + pos;
-    const uint token = token_base + local_pos - start_local;
-    if (token < token_base ||
-            token >= token_base + p.tokens_per_stream) {
+    barrier();
+    if (sh_workspace_selected_token == 0xffffffffu) {
         return;
     }
 
     if (lane < KVAR_N_DIM / 2u) {
         const uint stage_base =
-            stream * KVAR_N_DIM * p.stage_groups;
+            sh_workspace_selected_stream * KVAR_N_DIM * p.stage_groups;
         const uint stage_pos = stage_base + stage_local;
         data_stage[stage_word_index(stage_pos, head, lane)] =
-            data_workspace[workspace_word_index(token, head, lane)];
+            data_workspace[workspace_word_index(
+                sh_workspace_selected_token, head, lane)];
     }
 }
 
@@ -801,7 +809,9 @@ void monolithic_store(uint lane) {
             for (uint slice = 0u; slice < p.head_slices; ++slice) {
                 const uint head = head0 + slice;
                 const uint record_base = (flush_record_group * p.n_heads + head) * p.record_words;
-                quantize_stage(head, stage_base, flush_group, record_base, lane);
+                const uint flush_slot = p.swa != 0u ? flush_group % p.stage_groups :
+                    1u + ((flush_group - 1u) % p.tail_groups);
+                quantize_stage(head, stage_base, flush_slot, record_base, lane);
             }
         }
 
@@ -829,7 +839,9 @@ void monolithic_store(uint lane) {
             values[3] = (a - b - c + d) * 0.5;
         }
 
-        const uint stage_slot = p.swa != 0u ? (group % p.stage_groups) : (group == 0u ? 0u : 1u + ((group - 1u) % p.tail_groups));
+        const uint fallback_slot = p.swa != 0u ? (group % p.stage_groups) :
+            (group == 0u ? 0u : 1u + ((group - 1u) % p.tail_groups));
+        const uint stage_slot = read_stage_slot(token, fallback_slot);
         const uint stage_pos = stage_base + stage_slot * KVAR_N_DIM + pos;
         for (uint slice = 0u; slice < p.head_slices; ++slice) {
             const uint head = head0 + slice;
@@ -844,7 +856,7 @@ void monolithic_store(uint lane) {
             for (uint slice = 0u; slice < p.head_slices; ++slice) {
                 const uint head = head0 + slice;
                 const uint record_base = (record_group * p.n_heads + head) * p.record_words;
-                quantize_stage(head, stage_base, group, record_base, lane);
+                quantize_stage(head, stage_base, stage_slot, record_base, lane);
             }
         }
     }

@@ -47,13 +47,28 @@ struct ggml_cuda_fattn_kvarn_desc {
 static __device__ __forceinline__ int64_t ggml_cuda_fattn_kvarn_read_cell(
         const ggml_cuda_fattn_kvarn_desc & desc,
         const int64_t encoded,
-        bool & explicitly_staged) {
-    explicitly_staged = false;
-    if (encoded >= -1) {
-        return encoded;
+        bool & explicitly_staged,
+        int * assigned_slot = nullptr) {
+    GGML_UNUSED(desc);
+    explicitly_staged = encoded < -1;
+    const uint64_t payload = uint64_t(encoded < -1 ? -(encoded + 2) : encoded);
+    if (assigned_slot != nullptr) {
+        const uint32_t packed = uint32_t(payload >> 32u);
+        *assigned_slot = packed == 0 ? -1 : int(packed - 1u);
     }
-    explicitly_staged = true;
-    return -encoded - 2;
+    return int64_t(uint32_t(payload));
+}
+
+static __device__ __forceinline__ int ggml_cuda_fattn_kvarn_stage_pos(
+        const ggml_cuda_fattn_kvarn_desc & desc,
+        int group,
+        int pos,
+        int assigned_slot = -1) {
+    const int stage_base = desc.stream*GGML_CUDA_FATTN_KVARN_DIM*desc.stage_groups;
+    const int stage_slot = assigned_slot >= 0 ? assigned_slot :
+        (desc.swa ? group%desc.stage_groups :
+            (group == 0 ? 0 : 1 + ((group - 1)%desc.tail_groups)));
+    return stage_base + stage_slot*GGML_CUDA_FATTN_KVARN_DIM + pos;
 }
 
 static __device__ __forceinline__ bool ggml_cuda_fattn_kvarn_group_from_stage(

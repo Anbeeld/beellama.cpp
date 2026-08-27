@@ -146,10 +146,22 @@ uint read_index_low(bool value, uint token) {
         data_vindex[2u * token] : data_kindex[2u * token];
 }
 
-int read_cell(bool value, uint token, bool swa, out bool explicitly_staged) {
-    const int encoded = int(read_index_low(value, token));
-    explicitly_staged = encoded < -1;
-    return explicitly_staged ? -encoded - 2 : encoded;
+uint read_index_high(bool value, uint token) {
+    return value && (p.flags & FLAG_SHARED_INDICES) == 0u ?
+        data_vindex[2u * token + 1u] : data_kindex[2u * token + 1u];
+}
+
+int read_cell(
+        bool value, uint token, bool swa,
+        out bool explicitly_staged, out uint assigned_slot) {
+    const uint64_t raw = (uint64_t(read_index_high(value, token)) << 32u) |
+        read_index_low(value, token);
+    const int64_t encoded = int64_t(raw);
+    explicitly_staged = encoded < -1l;
+    const uint64_t payload = explicitly_staged ? uint64_t(-(encoded + 2l)) : raw;
+    const uint packed_slot = uint(payload >> 32u);
+    assigned_slot = packed_slot == 0u ? 0xffffffffu : packed_slot - 1u;
+    return int(uint(payload));
 }
 
 float load_stage(bool value, uint stage_pos, uint head, uint dim) {
@@ -195,7 +207,8 @@ void compute_live(
     for (uint i = lane; i < p.n_indices; i += KVAR_N_DIM) {
         const bool swa = (p.flags & FLAG_SWA) != 0u;
         bool explicitly_staged;
-        const int index = read_cell(value, i, swa, explicitly_staged);
+        uint assigned_slot;
+        const int index = read_cell(value, i, swa, explicitly_staged, assigned_slot);
         if (index == -1) {
             continue;
         }
@@ -244,8 +257,9 @@ float load_kvarn(
         uint dim) {
     const bool swa = (p.flags & FLAG_SWA) != 0u;
     bool explicitly_staged = false;
+    uint assigned_slot = 0xffffffffu;
     const int absolute_pos = (swa || read_indirect()) ?
-        read_cell(value, token, swa, explicitly_staged) : int(token);
+        read_cell(value, token, swa, explicitly_staged, assigned_slot) : int(token);
     if (absolute_pos == -1) {
         return 0.0;
     }
@@ -283,8 +297,9 @@ float load_kvarn(
 
     const uint head = logical_head * head_slices() + slice;
     if (from_stage) {
-        const uint stage_slot = swa ? group % stage_groups() :
-            (group == 0u ? 0u : 1u + ((group - 1u) % tail_groups()));
+        const uint stage_slot = assigned_slot != 0xffffffffu ? assigned_slot :
+            (swa ? group % stage_groups() :
+                (group == 0u ? 0u : 1u + ((group - 1u) % tail_groups())));
         const uint stage_pos = stream * KVAR_N_DIM * stage_groups() +
             stage_slot * KVAR_N_DIM + pos;
         return load_stage(value, stage_pos, head, dim);

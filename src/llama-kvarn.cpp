@@ -286,13 +286,68 @@ bool llama_kvarn_plan_remove_range(
     return true;
 }
 
+bool llama_kvarn_group_owner_compatible(
+        uint32_t group_used,
+        bool group_mixed,
+        const std::vector<llama_seq_id> & current_owners,
+        const std::vector<llama_seq_id> & desired_owners) {
+    return !group_mixed && (group_used == 0 || current_owners == desired_owners);
+}
+
+bool llama_kvarn_reconcile_stage_slots(
+        const std::vector<uint32_t> & live_groups,
+        uint32_t group_capacity,
+        uint32_t stage_slot_capacity,
+        std::vector<int32_t> & group_slots) {
+    if (group_capacity == 0 || stage_slot_capacity == 0) {
+        return false;
+    }
+
+    std::vector<bool> live(group_capacity, false);
+    for (uint32_t group : live_groups) {
+        if (group == 0 || group >= group_capacity || live[group]) {
+            return false;
+        }
+        live[group] = true;
+    }
+
+    std::vector<int32_t> planned(group_capacity, -1);
+    std::vector<bool> used(stage_slot_capacity + 1u, false);
+    if (group_slots.size() == group_capacity) {
+        for (uint32_t group : live_groups) {
+            const int32_t slot = group_slots[group];
+            if (slot > 0 && uint32_t(slot) <= stage_slot_capacity && !used[size_t(slot)]) {
+                planned[group] = slot;
+                used[size_t(slot)] = true;
+            }
+        }
+    }
+
+    for (uint32_t group : live_groups) {
+        if (planned[group] > 0) {
+            continue;
+        }
+        const auto free = std::find(used.begin() + 1, used.end(), false);
+        if (free == used.end()) {
+            return false;
+        }
+        const int32_t slot = int32_t(std::distance(used.begin(), free));
+        planned[group] = slot;
+        used[size_t(slot)] = true;
+    }
+
+    group_slots = std::move(planned);
+    return true;
+}
+
 std::vector<llama_kvarn_state_stage_cell> llama_kvarn_select_state_stage_cells(
         const std::vector<uint32_t> & source_cells,
         uint32_t live_cell_max_p1,
         uint32_t stage_groups,
         uint32_t tail_groups,
         bool swa,
-        const std::vector<uint32_t> * staged_groups) {
+        const std::vector<uint32_t> * staged_groups,
+        const std::vector<int32_t> * group_stage_slots) {
     if (live_cell_max_p1 == 0) {
         return {};
     }
@@ -320,8 +375,16 @@ std::vector<llama_kvarn_state_stage_cell> llama_kvarn_select_state_stage_cells(
         if (!staged) {
             continue;
         }
-        const uint32_t slot = swa ? group%stage_groups :
-                (group == 0 ? 0 : 1 + ((group - 1)%tail_groups));
+        int32_t assigned_slot = -1;
+        if (!swa && group_stage_slots != nullptr && group < group_stage_slots->size()) {
+            assigned_slot = group == 0 ? 0 : group_stage_slots->at(group);
+        }
+        const uint32_t slot = assigned_slot >= 0 ? uint32_t(assigned_slot) :
+                (swa ? group%stage_groups :
+                    (group == 0 ? 0 : 1 + ((group - 1)%tail_groups)));
+        if (slot >= stage_groups) {
+            throw std::invalid_argument("invalid KVarN explicit stage assignment");
+        }
         result.push_back({ cell, slot*KVAR_N_GROUP + pos });
     }
     return result;

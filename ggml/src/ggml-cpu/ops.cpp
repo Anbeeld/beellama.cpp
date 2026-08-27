@@ -11600,15 +11600,22 @@ static constexpr int KVAR_N_OP_PARAM_STAGE_GROUPS = 7;
 static constexpr int KVAR_N_OP_PARAM_TAIL_GROUPS = 8;
 static constexpr int KVAR_N_OP_PARAM_EAGER_RECORDS = 9;
 static constexpr int KVAR_N_OP_PARAM_READ_INDIRECT = 10;
-static inline int64_t kvarn_cpu_read_cell(int64_t encoded, bool read_indirect, bool swa, bool & staged) {
+static inline int64_t kvarn_cpu_index_payload(int64_t encoded) {
+    return encoded < -1 ? -(encoded + 2) : encoded;
+}
+
+static inline int64_t kvarn_cpu_read_cell(
+        int64_t encoded, bool read_indirect, bool swa, bool & staged,
+        int64_t * assigned_slot = nullptr) {
     GGML_UNUSED(read_indirect);
     GGML_UNUSED(swa);
-    staged = false;
-    if (encoded >= -1) {
-        return encoded;
+    staged = encoded < -1;
+    const uint64_t payload = uint64_t(kvarn_cpu_index_payload(encoded));
+    if (assigned_slot != nullptr) {
+        const uint32_t packed = uint32_t(payload >> 32u);
+        *assigned_slot = packed == 0 ? -1 : int64_t(packed - 1u);
     }
-    staged = true;
-    return -encoded - 2;
+    return int64_t(uint32_t(payload));
 }
 
 static void kvarn_cpu_hadamard(float * values) {
@@ -11928,8 +11935,12 @@ void ggml_compute_forward_kvarn_store(const ggml_compute_params * params, ggml_t
     const int64_t groups_per_stream = records->ne[2] / n_stream;
 
     for (int64_t t = 0; t < n_tokens; ++t) {
-        const int64_t idx = idx_data[t];
-        GGML_ASSERT(idx >= 0);
+        const int64_t encoded_idx = idx_data[t];
+        GGML_ASSERT(encoded_idx >= 0);
+        const uint64_t payload = uint64_t(encoded_idx);
+        const uint32_t packed_slot = uint32_t(payload >> 32u);
+        const int64_t assigned_slot = packed_slot == 0 ? -1 : int64_t(packed_slot - 1u);
+        const int64_t idx = int64_t(uint32_t(payload));
         const int64_t group_global = idx / 128;
         const int64_t pos = idx % 128;
         const int64_t stream = swa ? 0 : group_global / groups_per_stream;
@@ -11952,7 +11963,9 @@ void ggml_compute_forward_kvarn_store(const ggml_compute_params * params, ggml_t
             }
         }
 
-        const int64_t stage_slot = swa ? group % stage_groups : (group == 0 ? 0 : 1 + ((group - 1) % tail_groups));
+        const int64_t stage_slot = assigned_slot >= 0 ? assigned_slot :
+            (swa ? group % stage_groups : (group == 0 ? 0 : 1 + ((group - 1) % tail_groups)));
+        GGML_ASSERT(stage_slot >= 0 && stage_slot < stage_groups);
         const int64_t stage_pos = stage_base + stage_slot * 128 + pos;
         for (int64_t h0 = 0; h0 < n_heads; h0 += head_slices) {
             std::array<std::array<float, KVAR_N_GROUP>, 4> rows = {};
@@ -12053,7 +12066,9 @@ void ggml_compute_forward_kvarn_materialize(const ggml_compute_params * params, 
         std::array<std::array<float, KVAR_N_GROUP>, 4> rows = {};
         if (encoded != -1) {
             bool explicitly_staged;
-            const int64_t abs_pos = kvarn_cpu_read_cell(encoded, read_indirect, swa, explicitly_staged);
+            int64_t assigned_slot = -1;
+            const int64_t abs_pos = kvarn_cpu_read_cell(
+                    encoded, read_indirect, swa, explicitly_staged, &assigned_slot);
             const int64_t group = abs_pos / KVAR_N_GROUP;
             const int64_t pos = abs_pos % KVAR_N_GROUP;
             const int64_t live_group = live_groups[out_stream];
@@ -12065,8 +12080,9 @@ void ggml_compute_forward_kvarn_materialize(const ggml_compute_params * params, 
             int64_t record_group = 0;
             if (explicitly_staged) {
                 from_stage = true;
-                stage_pos = stage_base + (group == 0 ? pos :
-                    KVAR_N_GROUP + ((group - 1) % tail_groups) * KVAR_N_GROUP + pos);
+                const int64_t stage_slot = assigned_slot >= 0 ? assigned_slot :
+                    (group == 0 ? 0 : 1 + ((group - 1) % tail_groups));
+                stage_pos = stage_base + stage_slot*KVAR_N_GROUP + pos;
             } else if (read_indirect && !swa) {
                 from_stage = explicitly_staged;
                 from_record = !from_stage;
@@ -12272,7 +12288,9 @@ static kvarn_cpu_attn_ref kvarn_cpu_attn_resolve(
         return {};
     }
     bool explicitly_staged;
-    const int64_t absolute_pos = kvarn_cpu_read_cell(encoded, side.read_indirect, side.swa, explicitly_staged);
+    int64_t assigned_slot = -1;
+    const int64_t absolute_pos = kvarn_cpu_read_cell(
+            encoded, side.read_indirect, side.swa, explicitly_staged, &assigned_slot);
 
     const int64_t group = absolute_pos / KVAR_N_GROUP;
     const int64_t position = absolute_pos % KVAR_N_GROUP;
@@ -12284,8 +12302,9 @@ static kvarn_cpu_attn_ref kvarn_cpu_attn_resolve(
 
     if (explicitly_staged) {
         result.from_stage = true;
-        result.stage_pos = stage_base + (group == 0 ? position :
-            KVAR_N_GROUP + ((group - 1) % side.tail_groups) * KVAR_N_GROUP + position);
+        const int64_t stage_slot = assigned_slot >= 0 ? assigned_slot :
+            (group == 0 ? 0 : 1 + ((group - 1) % side.tail_groups));
+        result.stage_pos = stage_base + stage_slot*KVAR_N_GROUP + position;
     } else if (side.read_indirect && !side.swa) {
         result.from_stage = explicitly_staged;
         result.from_record = !result.from_stage;

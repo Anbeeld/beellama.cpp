@@ -2679,16 +2679,24 @@ private:
             bool restore_target,
             bool restore_draft,
             bool restore_speculative) {
-        const bool restored = server_prompt_restore_transaction(
+        const auto result = server_prompt_restore_transaction_diagnostic(
                 target, draft, spec.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY,
                 { checkpoint.data_tgt.data(), checkpoint.data_tgt.size() },
                 { checkpoint.data_dft.data(), checkpoint.data_dft.size() },
                 { checkpoint.data_spec.data(), checkpoint.data_spec.size() },
                 restore_target, restore_draft, restore_speculative);
-        if (!restored) {
-            SLT_WRN(slot, "%s", "checkpoint restore preparation failed; destination is unchanged\n");
+        if (!result.success) {
+            const char * component = !result.has_component ? "none" :
+                    result.component == SERVER_PROMPT_STATE_MAIN ? "target" :
+                    result.component == SERVER_PROMPT_STATE_DRAFT ? "draft" : "speculative";
+            const char * reason = result.reason == SERVER_PROMPT_RESTORE_INVALID_IO ? "invalid transaction callbacks" :
+                    result.reason == SERVER_PROMPT_RESTORE_MISSING_REQUIRED_STATE ? "missing required state" :
+                    result.reason == SERVER_PROMPT_RESTORE_PREPARE_REJECTED ? "prepare rejected state" : "unknown";
+            SLT_WRN(slot,
+                    "checkpoint restore preparation failed (component = %s, reason = %s); destination is unchanged\n",
+                    component, reason);
         }
-        return restored;
+        return result.success;
     }
 
     // returns false to decline the task, it is offered again after the decode is done
@@ -3689,8 +3697,25 @@ private:
                             if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
                                 if (pos_min == -1) {
-                                    SLT_ERR(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min);
-                                    GGML_ABORT("pos_min == -1, but n_past > 0 - should not happen: https://github.com/ggml-org/llama.cpp/pull/13833#discussion_r2116181237");
+                                    SLT_WRN(slot,
+                                            "lost live KV state with n_past = %d and prompt_tokens = %d; attempting owner-only full reprocess\n",
+                                            n_past, (int) slot.prompt.tokens.size());
+                                    const bool target_cleared = llama_memory_seq_rm(
+                                            llama_get_memory(slot.ctx_tgt), slot.id, -1, -1);
+                                    const bool draft_cleared = !slot.ctx_dft || llama_memory_seq_rm(
+                                            llama_get_memory(slot.ctx_dft), slot.id, -1, -1);
+                                    if (!target_cleared || !draft_cleared) {
+                                        SLT_ERR(slot,
+                                                "failed to recover lost live KV state (target = %s, draft = %s)\n",
+                                                target_cleared ? "cleared" : "refused",
+                                                draft_cleared ? "cleared" : "refused");
+                                        send_error(slot, "lost live KV state could not be recovered", ERROR_TYPE_SERVER);
+                                        slot.release();
+                                        return;
+                                    }
+                                    slot.prompt_reset_after_memory_clear();
+                                    slot.state = SLOT_STATE_STARTED;
+                                    return;
                                 }
 
                                 // when the prompt prefix does not match, print the tokens around the mismatch
@@ -4159,20 +4184,46 @@ private:
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
             ret = llama_decode(ctx_tgt, batch_view);
-            if (ret == 0 && has_output) {
+            if (ret == 0) {
+                // Server KV/state and speculative scheduling inspect this memory
+                // immediately after decode, including prompt-only sub-batches.
                 llama_synchronize(ctx_tgt);
             }
         });
 
         if (ret != 0) {
+            if (n_batch == 1 && ret == 1) {
+                GGML_ASSERT(batch_view.n_tokens == 1);
+                const std::string err = "Unable to allocate KV cache for this request.";
+                for (int32_t j = 0; j < batch_view.n_seq_id[0]; ++j) {
+                    const llama_seq_id owner = batch_view.seq_id[0][j];
+                    for (auto & slot : slots) {
+                        if (!slot.is_processing() || slot.id != owner) {
+                            continue;
+                        }
+                        SLT_ERR(slot, "%s off = %d, n_batch = %d, ret = %d\n",
+                                err.c_str(), off, n_batch, ret);
+                        send_error(slot, err, ERROR_TYPE_SERVER);
+                        const bool target_cleared = llama_memory_seq_rm(
+                                llama_get_memory(slot.ctx_tgt), slot.id, -1, -1);
+                        const bool draft_cleared = !slot.ctx_dft || llama_memory_seq_rm(
+                                llama_get_memory(slot.ctx_dft), slot.id, -1, -1);
+                        if (target_cleared && draft_cleared) {
+                            slot.prompt_reset_after_memory_clear();
+                        } else {
+                            SLT_ERR(slot,
+                                    "failed to clear owner after KV allocation refusal (target = %s, draft = %s)\n",
+                                    target_cleared ? "cleared" : "refused",
+                                    draft_cleared ? "cleared" : "refused");
+                        }
+                        slot.release();
+                    }
+                }
+                return true;
+            }
+
             {
                 std::string err;
-
-                if (n_batch == 1 && ret == 1) {
-                    // TODO: try to terminate only the largest active slot/sequence and continue with the rest
-                    //       need to remove the tokens from the current batch too
-                    err = "Context size has been exceeded.";
-                }
 
                 if (ret == -1) {
                     err = "Invalid input batch.";
@@ -4423,6 +4474,8 @@ private:
 
                 const bool use_ckpt_tgt = server_speculative_rollback_requires_checkpoint(
                         ctx_tgt_seq_rm_type, common_context_seq_rm_max_rollback(ctx_tgt), n_rollback);
+                const bool use_ckpt_dft = ctx_dft && server_speculative_rollback_requires_checkpoint(
+                        ctx_dft_seq_rm_type, common_context_seq_rm_max_rollback(ctx_dft), n_rollback);
 
                 // check for partial draft acceptance
                 if (n_rollback > 0) {
@@ -4441,7 +4494,7 @@ private:
 
                         if (!restore_checkpoint_transaction(
                                     slot, ckpt, slot.ctx_tgt, slot.ctx_dft,
-                                    true, slot.ctx_dft != nullptr, true)) {
+                                    true, use_ckpt_dft, true)) {
                             SLT_ERR(slot, "%s", "failed to restore speculative checkpoint transaction\n");
                             slot.release();
                             return;

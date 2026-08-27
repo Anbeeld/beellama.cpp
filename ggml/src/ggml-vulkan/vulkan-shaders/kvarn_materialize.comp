@@ -1,5 +1,7 @@
 #version 450
 
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform parameter {
@@ -39,11 +41,16 @@ shared uint sh_live_group[128];
 shared uint sh_live_pos[128];
 
 uint read_index_low(uint token) { return data_indices[2 * token]; }
+uint read_index_high(uint token) { return data_indices[2 * token + 1u]; }
 
-int read_cell(uint token, out bool explicitly_staged) {
-    const int encoded = int(read_index_low(token));
-    explicitly_staged = encoded < -1;
-    return explicitly_staged ? -encoded - 2 : encoded;
+int read_cell(uint token, out bool explicitly_staged, out uint assigned_slot) {
+    const uint64_t raw = (uint64_t(read_index_high(token)) << 32u) | read_index_low(token);
+    const int64_t encoded = int64_t(raw);
+    explicitly_staged = encoded < -1l;
+    const uint64_t payload = explicitly_staged ? uint64_t(-(encoded + 2l)) : raw;
+    const uint packed_slot = uint(payload >> 32u);
+    assigned_slot = packed_slot == 0u ? 0xffffffffu : packed_slot - 1u;
+    return int(uint(payload));
 }
 
 float load_stage_value(uint stage_pos, uint head, uint dim) {
@@ -73,7 +80,8 @@ void compute_live(uint stream, uint lane, out uint group_out, out uint pos_out) 
     uint live_pos = 0u;
     for (uint i = lane; i < p.n_indices; i += KVAR_N_DIM) {
         bool explicitly_staged;
-        const int idx = read_cell(i, explicitly_staged);
+        uint assigned_slot;
+        const int idx = read_cell(i, explicitly_staged, assigned_slot);
         if (idx == -1) { continue; }
         const uint group_global = uint(idx) / KVAR_N_DIM;
         const uint idx_stream = p.swa != 0u ? stream : group_global / p.groups_per_stream;
@@ -143,8 +151,9 @@ float load_materialized(
         uint live_pos,
         uint lane) {
     bool explicitly_staged = false;
+    uint assigned_slot = 0xffffffffu;
     const int abs_pos_i = (p.swa != 0u || p.read_indirect != 0u) ?
-        read_cell(token, explicitly_staged) : int(token);
+        read_cell(token, explicitly_staged, assigned_slot) : int(token);
     if (abs_pos_i == -1) {
         return 0.0;
     }
@@ -176,8 +185,9 @@ float load_materialized(
     }
 
     if (from_stage) {
-        const uint stage_slot = p.swa != 0u ? group % p.stage_groups :
-            (group == 0u ? 0u : 1u + ((group - 1u) % p.tail_groups));
+        const uint stage_slot = assigned_slot != 0xffffffffu ? assigned_slot :
+            (p.swa != 0u ? group % p.stage_groups :
+                (group == 0u ? 0u : 1u + ((group - 1u) % p.tail_groups)));
         const uint stage_pos = stream * KVAR_N_DIM * p.stage_groups + stage_slot * KVAR_N_DIM + pos;
         return load_stage_value(stage_pos, head, lane);
     }
