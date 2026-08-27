@@ -14,7 +14,6 @@
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
 
-using json = nlohmann::ordered_json;
 
 struct common_speculative;
 

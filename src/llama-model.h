@@ -140,6 +140,7 @@ enum llm_type {
     LLM_TYPE_230B_A10B, // Minimax M2
     LLM_TYPE_428B_A23B, // Minimax M3
     LLM_TYPE_235B_A22B,
+    LLM_TYPE_288B_A19B, // dots3-note
     LLM_TYPE_300B_A47B, // Ernie MoE big
     LLM_TYPE_310B_A15B, // /MiMo-V2-Flash
     LLM_TYPE_355B_A32B, // GLM-4.5
@@ -773,6 +774,7 @@ struct llama_model_base : public llama_model {
     const int TENSOR_SKIP;
     const int TENSOR_SKIP_IF_VIRTUAL;
     const int TENSOR_ALLOW_RESHAPE;
+    const int TENSOR_READ_LAZY;
 
     explicit llama_model_base(const llama_model_params & params);
     virtual ~llama_model_base() = default;

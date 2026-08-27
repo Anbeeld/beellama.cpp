@@ -25,6 +25,7 @@
 #include <exception>
 #include <memory>
 #include <filesystem>
+#include <random>
 #include <utility>
 #include <fstream>
 
@@ -36,8 +37,6 @@
 #endif
 #include <windows.h>
 #endif
-
-using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
@@ -81,6 +80,61 @@ static common_speculative_output_limits server_output_limits(const common_params
 
     result.total   = std::max<int32_t>(1, result.total);
     result.per_seq = std::max<int32_t>(1, result.per_seq);
+    return result;
+}
+
+// synthetic draft verification for benchmarking - accept draft tokens at random instead of by match with the target
+// on replay the draft was already accepted before a context checkpoint restore, so repeat the same decisions
+static std::vector<llama_token> server_sample_and_accept_synth(
+        common_sampler * smpl,
+        llama_context * ctx,
+        const std::vector<int32_t> & idxs,
+        const llama_tokens & draft,
+        const std::vector<double> & synth_probs,
+        std::mt19937 & rng,
+        bool is_replay,
+        const common_sampler_accept_callback & on_accept) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1);
+    GGML_ASSERT(synth_probs.size() >= draft.size());
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    auto accept_target = [&](llama_token id) {
+        const auto info = common_sampler_accept_with_info(smpl, id, true);
+        result.push_back(id);
+        return !on_accept || on_accept(info);
+    };
+
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+    std::uniform_real_distribution<double> dist(0.0, 1.0);
+    for (size_t i = 0; i < draft.size(); ++i) {
+        const llama_token id = common_sampler_sample(smpl, ctx, idxs[i]);
+        const bool accept = is_replay || dist(rng) < synth_probs[i];
+        // do not accept a drafted EOG token - it would end the generation early
+        // on replay the last token is from the target and can be EOG, so skip this check
+        if (accept && (is_replay || !llama_vocab_is_eog(vocab, draft[i]))) {
+            // synthetic draft tokens do not advance grammar or reasoning state
+            // the last replay token is from the target and must advance both
+            const bool is_replay_target = is_replay && i + 1 == draft.size();
+            if (is_replay_target) {
+                if (!accept_target(draft[i])) {
+                    return result;
+                }
+            } else {
+                common_sampler_accept(smpl, draft[i], false);
+                result.push_back(draft[i]);
+            }
+            continue;
+        }
+
+        (void) accept_target(id);
+        return result;
+    }
+
+    const llama_token id = common_sampler_sample(smpl, ctx, idxs[draft.size()]);
+    (void) accept_target(id);
+
     return result;
 }
 
@@ -244,6 +298,7 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+    std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -774,14 +829,14 @@ struct server_slot {
             res["n_prompt_tokens_processed"] = stats.n_prompt_processed;
             res["n_prompt_tokens_cache"]     = stats.n_prompt_cached;
             res["params"] = ptask->params.to_json(only_metrics);
-            res["next_token"] = {
+            res["next_token"] = json::array({
                 {
                     {"has_next_token", has_next_token},
                     {"has_new_line",   has_new_line},
                     {"n_remain",       n_remaining()},
                     {"n_decoded",      stats.n_gen},
                 }
-            };
+            });
 
             if (!only_metrics) {
                 res["prompt"] = ptask->tokens.detokenize(ctx_tgt, true);
@@ -918,6 +973,8 @@ public:
     llama_model * model_tgt = nullptr;
 
     mtmd_context * mctx = nullptr;
+    // note: video_params.ffmpeg_bin_dir points into params_base, which outlives this struct
+    mtmd_helper_init_opt init_opt = mtmd_helper_init_opt_default();
     const llama_vocab * vocab = nullptr;
 
     server_queue    queue_tasks;
@@ -1004,8 +1061,10 @@ private:
     // slots / clients
     std::vector<server_slot> slots;
 
-    int trace = 0;
-    int slots_debug = 0;
+    int trace = 0;        // env: LLAMA_TRACE
+    int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
+    int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
+
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
@@ -1191,62 +1250,7 @@ private:
             }
         }
 
-        // optionally reserve VRAM for the draft / MTP context before fitting the target model
-        if (params_base.fit_params) {
-            if (has_spec) {
-                // MTP draft context lives on the target model, only context+compute are new
-                bool measure_model_bytes = has_draft;
-
-                common_params params_dft = common_base_params_to_speculative(params_base);
-
-                auto mparams_dft = common_model_params_to_llama(params_dft);
-                auto cparams_dft = common_context_params_to_llama(params_dft);
-                if (spec_mtp) {
-                    cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
-                }
-                cparams_dft.n_rs_seq = 0;
-
-                std::vector<ggml_backend_dev_t> devs;
-                uint32_t hp_ngl = 0;
-                uint32_t hp_nct = 0;
-                uint32_t hp_nex = 0;
-                try {
-                    auto dmd = common_get_device_memory_data(
-                        params_dft.model.path.c_str(), &mparams_dft, &cparams_dft,
-                        devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
-
-                    GGML_ASSERT(!params_base.fit_params_target.empty());
-                    size_t total = 0;
-
-                    std::vector<ggml_backend_dev_t> tgt_devices = params.devices;
-
-                    if (tgt_devices.empty()) {
-                        for(size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-                           tgt_devices.push_back(ggml_backend_dev_get(i));
-                        }
-                    }
-
-                    for (size_t j = 0; j < devs.size(); ++j) {
-                        const size_t bytes = (measure_model_bytes ? dmd[j].model : 0) + dmd[j].context + dmd[j].compute;
-                        total += bytes;
-                        for (size_t i = 0; i < tgt_devices.size(); i++) {
-                            if (tgt_devices[i] == devs[j]) {
-                                SRV_DBG("[spec] adding %.2f MiB to fit_params_target for device %s\n",
-                                        bytes / (1024.0 * 1024.0), ggml_backend_dev_name(devs[j]));
-                                params_base.fit_params_target[i] += bytes;
-                                break;
-                            }
-                        }
-                    }
-                    SRV_TRC("[spec] estimated memory usage of %s is %.2f MiB\n",
-                            has_draft ? "draft model" : "MTP context",
-                            total / (1024.0 * 1024.0));
-                } catch (const std::exception & e) {
-                    SRV_WRN("[spec] failed to measure %s memory: %s\n",
-                            has_draft ? "draft model" : "MTP context", e.what());
-                }
-            }
-        }
+        // note: the draft / MTP context is fitted together with the target model, see common_fit_extra_model
 
         // attach a progress callback
         {
@@ -1324,6 +1328,11 @@ private:
             }
             SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
 
+            init_opt.video_params.fps_target = params_base.video_fps;
+            init_opt.video_params.timestamp_interval_ms = params_base.video_timestamp_interval_ms;
+            init_opt.video_params.ffmpeg_bin_dir = params_base.video_ffmpeg_bin_dir.empty()
+                                ? nullptr : params_base.video_ffmpeg_bin_dir.c_str();
+
             if (params_base.ctx_shift) {
                 params_base.ctx_shift = false;
                 SRV_WRN("%s\n", "ctx_shift is not supported by multimodal, it will be disabled");
@@ -1393,6 +1402,9 @@ private:
                 spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
             } catch (const std::exception & e) {
                 SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
+                if (params_base.speculative.has_synth()) {
+                    return false;
+                }
             }
         }
 
@@ -1406,6 +1418,11 @@ private:
             spec_init.reset();
             ctx_dft   = nullptr;
             model_dft = nullptr;
+        }
+
+        if (!spec && params_base.speculative.has_synth()) {
+            SRV_ERR("%s", "synthetic acceptance requires an initialized speculative decoding context\n");
+            return false;
         }
 
         for (int i = 0; i < params_base.n_parallel; i++) {
@@ -1452,6 +1469,15 @@ private:
 
             if (slots_debug) {
                 SRV_WRN("LLAMA_SERVER_SLOTS_DEBUG = %d\n", slots_debug);
+            }
+        }
+
+        {
+            const char * LLAMA_SERVER_SLOTS_N_DIFF = getenv("LLAMA_SERVER_SLOTS_N_DIFF");
+            slots_n_diff = LLAMA_SERVER_SLOTS_N_DIFF ? atoi(LLAMA_SERVER_SLOTS_N_DIFF) : 0;
+
+            if (slots_n_diff) {
+                SRV_WRN("LLAMA_SERVER_SLOTS_N_DIFF = %d\n", slots_n_diff);
             }
         }
 
@@ -1926,6 +1952,13 @@ private:
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
             SLT_TRC(slot, "sampler params: \n%s\n", task.params.sampling.print().c_str());
+
+            if (spec && !common_speculative_get_synth_probs(spec.get()).empty()) {
+                const uint32_t seed = task.params.sampling.seed == LLAMA_DEFAULT_SEED
+                    ? std::random_device{}()
+                    : task.params.sampling.seed;
+                slot.spec_synth_rng.seed(seed);
+            }
         } else {
             slot.smpl.reset();
         }
@@ -2485,9 +2518,9 @@ private:
         try {
             auto & prompt = task.cli_prompt;
             if (mctx != nullptr) {
-                task.tokens = process_mtmd_prompt(mctx, prompt, task.cli_files);
+                task.tokens = process_mtmd_prompt(mctx, prompt, task.cli_files, init_opt);
             } else {
-                task.tokens = std::move(tokenize_input_prompts(vocab, mctx, prompt, true, true)[0]);
+                task.tokens = std::move(tokenize_input_prompts(vocab, mctx, prompt, true, true, init_opt)[0]);
             }
             task.cli_prompt.clear();
             task.cli_files.clear();
@@ -3721,8 +3754,8 @@ private:
                                 // when the prompt prefix does not match, print the tokens around the mismatch
                                 // this is useful for debugging prompt caching
                                 if (slots_debug) {
-                                    const int np0 = std::max<int>(n_past - 4, 0);
-                                    const int np1 = std::min<int>(n_past + 6, std::min(slot.prompt.tokens.size(), slot.task->tokens.size()));
+                                    const int np0 = std::max<int>(n_past - slots_n_diff, 0);
+                                    const int np1 = std::min<int>(n_past + slots_n_diff + 2, std::min(slot.prompt.tokens.size(), slot.task->tokens.size()));
 
                                     std::stringstream ss0;
                                     std::stringstream ss1;
@@ -4464,8 +4497,13 @@ private:
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto on_accept = make_loop_guard_accept_callback(slot);
-                auto accepted = common_sampler_sample_and_accept_n(
-                    slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, false, on_accept);
+                const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
+                auto accepted = synth_probs.empty()
+                    ? common_sampler_sample_and_accept_n(
+                            slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, false, on_accept)
+                    : server_sample_and_accept_synth(
+                            slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
+                            synth_probs, slot.spec_synth_rng, slot.spec_is_replay, on_accept);
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
@@ -4562,7 +4600,7 @@ private:
 
             auto & n_accepted_per_pos = slot.n_accepted_per_pos;
             if (n_accepted_per_pos.empty()) {
-                n_accepted_per_pos.resize(common_speculative_n_max(&params_base.speculative), 0);
+                n_accepted_per_pos.resize(common_speculative_n_max(spec.get()), 0);
             }
             for (size_t i = 0; i < n_accepted && i < n_accepted_per_pos.size(); ++i) {
                 n_accepted_per_pos[i]++;
@@ -4866,16 +4904,17 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
         if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
-            inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files));
+            inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt));
         } else {
             // Everything else, including multimodal completions.
-            inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true);
+            inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true, ctx_server.init_opt);
         }
 
         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
 
         // message delimiters for checkpointing
-        auto delimiters = common_chat_msg_delimiters_parse(json_value(data, "message_delimiters", json::array()));
+        json delims = json_value(data, "message_delimiters", json::array());
+        auto delimiters = common_chat_msg_delimiters_parse(delims);
         delimiters.tokenize(ctx_server.vocab);
 
         for (size_t i = 0; i < inputs.size(); i++) {
@@ -5138,8 +5177,8 @@ static json get_res_model_info(const server_context_meta & meta) {
 static json get_res_models(const server_context_meta & meta) {
     // note: do NOT use ctx_server here, otherwise it's not possible to use this during sleep
 
-    return {
-        {"models", {
+    return json{
+        {"models", json::array({
             {
                 {"name",  meta.model_name},
                 {"model", meta.model_name},
@@ -5148,23 +5187,23 @@ static json get_res_models(const server_context_meta & meta) {
                 {"digest", ""}, // dummy value, llama.cpp does not support managing model file's hash
                 {"type", "model"},
                 {"description", ""},
-                {"tags", {""}},
-                {"capabilities", meta.has_mtmd ? json({"completion","multimodal"}) : json({"completion"})},
+                {"tags", json::array({""})},
+                {"capabilities", meta.has_mtmd ? json::array({"completion","multimodal"}) : json::array({"completion"})},
                 {"parameters", ""},
                 {"details", {
                     {"parent_model", ""},
                     {"format", "gguf"},
                     {"family", ""},
-                    {"families", {""}},
+                    {"families", json::array({""})},
                     {"parameter_size", ""},
                     {"quantization_level", ""}
                 }}
             }
-        }},
+        })},
         {"object", "list"},
-        {"data", {
+        {"data", json::array({
             get_res_model_info(meta),
-        }}
+        })}
     };
 }
 
@@ -5455,7 +5494,7 @@ void server_routes::init_routes() {
         data["input_extra"] = input_extra; // default to empty array if it's not exist
 
         std::string prompt = json_value(data, "prompt", std::string());
-        std::vector<server_tokens> tokenized_prompts = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, false, true);
+        std::vector<server_tokens> tokenized_prompts = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, false, true, ctx_server.init_opt);
         SRV_DBG("creating infill tasks, n_prompts = %d\n", (int) tokenized_prompts.size());
         data["prompt"] = format_prompt_infill(
             ctx_server.vocab,
@@ -5519,7 +5558,7 @@ void server_routes::init_routes() {
     };
 
     this->post_chat_completions_tok = [this](const server_http_req & req) {
-        return handle_count_tokens(ctx_server.vocab, ctx_server.mctx, req, TASK_RESPONSE_TYPE_OAI_CHAT);
+        return handle_count_tokens(ctx_server.vocab, ctx_server.mctx, ctx_server.init_opt, req, TASK_RESPONSE_TYPE_OAI_CHAT);
     };
 
     this->post_control = [this](const server_http_req & req) {
@@ -5578,7 +5617,7 @@ void server_routes::init_routes() {
     };
 
     this->post_responses_tok_oai = [this](const server_http_req & req) {
-        return handle_count_tokens(ctx_server.vocab, ctx_server.mctx, req, TASK_RESPONSE_TYPE_OAI_RESP);
+        return handle_count_tokens(ctx_server.vocab, ctx_server.mctx, ctx_server.init_opt, req, TASK_RESPONSE_TYPE_OAI_RESP);
     };
 
     this->post_transcriptions_oai = [this](const server_http_req & req) {
@@ -5628,7 +5667,7 @@ void server_routes::init_routes() {
     };
 
     this->post_anthropic_count_tokens = [this](const server_http_req & req) {
-        return handle_count_tokens(ctx_server.vocab, ctx_server.mctx, req, TASK_RESPONSE_TYPE_ANTHROPIC);
+        return handle_count_tokens(ctx_server.vocab, ctx_server.mctx, ctx_server.init_opt, req, TASK_RESPONSE_TYPE_ANTHROPIC);
     };
 
     // same with handle_chat_completions, but without inference part
@@ -5703,7 +5742,7 @@ void server_routes::init_routes() {
 
         std::string content;
         if (body.count("tokens") != 0) {
-            const llama_tokens tokens = body.at("tokens");
+            const llama_tokens tokens = body.at("tokens").get<llama_tokens>();
             content = tokens_to_str(ctx_server.vocab, tokens);
         }
 
@@ -5761,7 +5800,7 @@ void server_routes::init_routes() {
             std::vector<server_task> tasks;
             tasks.reserve(documents.size());
             for (size_t i = 0; i < documents.size(); i++) {
-                auto tmp = format_prompt_rerank(ctx_server.model_tgt, ctx_server.vocab, ctx_server.mctx, query, documents[i]);
+                auto tmp = format_prompt_rerank(ctx_server.model_tgt, ctx_server.vocab, ctx_server.mctx, query, documents[i], ctx_server.init_opt);
                 server_task task = server_task(SERVER_TASK_TYPE_RERANK);
                 task.id     = rd.get_new_id();
                 task.tokens = std::move(tmp);
@@ -5999,7 +6038,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
         }
     }
 
-    auto tokenized_prompts = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true);
+    auto tokenized_prompts = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true, ctx_server.init_opt);
     for (const auto & tokens : tokenized_prompts) {
         // this check is necessary for models that do not add BOS token to the input
         if (tokens.empty()) {
@@ -6010,7 +6049,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
 
     int embd_normalize = params.embd_normalize;
     if (body.count("embd_normalize") != 0) {
-        embd_normalize = body.at("embd_normalize");
+        embd_normalize = body.at("embd_normalize").get<int>();
         if (meta->pooling_type == LLAMA_POOLING_TYPE_NONE) {
             SRV_DBG("embd_normalize is not supported by pooling type %d, ignoring it\n", meta->pooling_type);
         }
@@ -6060,7 +6099,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
     return res;
 }
 
-std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const llama_vocab * vocab, mtmd_context * mctx, const server_http_req & req, task_response_type res_type) {
+std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const llama_vocab * vocab, mtmd_context * mctx, const mtmd_helper_init_opt & init_opt, const server_http_req & req, task_response_type res_type) {
     auto res = create_response();
     std::vector<raw_buffer> files;
     json body = json::parse(req.body);
@@ -6098,7 +6137,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const l
         if (!prompt.is_string()) {
             throw std::runtime_error("for mtmd, input prompt must be a string.");
         }
-        n_tokens = process_mtmd_prompt(mctx, prompt.get<std::string>(), files, true).size();
+        n_tokens = process_mtmd_prompt(mctx, prompt.get<std::string>(), files, init_opt, true).size();
     } else {
         n_tokens = tokenize_mixed(vocab, prompt, true, true).size();
     }

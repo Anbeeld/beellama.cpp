@@ -12,8 +12,6 @@
 
 #include <sstream>
 
-using json = nlohmann::ordered_json;
-
 //
 // task_params
 //
@@ -318,7 +316,7 @@ json completion_token_output::probs_vector_to_json(const std::vector<completion_
 }
 
 float completion_token_output::logarithm(float x) {
-    // nlohmann::json converts -inf to null, so we need to prevent that
+    // the JSON library converts -inf to null, so we need to prevent that
     return x == 0.0f ? std::numeric_limits<float>::lowest() : std::log(x);
 }
 
@@ -445,7 +443,7 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
         res["__verbose"] = to_json_non_oaicompat();
     }
     if (stats.is_set()) {
-        res.push_back({"timings", stats.to_json()});
+        res["timings"] = stats.to_json();
     }
 
     return res;
@@ -493,7 +491,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
         res["__verbose"] = to_json_non_oaicompat();
     }
     if (stats.is_set()) {
-        res.push_back({"timings", stats.to_json()});
+        res["timings"] = stats.to_json();
     }
 
     return res;
@@ -554,7 +552,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
     }
 
     if (stats.is_set()) {
-        deltas.back().push_back({"timings", stats.to_json()});
+        deltas.back()["timings"] = stats.to_json();
     }
 
     // extra fields for debugging purposes
@@ -747,7 +745,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
     });
 
     if (stats.is_set()) {
-        server_sent_events.back().at("data").push_back({"timings", stats.to_json()});
+        server_sent_events.back().at("data")["timings"] = stats.to_json();
     }
 
     return server_sent_events;
@@ -1099,10 +1097,10 @@ json server_task_result_cmpl_partial::to_json_non_oaicompat() {
     };
     // populate the timings object when needed (usually for the last response or with timings_per_token enabled)
     if (stats.is_set()) {
-        res.push_back({"timings", stats.to_json()});
+        res["timings"] = stats.to_json();
     }
     if (is_progress) {
-        res.push_back({"prompt_progress", progress.to_json()});
+        res["prompt_progress"] = progress.to_json();
     }
     if (!prob_output.probs.empty()) {
         res["completion_probabilities"] = completion_token_output::probs_vector_to_json({prob_output}, post_sampling_probs);
@@ -1139,10 +1137,10 @@ json server_task_result_cmpl_partial::to_json_oaicompat() {
         res["__verbose"] = to_json_non_oaicompat();
     }
     if (stats.is_set()) {
-        res.push_back({"timings", stats.to_json()});
+        res["timings"] = stats.to_json();
     }
     if (is_progress) {
-        res.push_back({"prompt_progress", progress.to_json()});
+        res["prompt_progress"] = progress.to_json();
     }
 
     return res;
@@ -1193,10 +1191,10 @@ json server_task_result_cmpl_partial::to_json_oaicompat_chat() {
         }
 
         if (stats.is_set()) {
-            last_json.push_back({"timings", stats.to_json()});
+            last_json["timings"] = stats.to_json();
         }
         if (is_progress) {
-            last_json.push_back({"prompt_progress", progress.to_json()});
+            last_json["prompt_progress"] = progress.to_json();
         }
     }
 
@@ -1343,10 +1341,10 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
     if (!events.empty()) {
         json & data = events.back().at("data");
         if (stats.is_set()) {
-            data.push_back({"timings", stats.to_json()});
+            data["timings"] = stats.to_json();
         }
         if (is_progress) {
-            data.push_back({"prompt_progress", progress.to_json()});
+            data["prompt_progress"] = progress.to_json();
         }
     }
 

@@ -358,6 +358,14 @@ public:
     // read-only access to the KV cell metadata for a given stream
     const llama_kv_cells & get_cells(uint32_t stream) const { return v_cells[stream]; }
 
+    // true if llama_kv_cell_ext holds information that has to survive a state save/restore
+    bool has_cell_ext() const;
+
+    // for every token of the ubatch, the ids of the n tokens that precede it in its sequence
+    // entries with no matching cell are set to LLAMA_TOKEN_NULL
+    // note: used by n-gram input embeddings
+    void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
+
 private:
     bool seq_rm_unchecked(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
     void reset_allocation_head(llama_seq_id seq_id);
@@ -690,6 +698,9 @@ public:
     virtual void set_input_v_rot(ggml_tensor * dst) const;
     virtual void set_input_k_rot_backend(ggml_tensor * dst) const;
     virtual void set_input_v_rot_backend(ggml_tensor * dst) const;
+
+    // see llama_kv_cache::get_prev_tokens()
+    void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
 private:
     llama_memory_status status;
