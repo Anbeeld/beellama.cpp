@@ -153,13 +153,13 @@ buffer-device-address support. CPU placement is valid with KV offload disabled.
 
 | NVIDIA architecture | Toolkit and package | Native KVarN route | Qualification |
 |---|---|---|---|
-| Turing and newer, SM 7.5+ | CUDA 12.4 or 13.1 | Specialized MMA/split/vector routes with portable fallback | Current release tier; CUDA 13.1 is locally exercised on SM 8.6 |
+| Turing and newer, SM 7.5+ | CUDA 12.4 or 13.3 | Specialized MMA/split/vector routes with portable fallback | Current release tier; CUDA 13.3 requires preview qualification, while its CUDA 13.1 predecessor was locally exercised on SM 8.6 |
 | Volta, SM 7.0/7.2 | CUDA 12.4 | Portable direct body-plus-tail attention | Explicit build target; real-device validation required |
 | Pascal, SM 6.0/6.1/6.2 | CUDA 12.4 | Portable direct body-plus-tail attention | Priority compatibility target for issue #112; real-device validation required |
 | Maxwell, SM 5.0/5.2/5.3 | CUDA 12.4 | Portable direct body-plus-tail attention | Experimental until an SM 5.2 device passes runtime gates |
-| Kepler | Not in the CUDA 12.4/13.1 release lane | None | Unsupported |
+| Kepler | Not in the CUDA 12.4/13.3 release lane | None | Unsupported |
 
-Use the CUDA 12.4 release package for Maxwell, Pascal, or Volta. CUDA 13.1
+Use the CUDA 12.4 release package for Maxwell, Pascal, or Volta. CUDA 13.3
 does not contain device code for those architectures. Build coverage proves
 that a translation unit accepts a target; it does not prove runtime
 correctness, memory behavior, or performance on that GPU.

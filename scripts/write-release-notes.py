@@ -40,7 +40,7 @@ def main() -> None:
         asset(release_url, tag, "bin-ubuntu-x64.tar.gz", "Ubuntu x64 CPU"),
         asset(release_url, tag, "bin-ubuntu-arm64.tar.gz", "Ubuntu arm64 CPU"),
         asset(release_url, tag, "bin-ubuntu-cuda-12.4-x64.tar.gz", "Ubuntu x64 CUDA 12.4"),
-        asset(release_url, tag, "bin-ubuntu-cuda-13.1-x64.tar.gz", "Ubuntu x64 CUDA 13.1"),
+        asset(release_url, tag, "bin-ubuntu-cuda-13.3-x64.tar.gz", "Ubuntu x64 CUDA 13.3"),
         asset(release_url, tag, "bin-ubuntu-vulkan-x64.tar.gz", "Ubuntu x64 Vulkan"),
         asset(release_url, tag, "bin-ubuntu-rocm-7.2-x64.tar.gz", "Ubuntu x64 ROCm 7.2"),
         asset(release_url, tag, "bin-ubuntu-sycl-x64.tar.gz", "Ubuntu x64 SYCL"),
@@ -54,8 +54,8 @@ def main() -> None:
             + f" - [DLLs]({release_url}/beellama-{tag}-cudart-win-cuda-12.4-x64.zip)"
         ),
         (
-            asset(release_url, tag, "bin-win-cuda-13.1-x64.zip", "Windows x64 CUDA 13.1")
-            + f" - [DLLs]({release_url}/beellama-{tag}-cudart-win-cuda-13.1-x64.zip)"
+            asset(release_url, tag, "bin-win-cuda-13.3-x64.zip", "Windows x64 CUDA 13.3")
+            + f" - [DLLs]({release_url}/beellama-{tag}-cudart-win-cuda-13.3-x64.zip)"
         ),
         asset(release_url, tag, "bin-win-hip-radeon-x64.zip", "Windows x64 HIP"),
         "",
@@ -63,7 +63,7 @@ def main() -> None:
         docker_line(args.image_repo, tag, "CPU", "-cpu"),
         docker_line(args.image_repo, tag, "CUDA", "-cuda"),
         docker_line(args.image_repo, tag, "CUDA 12", "-cuda12"),
-        docker_line(args.image_repo, tag, "CUDA 13", "-cuda13"),
+        docker_line(args.image_repo, tag, "CUDA 13.3", "-cuda13"),
         docker_line(args.image_repo, tag, "ROCm", "-rocm"),
         docker_line(args.image_repo, tag, "Vulkan", "-vulkan"),
         docker_line(args.image_repo, tag, "SYCL", "-sycl"),

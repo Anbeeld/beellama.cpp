@@ -15,7 +15,7 @@ The CI workflow publishes `llama-server` images to
 
 - `server` / `server-cpu`: CPU backend. (`linux/amd64`, `linux/arm64`)
 - `server-cuda` / `server-cuda12`: CUDA 12.4 backend. (`linux/amd64`)
-- `server-cuda13`: CUDA 13.1 backend. (`linux/amd64`)
+- `server-cuda13`: CUDA 13.3 backend. (`linux/amd64`)
 - `server-rocm`: ROCm backend. (`linux/amd64`)
 - `server-vulkan`: Vulkan backend. (`linux/amd64`)
 - `server-sycl`: SYCL backend for Intel GPUs. (`linux/amd64`)

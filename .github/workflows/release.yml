@@ -24,7 +24,7 @@ on:
         type: boolean
 
 concurrency:
-  group: ${{ github.workflow }}-${{ inputs.source_ref }}
+  group: ${{ github.workflow }}-${{ inputs.source_ref }}-${{ inputs.publish_release && 'stable' || 'preview' }}
   cancel-in-progress: ${{ !inputs.publish_release }}
 
 permissions:
@@ -32,7 +32,7 @@ permissions:
   contents: read
 
 env:
-  CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON"
+  CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_IS_DEV=OFF -DLLAMA_BUILD_UI=ON -DLLAMA_USE_PREBUILT_UI=OFF -DGGML_RPC=ON"
 
 jobs:
   release-meta:
@@ -179,6 +179,20 @@ jobs:
           fi
           git cat-file -e "${source_sha}^{commit}"
 
+          cmake_lists="$(git show "${source_sha}:CMakeLists.txt")"
+          version_major="$(sed -nE 's/^set\(LLAMA_VERSION_MAJOR[[:space:]]+([0-9]+)\)[[:space:]]*$/\1/p' <<< "${cmake_lists}")"
+          version_minor="$(sed -nE 's/^set\(LLAMA_VERSION_MINOR[[:space:]]+([0-9]+)\)[[:space:]]*$/\1/p' <<< "${cmake_lists}")"
+          version_patch="$(sed -nE 's/^set\(LLAMA_VERSION_PATCH[[:space:]]+([0-9]+)\)[[:space:]]*$/\1/p' <<< "${cmake_lists}")"
+          if [[ -z "${version_major}" || -z "${version_minor}" || -z "${version_patch}" ]]; then
+            echo "Could not read the release version from CMakeLists.txt at ${source_sha}." >&2
+            exit 1
+          fi
+          source_version="${version_major}.${version_minor}.${version_patch}"
+          if [[ "${version_name#v}" != "${source_version}" ]]; then
+            echo "Requested version ${version_name} does not match source version v${source_version}." >&2
+            exit 1
+          fi
+
           if [[ "${preview}" == "true" ]]; then
             if [[ "${source_ref}" != v* || "${tag_name}" != "preview-${source_ref}" ]]; then
               echo "Invalid preview metadata: source_ref=${source_ref}, tag_name=${tag_name}." >&2
@@ -294,6 +308,7 @@ jobs:
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             ${{ env.CMAKE_ARGS }}
           cmake --build build --config Release -j "$(sysctl -n hw.logicalcpu)"
+          test -s build/tools/ui/dist/index.html
 
       - name: ccache stats
         if: always()
@@ -386,6 +401,7 @@ jobs:
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             ${{ env.CMAKE_ARGS }}
           cmake --build build --config Release -j "$(nproc)"
+          test -s build/tools/ui/dist/index.html
 
       - name: ccache stats
         if: always()
@@ -467,6 +483,7 @@ jobs:
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             ${{ env.CMAKE_ARGS }}
           cmake --build build --config Release -j "$(nproc)"
+          test -s build/tools/ui/dist/index.html
 
       - name: ccache stats
         if: always()
@@ -574,6 +591,7 @@ jobs:
             -DCMAKE_HIP_COMPILER_LAUNCHER=ccache \
             ${{ env.CMAKE_ARGS }}
           cmake --build build --config Release -j "$(nproc)"
+          test -s build/tools/ui/dist/index.html
 
       - name: ccache stats
         if: always()
@@ -686,6 +704,7 @@ jobs:
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             ${{ env.CMAKE_ARGS }}
           cmake --build build --config Release -j "$(nproc)"
+          test -s build/tools/ui/dist/index.html
 
       - name: ccache stats
         if: always()
@@ -738,8 +757,10 @@ jobs:
         include:
           - cuda: "12.4"
             cuda_container: "12.4.1-devel-ubuntu22.04"
-          - cuda: "13.1"
-            cuda_container: "13.1.1-devel-ubuntu24.04"
+            cuda_cmake_args: "-DGGML_CUDA_CUB_3DOT2=ON"
+          - cuda: "13.3"
+            cuda_container: "13.3.0-devel-ubuntu24.04"
+            cuda_cmake_args: "-DGGML_CUDA_CUB_3DOT2=OFF"
     steps:
       - name: Dependencies
         run: |
@@ -779,9 +800,11 @@ jobs:
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
+            ${{ matrix.cuda_cmake_args }} \
             ${{ env.CMAKE_ARGS }} \
             -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined
           cmake --build build --config Release -j "$(nproc)"
+          test -s build/tools/ui/dist/index.html
 
       - name: ccache stats
         if: always()
@@ -865,6 +888,10 @@ jobs:
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache ^
             %CMAKE_ARGS%
           cmake --build build --config Release -j %NUMBER_OF_PROCESSORS%
+          if not exist build\tools\ui\dist\index.html (
+            echo Source-built UI output is missing
+            exit /b 1
+          )
 
       - name: Verify OpenMP is enabled
         shell: cmd
@@ -896,11 +923,30 @@ jobs:
           $ErrorActionPreference = "Stop"
           $bin = ".\build\bin\Release"
           Copy-Item ".\LICENSE" $bin
-          $omp = & ".\scripts\find-msvc-openmp-runtime.ps1" -Architecture x64
-          Copy-Item -LiteralPath $omp -Destination $bin -Force
-          python scripts\verify-windows-package.py $bin
-          & "$bin\llama-server.exe" --version
+          python scripts\verify-windows-package.py `
+            --require-name "libomp.dll" `
+            --require-name "LICENSE-LLVM-OpenMP" `
+            --forbid-name "libomp140.x86_64.dll" `
+            $bin
+
+          $serverVersion = (& "$bin\llama-server.exe" --version 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            throw "llama-server --version failed with exit code $LASTEXITCODE"
+          }
+          Write-Host $serverVersion
+          $expectedVersion = "${{ needs.release-meta.outputs.version_name }}".TrimStart("v")
+          $sourceCommit = "${{ needs.release-meta.outputs.source_sha }}"
+          if ($serverVersion -notmatch "version:\s+$([regex]::Escape($expectedVersion))\b") {
+            throw "llama-server version does not report $expectedVersion"
+          }
+          $commitMatch = [regex]::Match($serverVersion, "commit\s+([0-9a-f]+)\b")
+          if (-not $commitMatch.Success -or -not $sourceCommit.StartsWith($commitMatch.Groups[1].Value)) {
+            throw "llama-server version does not report source commit $sourceCommit"
+          }
           & "$bin\llama-cli.exe" --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "llama-cli --version failed with exit code $LASTEXITCODE"
+          }
           7z a -snl "beellama-bin-win-cpu-x64.zip" "$bin\*"
 
       - name: Upload artifacts
@@ -1135,7 +1181,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        cuda: ["12.4", "13.1"]
+        include:
+          - cuda: "12.4"
+            cuda_cmake_args: "-DGGML_CUDA_CUB_3DOT2=ON"
+          - cuda: "13.3"
+            cuda_cmake_args: "-DGGML_CUDA_CUB_3DOT2=OFF"
     steps:
       - name: Clone
         uses: actions/checkout@v6
@@ -1187,6 +1237,7 @@ jobs:
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          nvcc --version || exit /b 1
           cmake -S . -B build -G "Ninja Multi-Config" ^
             -DGGML_BACKEND_DL=ON ^
             -DGGML_NATIVE=OFF ^
@@ -1198,7 +1249,7 @@ jobs:
             -DCMAKE_C_COMPILER_LAUNCHER=ccache ^
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache ^
             -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache ^
-            -DGGML_CUDA_CUB_3DOT2=ON
+            ${{ matrix.cuda_cmake_args }}
           cmake --build build --config Release -j %NUMBER_OF_PROCESSORS% --target ggml-cuda
 
       - name: ccache stats
@@ -1218,7 +1269,14 @@ jobs:
           evict-old-files: 1d
 
       - name: Pack CUDA backend
-        run: 7z a -snl "beellama-bin-win-cuda-${{ matrix.cuda }}-x64.zip" .\build\bin\Release\ggml-cuda.dll
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $backend = ".\build\bin\Release\ggml-cuda.dll"
+          if (-not (Test-Path $backend)) {
+            throw "CUDA backend was not produced at $backend"
+          }
+          7z a -snl "beellama-bin-win-cuda-${{ matrix.cuda }}-x64.zip" $backend
 
       - name: Upload CUDA backend
         uses: actions/upload-artifact@v6
@@ -1238,6 +1296,11 @@ jobs:
               Get-ChildItem -Path (Join-Path $root "*") -File -ErrorAction SilentlyContinue |
                 Where-Object { $_.Name -like "cudart64_*.dll" -or $_.Name -like "cublas64_*.dll" -or $_.Name -like "cublasLt64_*.dll" } |
                 Copy-Item -Destination $dst -Force
+            }
+          }
+          foreach ($pattern in @("cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll")) {
+            if (-not (Get-ChildItem -Path $dst -Filter $pattern -File -ErrorAction SilentlyContinue)) {
+              throw "CUDA runtime package is missing $pattern"
             }
           }
           7z a "cudart-beellama-bin-win-cuda-${{ matrix.cuda }}-x64.zip" "$dst\*"
@@ -1305,6 +1368,7 @@ jobs:
 
       - name: Build
         run: |
+          $ErrorActionPreference = "Stop"
           $env:HIP_PATH=$(Resolve-Path 'C:\Program Files\AMD\ROCm\*\bin\clang.exe' | Split-Path | Split-Path)
           $env:CMAKE_PREFIX_PATH="${env:HIP_PATH}"
           cmake -G "Unix Makefiles" -B build -S . `
@@ -1330,6 +1394,9 @@ jobs:
           Copy-Item "${env:HIP_PATH}\bin\libhipblas.dll" "build\bin\"
           Copy-Item "${env:HIP_PATH}\bin\libhipblaslt.dll" "build\bin\"
           Copy-Item "${env:HIP_PATH}\bin\rocblas.dll" "build\bin\"
+          Copy-Item "${env:HIP_PATH}\bin\amdhip64_7.dll" "build\bin\"
+          Copy-Item "${env:HIP_PATH}\bin\rocm_kpack.dll" "build\bin\"
+          Copy-Item "${env:HIP_PATH}\bin\amd_comgr.dll" "build\bin\"
           Copy-Item "${env:HIP_PATH}\bin\rocblas\library\*" "build\bin\rocblas\library\"
           Copy-Item "${env:HIP_PATH}\bin\hipblaslt\library\*" "build\bin\hipblaslt\library\"
 
@@ -1351,7 +1418,12 @@ jobs:
 
       - name: Pack artifacts
         run: |
-          python scripts\verify-windows-package.py .\build\bin
+          python scripts\verify-windows-package.py `
+            --require-name "ggml-hip.dll" `
+            --require-name "amdhip64_7.dll" `
+            --require-name "rocm_kpack.dll" `
+            --require-name "amd_comgr.dll" `
+            .\build\bin
           7z a -snl "beellama-bin-win-hip-radeon-x64.zip" .\build\bin\*
 
       - name: Upload artifacts
@@ -1442,15 +1514,25 @@ jobs:
             mv "${tar_file}" release/
           done
 
-          python3 scripts/verify-windows-package.py release/beellama-${TAG_NAME}-bin-win-*.zip
-          for cuda_version in 12.4 13.1; do
+          python3 scripts/verify-windows-package.py \
+            --require-name "llama-server.exe" \
+            --require-name "llama-cli.exe" \
+            --require-name "libomp.dll" \
+            --forbid-name "libomp140.x86_64.dll" \
+            release/beellama-${TAG_NAME}-bin-win-*.zip
+          for cuda_version in 12.4 13.3; do
             package_zip="release/beellama-${TAG_NAME}-bin-win-cuda-${cuda_version}-x64.zip"
             runtime_zip="release/beellama-${TAG_NAME}-cudart-win-cuda-${cuda_version}-x64.zip"
             if [[ -f "${package_zip}" && -f "${runtime_zip}" ]]; then
               temp_dir="$(mktemp -d)"
               unzip -q "${package_zip}" -d "${temp_dir}"
               unzip -q "${runtime_zip}" -d "${temp_dir}"
-              python3 scripts/verify-windows-package.py "${temp_dir}"
+              python3 scripts/verify-windows-package.py \
+                --require-name "ggml-cuda.dll" \
+                --require-glob "cudart64_*.dll" \
+                --require-glob "cublas64_*.dll" \
+                --require-glob "cublasLt64_*.dll" \
+                "${temp_dir}"
               rm -rf "${temp_dir}"
             fi
           done
@@ -1550,13 +1632,13 @@ jobs:
             runtime_packages: ca-certificates curl ffmpeg libgomp1
             runs_on: ubuntu-24.04
           - name: cuda13
-            display: CUDA 13.1
+            display: CUDA 13.3
             group: cuda13
             arch: amd64
             platform: linux/amd64
-            artifact: beellama-bin-ubuntu-cuda-13.1-x64.tar.gz
+            artifact: beellama-bin-ubuntu-cuda-13.3-x64.tar.gz
             dockerfile: .devops/runtime-server.Dockerfile
-            base_image: nvidia/cuda:13.1.1-runtime-ubuntu24.04
+            base_image: nvidia/cuda:13.3.0-runtime-ubuntu24.04
             runtime_packages: ca-certificates curl ffmpeg libgomp1
             runs_on: ubuntu-24.04
           - name: rocm
@@ -1704,7 +1786,7 @@ jobs:
             platforms: linux/amd64
             tag_suffixes: -cuda -cuda12
           - group: cuda13
-            display: CUDA 13.1
+            display: CUDA 13.3
             platforms: linux/amd64
             tag_suffixes: -cuda13
           - group: rocm
@@ -1865,21 +1947,19 @@ jobs:
 
           if gh release view "${TAG_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
             gh release upload "${TAG_NAME}" "${release_files[@]}" --clobber --repo "${GITHUB_REPOSITORY}"
-            if [[ "${PREVIEW}" == "true" ]]; then
-              mapfile -t existing_assets < <(gh release view "${TAG_NAME}" --repo "${GITHUB_REPOSITORY}" --json assets --jq '.assets[].name')
-              for existing_asset in "${existing_assets[@]}"; do
-                keep_asset="false"
-                for release_file in "${release_files[@]}"; do
-                  if [[ "$(basename "${release_file}")" == "${existing_asset}" ]]; then
-                    keep_asset="true"
-                    break
-                  fi
-                done
-                if [[ "${keep_asset}" != "true" ]]; then
-                  gh release delete-asset "${TAG_NAME}" "${existing_asset}" --yes --repo "${GITHUB_REPOSITORY}"
+            mapfile -t existing_assets < <(gh release view "${TAG_NAME}" --repo "${GITHUB_REPOSITORY}" --json assets --jq '.assets[].name')
+            for existing_asset in "${existing_assets[@]}"; do
+              keep_asset="false"
+              for release_file in "${release_files[@]}"; do
+                if [[ "$(basename "${release_file}")" == "${existing_asset}" ]]; then
+                  keep_asset="true"
+                  break
                 fi
               done
-            fi
+              if [[ "${keep_asset}" != "true" ]]; then
+                gh release delete-asset "${TAG_NAME}" "${existing_asset}" --yes --repo "${GITHUB_REPOSITORY}"
+              fi
+            done
             if [[ "${PREVIEW}" == "true" ]]; then
               gh release edit "${TAG_NAME}" --repo "${GITHUB_REPOSITORY}" --title "${RELEASE_TITLE}" --notes-file "${notes_file}" --target "${SOURCE_SHA}" --prerelease --latest=false --verify-tag
             else

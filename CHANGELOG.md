@@ -6,6 +6,7 @@
 - Optimized native KVarN SWA attention on CPU and CUDA. Fully covered non-SWA windows now use native exact storage, and CUDA routing retains split geometry and device capabilities without model- or GPU-specific policy.
 - Hardened KV and speculative state handling with transactional target/draft restore, selective checkpoint validation, KVarN stage ownership and generation tracking, restored bulk-workspace routing, complete DSA+iSWA lifecycle forwarding, head-aligned multi-GPU placement, and correct partial sharded-buffer memset.
 - Fixed MTP multi-ubatch synchronization and extended loop detection to pathological visible output while retaining force-close behavior for hidden reasoning loops.
+- Updated release packaging to CUDA 13.3, source-built Web UI assets, non-development version metadata, fetched LLVM OpenMP on Windows, and matching HIP runtime DLLs. Release metadata now validates the source version, Windows package checks fail closed on required runtime files, preview and stable concurrency are isolated, and reruns reconcile stale assets.
 
 ## v0.4.3
 

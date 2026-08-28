@@ -75,6 +75,77 @@ def main() -> None:
         "cuda-architecture-compile" not in release,
         "release workflow must not run the exhaustive CUDA architecture matrix",
     )
+    require(
+        "${{ inputs.publish_release && 'stable' || 'preview' }}" in release,
+        "preview and stable releases must use separate concurrency groups",
+    )
+    require(
+        "-DLLAMA_BUILD_IS_DEV=OFF" in release,
+        "release binaries must report the release version without a -dev suffix",
+    )
+    require(
+        "-DLLAMA_BUILD_UI=ON" in release and "-DLLAMA_USE_PREBUILT_UI=OFF" in release,
+        "release jobs must build the UI from the checked-out source",
+    )
+    require(
+        release.count("build/tools/ui/dist/index.html") == 6
+        and release.count(r"build\tools\ui\dist\index.html") == 1,
+        "all seven application builds must require source-built UI output",
+    )
+    require(
+        'source_version="${version_major}.${version_minor}.${version_patch}"' in release
+        and 'if [[ "${version_name#v}" != "${source_version}" ]]' in release,
+        "release metadata must bind the v* version to CMakeLists.txt at source_sha",
+    )
+    require(
+        release.count('cuda: "13.3"') == 2 and "13.1" not in release,
+        "release CUDA 13 lanes must use CUDA 13.3",
+    )
+    require(
+        release.count('cuda_cmake_args: "-DGGML_CUDA_CUB_3DOT2=ON"') == 2
+        and release.count("${{ matrix.cuda_cmake_args }}") == 2,
+        "only the CUDA 12.4 Linux and Windows matrix entries must request fetched CCCL",
+    )
+    for runtime in ("amdhip64_7.dll", "rocm_kpack.dll", "amd_comgr.dll"):
+        require(runtime in release, f"Windows HIP package must bundle {runtime}")
+    require(
+        "find-msvc-openmp-runtime.ps1" not in release
+        and '--require-name "libomp.dll"' in release
+        and '--forbid-name "libomp140.x86_64.dll"' in release,
+        "Windows packages must use only the fetched LLVM OpenMP runtime",
+    )
+    require(
+        'foreach ($pattern in @("cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll"))'
+        in release,
+        "CUDA runtime packaging must fail when a required runtime family is absent",
+    )
+    require(
+        'if [[ "${PREVIEW}" == "true" ]]; then\n              mapfile -t existing_assets' not in release,
+        "stable release updates must reconcile stale assets as well as previews",
+    )
+
+    setup_cuda = (ACTIONS / "windows-setup-cuda/action.yml").read_text(encoding="utf-8")
+    require("cuda_arch:" not in setup_cuda, "x64-only CUDA setup must not require cuda_arch")
+    require("13.4" not in setup_cuda, "unused ARM64 CUDA 13.4 setup must not remain")
+
+    removed_imports = (
+        ACTIONS / "ccache-buckets/action.yml",
+        ROOT / "scripts/ccache-clear.sh",
+        ROOT / "scripts/release.sh",
+        ROOT / "scripts/make-release-checks.sh",
+        ROOT / "scripts/make-release-desc.sh",
+        ROOT / "scripts/make-release-summary.txt",
+        ROOT / "cmake/arm64-windows-msvc-cuda.cmake",
+        ROOT / "scripts/find-msvc-openmp-runtime.ps1",
+    )
+    require(
+        not any(path.exists() for path in removed_imports),
+        "unused or incompatible upstream release helpers must not remain",
+    )
+    require(
+        (ACTIONS / "linux-setup-vulkan/action.yml").exists(),
+        "the dormant Vulkan setup action should remain aligned with the prior Bee release tree",
+    )
 
     save_count = release.count("- name: Save ccache")
     require(save_count == 11, f"expected 11 rolling-cache save steps, found {save_count}")

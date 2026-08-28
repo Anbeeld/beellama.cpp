@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import os
 import shutil
 import struct
@@ -143,14 +144,62 @@ def iter_package_files(root: Path) -> list[Path]:
     ]
 
 
-def verify_directory(root: Path, verbose: bool) -> int:
+def expected_file_failures(
+    root: Path,
+    required_names: list[str],
+    required_globs: list[str],
+    forbidden_names: list[str],
+) -> list[str]:
+    names = [path.name.casefold() for path in root.rglob("*") if path.is_file()]
+    failures: list[str] = []
+
+    for required in required_names:
+        if required.casefold() not in names:
+            failures.append(f"missing required file {required}")
+    for pattern in required_globs:
+        if not any(fnmatch.fnmatchcase(name, pattern.casefold()) for name in names):
+            failures.append(f"missing required file matching {pattern}")
+    for forbidden in forbidden_names:
+        if forbidden.casefold() in names:
+            failures.append(f"forbidden file present: {forbidden}")
+
+    return failures
+
+
+def duplicate_archive_entries(path: Path) -> list[str]:
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    with zipfile.ZipFile(path) as archive:
+        for info in archive.infolist():
+            if info.is_dir():
+                continue
+            normalized = info.filename.replace("\\", "/").lstrip("/").casefold()
+            if normalized in seen:
+                duplicates.append(info.filename)
+            else:
+                seen.add(normalized)
+    return duplicates
+
+
+def verify_directory(
+    root: Path,
+    verbose: bool,
+    required_names: list[str],
+    required_globs: list[str],
+    forbidden_names: list[str],
+) -> int:
     binaries = iter_package_files(root)
     by_name: dict[str, list[Path]] = {}
     for binary in binaries:
         by_name.setdefault(binary.name.lower(), []).append(binary)
 
     export_cache: dict[Path, set[str]] = {}
-    failures: list[str] = []
+    failures = expected_file_failures(
+        root,
+        required_names=required_names,
+        required_globs=required_globs,
+        forbidden_names=forbidden_names,
+    )
     local_edges = 0
     external_imports: set[str] = set()
 
@@ -211,19 +260,44 @@ def verify_directory(root: Path, verbose: bool) -> int:
     return 0
 
 
-def verify_path(path: Path, verbose: bool) -> int:
+def verify_path(
+    path: Path,
+    verbose: bool,
+    required_names: list[str],
+    required_globs: list[str],
+    forbidden_names: list[str],
+) -> int:
     if path.is_dir():
-        return verify_directory(path, verbose)
+        return verify_directory(
+            path,
+            verbose,
+            required_names=required_names,
+            required_globs=required_globs,
+            forbidden_names=forbidden_names,
+        )
 
     if path.suffix.lower() != ".zip":
         print(f"{path}: expected a directory or .zip file", file=sys.stderr)
+        return 1
+
+    duplicates = duplicate_archive_entries(path)
+    if duplicates:
+        print(f"Windows package verification failed for {path}:", file=sys.stderr)
+        for duplicate in duplicates:
+            print(f"  duplicate ZIP entry: {duplicate}", file=sys.stderr)
         return 1
 
     temp_dir = Path(tempfile.mkdtemp(prefix="verify-windows-package-"))
     try:
         with zipfile.ZipFile(path) as archive:
             archive.extractall(temp_dir)
-        return verify_directory(temp_dir, verbose)
+        return verify_directory(
+            temp_dir,
+            verbose,
+            required_names=required_names,
+            required_globs=required_globs,
+            forbidden_names=forbidden_names,
+        )
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -232,6 +306,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("paths", nargs="+", type=Path)
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--require-name", action="append", default=[])
+    parser.add_argument("--require-glob", action="append", default=[])
+    parser.add_argument("--forbid-name", action="append", default=[])
     args = parser.parse_args()
 
     status = 0
@@ -240,7 +317,13 @@ def main() -> int:
             print(f"{path}: path does not exist", file=sys.stderr)
             status = 1
             continue
-        status = verify_path(path, args.verbose) or status
+        status = verify_path(
+            path,
+            args.verbose,
+            required_names=args.require_name,
+            required_globs=args.require_glob,
+            forbidden_names=args.forbid_name,
+        ) or status
     return status
 
 

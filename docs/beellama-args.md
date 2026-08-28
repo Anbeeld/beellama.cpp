@@ -16,7 +16,7 @@ buffer-device-address support for its direct route. An explicitly supported
 materialization fallback retains compressed persistent storage when a native
 route is unavailable. Pre-Turing NVIDIA GPUs use CUDA's portable rotated-domain
 body-plus-tail route and require a CUDA 12.4 build or release package. CUDA
-13.1 packages target Turing and newer architectures.
+13.3 packages target Turing and newer architectures.
 
 | Argument | Env var | Default | Behavior |
 |---|---|---|---|
@@ -252,9 +252,9 @@ Use the same corpus, context, logical batch, and physical ubatch for both KLD le
 | `-DGGML_CUDA_FA_ALL_QUANTS=ON` | — | Off | Expands the CUDA vector matrix from 50 to all 169 standard cache pairs and, when `GGML_CUDA_KVARN=ON`, KVarN fast-decode instances from 15 balanced pairs to all 36 ordered bit pairs. Valid KVarN pairs outside the fast matrix use descriptor-native MMA. |
 | `-DGGML_CUDA_KVARN=ON/OFF` | — | On | Compiles or omits the shared CUDA/HIP KVarN kernels and CUDA native-attention template instances. When enabled, `GGML_CUDA_FA_ALL_QUANTS` selects 15 default or all 36 CUDA fast-decode pairs. CUDA devices without the specialized Turing MMA contract use the portable direct-record route when their warp, thread-block, shared-memory, head-dimension, and tail-type capabilities pass. |
 
-Release packages are built with CUDA 12.4 and 13.1. CUDA 12.4 can emit the
+Release packages are built with CUDA 12.4 and 13.3. CUDA 12.4 can emit the
 Maxwell, Pascal, and Volta PTX targets used by the portable KVarN route; CUDA
-13.1 covers Turing and newer architectures. The release workflow no longer has
+13.3 covers Turing and newer architectures. The release workflow no longer has
 an exhaustive per-architecture CUDA compile gate. For a local or CI build,
 select the intended target explicitly with `CMAKE_CUDA_ARCHITECTURES` when the
 build host cannot detect it. Pre-Turing support remains runtime-unqualified
