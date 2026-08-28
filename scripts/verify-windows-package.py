@@ -166,6 +166,18 @@ def expected_file_failures(
     return failures
 
 
+def required_local_import_failures(
+    external_imports: set[str],
+    required_local_imports: list[str],
+) -> list[str]:
+    external_names = {name.casefold() for name in external_imports}
+    return [
+        f"required local import is missing: {required}"
+        for required in required_local_imports
+        if required.casefold() in external_names
+    ]
+
+
 def duplicate_archive_entries(path: Path) -> list[str]:
     seen: set[str] = set()
     duplicates: list[str] = []
@@ -187,6 +199,7 @@ def verify_directory(
     required_names: list[str],
     required_globs: list[str],
     forbidden_names: list[str],
+    required_local_imports: list[str],
 ) -> int:
     binaries = iter_package_files(root)
     by_name: dict[str, list[Path]] = {}
@@ -242,6 +255,13 @@ def verify_directory(
                     f"missing import {symbol}"
                 )
 
+    failures.extend(
+        required_local_import_failures(
+            external_imports=external_imports,
+            required_local_imports=required_local_imports,
+        )
+    )
+
     if verbose and external_imports:
         print("External imports not checked:")
         for dll_name in sorted(external_imports):
@@ -266,6 +286,7 @@ def verify_path(
     required_names: list[str],
     required_globs: list[str],
     forbidden_names: list[str],
+    required_local_imports: list[str],
 ) -> int:
     if path.is_dir():
         return verify_directory(
@@ -274,6 +295,7 @@ def verify_path(
             required_names=required_names,
             required_globs=required_globs,
             forbidden_names=forbidden_names,
+            required_local_imports=required_local_imports,
         )
 
     if path.suffix.lower() != ".zip":
@@ -297,6 +319,7 @@ def verify_path(
             required_names=required_names,
             required_globs=required_globs,
             forbidden_names=forbidden_names,
+            required_local_imports=required_local_imports,
         )
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -309,6 +332,7 @@ def main() -> int:
     parser.add_argument("--require-name", action="append", default=[])
     parser.add_argument("--require-glob", action="append", default=[])
     parser.add_argument("--forbid-name", action="append", default=[])
+    parser.add_argument("--require-local-import", action="append", default=[])
     args = parser.parse_args()
 
     status = 0
@@ -323,6 +347,7 @@ def main() -> int:
             required_names=args.require_name,
             required_globs=args.require_glob,
             forbidden_names=args.forbid_name,
+            required_local_imports=args.require_local_import,
         ) or status
     return status
 

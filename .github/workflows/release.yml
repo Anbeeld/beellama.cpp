@@ -1395,8 +1395,13 @@ jobs:
           Copy-Item "${env:HIP_PATH}\bin\libhipblaslt.dll" "build\bin\"
           Copy-Item "${env:HIP_PATH}\bin\rocblas.dll" "build\bin\"
           Copy-Item "${env:HIP_PATH}\bin\amdhip64_7.dll" "build\bin\"
-          Copy-Item "${env:HIP_PATH}\bin\rocm_kpack.dll" "build\bin\"
-          Copy-Item "${env:HIP_PATH}\bin\amd_comgr.dll" "build\bin\"
+          Copy-Item "${env:HIP_PATH}\bin\amd_comgr_3.dll" "build\bin\"
+          $kpack = Join-Path $env:HIP_PATH "bin\rocm_kpack.dll"
+          if (Test-Path $kpack) {
+            Copy-Item $kpack "build\bin\"
+          } else {
+            Write-Host "ROCm SDK does not supply rocm_kpack.dll; verifying that packaged binaries do not import it"
+          }
           Copy-Item "${env:HIP_PATH}\bin\rocblas\library\*" "build\bin\rocblas\library\"
           Copy-Item "${env:HIP_PATH}\bin\hipblaslt\library\*" "build\bin\hipblaslt\library\"
 
@@ -1421,8 +1426,8 @@ jobs:
           python scripts\verify-windows-package.py `
             --require-name "ggml-hip.dll" `
             --require-name "amdhip64_7.dll" `
-            --require-name "rocm_kpack.dll" `
-            --require-name "amd_comgr.dll" `
+            --require-name "amd_comgr_3.dll" `
+            --require-local-import "rocm_kpack.dll" `
             .\build\bin
           7z a -snl "beellama-bin-win-hip-radeon-x64.zip" .\build\bin\*
 

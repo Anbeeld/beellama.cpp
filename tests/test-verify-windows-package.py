@@ -51,6 +51,22 @@ def main() -> None:
             f"unexpected expected-file failures: {failures}",
         )
 
+        failures = VERIFY.required_local_import_failures(
+            external_imports={"kernel32.dll", "rocm_kpack.dll"},
+            required_local_imports=["rocm_kpack.dll", "amd_comgr_3.dll"],
+        )
+        require(
+            failures == ["required local import is missing: rocm_kpack.dll"],
+            f"unexpected required-local-import failures: {failures}",
+        )
+        require(
+            not VERIFY.required_local_import_failures(
+                external_imports={"kernel32.dll"},
+                required_local_imports=["rocm_kpack.dll"],
+            ),
+            "an SDK that does not import KPack must not require it",
+        )
+
         archive_path = root / "duplicates.zip"
         with zipfile.ZipFile(archive_path, "w") as archive:
             archive.writestr("bin/ggml-cuda.dll", b"first")
