@@ -16,6 +16,12 @@ if (Python3_Interpreter_FOUND)
     set_property(TEST test-release-cache-parent PROPERTY LABELS main)
 
     add_test(
+        NAME test-verify-windows-package
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-verify-windows-package.py)
+    set_property(TEST test-verify-windows-package PROPERTY LABELS main)
+
+    add_test(
         NAME test-backend-ops-seed-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-backend-ops-seed-static.py)

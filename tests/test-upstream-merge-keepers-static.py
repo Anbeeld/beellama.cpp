@@ -215,7 +215,8 @@ def main() -> None:
     release = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
     require(release, "name: Build / Release", "the Bee release workflow was replaced by upstream's generic workflow")
     require(release, "beellama-${{", "Bee release assets must retain fork-specific names")
-    require(release, 'cuda: ["12.4", "13.1"]', "Bee's Windows release matrix must retain CUDA 13.1")
+    windows_cuda = release.split("  windows-cuda:", 1)[1].split("  windows-hip:", 1)[0]
+    require(windows_cuda, 'cuda: "13.3"', "Bee's Windows release matrix must retain the CUDA 13.3 lane")
     if "TurboQuant" in release or "TCQ cache" in release:
         raise AssertionError("release metadata still advertises removed TurboQuant/TCQ support")
 
