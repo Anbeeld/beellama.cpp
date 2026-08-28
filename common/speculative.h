@@ -29,6 +29,10 @@ int32_t common_speculative_n_max(const common_params_speculative * spec);
 // return the max number of draft tokens from the initialized implementations
 int32_t common_speculative_n_max(const common_speculative * spec);
 
+// Bee's variable-depth adaptive draft-max is limited to the original DFlash path.
+bool common_speculative_dflash_adaptive_dm_supported(int32_t selector_top_k);
+bool common_speculative_adaptive_dm_supported(const common_speculative * spec);
+
 // validate and resolve the unconditional synthetic acceptance rates
 std::vector<double> common_speculative_synth_rates_resolve(const common_params_speculative * spec, int32_t n_max);
 

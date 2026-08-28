@@ -586,6 +586,10 @@ struct server_slot {
                 COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != task->params.speculative.types.end();
     }
 
+    bool uses_adaptive_dflash() const {
+        return uses_dflash() && common_speculative_adaptive_dm_supported(spec);
+    }
+
     void add_token(const completion_token_output & token) {
         if (!is_processing()) {
             SLT_WRN(*this, "%s", "slot is not processing\n");
@@ -611,7 +615,7 @@ struct server_slot {
             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
         }
 
-        if (uses_dflash() && adaptive_dm.dm_adaptive && adaptive_dm.adaptive_n_max >= 0) {
+        if (uses_adaptive_dflash() && adaptive_dm.dm_adaptive && adaptive_dm.adaptive_n_max >= 0) {
             n_draft_max = std::min(n_draft_max, adaptive_dm.adaptive_n_max);
         }
 
@@ -1970,14 +1974,18 @@ private:
                 task.params.speculative.types.end(),
                 COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != task.params.speculative.types.end();
         if (slot.can_speculate() && task_uses_dflash) {
-            slot.adaptive_dm.configure(task.params.speculative);
-            const int base_n_max = common_speculative_n_max(&task.params.speculative);
-            slot.adaptive_dm.reset_profit_if_config_changed(
-                    task.params.speculative, base_n_max, slot.prompt.n_tokens(), &task.params.sampling);
-            slot.adaptive_dm.reset_request_state();
-            if (slot.adaptive_dm.dm_adaptive) {
-                slot.adaptive_dm.apply_profit_recommendation(
-                        slot.adaptive_dm.decide_profit_n_max(base_n_max));
+            if (common_speculative_adaptive_dm_supported(slot.spec)) {
+                slot.adaptive_dm.configure(task.params.speculative);
+                const int base_n_max = common_speculative_n_max(&task.params.speculative);
+                slot.adaptive_dm.reset_profit_if_config_changed(
+                        task.params.speculative, base_n_max, slot.prompt.n_tokens(), &task.params.sampling);
+                slot.adaptive_dm.reset_request_state();
+                if (slot.adaptive_dm.dm_adaptive) {
+                    slot.adaptive_dm.apply_profit_recommendation(
+                            slot.adaptive_dm.decide_profit_n_max(base_n_max));
+                } else {
+                    slot.adaptive_dm.adaptive_n_max = -1;
+                }
             } else {
                 slot.adaptive_dm.adaptive_n_max = -1;
             }
@@ -2086,7 +2094,7 @@ private:
     }
 
     void apply_adaptive_profit_decision(server_slot & slot) {
-        if (!slot.uses_dflash() || !slot.adaptive_dm.dm_adaptive) {
+        if (!slot.uses_adaptive_dflash() || !slot.adaptive_dm.dm_adaptive) {
             return;
         }
 
@@ -3363,7 +3371,7 @@ private:
 
             generating.push_back(&slot);
 
-            if (slot.uses_dflash() && slot.adaptive_dm.dm_adaptive) {
+            if (slot.uses_adaptive_dflash() && slot.adaptive_dm.dm_adaptive) {
                 slot.adaptive_cycle_start_us = ggml_time_us();
                 slot.adaptive_draft_ms = 0.0f;
                 slot.adaptive_requested_n_max = 0;
@@ -3378,7 +3386,7 @@ private:
                 const int n_draft_max = slot.get_n_draft_max();
 
                 if (n_draft_max > 0) {
-                    if (slot.uses_dflash() && slot.adaptive_dm.dm_adaptive) {
+                    if (slot.uses_adaptive_dflash() && slot.adaptive_dm.dm_adaptive) {
                         slot.adaptive_requested_n_max = n_draft_max;
                     }
                     GGML_ASSERT(slot.can_speculate());
@@ -3438,7 +3446,7 @@ private:
                 drafted_tokens_total += slot->spec_draft.size();
             }
             for (auto * slot : drafting) {
-                if (slot->uses_dflash() && slot->adaptive_dm.dm_adaptive) {
+                if (slot->uses_adaptive_dflash() && slot->adaptive_dm.dm_adaptive) {
                     // Upstream drafts the cohort in one batched call. Attribute that
                     // shared wall time by actual drafted-token work so a shallow
                     // adaptive DFlash slot is not charged the same as a deep one.
@@ -4427,7 +4435,7 @@ private:
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
             const int64_t t_now = ggml_time_us();
 
-            if (slot.uses_dflash() && slot.adaptive_dm.dm_adaptive &&
+            if (slot.uses_adaptive_dflash() && slot.adaptive_dm.dm_adaptive &&
                     slot.adaptive_requested_n_max == 0 && slot.adaptive_cycle_start_us > 0) {
                 const float cycle_ms = std::max(0.001f,
                         (float) (t_now - slot.adaptive_cycle_start_us) / 1000.0f);
@@ -4580,7 +4588,7 @@ private:
             slot.stats.n_draft_accepted += n_accepted;
             slot.stats.n_draft_verif_steps += 1;
 
-            if (slot.uses_dflash() && slot.adaptive_dm.dm_adaptive && slot.adaptive_cycle_start_us > 0) {
+            if (slot.uses_adaptive_dflash() && slot.adaptive_dm.dm_adaptive && slot.adaptive_cycle_start_us > 0) {
                 const int n_accepted_adaptive = std::max(0, (int) ids.size() - 1);
                 const float cycle_ms = std::max(0.001f,
                         (float) (t_now - slot.adaptive_cycle_start_us) / 1000.0f);

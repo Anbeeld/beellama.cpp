@@ -39,11 +39,12 @@ load-on-startup         = 1
 stop-timeout            = 10
 ```
 
-This example omits `spec-draft-n-max`, so DFlash uses
+This DFlash1 example omits `spec-draft-n-max`, so the drafter uses
 `dflash.block_size - 1` and the default-on profit controller adapts within that
 limit. Add `spec-draft-n-max = N` when a fixed upper bound is required; add
-`spec-dm-controller = off` when the resolved or explicit depth must remain
-static.
+`spec-dm-controller = off` when the resolved or explicit DFlash1 depth must
+remain static. DFlash2 always uses its fixed trained block limit and selector
+confidence.
 
 ## Router model selection
 

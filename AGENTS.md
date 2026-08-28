@@ -17,7 +17,7 @@ small:
   `q6_0`, and `q6_1`. Bee's cache-facing `q2_0` uses the internal enum
   `GGML_TYPE_Q2_0S` so it cannot collide with upstream's serialized Q2_0 weight
   format.
-- A profit-only adaptive draft-max controller for DFlash.
+- A profit-only adaptive draft-max controller for DFlash1. DFlash2 keeps its fixed trained block limit and selector confidence.
 - Reasoning-loop detection and the opted-in realtime
   `/v1/chat/completions/control` endpoint.
 - INI presets and KLD measurement support in `llama-perplexity`.

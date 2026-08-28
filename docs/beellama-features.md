@@ -540,15 +540,17 @@ measure the exact workload before deploying it.
 ### What it is
 
 Bee uses upstream `draft-dflash` for drafting and adds a server-side profit
-controller. If the draft maximum is omitted, Bee reads `dflash.block_size` and
-uses one less than the block size, normally 15; the controller remains
-default-on and can select shallower depths at runtime.
+controller for DFlash1. If the draft maximum is omitted, Bee reads
+`dflash.block_size` and uses one less than the block size, normally 15; the
+controller remains default-on and can select shallower DFlash1 depths at
+runtime. DFlash2 uses its fixed trained block limit and selector confidence.
 
 ### When to use it
 
 Use DFlash when you have an upstream-format drafter trained for the exact target
-model. Let the metadata-derived maximum and profit controller establish a
-baseline before pinning a smaller depth.
+model. For DFlash1, let the metadata-derived maximum and profit controller
+establish a baseline before pinning a smaller depth. For DFlash2, tune the
+static maximum and selector confidence against the target workload.
 
 ### Key arguments
 
@@ -569,7 +571,8 @@ cross-build oracle for speculative decoding.
 
 The drafter must expose upstream `dflash` architecture metadata and tensor
 names. Other DFlash GGUF schemas are unsupported. The profit controls apply only
-to DFlash; upstream simple, EAGLE3, MTP, and n-gram modes keep their own defaults.
+to DFlash1; DFlash2, upstream simple, EAGLE3, MTP, and n-gram modes keep their
+own draft-depth behavior.
 
 ## Reasoning loop guard and realtime control
 

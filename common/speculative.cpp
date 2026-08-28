@@ -171,6 +171,8 @@ struct common_speculative_impl {
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
 
+    virtual bool adaptive_dm_supported() const { return false; }
+
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual bool validate_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & data) const {
@@ -1006,6 +1008,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
 
         LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(type).c_str());
+        if (!common_speculative_dflash_adaptive_dm_supported(selector_top_k)) {
+            LOG_INF("%s: DFlash2 uses its fixed block limit and selector confidence; Bee adaptive draft-max is disabled\n", __func__);
+        }
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u, sample_from_anchor=%s\n", __func__,
                 block_size, mask_token_id, target_layer_ids_n, sample_from_anchor ? "true" : "false");
@@ -1369,6 +1374,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
         // noop
+    }
+
+    bool adaptive_dm_supported() const override {
+        return common_speculative_dflash_adaptive_dm_supported(selector_top_k);
     }
 };
 
@@ -2492,6 +2501,24 @@ int32_t common_speculative_n_max(const common_speculative * spec) {
     }
 
     return n_max;
+}
+
+bool common_speculative_dflash_adaptive_dm_supported(int32_t selector_top_k) {
+    return selector_top_k <= 0;
+}
+
+bool common_speculative_adaptive_dm_supported(const common_speculative * spec) {
+    if (spec == nullptr) {
+        return false;
+    }
+
+    for (const auto & impl : spec->impls) {
+        if (impl->adaptive_dm_supported()) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 std::vector<double> common_speculative_synth_rates_resolve(const common_params_speculative * spec, int32_t n_max) {

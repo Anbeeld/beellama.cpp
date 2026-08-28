@@ -6,7 +6,7 @@ keeps a small set of maintained extensions:
 - KVarN target-context KV-cache compression (`kvarn2` through `kvarn8`).
 - Low-bit standard KV cache types (`q2_0`, `q2_1`, `q3_0`, `q3_1`, `q6_0`, and
   `q6_1`).
-- Profit-only adaptive draft depth for upstream `draft-dflash` speculation.
+- Profit-only adaptive draft depth for DFlash1. DFlash2 uses its fixed trained block limit and selector confidence.
 - Server-side reasoning-loop protection.
 - KLD save/load support in `llama-perplexity` for KVarN validation.
 

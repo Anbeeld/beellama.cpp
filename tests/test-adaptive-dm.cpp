@@ -1,4 +1,5 @@
 #include "../tools/server/server-adaptive-dm.h"
+#include "speculative.h"
 
 #undef NDEBUG
 #include <cassert>
@@ -42,6 +43,10 @@ static common_params_speculative make_dflash_spec(int n_max) {
 }
 
 int main() {
+    assert(common_speculative_dflash_adaptive_dm_supported(0));
+    assert(!common_speculative_dflash_adaptive_dm_supported(16));
+    assert(!common_speculative_adaptive_dm_supported(nullptr));
+
     assert(server_adaptive_dm_probe_n_max(8, 0.25f) == 2);
     assert(server_adaptive_dm_probe_n_max(16, 0.25f) == 4);
     assert(server_adaptive_dm_probe_n_max(8, 0.50f) == 4);

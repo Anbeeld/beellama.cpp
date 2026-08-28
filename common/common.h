@@ -369,9 +369,9 @@ struct common_params_speculative_ngram_cache {
     std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding
 };
 
-// BeeLlama's adaptive draft-max controller is intentionally independent of
-// the speculative implementation.  Upstream remains authoritative for all
-// draft modes; the controller only chooses the next DFlash draft horizon.
+// Upstream remains authoritative for all draft modes. BeeLlama's adaptive
+// draft-max controller only chooses the next DFlash1 horizon; DFlash2 keeps
+// its fixed trained block limit and selector confidence.
 enum common_speculative_dm_controller {
     COMMON_SPECULATIVE_DM_CONTROLLER_OFF,
     COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT,
