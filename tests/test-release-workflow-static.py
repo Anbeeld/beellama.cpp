@@ -106,8 +106,21 @@ def main() -> None:
         and release.count("${{ matrix.cuda_cmake_args }}") == 2,
         "only the CUDA 12.4 Linux and Windows matrix entries must request fetched CCCL",
     )
-    for runtime in ("amdhip64_7.dll", "rocm_kpack.dll", "amd_comgr.dll"):
-        require(runtime in release, f"Windows HIP package must bundle {runtime}")
+    for runtime in ("amdhip64_7.dll", "amd_comgr_3.dll"):
+        require(
+            f'--require-name "{runtime}"' in release,
+            f"Windows HIP package must require {runtime}",
+        )
+    require(
+        '$kpack = Join-Path $env:HIP_PATH "bin\\rocm_kpack.dll"' in release
+        and "if (Test-Path $kpack)" in release
+        and '--require-local-import "rocm_kpack.dll"' in release,
+        "Windows HIP packaging must copy KPack when supplied and require it when imported",
+    )
+    require(
+        '--require-name "amd_comgr.dll"' not in release,
+        "ROCm 7.1 uses the versioned amd_comgr_3.dll runtime",
+    )
     require(
         "find-msvc-openmp-runtime.ps1" not in release
         and '--require-name "libomp.dll"' in release
