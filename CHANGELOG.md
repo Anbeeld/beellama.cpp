@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.4.4
+
+- Updated the llama.cpp base from `74ce15741` to `6fdd0ac89` and ggml from 0.19.0 to 0.22.0. Notable inherited changes include Qwen3.8 DFlash2 with local convolution, candidate selection, M-RoPE, converter/GGUF support, speculative `p_min`/`n_min`, and wide-row CUDA top-k; Granite Switch/SWA, Muse Glimmer, Kimi K3, MiniMax Text, BailingMoE3, Nanbeige4.2-3B, Pocket TTS, expanded MTP, DFlash, and DSpark coverage, and multi-output backend sampling; media-aware server state, Web UI tools and navigation, stronger tool isolation, automatic iGPU-safe loading, Metal kernel splitting, Vulkan TQ2_0 and Lightning Indexer support, asynchronous RPC APIs, and Apple RDMA transport. Bee keeps adaptive draft-max on DFlash1 while DFlash2 uses its fixed trained block and selector confidence.
+- Optimized native KVarN SWA attention on CPU and CUDA. Fully covered non-SWA windows now use native exact storage, and CUDA routing retains split geometry and device capabilities without model- or GPU-specific policy.
+- Hardened KV and speculative state handling with transactional target/draft restore, selective checkpoint validation, KVarN stage ownership and generation tracking, restored bulk-workspace routing, complete DSA+iSWA lifecycle forwarding, head-aligned multi-GPU placement, and correct partial sharded-buffer memset.
+- Fixed MTP multi-ubatch synchronization and extended loop detection to pathological visible output while retaining force-close behavior for hidden reasoning loops.
+- Updated release packaging to CUDA 13.3, source-built Web UI assets, non-development version metadata, fetched LLVM OpenMP on Windows, and matching HIP runtime DLLs. Release metadata now validates the source version, Windows package checks fail closed on required runtime files, preview and stable concurrency are isolated, and reruns reconcile stale assets.
+
 ## v0.4.3
 
 - Updated the llama.cpp base through upstream commit `74ce15741`. Notable inherited changes include Qwen3-TTS, DeepSeek V4 and DSpark, MTP support for GLM-4.7-Flash, GLM-5.2, Qwen3-Next, and DeepSeek V3.2, router LRU scheduling, initial Docker tool isolation, working-directory and filesystem tools in the server and Web UI, speculative metrics, and broad CUDA, Metal, Vulkan, SYCL, WebGPU, multimodal, conversion, and UI updates. ggml is now 0.19.0 and the RPC protocol is 5.0.1.

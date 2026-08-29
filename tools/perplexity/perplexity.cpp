@@ -2057,7 +2057,6 @@ int llama_perplexity(int argc, char ** argv) {
     }
 
     const int32_t n_ctx = params.n_ctx;
-
     if (n_ctx <= 0) {
         LOG_ERR("%s: perplexity tool requires '--ctx-size' > 0\n", __func__);
         return 1;

@@ -1,4 +1,4 @@
-# BeeLlama v0.4.3 argument reference
+# BeeLlama v0.4.4 argument reference
 
 This page covers Bee-owned arguments and the upstream arguments whose behavior
 BeeLlama extends. Run `llama-server --help` or `llama-cli --help` for the full
@@ -16,7 +16,7 @@ buffer-device-address support for its direct route. An explicitly supported
 materialization fallback retains compressed persistent storage when a native
 route is unavailable. Pre-Turing NVIDIA GPUs use CUDA's portable rotated-domain
 body-plus-tail route and require a CUDA 12.4 build or release package. CUDA
-13.1 packages target Turing and newer architectures.
+13.3 packages target Turing and newer architectures.
 
 | Argument | Env var | Default | Behavior |
 |---|---|---|---|
@@ -186,7 +186,7 @@ behavior. The `--spec-dm-*` rows are Bee server additions.
 | `--spec-draft-n-max N` | `LLAMA_ARG_SPEC_DRAFT_N_MAX` | Upstream: `3`; omitted DFlash: `dflash.block_size - 1` | Sets the maximum draft depth. An explicit CLI or env value always wins; upstream clamps values above the drafter's trained limit. A block-16 drafter therefore defaults to 15 only when this setting is omitted. |
 | `--spec-draft-n-min N` | `LLAMA_ARG_SPEC_DRAFT_N_MIN` | `0` | Sets the minimum number of draft tokens used by upstream speculation. |
 | `--spec-draft-p-min P`, `--draft-p-min P` | `LLAMA_ARG_SPEC_DRAFT_P_MIN` | `0.0` | Stops an individual greedy draft when its probability falls below `P`; this is independent of the profit controller. |
-| `--spec-dm-controller MODE` | `LLAMA_ARG_SPEC_DM_CONTROLLER` | `profit` | `profit` adapts DFlash depth from measured cycle profit; `off` keeps the resolved or explicit maximum static. Other speculative modes are unchanged. |
+| `--spec-dm-controller MODE` | `LLAMA_ARG_SPEC_DM_CONTROLLER` | `profit` | For DFlash1, `profit` adapts depth from measured cycle profit and `off` keeps the resolved or explicit maximum static. DFlash2 always uses its fixed trained block limit and selector confidence; other speculative modes are unchanged. |
 | `--spec-dm-profit-min F` | `LLAMA_ARG_SPEC_DM_PROFIT_MIN` | `0.05` | Sets the minimum margin over the no-spec baseline before clearing disable dwell. Range: `0.0` to `0.50`. |
 | `--spec-dm-profit-raise-margin F` | `LLAMA_ARG_SPEC_DM_PROFIT_RAISE_MARGIN` | `0.05` | Sets the relative profit margin required to raise draft depth. Range: `0.0` to `1.0`. |
 | `--spec-dm-profit-lower-margin F` | `LLAMA_ARG_SPEC_DM_PROFIT_LOWER_MARGIN` | `0.05` | Sets the relative profit margin required to lower draft depth. Range: `0.0` to `1.0`. |
@@ -252,9 +252,9 @@ Use the same corpus, context, logical batch, and physical ubatch for both KLD le
 | `-DGGML_CUDA_FA_ALL_QUANTS=ON` | — | Off | Expands the CUDA vector matrix from 50 to all 169 standard cache pairs and, when `GGML_CUDA_KVARN=ON`, KVarN fast-decode instances from 15 balanced pairs to all 36 ordered bit pairs. Valid KVarN pairs outside the fast matrix use descriptor-native MMA. |
 | `-DGGML_CUDA_KVARN=ON/OFF` | — | On | Compiles or omits the shared CUDA/HIP KVarN kernels and CUDA native-attention template instances. When enabled, `GGML_CUDA_FA_ALL_QUANTS` selects 15 default or all 36 CUDA fast-decode pairs. CUDA devices without the specialized Turing MMA contract use the portable direct-record route when their warp, thread-block, shared-memory, head-dimension, and tail-type capabilities pass. |
 
-Release packages are built with CUDA 12.4 and 13.1. CUDA 12.4 can emit the
+Release packages are built with CUDA 12.4 and 13.3. CUDA 12.4 can emit the
 Maxwell, Pascal, and Volta PTX targets used by the portable KVarN route; CUDA
-13.1 covers Turing and newer architectures. The release workflow no longer has
+13.3 covers Turing and newer architectures. The release workflow no longer has
 an exhaustive per-architecture CUDA compile gate. For a local or CI build,
 select the intended target explicitly with `CMAKE_CUDA_ARCHITECTURES` when the
 build host cannot detect it. Pre-Turing support remains runtime-unqualified

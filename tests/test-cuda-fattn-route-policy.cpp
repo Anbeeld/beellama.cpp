@@ -355,8 +355,9 @@ int main(int argc, char ** argv) {
                  cmake.find("_selected_pair_count EQUAL _expected_pair_count") != std::string::npos,
         "shared CUDA/HIP/MUSA configuration must validate the selected KVarN pair matrix");
     ok &= expect(count_occurrences(kvarn_mma,
-                 "idx < nbatch_fa * dim2_count_local; idx += nthreads") >= 2,
-        "rotated KVarN record reconstruction must distribute token/dimension pairs across the full CTA");
+                     "idx < nbatch_fa * dim2_count_local; idx += nthreads") >= 1 &&
+                 kvarn_mma.find("for (int row = warp; row < nbatch_fa; row += warps_per_block)") != std::string::npos,
+        "KVarN records must use the full CTA while original-stage rows use cooperative warp producers");
     ok &= expect(kvarn_mma.find("desc.value ? 3 * D : 0") != std::string::npos &&
                  kvarn_mma.find("axis_group_tags[axis_tag] != record_group") != std::string::npos,
         "rotated KVarN MMA must keep independent K/V record axes in shared memory and reuse them across subtiles");

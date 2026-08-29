@@ -106,6 +106,41 @@ int main() {
 
     {
         common_reasoning_loop_guard_params params = test_params();
+        params.min_reasoning_tokens = 32;
+        params.min_repeated_coverage = 24;
+        params.window_tokens = 64;
+        params.max_period = 8;
+        params.check_interval = 8;
+        server_loop_guard guard(params);
+
+        accept_many(guard, std::vector<llama_token>(32, 42), SERVER_LOOP_REGION_REASONING);
+        const auto reasoning = guard.check(SERVER_LOOP_REGION_REASONING);
+        assert(reasoning.triggered);
+        assert(reasoning.kind == "periodic_tail");
+        assert(reasoning.period == 1);
+
+        // A reasoning intervention must not disarm the independent visible tail.
+        accept_many(guard, repeat_block({7, 8}, 16), SERVER_LOOP_REGION_VISIBLE);
+        const auto visible = guard.check(SERVER_LOOP_REGION_VISIBLE);
+        assert(visible.triggered);
+        assert(visible.kind == "periodic_tail");
+        assert(visible.period == 2);
+    }
+
+    {
+        common_reasoning_loop_guard_params params = test_params();
+        params.min_repeated_coverage = 24;
+        params.window_tokens = 64;
+        params.max_period = 8;
+        params.check_interval = 8;
+        server_loop_guard guard(params);
+
+        accept_many(guard, std::vector<llama_token>(16, 9), SERVER_LOOP_REGION_VISIBLE);
+        assert_not_triggered(guard.check(SERVER_LOOP_REGION_VISIBLE));
+    }
+
+    {
+        common_reasoning_loop_guard_params params = test_params();
         params.min_reasoning_tokens = 0;
         params.min_repeated_coverage = 1;
         params.window_tokens = 64;

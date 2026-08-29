@@ -84,6 +84,7 @@ struct server_model_meta {
     int exit_code = 0; // exit code of the model instance process (only valid if status == FAILED)
     int stop_timeout = 0; // seconds to wait before force-killing the model instance during shutdown
     mtmd_caps multimodal; // multimodal capabilities
+    bool hidden = false; // hidden from GET /models, but still accept if requested
 
     bool is_ready() const {
         return status == SERVER_MODEL_STATUS_LOADED;
@@ -133,6 +134,9 @@ private:
     // set to true while load_models() is executing a reload; load() will wait until clear
     bool is_reloading = false;
 
+    // models marked with load-on-startup, unset once load_startup_models() drains it
+    // no value means the startup phase is over, so a reload must not queue anything
+    std::optional<std::vector<std::string>> startup_models{std::in_place};
     // conv_id -> model name that currently serves its stream session, lets the resumable stream
     // routes go straight to the owning child instead of polling every one. populated when
     // proxy_request forwards a POST carrying an X-Conversation-Id. best effort: a stale entry just
@@ -228,6 +232,9 @@ public:
     //   - if a model is running but updated or removed from the source, it will be unloaded
     //   - if a model is not running, it will be added or updated according to the source
     void load_models();
+
+    // lazy-load startup_models, to be called after main() setup phase
+    void load_startup_models();
 
     // check if a model instance exists (thread-safe)
     bool has_model(const std::string & name);

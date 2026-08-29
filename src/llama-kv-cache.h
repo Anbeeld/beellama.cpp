@@ -45,8 +45,9 @@ public:
         uint32_t s0;
         uint32_t s1;
 
-        std::vector<llama_seq_id> strm; // [ns]
-        std::vector<idx_vec_t>    idxs; // [ns]
+        std::vector<llama_seq_id> strm;        // [ns]
+        std::vector<idx_vec_t>    idxs;        // [ns]
+        std::vector<idx_vec_t>    stage_slots; // [ns], structured caches only
 
         uint32_t head() const {
             GGML_ASSERT(idxs.size() == 1);
@@ -77,6 +78,7 @@ public:
 
         void clear() {
             idxs.clear();
+            stage_slots.clear();
         }
 
         // check if indices are contiguous starting from head()
@@ -267,6 +269,8 @@ public:
     void clone_logical_state_from(const llama_kv_cache & source);
     void set_allocation_group_size(uint32_t group_size, uint32_t stage_groups = 1);
     bool allocation_cell_uses_stage(uint32_t cell) const;
+    int32_t allocation_cell_stage_slot(uint32_t cell) const;
+    const std::vector<int32_t> & get_allocation_stage_slots() const;
     void set_state_remap_group_size(uint32_t group_size);
     const std::vector<std::pair<uint32_t, uint32_t>> & get_state_cell_remap() const;
 
@@ -354,10 +358,20 @@ public:
     // read-only access to the KV cell metadata for a given stream
     const llama_kv_cells & get_cells(uint32_t stream) const { return v_cells[stream]; }
 
+    // true if llama_kv_cell_ext holds information that has to survive a state save/restore
+    bool has_cell_ext() const;
+
+    // for every token of the ubatch, the ids of the n tokens that precede it in its sequence
+    // entries with no matching cell are set to LLAMA_TOKEN_NULL
+    // note: used by n-gram input embeddings
+    void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
+
 private:
     bool seq_rm_unchecked(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
     void reset_allocation_head(llama_seq_id seq_id);
     void rebuild_allocation_head(llama_seq_id seq_id);
+    bool reconcile_allocation_stage_slots();
+    std::vector<uint32_t> allocation_live_stage_groups() const;
 
     const llama_model & model;
     const llama_hparams & hparams;
@@ -438,6 +452,7 @@ private:
     // independent cursor per logical sequence and select new groups whose
     // stage slot is not occupied by another live frontier.
     std::vector<uint32_t> allocation_seq_heads;
+    std::vector<int32_t> allocation_group_stage_slots;
     uint32_t state_remap_group_size = 1;
     std::vector<std::pair<uint32_t, uint32_t>> state_cell_remap;
     uint32_t tail_write_levels = 0;
@@ -683,6 +698,9 @@ public:
     virtual void set_input_v_rot(ggml_tensor * dst) const;
     virtual void set_input_k_rot_backend(ggml_tensor * dst) const;
     virtual void set_input_v_rot_backend(ggml_tensor * dst) const;
+
+    // see llama_kv_cache::get_prev_tokens()
+    void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
 private:
     llama_memory_status status;

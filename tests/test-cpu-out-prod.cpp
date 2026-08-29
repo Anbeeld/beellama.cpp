@@ -6,7 +6,7 @@
 #include <cstdlib>
 #include <vector>
 
-static void fail(const char * msg) {
+[[noreturn]] static void fail(const char * msg) {
     fprintf(stderr, "%s\n", msg);
     exit(1);
 }

@@ -8,8 +8,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def main() -> None:
     expected_scripts = {
-        "build-win-cuda-13.1-sm_86.ps1": "build-win-cuda-13.1-sm_86",
-        "build-win-cuda-13.1-sm_86-default.ps1": "build-win-cuda-13.1-sm_86-default",
+        "build-win-cuda-sm_86.ps1": "build-win-cuda-sm_86",
+        "build-win-cuda-sm_86-default.ps1": "build-win-cuda-sm_86-default",
         "build-win-vulkan.ps1": "build-win-vulkan",
     }
     old_scripts = (
@@ -46,7 +46,6 @@ def main() -> None:
         for required in (
             "[switch]$AllTests = $false",
             '"-DGGML_BACKEND_DL=$(if ($AllTests) { \'OFF\' } else { \'ON\' })"',
-            '$commonFlags += "-DBUILD_SHARED_LIBS=OFF"',
             "$ninjaExe -C $buildDir -t targets all",
             '"^(test-[A-Za-z0-9_.-]+):"',
             '$buildArgs += @("--target") + $testTargets',
@@ -55,6 +54,16 @@ def main() -> None:
         ):
             if required not in source:
                 raise AssertionError(f"{script_name} lacks full-test behavior: {required}")
+
+        if script_name.startswith("build-win-cuda-sm_86") and '"-DGGML_CCACHE=OFF"' not in source:
+            raise AssertionError(f"{script_name} must disable sccache for CUDA 13.3")
+
+        shared_libs_test_mode = (
+            '$commonFlags += "-DBUILD_SHARED_LIBS=OFF"' in source
+            or '"-DBUILD_SHARED_LIBS=$(if ($AllTests) { \'OFF\' } else { \'ON\' })"' in source
+        )
+        if not shared_libs_test_mode:
+            raise AssertionError(f"{script_name} does not select static libraries for -AllTests")
 
 
 if __name__ == "__main__":

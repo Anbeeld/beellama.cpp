@@ -8,6 +8,7 @@
 #include "ggml.h"
 #include "llama.h"
 
+#include <list>
 #include <set>
 #include <sstream>
 #include <string>
@@ -368,9 +369,9 @@ struct common_params_speculative_ngram_cache {
     std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding
 };
 
-// BeeLlama's adaptive draft-max controller is intentionally independent of
-// the speculative implementation.  Upstream remains authoritative for all
-// draft modes; the controller only chooses the next DFlash draft horizon.
+// Upstream remains authoritative for all draft modes. BeeLlama's adaptive
+// draft-max controller only chooses the next DFlash1 horizon; DFlash2 keeps
+// its fixed trained block limit and selector confidence.
 enum common_speculative_dm_controller {
     COMMON_SPECULATIVE_DM_CONTROLLER_OFF,
     COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT,
@@ -378,6 +379,9 @@ enum common_speculative_dm_controller {
 
 struct common_params_speculative {
     std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
+
+    double synth_len = -1.0;
+    std::vector<double> synth_rates;
 
     // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
     common_params_speculative_draft draft;
@@ -404,6 +408,10 @@ struct common_params_speculative {
 
     bool has_dft() const {
         return !draft.mparams.empty();
+    }
+
+    bool has_synth() const {
+        return synth_len != -1.0 || !synth_rates.empty();
     }
 
     uint32_t need_n_rs_seq() const {
@@ -495,6 +503,7 @@ struct common_params {
     int32_t n_parallel            =     1; // number of parallel sequences to decode
     int32_t n_sequences           =     1; // number of sequences to decode
     int32_t n_outputs_max         =     0; // max outputs in a batch (0 = n_batch)
+    int32_t n_outputs_max_per_seq =     1; // max outputs per sequence
     int32_t grp_attn_n            =     1; // group-attention factor
     int32_t grp_attn_w            =   512; // group-attention width
     int32_t n_print               =    -1; // print token count every n tokens (-1 = disabled)
@@ -520,7 +529,9 @@ struct common_params {
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);
 
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
-    enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_MMAP; // how to load the model
+    enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_AUTO; // how to load the model
+
+    enum llama_tensor_read_lazy tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_AUTO; // on-demand reading of tensors marked by the arch
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
@@ -651,12 +662,18 @@ struct common_params {
 
     // multimodal models (see tools/mtmd)
     struct common_params_model mmproj;
-    bool mmproj_use_gpu = true;     // use GPU for multimodal model
-    bool no_mmproj = false;         // explicitly disable multimodal model
-    std::vector<std::string> image; // path to image file(s) ; TODO: change the name to "media"
+    bool mmproj_use_gpu = true;                 // use GPU for multimodal model
+    ggml_backend_dev_t mmproj_device = nullptr; // GPU device to use for multimodal model
+    bool no_mmproj = false;                     // explicitly disable multimodal model
+    std::vector<std::string> image;             // path to image file(s) ; TODO: change the name to "media"
     int image_min_tokens = -1;
     int image_max_tokens = -1;
     int mtmd_batch_max_tokens = 1024;
+
+    // for video input
+    float       video_fps                   = 4.0f;
+    int64_t     video_timestamp_interval_ms = 5000;
+    std::string video_ffmpeg_bin_dir        = "";
 
     // finetune
     struct lr_opt lr;
@@ -954,6 +971,7 @@ bool fs_is_directory(const std::string & path);
 
 std::string fs_get_cache_directory();
 std::string fs_get_cache_file(const std::string & filename);
+std::string fs_get_config_directory();
 
 struct common_file_info {
     std::string path;
@@ -1001,9 +1019,8 @@ using common_init_result_ptr = std::unique_ptr<common_init_result>;
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only = false);
 
-struct llama_model_params     common_model_params_to_llama  (      common_params & params);
-struct llama_context_params   common_context_params_to_llama(const common_params & params);
-struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const common_cpu_params & params);
+struct llama_model_params   common_model_params_to_llama  (      common_params & params);
+struct llama_context_params common_context_params_to_llama(const common_params & params);
 
 // clear LoRA adapters from context, then apply new list of adapters
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora);
@@ -1013,6 +1030,28 @@ std::string common_get_model_endpoint();
 
 // for testing purposes
 char * common_get_model_or_exit(int, char*[]);
+
+//
+// Threadpool utils
+//
+
+struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const common_cpu_params & params);
+
+struct common_threadpools {
+    common_threadpools() = default;
+    ~common_threadpools();
+
+    common_threadpools(const common_threadpools &) = delete;
+    common_threadpools & operator=(const common_threadpools &) = delete;
+
+    void init(llama_context * ctx, const common_params & params);
+
+private:
+    ggml_threadpool * threadpool       = nullptr;
+    ggml_threadpool * threadpool_batch = nullptr;
+
+    decltype(ggml_threadpool_free) * free_fn = nullptr;
+};
 
 //
 // Context utils
@@ -1193,17 +1232,28 @@ const char * const LLM_KV_SPLIT_TENSORS_COUNT = "split.tensors.count";
 }
 
 //
-// MoE utils
+// FFN offload utils
 //
 
 const char * const LLM_FFN_EXPS_REGEX = "\\.ffn_(up|down|gate|gate_up)_(ch|)exps";
 
-inline std::string llm_ffn_exps_block_regex(int idx) {
-    return string_format("blk\\.%d%s", idx, LLM_FFN_EXPS_REGEX);
+const char * const LLM_FFN_DENSE_REGEX = "\\.ffn_(up|down|gate)\\.";
+
+inline std::string llm_ffn_block_regex(int idx, const char * ffn_regex) {
+    return string_format("blk\\.%d%s", idx, ffn_regex);
 }
 
 inline llama_model_tensor_buft_override llm_ffn_exps_cpu_override() {
     return { LLM_FFN_EXPS_REGEX, ggml_backend_cpu_buffer_type() };
+}
+
+inline void llm_add_n_cpu_ffn_overrides(int n, const char * ffn_regex, std::vector<llama_model_tensor_buft_override> & overrides) {
+    // keep strings alive and avoid leaking memory by storing them in a static list
+    static std::list<std::string> buft_override_strings;
+    for (int i = 0; i < n; ++i) {
+        buft_override_strings.push_back(llm_ffn_block_regex(i, ffn_regex));
+        overrides.push_back({buft_override_strings.back().c_str(), ggml_backend_cpu_buffer_type()});
+    }
 }
 
 //

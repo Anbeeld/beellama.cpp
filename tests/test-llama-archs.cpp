@@ -65,7 +65,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] [--test-mtp-ubatch-sync]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -79,10 +79,10 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
     return ret;
 }
 
-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
+static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const bool mtp = false) {
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(arch, ret.get());
-    const uint32_t n_ctx = 128;
+    const uint32_t n_ctx = mtp ? 256 : 128;
 
     uint32_t n_vocab = 128;
     uint32_t n_embd  = 256;
@@ -101,10 +101,23 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_head = 1;
         n_ff   = 96;
         n_layer = 22; // hparams.n_layer_kv_from_start = 20 is hardcoded
+    } else if (arch == LLM_ARCH_DEEPSEEK4) {
+        // head size 64 so that GPU flash attention kernels support the model
+        n_embd  = 512;
+        n_head  = 8;
+        n_ff    = 1024;
+        n_layer = 4;
+    } else if (arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_LAGUNA) {
+        n_embd = 160; // exercise per-head tensor split granularity with head size 80
+    } else if (arch == LLM_ARCH_QWEN3 || arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_AFMOE) {
+        n_head = 4;
     } else if (arch == LLM_ARCH_DEEPSEEK2
             || arch == LLM_ARCH_DEEPSEEK32
             || arch == LLM_ARCH_GLM_DSA
+            || arch == LLM_ARCH_DOTS3NOTE
             || arch == LLM_ARCH_KIMI_LINEAR
+            || arch == LLM_ARCH_BAILINGMOE3
+            || arch == LLM_ARCH_KIMI_K3
             || arch == LLM_ARCH_MISTRAL4) {
         n_embd = 128;
         n_head = 1;
@@ -117,6 +130,12 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_vocab = 4096; // must be >= the hard-coded codec head size (3072)
     }
 
+    uint32_t n_head_kv = n_head;
+    if (arch == LLM_ARCH_QWEN3) {
+        n_head_kv = 1; // MQA coverage
+    } else if (arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_AFMOE) {
+        n_head_kv = 2; // GQA coverage
+    }
     const uint32_t n_embd_head = n_embd / n_head;
 
     ms.add_kv(LLM_KV_GENERAL_ARCHITECTURE,      llm_arch_name(arch));
@@ -126,6 +145,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_FEATURES_LENGTH,           n_embd);
     ms.add_kv(LLM_KV_BLOCK_COUNT,               n_layer);
     ms.add_kv(LLM_KV_LEADING_DENSE_BLOCK_COUNT, uint32_t(1));
+    if (mtp) {
+        ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, uint32_t(1));
+    }
 
     if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
         std::vector<uint32_t> n_ff_per_layer;
@@ -145,7 +167,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_FULL_ATTENTION_INTERVAL, uint32_t(2));
 
     if (arch == LLM_ARCH_PLAMO2 || arch == LLM_ARCH_JAMBA || arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE ||
-            arch == LLM_ARCH_GRANITE_HYBRID || arch == LLM_ARCH_LFM2 || arch == LLM_ARCH_LFM2MOE || arch == LLM_ARCH_KIMI_LINEAR) {
+            arch == LLM_ARCH_GRANITE_HYBRID || arch == LLM_ARCH_LFM2 || arch == LLM_ARCH_LFM2MOE || arch == LLM_ARCH_KIMI_LINEAR ||
+            arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_KIMI_K3) {
         GGML_ASSERT(n_layer >= 2);
         std::vector<uint32_t> n_head_per_layer;
         n_head_per_layer.reserve(n_layer);
@@ -156,20 +179,43 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_per_layer);
     } else {
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head);
-        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head);
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, arch == LLM_ARCH_DEEPSEEK4 ? uint32_t(1) : n_head_kv);
     }
 
     ms.add_kv(LLM_KV_ATTENTION_MAX_ALIBI_BIAS, 8.0f);
-    if (arch == LLM_ARCH_DEEPSEEK2
+    if (arch == LLM_ARCH_DEEPSEEK4) {
+        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,   n_embd_head);
+        ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH, n_embd_head);
+        ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,   n_embd_head/2);
+    } else if (arch == LLM_ARCH_DEEPSEEK2
             || arch == LLM_ARCH_DEEPSEEK32
             || arch == LLM_ARCH_GLM_DSA
+            || arch == LLM_ARCH_DOTS3NOTE
             || arch == LLM_ARCH_KIMI_LINEAR
+            || arch == LLM_ARCH_BAILINGMOE3
+            || arch == LLM_ARCH_KIMI_K3
             || arch == LLM_ARCH_MISTRAL4) {
         ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,       uint32_t(576));
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,     uint32_t(512));
         ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(64));
         ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_MLA,   uint32_t(192));
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_MLA, uint32_t(128));
+        if (arch == LLM_ARCH_DOTS3NOTE) {
+            // SWA layers reuse the same MLA geometry as the full layers in this fixture
+            ms.add_kv(LLM_KV_ATTENTION_KV_LORA_RANK_SWA,     uint32_t(512));
+            ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_SWA,       uint32_t(576));
+            ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_SWA,     uint32_t(512));
+            ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_MLA_SWA,   uint32_t(192));
+            ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_MLA_SWA, uint32_t(128));
+            ms.add_kv(LLM_KV_ROPE_FREQ_BASE_SWA,             10000.0f);
+            // indexer on the full-attention layers (inverse of the swa pattern)
+            std::vector<uint32_t> indexer_types;
+            indexer_types.reserve(n_layer);
+            for (uint32_t il = 0; il < n_layer; il++) {
+                indexer_types.push_back(il % 2 ? 0 : 1);
+            }
+            ms.add_kv(LLM_KV_ATTENTION_INDEXER_TYPES, indexer_types);
+        }
     } else if (arch == LLM_ARCH_MINIMAX_M3) {
         // partial rotary: n_rot must not exceed the indexer key length (64)
         ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(64));
@@ -179,7 +225,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,      1e-5f);
     ms.add_kv(LLM_KV_ATTENTION_GROUPNORM_EPS,          1e-5f);
     ms.add_kv(LLM_KV_ATTENTION_GROUPNORM_GROUPS,       uint32_t(8));
-    ms.add_kv(LLM_KV_ATTENTION_Q_LORA_RANK,            uint32_t(512));
+    ms.add_kv(LLM_KV_ATTENTION_Q_LORA_RANK,            arch == LLM_ARCH_DEEPSEEK4 ? uint32_t(64) : uint32_t(512));
     ms.add_kv(LLM_KV_ATTENTION_KV_LORA_RANK,           uint32_t(512));
     ms.add_kv(LLM_KV_ATTENTION_RELATIVE_BUCKETS_COUNT, uint32_t(8));
     ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW,         n_ctx/8);
@@ -192,7 +238,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_ROPE_FREQ_BASE_SWA,              10000.0f);
         // SWA pattern: every 5th layer is full attention (matches E2B layer_types)
         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, uint32_t(5));
-    } else if (arch == LLM_ARCH_COHERE2MOE || arch == LLM_ARCH_MIMO2 || arch == LLM_ARCH_STEP35) {
+    } else if (arch == LLM_ARCH_COHERE2MOE || arch == LLM_ARCH_MIMO2 || arch == LLM_ARCH_STEP35 ||
+            arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_GRANITE_SWA || arch == LLM_ARCH_DOTS3NOTE) {
         std::vector<uint32_t> pattern;
         pattern.reserve(n_layer);
         for (uint32_t il = 0; il < n_layer; il++) {
@@ -205,23 +252,39 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
 
     // MSA requires one indexer head per GQA (KV) head, unlike the DSA archs where the
     // indexer head count is independent of the main attention head count.
-    ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,   arch == LLM_ARCH_MINIMAX_M3 ? n_head : uint32_t(1));
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,   arch == LLM_ARCH_MINIMAX_M3 || arch == LLM_ARCH_DEEPSEEK4 ? n_head : uint32_t(1));
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,   uint32_t(64));
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,        uint32_t(8));
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_BLOCK_SIZE,   uint32_t(4));
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_LOCAL_BLOCKS, uint32_t(1));
     ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS, std::vector<uint32_t>({n_embd_head/4, n_embd_head/4, n_embd_head/4, n_embd_head/4}));
+
+    if (arch == LLM_ARCH_DEEPSEEK4) {
+        ms.add_kv(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,         uint32_t(8));
+        ms.add_kv(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,           uint32_t(32));
+        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS,            std::vector<uint32_t>({0, 0, 4, 128}));
+        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE,    160000.0f);
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,               uint32_t(4));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, uint32_t(2));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_EPSILON,             1.0e-6f);
+        ms.add_kv(LLM_KV_HASH_LAYER_COUNT,                      uint32_t(0));
+        ms.add_kv(LLM_KV_SWIGLU_CLAMP_EXP,                      10.0f);
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,                  1.0f);
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,                   true);
+    }
     ms.add_kv(LLM_KV_TOKENIZER_MODEL,         "no_vocab");
     // ms.add_kv(LLM_KV_DENSE_2_FEAT_OUT,     n_embd);
     // ms.add_kv(LLM_KV_DENSE_3_FEAT_IN,      n_embd);
 
     if (moe) {
         ms.add_kv(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, n_ff);
+        ms.add_kv(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, n_ff / 2);  // distinct from n_ff so a saver key-clobber surfaces on reload
+        ms.add_kv(LLM_KV_EXPERT_LATENT_LENGTH,       n_ff);
         ms.add_kv(LLM_KV_INTERLEAVE_MOE_LAYER_STEP,  uint32_t(2));
         ms.add_kv(LLM_KV_EXPERT_COUNT,               uint32_t(2));
         ms.add_kv(LLM_KV_EXPERT_USED_COUNT,          uint32_t(1));
         ms.add_kv(LLM_KV_EXPERT_SHARED_COUNT,        uint32_t(1));
-        ms.add_kv(LLM_KV_EXPERT_GATING_FUNC,         uint32_t(2)); // sigmoid
+        ms.add_kv(LLM_KV_EXPERT_GATING_FUNC,         arch == LLM_ARCH_DEEPSEEK4 ? uint32_t(4) : uint32_t(2)); // sqrtsoftplus : sigmoid
         ms.add_kv(LLM_KV_EXPERT_GROUP_SCALE,         1.0f);
         ms.add_kv(LLM_KV_EXPERTS_PER_GROUP,          uint32_t(1));
     }
@@ -240,8 +303,19 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_SSM_TIME_STEP_RANK,        n_head);
     ms.add_kv(LLM_KV_SSM_GROUP_COUNT,           arch == LLM_ARCH_PLAMO2 ? 0 : uint32_t(2));
     ms.add_kv(LLM_KV_KDA_HEAD_DIM,              uint32_t(128));
+    ms.add_kv(LLM_KV_KDA_SAFE_GATE,              true);
+    ms.add_kv(LLM_KV_KDA_GATE_LOWER_BOUND,       -5.0f);
+    if (arch == LLM_ARCH_BAILINGMOE3) {
+        ms.add_kv(LLM_KV_SWIGLU_CLAMP_EXP,   std::vector<float>({0.0f, 4.0f}));
+        ms.add_kv(LLM_KV_SWIGLU_CLAMP_SHEXP, std::vector<float>({0.0f, 5.0f}));
+    }
     ms.add_kv(LLM_KV_WKV_HEAD_SIZE,             n_embd/n_head);
     ms.add_kv(LLM_KV_SHORTCONV_L_CACHE,         uint32_t(3));
+    ms.add_kv(LLM_KV_RESIDUAL_SCALE,            3.5565588200778455f);
+    ms.add_kv(LLM_KV_ATTN_RES_BLOCK_SIZE,       uint32_t(12));
+    ms.add_kv(LLM_KV_ACTIVATION_SITU_BETA,      4.0f);
+    ms.add_kv(LLM_KV_ACTIVATION_SITU_LINEAR_BETA, 25.0f);
+    ms.add_kv(LLM_KV_KDA_GATE_LOWER_BOUND,      -5.0f);
 
     for (uint32_t il = 0; il < n_layer; il++) {
         ggml_tensor t;
@@ -296,6 +370,83 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     return std::make_pair(std::move(model), std::move(lctx));
 }
 
+static bool mtp_sync_test_decode(llama_model * model, uint32_t n_ubatch) {
+    const int32_t n_tokens = 4;
+    const int32_t n_embd   = llama_model_n_embd_out(model);
+
+    llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.n_ctx = 8;
+    ctx_params.n_batch = n_tokens;
+    ctx_params.n_ubatch = n_ubatch;
+    ctx_params.n_threads = 4;
+    ctx_params.n_threads_batch = 4;
+    ctx_params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+
+    llama_context_ptr ctx(llama_init_from_model(model, ctx_params));
+    if (!ctx) {
+        throw std::runtime_error("failed to create MTP context");
+    }
+
+    std::vector<llama_token> token(n_tokens);
+    std::vector<float> embd((size_t) n_tokens * n_embd, 1.0e-2f);
+    std::vector<llama_pos> pos(n_tokens);
+    std::vector<int32_t> n_seq_id(n_tokens, 1);
+    std::vector<llama_seq_id> seq_id_data(n_tokens, 0);
+    std::vector<llama_seq_id *> seq_id(n_tokens);
+    std::vector<int8_t> logits(n_tokens, 0);
+
+    for (int32_t i = 0; i < n_tokens; ++i) {
+        token[i] = i;
+        pos[i] = i;
+        seq_id[i] = &seq_id_data[i];
+    }
+    logits.back() = 1;
+
+    llama_batch batch = {
+        /*.n_tokens =*/ n_tokens,
+        /*.token    =*/ token.data(),
+        /*.embd     =*/ embd.data(),
+        /*.pos      =*/ pos.data(),
+        /*.n_seq_id =*/ n_seq_id.data(),
+        /*.seq_id   =*/ seq_id.data(),
+        /*.logits   =*/ logits.data(),
+    };
+
+    llama_perf_context_reset(ctx.get());
+    const int32_t ret = llama_decode(ctx.get(), batch);
+    if (ret != 0) {
+        throw std::runtime_error("failed to decode MTP batch");
+    }
+
+    // A synchronized multi-ubatch decode accounts its queued prompt tokens
+    // before returning. The intentionally asynchronous single-ubatch path does not.
+    return llama_perf_context(ctx.get()).n_p_eval >= n_tokens;
+}
+
+static int test_mtp_ubatch_sync(const size_t seed) {
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN35, false, true);
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    model_params.load_mtp = true;
+
+    size_t tmp = seed;
+    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tmp, model_params));
+    if (!model) {
+        throw std::runtime_error("failed to create MTP model");
+    }
+
+    if (!mtp_sync_test_decode(model.get(), 2)) {
+        fprintf(stderr, "MTP ubatches were not synchronized\n");
+        return 1;
+    }
+    if (mtp_sync_test_decode(model.get(), 4)) {
+        fprintf(stderr, "single MTP ubatch was synchronized\n");
+        return 1;
+    }
+
+    return 0;
+}
+
 static std::vector<float> get_logits(
         llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false) {
     const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
@@ -347,11 +498,14 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_DEEPSEEK:
         case LLM_ARCH_DEEPSEEK2:
         case LLM_ARCH_DEEPSEEK32:
+        case LLM_ARCH_DOTS3NOTE:
+        case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_GLM4_MOE:
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_EXAONE_MOE:
         case LLM_ARCH_BAILINGMOE:
         case LLM_ARCH_BAILINGMOE2:
+        case LLM_ARCH_BAILINGMOE3:
         case LLM_ARCH_DOTS1:
         case LLM_ARCH_AFMOE:
         case LLM_ARCH_ERNIE4_5:
@@ -363,12 +517,14 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_SMALLTHINKER:
         case LLM_ARCH_LLADA_MOE:
         case LLM_ARCH_GROVEMOE:
+        case LLM_ARCH_MINIMAX_01:
         case LLM_ARCH_MINIMAX_M2:
         case LLM_ARCH_MINIMAX_M3:
         case LLM_ARCH_RND1:
         case LLM_ARCH_PADDLEOCR:
         case LLM_ARCH_MIMO2:
         case LLM_ARCH_KIMI_LINEAR:
+        case LLM_ARCH_KIMI_K3:
         case LLM_ARCH_STEP35:
         case LLM_ARCH_MISTRAL4:
         case LLM_ARCH_MELLUM:
@@ -410,6 +566,9 @@ static bool arch_supported(const llm_arch arch) {
     if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
         return false; // FIXME @ngxson
     }
+    if (arch == LLM_ARCH_GRANITE_SWITCH) {
+        return false; // FIXME adapter fixture
+    }
     if (arch == LLM_ARCH_LLAMA_EMBED || arch == LLM_ARCH_GEMMA_EMBEDDING || arch == LLM_ARCH_T5ENCODER) {
         return false; // FIXME Embedding (?) models produce inconsistent results.
     }
@@ -426,13 +585,9 @@ static bool arch_supported(const llm_arch arch) {
     if (arch == LLM_ARCH_DEEPSEEK2OCR) {
         return false;
     }
-    if (arch == LLM_ARCH_DEEPSEEK4) {
-        return false;
-    }
-
     // FIXME: these hit scheduler/view-backed-output issues with WebGPU on CI.
 #ifdef GGML_USE_WEBGPU
-    if (arch == LLM_ARCH_DEEPSEEK32 || arch == LLM_ARCH_GLM_DSA) {
+    if (arch == LLM_ARCH_DEEPSEEK32 || arch == LLM_ARCH_GLM_DSA || arch == LLM_ARCH_DOTS3NOTE) {
         return false;
     }
 #endif // GGML_USE_WEBGPU
@@ -596,6 +751,9 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
             }
             const std::string config_name = moe ? "MoE" : "Dense";
             gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
+            if (arch == LLM_ARCH_BAILINGMOE3) {
+                GGML_ASSERT(gguf_remove_key(gguf_ctx.get(), "bailingmoe3.kda.safe_gate") >= 0);
+            }
             std::pair<llama_model_ptr, llama_context_ptr> model_and_ctx_cpu;
             std::vector<float> logits_cpu;
             for (device_config & dc : dev_configs) {
@@ -672,6 +830,7 @@ int main(int argc, char ** argv) {
     size_t seed = rd();
     ggml_log_level log_level = GGML_LOG_LEVEL_ERROR;
     std::string out;
+    bool test_mtp_sync = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
@@ -707,12 +866,18 @@ int main(int argc, char ** argv) {
                 return 1;
             }
         }
+        if (strcmp(argv[i], "--test-mtp-ubatch-sync") == 0) {
+            test_mtp_sync = true;
+        }
     }
     printf("%s: using seed %zu\n", __func__, seed);
 
     try {
         if (!out.empty()) {
             return save_models(arch, seed, log_level, out);
+        }
+        if (test_mtp_sync) {
+            return test_mtp_ubatch_sync(seed);
         }
         return test_backends(arch, seed, log_level);
     } catch (const std::exception & err) {

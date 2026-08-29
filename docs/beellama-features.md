@@ -1,6 +1,6 @@
-# BeeLlama v0.4.3 features
+# BeeLlama v0.4.4 features
 
-BeeLlama v0.4.3 keeps a small fork surface on top of upstream llama.cpp. Use
+BeeLlama v0.4.4 keeps a small fork surface on top of upstream llama.cpp. Use
 this page to choose a feature; use the [argument reference](beellama-args.md)
 for exact names, environment variables, defaults, and validation ranges.
 
@@ -153,13 +153,13 @@ buffer-device-address support. CPU placement is valid with KV offload disabled.
 
 | NVIDIA architecture | Toolkit and package | Native KVarN route | Qualification |
 |---|---|---|---|
-| Turing and newer, SM 7.5+ | CUDA 12.4 or 13.1 | Specialized MMA/split/vector routes with portable fallback | Current release tier; CUDA 13.1 is locally exercised on SM 8.6 |
+| Turing and newer, SM 7.5+ | CUDA 12.4 or 13.3 | Specialized MMA/split/vector routes with portable fallback | Current release tier; CUDA 13.3 requires preview qualification, while its CUDA 13.1 predecessor was locally exercised on SM 8.6 |
 | Volta, SM 7.0/7.2 | CUDA 12.4 | Portable direct body-plus-tail attention | Explicit build target; real-device validation required |
 | Pascal, SM 6.0/6.1/6.2 | CUDA 12.4 | Portable direct body-plus-tail attention | Priority compatibility target for issue #112; real-device validation required |
 | Maxwell, SM 5.0/5.2/5.3 | CUDA 12.4 | Portable direct body-plus-tail attention | Experimental until an SM 5.2 device passes runtime gates |
-| Kepler | Not in the CUDA 12.4/13.1 release lane | None | Unsupported |
+| Kepler | Not in the CUDA 12.4/13.3 release lane | None | Unsupported |
 
-Use the CUDA 12.4 release package for Maxwell, Pascal, or Volta. CUDA 13.1
+Use the CUDA 12.4 release package for Maxwell, Pascal, or Volta. CUDA 13.3
 does not contain device code for those architectures. Build coverage proves
 that a translation unit accepts a target; it does not prove runtime
 correctness, memory behavior, or performance on that GPU.
@@ -540,15 +540,17 @@ measure the exact workload before deploying it.
 ### What it is
 
 Bee uses upstream `draft-dflash` for drafting and adds a server-side profit
-controller. If the draft maximum is omitted, Bee reads `dflash.block_size` and
-uses one less than the block size, normally 15; the controller remains
-default-on and can select shallower depths at runtime.
+controller for DFlash1. If the draft maximum is omitted, Bee reads
+`dflash.block_size` and uses one less than the block size, normally 15; the
+controller remains default-on and can select shallower DFlash1 depths at
+runtime. DFlash2 uses its fixed trained block limit and selector confidence.
 
 ### When to use it
 
 Use DFlash when you have an upstream-format drafter trained for the exact target
-model. Let the metadata-derived maximum and profit controller establish a
-baseline before pinning a smaller depth.
+model. For DFlash1, let the metadata-derived maximum and profit controller
+establish a baseline before pinning a smaller depth. For DFlash2, tune the
+static maximum and selector confidence against the target workload.
 
 ### Key arguments
 
@@ -569,7 +571,8 @@ cross-build oracle for speculative decoding.
 
 The drafter must expose upstream `dflash` architecture metadata and tensor
 names. Other DFlash GGUF schemas are unsupported. The profit controls apply only
-to DFlash; upstream simple, EAGLE3, MTP, and n-gram modes keep their own defaults.
+to DFlash1; DFlash2, upstream simple, EAGLE3, MTP, and n-gram modes keep their
+own draft-depth behavior.
 
 ## Reasoning loop guard and realtime control
 

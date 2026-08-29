@@ -2,7 +2,7 @@
 
 #include "common.cuh"
 
-constexpr uint32_t GGML_CUDA_KVARN_STORE_ROUTE_STATS_ABI_VERSION = 1;
+constexpr uint32_t GGML_CUDA_KVARN_STORE_ROUTE_STATS_ABI_VERSION = 2;
 
 struct ggml_cuda_kvarn_store_route_stats {
     uint32_t struct_size;
@@ -13,6 +13,9 @@ struct ggml_cuda_kvarn_store_route_stats {
     uint64_t direct_store;
     uint64_t high_shared_fallback;
     uint64_t low_shared_store;
+    uint64_t sealer_128;
+    uint64_t sealer_256;
+    uint64_t sealer_candidates;
 };
 
 void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

@@ -422,7 +422,7 @@ static const cmd_params cmd_params_defaults = {
     /* n_gpu_layers         */ { -1 },
     /* n_cpu_moe            */ { 0 },
     /* split_mode           */ { LLAMA_SPLIT_MODE_LAYER },
-    /* load_mode            */ { LLAMA_LOAD_MODE_MMAP },
+    /* load_mode            */ { LLAMA_LOAD_MODE_AUTO },
     /* main_gpu             */ { 0 },
     /* no_kv_offload        */ { false },
     /* flash_attn           */ { LLAMA_FLASH_ATTN_TYPE_AUTO },
@@ -501,7 +501,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -nkvo, --no-kv-offload <0|1>                      (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
     printf("  -fa, --flash-attn <on|off|auto>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.flash_attn, llama_flash_attn_type_name), ",").c_str());
     printf("  -dev, --device <dev0/dev1/...>                    (default: auto)\n");
-    printf("  -lm, --load-mode <none|mmap|mlock|mmap+mlock|dio> (default: %s)\n", join(transform_to_str(cmd_params_defaults.load_mode, llama_load_mode_name), ",").c_str());
+    printf("  -lm, --load-mode <auto|none|mmap|mlock|mmap+mlock|dio> (default: %s)\n", join(transform_to_str(cmd_params_defaults.load_mode, llama_load_mode_name), ",").c_str());
     printf("  -mmp, --mmap <0|1>                                (DEPRECATED IN FAVOUR OF --load-mode)\n");
     printf("  -dio, --direct-io <0|1>                           (DEPRECATED IN FAVOUR OF --load-mode)\n");
     printf("  -embd, --embeddings <0|1>                         (default: %s)\n", join(cmd_params_defaults.embeddings, ",").c_str());
@@ -952,7 +952,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 std::vector<llama_load_mode> modes;
                 for (const auto & m : p) {
                     llama_load_mode mode;
-                    if (m == "none") {
+                    if (m == "auto") {
+                        mode = LLAMA_LOAD_MODE_AUTO;
+                    } else if (m == "none") {
                         mode = LLAMA_LOAD_MODE_NONE;
                     } else if (m == "mmap") {
                         mode = LLAMA_LOAD_MODE_MMAP;
@@ -1032,7 +1034,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     invalid_param = true;
                     break;
                 }
-                LOG_WRN("DEPRECATED: -mmp and --mmap are deprecated in favour of --load-mode. Please use --load-mode mmap instead.");
+                LOG_WRN("DEPRECATED: -mmp and --mmap are deprecated in favour of --load-mode. Please use --load-mode mmap instead.\n");
                 auto p = string_split<bool>(argv[i], split_delim);
 
                 std::vector<llama_load_mode> modes;
@@ -1051,7 +1053,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     invalid_param = true;
                     break;
                 }
-                LOG_WRN("DEPRECATED: -dio and --direct-io are deprecated in favour of --load-mode. Please use --load-mode dio instead.");
+                LOG_WRN("DEPRECATED: -dio and --direct-io are deprecated in favour of --load-mode. Please use --load-mode dio instead.\n");
                 auto p = string_split<bool>(argv[i], split_delim);
 
                 std::vector<llama_load_mode> modes;
@@ -1450,7 +1452,7 @@ struct cmd_params_instance {
             merged.reserve(merged.size() + (size_t) n_cpu_moe + 1);
 
             for (int i = 0; i < n_cpu_moe; ++i) {
-                patterns.push_back(llm_ffn_exps_block_regex(i));
+                patterns.push_back(llm_ffn_block_regex(i, LLM_FFN_EXPS_REGEX));
                 merged.push_back({ patterns.back().c_str(),
                                 ggml_backend_cpu_buffer_type() });
             }
@@ -1681,6 +1683,27 @@ struct test {
     uint64_t                 kvarn_route_direct = 0;
     uint64_t                 kvarn_route_compact_tail = 0;
     uint64_t                 kvarn_route_generic_rejected = 0;
+    uint64_t                 kvarn_route_unified_partial = 0;
+    uint64_t                 kvarn_geometry_candidates = 0;
+    uint64_t                 kvarn_geometry_split_8 = 0;
+    uint64_t                 kvarn_geometry_split_16 = 0;
+    uint64_t                 kvarn_geometry_split_32 = 0;
+    uint64_t                 kvarn_geometry_split_64 = 0;
+    uint64_t                 kvarn_geometry_candidate_mask = 0;
+    uint64_t                 kvarn_capability_key = 0;
+    uint32_t                 kvarn_capability_subgroup_width = 0;
+    uint32_t                 kvarn_capability_compute_units = 0;
+    uint32_t                 kvarn_capability_max_threads = 0;
+    uint32_t                 kvarn_capability_shared_kib = 0;
+    uint64_t                 kvarn_store_headwide_workspace = 0;
+    uint64_t                 kvarn_store_headwide_monolithic = 0;
+    uint64_t                 kvarn_store_single_slice_workspace = 0;
+    uint64_t                 kvarn_store_direct = 0;
+    uint64_t                 kvarn_store_high_shared_fallback = 0;
+    uint64_t                 kvarn_store_low_shared = 0;
+    uint64_t                 kvarn_sealer_128 = 0;
+    uint64_t                 kvarn_sealer_256 = 0;
+    uint64_t                 kvarn_sealer_candidates = 0;
     uint64_t                 kv_k_payload_bytes = 0;
     uint64_t                 kv_v_payload_bytes = 0;
     uint64_t                 kv_exact_tail_bytes = 0;
@@ -1690,6 +1713,7 @@ struct test {
     uint64_t                 kv_rollback_reserve_bytes = 0;
     uint64_t                 kv_transient_estimate_bytes = 0;
     uint64_t                 kv_staging_bytes = 0;
+    uint64_t                 kv_stage_rotated_bytes = 0;
     uint64_t                 kv_metadata_bytes = 0;
     uint64_t                 kv_padding_bytes = 0;
     uint64_t                 kv_resident_bytes = 0;
@@ -1849,10 +1873,18 @@ struct test {
             "kvarn_route_families", "kvarn_route_portable", "kvarn_route_amd_generic",
             "kvarn_route_amd_split", "kvarn_route_amd_vector", "kvarn_route_materialize",
             "kvarn_route_split_reduce", "kvarn_route_direct", "kvarn_route_compact_tail",
-            "kvarn_route_generic_rejected",
+            "kvarn_route_generic_rejected", "kvarn_route_unified_partial",
+            "kvarn_geometry_candidates", "kvarn_geometry_split_8", "kvarn_geometry_split_16",
+            "kvarn_geometry_split_32", "kvarn_geometry_split_64", "kvarn_geometry_candidate_mask",
+            "kvarn_capability_key", "kvarn_capability_subgroup_width", "kvarn_capability_compute_units",
+            "kvarn_capability_max_threads", "kvarn_capability_shared_kib",
+            "kvarn_store_headwide_workspace", "kvarn_store_headwide_monolithic",
+            "kvarn_store_single_slice_workspace", "kvarn_store_direct",
+            "kvarn_store_high_shared_fallback", "kvarn_store_low_shared",
+            "kvarn_sealer_128", "kvarn_sealer_256", "kvarn_sealer_candidates",
             "kv_k_payload_bytes", "kv_v_payload_bytes", "kv_exact_tail_bytes", "kv_exact_history_bytes",
             "kv_exact_overlay_bytes", "kv_native_exact_bytes", "kv_rollback_reserve_bytes",
-            "kv_transient_estimate_bytes", "kv_staging_bytes",
+            "kv_transient_estimate_bytes", "kv_staging_bytes", "kv_stage_rotated_bytes",
             "kv_metadata_bytes", "kv_padding_bytes", "kv_resident_bytes", "kv_global_resident_bytes",
             "kv_swa_resident_bytes", "kv_allocated_capacity_tokens", "kv_live_tokens", "kv_descriptor_bytes",
             "kv_tail_native_bodyless_layers", "kv_tail_native_mixed_layers",
@@ -1878,7 +1910,7 @@ struct test {
 
     static field_type get_field_type(const std::string & field) {
         const bool bytes_field = field.size() >= 6 && field.compare(field.size() - 6, 6, "_bytes") == 0;
-        if (bytes_field || string_starts_with(field, "cuda_") ||
+        if (bytes_field || string_starts_with(field, "cuda_") || string_starts_with(field, "kvarn_") ||
                 field == "kv_allocated_capacity_tokens" || field == "kv_live_tokens") {
             return INT;
         }
@@ -1982,6 +2014,27 @@ struct test {
                                              std::to_string(kvarn_route_direct),
                                              std::to_string(kvarn_route_compact_tail),
                                              std::to_string(kvarn_route_generic_rejected),
+                                             std::to_string(kvarn_route_unified_partial),
+                                             std::to_string(kvarn_geometry_candidates),
+                                             std::to_string(kvarn_geometry_split_8),
+                                             std::to_string(kvarn_geometry_split_16),
+                                             std::to_string(kvarn_geometry_split_32),
+                                             std::to_string(kvarn_geometry_split_64),
+                                             std::to_string(kvarn_geometry_candidate_mask),
+                                             std::to_string(kvarn_capability_key),
+                                             std::to_string(kvarn_capability_subgroup_width),
+                                             std::to_string(kvarn_capability_compute_units),
+                                             std::to_string(kvarn_capability_max_threads),
+                                             std::to_string(kvarn_capability_shared_kib),
+                                             std::to_string(kvarn_store_headwide_workspace),
+                                             std::to_string(kvarn_store_headwide_monolithic),
+                                             std::to_string(kvarn_store_single_slice_workspace),
+                                             std::to_string(kvarn_store_direct),
+                                             std::to_string(kvarn_store_high_shared_fallback),
+                                             std::to_string(kvarn_store_low_shared),
+                                             std::to_string(kvarn_sealer_128),
+                                             std::to_string(kvarn_sealer_256),
+                                             std::to_string(kvarn_sealer_candidates),
                                              std::to_string(kv_k_payload_bytes),
                                              std::to_string(kv_v_payload_bytes),
                                              std::to_string(kv_exact_tail_bytes),
@@ -1991,6 +2044,7 @@ struct test {
                                              std::to_string(kv_rollback_reserve_bytes),
                                              std::to_string(kv_transient_estimate_bytes),
                                              std::to_string(kv_staging_bytes),
+                                             std::to_string(kv_stage_rotated_bytes),
                                              std::to_string(kv_metadata_bytes),
                                              std::to_string(kv_padding_bytes),
                                              std::to_string(kv_resident_bytes),
@@ -2594,6 +2648,18 @@ struct bench_kvarn_route_stats {
     uint64_t direct_entry;
     uint64_t compact_tail_entry;
     uint64_t generic_shape_rejected;
+    uint64_t unified_body_exact_partial;
+    uint64_t geometry_candidates;
+    uint64_t geometry_split_8;
+    uint64_t geometry_split_16;
+    uint64_t geometry_split_32;
+    uint64_t geometry_split_64;
+    uint64_t geometry_candidate_mask;
+    uint64_t capability_key;
+    uint32_t capability_subgroup_width;
+    uint32_t capability_compute_units;
+    uint32_t capability_max_threads;
+    uint32_t capability_shared_kib;
 };
 
 static bench_kvarn_route_stats make_bench_kvarn_route_stats(uint32_t abi_version) {
@@ -2619,6 +2685,21 @@ struct bench_kv_memory_transient_stats {
 
 using bench_kvarn_route_stats_reset_fn = void (*)();
 using bench_kvarn_route_stats_get_fn = void (*)(bench_kvarn_route_stats *);
+struct bench_kvarn_store_route_stats {
+    uint32_t struct_size;
+    uint32_t abi_version;
+    uint64_t headwide_workspace;
+    uint64_t headwide_monolithic;
+    uint64_t single_slice_workspace;
+    uint64_t direct_store;
+    uint64_t high_shared_fallback;
+    uint64_t low_shared_store;
+    uint64_t sealer_128;
+    uint64_t sealer_256;
+    uint64_t sealer_candidates;
+};
+using bench_kvarn_store_route_stats_reset_fn = void (*)();
+using bench_kvarn_store_route_stats_get_fn = void (*)(bench_kvarn_store_route_stats *);
 using bench_kv_memory_transient_stats_reset_fn = void (*)();
 using bench_kv_memory_transient_stats_get_fn = void (*)(bench_kv_memory_transient_stats *);
 using bench_cuda_memory_checkpoint_fn = bool (*)(int, uint64_t *, uint64_t *, uint64_t *);
@@ -2775,6 +2856,7 @@ int llama_bench(int argc, char ** argv) {
                 fit_overrides.data(),
                 margins.data(),
                 inst.fit_min_ctx,
+                nullptr,
                 params.verbose ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
        }
 
@@ -2798,7 +2880,7 @@ int llama_bench(int argc, char ** argv) {
         ggml_backend_dev_t memory_dev = bench_memory_device(inst);
         const char * memory_device_name = memory_dev != nullptr ? ggml_backend_dev_name(memory_dev) : nullptr;
         const uint32_t route_stats_abi_version = memory_device_name != nullptr &&
-            strncmp(memory_device_name, "Vulkan", 6) == 0 ? 1u : 2u;
+            strncmp(memory_device_name, "Vulkan", 6) == 0 ? 1u : 3u;
         ggml_backend_reg_t memory_reg =
             memory_dev != nullptr ? ggml_backend_dev_backend_reg(memory_dev) : nullptr;
         auto kvarn_route_stats_reset = memory_reg != nullptr ?
@@ -2809,6 +2891,14 @@ int llama_bench(int argc, char ** argv) {
             reinterpret_cast<bench_kvarn_route_stats_get_fn>(
                 ggml_backend_reg_get_proc_address(
                     memory_reg, "ggml_backend_kvarn_route_stats_get")) : nullptr;
+        auto kvarn_store_route_stats_reset = memory_reg != nullptr ?
+            reinterpret_cast<bench_kvarn_store_route_stats_reset_fn>(
+                ggml_backend_reg_get_proc_address(
+                    memory_reg, "ggml_backend_kvarn_store_route_stats_reset")) : nullptr;
+        auto kvarn_store_route_stats_get = memory_reg != nullptr ?
+            reinterpret_cast<bench_kvarn_store_route_stats_get_fn>(
+                ggml_backend_reg_get_proc_address(
+                    memory_reg, "ggml_backend_kvarn_store_route_stats_get")) : nullptr;
         auto kv_memory_transient_stats_reset = memory_reg != nullptr ?
             reinterpret_cast<bench_kv_memory_transient_stats_reset_fn>(
                 ggml_backend_reg_get_proc_address(
@@ -2856,6 +2946,7 @@ int llama_bench(int argc, char ** argv) {
             t.kv_rollback_reserve_bytes = kv_stats.rollback_reserve_bytes();
             t.kv_transient_estimate_bytes = kv_stats.transient_estimate_bytes();
             t.kv_staging_bytes = kv_stats.global.staging_bytes + kv_stats.swa.staging_bytes;
+            t.kv_stage_rotated_bytes = kv_stats.stage_rotated_bytes();
             t.kv_metadata_bytes = kv_stats.global.metadata_bytes + kv_stats.swa.metadata_bytes;
             t.kv_padding_bytes = kv_stats.global.padding_bytes + kv_stats.swa.padding_bytes;
             t.kv_resident_bytes = kv_stats.resident_bytes();
@@ -2900,6 +2991,9 @@ int llama_bench(int argc, char ** argv) {
 
         if (kvarn_route_stats_reset != nullptr) {
             kvarn_route_stats_reset();
+        }
+        if (kvarn_store_route_stats_reset != nullptr) {
+            kvarn_store_route_stats_reset();
         }
 
         llama_memory_clear(llama_get_memory(ctx), false);
@@ -3084,6 +3178,36 @@ int llama_bench(int argc, char ** argv) {
             t.kvarn_route_direct = stats.direct_entry;
             t.kvarn_route_compact_tail = stats.compact_tail_entry;
             t.kvarn_route_generic_rejected = stats.generic_shape_rejected;
+            if (route_stats_abi_version >= 3) {
+                t.kvarn_route_unified_partial = stats.unified_body_exact_partial;
+                t.kvarn_geometry_candidates = stats.geometry_candidates;
+                t.kvarn_geometry_split_8 = stats.geometry_split_8;
+                t.kvarn_geometry_split_16 = stats.geometry_split_16;
+                t.kvarn_geometry_split_32 = stats.geometry_split_32;
+                t.kvarn_geometry_split_64 = stats.geometry_split_64;
+                t.kvarn_geometry_candidate_mask = stats.geometry_candidate_mask;
+                t.kvarn_capability_key = stats.capability_key;
+                t.kvarn_capability_subgroup_width = stats.capability_subgroup_width;
+                t.kvarn_capability_compute_units = stats.capability_compute_units;
+                t.kvarn_capability_max_threads = stats.capability_max_threads;
+                t.kvarn_capability_shared_kib = stats.capability_shared_kib;
+            }
+        }
+
+        if (kvarn_store_route_stats_get != nullptr) {
+            bench_kvarn_store_route_stats stats = {};
+            stats.struct_size = sizeof(stats);
+            stats.abi_version = 2;
+            kvarn_store_route_stats_get(&stats);
+            t.kvarn_store_headwide_workspace = stats.headwide_workspace;
+            t.kvarn_store_headwide_monolithic = stats.headwide_monolithic;
+            t.kvarn_store_single_slice_workspace = stats.single_slice_workspace;
+            t.kvarn_store_direct = stats.direct_store;
+            t.kvarn_store_high_shared_fallback = stats.high_shared_fallback;
+            t.kvarn_store_low_shared = stats.low_shared_store;
+            t.kvarn_sealer_128 = stats.sealer_128;
+            t.kvarn_sealer_256 = stats.sealer_256;
+            t.kvarn_sealer_candidates = stats.sealer_candidates;
         }
 
         if (params.kv_memory) {

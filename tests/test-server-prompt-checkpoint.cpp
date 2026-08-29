@@ -138,6 +138,38 @@ static void restore_transaction_validation_failures_are_atomic() {
     }
 }
 
+static void restore_transaction_validation_failure_identifies_prepare_leg() {
+    const server_prompt_state_view states[] = {
+        { reinterpret_cast<const uint8_t *>("target"), 6 },
+        { reinterpret_cast<const uint8_t *>("draft"), 5 },
+        { reinterpret_cast<const uint8_t *>("spec"), 4 },
+    };
+    const server_prompt_state_kind kinds[] = {
+        SERVER_PROMPT_STATE_MAIN,
+        SERVER_PROMPT_STATE_DRAFT,
+        SERVER_PROMPT_STATE_SPECULATIVE,
+    };
+
+    for (const auto failed_kind : kinds) {
+        int committed = 0;
+        server_prompt_restore_transaction_io io {
+            /*.restore_target =*/ true,
+            /*.restore_draft =*/ true,
+            /*.restore_speculative =*/ true,
+            /*.prepare =*/ [&](server_prompt_state_kind kind, server_prompt_state_view) {
+                return kind != failed_kind;
+            },
+            /*.commit =*/ [&](server_prompt_state_kind) { ++committed; },
+        };
+        const auto result = server_prompt_restore_transaction_diagnostic(
+                states[0], states[1], states[2], io);
+        assert(!result.success);
+        assert(result.component == failed_kind);
+        assert(result.reason == SERVER_PROMPT_RESTORE_PREPARE_REJECTED);
+        assert(committed == 0);
+    }
+}
+
 static void prompt_cache_ranks_safe_restorable_prefix_before_lexical_lcp() {
     server_prompt_cache cache(1, 0);
     server_prompt_cache_state saved;
@@ -324,6 +356,7 @@ int main() {
     prompt_cache_ranks_safe_restorable_prefix_before_lexical_lcp();
     prompt_cache_load_target_success_draft_failure_is_atomic();
     restore_transaction_validation_failures_are_atomic();
+    restore_transaction_validation_failure_identifies_prepare_leg();
     speculative_rollback_checkpoint_boundary();
     checkpoint_failed_target_save_cannot_reuse_stale_bytes();
     server_unsupported_removal_falls_back_to_full_reprocess();
@@ -371,6 +404,7 @@ int main() {
             /*.data =*/ {
                 /*.main =*/ std::vector<uint8_t>(64),
                 /*.drft =*/ std::vector<uint8_t>(32),
+                /*.spec =*/ { },
             },
         };
         assert(state.accounted_size() == 128);

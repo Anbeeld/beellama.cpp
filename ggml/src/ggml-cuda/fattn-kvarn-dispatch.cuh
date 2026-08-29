@@ -5,7 +5,7 @@
 
 #include <cstdint>
 
-constexpr uint32_t GGML_CUDA_FATTN_KVARN_ROUTE_STATS_ABI_VERSION = 2;
+constexpr uint32_t GGML_CUDA_FATTN_KVARN_ROUTE_STATS_ABI_VERSION = 3;
 
 struct ggml_cuda_fattn_kvarn_route_stats {
     uint32_t struct_size;
@@ -25,6 +25,18 @@ struct ggml_cuda_fattn_kvarn_route_stats {
     uint64_t direct_entry;
     uint64_t compact_tail_entry;
     uint64_t generic_shape_rejected;
+    uint64_t unified_body_exact_partial;
+    uint64_t geometry_candidates;
+    uint64_t geometry_split_8;
+    uint64_t geometry_split_16;
+    uint64_t geometry_split_32;
+    uint64_t geometry_split_64;
+    uint64_t geometry_candidate_mask;
+    uint64_t capability_key;
+    uint32_t capability_subgroup_width;
+    uint32_t capability_compute_units;
+    uint32_t capability_max_threads;
+    uint32_t capability_shared_kib;
 };
 
 enum ggml_cuda_fattn_kvarn_entry_path {

@@ -78,28 +78,18 @@ static __device__ __forceinline__ float ggml_cuda_fattn_kvarn_load_rotated(
         if (encoded == -1) {
             return 0.0f;
         }
-        if (encoded < -1) {
-            const int64_t abs_pos = -encoded - 2;
-            group = (int) (abs_pos / GGML_CUDA_FATTN_KVARN_DIM);
-            pos = (int) (abs_pos - (int64_t) group * GGML_CUDA_FATTN_KVARN_DIM);
-            const int stage_base = desc.stream * GGML_CUDA_FATTN_KVARN_DIM * desc.stage_groups;
-            stage_pos = stage_base + (group == 0 ? pos : GGML_CUDA_FATTN_KVARN_DIM +
-                ((group - 1) % desc.tail_groups) * GGML_CUDA_FATTN_KVARN_DIM + pos);
-            return ggml_cuda_fattn_kvarn_load_stage_rotated(desc, stage_pos, record_head, dim);
-        }
         bool explicitly_staged;
-        const int64_t abs_pos = ggml_cuda_fattn_kvarn_read_cell(desc, encoded, explicitly_staged);
+        int assigned_slot = -1;
+        const int64_t abs_pos = ggml_cuda_fattn_kvarn_read_cell(
+                desc, encoded, explicitly_staged, &assigned_slot);
         group = (int) (abs_pos / GGML_CUDA_FATTN_KVARN_DIM);
         pos   = (int) (abs_pos - (int64_t) group * GGML_CUDA_FATTN_KVARN_DIM);
         from_stage = explicitly_staged ||
             (!(desc.read_indirect && !desc.swa) && ggml_cuda_fattn_kvarn_group_from_stage(desc, group));
         from_record = !explicitly_staged && (desc.read_indirect && !desc.swa ? true :
             ggml_cuda_fattn_kvarn_group_from_record(desc, group));
-        const int stage_base = desc.stream * GGML_CUDA_FATTN_KVARN_DIM * desc.stage_groups;
-        stage_pos = desc.swa ?
-            (group % desc.stage_groups) * GGML_CUDA_FATTN_KVARN_DIM + pos :
-            stage_base + (group == 0 ? pos : GGML_CUDA_FATTN_KVARN_DIM +
-                ((group - 1) % desc.tail_groups) * GGML_CUDA_FATTN_KVARN_DIM + pos);
+        stage_pos = ggml_cuda_fattn_kvarn_stage_pos(
+                desc, group, pos, assigned_slot);
         record_group = desc.swa ? group % desc.groups_per_stream :
             desc.stream * desc.groups_per_stream + group;
     } else {

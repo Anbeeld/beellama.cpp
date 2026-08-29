@@ -17,6 +17,61 @@ static __device__ __forceinline__ float ggml_cuda_fattn_kvarn_load_tail(
     return __half2float(*reinterpret_cast<const half *>(ptr));
 }
 
+struct ggml_cuda_fattn_kvarn_portable_ref {
+    bool valid;
+    bool stage;
+    int stage_pos;
+};
+
+static __device__ __forceinline__ ggml_cuda_fattn_kvarn_portable_ref
+ggml_cuda_fattn_kvarn_portable_resolve(
+        const ggml_cuda_fattn_kvarn_desc & desc, int token) {
+    ggml_cuda_fattn_kvarn_portable_ref result = {};
+    int group;
+    int pos;
+    bool explicitly_staged = false;
+    int assigned_slot = -1;
+    if (desc.swa || desc.read_indirect) {
+        const int64_t encoded = desc.indices[token];
+        if (encoded == -1) {
+            return result;
+        }
+        const int64_t absolute = ggml_cuda_fattn_kvarn_read_cell(
+                desc, encoded, explicitly_staged, &assigned_slot);
+        group = int(absolute/GGML_CUDA_FATTN_KVARN_DIM);
+        pos = int(absolute - int64_t(group)*GGML_CUDA_FATTN_KVARN_DIM);
+    } else {
+        group = token/GGML_CUDA_FATTN_KVARN_DIM;
+        pos = token - group*GGML_CUDA_FATTN_KVARN_DIM;
+    }
+    result.stage = explicitly_staged ||
+        (!(desc.read_indirect && !desc.swa) &&
+         ggml_cuda_fattn_kvarn_group_from_stage(desc, group));
+    result.valid = result.stage || (!explicitly_staged &&
+        (desc.read_indirect && !desc.swa ? true :
+         ggml_cuda_fattn_kvarn_group_from_record(desc, group)));
+    if (result.stage) {
+        result.stage_pos = ggml_cuda_fattn_kvarn_stage_pos(
+                desc, group, pos, assigned_slot);
+    }
+    return result;
+}
+
+template<int D>
+static __device__ __forceinline__ void ggml_cuda_fattn_kvarn_portable_stage_rotated(
+        const ggml_cuda_fattn_kvarn_desc & desc,
+        int stage_pos,
+        int tid,
+        float (&values)[D/GGML_CUDA_FATTN_KVARN_DIM]) {
+    constexpr int SLICES = D/GGML_CUDA_FATTN_KVARN_DIM;
+#pragma unroll
+    for (int slice = 0; slice < SLICES; ++slice) {
+        const int head = desc.head_base + slice;
+        values[slice] = __half2float(desc.stage[
+            ((int64_t) stage_pos*desc.n_record_heads + head)*GGML_CUDA_FATTN_KVARN_DIM + tid]);
+    }
+}
+
 template<int D>
 static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
         const char * q_data,
@@ -134,12 +189,24 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
             k_descs[(size_t) body_stream * n_kv_heads + kv_head];
         const ggml_cuda_fattn_kvarn_desc & v_desc =
             v_descs[(size_t) body_stream * n_kv_heads + kv_head];
+        const auto k_ref = ggml_cuda_fattn_kvarn_portable_resolve(k_desc, token);
+        const auto v_ref = ggml_cuda_fattn_kvarn_portable_resolve(v_desc, token);
+        float k_values[SLICES] = {};
+        if (k_ref.stage) {
+            ggml_cuda_fattn_kvarn_portable_stage_rotated<D>(
+                    k_desc, k_ref.stage_pos, tid, k_values);
+        } else {
+#pragma unroll
+            for (int slice = 0; slice < SLICES; ++slice) {
+                k_values[slice] = ggml_cuda_fattn_kvarn_load_rotated(
+                        k_desc, token, slice, tid);
+            }
+        }
         float partial = 0.0f;
 #pragma unroll
         for (int slice = 0; slice < SLICES; ++slice) {
             const int dim = slice * GGML_CUDA_FATTN_KVARN_DIM + tid;
-            partial += q[dim] *
-                ggml_cuda_fattn_kvarn_load_rotated(k_desc, token, slice, tid);
+            partial += q[dim] * k_values[slice];
         }
         reduction[tid] = partial;
         __syncthreads();
@@ -181,11 +248,20 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
         }
         __syncthreads();
 
+        float v_values[SLICES] = {};
+        if (v_ref.stage) {
+            ggml_cuda_fattn_kvarn_portable_stage_rotated<D>(
+                    v_desc, v_ref.stage_pos, tid, v_values);
+        } else {
+            for (int slice = 0; slice < SLICES; ++slice) {
+                v_values[slice] = ggml_cuda_fattn_kvarn_load_rotated(
+                        v_desc, token, slice, tid);
+            }
+        }
 #pragma unroll
         for (int slice = 0; slice < SLICES; ++slice) {
             accumulator[slice] = accumulator[slice] * old_scale_shared +
-                ggml_cuda_fattn_kvarn_load_rotated(v_desc, token, slice, tid) *
-                weight_shared;
+                v_values[slice] * weight_shared;
         }
         __syncthreads();
     }

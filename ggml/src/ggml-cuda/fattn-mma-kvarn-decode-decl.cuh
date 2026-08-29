@@ -13,6 +13,7 @@ struct ggml_cuda_fattn_kvarn_decode_geometry {
     int  max_blocks_per_sm;
     int  wave_efficiency_percent;
     int  n_waves;
+    int  candidate_count;
 };
 
 struct ggml_cuda_fattn_kvarn_decode_args {

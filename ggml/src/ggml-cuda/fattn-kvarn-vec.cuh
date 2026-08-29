@@ -33,7 +33,9 @@ ggml_cuda_fattn_kvarn_vec_resolve(
             return ref;
         }
         bool explicitly_staged;
-        const int64_t abs_pos = ggml_cuda_fattn_kvarn_read_cell(desc, encoded, explicitly_staged);
+        int assigned_slot = -1;
+        const int64_t abs_pos = ggml_cuda_fattn_kvarn_read_cell(
+                desc, encoded, explicitly_staged, &assigned_slot);
         group = (int) (abs_pos / GGML_CUDA_FATTN_KVARN_DIM);
         ref.pos = (int) (abs_pos - (int64_t) group * GGML_CUDA_FATTN_KVARN_DIM);
         const bool from_stage = explicitly_staged ||
@@ -42,11 +44,8 @@ ggml_cuda_fattn_kvarn_vec_resolve(
             ggml_cuda_fattn_kvarn_group_from_record(desc, group));
         if (from_stage) {
             ref.source = GGML_CUDA_FATTN_KVARN_VEC_STAGE;
-            const int stage_base = desc.stream * GGML_CUDA_FATTN_KVARN_DIM * desc.stage_groups;
-            ref.stage_pos = desc.swa ?
-                (group % desc.stage_groups) * GGML_CUDA_FATTN_KVARN_DIM + ref.pos :
-                stage_base + (group == 0 ? ref.pos : GGML_CUDA_FATTN_KVARN_DIM +
-                    ((group - 1) % desc.tail_groups) * GGML_CUDA_FATTN_KVARN_DIM + ref.pos);
+            ref.stage_pos = ggml_cuda_fattn_kvarn_stage_pos(
+                    desc, group, ref.pos, assigned_slot);
         } else if (from_record) {
             ref.source = GGML_CUDA_FATTN_KVARN_VEC_RECORD;
             ref.record_group = desc.swa ? group % desc.groups_per_stream :
@@ -326,7 +325,7 @@ static void ggml_cuda_fattn_kvarn_vec_launch_tps(
 
 template<int D, int K_BITS, int V_BITS>
 void ggml_cuda_fattn_kvarn_vec_launch(const ggml_cuda_fattn_kvarn_decode_args & args) {
-    switch (ggml_cuda_fattn_kvarn_vec_tokens_per_split()) {
+    switch (args.split_tokens) {
         case 8:
             ggml_cuda_fattn_kvarn_vec_launch_tps<D, 8, K_BITS, V_BITS>(args);
             break;

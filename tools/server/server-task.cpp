@@ -10,7 +10,7 @@
 #include "speculative.h"
 #include "server-common.h"
 
-using json = nlohmann::ordered_json;
+#include <sstream>
 
 //
 // task_params
@@ -251,39 +251,6 @@ common_chat_msg task_result_state::update_chat_msg(
 }
 
 //
-
-// result_timings
-//
-
-json result_timings::to_json() const {
-    json base = {
-        {"cache_n",                cache_n},
-        {"cache_lcp_n",            cache_lcp_n},
-        {"cache_planned_n",        cache_planned_n},
-        {"cache_reprocessed_n",    cache_reprocessed_n},
-        {"cache_source",           cache_source},
-        {"cache_reason",           cache_reason},
-
-        {"prompt_n",               prompt_n},
-        {"prompt_ms",              prompt_ms},
-        {"prompt_per_token_ms",    prompt_per_token_ms},
-        {"prompt_per_second",      prompt_per_second},
-
-        {"predicted_n",            predicted_n},
-        {"predicted_ms",           predicted_ms},
-        {"predicted_per_token_ms", predicted_per_token_ms},
-        {"predicted_per_second",   predicted_per_second},
-    };
-
-    if (draft_n > 0) {
-        base["draft_n"] = draft_n;
-        base["draft_n_accepted"] = draft_n_accepted;
-    }
-
-    return base;
-}
-
-//
 // result_prompt_progress
 //
 json result_prompt_progress::to_json() const {
@@ -349,7 +316,7 @@ json completion_token_output::probs_vector_to_json(const std::vector<completion_
 }
 
 float completion_token_output::logarithm(float x) {
-    // nlohmann::json converts -inf to null, so we need to prevent that
+    // the JSON library converts -inf to null, so we need to prevent that
     return x == 0.0f ? std::numeric_limits<float>::lowest() : std::log(x);
 }
 
@@ -404,13 +371,22 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
         {"visible_completion_tokens", visible_output_tokens},
         {"stopping_word",       stopping_word},
         {"tokens_cached",       n_tokens_cached},
-        {"timings",             timings.to_json()},
+        {"timings",             stats.to_json()},
     };
-    if (loop_guard_triggered) {
+    if (loop_guard_event.triggered) {
         res["loop_guard"] = json {
             {"triggered", true},
-            {"action", loop_guard_action},
-            {"reason", loop_guard_reason},
+            {"region", loop_guard_event.region},
+            {"detector", loop_guard_event.detector},
+            {"period", loop_guard_event.period},
+            {"coverage", loop_guard_event.coverage},
+            {"score", loop_guard_event.score},
+            {"interventions", loop_guard_event.interventions},
+            {"action", loop_guard_event.action},
+            {"decoded_token_index", loop_guard_event.decoded_token_index},
+            {"token", loop_guard_event.token},
+            {"token_piece", loop_guard_event.token_piece},
+            {"reason", loop_guard_event.reason},
         };
     }
     if (!stream && !probs_output.empty()) {
@@ -466,8 +442,8 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
     if (verbose) {
         res["__verbose"] = to_json_non_oaicompat();
     }
-    if (timings.prompt_n >= 0) {
-        res.push_back({"timings", timings.to_json()});
+    if (stats.is_set()) {
+        res["timings"] = stats.to_json();
     }
 
     return res;
@@ -514,8 +490,8 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
     if (verbose) {
         res["__verbose"] = to_json_non_oaicompat();
     }
-    if (timings.prompt_n >= 0) {
-        res.push_back({"timings", timings.to_json()});
+    if (stats.is_set()) {
+        res["timings"] = stats.to_json();
     }
 
     return res;
@@ -575,8 +551,8 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
         });
     }
 
-    if (timings.prompt_n >= 0) {
-        deltas.back().push_back({"timings", timings.to_json()});
+    if (stats.is_set()) {
+        deltas.back()["timings"] = stats.to_json();
     }
 
     // extra fields for debugging purposes
@@ -768,8 +744,8 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
         }}
     });
 
-    if (timings.prompt_n >= 0) {
-        server_sent_events.back().at("data").push_back({"timings", timings.to_json()});
+    if (stats.is_set()) {
+        server_sent_events.back().at("data")["timings"] = stats.to_json();
     }
 
     return server_sent_events;
@@ -1120,11 +1096,11 @@ json server_task_result_cmpl_partial::to_json_non_oaicompat() {
         {"tokens_evaluated", n_prompt_tokens},
     };
     // populate the timings object when needed (usually for the last response or with timings_per_token enabled)
-    if (timings.prompt_n > 0) {
-        res.push_back({"timings", timings.to_json()});
+    if (stats.is_set()) {
+        res["timings"] = stats.to_json();
     }
     if (is_progress) {
-        res.push_back({"prompt_progress", progress.to_json()});
+        res["prompt_progress"] = progress.to_json();
     }
     if (!prob_output.probs.empty()) {
         res["completion_probabilities"] = completion_token_output::probs_vector_to_json({prob_output}, post_sampling_probs);
@@ -1160,11 +1136,11 @@ json server_task_result_cmpl_partial::to_json_oaicompat() {
     if (verbose) {
         res["__verbose"] = to_json_non_oaicompat();
     }
-    if (timings.prompt_n >= 0) {
-        res.push_back({"timings", timings.to_json()});
+    if (stats.is_set()) {
+        res["timings"] = stats.to_json();
     }
     if (is_progress) {
-        res.push_back({"prompt_progress", progress.to_json()});
+        res["prompt_progress"] = progress.to_json();
     }
 
     return res;
@@ -1214,11 +1190,11 @@ json server_task_result_cmpl_partial::to_json_oaicompat_chat() {
             };
         }
 
-        if (timings.prompt_n >= 0) {
-            last_json.push_back({"timings", timings.to_json()});
+        if (stats.is_set()) {
+            last_json["timings"] = stats.to_json();
         }
         if (is_progress) {
-            last_json.push_back({"prompt_progress", progress.to_json()});
+            last_json["prompt_progress"] = progress.to_json();
         }
     }
 
@@ -1364,11 +1340,11 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
 
     if (!events.empty()) {
         json & data = events.back().at("data");
-        if (timings.prompt_n >= 0) {
-            data.push_back({"timings", timings.to_json()});
+        if (stats.is_set()) {
+            data["timings"] = stats.to_json();
         }
         if (is_progress) {
-            data.push_back({"prompt_progress", progress.to_json()});
+            data["prompt_progress"] = progress.to_json();
         }
     }
 
@@ -1572,48 +1548,162 @@ json server_task_result_error::to_json() {
 //
 // server_task_result_metrics
 //
+json server_task_result_slots::to_json() {
+    return slots_data;
+}
+
 json server_task_result_metrics::to_json() {
-    return json {
-        { "idle",                            n_idle_slots },
-        { "processing",                      n_processing_slots },
-        { "deferred",                        n_tasks_deferred },
-        { "t_start",                         t_start },
+    // not used, /metrics renders prometheus text via to_metrics()
+    return json{};
+}
 
-        { "n_prompt_tokens_processed_total", n_prompt_tokens_processed_total },
-        { "t_tokens_generation_total",       t_tokens_generation_total },
-        { "n_tokens_predicted_total",        n_tokens_predicted_total },
-        { "t_prompt_processing_total",       t_prompt_processing_total },
-
-        { "n_tokens_max",                    n_tokens_max },
-
-        { "n_prompt_tokens_processed",       n_prompt_tokens_processed },
-        { "t_prompt_processing",             t_prompt_processing },
-        { "n_tokens_predicted",              n_tokens_predicted },
-        { "t_tokens_generation",             t_tokens_generation },
-
-        { "n_decode_total",                  n_decode_total },
-        { "n_busy_slots_total",              n_busy_slots_total },
-
-        { "kv_tail_requested",               kv_tail_requested },
-        { "kv_tail_exact",                   kv_tail_exact },
-        { "kv_tail_complete_groups",         kv_tail_complete_groups },
-        { "kv_tail_partial_groups",          kv_tail_partial_groups },
-        { "kv_tail_none_groups",             kv_tail_none_groups },
-        { "kv_tail_degraded_sequences",      kv_tail_degraded_sequences },
-        { "prompt_cache_admission_attempts",  prompt_cache_admission_attempts },
-        { "prompt_cache_admission_successes", prompt_cache_admission_successes },
-        { "prompt_cache_admission_failures",  prompt_cache_admission_failures },
-        { "prompt_cache_restore_attempts",    prompt_cache_restore_attempts },
-        { "prompt_cache_restore_successes",   prompt_cache_restore_successes },
-        { "prompt_cache_restore_failures",    prompt_cache_restore_failures },
-        { "prompt_cache_accounted_bytes",     prompt_cache_accounted_bytes },
-        { "n_draft_tokens_total",            n_draft_tokens_total },
-        { "n_draft_accepted_total",          n_draft_accepted_total },
-        { "n_draft_verif_steps_total",       n_draft_verif_steps_total },
-        { "n_accepted_per_pos_total",        n_accepted_per_pos_total },
-
-        { "slots",                           slots_data },
+// metrics definition: https://prometheus.io/docs/practices/naming/#metric-names
+std::string server_task_result_metrics::to_metrics() {
+    const std::vector<metric_item> counters = {
+        {
+            "prompt_tokens_total",
+            "Number of prompt tokens processed, excluding cached tokens",
+            (double) metrics.prompt.count
+        }, {
+            "prompt_tokens_cached_total",
+            "Number of prompt tokens reused from the cache",
+            (double) metrics.n_prompt_cached
+        }, {
+            "prompt_seconds_total",
+            "Total time spent processing prompts",
+            metrics.prompt.time / 1.e6
+        }, {
+            "tokens_predicted_total",
+            "Number of generation tokens processed",
+            (double) metrics.predict.count
+        }, {
+            "tokens_predicted_seconds_total",
+            "Total time spent generating tokens",
+            metrics.predict.time / 1.e6
+        }, {
+            "n_decode_total",
+            "Total number of llama_decode() calls, excluding speculative decoding and multimodal decoding",
+            (double) metrics.n_decode
+        }, {
+            "n_tokens_max",
+            "Largest observed sequence length (prompt + generation)",
+            (double) metrics.n_tokens_max
+        }, {
+            "spec_decode_num_draft_tokens_total",
+            "Speculative: Total draft tokens generated",
+            (double) metrics.n_draft_tokens
+        }, {
+            "spec_decode_num_accepted_tokens_total",
+            "Speculative: Total draft tokens accepted by the target model",
+            (double) metrics.n_draft_accepted
+        }, {
+            "spec_decode_num_drafts_total",
+            "Speculative: Total speculative decoding verification steps",
+            (double) metrics.n_draft_verif_steps
+        }, {
+            "prompt_cache_admission_attempts_total",
+            "Total immutable RAM prompt-cache admission attempts",
+            (double) metrics.prompt_cache_admission_attempts
+        }, {
+            "prompt_cache_admission_successes_total",
+            "Total immutable RAM prompt-cache admissions",
+            (double) metrics.prompt_cache_admission_successes
+        }, {
+            "prompt_cache_admission_failures_total",
+            "Total rejected RAM prompt-cache admissions",
+            (double) metrics.prompt_cache_admission_failures
+        }, {
+            "prompt_cache_restore_attempts_total",
+            "Total transactional RAM prompt-cache restore attempts",
+            (double) metrics.prompt_cache_restore_attempts
+        }, {
+            "prompt_cache_restore_successes_total",
+            "Total committed RAM prompt-cache restores",
+            (double) metrics.prompt_cache_restore_successes
+        }, {
+            "prompt_cache_restore_failures_total",
+            "Total aborted RAM prompt-cache restores",
+            (double) metrics.prompt_cache_restore_failures
+        },
     };
+
+    const std::vector<metric_item> gauges = {
+        {
+            "prompt_tokens_seconds",
+            "Average prompt throughput in tokens/s",
+            metrics.prompt_bucket.n_per_second()
+        }, {
+            "predicted_tokens_seconds",
+            "Average generation throughput in tokens/s",
+            metrics.predict_bucket.n_per_second()
+        }, {
+            "requests_processing",
+            "Number of requests processing",
+            (double) n_processing_slots
+        }, {
+            "requests_deferred",
+            "Number of requests deferred",
+            (double) n_tasks_deferred
+        }, {
+            "n_busy_slots_per_decode",
+            "Average number of busy slots per llama_decode() call",
+            (double) metrics.n_busy_slots / std::max((double) metrics.n_decode, 1.0)
+        }, {
+            "kv_tail_requested_tokens",
+            "Configured exact-tail tokens currently requested across server slots and cache groups",
+            (double) metrics.kv_tail_requested
+        }, {
+            "kv_tail_exact_tokens",
+            "Exact-tail tokens currently covered across server slots and cache groups",
+            (double) metrics.kv_tail_exact
+        }, {
+            "kv_tail_complete_groups",
+            "Server slot cache groups with complete exact-tail coverage",
+            (double) metrics.kv_tail_complete_groups
+        }, {
+            "kv_tail_partial_groups",
+            "Server slot cache groups with partial exact-tail coverage",
+            (double) metrics.kv_tail_partial_groups
+        }, {
+            "kv_tail_none_groups",
+            "Server slot cache groups with no exact-tail coverage",
+            (double) metrics.kv_tail_none_groups
+        }, {
+            "kv_tail_degraded_sequences",
+            "Server slots reporting an explicit exact-tail degradation reason",
+            (double) metrics.kv_tail_degraded_sequences
+        }, {
+            "prompt_cache_accounted_bytes",
+            "Serialized RAM prompt-cache payload bytes, excluding container and allocator overhead",
+            (double) metrics.prompt_cache_accounted_bytes
+        },
+    };
+
+    std::stringstream prometheus;
+
+    auto add_items = [&prometheus](const char * type, const std::vector<metric_item> & items) {
+        for (const auto & item : items) {
+            prometheus << "# HELP llamacpp:" << item.name << " " << item.description << "\n"
+                       << "# TYPE llamacpp:" << item.name << " " << type             << "\n"
+                       << "llamacpp:"        << item.name << " " << item.value       << "\n";
+        }
+    };
+
+    add_items("counter", counters);
+    add_items("gauge",   gauges);
+
+    // labeled counter: one time series per draft position
+    if (!metrics.n_accepted_per_pos.empty()) {
+        prometheus << "# HELP llamacpp:spec_decode_num_accepted_tokens_per_pos_total"
+                      " Accepted tokens per draft position\n"
+                   << "# TYPE llamacpp:spec_decode_num_accepted_tokens_per_pos_total counter\n";
+        for (size_t i = 0; i < metrics.n_accepted_per_pos.size(); i++) {
+            prometheus << "llamacpp:spec_decode_num_accepted_tokens_per_pos_total{position=\""
+                       << i << "\"} " << metrics.n_accepted_per_pos[i] << "\n";
+        }
+    }
+
+    return prometheus.str();
 }
 
 //
@@ -1843,21 +1933,41 @@ bool server_prompt_cache::erase(const server_prompt_cache_state * entry) {
     return false;
 }
 
-bool server_prompt_restore_transaction(
+server_prompt_restore_result server_prompt_restore_transaction_diagnostic(
         server_prompt_state_view target,
         server_prompt_state_view draft,
         server_prompt_state_view speculative,
         const server_prompt_restore_transaction_io & io) {
-    if ((io.restore_target && target.size == 0) ||
-            (io.restore_draft && draft.size == 0) ||
-            !io.prepare || !io.commit) {
-        return false;
+    if (!io.prepare || !io.commit) {
+        return { false, false, SERVER_PROMPT_STATE_MAIN, SERVER_PROMPT_RESTORE_INVALID_IO };
+    }
+    if (io.restore_target && target.size == 0) {
+        return { false, true, SERVER_PROMPT_STATE_MAIN, SERVER_PROMPT_RESTORE_MISSING_REQUIRED_STATE };
+    }
+    if (io.restore_draft && draft.size == 0) {
+        return { false, true, SERVER_PROMPT_STATE_DRAFT, SERVER_PROMPT_RESTORE_MISSING_REQUIRED_STATE };
     }
 
-    if ((io.restore_target && !io.prepare(SERVER_PROMPT_STATE_MAIN, target)) ||
-            (io.restore_draft && !io.prepare(SERVER_PROMPT_STATE_DRAFT, draft)) ||
-            (io.restore_speculative && !io.prepare(SERVER_PROMPT_STATE_SPECULATIVE, speculative))) {
-        return false;
+    const auto prepare = [&](bool enabled, server_prompt_state_kind kind, server_prompt_state_view state) {
+        if (enabled && !io.prepare(kind, state)) {
+            return server_prompt_restore_result {
+                false, true, kind, SERVER_PROMPT_RESTORE_PREPARE_REJECTED
+            };
+        }
+        return server_prompt_restore_result {
+            true, false, SERVER_PROMPT_STATE_MAIN, SERVER_PROMPT_RESTORE_NONE
+        };
+    };
+    for (const auto & step : {
+            std::pair { io.restore_target, SERVER_PROMPT_STATE_MAIN },
+            std::pair { io.restore_draft, SERVER_PROMPT_STATE_DRAFT },
+            std::pair { io.restore_speculative, SERVER_PROMPT_STATE_SPECULATIVE } }) {
+        const server_prompt_state_view state = step.second == SERVER_PROMPT_STATE_MAIN ? target :
+                step.second == SERVER_PROMPT_STATE_DRAFT ? draft : speculative;
+        const auto result = prepare(step.first, step.second, state);
+        if (!result.success) {
+            return result;
+        }
     }
 
     // Speculative apply is prepared and no-fail. Memory commits likewise only
@@ -1871,10 +1981,18 @@ bool server_prompt_restore_transaction(
     if (io.restore_draft) {
         io.commit(SERVER_PROMPT_STATE_DRAFT);
     }
-    return true;
+    return { true, false, SERVER_PROMPT_STATE_MAIN, SERVER_PROMPT_RESTORE_NONE };
 }
 
 bool server_prompt_restore_transaction(
+        server_prompt_state_view target,
+        server_prompt_state_view draft,
+        server_prompt_state_view speculative,
+        const server_prompt_restore_transaction_io & io) {
+    return server_prompt_restore_transaction_diagnostic(target, draft, speculative, io).success;
+}
+
+server_prompt_restore_result server_prompt_restore_transaction_diagnostic(
         llama_context * target,
         llama_context * draft,
         common_speculative * speculative,
@@ -1927,8 +2045,26 @@ bool server_prompt_restore_transaction(
             GGML_ASSERT(llama_state_seq_restore_plan_commit(plan.get()) == expected);
         },
     };
-    return server_prompt_restore_transaction(
+    return server_prompt_restore_transaction_diagnostic(
             target_state, draft_state, speculative_state, io);
+}
+
+bool server_prompt_restore_transaction(
+        llama_context * target,
+        llama_context * draft,
+        common_speculative * speculative,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags,
+        server_prompt_state_view target_state,
+        server_prompt_state_view draft_state,
+        server_prompt_state_view speculative_state,
+        bool restore_target,
+        bool restore_draft,
+        bool restore_speculative) {
+    return server_prompt_restore_transaction_diagnostic(
+            target, draft, speculative, seq_id, flags,
+            target_state, draft_state, speculative_state,
+            restore_target, restore_draft, restore_speculative).success;
 }
 
 bool server_prompt_cache::load(
