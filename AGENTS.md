@@ -63,11 +63,11 @@ matrix use descriptor-native MMA fallback.
 Use `-DCMAKE_CUDA_ARCHITECTURES=86` for RTX 3090 and `89` for RTX 4090 when
 the build host cannot detect the target GPU.
 
-On Windows hosts matching CUDA 13.1 and compute capability 8.6, prefer:
+On Windows hosts matching CUDA 13.3 and compute capability 8.6, prefer:
 
 ```powershell
-powershell -File scripts/build-win-cuda-13.1-sm_86.ps1 -AllTests
-powershell -File scripts/build-win-cuda-13.1-sm_86-default.ps1 -AllTests
+powershell -File scripts/build-win-cuda-sm_86.ps1 -AllTests
+powershell -File scripts/build-win-cuda-sm_86-default.ps1 -AllTests
 powershell -File scripts/build-win-vulkan.ps1 -AllTests
 ```
 

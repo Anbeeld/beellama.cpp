@@ -8,8 +8,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def main() -> None:
     expected_scripts = {
-        "build-win-cuda-13.1-sm_86.ps1": "build-win-cuda-13.1-sm_86",
-        "build-win-cuda-13.1-sm_86-default.ps1": "build-win-cuda-13.1-sm_86-default",
+        "build-win-cuda-sm_86.ps1": "build-win-cuda-sm_86",
+        "build-win-cuda-sm_86-default.ps1": "build-win-cuda-sm_86-default",
         "build-win-vulkan.ps1": "build-win-vulkan",
     }
     old_scripts = (
@@ -54,6 +54,9 @@ def main() -> None:
         ):
             if required not in source:
                 raise AssertionError(f"{script_name} lacks full-test behavior: {required}")
+
+        if script_name.startswith("build-win-cuda-sm_86") and '"-DGGML_CCACHE=OFF"' not in source:
+            raise AssertionError(f"{script_name} must disable sccache for CUDA 13.3")
 
         shared_libs_test_mode = (
             '$commonFlags += "-DBUILD_SHARED_LIBS=OFF"' in source

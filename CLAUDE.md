@@ -26,11 +26,11 @@ cmake -B build -G Ninja -DGGML_CUDA=ON -DGGML_NATIVE=ON `
 cmake --build build --config Release --parallel 16
 ```
 
-For Windows hosts matching CUDA 13.1 and compute capability 8.6, use:
+For Windows hosts matching CUDA 13.3 and compute capability 8.6, use:
 
 ```powershell
-powershell -File scripts/build-win-cuda-13.1-sm_86.ps1 -AllTests
-powershell -File scripts/build-win-cuda-13.1-sm_86-default.ps1 -AllTests
+powershell -File scripts/build-win-cuda-sm_86.ps1 -AllTests
+powershell -File scripts/build-win-cuda-sm_86-default.ps1 -AllTests
 powershell -File scripts/build-win-vulkan.ps1 -AllTests
 ```
 

@@ -1,13 +1,13 @@
 param(
     [string]$OutputDir = "release-packages",
-    [string]$PackageName = "build-win-cuda-13.1-sm_86-default",
-    [string]$BuildName = "build-win-cuda-13.1-sm_86-default",
+    [string]$PackageName = "build-win-cuda-sm_86",
+    [string]$BuildName = "build-win-cuda-sm_86",
     [string]$Target = "",
     [int]$Parallel = 24,
     [switch]$Package = $false,
+    [switch]$StdQuantIteration = $false,
     [switch]$AllTests = $false,
     [switch]$SkipStage = $false,
-    [switch]$SkipConfigure = $false,
     [switch]$ConfigureOnly = $false
 )
 
@@ -16,7 +16,7 @@ $ProgressPreference = "SilentlyContinue"
 $env:MSBUILDDISABLENODEREUSE = "1"
 
 $repoRoot = $PSScriptRoot | Split-Path -Parent
-$cudaVer = "13.1"
+$cudaVer = "13.3"
 $cudaArch = "86" # RTX 3090 / GA102 / Ampere
 $cudaBase = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"
 $cudaPath = Join-Path $cudaBase "v$cudaVer"
@@ -33,17 +33,14 @@ if (Test-Path $ninjaExe) {
     exit 1
 }
 
-# Keep sccache enabled, but prevent its request-based idle timer from expiring
-# while a long CUDA template translation unit is still compiling. The daemon
-# retains a bounded lifetime after the build becomes truly inactive.
-$sccacheExe = Get-Command sccache.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-if ($sccacheExe) {
-    $env:PATH = "$($sccacheExe.DirectoryName);$env:PATH"
-    $env:SCCACHE_IDLE_TIMEOUT = "7200"
-    Write-Host "[ENV] sccache on PATH: $($sccacheExe.Source)"
-    Write-Host "[ENV] sccache idle timeout: $($env:SCCACHE_IDLE_TIMEOUT)s"
-} else {
-    Write-Host "[WARN] sccache.exe not found; compiler cache disabled"
+# sccache 0.16.0 is incompatible with CUDA 13.3 nvcc: it can lose the generated
+# PTX file during fatbinary creation. Keep CUDA compilation uncached for this toolkit.
+
+# Ensure vswhere.exe is locatable; vcvarsall.bat calls it and the script aborts under
+# -ErrorAction Stop when it is not on PATH. Standard Visual Studio Installer location.
+$vsInstaller = "C:\Program Files (x86)\Microsoft Visual Studio\Installer"
+if (Test-Path (Join-Path $vsInstaller "vswhere.exe")) {
+    $env:PATH = "$vsInstaller;$env:PATH"
 }
 
 # Activate MSVC environment for Ninja (cl.exe, link.exe, etc.).
@@ -67,8 +64,16 @@ if (-not (Test-Path $cudaPath)) {
 $env:CUDA_PATH = $cudaPath
 $env:PATH = "$cudaPath\bin;$env:PATH"
 
-# -AllTests compiles every test target, including tests hidden from Windows shared-library
-# builds or backend-dynamic-loading builds. Use a separate static build tree and skip packaging.
+# -AllTests compiles every test target, including the ones tests/CMakeLists.txt hides from the
+# default local configuration:
+#   - `if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)` skips test-reasoning-budget, test-sampling, the
+#     grammar/tokenizer-1 tests, test-chat, test-json-schema-to-grammar, test-llama-archs and
+#     test-gbnf-validator on a Windows shared-library build.
+#   - `if (NOT GGML_BACKEND_DL)` skips test-quantize-stats, test-barrier, test-quantize-fns,
+#     test-quantize-perf, test-rope and test-col2im-1d.
+# Both gates are configuration-level, so the only way to compile those sources is a static
+# build. That needs its own build tree: reusing the shared-library one would relink every
+# staged artifact. Staging is meaningless here, so it is forced off.
 if ($AllTests) {
     $SkipStage = $true
 }
@@ -78,19 +83,18 @@ $buildDir = Join-Path $repoRoot $BuildName
 $pkgDir = Join-Path $repoRoot "$OutputDir\$PackageName"
 $binDir = Join-Path $buildDir "bin"
 
-# Release flags narrowed to CUDA 13.1 + RTX 3090 with the default FA matrices.
+# Same release flags as build-release.ps1, narrowed to CUDA 13.3 + RTX 3090 only.
 # Ninja generator avoids MSBuild CUDA targets interference (lets us pick nvcc per toolkit).
 $commonFlags = @(
     "-G", "Ninja",
     "-DCMAKE_BUILD_TYPE=Release",
     "-DGGML_CUDA=ON",
-    "-DGGML_CUDA_FA_ALL_QUANTS=OFF",
-    "-DGGML_CUDA_KVARN=ON",
+    "-DGGML_CCACHE=OFF",
+    "-DGGML_CUDA_FA_ALL_QUANTS=ON",
+    "-DGGML_CUDA_KVARN=$(if ($StdQuantIteration) { 'OFF' } else { 'ON' })",
     "-DGGML_CUDA_CUB_3DOT2=ON",
-    "-DGGML_CCACHE=ON",
     "-DGGML_NATIVE=OFF",
     "-DGGML_BACKEND_DL=$(if ($AllTests) { 'OFF' } else { 'ON' })",
-    "-DBUILD_SHARED_LIBS=$(if ($AllTests) { 'OFF' } else { 'ON' })",
     "-DGGML_RPC=ON",
     "-DLLAMA_BUILD_BORINGSSL=ON",
     "-DLLAMA_BUILD_EXAMPLES=ON",
@@ -100,9 +104,13 @@ $commonFlags = @(
     "-DCMAKE_CUDA_ARCHITECTURES=$cudaArch"
 )
 
+if ($AllTests) {
+    # GGML_BACKEND_DL requires BUILD_SHARED_LIBS (ggml/src/CMakeLists.txt), so both flip together.
+    $commonFlags += "-DBUILD_SHARED_LIBS=OFF"
+}
+
 Write-Host "========================================"
-Write-Host "BeeLlama.cpp Windows CUDA 13.1 sm_86 Default-Pairs Build"
-Write-Host "FA mode: DEFAULT standard pairs; 15 default KVarN fast-decode pairs"
+Write-Host "BeeLlama.cpp Windows CUDA 13.3 sm_86 Build"
 Write-Host "CUDA:    $cudaVer"
 Write-Host "Arch:    sm_$cudaArch"
 Write-Host "Build:   $buildDir"
@@ -112,31 +120,23 @@ Write-Host "Jobs:    $Parallel"
 Write-Host "Zip:     disabled"
 Write-Host "========================================"
 
-if ($SkipConfigure) {
-    if (-not (Test-Path (Join-Path $buildDir "build.ninja"))) {
-        Write-Host "[FAIL] SkipConfigure requested but build.ninja is missing in $buildDir"
-        exit 1
-    }
-    Write-Host "`n[CONFIGURE] skipped; reusing $buildDir\build.ninja"
-} else {
-    # --- CMake Configure ---
-    Write-Host "`n[CONFIGURE] cmake -S $repoRoot -B $buildDir"
-    $cmakeArgs = @("-S", $repoRoot, "-B", $buildDir)
-    $cmakeArgs += $commonFlags
-    $cmakeArgs += "-DCUDAToolkit_ROOT=$cudaPath"
-    $cmakeArgs += "-DCMAKE_CUDA_COMPILER=$cudaPath\bin\nvcc.exe"
-    $cmakeArgs += "-DCMAKE_MAKE_PROGRAM=$ninjaExe"
+# --- CMake Configure ---
+Write-Host "`n[CONFIGURE] cmake -S $repoRoot -B $buildDir"
+$cmakeArgs = @("-S", $repoRoot, "-B", $buildDir)
+$cmakeArgs += $commonFlags
+$cmakeArgs += "-DCUDAToolkit_ROOT=$cudaPath"
+$cmakeArgs += "-DCMAKE_CUDA_COMPILER=$cudaPath\bin\nvcc.exe"
+$cmakeArgs += "-DCMAKE_MAKE_PROGRAM=$ninjaExe"
 
-    $prevEAP = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    & cmake @cmakeArgs 2>&1 | ForEach-Object { Write-Host $_ }
-    $ErrorActionPreference = $prevEAP
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "[FAIL] CMake configure failed (exit code $LASTEXITCODE)"
-        exit 1
-    }
-    Write-Host "[OK] CMake configured"
+$prevEAP = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+& cmake @cmakeArgs 2>&1 | ForEach-Object { Write-Host $_ }
+$ErrorActionPreference = $prevEAP
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[FAIL] CMake configure failed (exit code $LASTEXITCODE)"
+    exit 1
 }
+Write-Host "[OK] CMake configured"
 
 if ($ConfigureOnly) {
     Write-Host "[DONE] ConfigureOnly requested; build/package skipped"
@@ -148,6 +148,9 @@ $buildArgs = @("--build", $buildDir, "--parallel", "$Parallel")
 if ($Target) {
     $buildArgs += @("--target", $Target)
 } elseif ($AllTests) {
+    # Ask the generated ninja graph which test targets exist rather than hardcoding a list that
+    # would silently rot as tests/CMakeLists.txt grows. Each CMake target appears as a phony
+    # target under its own name plus a `bin/<name>.exe` path rule; keep the former only.
     $ninjaTargets = & $ninjaExe -C $buildDir -t targets all 2>$null
     $testTargets = $ninjaTargets |
         ForEach-Object { if ($_ -match "^(test-[A-Za-z0-9_.-]+):") { $matches[1] } } |
@@ -163,6 +166,9 @@ if ($Target) {
     } else {
         Write-Host "[WARN] No test-* targets discovered in the ninja graph; falling back to 'all'"
     }
+
+    # Keep going after a failure so one run reports every broken target instead of only the
+    # first. The build still exits non-zero, so the [FAIL] path below is unaffected.
     $buildArgs += @("--", "-k", "0")
 }
 Write-Host "`n[BUILD] cmake $($buildArgs -join ' ')"
