@@ -100,6 +100,9 @@ if (GGML_METAL_EMBED_LIBRARY)
             COMMAND echo ".globl _ggml_metallib_${kind_sym}_start"               >> "${ASM}"
             COMMAND echo "_ggml_metallib_${kind_sym}_start:"                     >> "${ASM}"
             COMMAND echo .incbin "\"${EMBED}\""                                  >> "${ASM}"
+            # sccache hashes only the .s contents, not the incbin'd file, so
+            # embed the source digest here to bust the cache when kernels change
+            COMMAND echo "/* src-md5: `md5 -q ${EMBED}` */"                      >> "${ASM}"
             COMMAND echo ".globl _ggml_metallib_${kind_sym}_end"                 >> "${ASM}"
             COMMAND echo "_ggml_metallib_${kind_sym}_end:"                       >> "${ASM}"
             DEPENDS ../ggml-common.h ggml-metal-impl.h

@@ -756,13 +756,15 @@ void dequantize_iq4_nl(device const block_iq4_nl * xb, short il, thread type4x4 
     const float d = xb->d;
     uint32_t aux32;
     thread const uint8_t * q8 = (thread const uint8_t *)&aux32;
+    float4x4 tmp;
     for (int i = 0; i < 4; ++i) {
         aux32 = ((q4[2*i] | (q4[2*i+1] << 16)) >> 4*il) & 0x0f0f0f0f;
-        reg[i][0] = d * kvalues_iq4nl_f[q8[0]];
-        reg[i][1] = d * kvalues_iq4nl_f[q8[1]];
-        reg[i][2] = d * kvalues_iq4nl_f[q8[2]];
-        reg[i][3] = d * kvalues_iq4nl_f[q8[3]];
+        tmp[i][0] = d * kvalues_iq4nl_f[q8[0]];
+        tmp[i][1] = d * kvalues_iq4nl_f[q8[1]];
+        tmp[i][2] = d * kvalues_iq4nl_f[q8[2]];
+        tmp[i][3] = d * kvalues_iq4nl_f[q8[3]];
     }
+    reg = (type4x4) tmp;
 }
 
 template <typename type4>

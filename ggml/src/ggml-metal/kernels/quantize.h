@@ -19,6 +19,59 @@ void quantize_q1_0(device const float * src, device block_q1_0 & dst) {
     }
 }
 
+// 2-bit: byte j of qs holds elements j, j+8, j+16, j+24, two bits each
+void quantize_q2_0s(device const float * src, device block_q2_0s & dst) {
+    float amax = 0.0f;
+    float vmax = 0.0f;
+    for (int j = 0; j < QK2_0S; ++j) {
+        if (fabs(src[j]) > amax) {
+            amax = fabs(src[j]);
+            vmax = src[j];
+        }
+    }
+    const float d  = vmax / -2.0f;
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+
+    dst.d = d;
+
+    for (int j = 0; j < QK2_0S / 4; ++j) {
+        dst.qs[j] = 0;
+    }
+    for (int j = 0; j < QK2_0S; ++j) {
+        const float x0 = src[j] * id;
+        const uint8_t xi0 = (uint8_t) clamp((int) floor(x0 + 2.5f), 0, 3);
+        dst.qs[j % (QK2_0S / 4)] |= (xi0 & 0x03) << (2 * (j / (QK2_0S / 4)));
+    }
+}
+
+void quantize_q2_1(device const float * src, device block_q2_1 & dst) {
+    float vmin = FLT_MAX;
+    float vmax = -FLT_MAX;
+    for (int j = 0; j < QK2_1; ++j) {
+        const float v = src[j];
+        if (v < vmin) {
+            vmin = v;
+        }
+        if (v > vmax) {
+            vmax = v;
+        }
+    }
+    const float d  = (vmax - vmin) / 3.0f;
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+
+    dst.d = d;
+    dst.m = vmin;
+
+    for (int j = 0; j < QK2_1 / 4; ++j) {
+        dst.qs[j] = 0;
+    }
+    for (int j = 0; j < QK2_1; ++j) {
+        const float x0 = (src[j] - vmin) * id;
+        const uint8_t xi0 = (uint8_t) clamp((int) floor(x0 + 0.5f), 0, 3);
+        dst.qs[j % (QK2_1 / 4)] |= (xi0 & 0x03) << (2 * (j / (QK2_1 / 4)));
+    }
+}
+
 void quantize_q6_0(device const float * src, device block_q6_0 & dst) {
     float amax = 0.0f;
     float vmax = 0.0f;
