@@ -127,7 +127,8 @@ public:
                  uint32_t   tail_tokens_requested = UINT32_MAX,
                      bool   tail_metadata_only = false,
                  uint32_t   tail_rollback_tokens = 0,
-                 uint32_t   tail_visibility_window = 0);
+                 uint32_t   tail_visibility_window = 0,
+                 const char * name_tag = "");
 
     ~llama_kv_cache() = default;
 
@@ -186,6 +187,9 @@ public:
     bool requires_state_for_partial_restore() const override;
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
+    void state_read_sinfo(
+            llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags,
+            slot_info_vec_t * sinfos_out, const slot_info_vec_t * sinfos_in);
 
     //
     // llama_kv_cache specific API
@@ -555,15 +559,18 @@ private:
             uint32_t version);
     void materialize_pending_copies();
     std::vector<std::vector<uint32_t>> state_read_body(
-            llama_io_read_i & io, llama_seq_id seq_id, uint32_t n_stream_cur);
-    void state_read_impl(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags);
+            llama_io_read_i & io, llama_seq_id seq_id, uint32_t n_stream_cur,
+            slot_info_vec_t * sinfos_out, const slot_info_vec_t * sinfos_in);
+    void state_read_impl(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags,
+            slot_info_vec_t * sinfos_out, const slot_info_vec_t * sinfos_in);
     void state_read_tail(
             llama_io_read_i & io,
             llama_seq_id seq_id,
             const std::vector<std::vector<uint32_t>> & restored_cells,
             llama_state_seq_flags flags);
 
-    bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1);
+    bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,
+            slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr);
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
 };
 

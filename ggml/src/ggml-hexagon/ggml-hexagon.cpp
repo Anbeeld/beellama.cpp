@@ -4643,6 +4643,7 @@ static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
         case GGML_OP_CLAMP:           return HTP_OP_CLAMP;
         case GGML_OP_SQR:             return HTP_OP_SQR;
         case GGML_OP_SQRT:            return HTP_OP_SQRT;
+        case GGML_OP_LOG:             return HTP_OP_UNARY_LOG;
         case GGML_OP_SOFT_MAX:        return HTP_OP_SOFTMAX;
         case GGML_OP_SSM_CONV:        return HTP_OP_SSM_CONV;
         case GGML_OP_GATED_DELTA_NET: return HTP_OP_GATED_DELTA_NET;
@@ -4666,6 +4667,7 @@ static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
                 case GGML_UNARY_OP_EXP:        return HTP_OP_UNARY_EXP;
                 case GGML_UNARY_OP_SOFTPLUS:   return HTP_OP_UNARY_SOFTPLUS;
                 case GGML_UNARY_OP_TANH:       return HTP_OP_UNARY_TANH;
+                case GGML_UNARY_OP_ABS:        return HTP_OP_UNARY_ABS;
             default:
                 break;
             }
@@ -4982,7 +4984,9 @@ static std::vector<int> ggml_hexagon_graph_optimize_reorder(const std::vector<ht
     return res;
 }
 
-static void ggml_backend_hexagon_graph_optimize(ggml_backend_t backend, ggml_cgraph * gf) {
+static void ggml_backend_hexagon_graph_optimize(ggml_backend_t backend, ggml_cgraph * gf, ggml_backend_graph_optimize_params * params) {
+    GGML_UNUSED(params);
+
     const int n = gf->n_nodes;
 
     constexpr int MAX_FUSE = 16;
@@ -5463,6 +5467,7 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
 
         case GGML_OP_SQR:
         case GGML_OP_SQRT:
+        case GGML_OP_LOG:
             supp = ggml_hexagon_supported_unary(sess, op);
             break;
 
@@ -5481,6 +5486,7 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
                 case GGML_UNARY_OP_SIGMOID:
                 case GGML_UNARY_OP_SOFTPLUS:
                 case GGML_UNARY_OP_TANH:
+                case GGML_UNARY_OP_ABS:
                 case GGML_UNARY_OP_SILU:
                 case GGML_UNARY_OP_GELU:
                 case GGML_UNARY_OP_GELU_QUICK:
