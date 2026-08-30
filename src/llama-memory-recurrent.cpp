@@ -1274,7 +1274,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
             }
 
             if (cell_count) {
-                io.read_tensor(p_l[il], head * p_size_row, cell_count * p_size_row);
+                io.read_tensor(p_l[il], restore_head * p_size_row, cell_count * p_size_row);
             }
         }
     }

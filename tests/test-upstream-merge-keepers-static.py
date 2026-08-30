@@ -163,6 +163,14 @@ def main() -> None:
         "the atomic DSA cache removal preflight was lost during an upstream merge",
     )
 
+    recurrent = (ROOT / "src/llama-memory-recurrent.cpp").read_text(encoding="utf-8")
+    ple_restore = recurrent.split("if (p_l[il] != nullptr)", 2)[2].split("if (!s_trans)", 1)[0]
+    require(
+        ple_restore,
+        "io.read_tensor(p_l[il], restore_head * p_size_row",
+        "PLE state must restore into the transactionally selected recurrent row",
+    )
+
     generic_kv = (ROOT / "src/llama-kv-cache.cpp").read_text(encoding="utf-8")
     generic_kv_h = (ROOT / "src/llama-kv-cache.h").read_text(encoding="utf-8")
     if generic_kv.count("dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);") < 4:
