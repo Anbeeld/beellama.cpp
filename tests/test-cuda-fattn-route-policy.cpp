@@ -51,6 +51,8 @@ int main(int argc, char ** argv) {
     ok &= expect(argc == 2, "expected repo root argument");
     ok &= expect(GGML_CUDA_FATTN_KVARN_SPECIALIZED_DECODE_MAX_Q == 16,
         "specialized CUDA KVarN attention must cover a complete DFlash verification block");
+    ok &= expect(GGML_CUDA_FATTN_KVARN_SPLIT_DEFAULT_MAX_Q == 8,
+        "CUDA KVarN split decode must cover the measured MTP verification batch range");
     if (!ok) {
         return 1;
     }
@@ -87,24 +89,24 @@ int main(int argc, char ** argv) {
             "optional body metadata changed an eligible KVarN route");
     };
 
-    expect_route({256, 1, 6, 4, 4, false, false, false, true, false},
+    expect_route({256, 1, 6, 4, 4, false, false, false, true, false, 8},
         GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_SPLIT,
         "Qwen-like D256 global decode did not select split decode");
-    expect_route({512, 1, 16, 4, 4, false, false, false, true, false},
+    expect_route({512, 1, 16, 4, 4, false, false, false, true, false, 8},
         GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_SPLIT,
         "Gemma-like D512 global decode did not select split decode");
-    expect_route({256, 1, 2, 4, 4, true, false, true, true, false},
+    expect_route({256, 1, 2, 4, 4, true, false, true, true, false, 8},
         GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_VECTOR,
         "Gemma-like D256 SWA decode did not select vector decode");
     for (int n_q = 2; n_q <= GGML_CUDA_FATTN_KVARN_SPECIALIZED_DECODE_MAX_Q; ++n_q) {
-        expect_route({256, n_q, 6, 4, 4, false, false, false, true, false},
-            GGML_CUDA_FATTN_KVARN_ROUTE_GENERIC_MMA,
-            "supported multi-token verification shape did not select tiled native MMA");
+        expect_route({256, n_q, 6, 4, 4, false, false, false, true, false, 8},
+            n_q <= 8 ? GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_SPLIT : GGML_CUDA_FATTN_KVARN_ROUTE_GENERIC_MMA,
+            "multi-token verification shape selected the wrong KVarN decode route");
     }
-    expect_route({384, 1, 6, 4, 4, false, false, false, false, false},
+    expect_route({384, 1, 6, 4, 4, false, false, false, false, false, 8},
         GGML_CUDA_FATTN_KVARN_ROUTE_GENERIC_MMA,
         "unsupported head shape did not remain on generic fallback");
-    expect_route({256, 64, 6, 4, 4, false, false, false, false, true},
+    expect_route({256, 64, 6, 4, 4, false, false, false, false, true, 8},
         GGML_CUDA_FATTN_KVARN_ROUTE_PROMPT_PREFILL,
         "prompt/prefill shape did not retain the prompt route");
     ok &= expect(ggml_cuda_fattn_kvarn_use_wide_mma(16, 6, true),

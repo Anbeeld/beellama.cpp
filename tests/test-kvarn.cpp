@@ -3465,8 +3465,10 @@ static void test_native_flash_attention_gpu() {
     require_metadata_case(256, 1, 2, 1, 4, true, 0, 1, false,
             "Gemma-like D256 SWA metadata-capable vector output differs from reference");
     for (int n_q = 2; n_q <= 16; ++n_q) {
-        require_metadata_case(256, n_q, 6, 1, 4, false, 0, 0, true,
-                "multi-token metadata-capable tiled MMA output differs from reference");
+        const bool tiled_mma = n_q > 8;
+        require_metadata_case(256, n_q, 6, 1, 4, false,
+                tiled_mma ? 0 : 1, 0, tiled_mma,
+                "multi-token metadata-capable KVarN output differs from reference");
     }
     require_metadata_case(256, 9, 6, 1, 6, false, 0, 0, true,
             "KVarN6 DFlash-sized tiled MMA output differs from reference");
@@ -3518,8 +3520,10 @@ static void test_native_flash_attention_gpu() {
     require_exact_tail_case(256, 1, 2, 1, true, 128, 0, 1, false,
             "D256 SWA vector exact-tail merge differs from generic KVarN reference");
     for (int n_q = 2; n_q <= 16; ++n_q) {
-        require_exact_tail_case(256, n_q, 6, 1, false, 128, 0, 0, true,
-                "speculative exact-tail tiled MMA output differs from generic KVarN reference");
+        const bool tiled_mma = n_q > 8;
+        require_exact_tail_case(256, n_q, 6, 1, false, 128,
+                tiled_mma ? 0 : 1, 0, tiled_mma,
+                "speculative exact-tail KVarN output differs from generic KVarN reference");
     }
 
     for (int head_dim : { 128, 256, 512 }) {

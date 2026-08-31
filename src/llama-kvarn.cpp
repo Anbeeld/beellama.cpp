@@ -425,12 +425,16 @@ std::vector<int64_t> llama_kvarn_compact_read_plan(
     cells.reserve(occupied_cells.size() + pending_cells.size());
     cells.insert(cells.end(), occupied_cells.begin(), occupied_cells.end());
     cells.insert(cells.end(), pending_cells.begin(), pending_cells.end());
-    std::set<uint32_t> seen;
+    std::vector<bool> seen(capacity, false);
     cells.erase(std::remove_if(cells.begin(), cells.end(), [&](uint32_t cell) {
         if (cell >= capacity) {
             throw std::invalid_argument("KVarN compact read-plan cell exceeds cache capacity");
         }
-        return !seen.insert(cell).second;
+        if (seen[cell]) {
+            return true;
+        }
+        seen[cell] = true;
+        return false;
     }), cells.end());
     if (cells.size() > capacity) {
         throw std::invalid_argument("KVarN compact read plan exceeds cache capacity");

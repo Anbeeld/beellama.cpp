@@ -6,6 +6,7 @@
 #define GGML_CUDA_FATTN_KVARN_OPERATION_POLICY 1
 
 constexpr int GGML_CUDA_FATTN_KVARN_SPECIALIZED_DECODE_MAX_Q = 16;
+constexpr int GGML_CUDA_FATTN_KVARN_SPLIT_DEFAULT_MAX_Q = 8;
 constexpr int GGML_CUDA_FATTN_KVARN_PORTABLE_THREADS = 128;
 constexpr uint32_t GGML_CUDA_FATTN_KVARN_PORTABLE_MAX_Q =
     std::numeric_limits<uint32_t>::max();
@@ -215,6 +216,7 @@ struct ggml_cuda_fattn_kvarn_route_input {
     bool vector_eligible;
     bool split_eligible;
     bool prompt_prefill;
+    int  split_max_q;
 };
 
 // Optional softmax metadata is an output contract, not a route constraint.
@@ -227,11 +229,8 @@ inline ggml_cuda_fattn_kvarn_route ggml_cuda_fattn_kvarn_select_route(
     if (input.vector_eligible) {
         return GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_VECTOR;
     }
-    // Split decode parallelizes one query over the KV sequence. Reusing it for
-    // speculative verification repeats K/V decoding for every query and grows
-    // its partial output with n_q * n_splits. The native MMA path instead tiles
-    // the short query batch and reuses each decoded K/V tile across those rows.
-    if (input.n_q == 1 && input.split_eligible) {
+    const int split_max_q = input.split_max_q > 0 ? input.split_max_q : 1;
+    if (input.n_q <= split_max_q && input.split_eligible) {
         return GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_SPLIT;
     }
     return GGML_CUDA_FATTN_KVARN_ROUTE_GENERIC_MMA;

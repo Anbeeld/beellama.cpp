@@ -650,10 +650,12 @@ llama_kv_cache_context * llama_kv_cache_kvarn_context::base() const {
 }
 
 bool llama_kv_cache_kvarn_context::next() {
+    compact_read_plan_cache.clear();
     return base()->next();
 }
 
 bool llama_kv_cache_kvarn_context::apply() {
+    compact_read_plan_cache.clear();
     if (!base()->apply()) {
         return false;
     }

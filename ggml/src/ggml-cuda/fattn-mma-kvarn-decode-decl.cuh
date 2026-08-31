@@ -14,6 +14,8 @@ struct ggml_cuda_fattn_kvarn_decode_geometry {
     int  wave_efficiency_percent;
     int  n_waves;
     int  candidate_count;
+    // Сколько строк запроса ведёт один блок. Единица — прежнее поведение.
+    int  q_tile;
 };
 
 struct ggml_cuda_fattn_kvarn_decode_args {
@@ -45,6 +47,7 @@ struct ggml_cuda_fattn_kvarn_decode_args {
     int n_splits;
     int split_tokens;
     int nwarps;
+    int q_tile;
     int wave_size;
     cudaStream_t stream;
 };
