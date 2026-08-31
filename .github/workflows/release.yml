@@ -1746,8 +1746,8 @@ jobs:
             manifest:org.opencontainers.image.description=BeeLlama.cpp GGUF inference with upstream DFlash and KVarN KV-cache support
             manifest:org.opencontainers.image.url=${{ github.server_url }}/${{ github.repository }}
             manifest:org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-          cache-from: type=registry,ref=${{ needs.release-meta.outputs.image_repo }}:buildcache-runtime-${{ matrix.config.name }}
-          cache-to: type=registry,ref=${{ needs.release-meta.outputs.image_repo }}:buildcache-runtime-${{ matrix.config.name }},mode=max
+          cache-from: ${{ matrix.config.name != 'rocm' && format('type=registry,ref={0}:buildcache-runtime-{1}', needs.release-meta.outputs.image_repo, matrix.config.name) || '' }}
+          cache-to: ${{ matrix.config.name != 'rocm' && format('type=registry,ref={0}:buildcache-runtime-{1},mode=max', needs.release-meta.outputs.image_repo, matrix.config.name) || '' }}
 
       - name: Record digest
         shell: bash
