@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.4.5
+
+- Updated the llama.cpp base from `6fdd0ac89` to `57291f264` (`b10689`). Notable inherited changes include Qwen3.8 Flash Next (`qwen4exp`) target support with HyperConnections, QSA sparse attention, PLE n-gram embeddings, GGUF metadata and tensor mappings, conversion, multi-GPU placement, and graph lifecycle integration, together with the upstream server, Web UI, conversion, model, and backend updates through that merge point. Bee's release workflows and fork-specific feature surface remain in place.
+- Added standalone Qwen3.8 MTP sidecar support. The draft loader now uses the configured draft model path, device, and offload settings; the Qwen4Exp MTP graph consumes target hidden states, applies the output HyperConnection mixer, and exports complete sidecars through the converter. Quantized draft caches retain the activation domain required for useful token acceptance.
+- Extended standard quantized caches, KVarN, and F16/BF16 precision tails to Qwen3.8 QSA. Sparse selection now composes with the generic attention path instead of bypassing cache writes, native KVarN routing, or precision-tail handling, while the index cache keeps a validated mirrored slot layout.
+- Hardened Qwen3.8 prompt checkpoints and repeated-request restore. Hybrid attention/index state restores transactionally across ordinary and KVarN caches, precision-tail restores rebuild mirrored slot information, KVarN delegates PLE token-history lookup to its initialized base cache, and PLE recurrent rows restore into the transactionally selected destination.
+
 ## v0.4.4
 
 - Updated the llama.cpp base from `74ce15741` to `6fdd0ac89` and ggml from 0.19.0 to 0.22.0. Notable inherited changes include Qwen3.8 DFlash2 with local convolution, candidate selection, M-RoPE, converter/GGUF support, speculative `p_min`/`n_min`, and wide-row CUDA top-k; Granite Switch/SWA, Muse Glimmer, Kimi K3, MiniMax Text, BailingMoE3, Nanbeige4.2-3B, Pocket TTS, expanded MTP, DFlash, and DSpark coverage, and multi-output backend sampling; media-aware server state, Web UI tools and navigation, stronger tool isolation, automatic iGPU-safe loading, Metal kernel splitting, Vulkan TQ2_0 and Lightning Indexer support, asynchronous RPC APIs, and Apple RDMA transport. Bee keeps adaptive draft-max on DFlash1 while DFlash2 uses its fixed trained block and selector confidence.
