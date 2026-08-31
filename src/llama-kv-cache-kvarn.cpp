@@ -736,6 +736,15 @@ const llama_kv_cache::slot_info & llama_kv_cache_kvarn_context::current_sinfo() 
     return base()->current_sinfo();
 }
 
+const llama_kv_cache::slot_info_vec_t & llama_kv_cache_kvarn_context::get_sinfos() const {
+    return base()->get_sinfos();
+}
+
+void llama_kv_cache_kvarn_context::get_prev_tokens(
+        const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
+    base()->get_prev_tokens(ubatch, n, res);
+}
+
 ggml_type llama_kv_cache_kvarn_context::type_k() const {
     return GGML_TYPE_F16;
 }
@@ -2386,6 +2395,13 @@ uint32_t llama_kv_cache_kvarn_context::native_rotated_max_query_tokens(int32_t i
 }
 
 void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    state_read_sinfo(io, seq_id, flags, nullptr, nullptr);
+}
+
+void llama_kv_cache_kvarn::state_read_sinfo(
+        llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags,
+        llama_kv_cache::slot_info_vec_t * sinfos_out,
+        const llama_kv_cache::slot_info_vec_t * sinfos_in) {
     if (has_pending_stream_copies()) {
         throw std::runtime_error("cannot restore KVarN state while a stream copy is pending");
     }
@@ -2401,7 +2417,7 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
     if (self_contained) {
         metadata_prepared->set_state_remap_group_size(KVAR_N_GROUP);
     }
-    metadata_prepared->state_read(io, seq_id, flags);
+    metadata_prepared->state_read_sinfo(io, seq_id, flags, sinfos_out, sinfos_in);
     const auto & state_cell_remap_pairs = metadata_prepared->get_state_cell_remap();
     std::unordered_map<uint32_t, uint32_t> state_cell_remap(
             state_cell_remap_pairs.begin(), state_cell_remap_pairs.end());

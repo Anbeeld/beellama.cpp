@@ -380,7 +380,8 @@ llama_kv_cache::llama_kv_cache(
                      bool   tail_metadata_only,
                  uint32_t   tail_rollback_tokens,
                  uint32_t   tail_visibility_window,
-                 const char * name_tag) :
+                 const char * name_tag,
+                     bool   disable_attn_rot) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa),
     tail_tokens(tail_tokens), tail_rollback_tokens(tail_rollback_tokens),
@@ -1267,9 +1268,11 @@ llama_kv_cache::llama_kv_cache(
         attn_rot_v = other->attn_rot_v;
     } else {
         const char * LLAMA_ATTN_ROT_DISABLE = getenv("LLAMA_ATTN_ROT_DISABLE");
-        const bool attn_rot_disable = LLAMA_ATTN_ROT_DISABLE ? atoi(LLAMA_ATTN_ROT_DISABLE) : false;
+        const bool attn_rot_disable = disable_attn_rot ||
+                (LLAMA_ATTN_ROT_DISABLE ? atoi(LLAMA_ATTN_ROT_DISABLE) : false);
         if (attn_rot_disable) {
-            LLAMA_LOG_WARN("%s: attention rotation force disabled (LLAMA_ATTN_ROT_DISABLE)\n", __func__);
+            LLAMA_LOG_WARN("%s: attention rotation disabled%s\n", __func__,
+                    disable_attn_rot ? " for this context" : " (LLAMA_ATTN_ROT_DISABLE)");
         }
 
         attn_rot_k =
@@ -4692,7 +4695,7 @@ void llama_kv_cache::state_v2_write_tail_payload(
     }
 }
 
-void llama_kv_cache::state_v2_read_payload_and_install(
+std::vector<std::vector<uint32_t>> llama_kv_cache::state_v2_read_payload_and_install(
         llama_io_read_i & io,
         llama_seq_id seq_id,
         llama_state_seq_flags flags,
@@ -5101,7 +5104,7 @@ void llama_kv_cache::state_v2_read_payload_and_install(
         } else {
             rebuild_allocation_head(seq_id);
         }
-        return;
+        return restored_cells;
     }
 
     if (seq_id == -1) {
@@ -5174,6 +5177,8 @@ void llama_kv_cache::state_v2_read_payload_and_install(
     } else {
         rebuild_allocation_head(seq_id);
     }
+
+    return restored_cells;
 }
 
 bool llama_kv_cache::requires_state_for_partial_restore() const {
@@ -5460,8 +5465,22 @@ void llama_kv_cache::state_read_impl(
         if (io.n_bytes() - manifest_begin != manifest_size) {
             throw std::runtime_error("invalid KV tail state manifest size");
         }
-        state_v2_read_payload_and_install(
+        const auto restored_cells = state_v2_read_payload_and_install(
                 io, seq_id, flags, manifest, body_payload_size, tail_payload_size, version);
+        if (sinfos_out) {
+            sinfos_out->assign(n_stream, slot_info{});
+            for (uint32_t stream = 0; stream < n_stream; ++stream) {
+                if (restored_cells[stream].empty()) {
+                    continue;
+                }
+                auto & sinfo = (*sinfos_out)[stream];
+                sinfo.s0 = stream;
+                sinfo.s1 = stream;
+                sinfo.resize(1);
+                sinfo.strm[0] = seq_id == -1 ? stream : seq_to_stream.at(seq_id);
+                sinfo.idxs[0] = restored_cells[stream];
+            }
+        }
         return;
     }
 
@@ -6625,6 +6644,10 @@ const llama_kv_cache::slot_info & llama_kv_cache_context::current_sinfo() const 
     assert(i_cur < sinfos.size());
 
     return sinfos[i_cur];
+}
+
+const llama_kv_cache::slot_info_vec_t & llama_kv_cache_context::get_sinfos() const {
+    return sinfos;
 }
 
 ggml_type llama_kv_cache_context::type_k() const {

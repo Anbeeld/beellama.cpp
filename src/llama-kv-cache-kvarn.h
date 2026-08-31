@@ -101,6 +101,8 @@ public:
     uint32_t get_n_kv() const override;
     llama_kv_cache * get_kv() const override;
     const llama_kv_cache::slot_info & current_sinfo() const override;
+    const slot_info_vec_t & get_sinfos() const override;
+    void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const override;
 
     ggml_type type_k() const override;
     ggml_type type_v() const override;
@@ -271,6 +273,10 @@ public:
     bool state_seq_can_restore(llama_seq_id seq_id, llama_state_seq_flags flags) const override;
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read(llama_io_read_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
+    void state_read_sinfo(
+            llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags,
+            llama_kv_cache::slot_info_vec_t * sinfos_out,
+            const llama_kv_cache::slot_info_vec_t * sinfos_in);
 
     llama_kv_cache * get_metadata_cache() const;
     int32_t mapped_layer_id(int32_t il) const;

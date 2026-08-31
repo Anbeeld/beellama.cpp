@@ -38,6 +38,27 @@ public:
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
                             /* the indexer cache exists only if this is given */
+    const layer_filter_cb & filter_idx,
+                 uint32_t   tail_tokens = 0,
+                ggml_type   tail_type = GGML_TYPE_F16,
+                 uint32_t   tail_tokens_requested = UINT32_MAX,
+                 uint32_t   tail_rollback_tokens = 0);
+
+    llama_memory_hybrid_idx(
+        const llama_model & model,
+        std::unique_ptr<llama_memory_i> mem_attn,
+        std::unique_ptr<llama_memory_recurrent> mem_recr,
+                ggml_type   idx_type_k,
+                ggml_type   idx_type_v,
+                     bool   idx_v_trans,
+                 uint32_t   kv_size,
+                 uint32_t   n_pad,
+                 uint32_t   n_swa,
+           llama_swa_type   swa_type,
+                 uint32_t   n_seq_max,
+                 uint32_t   n_ubatch,
+                     bool   offload,
+                     bool   unified,
     const layer_filter_cb & filter_idx);
 
     ~llama_memory_hybrid_idx() = default;
@@ -104,7 +125,7 @@ public:
     // used to create a batch processing context from a batch
     llama_memory_hybrid_idx_context(
             llama_memory_hybrid_idx * mem,
-                    slot_info_vec_t   sinfos_attn,
+             llama_memory_context_ptr ctx_attn,
                     slot_info_vec_t   sinfos_idx,
           std::vector<llama_ubatch>   ubatches);
 

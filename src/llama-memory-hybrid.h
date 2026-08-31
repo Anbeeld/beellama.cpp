@@ -159,6 +159,8 @@ public:
     //
 
     const llama_kv_cache_context * get_attn() const;
+    const llama_memory_context_i * get_attn_memory_context() const;
+    const llama_kv_cache_context * get_attn_kv_context() const;
     const llama_memory_recurrent_context * get_recr() const;
 
 private:

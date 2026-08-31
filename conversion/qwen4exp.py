@@ -24,10 +24,11 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     """
 
     model_arch = gguf.MODEL_ARCH.QWEN4EXP
-
-    # the MTP block is a separate draft head; vLLM drops it too
-    supports_mtp_export = False
-    no_mtp = True
+    mtp_only_extra_tensor_prefixes = (
+        "model.hyper_connection_mixer.hc_norm",
+        "model.hyper_connection_mixer.input_mix_weight_down",
+        "model.hyper_connection_mixer.input_mix_weight_up",
+    )
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

@@ -2698,8 +2698,9 @@ common_speculative_init_result::common_speculative_init_result(
                                     params.speculative.types.end(),
                                     COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
-    auto mparams = common_model_params_to_llama(params);
-    auto cparams = common_context_params_to_llama(params);
+    common_params params_dft = common_base_params_to_speculative(params);
+    auto mparams = common_model_params_to_llama(params_dft);
+    auto cparams = common_context_params_to_llama(params_dft);
 
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
@@ -2720,7 +2721,7 @@ common_speculative_init_result::common_speculative_init_result(
         model_path = params.speculative.draft.mparams.path;
         LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
 
-        llama_model * model_dft = llama_model_load_from_file(params.model.path.c_str(), mparams);
+        llama_model * model_dft = llama_model_load_from_file(model_path.c_str(), mparams);
         if (model_dft == NULL) {
             LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());
             return;

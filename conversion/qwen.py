@@ -292,6 +292,7 @@ class _QwenMtpMixin:
     mtp_only: bool
     _original_block_count: int | None = None
     opt_num_mtp_layers: int = 0
+    mtp_only_extra_tensor_prefixes: tuple[str, ...] = ()
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -342,7 +343,11 @@ class _QwenMtpMixin:
                 "model.embed_tokens.weight", "model.norm.weight", "lm_head.weight",
                 "embed_tokens.weight", "norm.weight",
             )
-            if not keep:
+            keep_extra = any(
+                name == prefix or name.startswith(prefix + ".")
+                for prefix in cls.mtp_only_extra_tensor_prefixes
+            )
+            if not keep and not keep_extra:
                 return None
         return name, gen
 

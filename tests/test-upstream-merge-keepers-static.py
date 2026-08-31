@@ -20,6 +20,38 @@ def main() -> None:
             f"Dream {model_type} ({layers} layers) model-size mapping was lost during an upstream merge",
         )
 
+    qwen4exp = (ROOT / "src/models/qwen4exp.cpp").read_text(encoding="utf-8")
+    qwen4exp_h = (ROOT / "src/models/models.h").read_text(encoding="utf-8")
+    for needle in (
+        "LLM_KV_NEXTN_PREDICT_LAYERS",
+        "const bool mtp_only",
+        "LLM_TENSOR_NEXTN_EH_PROJ",
+        "LLM_GRAPH_TYPE_DECODER_MTP",
+        "llama_model_qwen4exp::graph_mtp::graph_mtp",
+        "mctx_hyb != nullptr && mctx_hyb->get_idx() != nullptr",
+        "(!cparams.embeddings_nextn || cparams.embeddings_nextn_masked)",
+        "if (inp_out_ids && cparams.embeddings_nextn && !cparams.embeddings_nextn_masked)",
+    ):
+        require(qwen4exp, needle, "Qwen4Exp standalone MTP draft-head support is incomplete")
+    require(qwen4exp_h, "struct graph_mtp : public graph", "Qwen4Exp MTP graph declaration is missing")
+
+    qwen4exp_converter = (ROOT / "conversion/qwen4exp.py").read_text(encoding="utf-8")
+    require(
+        qwen4exp_converter,
+        "mtp_only_extra_tensor_prefixes = (",
+        "Qwen4Exp conversion must export its complete standalone MTP draft head",
+    )
+    for needle in (
+        "model.hyper_connection_mixer.hc_norm",
+        "model.hyper_connection_mixer.input_mix_weight_down",
+        "model.hyper_connection_mixer.input_mix_weight_up",
+    ):
+        require(
+            qwen4exp_converter,
+            needle,
+            "Qwen4Exp standalone MTP conversion must retain its output hyper-connection mixer",
+        )
+
     qwen3next = (ROOT / "src/models/qwen3next.cpp").read_text(encoding="utf-8")
     require(
         qwen3next,
@@ -110,6 +142,12 @@ def main() -> None:
     )
 
     kvarn_cache = (ROOT / "src/llama-kv-cache-kvarn.h").read_text(encoding="utf-8")
+    kvarn_cache_cpp = (ROOT / "src/llama-kv-cache-kvarn.cpp").read_text(encoding="utf-8")
+    require(
+        kvarn_cache_cpp,
+        "base()->get_prev_tokens(ubatch, n, res);",
+        "KVarN must delegate Qwen4Exp PLE token history to its initialized base cache",
+    )
     require(
         kvarn_cache,
         "return 1;",
@@ -173,6 +211,16 @@ def main() -> None:
 
     generic_kv = (ROOT / "src/llama-kv-cache.cpp").read_text(encoding="utf-8")
     generic_kv_h = (ROOT / "src/llama-kv-cache.h").read_text(encoding="utf-8")
+    require(
+        generic_kv_h,
+        "virtual void get_prev_tokens",
+        "wrapped KV contexts must be able to provide PLE token history polymorphically",
+    )
+    require(
+        generic_kv_h,
+        "bool   disable_attn_rot = false",
+        "attention-cache rotation must be selectable per context",
+    )
     if generic_kv.count("dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);") < 4:
         raise AssertionError("standard KV-tail routes must retain a concrete CPU owner for CPU buffer types")
     for retired_generic_msa in ("msa_strict_slots", "get_k_idx", "cpy_k_idx", "n_embd_k_idx"):
@@ -197,6 +245,17 @@ def main() -> None:
     null_memory_arches = create_memory.split("case LLM_ARCH_DEEPSEEK32:", 1)[0]
     if "case LLM_ARCH_DFLASH:" in null_memory_arches:
         raise AssertionError("DFlash requires its own KV cache; routing it to null memory crashes graph reservation")
+    mtp_hybrid_qwen = create_memory.split("const bool mtp_on_hybrid_qwen", 1)[1].split(";", 1)[0]
+    require(
+        mtp_hybrid_qwen,
+        "arch == LLM_ARCH_QWEN4EXP",
+        "Qwen4Exp MTP must use a plain attention cache rather than the target hybrid cache",
+    )
+    require(
+        create_memory,
+        "params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_QWEN4EXP",
+        "only the Qwen4Exp MTP cache may opt out of quantized-cache activation rotation",
+    )
 
     dflash = (ROOT / "src/models/dflash.cpp").read_text(encoding="utf-8")
     if dflash.count("Kcur = llama_mul_mat_hadamard(ctx0, Kcur") != 2:
@@ -212,6 +271,21 @@ def main() -> None:
         raise AssertionError("the omitted DFlash draft maximum must resolve before server output-buffer sizing")
     require(load_model, "params_base.n_outputs_max = output_limits.total;", "server output-buffer total was not applied")
     require(load_model, "params_base.n_outputs_max_per_seq = output_limits.per_seq;", "per-sequence output limit was not applied")
+
+    speculative = (ROOT / "common/speculative.cpp").read_text(encoding="utf-8")
+    draft_init = speculative.split(
+        "common_speculative_init_result::common_speculative_init_result", 1
+    )[1].split("common_speculative_init_result::~common_speculative_init_result", 1)[0]
+    require(
+        draft_init,
+        "common_params params_dft = common_base_params_to_speculative(params);",
+        "standalone draft loading must derive model, device, and offload settings from draft parameters",
+    )
+    require(
+        draft_init,
+        "llama_model_load_from_file(model_path.c_str(), mparams)",
+        "standalone draft loading must open the configured draft GGUF rather than the target GGUF",
+    )
 
     common_h = (ROOT / "common/common.h").read_text(encoding="utf-8")
     common_cpp = (ROOT / "common/common.cpp").read_text(encoding="utf-8")

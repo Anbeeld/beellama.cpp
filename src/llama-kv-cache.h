@@ -128,7 +128,8 @@ public:
                      bool   tail_metadata_only = false,
                  uint32_t   tail_rollback_tokens = 0,
                  uint32_t   tail_visibility_window = 0,
-                 const char * name_tag = "");
+                 const char * name_tag = "",
+                     bool   disable_attn_rot = false);
 
     ~llama_kv_cache() = default;
 
@@ -549,7 +550,7 @@ private:
             uint32_t version) const;
     void state_v2_write_body_payload(llama_io_write_i & io, const state_v2_manifest & manifest) const;
     void state_v2_write_tail_payload(llama_io_write_i & io, const state_v2_manifest & manifest) const;
-    void state_v2_read_payload_and_install(
+    std::vector<std::vector<uint32_t>> state_v2_read_payload_and_install(
             llama_io_read_i & io,
             llama_seq_id seq_id,
             llama_state_seq_flags flags,
@@ -621,6 +622,7 @@ public:
     virtual uint32_t get_n_kv() const;
     virtual llama_kv_cache * get_kv() const;
     virtual const llama_kv_cache::slot_info & current_sinfo() const;
+    virtual const slot_info_vec_t & get_sinfos() const;
 
     virtual ggml_type type_k() const;
     virtual ggml_type type_v() const;
@@ -707,7 +709,7 @@ public:
     virtual void set_input_v_rot_backend(ggml_tensor * dst) const;
 
     // see llama_kv_cache::get_prev_tokens()
-    void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
+    virtual void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
 private:
     llama_memory_status status;

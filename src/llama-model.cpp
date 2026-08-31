@@ -2486,7 +2486,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 const bool mtp_on_hybrid_qwen =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
                     (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
-                     arch == LLM_ARCH_BAILINGMOE3);
+                     arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_BAILINGMOE3);
 
                 const bool mtp_on_hybrid_nemotron =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
@@ -2530,6 +2530,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 return il < hparams.n_layer() && !hparams.is_recr(il);
                             };
                         }
+
                     }
 
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
@@ -2561,21 +2562,18 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* SWA requested     */ params.kv_tail_tokens_swa_requested,
                             /* rollback reserve  */ params.kv_tail_rollback_tokens,
                             /* SWA native exact  */ params.kv_tail_native_exact_swa);
-                    } else if (needs_mem_idx) {
-                        // QSA's attention and indexer caches must share an ordinary KV cell layout.
-                        // KVarN and precision-tail compatibility require separate mirrored-cache validation.
-                        if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED ||
-                                params.kv_tail_tokens > 0 || params.kv_tail_tokens_swa > 0) {
-                            throw std::invalid_argument(
-                                    "Qwen4Exp QSA does not support KVarN or KV precision tails");
-                        }
+                    } else if (needs_mem_idx && params.kvarn.type == LLAMA_KVARN_TYPE_DISABLED) {
+                        // QSA's indexer mirrors the ordinary KV cell layout. The shared attention builder
+                        // remains authoritative for standard quantized caches and precision tails.
                         res = new llama_memory_hybrid_idx(
                             *this, params.type_k, params.type_v, !cparams.flash_attn,
                             cparams.n_ctx_seq, 1, hparams.n_swa, hparams.swa_type,
                             GGML_TYPE_F32, GGML_TYPE_F32,
                             std::max((uint32_t) 1, cparams.n_seq_max), cparams.n_seq_max,
                             cparams.n_rs_seq, cparams.n_ubatch, cparams.offload_kqv, cparams.kv_unified,
-                            std::move(filter_attn), std::move(filter_recr), std::move(filter_idx));
+                            std::move(filter_attn), std::move(filter_recr), std::move(filter_idx),
+                            params.kv_tail_tokens, params.kv_tail_type,
+                            params.kv_tail_tokens_requested, params.kv_tail_rollback_tokens);
                     } else {
                         if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
                             std::unique_ptr<llama_memory_i> mem_attn;
@@ -2606,7 +2604,16 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     cparams.n_seq_max,
                                     cparams.n_rs_seq,
                                     filter_recr);
-                            res = new llama_memory_hybrid(*this, std::move(mem_attn), std::move(mem_recr));
+                            if (needs_mem_idx) {
+                                res = new llama_memory_hybrid_idx(
+                                        *this, std::move(mem_attn), std::move(mem_recr),
+                                        params.type_k, params.type_v, !cparams.flash_attn,
+                                        cparams.n_ctx_seq, 1, hparams.n_swa, hparams.swa_type,
+                                        cparams.n_seq_max, cparams.n_ubatch,
+                                        cparams.offload_kqv, cparams.kv_unified, std::move(filter_idx));
+                            } else {
+                                res = new llama_memory_hybrid(*this, std::move(mem_attn), std::move(mem_recr));
+                            }
                         } else {
                             res = new llama_memory_hybrid(
                                 /* model             */ *this,
@@ -2777,7 +2784,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     params.kv_tail_type,
                                     params.kv_tail_tokens_requested,
                                     false,
-                                    params.kv_tail_rollback_tokens);
+                                    params.kv_tail_rollback_tokens,
+                                    0,
+                                    "",
+                                    params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_QWEN4EXP);
                         }
                     }
                 }

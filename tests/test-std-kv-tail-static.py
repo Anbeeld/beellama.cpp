@@ -172,7 +172,7 @@ def main() -> None:
         raise AssertionError("standard exact-tail device restore does not use the device tensor protocol")
 
     state_v2_installer = state_cache_source.split(
-        "void llama_kv_cache::state_v2_read_payload_and_install(", 1
+        "llama_kv_cache::state_v2_read_payload_and_install(", 1
     )[1].split("void llama_kv_cache::state_write(", 1)[0]
     if "if (manifest.body_only)" not in state_v2_installer:
         raise AssertionError("v2 state restore does not distinguish an explicit body-only frame")

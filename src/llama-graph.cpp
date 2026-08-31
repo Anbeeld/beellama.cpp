@@ -3462,7 +3462,8 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * sinks,
         ggml_tensor * v_mla, // TODO: remove
             float     kq_scale,
-            int       il) const {
+            int       il,
+        ggml_tensor * kq_mask_override) const {
     GGML_ASSERT(v_mla == nullptr);
 
     const auto * mctx_cur = inp->mctx;
@@ -3552,7 +3553,7 @@ ggml_tensor * llm_graph_context::build_attn(
         }
     }
 
-    ggml_tensor * kq_mask = inp->get_kq_mask();
+    ggml_tensor * kq_mask = kq_mask_override ? kq_mask_override : inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = use_kvarn ?
@@ -4615,7 +4616,7 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
 
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
-    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
+    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn_kv_context());
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 
