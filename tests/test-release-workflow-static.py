@@ -76,6 +76,13 @@ def main() -> None:
         "release workflow must not run the exhaustive CUDA architecture matrix",
     )
     require(
+        "cache-from: ${{ matrix.config.name != 'rocm' && format('type=registry,ref={0}:buildcache-runtime-{1}', needs.release-meta.outputs.image_repo, matrix.config.name) || '' }}"
+        in release
+        and "cache-to: ${{ matrix.config.name != 'rocm' && format('type=registry,ref={0}:buildcache-runtime-{1},mode=max', needs.release-meta.outputs.image_repo, matrix.config.name) || '' }}"
+        in release,
+        "ROCm Docker packaging must bypass the oversized GHCR registry cache",
+    )
+    require(
         "${{ inputs.publish_release && 'stable' || 'preview' }}" in release,
         "preview and stable releases must use separate concurrency groups",
     )
