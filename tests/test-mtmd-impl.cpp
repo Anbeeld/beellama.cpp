@@ -3,6 +3,8 @@
 #include "mtmd-image.h"
 #include "mtmd-internal.h"
 
+#include "ggml-backend.h"
+
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -37,6 +39,33 @@ struct test_registry {
     static void name(testing & t);                                    \
     static const test_registry test_registry_ ## name(#name, &name);  \
     static void name(testing & t)
+
+size_t clip_set_n_threads(const std::vector<ggml_backend_t> & backends, int n_threads);
+
+MAKE_TEST(test_clip_backend_thread_propagation) {
+    ggml_backend_load_all();
+
+    ggml_backend_t cpu_backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    t.assert_true("failed to initialize CPU backend", cpu_backend != nullptr);
+    if (!cpu_backend) {
+        return;
+    }
+
+    const std::vector<ggml_backend_t> duplicate_backends = { cpu_backend, cpu_backend };
+    t.assert_equal("duplicate backend configured once", size_t(1),
+                   clip_set_n_threads(duplicate_backends, 2));
+
+    ggml_backend_t second_cpu_backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    t.assert_true("failed to initialize second CPU backend", second_cpu_backend != nullptr);
+    if (second_cpu_backend) {
+        const std::vector<ggml_backend_t> distinct_backends = { cpu_backend, second_cpu_backend };
+        t.assert_equal("distinct backends configured independently", size_t(2),
+                       clip_set_n_threads(distinct_backends, 2));
+        ggml_backend_free(second_cpu_backend);
+    }
+
+    ggml_backend_free(cpu_backend);
+}
 
 
 //

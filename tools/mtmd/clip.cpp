@@ -4366,6 +4366,28 @@ static std::vector<c2w_state_slot> list_gen_state_slots(const clip_hparams & hpa
     }
 }
 
+size_t clip_set_n_threads(const std::vector<ggml_backend_t> & backends, int n_threads) {
+    std::unordered_set<ggml_backend_t> configured;
+    size_t count = 0;
+    for (ggml_backend_t backend : backends) {
+        if (!backend || !configured.insert(backend).second) {
+            continue;
+        }
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (!reg) {
+            continue;
+        }
+        auto set_n_threads = (ggml_backend_set_n_threads_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+        if (set_n_threads) {
+            set_n_threads(backend, n_threads);
+            ++count;
+        }
+    }
+    return count;
+}
+
 bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     const clip_image_f32_batch & imgs = *params->imgs;
     int n_batch_cur = imgs.entries.size();
@@ -5637,15 +5659,13 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
             GGML_ABORT("Unknown projector type");
     }
 
-    // ggml_backend_cpu_set_n_threads(ctx->backend_cpu, n_threads);
-    ggml_backend_dev_t dev = ggml_backend_get_device(ctx->backend_cpu);
-    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
-    if (reg) {
-        auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
-        if (ggml_backend_set_n_threads_fn) {
-            ggml_backend_set_n_threads_fn(ctx->backend_cpu, params->n_threads);
-        }
+    std::vector<ggml_backend_t> thread_backends;
+    thread_backends.reserve(size_t(ggml_backend_sched_get_n_backends(ctx->sched.get())) + 1);
+    thread_backends.push_back(ctx->backend_cpu);
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(ctx->sched.get()); ++i) {
+        thread_backends.push_back(ggml_backend_sched_get_backend(ctx->sched.get(), i));
     }
+    clip_set_n_threads(thread_backends, params->n_threads);
 
     auto status = ggml_backend_sched_graph_compute(ctx->sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
