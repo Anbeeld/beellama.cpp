@@ -268,6 +268,7 @@ public:
     stream_copy_info take_pending_tail_copies();
     void commit_pending_tail_copy();
     void cancel_pending_tail_copy();
+    std::vector<int32_t> state_tail_cell_ordinals(llama_seq_id seq_id, uint32_t stream) const;
     std::vector<int32_t> state_tail_payload_slots(llama_seq_id seq_id) const;
     std::vector<uint32_t> state_source_cells(llama_seq_id seq_id) const;
     std::vector<std::vector<int32_t>> take_restored_tail_payload_slots();

@@ -1772,7 +1772,11 @@ bool llama_kv_cache_kvarn::get_can_shift() const {
 }
 
 llama_memory_i::seq_rm_capability llama_kv_cache_kvarn::get_seq_rm_capability() const {
-    return metadata->get_seq_rm_capability();
+    // Metadata can discard an unbounded suffix because KVarN owns the body, but
+    // this cache only guarantees exact in-place rollback through the current
+    // and previous staged record.
+    return llama_memory_clamp_suffix_rollback_capability(
+            metadata->get_seq_rm_capability(), KVAR_N_GROUP);
 }
 
 void llama_kv_cache_kvarn::clear(bool data) {
@@ -1855,7 +1859,18 @@ bool llama_kv_cache_kvarn::seq_rm_plan(
 bool llama_kv_cache_kvarn::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     apply_pending_stream_copies(nullptr);
     if (!can_seq_rm(seq_id, p0, p1)) {
-        LLAMA_LOG_WARN("%s: KVarN can only remove a complete sequence or the current/previous fp16 tail groups\n", __func__);
+        const bool valid_seq = seq_id >= 0 && uint32_t(seq_id) < n_seq_max;
+        const llama_pos pos_min = valid_seq ? metadata->seq_pos_min(seq_id) : -1;
+        const llama_pos pos_max = valid_seq ? metadata->seq_pos_max(seq_id) : -1;
+        const llama_pos earliest_exact =
+                std::max<llama_pos>(0, pos_max / llama_pos(KVAR_N_GROUP) - 1) *
+                llama_pos(KVAR_N_GROUP);
+        LLAMA_LOG_WARN("%s: KVarN can only remove a complete sequence or the current/previous fp16 tail groups "
+                       "(seq_id = %d, p0 = %d, p1 = %d, seq_pos_min = %d, seq_pos_max = %d, "
+                       "group = %u, earliest_exact = %d, meta_can_seq_rm = %d)\n",
+                       __func__, seq_id, p0, p1, pos_min, pos_max,
+                       unsigned(KVAR_N_GROUP), earliest_exact,
+                       int(metadata->can_seq_rm(seq_id, p0, p1)));
         return false;
     }
     return metadata->seq_rm(seq_id, p0, p1);

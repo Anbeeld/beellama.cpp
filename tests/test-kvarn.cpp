@@ -256,6 +256,28 @@ struct test_planning_memory : public test_state_memory {
     }
 };
 
+static void kvarn_suffix_rollback_capability_contract() {
+    const auto ordinary = llama_memory_suffix_rollback_capability(false, false, 7);
+    require(ordinary.full_clear && ordinary.arbitrary_ranges &&
+                    ordinary.suffix_rollback_tokens == UINT32_MAX,
+            "ordinary cache capability changed when no compact tail is present");
+
+    const auto bodyless = llama_memory_suffix_rollback_capability(true, false, 7);
+    require(bodyless.full_clear && !bodyless.arbitrary_ranges &&
+                    bodyless.suffix_rollback_tokens == 7,
+            "bodyless compact tail did not advertise its bounded rollback reserve");
+
+    const auto overlay = llama_memory_suffix_rollback_capability(true, true, 7);
+    require(overlay.full_clear && !overlay.arbitrary_ranges &&
+                    overlay.suffix_rollback_tokens == UINT32_MAX,
+            "body-backed compact tail understated its suffix rollback capability");
+
+    const auto kvarn = llama_memory_clamp_suffix_rollback_capability(overlay, KVAR_N_GROUP);
+    require(kvarn.full_clear && !kvarn.arbitrary_ranges &&
+                    kvarn.suffix_rollback_tokens == KVAR_N_GROUP,
+            "KVarN capability did not clamp the exact suffix guarantee to one record");
+}
+
 static void kvarn_composite_exclusivity_forwards() {
     const test_state_memory permissive(true, true);
     const test_state_memory contended_kvarn_like(false, false);
@@ -5000,6 +5022,7 @@ int main() {
         return 0;
     }
 
+    kvarn_suffix_rollback_capability_contract();
     kvarn_composite_exclusivity_forwards();
     kvarn_composite_removal_plan_forwards();
     kvarn_unified_save_requires_exclusive_stream();

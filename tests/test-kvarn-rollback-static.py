@@ -24,6 +24,7 @@ def main() -> None:
     source = KVAR_N_CACHE.read_text(encoding="utf-8")
     can_remove = function_body(source, "bool llama_kv_cache_kvarn::can_remove(")
     seq_rm_plan = function_body(source, "bool llama_kv_cache_kvarn::seq_rm_plan(")
+    seq_rm = function_body(source, "bool llama_kv_cache_kvarn::seq_rm(")
 
     assert "if (swa)" not in can_remove, (
         "SWA removal must use the KVarN group-safety policy instead of trusting metadata alone"
@@ -31,6 +32,8 @@ def main() -> None:
     assert "if (swa ||" not in seq_rm_plan, (
         "deep SWA rollback must widen to a complete KVarN group boundary"
     )
+    for diagnostic in ("seq_pos_min", "seq_pos_max", "earliest_exact", "meta_can_seq_rm"):
+        assert diagnostic in seq_rm, f"KVarN removal refusal omits {diagnostic} diagnostics"
 
     tests = KVAR_N_TEST.read_text(encoding="utf-8")
     assert "llama_kvarn_non_swa_tail_groups(0, 0) + 1" in tests, (

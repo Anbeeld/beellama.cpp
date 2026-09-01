@@ -1,4 +1,5 @@
 #include "llama-kv-cache.h"
+#include "llama-kv-cache-state.h"
 #include "llama-kv-cache-update.h"
 
 #include "llama-impl.h"
@@ -1350,14 +1351,13 @@ void llama_kv_cache::clear(bool data) {
 }
 
 llama_memory_i::seq_rm_capability llama_kv_cache::get_seq_rm_capability() const {
-    if (has_compact_tail()) {
-        return {
-            /* .full_clear = */ true,
-            /* .arbitrary_ranges = */ false,
-            /* .suffix_rollback_tokens = */ tail_rollback_tokens,
-        };
-    }
-    return {};
+    // can_seq_rm() only applies tail_rollback_tokens to a bodyless exact tail.
+    // A body-backed overlay, or metadata for a structured cache, can discard an
+    // arbitrarily deep exact suffix without losing surviving positions.
+    const bool suffix_unbounded =
+        tail_metadata_only || tail_plan.has_owned_body || tail_plan.has_shared_body;
+    return llama_memory_suffix_rollback_capability(
+            has_compact_tail(), suffix_unbounded, tail_rollback_tokens);
 }
 
 bool llama_kv_cache::can_seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
@@ -5784,32 +5784,38 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
 
 }
 
+std::vector<int32_t> llama_kv_cache::state_tail_cell_ordinals(
+        llama_seq_id seq_id, uint32_t stream) const {
+    const auto & cells = v_cells[stream];
+    const llama_pos pos_max = seq_id == -1 ? 0 : cells.seq_pos_max(seq_id);
+    return llama_kv_cache_state_cell_ordinals(cells.size(), [&](uint32_t cell) {
+        bool included = !cells.is_empty(cell) && (seq_id == -1 || cells.seq_has(cell, seq_id));
+        if (included && seq_id != -1) {
+            included = !llama_hparams::is_masked_swa(
+                    n_swa, swa_type, cells.pos_get(cell), pos_max);
+        }
+        return included;
+    });
+}
+
 std::vector<int32_t> llama_kv_cache::state_tail_payload_slots(llama_seq_id seq_id) const {
     GGML_ASSERT(tail);
 
     std::vector<int32_t> result;
     std::unordered_map<int32_t, uint32_t> payload_by_slot;
+    std::unordered_map<uint32_t, std::vector<int32_t>> ordinals_by_stream;
     for (const auto & entry : tail->snapshot(seq_id)) {
         if (entry.identity.stream >= v_cells.size()) {
             continue;
         }
-        const auto & cells = v_cells[entry.identity.stream];
-        bool found = false;
-        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
-            bool included = !cells.is_empty(cell) && (seq_id == -1 || cells.seq_has(cell, seq_id));
-            if (included && seq_id != -1) {
-                included = !llama_hparams::is_masked_swa(
-                        n_swa, swa_type, cells.pos_get(cell), cells.seq_pos_max(seq_id));
-            }
-            if (!included) {
-                continue;
-            }
-            if (cell == entry.identity.cell) {
-                found = true;
-                break;
-            }
+        auto ordinals = ordinals_by_stream.find(entry.identity.stream);
+        if (ordinals == ordinals_by_stream.end()) {
+            ordinals = ordinals_by_stream.emplace(
+                    entry.identity.stream,
+                    state_tail_cell_ordinals(seq_id, entry.identity.stream)).first;
         }
-        if (!found) {
+        if (entry.identity.cell >= ordinals->second.size() ||
+                ordinals->second[entry.identity.cell] < 0) {
             continue;
         }
         if (payload_by_slot.emplace(entry.slot, uint32_t(result.size())).second) {
@@ -6022,35 +6028,26 @@ void llama_kv_cache::state_write_tail(llama_io_write_i & io, llama_seq_id seq_id
         payload_by_slot.emplace(payload_slots[payload], payload);
     }
 
+    std::unordered_map<uint32_t, std::vector<int32_t>> ordinals_by_stream;
     for (const auto & entry : tail->snapshot(seq_id)) {
         if (entry.identity.stream >= v_cells.size()) {
             continue;
         }
-        const auto & cells = v_cells[entry.identity.stream];
-        uint32_t ordinal = 0;
-        bool found = false;
-        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
-            bool included = !cells.is_empty(cell) && (seq_id == -1 || cells.seq_has(cell, seq_id));
-            if (included && seq_id != -1) {
-                included = !llama_hparams::is_masked_swa(
-                        n_swa, swa_type, cells.pos_get(cell), cells.seq_pos_max(seq_id));
-            }
-            if (!included) {
-                continue;
-            }
-            if (cell == entry.identity.cell) {
-                found = true;
-                break;
-            }
-            ++ordinal;
+        auto ordinals = ordinals_by_stream.find(entry.identity.stream);
+        if (ordinals == ordinals_by_stream.end()) {
+            ordinals = ordinals_by_stream.emplace(
+                    entry.identity.stream,
+                    state_tail_cell_ordinals(seq_id, entry.identity.stream)).first;
         }
-        if (!found) {
+        if (entry.identity.cell >= ordinals->second.size() ||
+                ordinals->second[entry.identity.cell] < 0) {
             continue;
         }
 
         const auto it = payload_by_slot.find(entry.slot);
         GGML_ASSERT(it != payload_by_slot.end());
-        records.push_back({ entry.seq_id, entry.identity.stream, ordinal, entry.identity.generation,
+        records.push_back({ entry.seq_id, entry.identity.stream,
+                uint32_t(ordinals->second[entry.identity.cell]), entry.identity.generation,
                 entry.position, entry.insertion_ordinal, it->second });
     }
 
