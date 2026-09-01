@@ -28,6 +28,12 @@ if (Python3_Interpreter_FOUND)
     set_property(TEST test-backend-ops-seed-static PROPERTY LABELS main)
 
     add_test(
+        NAME test-metal-low-bit-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-metal-low-bit-static.py)
+    set_property(TEST test-metal-low-bit-static PROPERTY LABELS main)
+
+    add_test(
         NAME test-arm-cpu-feats-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-arm-cpu-feats-static.py)

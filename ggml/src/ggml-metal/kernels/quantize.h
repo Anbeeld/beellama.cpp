@@ -112,6 +112,18 @@ void quantize_q3_1(device const float * src, device block_q3_1 & dst) {
     for (int j = 0; j < 8; ++j) dst.qs[j] = qs[j];
     for (int j = 0; j < 4; ++j) dst.qh[j] = qh[j];
 }
+void quantize_q2_0s(device const float * src, device block_q2_0s & dst) {
+    float d, m; uint8_t qs[8], qh[4];
+    quantize_planar_values<4, false>(src, d, m, qs, qh);
+    dst.d = d;
+    for (int j = 0; j < 8; ++j) dst.qs[j] = qs[j];
+}
+void quantize_q2_1(device const float * src, device block_q2_1 & dst) {
+    float d, m; uint8_t qs[8], qh[4];
+    quantize_planar_values<4, true>(src, d, m, qs, qh);
+    dst.d = d; dst.m = m;
+    for (int j = 0; j < 8; ++j) dst.qs[j] = qs[j];
+}
 void quantize_q2_0(device const float * src, device block_q2_0 & dst) {
     float amax = 0.0f;
     for (int j = 0; j < QK2_0; j++) {
