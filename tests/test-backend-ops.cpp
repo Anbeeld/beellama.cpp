@@ -10514,7 +10514,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q1_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_F16));
-    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q6_0, GGML_TYPE_Q6_0));
+    for (ggml_type type_KV : { GGML_TYPE_Q2_0S, GGML_TYPE_Q2_1, GGML_TYPE_Q3_0,
+                               GGML_TYPE_Q3_1, GGML_TYPE_Q6_0, GGML_TYPE_Q6_1 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 256, 2, true, false, 0, 0,
+            GGML_PREC_F32, type_KV, type_KV));
+    }
+    for (const auto & type_KV : {
+            std::pair{ GGML_TYPE_Q2_0S, GGML_TYPE_Q2_1 },
+            std::pair{ GGML_TYPE_Q3_0,  GGML_TYPE_Q3_1 },
+            std::pair{ GGML_TYPE_Q6_0,  GGML_TYPE_Q6_1 } }) {
+        test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 256, 2, true, false, 0, 0,
+            GGML_PREC_F32, type_KV.first, type_KV.second));
+    }
     // Query-specific exact tails: isolate the tail partial, then exercise the
     // FP32 global-softmax merge with a quantized body partial.
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 2, {2, 1}, 256, 2, true, false, 0, 0,

@@ -9,7 +9,7 @@
 - Fixed KVarN compact-plan reuse across cache metadata transitions and padded the CUDA MMA query tile to the physical eight-row `ldmatrix` extent. Compact-plan duplicate filtering now uses a capacity bitmap without dropping distinct physical cells, and new route, metadata, exact-tail, multi-query, and source-invariant regressions cover the optimized paths.
 - Hardened Qwen3.8 prompt checkpoints and repeated-request restore. Hybrid attention/index state restores transactionally across ordinary and KVarN caches, precision-tail restores rebuild mirrored slot information, KVarN delegates PLE token-history lookup to its initialized base cache, and PLE recurrent rows restore into the transactionally selected destination.
 - Fixed Metal compilation for standard Q2 cache quantization and explicit F16/BF16 conversions. Embedded Metal assembly now includes a content digest so sccache cannot reuse stale kernel sources.
-- Added native Vulkan FlashAttention decoding for standard `q6_0` K/V caches, avoiding the CPU fallback that previously collapsed decode throughput.
+- Added native Vulkan FlashAttention decoding for standard `q2_0`, `q2_1`, `q3_0`, `q3_1`, `q6_0`, and `q6_1` K/V caches, avoiding the CPU fallback that previously collapsed decode throughput.
 
 ## v0.4.4
 
