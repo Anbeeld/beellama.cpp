@@ -66,6 +66,46 @@ f16vec4 dequantFuncQ2_0_v(const in decodeBufQ2_0 bl, const in uint blockCoords[2
     return f16vec4((vec4(bits & 3u, (bits >> 2u) & 3u, (bits >> 4u) & 3u, bits >> 6u) - 1.0f) * float(d));
 }
 
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufQ6_0 {
+   block_q6_0 block;
+};
+
+float16_t dequantFuncQ6_0(const in decodeBufQ6_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const uint idx = coordInBlock[1];
+    const uint j = idx & 15u;
+    const uint h = uint(bl.block.qh[j & 7u]) >> (4u * (j >> 3u));
+    const uint q = idx < 16u ?
+        ((uint(bl.block.qs[j]) & 0x0fu) | ((h & 0x03u) << 4u)) :
+        ((uint(bl.block.qs[j]) >> 4u)   | ((h & 0x0cu) << 2u));
+    return (float16_t(q) - float16_t(32.0)) * bl.block.d;
+}
+
+f16vec4 dequantFuncQ6_0_v(const in decodeBufQ6_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const uint idx = coordInBlock[1];
+    const uint j = idx & 15u;
+    const uint h0 = uint(bl.block.qh[(j + 0u) & 7u]) >> (4u * ((j + 0u) >> 3u));
+    const uint h1 = uint(bl.block.qh[(j + 1u) & 7u]) >> (4u * ((j + 1u) >> 3u));
+    const uint h2 = uint(bl.block.qh[(j + 2u) & 7u]) >> (4u * ((j + 2u) >> 3u));
+    const uint h3 = uint(bl.block.qh[(j + 3u) & 7u]) >> (4u * ((j + 3u) >> 3u));
+    uvec4 q;
+    if (idx < 16u) {
+        q = uvec4(
+            (uint(bl.block.qs[j + 0u]) & 0x0fu) | ((h0 & 0x03u) << 4u),
+            (uint(bl.block.qs[j + 1u]) & 0x0fu) | ((h1 & 0x03u) << 4u),
+            (uint(bl.block.qs[j + 2u]) & 0x0fu) | ((h2 & 0x03u) << 4u),
+            (uint(bl.block.qs[j + 3u]) & 0x0fu) | ((h3 & 0x03u) << 4u));
+    } else {
+        q = uvec4(
+            (uint(bl.block.qs[j + 0u]) >> 4u) | ((h0 & 0x0cu) << 2u),
+            (uint(bl.block.qs[j + 1u]) >> 4u) | ((h1 & 0x0cu) << 2u),
+            (uint(bl.block.qs[j + 2u]) >> 4u) | ((h2 & 0x0cu) << 2u),
+            (uint(bl.block.qs[j + 3u]) >> 4u) | ((h3 & 0x0cu) << 2u));
+    }
+    return f16vec4((vec4(q) - vec4(32.0)) * float(bl.block.d));
+}
+
 layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufQ4_0 {
    block_q4_0_packed16 block;
 };

@@ -11,6 +11,7 @@
 #define FA_TYPE_Q5_1  7u
 #define FA_TYPE_Q8_0  8u
 #define FA_TYPE_IQ4_NL 20u
+#define FA_TYPE_Q6_0 43u
 #define FA_TYPE_BF16 30u
 
 // Number of matrix elements per buffer block, derived from the K/V type spec
@@ -26,6 +27,7 @@ uint fa_block_elems(uint ty) {
         case FA_TYPE_Q5_1: return uint(QUANT_K_Q5_1);
         case FA_TYPE_Q8_0: return uint(QUANT_K_Q8_0);
         case FA_TYPE_IQ4_NL: return uint(QUANT_K_IQ4_NL);
+        case FA_TYPE_Q6_0: return uint(QUANT_K_Q6_0);
         case FA_TYPE_BF16: return 1u;
         default:           return 1u;
     }
