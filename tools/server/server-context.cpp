@@ -3498,8 +3498,35 @@ private:
                     }
                 }
 
-                if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
-                    GGML_ABORT("failed to remove sequence %d\n", slot.id);
+                auto * mem_dft = llama_get_memory(ctx_dft);
+                const llama_pos rm_p0 = server_speculative_draft_rollback_p0(
+                        ckpt.n_tokens, ckpt.pos_max);
+                const server_speculative_draft_rollback_io rollback_io {
+                    /*.plan =*/ [&](llama_pos p0, llama_pos p1,
+                                     llama_pos & planned_p0, llama_pos & planned_p1) {
+                        return llama_memory_seq_rm_plan(
+                                mem_dft, slot.id, p0, p1, &planned_p0, &planned_p1);
+                    },
+                    /*.remove =*/ [&](llama_pos p0, llama_pos p1) {
+                        return llama_memory_seq_rm(mem_dft, slot.id, p0, p1);
+                    },
+                };
+                llama_pos applied_p0 = rm_p0;
+                const auto rollback = server_speculative_draft_rollback(
+                        rm_p0, rollback_io, applied_p0);
+                if (rollback == SERVER_SPECULATIVE_DRAFT_ROLLBACK_FAILED) {
+                    GGML_ABORT("failed to remove draft sequence %d from %d\n", slot.id, rm_p0);
+                }
+                if (rollback == SERVER_SPECULATIVE_DRAFT_ROLLBACK_WIDENED) {
+                    SLT_WRN(slot, "draft rollback widened: [%d, -1) -> [%d, -1)\n",
+                            rm_p0, applied_p0);
+                    draft.clear();
+                    return;
+                }
+                if (rollback == SERVER_SPECULATIVE_DRAFT_ROLLBACK_CLEARED) {
+                    SLT_WRN(slot, "draft rollback from %d refused, draft sequence cleared\n", rm_p0);
+                    draft.clear();
+                    return;
                 }
             }
 

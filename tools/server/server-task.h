@@ -28,6 +28,48 @@ static inline bool server_speculative_rollback_requires_checkpoint(
           (type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && proposed_rollback > max_rollback);
 }
 
+static inline llama_pos server_speculative_draft_rollback_p0(
+        size_t checkpoint_tokens, llama_pos target_pos_max) {
+    return checkpoint_tokens > 0 ? llama_pos(checkpoint_tokens) : target_pos_max + 1;
+}
+
+enum server_speculative_draft_rollback_result {
+    SERVER_SPECULATIVE_DRAFT_ROLLBACK_EXACT,
+    SERVER_SPECULATIVE_DRAFT_ROLLBACK_WIDENED,
+    SERVER_SPECULATIVE_DRAFT_ROLLBACK_CLEARED,
+    SERVER_SPECULATIVE_DRAFT_ROLLBACK_FAILED,
+};
+
+struct server_speculative_draft_rollback_io {
+    std::function<bool(llama_pos, llama_pos, llama_pos &, llama_pos &)> plan;
+    std::function<bool(llama_pos, llama_pos)> remove;
+};
+
+static inline server_speculative_draft_rollback_result server_speculative_draft_rollback(
+        llama_pos requested_p0,
+        const server_speculative_draft_rollback_io & io,
+        llama_pos & applied_p0) {
+    applied_p0 = requested_p0;
+    if (io.remove(requested_p0, -1)) {
+        return SERVER_SPECULATIVE_DRAFT_ROLLBACK_EXACT;
+    }
+
+    llama_pos planned_p0 = requested_p0;
+    llama_pos planned_p1 = -1;
+    if (io.plan && io.plan(requested_p0, -1, planned_p0, planned_p1) &&
+            planned_p0 >= 0 && planned_p1 < 0 && planned_p0 < requested_p0 &&
+            io.remove(planned_p0, planned_p1)) {
+        applied_p0 = planned_p0;
+        return SERVER_SPECULATIVE_DRAFT_ROLLBACK_WIDENED;
+    }
+
+    if (io.remove(-1, -1)) {
+        applied_p0 = -1;
+        return SERVER_SPECULATIVE_DRAFT_ROLLBACK_CLEARED;
+    }
+    return SERVER_SPECULATIVE_DRAFT_ROLLBACK_FAILED;
+}
+
 // Some memory layouts need a durable checkpoint even when ordinary attention
 // retains the complete prefix (pos_min == 0). In that case the live suffix
 // threshold alone would not enter checkpoint selection.
