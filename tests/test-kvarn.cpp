@@ -375,6 +375,24 @@ static void kvarn_compact_read_plan_skips_ownership_holes() {
             { 1, 2, 3 }, { 2, 3, 4 }, 128, 256);
     require(deduped.size() == 128 && deduped[0] == 1 && deduped[3] == 4 && deduped[4] == -1,
             "compact KVarN read plan did not deduplicate pending cells");
+
+    std::vector<uint32_t> group_ordered;
+    for (uint32_t cell = 7*128; cell < 8*128; ++cell) {
+        group_ordered.push_back(cell);
+    }
+    for (uint32_t cell = 3*128; cell < 4*128; ++cell) {
+        group_ordered.push_back(cell);
+    }
+    const auto aligned = llama_kvarn_compact_read_plan(
+            group_ordered, { 11*128, 11*128 + 1 }, 2048, 256, 128);
+    require(aligned.size() == 512 && aligned[0] == 3*128 && aligned[127] == 4*128 - 1 &&
+            aligned[128] == 7*128 && aligned[255] == 8*128 - 1 &&
+            aligned[256] == 11*128 && aligned[257] == 11*128 + 1 && aligned[258] == -1,
+            "group-aligned KVarN read plan did not preserve sorted physical record segments");
+
+    const auto sparse = llama_kvarn_compact_read_plan({ 0, 128 }, {}, 512, 256, 128);
+    require(sparse.size() == 256 && sparse[0] == 0 && sparse[1] == -1 && sparse[128] == 128,
+            "sparse KVarN read plan did not retain separate physical record segments");
 }
 
 static void kvarn_planning_reservations_preserve_group_ownership() {
@@ -1567,7 +1585,8 @@ static std::vector<ggml_fp16_t> test_store_reference_output(
         int            stage_groups = 3,
         int            head_slices = 1,
         int            striped_group_stride = 0,
-        bool           eager_records = false) {
+        bool           eager_records = false,
+        bool           explicit_stage_slots = false) {
     ggml_init_params params = {
         /*.mem_size   =*/ 16 * 1024 * 1024,
         /*.mem_buffer =*/ nullptr,
@@ -1623,7 +1642,14 @@ static std::vector<ggml_fp16_t> test_store_reference_output(
                     ((logical_idx / 128) * striped_group_stride + striped_group_stride - 1) * 128 +
                             logical_idx % 128 :
                     logical_idx + (discontinuous_indices && t >= n_tokens_per_stream / 2 ? 1 : 0);
-            idx[s * n_tokens_per_stream + t] = int64_t(s * n_groups_per_stream * 128 + local_idx);
+            const uint32_t cell = uint32_t(s * n_groups_per_stream * 128 + local_idx);
+            if (explicit_stage_slots && local_idx >= 128) {
+                const uint32_t group = uint32_t(local_idx / 128);
+                const uint32_t slot = 1u + (group % uint32_t(stage_groups - 1));
+                idx[s * n_tokens_per_stream + t] = llama_kvarn_encode_store_cell(cell, slot);
+            } else {
+                idx[s * n_tokens_per_stream + t] = int64_t(cell);
+            }
         }
     }
 
@@ -3840,6 +3866,19 @@ static void test_native_flash_attention_prefill_route_parity() {
                     n_kv, 3, false, nullptr, false, tail_candidates, true);
         }
         require_close_f32_rmse(generic, windowed, 1e-4f, message);
+
+        std::vector<float> chunked;
+        {
+            const std::string chunk = std::to_string(std::max(128, n_kv/2));
+            scoped_test_env force_chunk("GGML_KVARN_WINDOW_CHUNK", chunk.c_str());
+            chunked = test_native_flash_attention_output(
+                    gpu_backend, true, true, 256, bits, bits, 512, 6, 1,
+                    n_kv, 3, false, nullptr, false, tail_candidates, true);
+        }
+        // Combining independently normalized windows changes floating-point
+        // reduction order slightly while preserving the online-softmax result.
+        require_close_f32_rmse(generic, chunked, 3e-4f,
+                "chunked KVarN prefill merge disagrees with generic attention");
     };
 
     require_route_parity(4, 512, 128,
@@ -3943,6 +3982,24 @@ static void test_store_paths_gpu() {
                     cpu_backend, bits, value, 1, 2, 16, 504, false, true, 4);
             require_close_f16_rmse(cuda_output, cpu_output, 1e-1f, "KVarN CUDA direct-flush store output differs from CPU reference");
         }
+    }
+
+    for (bool value : { false, true }) {
+        const std::vector<ggml_fp16_t> cuda_output = test_store_reference_output(
+                gpu_backend, 4, value, 1, 2, 512, 200, false, true, 3, 1, 0, false, true);
+        const std::vector<ggml_fp16_t> cpu_output = test_store_reference_output(
+                cpu_backend, 4, value, 1, 2, 512, 200, false, true, 3, 1, 0, false, true);
+        require_close_f16_rmse(cuda_output, cpu_output, 1e-1f,
+                "KVarN CUDA workspace flush ignored an explicit replacement stage slot");
+    }
+
+    for (bool value : { false, true }) {
+        const std::vector<ggml_fp16_t> cuda_output = test_store_reference_output(
+                gpu_backend, 4, value, 1, 2, 16, 512, false, true, 4, 1, 0, false, true);
+        const std::vector<ggml_fp16_t> cpu_output = test_store_reference_output(
+                cpu_backend, 4, value, 1, 2, 16, 512, false, true, 4, 1, 0, false, true);
+        require_close_f16_rmse(cuda_output, cpu_output, 1e-1f,
+                "KVarN CUDA direct flush ignored an explicit replacement stage slot");
     }
 
     for (bool value : { false, true }) {

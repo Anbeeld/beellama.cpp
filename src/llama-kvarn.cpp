@@ -416,7 +416,8 @@ std::vector<int64_t> llama_kvarn_compact_read_plan(
         const std::vector<uint32_t> & occupied_cells,
         const std::vector<uint32_t> & pending_cells,
         uint32_t capacity,
-        uint32_t padding) {
+        uint32_t padding,
+        uint32_t group_align) {
     if (capacity == 0 || padding == 0) {
         throw std::invalid_argument("invalid KVarN compact read-plan extent");
     }
@@ -441,6 +442,46 @@ std::vector<int64_t> llama_kvarn_compact_read_plan(
     }
 
     const uint32_t used = uint32_t(cells.size());
+    if (group_align > 0) {
+        // Sort physical groups and reserve one complete plan segment for each
+        // record. This keeps every segment monotonic and prevents interleaved
+        // unified-cache sequences from resembling a contiguous physical tile.
+        // Falling back to logical order for sparse groups would reintroduce
+        // that ambiguity, so every selected group receives its own segment.
+        std::vector<uint32_t> groups;
+        groups.reserve(cells.size()/group_align + 8);
+        std::vector<bool> group_seen((capacity + group_align - 1u)/group_align, false);
+        for (const uint32_t cell : cells) {
+            const uint32_t group = cell/group_align;
+            if (!group_seen[group]) {
+                group_seen[group] = true;
+                groups.push_back(group);
+            }
+        }
+        std::sort(groups.begin(), groups.end());
+        uint64_t aligned_used = 0;
+        for (const uint32_t group : groups) {
+            const uint32_t begin = group*group_align;
+            aligned_used += std::min(group_align, capacity - begin);
+        }
+        const uint32_t aligned_padded = std::min<uint64_t>(capacity,
+                std::max<uint64_t>(padding,
+                    ((aligned_used + padding - 1u)/padding)*padding));
+        std::vector<int64_t> aligned(aligned_padded, -1);
+        size_t out = 0;
+        for (const uint32_t group : groups) {
+            const uint32_t begin = group*group_align;
+            const uint32_t end = std::min(begin + group_align, capacity);
+            size_t slot = out;
+            for (uint32_t cell = begin; cell < end; ++cell) {
+                if (seen[cell]) {
+                    aligned[slot++] = int64_t(cell);
+                }
+            }
+            out += end - begin;
+        }
+        return aligned;
+    }
     const uint32_t padded = std::min(capacity,
             std::max(padding, ((used + padding - 1u)/padding)*padding));
     std::vector<int64_t> result(padded, -1);

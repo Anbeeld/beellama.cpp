@@ -1013,7 +1013,8 @@ static __global__ void kvarn_store_kernel_hishmem(
             const int flush_ring = swa ? flush_group % groups_per_stream : flush_group;
             const int flush_record_group = stream * groups_per_stream + flush_ring;
             uint8_t * record = records + (flush_record_group * n_heads + head) * record_bytes;
-            kvarn_quantize_stage(stage, record, n_heads, head, stage_base, flush_group, bits, iterations, value, swa, stage_groups, tail_groups, shared);
+            kvarn_quantize_stage(stage, record, n_heads, head, stage_base, flush_group,
+                    bits, iterations, value, swa, stage_groups, tail_groups, shared, assigned_slot);
         }
 
         shared[threadIdx.x] = current[(token * n_heads + head) * KVAR_N_DIM + threadIdx.x];
@@ -1083,7 +1084,8 @@ static __global__ void kvarn_store_kernel_headwide(
             for (int slice = 0; slice < head_slices; ++slice) {
                 const int head = head0 + slice;
                 uint8_t * record = records + ((int64_t) flush_record_group * n_heads + head) * record_bytes;
-            kvarn_quantize_stage(stage, record, n_heads, head, stage_base, flush_group, bits, iterations, value, swa, stage_groups, tail_groups, shared);
+                kvarn_quantize_stage(stage, record, n_heads, head, stage_base, flush_group,
+                        bits, iterations, value, swa, stage_groups, tail_groups, shared, assigned_slot);
             }
         }
 
@@ -1165,7 +1167,7 @@ static __global__ void kvarn_store_kernel_lowshmem(
                 uint8_t * record = records + ((int64_t) flush_record_group * n_heads + head) * record_bytes;
                 kvarn_quantize_stage_lowshmem(
                         stage, record, n_heads, head, stage_base, flush_group, bits, iterations,
-                        value, swa, stage_groups, tail_groups, shared);
+                        value, swa, stage_groups, tail_groups, shared, assigned_slot);
             }
         }
 
@@ -1223,7 +1225,9 @@ static __global__ void kvarn_store_direct_flush_kernel(
         return;
     }
 
-    const int64_t idx = kvarn_index_cell(indices[token]);
+    const int64_t encoded_idx = indices[token];
+    const int assigned_slot = kvarn_index_stage_slot(encoded_idx);
+    const int64_t idx = kvarn_index_cell(encoded_idx);
     const int group_global = (int) (idx / KVAR_N_DIM);
     const int stream = swa ? 0 : group_global / groups_per_stream;
     const int group = swa ? group_global : group_global - stream * groups_per_stream;
@@ -1240,7 +1244,8 @@ static __global__ void kvarn_store_direct_flush_kernel(
     const int flush_ring = swa ? flush_group % groups_per_stream : flush_group;
     const int flush_record_group = stream * groups_per_stream + flush_ring;
     uint8_t * record = records + ((int64_t) flush_record_group * n_heads + head) * record_bytes;
-    kvarn_quantize_stage(stage, record, n_heads, head, stage_base, flush_group, bits, iterations, value, swa, stage_groups, tail_groups, shared);
+    kvarn_quantize_stage(stage, record, n_heads, head, stage_base, flush_group,
+            bits, iterations, value, swa, stage_groups, tail_groups, shared, assigned_slot);
 }
 
 static __global__ void kvarn_store_direct_stage_kernel(
@@ -1576,11 +1581,17 @@ static __global__ void kvarn_store_workspace_flush_kernel(
     const int flush_group_global = stream * groups_per_stream + record_group;
     int source_stage_slot = swa ? record_group % stage_groups :
             1 + ((record_group - 1) % tail_groups);
-    const int first_store_token = flush_start > start_local ? flush_start - start_local : 0;
-    if (first_store_token < tokens_per_stream) {
-        const int64_t first_store_encoded = indices[token_base + first_store_token];
-        if (kvarn_index_cell(first_store_encoded) / KVAR_N_DIM == flush_group_global) {
-            const int assigned_slot = kvarn_index_stage_slot(first_store_encoded);
+    // Delayed sealing reads the slot that the boundary group is about to
+    // reuse, not the flushed group's modulo slot. Host stage assignments are
+    // stable for live groups but need not follow that modulo mapping.
+    const int source_group = eager_records ? record_group : record_group + tail_groups;
+    const int source_start = source_group * KVAR_N_DIM;
+    const int source_token = source_start > start_local ? source_start - start_local : 0;
+    if (source_token < tokens_per_stream) {
+        const int64_t source_encoded = indices[token_base + source_token];
+        const int source_group_global = stream * groups_per_stream + source_group;
+        if (kvarn_index_cell(source_encoded) / KVAR_N_DIM == source_group_global) {
+            const int assigned_slot = kvarn_index_stage_slot(source_encoded);
             if (assigned_slot >= 0) {
                 source_stage_slot = assigned_slot;
             }

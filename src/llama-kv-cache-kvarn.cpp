@@ -726,7 +726,8 @@ const std::vector<int64_t> & llama_kv_cache_kvarn_context::compact_read_plan() c
         GGML_ASSERT(current_sinfo().n_stream() == 1);
         pending.assign(current_sinfo().idxs[0].begin(), current_sinfo().idxs[0].end());
     }
-    compact_read_plan_cache = llama_kvarn_compact_read_plan(occupied, pending, cells.size(), 256);
+    compact_read_plan_cache = llama_kvarn_compact_read_plan(
+            occupied, pending, cells.size(), 256, KVAR_N_GROUP);
     return compact_read_plan_cache;
 }
 

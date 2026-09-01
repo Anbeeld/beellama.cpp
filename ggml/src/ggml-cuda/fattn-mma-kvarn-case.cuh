@@ -12,10 +12,11 @@ using ggml_cuda_fattn_kernel_attr_ptr_t = const void *;
 using ggml_cuda_fattn_kernel_attr_ptr_t = fattn_kernel_t;
 #endif
 
-// STOPGAP: keep windowed prefill single-chunk by default until the chunked
-// merge path emits reference-faithful partials. Smaller chunks remain useful
-// for profiling via GGML_KVARN_WINDOW_CHUNK.
-static constexpr int GGML_CUDA_FATTN_KVARN_WINDOW_CHUNK = 65536;
+// Bound transient K/V materialization for large unified caches. The partial
+// merge preserves the online-softmax numerator, maximum, and denominator;
+// keeping the window at 32K avoids full-window scratch exhaustion when two
+// long prompts share a 128K cache.
+static constexpr int GGML_CUDA_FATTN_KVARN_WINDOW_CHUNK = 32768;
 
 static inline bool ggml_cuda_fattn_kvarn_window_enabled() {
     const char * env = getenv("GGML_KVARN_WINDOW");
