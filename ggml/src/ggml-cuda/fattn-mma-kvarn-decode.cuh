@@ -260,6 +260,7 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
     // в score_partial_sh). Результат лишних строк отбрасывается по h < MAX_GQA,
     // но само чтение было некорректным.
     constexpr int Q_ROWS = MAX_GQA < 8 ? 8 : MAX_GQA;
+    constexpr int P_ROWS = MAX_GQA < 8 ? 8 : MAX_GQA;
     constexpr int P_STRIDE2 = SPLIT_TOKENS / 2 + 4;
 
     using T_A = tile<16, 8, half2>;
@@ -289,7 +290,7 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
     // блока на мультипроцессор сохраняются.
     __shared__ __align__(16) float score_partial_sh[NWARPS][MAX_GQA * TOKENS_PER_CHUNK];
     __shared__ __align__(16) float score_sh[Q_TILE][MAX_GQA][SPLIT_TOKENS];
-    __shared__ __align__(16) half2 p_sh[Q_TILE][MAX_GQA][P_STRIDE2];
+    __shared__ __align__(16) half2 p_sh[Q_TILE][P_ROWS][P_STRIDE2];
     // Оси квантования лежат в записи как half и раньше раскладывались в shared
     // как float. Точности это не добавляло ни одного бита — значение уже прошло
     // округление до half при записи, — зато стоило вдвое больше байт shared и
@@ -587,6 +588,15 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
 #pragma unroll
     for (int qt = 0; qt < Q_TILE; ++qt) {
         half * p_h = (half *) p_sh[qt];
+        // load_ldmatrix below reads a physical eight-row probability tile. When
+        // MAX_GQA is six, initialize the two rows that are not produced by
+        // softmax so every Q_TILE row has defined input for the V mma.
+        for (int i = tid; i < (P_ROWS - MAX_GQA) * SPLIT_TOKENS;
+                i += NWARPS * PHYSICAL_WAVE_SIZE) {
+            const int h = MAX_GQA + i / SPLIT_TOKENS;
+            const int token = i % SPLIT_TOKENS;
+            p_h[h * (2 * P_STRIDE2) + token] = __float2half(0.0f);
+        }
 #if defined(GGML_USE_HIP) && defined(CDNA)
         if (tid < MAX_GQA) {
             const int h = tid;

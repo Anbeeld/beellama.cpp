@@ -35,6 +35,17 @@ assert re.search(r"q_sh\s*\[Q_TILE\]\s*\[Q_ROWS\]\s*\[Q_STRIDE2\]", DECODE), \
 assert "i < Q_ROWS * D" in DECODE, \
     "KVarN MMA decode does not initialize every physical query row read by ldmatrix"
 
+padded = re.search(r"constexpr int P_ROWS\s*=\s*MAX_GQA\s*<\s*8\s*\?\s*8\s*:\s*MAX_GQA\s*;", DECODE)
+assert padded, "KVarN MMA decode must pad physical probability storage to the eight-row ldmatrix tile"
+assert re.search(r"p_sh\s*\[Q_TILE\]\s*\[P_ROWS\]\s*\[P_STRIDE2\]", DECODE), \
+    "KVarN MMA decode probability shared storage does not use the padded physical row count"
+assert re.search(
+    r"for \(int i = tid; i < \(P_ROWS - MAX_GQA\) \* SPLIT_TOKENS;\s*i \+= NWARPS \* PHYSICAL_WAVE_SIZE\).*?"
+    r"p_h\[.*?\] = __float2half\(0\.0f\);",
+    DECODE,
+    re.DOTALL,
+), "KVarN MMA decode does not initialize padded probability rows for every query tile row"
+
 DISPATCH = (ROOT / "ggml/src/ggml-cuda/fattn-kvarn-dispatch.cu").read_text(encoding="utf-8")
 assert "GGML_CUDA_FATTN_KVARN_DESCS_THREADS = 1024" in DISPATCH, \
     "KVarN descriptor scan does not use the profiled 1024-thread reduction"
