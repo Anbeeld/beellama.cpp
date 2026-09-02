@@ -234,10 +234,9 @@ llama_kvarn_iswa_policy llama_kvarn_iswa_policy_for(
     if (!enabled) {
         return LLAMA_KVARN_ISWA_DISABLED;
     }
-    if (!has_swa || n_seq_max <= 1) {
-        return LLAMA_KVARN_ISWA_ALL_LAYERS;
-    }
-    return LLAMA_KVARN_ISWA_STANDARD_SWA_FALLBACK;
+    GGML_UNUSED(has_swa);
+    GGML_UNUSED(n_seq_max);
+    return LLAMA_KVARN_ISWA_ALL_LAYERS;
 }
 
 bool llama_kvarn_can_remove_range(llama_pos pos_max, llama_pos p0, llama_pos p1, uint32_t group) {

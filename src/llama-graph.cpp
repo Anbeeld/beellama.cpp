@@ -911,7 +911,7 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
                     get_tail_read_idxs(swa), get_tail_body_read_idxs(swa),
                     get_tail_bias_read_idxs(swa), ubatch, cparams.causal_attn);
             group->set_input_tail_body_plan(
-                    self_tail_query_order, get_tail_run_desc(swa), mask,
+                    get_tail_query_order(swa), get_tail_run_desc(swa), mask,
                     ubatch, cparams.causal_attn);
         }
     };
@@ -3433,7 +3433,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_kvarn_rot_128 = kvarn->build_input_kvarn_rot(ctx0, 128);
         inp->self_kvarn_rot_256 = kvarn->build_input_kvarn_rot(ctx0, 256);
         inp->self_kvarn_rot_512 = kvarn->build_input_kvarn_rot(ctx0, 512);
-        if (kvarn->uses_compact_read_indices()) {
+        if (kvarn->uses_materialization_indices()) {
             inp->self_kvarn_mat_idxs = kvarn->build_input_kvarn_mat_idxs(ctx0);
             kvarn->set_mat_idxs(inp->self_kvarn_mat_idxs);
         }
@@ -4397,7 +4397,7 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
         inp->self_kvarn_rot_128 = kvarn_base->build_input_kvarn_rot(ctx0, 128);
         inp->self_kvarn_rot_256 = kvarn_base->build_input_kvarn_rot(ctx0, 256);
         inp->self_kvarn_rot_512 = kvarn_base->build_input_kvarn_rot(ctx0, 512);
-        if (kvarn_base->uses_compact_read_indices()) {
+        if (kvarn_base->uses_materialization_indices()) {
             inp->self_kvarn_mat_idxs = kvarn_base->build_input_kvarn_mat_idxs(ctx0);
             kvarn_base->set_mat_idxs(inp->self_kvarn_mat_idxs);
         }

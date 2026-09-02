@@ -36,6 +36,17 @@ constexpr int32_t llama_kvarn_decode_stage_slot(int64_t index) {
     return encoded == 0 ? -1 : int32_t(encoded - 1u);
 }
 
+// SWA indices retain the absolute position in the low word and identify the
+// independent KV stream in the high word. SWA never uses explicit stage-slot
+// encoding, so the two representations cannot collide within one operation.
+constexpr int64_t llama_kvarn_encode_swa_position(uint32_t stream, uint32_t pos) {
+    return int64_t(uint64_t(stream) << 32u | uint64_t(pos));
+}
+
+constexpr uint32_t llama_kvarn_decode_swa_stream(int64_t index) {
+    return uint32_t(uint64_t(index) >> 32u);
+}
+
 struct llama_kvarn_type_desc {
     llama_kvarn_type type;
     const char * name;
@@ -70,7 +81,6 @@ struct llama_kvarn_runtime_requirements {
 enum llama_kvarn_iswa_policy {
     LLAMA_KVARN_ISWA_DISABLED,
     LLAMA_KVARN_ISWA_ALL_LAYERS,
-    LLAMA_KVARN_ISWA_STANDARD_SWA_FALLBACK,
 };
 
 llama_kvarn_iswa_policy llama_kvarn_iswa_policy_for(

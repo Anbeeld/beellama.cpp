@@ -67,7 +67,11 @@ uint read_index_high(uint token) {
 
 uint read_stage_slot(uint token, uint fallback) {
     const uint encoded = read_index_high(token);
-    return encoded == 0u ? fallback : encoded - 1u;
+    return p.swa != 0u || encoded == 0u ? fallback : encoded - 1u;
+}
+
+uint read_swa_stream(uint token) {
+    return read_index_high(token);
 }
 
 uint workspace_word_index(uint token, uint head, uint dim_pair) {
@@ -793,9 +797,9 @@ void monolithic_store(uint lane) {
         const uint idx = read_index_low(token);
         const uint group_global = idx / KVAR_N_DIM;
         const uint pos = idx % KVAR_N_DIM;
-        // SWA: idx is the absolute token position; records form a ring (single
-        // stream) and there is no permanent group-0 sink.
-        const uint stream = p.swa != 0u ? 0u : group_global / p.groups_per_stream;
+        // SWA: the low word is the absolute token position and the high word
+        // selects an independent per-slot ring.
+        const uint stream = p.swa != 0u ? read_swa_stream(token) : group_global / p.groups_per_stream;
         const uint group = p.swa != 0u ? group_global : group_global - stream * p.groups_per_stream;
         if (stream >= p.n_stream || (p.swa == 0u && group >= p.groups_per_stream)) {
             return;

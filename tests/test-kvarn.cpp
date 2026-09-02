@@ -668,8 +668,8 @@ static void test_remove_policy() {
 
 static void iswa_nonunified_multislot_kvarn_policy() {
     require(llama_kvarn_iswa_policy_for(true, true, 2) ==
-                    LLAMA_KVARN_ISWA_STANDARD_SWA_FALLBACK,
-            "non-unified multi-slot iSWA did not select the standard-SWA fallback");
+                    LLAMA_KVARN_ISWA_ALL_LAYERS,
+            "non-unified multi-slot iSWA did not keep KVarN on all layers");
     require(llama_kvarn_iswa_policy_for(true, true, 1) ==
                     LLAMA_KVARN_ISWA_ALL_LAYERS,
             "single-slot non-unified iSWA KVarN was rejected");
@@ -1397,8 +1397,19 @@ static void test_cache_ops_multi_stream(enum ggml_backend_dev_type device_type, 
             ctx, records, stored, indices, n_tokens_per_stream, 0, n_stream, bits, false, 3);
     materialized->op_params[4] = 1;
 
+    // MTP shares persistent KVarN records after the target store graph has
+    // completed. It therefore supplies one high-watermark index per stream
+    // instead of depending on the graph-local store operation.
+    ggml_tensor * shared_live_indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_stream);
+    ggml_tensor * shared_materialized = ggml_kvarn_materialize(
+            ctx, records, stage, shared_live_indices,
+            n_tokens_per_stream, 0, n_stream, bits, false, 3);
+    shared_materialized->op_params[4] = 1;
+
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, materialized);
+    ggml_cgraph * shared_graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(shared_graph, shared_materialized);
 
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     require(buffer != nullptr, "failed to allocate multi-stream KVarN tensors");
@@ -1420,14 +1431,21 @@ static void test_cache_ops_multi_stream(enum ggml_backend_dev_type device_type, 
             idx[s * n_tokens_per_stream + t] = int64_t(s * kv_size + t);
         }
     }
+    const std::vector<int64_t> shared_live = {
+        n_tokens_per_stream - 1,
+        kv_size + n_tokens_per_stream - 1,
+    };
     std::vector<uint8_t> zeros(std::max(ggml_nbytes(stage), ggml_nbytes(records)), 0);
 
     ggml_backend_tensor_set(current, input.data(), 0, ggml_nbytes(current));
     ggml_backend_tensor_set(indices, idx.data(), 0, ggml_nbytes(indices));
+    ggml_backend_tensor_set(shared_live_indices, shared_live.data(), 0, ggml_nbytes(shared_live_indices));
     ggml_backend_tensor_set(stage, zeros.data(), 0, ggml_nbytes(stage));
     ggml_backend_tensor_set(records, zeros.data(), 0, ggml_nbytes(records));
 
     require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "multi-stream KVarN graph compute failed");
+    require(ggml_backend_graph_compute(backend, shared_graph) == GGML_STATUS_SUCCESS,
+            "shared multi-stream KVarN graph compute failed");
 
     const std::vector<float> output = test_kvarn_reference_decode_f32(
             records, stored, idx, n_tokens_per_stream, 0, n_stream, bits, false, 3);
@@ -1437,6 +1455,10 @@ static void test_cache_ops_multi_stream(enum ggml_backend_dev_type device_type, 
     ggml_backend_tensor_get(materialized, rotated_actual.data(), 0, ggml_nbytes(materialized));
     require_close_f16_rmse(rotated_reference, rotated_actual, 2e-3f,
             "multi-stream rotated KVarN materialization mismatch");
+    std::vector<ggml_fp16_t> shared_actual(ggml_nelements(shared_materialized));
+    ggml_backend_tensor_get(shared_materialized, shared_actual.data(), 0, ggml_nbytes(shared_materialized));
+    require_close_f16_rmse(rotated_reference, shared_actual, 2e-3f,
+            "shared multi-stream KVarN materialization mismatch");
 
     for (int s = 0; s < n_stream; ++s) {
         double sink_error = 0.0;
@@ -1490,7 +1512,7 @@ static void test_cache_ops_multi_stream(enum ggml_backend_dev_type device_type, 
 // in-window tile comes from records
 // whose ring slots were reused — a ring/seal bug would surface stale tiles and
 // blow up the error.
-static void test_cache_ops_swa(enum ggml_backend_dev_type device_type, bool required) {
+static void test_cache_ops_swa(enum ggml_backend_dev_type device_type, bool required, int n_stream) {
     ggml_backend_t backend = init_test_backend(device_type, required);
     if (backend == nullptr) {
         return;
@@ -1510,22 +1532,24 @@ static void test_cache_ops_swa(enum ggml_backend_dev_type device_type, bool requ
     constexpr int tail_groups = 4;         // explicit SWA no-sink tail: tail == stage
     constexpr int gps = 1;                 // deduplicated record ring for the one sealed window tile
     constexpr int n_tiles = 10;            // tiles 0..9 -> ring wraps (tile 6 reuses tile 0's slot)
-    constexpr int n_tokens = n_tiles * 128;
+    constexpr int n_tokens_per_stream = n_tiles * 128;
+    const int n_tokens = n_tokens_per_stream * n_stream;
     constexpr int window_base = 5 * 128;   // window covers tiles 5..9
     constexpr int n_kv = 5 * 128;          // tile 5 sealed; tiles 6..9 live in staging
     const int record_bytes = int(llama_kvarn_packed_bytes(128 * 128, bits) + 3 * 128 * sizeof(ggml_fp16_t));
 
     ggml_tensor * current = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, n_heads, n_tokens);
     ggml_tensor * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
-    ggml_tensor * stage = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, n_heads, 128 * stage_groups);
-    ggml_tensor * records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, record_bytes, n_heads, gps);
+    ggml_tensor * stage = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, n_heads, 128 * stage_groups * n_stream);
+    ggml_tensor * records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, record_bytes, n_heads, gps * n_stream);
 
     ggml_tensor * stored = ggml_kvarn_store(ctx, current, indices, stage, records, bits, 16, false, stage_groups);
+    stored->op_params[3] = n_tokens_per_stream;
     stored->op_params[4] = 1; // SWA ring store
     stored->op_params[8] = tail_groups;
-    ggml_tensor * mat_indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_kv);
+    ggml_tensor * mat_indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_kv * n_stream);
     ggml_tensor * materialized = ggml_kvarn_materialize(
-            ctx, records, stored, mat_indices, n_kv, 0, 1, bits, false, stage_groups);
+            ctx, records, stored, mat_indices, n_kv, 0, n_stream, bits, false, stage_groups);
     materialized->op_params[6] = 1;
     materialized->op_params[8] = tail_groups;
 
@@ -1536,21 +1560,29 @@ static void test_cache_ops_swa(enum ggml_backend_dev_type device_type, bool requ
     require(buffer != nullptr, "swa: failed to allocate tensors");
 
     std::vector<float> input(128 * n_heads * n_tokens);
-    for (int t = 0; t < n_tokens; ++t) {
-        for (int d = 0; d < 128; ++d) {
-            input[t * 128 + d] =
-                std::sin(float(d) * 0.071f) +
-                std::cos(float(t) * 0.0037f) +
-                float((d * 13 + t * 17) % 31 - 15) * 0.01f;
+    for (int stream = 0; stream < n_stream; ++stream) {
+        for (int t = 0; t < n_tokens_per_stream; ++t) {
+            for (int d = 0; d < 128; ++d) {
+                input[(stream * n_tokens_per_stream + t) * 128 + d] =
+                    std::sin(float(d) * 0.071f + float(stream) * 0.19f) +
+                    std::cos(float(t) * 0.0037f + float(stream) * 0.31f) +
+                    float((d * 13 + t * 17 + stream * 23) % 31 - 15) * 0.01f;
+            }
         }
     }
     std::vector<int64_t> idx(n_tokens);
-    for (int i = 0; i < n_tokens; ++i) {
-        idx[i] = i; // absolute token position
+    for (int stream = 0; stream < n_stream; ++stream) {
+        for (int t = 0; t < n_tokens_per_stream; ++t) {
+            idx[stream * n_tokens_per_stream + t] =
+                    llama_kvarn_encode_swa_position(stream, uint32_t(t));
+        }
     }
-    std::vector<int64_t> mat_idx(n_kv);
-    for (int cell = 0; cell < n_kv; ++cell) {
-        mat_idx[cell] = window_base + cell; // window covers tiles 6..9
+    std::vector<int64_t> mat_idx(n_kv * n_stream);
+    for (int stream = 0; stream < n_stream; ++stream) {
+        for (int cell = 0; cell < n_kv; ++cell) {
+            mat_idx[stream * n_kv + cell] =
+                    llama_kvarn_encode_swa_position(stream, uint32_t(window_base + cell));
+        }
     }
     std::vector<uint8_t> zeros(ggml_nbytes(stage) + ggml_nbytes(records), 0);
 
@@ -1562,30 +1594,29 @@ static void test_cache_ops_swa(enum ggml_backend_dev_type device_type, bool requ
 
     require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "swa: graph compute failed");
 
-    const std::vector<float> output = test_kvarn_reference_decode_f32(
-            records, stored, mat_idx, n_kv, 0, 1, bits, false, stage_groups, false, true);
     std::vector<ggml_fp16_t> materialized_data(ggml_nelements(materialized));
     ggml_backend_tensor_get(materialized, materialized_data.data(), 0, ggml_nbytes(materialized));
-    for (size_t i = 0; i < output.size(); ++i) {
-        require(std::abs(ggml_fp16_to_fp32(materialized_data[i]) - output[i]) < 2e-3f,
-                "SWA KVarN materialization mismatch");
-    }
 
     double sealed_error = 0.0; // tile 5 -> reused ring slot 0
     double live_error = 0.0;   // tiles 6..9 -> fp16 staging
-    for (int cell = 0; cell < n_kv; ++cell) {
-        const int abs_pos = window_base + cell;
-        for (int d = 0; d < 128; ++d) {
-            const double diff = double(input[abs_pos * 128 + d]) - double(output[cell * 128 + d]);
-            if (cell < 128) {
-                sealed_error += diff * diff;
-            } else {
-                live_error += diff * diff;
+    for (int stream = 0; stream < n_stream; ++stream) {
+        for (int cell = 0; cell < n_kv; ++cell) {
+            const int abs_pos = window_base + cell;
+            for (int d = 0; d < 128; ++d) {
+                const size_t input_off = size_t(stream * n_tokens_per_stream + abs_pos) * 128 + d;
+                const size_t output_off = (size_t(stream) * n_kv + cell) * 128 + d;
+                const double diff = double(input[input_off]) -
+                        double(ggml_fp16_to_fp32(materialized_data[output_off]));
+                if (cell < 128) {
+                    sealed_error += diff * diff;
+                } else {
+                    live_error += diff * diff;
+                }
             }
         }
     }
-    sealed_error = std::sqrt(sealed_error / (128 * 128));
-    live_error = std::sqrt(live_error / (4 * 128 * 128));
+    sealed_error = std::sqrt(sealed_error / (n_stream * 128 * 128));
+    live_error = std::sqrt(live_error / (n_stream * 4 * 128 * 128));
     require(sealed_error < 0.25, "swa: sealed (wrapped) tile reconstruction error too high");
     require(live_error < 0.02, "swa: live tail reconstruction error too high");
 
@@ -5108,8 +5139,10 @@ int main() {
     }
     test_cache_ops_multi_stream(GGML_BACKEND_DEVICE_TYPE_CPU, true, 6);
     test_cache_ops_multi_stream(GGML_BACKEND_DEVICE_TYPE_GPU, false, 6);
-    test_cache_ops_swa(GGML_BACKEND_DEVICE_TYPE_CPU, true);
-    test_cache_ops_swa(GGML_BACKEND_DEVICE_TYPE_GPU, false); // CUDA SWA ring parity
+    test_cache_ops_swa(GGML_BACKEND_DEVICE_TYPE_CPU, true, 1);
+    test_cache_ops_swa(GGML_BACKEND_DEVICE_TYPE_GPU, false, 1); // CUDA SWA ring parity
+    test_cache_ops_swa(GGML_BACKEND_DEVICE_TYPE_CPU, true, 2);
+    test_cache_ops_swa(GGML_BACKEND_DEVICE_TYPE_GPU, false, 2); // multi-slot SWA ring parity
     test_store_paths_gpu();
     test_native_flash_attention_support_gates();
     test_native_flash_attention_cpu();

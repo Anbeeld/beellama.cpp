@@ -11610,14 +11610,17 @@ static inline int64_t kvarn_cpu_read_cell(
         int64_t encoded, bool read_indirect, bool swa, bool & staged,
         int64_t * assigned_slot = nullptr) {
     GGML_UNUSED(read_indirect);
-    GGML_UNUSED(swa);
-    staged = encoded < -1;
+    staged = !swa && encoded < -1;
     const uint64_t payload = uint64_t(kvarn_cpu_index_payload(encoded));
     if (assigned_slot != nullptr) {
         const uint32_t packed = uint32_t(payload >> 32u);
-        *assigned_slot = packed == 0 ? -1 : int64_t(packed - 1u);
+        *assigned_slot = swa || packed == 0 ? -1 : int64_t(packed - 1u);
     }
     return int64_t(uint32_t(payload));
+}
+
+static inline int64_t kvarn_cpu_swa_stream(int64_t encoded) {
+    return int64_t(uint64_t(encoded) >> 32u);
 }
 
 static void kvarn_cpu_hadamard(float * values) {
@@ -11941,11 +11944,11 @@ void ggml_compute_forward_kvarn_store(const ggml_compute_params * params, ggml_t
         GGML_ASSERT(encoded_idx >= 0);
         const uint64_t payload = uint64_t(encoded_idx);
         const uint32_t packed_slot = uint32_t(payload >> 32u);
-        const int64_t assigned_slot = packed_slot == 0 ? -1 : int64_t(packed_slot - 1u);
+        const int64_t assigned_slot = swa || packed_slot == 0 ? -1 : int64_t(packed_slot - 1u);
         const int64_t idx = int64_t(uint32_t(payload));
         const int64_t group_global = idx / 128;
         const int64_t pos = idx % 128;
-        const int64_t stream = swa ? 0 : group_global / groups_per_stream;
+        const int64_t stream = swa ? kvarn_cpu_swa_stream(encoded_idx) : group_global / groups_per_stream;
         const int64_t group = swa ? group_global : group_global - stream * groups_per_stream;
         GGML_ASSERT(stream >= 0 && stream < n_stream);
         if (!swa) {
@@ -12041,7 +12044,7 @@ void ggml_compute_forward_kvarn_materialize(const ggml_compute_params * params, 
         const int64_t idx = kvarn_cpu_read_cell(encoded, read_indirect, swa, staged);
         const int64_t group_global = idx / KVAR_N_GROUP;
         const int64_t pos = idx % KVAR_N_GROUP;
-        const int64_t stream = swa ? stream_start : group_global / groups_per_stream;
+        const int64_t stream = swa ? kvarn_cpu_swa_stream(encoded) : group_global / groups_per_stream;
         if (stream < stream_start || stream >= stream_start + n_stream) {
             continue;
         }
@@ -12064,7 +12067,8 @@ void ggml_compute_forward_kvarn_materialize(const ggml_compute_params * params, 
         const int64_t cell = cell_stream % n_kv;
         const int64_t out_stream = cell_stream / n_kv;
         const int64_t stream = stream_start + out_stream;
-        const int64_t encoded = (swa || read_indirect) ? idx_data[cell] : cell;
+        const int64_t encoded = swa ? idx_data[stream*n_kv + cell] :
+                (read_indirect ? idx_data[cell] : cell);
         std::array<std::array<float, KVAR_N_GROUP>, 4> rows = {};
         if (encoded != -1) {
             bool explicitly_staged;

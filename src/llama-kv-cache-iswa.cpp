@@ -10,6 +10,92 @@
 #include <stdexcept>
 #include <string>
 
+namespace {
+
+class llama_kv_cache_kvarn_shared final : public llama_memory_i {
+public:
+    llama_kv_cache_kvarn_shared(
+            llama_kv_cache_kvarn * source,
+            std::unique_ptr<llama_kv_cache> metadata,
+            std::vector<int32_t> graph_layers) :
+        source(source), metadata(std::move(metadata)), graph_layers(std::move(graph_layers)) {
+    }
+
+    llama_memory_context_ptr init_batch(
+            llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) override {
+        return std::make_unique<llama_kv_cache_kvarn_context>(
+                source, metadata->init_batch(balloc, n_ubatch, embd_all), nullptr, graph_layers);
+    }
+
+    llama_memory_context_ptr init_full() override {
+        return std::make_unique<llama_kv_cache_kvarn_context>(
+                source, metadata->init_full(), nullptr, graph_layers);
+    }
+
+    llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override {
+        return std::make_unique<llama_kv_cache_kvarn_context>(
+                source, metadata->init_update(lctx, optimize), lctx, graph_layers);
+    }
+
+    uint32_t get_kv_n_stream() const override { return metadata->get_kv_n_stream(); }
+    uint32_t get_kv_size() const override { return metadata->get_kv_size(); }
+    llama_memory_context_ptr init_kv_batch(const std::vector<llama_ubatch> & ubatches) override {
+        return std::make_unique<llama_kv_cache_kvarn_context>(
+                source, metadata->init_kv_batch(ubatches), nullptr, graph_layers);
+    }
+
+    bool get_can_shift() const override { return metadata->get_can_shift(); }
+    seq_rm_capability get_seq_rm_capability() const override { return metadata->get_seq_rm_capability(); }
+    void clear(bool data) override { metadata->clear(data); }
+    bool can_seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const override {
+        return metadata->can_seq_rm(seq_id, p0, p1);
+    }
+    bool seq_rm_plan(
+            llama_seq_id seq_id, llama_pos p0, llama_pos p1,
+            llama_pos & planned_p0, llama_pos & planned_p1) const override {
+        return metadata->seq_rm_plan(seq_id, p0, p1, planned_p0, planned_p1);
+    }
+    bool seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) override {
+        return metadata->seq_rm(seq_id, p0, p1);
+    }
+    bool seq_rm_cell(llama_seq_id seq_id, uint32_t cell_idx) override {
+        return metadata->seq_rm_cell(seq_id, cell_idx);
+    }
+    int cells_at_pos(llama_seq_id seq_id, llama_pos pos, uint32_t * cells, int n_max) override {
+        return metadata->cells_at_pos(seq_id, pos, cells, n_max);
+    }
+    void seq_cp(llama_seq_id src, llama_seq_id dst, llama_pos p0, llama_pos p1) override {
+        metadata->seq_cp(src, dst, p0, p1);
+    }
+    void seq_keep(llama_seq_id seq_id) override { metadata->seq_keep(seq_id); }
+    void seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) override {
+        metadata->seq_add(seq_id, p0, p1, shift);
+    }
+    void seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) override {
+        metadata->seq_div(seq_id, p0, p1, d);
+    }
+    llama_pos seq_pos_min(llama_seq_id seq_id) const override { return metadata->seq_pos_min(seq_id); }
+    llama_pos seq_pos_max(llama_seq_id seq_id) const override { return metadata->seq_pos_max(seq_id); }
+    std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override {
+        return metadata->memory_breakdown();
+    }
+    llama_kv_memory_stats kv_memory_stats() const override { return metadata->kv_memory_stats(); }
+    ggml_type get_kv_tail_type() const override { return metadata->get_kv_tail_type(); }
+    void state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const override {
+        metadata->state_write(io, seq_id, flags);
+    }
+    void state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) override {
+        metadata->state_read(io, seq_id, flags);
+    }
+
+private:
+    llama_kv_cache_kvarn * source;
+    std::unique_ptr<llama_kv_cache> metadata;
+    std::vector<int32_t> graph_layers;
+};
+
+} // namespace
+
 //
 // llama_kv_cache_iswa
 //
@@ -139,19 +225,12 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     if (kvarn_policy == LLAMA_KVARN_ISWA_ALL_LAYERS) {
         LLAMA_LOG_INFO("%s: KVarN enabled for all layers (non-SWA %s, SWA %s sliding-window ring)\n",
                 __func__, llama_kvarn_type_name(kvarn.type), llama_kvarn_type_name(kvarn_swa.type));
-    } else if (kvarn_policy == LLAMA_KVARN_ISWA_STANDARD_SWA_FALLBACK) {
-        LLAMA_LOG_WARN(
-                "%s: KVarN enabled for non-SWA layers (%s); SWA layers use standard %s/%s "
-                "because the position-addressed KVarN SWA ring is single-sequence with %u slots\n",
-                __func__, llama_kvarn_type_name(kvarn.type),
-                ggml_type_name(type_k), ggml_type_name(type_v), n_seq_max);
     }
 
     auto make_cache = [&](uint32_t size, uint32_t n_swa, llama_swa_type swa_type,
                           const layer_filter_cb & layer_filter, llama_memory_t cache_mem_other,
-                          const llama_kvarn_params & cache_kvarn) -> std::unique_ptr<llama_memory_i> {
-        // A sliding-window KVarN ring uses one stream.  A non-unified cache is
-        // still valid when there is only one sequence.
+                          const llama_kvarn_params & cache_kvarn,
+                          const layer_share_cb & cache_share) -> std::unique_ptr<llama_memory_i> {
         const bool is_swa_group = n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE;
         const bool kvarn_ok = cache_kvarn.type != LLAMA_KVARN_TYPE_DISABLED &&
             (!is_swa_group || kvarn_policy == LLAMA_KVARN_ISWA_ALL_LAYERS);
@@ -184,10 +263,38 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                     exact_tokens, tail_type, exact_requested, tail_rollback_tokens);
         }
 
+        if (auto * kvarn_other = dynamic_cast<llama_kv_cache_kvarn *>(cache_mem_other)) {
+            if (!cache_share) {
+                throw std::runtime_error("structured KVarN cache sharing requires a layer mapping");
+            }
+            std::vector<int32_t> shared_graph_layers(hparams.n_layer_all, -1);
+            for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+                if (layer_filter && layer_filter(il)) {
+                    const int32_t shared_il = cache_share(il);
+                    if (shared_il < 0) {
+                        throw std::runtime_error("structured KVarN auxiliary sharing requires every selected layer to be shared");
+                    }
+                    try {
+                        (void) kvarn_other->mapped_layer_id(shared_il);
+                    } catch (const std::out_of_range &) {
+                        throw std::runtime_error("structured KVarN auxiliary sharing mapped to an unavailable target layer");
+                    }
+                    shared_graph_layers[il] = shared_il;
+                }
+            }
+
+            auto metadata_view = kvarn_other->make_shared_metadata_cache(model);
+            return std::make_unique<llama_kv_cache_kvarn_shared>(
+                    kvarn_other, std::move(metadata_view), std::move(shared_graph_layers));
+        }
+        if (cache_mem_other && dynamic_cast<llama_kv_cache *>(cache_mem_other) == nullptr) {
+            throw std::runtime_error("cannot share auxiliary KV caches with incompatible representations");
+        }
+
         return std::make_unique<llama_kv_cache>(
                 model, hparams, type_k, type_v,
                 v_trans, offload, unified, size, n_seq_max, n_pad,
-                n_swa, swa_type, cache_mem_other, layer_filter, reuse, share,
+                n_swa, swa_type, cache_mem_other, layer_filter, reuse, cache_share,
                 n_ubatch, n_swa > 0 ? tail_tokens_swa : tail_tokens, tail_type,
                 n_swa > 0 ? tail_tokens_swa_requested : tail_tokens_requested,
                 false, tail_rollback_tokens);
@@ -195,21 +302,22 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
 
     LLAMA_LOG_INFO("%s: creating non-SWA KV cache, size = %u cells\n", __func__, size_base);
 
-    llama_memory_t mem_other_base = nullptr;
+    llama_kv_cache_iswa * mem_other_iswa = nullptr;
     if (mem_other) {
-        mem_other_base = static_cast<llama_kv_cache_iswa *>(mem_other)->get_base();
+        mem_other_iswa = dynamic_cast<llama_kv_cache_iswa *>(mem_other);
+        if (!mem_other_iswa) {
+            throw std::runtime_error("cannot share an auxiliary ISWA cache with a non-ISWA target cache");
+        }
     }
 
-    llama_memory_t mem_other_swa = nullptr;
-    if (mem_other) {
-        mem_other_swa = static_cast<llama_kv_cache_iswa *>(mem_other)->get_swa();
-    }
+    llama_memory_t mem_other_base = mem_other_iswa ? mem_other_iswa->get_base() : nullptr;
+    llama_memory_t mem_other_swa  = mem_other_iswa ? mem_other_iswa->get_swa()  : nullptr;
 
-    kv_base = make_cache(size_base, 0, LLAMA_SWA_TYPE_NONE, filter_base, mem_other_base, kvarn);
+    kv_base = make_cache(size_base, 0, LLAMA_SWA_TYPE_NONE, filter_base, mem_other_base, kvarn, share);
 
     LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
 
-    kv_swa = make_cache(size_swa, hparams.n_swa, hparams.swa_type, filter_swa, mem_other_swa, kvarn_swa);
+    kv_swa = make_cache(size_swa, hparams.n_swa, hparams.swa_type, filter_swa, mem_other_swa, kvarn_swa, share);
 }
 
 void llama_kv_cache_iswa::clear(bool data) {
