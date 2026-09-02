@@ -307,7 +307,20 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
 #define KVARN_AXIS_OTHER(sl, i) __half2float(axes_sh[sl][2 * GGML_CUDA_FATTN_KVARN_DIM + (i)])
     __shared__ float zq_sh[Q_TILE][SLICES][MAX_GQA];
     __shared__ float m_sh[Q_TILE][MAX_GQA];
-    __shared__ float denom_sh[Q_TILE][MAX_GQA];
+    // NVCC 13.1/sm_86 trims eight bytes from this kernel when the TU-local
+    // combine instantiation is removed. Preserve the verified baseline resource
+    // footprint only for that compiler target; other backends/toolkits retain
+    // the original declaration until separately proven to need compensation.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 860 && \
+    defined(__CUDACC_VER_MAJOR__) && __CUDACC_VER_MAJOR__ == 13 && \
+    defined(__CUDACC_VER_MINOR__) && __CUDACC_VER_MINOR__ == 1 && \
+    !defined(__HIPCC__) && !defined(GGML_USE_MUSA)
+    static constexpr int GGML_CUDA_FATTN_KVARN_DECODE_RESOURCE_PAD =
+        D == 128 && MAX_GQA == 6 && SPLIT_TOKENS == 64 && NWARPS == 4 && Q_TILE == 1 ? 2 : 0;
+#else
+    static constexpr int GGML_CUDA_FATTN_KVARN_DECODE_RESOURCE_PAD = 0;
+#endif
+    __shared__ float denom_sh[Q_TILE][MAX_GQA + GGML_CUDA_FATTN_KVARN_DECODE_RESOURCE_PAD];
 
     const ggml_cuda_fattn_kvarn_desc & k_desc = k_descs[stream * n_kv_heads + kv_head];
     const ggml_cuda_fattn_kvarn_desc & v_desc = v_descs[stream * n_kv_heads + kv_head];
@@ -784,111 +797,19 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
     }
 }
 
-template<int D>
-static __global__ void ggml_cuda_fattn_kvarn_decode_combine_kernel(
-        const float * partial,
-        const float2 * partial_meta,
-        float * dst,
-        float2 * dst_meta,
-        int n_splits,
-        int n_q,
-        int n_q_heads) {
-    const int q_head = blockIdx.x;
-    const int q_index = blockIdx.y;
-    const int stream = blockIdx.z;
-    const int tid = threadIdx.x;
-
-    __shared__ float reduce_sh[GGML_CUDA_FATTN_KVARN_DECODE_THREADS];
-    extern __shared__ float split_weights[];
-
-    float local_max = -FLT_MAX / 2.0f;
-    for (int split = tid; split < n_splits; split += blockDim.x) {
-        const float2 meta = partial_meta[(((size_t) stream * n_q + q_index) * n_q_heads + q_head) * n_splits + split];
-        if (meta.y > 0.0f) {
-            local_max = fmaxf(local_max, meta.x);
-        }
-    }
-    reduce_sh[tid] = local_max;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            reduce_sh[tid] = fmaxf(reduce_sh[tid], reduce_sh[tid + stride]);
-        }
-        __syncthreads();
-    }
-    const float m = reduce_sh[0];
-
-    float local_denom = 0.0f;
-    for (int split = tid; split < n_splits; split += blockDim.x) {
-        const float2 meta = partial_meta[(((size_t) stream * n_q + q_index) * n_q_heads + q_head) * n_splits + split];
-        float weight = 0.0f;
-        if (meta.y > 0.0f) {
-            weight = __expf(meta.x - m);
-            local_denom += weight * meta.y;
-        }
-        split_weights[split] = weight;
-    }
-    reduce_sh[tid] = local_denom;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            reduce_sh[tid] += reduce_sh[tid + stride];
-        }
-        __syncthreads();
-    }
-    const float denom = reduce_sh[0];
-
-    const size_t output_row = ((size_t) stream * n_q + q_index) * n_q_heads + q_head;
-    if (tid == 0 && dst_meta != nullptr) {
-        dst_meta[output_row] = make_float2(m, denom);
-    }
-
-    for (int dim = tid; dim < D; dim += blockDim.x) {
-        float out = 0.0f;
-        if (denom > 0.0f) {
-            for (int split = 0; split < n_splits; ++split) {
-                // Пропущенные сплиты не писали partial вовсе, а раньше писали
-                // туда нули: прибавить ноль и не прибавлять ничего — одно и то
-                // же значение. Заодно это убирает половину чтений partial при
-                // двух последовательностях в объединённом кэше.
-                const float weight = split_weights[split];
-                if (weight == 0.0f) {
-                    continue;
-                }
-                const size_t base = (((size_t) stream * n_q + q_index) * n_q_heads + q_head) * n_splits + split;
-                out += weight * partial[base * D + dim];
-            }
-            out /= denom;
-        }
-        dst[output_row * D + dim] = out;
-    }
-}
-
 static inline int ggml_cuda_fattn_kvarn_decode_div_up_i64(const int64_t x, const int y) {
     return (int) ((x + y - 1) / y);
 }
 
-// The KVarN decode combine reduction holds n_splits partials in dynamic shared
-// memory. n_splits = ceil(n_kv / SPLIT_TOKENS) grows with context, so once
-// n_splits*sizeof(float) exceeds CUDA's 48KB default per-block dynamic-shared-
-// mem ceiling (~786K tokens at SPLIT_TOKENS=64), the launch fails with
-// cudaErrorInvalidConfiguration ("invalid argument"). Raise the kernel's
-// dynamic-shared-mem limit once per device to the device opt-in max, mirroring
-// CUDA_SET_SHARED_MEMORY_LIMIT. Setting it per launch to the current demand
-// would shrink the ceiling below what a later, larger launch of the same kernel
-// needs (the VEC path in fattn-kvarn-vec.cuh launches this same kernel
-// template), so the limit must only ever be raised. Coverage is bounded by the
-// device's sharedMemPerBlockOptin (e.g. ~228KB on sm_120 = n_kv ~3.7M; 64KB at
-// n_kv=1M). Beyond that the launch still fails; the split planner in
-// ggml_cuda_fattn_kvarn_decode_select does not gate on this limit.
+// The combine reduction uses n_splits floats of dynamic shared memory. Keep
+// the original per-specialization preparation in the caller while caching the
+// canonical kernel pointer, so steady-state launches add no cross-TU host call.
 template<int D>
-static void ggml_cuda_fattn_kvarn_decode_combine_prepare(const int nbytes_shared_combine) {
+static void ggml_cuda_fattn_kvarn_decode_combine_prepare(
+        ggml_cuda_fattn_kvarn_decode_combine_kernel_t kernel,
+        const int nbytes_shared_combine) {
     const int device = ggml_cuda_get_device();
     GGML_ASSERT(device >= 0 && device < GGML_CUDA_MAX_DEVICES);
-    // The opt-in ceiling is shared between static and dynamic shared memory:
-    // cudaFuncSetAttribute rejects values where value + static > smpbo. The
-    // combine kernel holds reduce_sh[] in static shared memory, so the dynamic
-    // limit is smpbo minus that static footprint.
     constexpr int nbytes_static_combine = GGML_CUDA_FATTN_KVARN_DECODE_THREADS * (int) sizeof(float);
     const int smem_max = (int) ggml_cuda_info().devices[device].smpbo - nbytes_static_combine;
     GGML_ASSERT(nbytes_shared_combine <= smem_max &&
@@ -897,10 +818,12 @@ static void ggml_cuda_fattn_kvarn_decode_combine_prepare(const int nbytes_shared
     static bool raised[GGML_CUDA_MAX_DEVICES] = {};
     if (!raised[device]) {
         CUDA_CHECK(cudaFuncSetAttribute(
-            reinterpret_cast<const void *>(ggml_cuda_fattn_kvarn_decode_combine_kernel<D>),
+            reinterpret_cast<const void *>(kernel),
             cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max));
         raised[device] = true;
     }
+#else
+    GGML_UNUSED(kernel);
 #endif
 }
 
@@ -1250,11 +1173,12 @@ void ggml_cuda_fattn_kvarn_decode_launch(const ggml_cuda_fattn_kvarn_decode_args
     }
     CUDA_CHECK(cudaGetLastError());
 
+    static const ggml_cuda_fattn_kvarn_decode_combine_kernel_t combine_kernel =
+        ggml_cuda_fattn_kvarn_decode_combine_get_kernel<D>();
     const dim3 blocks_combine((uint32_t) args.n_q_heads, (uint32_t) args.n_q, (uint32_t) args.n_stream);
-
     const int nbytes_shared_combine = args.n_splits * (int) sizeof(float);
-    ggml_cuda_fattn_kvarn_decode_combine_prepare<D>(nbytes_shared_combine);
-    ggml_cuda_fattn_kvarn_decode_combine_kernel<D>
+    ggml_cuda_fattn_kvarn_decode_combine_prepare<D>(combine_kernel, nbytes_shared_combine);
+    combine_kernel
         <<<blocks_combine, GGML_CUDA_FATTN_KVARN_DECODE_THREADS, nbytes_shared_combine, args.stream>>>(
             args.partial, args.partial_meta, args.dst, args.dst_meta,
             args.n_splits, args.n_q, args.n_q_heads);

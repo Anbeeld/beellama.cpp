@@ -52,6 +52,12 @@ struct ggml_cuda_fattn_kvarn_decode_args {
     cudaStream_t stream;
 };
 
+using ggml_cuda_fattn_kvarn_decode_combine_kernel_t = void (*)(
+        const float *, const float2 *, float *, float2 *, int, int, int);
+
+template<int D>
+ggml_cuda_fattn_kvarn_decode_combine_kernel_t ggml_cuda_fattn_kvarn_decode_combine_get_kernel();
+
 template<int D, int K_BITS, int V_BITS>
 ggml_cuda_fattn_kvarn_decode_geometry ggml_cuda_fattn_kvarn_decode_select(
         int device,

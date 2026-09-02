@@ -136,6 +136,12 @@ if (Python3_Interpreter_FOUND)
     set_property(TEST test-kvarn-hip-tail-capability-static PROPERTY LABELS hip)
 
     add_test(
+        NAME test-cuda-binary-equivalence
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-cuda-binary-equivalence.py)
+    set_property(TEST test-cuda-binary-equivalence PROPERTY LABELS cuda)
+
+    add_test(
         NAME test-kvarn-hip-runtime-validation
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-kvarn-hip-runtime-validation.py ${PROJECT_SOURCE_DIR})
