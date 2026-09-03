@@ -1,5 +1,6 @@
 #include "testing.h"
 
+#include "clip.h"
 #include "mtmd-image.h"
 #include "mtmd-internal.h"
 
@@ -39,8 +40,6 @@ struct test_registry {
     static void name(testing & t);                                    \
     static const test_registry test_registry_ ## name(#name, &name);  \
     static void name(testing & t)
-
-size_t clip_set_n_threads(const std::vector<ggml_backend_t> & backends, int n_threads);
 
 MAKE_TEST(test_clip_backend_thread_propagation) {
     ggml_backend_load_all();
