@@ -457,12 +457,17 @@ llama_kv_cache::llama_kv_cache(
                 const int32_t il_share = share(il);
                 if (il_share >= 0) {
                     const auto & source = other->layers[other->map_layer_ids.at(il_share)];
+                    const auto * source_k = source.k ? source.k : source.k_tail;
+                    const auto * source_v = source.v ? source.v : source.v_tail;
+                    if (!source_k || (has_v && !source_v)) {
+                        throw std::runtime_error("shared KV layer has no readable K/V payload");
+                    }
                     shared_layer = true;
-                    actual_type_k = source.k->type;
-                    actual_k_dim = uint32_t(source.k->ne[0]);
-                    if (has_v && source.v) {
-                        actual_type_v = source.v->type;
-                        actual_v_dim = uint32_t(source.v->ne[0]);
+                    actual_type_k = source_k->type;
+                    actual_k_dim = uint32_t(source_k->ne[0]);
+                    if (has_v) {
+                        actual_type_v = source_v->type;
+                        actual_v_dim = uint32_t(source_v->ne[0]);
                     }
                 }
             }
@@ -524,7 +529,9 @@ llama_kv_cache::llama_kv_cache(
             if (shared_layer) {
                 const int32_t il_share = share(il);
                 const auto & source = other->layers[other->map_layer_ids.at(il_share)];
-                route_buft = ggml_backend_buffer_get_type(source.k->buffer);
+                const auto * source_k = source.k ? source.k : source.k_tail;
+                GGML_ASSERT(source_k && source_k->buffer);
+                route_buft = ggml_backend_buffer_get_type(source_k->buffer);
             } else if (offload) {
                 route_buft = ggml_backend_dev_buffer_type(model.dev_layer(il));
             } else {
@@ -580,6 +587,13 @@ llama_kv_cache::llama_kv_cache(
         n_swa > 0 && !has_shared_layer,
     };
     tail_plan = llama_kv_tail_storage_plan_for(storage_request);
+    if (other && has_shared_layer && !has_owned_layer && other->has_compact_tail()) {
+        // A bodyless full-window tail is the target cache's authoritative K/V
+        // payload. Preserve that representation for read-only auxiliary views
+        // instead of misclassifying its F16 tail tensors as a dense body.
+        tail_plan = other->tail_plan;
+        tail_plan.layer_routes.clear();
+    }
 
     const auto resolve_overlay_routes = [&](ggml_type candidate,
                                             std::vector<llama_kv_tail_layer_route> & routes,
@@ -821,19 +835,23 @@ llama_kv_cache::llama_kv_cache(
             const int32_t il_share = share(il);
 
             if (il_share >= 0) {
-                const auto & layer_share = other->layers[other->map_layer_ids[il_share]];
+                const auto & layer_share = other->layers[other->map_layer_ids.at(il_share)];
+                const auto * source_k = layer_share.k ? layer_share.k : layer_share.k_tail;
+                const auto * source_v = layer_share.v ? layer_share.v : layer_share.v_tail;
+                if (!source_k || (!is_mla && !source_v)) {
+                    throw std::runtime_error("shared KV layer has no readable K/V payload");
+                }
 
                 LLAMA_LOG_WARN("%s: layer %3d: sharing with layer %d. k = %p, v = %p\n", __func__, il, il_share,
-                        layer_share.k->data, layer_share.v->data);
+                        source_k->data, source_v ? source_v->data : nullptr);
 
                 map_layer_ids[il] = layers.size();
+                shared_layer_ids[il] = il_share;
 
                 layers.push_back(layer_share);
                 layers.back().il = il;
-
-                // exact-tail storage is never shared between layers
-                layers.back().k_tail = nullptr;
-                layers.back().v_tail = nullptr;
+                layers.back().k_tail = layer_share.k_tail;
+                layers.back().v_tail = layer_share.v_tail;
 
                 continue;
             }
@@ -1051,7 +1069,35 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
-    if (has_tail_overlay() && !tail_metadata_only) {
+    if (other && !shared_layer_ids.empty() && shared_layer_ids.size() != layers.size() &&
+            other->get_tail_tokens() > 0) {
+        throw std::runtime_error(
+                "KV tail sharing requires each cache group to be entirely shared or entirely owned");
+    }
+
+    if (other) {
+        for (const auto & [il, il_share] : shared_layer_ids) {
+            const auto found = std::find_if(tail_plan.layer_routes.begin(), tail_plan.layer_routes.end(),
+                    [&](const auto & route) { return route.layer_id == uint32_t(il); });
+            if (found == tail_plan.layer_routes.end()) {
+                const auto * source_route = other->get_tail_layer_route(il_share);
+                if (source_route) {
+                    auto route = *source_route;
+                    route.layer_id = uint32_t(il);
+                    tail_plan.layer_routes.push_back(std::move(route));
+                }
+            }
+        }
+        for (auto & route : tail_plan.layer_routes) {
+            // Shared MTP layers read rows already committed by the target graph;
+            // they do not contribute a graph-local current K/V segment.
+            if (is_shared_layer(int32_t(route.layer_id))) {
+                route.has_current = false;
+            }
+        }
+    }
+
+    if (has_tail_overlay() && !tail_metadata_only && !uses_shared_tail()) {
         finalize_tail_overlay_metadata();
 
         std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> tail_ctx_map;
@@ -3293,7 +3339,26 @@ uint64_t llama_kv_cache::get_kv_tail_planner_timing_ns() const {
     return tail_planner_timing_ns.load(std::memory_order_relaxed);
 }
 
+bool llama_kv_cache::uses_shared_tail() const {
+    return other && !layers.empty() && shared_layer_ids.size() == layers.size();
+}
+
+bool llama_kv_cache::is_shared_layer(int32_t il) const {
+    return shared_layer_ids.find(il) != shared_layer_ids.end();
+}
+
+int32_t llama_kv_cache::shared_layer_id(int32_t il) const {
+    const auto it = shared_layer_ids.find(il);
+    if (it == shared_layer_ids.end()) {
+        throw std::out_of_range("KV layer is not mapped to a shared source layer");
+    }
+    return it->second;
+}
+
 ggml_tensor * llama_kv_cache::get_k_tail(ggml_context * ctx, int32_t il) const {
+    if (is_shared_layer(il)) {
+        return get_tail_tokens() > 0 ? other->get_k_tail(ctx, shared_layer_id(il)) : nullptr;
+    }
     const auto * tensor = layers[map_layer_ids.at(il)].k_tail;
     if (!tensor) {
         return nullptr;
@@ -3305,6 +3370,9 @@ ggml_tensor * llama_kv_cache::get_k_tail(ggml_context * ctx, int32_t il) const {
 }
 
 ggml_tensor * llama_kv_cache::get_v_tail(ggml_context * ctx, int32_t il) const {
+    if (is_shared_layer(il)) {
+        return get_tail_tokens() > 0 ? other->get_v_tail(ctx, shared_layer_id(il)) : nullptr;
+    }
     const auto * tensor = layers[map_layer_ids.at(il)].v_tail;
     if (!tensor) {
         return nullptr;
@@ -3422,6 +3490,9 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
 }
 
 ggml_tensor * llama_kv_cache::build_input_tail_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
+    if (uses_shared_tail()) {
+        return nullptr;
+    }
     if (!tail) {
         return nullptr;
     }
@@ -3435,6 +3506,9 @@ ggml_tensor * llama_kv_cache::build_input_tail_idxs(ggml_context * ctx, const ll
 }
 
 ggml_tensor * llama_kv_cache::build_input_tail_body_idxs(ggml_context * ctx) const {
+    if (uses_shared_tail()) {
+        return other->build_input_tail_body_idxs(ctx);
+    }
     if (!tail) {
         return nullptr;
     }
@@ -3562,6 +3636,9 @@ void llama_kv_cache::set_input_tail_idxs(ggml_tensor * dst, const llama_ubatch *
 }
 
 void llama_kv_cache::set_input_tail_body_idxs(ggml_tensor * dst) const {
+    if (uses_shared_tail()) {
+        return other->set_input_tail_body_idxs(dst);
+    }
     if (!dst) {
         return;
     }
@@ -6806,6 +6883,17 @@ uint32_t llama_kv_cache_context::get_tail_rollback_tokens() const {
 }
 
 uint32_t llama_kv_cache::get_tail_attention_stride(uint32_t n_query_tokens) const {
+    if (uses_shared_tail()) {
+        GGML_UNUSED(n_query_tokens);
+        // Shared MTP reads have no graph-local current segment, so they need
+        // only the target's persistent retention extent, not query rollback rows.
+        const uint32_t required = get_tail_tokens();
+        if (has_compact_tail() || required <= 128) {
+            return required;
+        }
+        constexpr uint32_t fa_tile = 256;
+        return (required + fa_tile - 1)/fa_tile*fa_tile;
+    }
     if (!has_tail_overlay()) {
         return 0;
     }
@@ -6853,6 +6941,9 @@ const llama_kv_tail_layer_route * llama_kv_cache::get_tail_layer_route(int32_t i
 }
 
 uint32_t llama_kv_cache::get_tail_body_execution_stride() const {
+    if (uses_shared_tail()) {
+        return other->get_tail_body_execution_stride();
+    }
     uint32_t result = 0;
     for (const auto & route : tail_plan.layer_routes) {
         result = std::max(result, route.body_execution_rows);
@@ -6861,6 +6952,9 @@ uint32_t llama_kv_cache::get_tail_body_execution_stride() const {
 }
 
 uint32_t llama_kv_cache::get_tail_body_execution_rows(int32_t il) const {
+    if (is_shared_layer(il)) {
+        return other->get_tail_body_execution_rows(shared_layer_id(il));
+    }
     if (!has_tail_overlay()) {
         return 0;
     }
@@ -6873,6 +6967,9 @@ uint32_t llama_kv_cache::get_tail_body_execution_rows(int32_t il) const {
 }
 
 bool llama_kv_cache::has_kv_body(int32_t il) const {
+    if (is_shared_layer(il)) {
+        return other->has_kv_body(shared_layer_id(il));
+    }
     if (!has_tail_overlay()) {
         return true;
     }
@@ -6897,6 +6994,9 @@ bool llama_kv_cache::has_tail_current(int32_t il) const {
 }
 
 ggml_backend_dev_t llama_kv_cache::get_tail_backend(int32_t il) const {
+    if (is_shared_layer(il)) {
+        return other->get_tail_backend(shared_layer_id(il));
+    }
     if (!has_tail_overlay()) {
         return nullptr;
     }
@@ -6909,6 +7009,9 @@ ggml_backend_dev_t llama_kv_cache::get_tail_backend(int32_t il) const {
 }
 
 bool llama_kv_cache::get_tail_explicit_bias(int32_t il) const {
+    if (is_shared_layer(il)) {
+        return other->get_tail_explicit_bias(shared_layer_id(il));
+    }
     if (!has_tail_overlay() && tail_plan.kind != LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT) {
         return false;
     }
@@ -7195,6 +7298,10 @@ void llama_kv_cache::set_input_kq_mask_tail(
         ggml_tensor * body, ggml_tensor * exact,
         ggml_tensor * read_idxs, ggml_tensor * body_read_idxs, ggml_tensor * bias_read_idxs,
         const llama_ubatch * ubatch, bool causal_attn) const {
+    if (uses_shared_tail()) {
+        return other->set_input_kq_mask_tail(
+                body, exact, read_idxs, body_read_idxs, bias_read_idxs, ubatch, causal_attn);
+    }
     set_input_kq_mask_tail_mapped(
             body, exact, read_idxs, body_read_idxs, bias_read_idxs,
             ubatch, causal_attn, {});
@@ -7267,6 +7374,9 @@ void llama_kv_cache::set_input_kq_mask_tail_mapped(
 }
 
 bool llama_kv_cache::can_pack_tail_body(const llama_ubatch & ubatch) const {
+    if (uses_shared_tail()) {
+        return other->can_pack_tail_body(ubatch);
+    }
     if (!has_kv_body() || !tail || tail_arena_stride == 0 ||
             ubatch.n_seq_id == nullptr || ubatch.seq_id == nullptr) {
         return false;
@@ -7397,6 +7507,9 @@ static void set_input_tail_body_plan_impl(
 void llama_kv_cache::set_input_tail_body_plan(
         ggml_tensor * query_order, ggml_tensor * run_desc,
         ggml_tensor * body_mask, const llama_ubatch * ubatch, bool causal_attn) const {
+    if (uses_shared_tail()) {
+        return other->set_input_tail_body_plan(query_order, run_desc, body_mask, ubatch, causal_attn);
+    }
     const uint32_t attention_stride = get_tail_attention_stride(uint32_t(query_order ? query_order->ne[0] : 0));
     if (!query_order || !run_desc || !body_mask || run_desc->ne[0] < int64_t(6 + attention_stride) ||
             !query_order->buffer || !run_desc->buffer || !body_mask->buffer) {

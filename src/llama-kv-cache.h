@@ -229,30 +229,36 @@ public:
     ggml_tensor * get_k_tail_fallback(ggml_context * ctx, int32_t il, ggml_tensor * body_idxs) const;
     ggml_tensor * get_v_tail_fallback(ggml_context * ctx, int32_t il, ggml_tensor * body_idxs) const;
     uint32_t get_tail_slots() const {
-        return has_tail_overlay() ? tail_slots : 0;
+        return uses_shared_tail() ? other->get_tail_slots() : (has_tail_overlay() ? tail_slots : 0);
     }
-    ggml_type get_tail_type() const { return tail_type; }
+    ggml_type get_tail_type() const { return uses_shared_tail() ? other->get_tail_type() : tail_type; }
     uint32_t get_tail_tokens() const {
-        return has_tail_overlay() ? tail_plan.effective_tokens : 0;
+        return uses_shared_tail() ? other->get_tail_tokens() : (has_tail_overlay() ? tail_plan.effective_tokens : 0);
     }
     uint32_t get_tail_arena_stride() const {
-        return has_tail_overlay() ? tail_arena_stride : 0;
+        return uses_shared_tail() ? other->get_tail_arena_stride() : (has_tail_overlay() ? tail_arena_stride : 0);
     }
-    uint32_t get_tail_rollback_tokens() const { return tail_plan.compact_layout.rollback_tokens; }
-    llama_kv_tail_storage_kind get_tail_storage_kind() const { return tail_plan.kind; }
+    uint32_t get_tail_rollback_tokens() const {
+        return uses_shared_tail() ? other->get_tail_rollback_tokens() : tail_plan.compact_layout.rollback_tokens;
+    }
+    llama_kv_tail_storage_kind get_tail_storage_kind() const {
+        return uses_shared_tail() ? other->get_tail_storage_kind() : tail_plan.kind;
+    }
     bool has_kv_body() const {
-        return tail_plan.kind != LLAMA_KV_TAIL_STORAGE_COMPACT_NATIVE_EXACT;
+        return uses_shared_tail() ? other->has_kv_body() : tail_plan.kind != LLAMA_KV_TAIL_STORAGE_COMPACT_NATIVE_EXACT;
     }
     bool has_kv_body(int32_t il) const;
     bool has_tail_current(int32_t il) const;
     ggml_backend_dev_t get_tail_backend(int32_t il) const;
     bool has_tail_overlay() const {
-        return tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY ||
+        return uses_shared_tail() ? other->has_tail_overlay() :
+                tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY ||
                 tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_OVERLAY ||
                 tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_NATIVE_EXACT;
     }
     bool has_compact_tail() const {
-        return tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_OVERLAY ||
+        return uses_shared_tail() ? other->has_compact_tail() :
+                tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_OVERLAY ||
                 tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_NATIVE_EXACT;
     }
     uint32_t get_tail_attention_stride(uint32_t n_query_tokens = 0) const;
@@ -511,6 +517,12 @@ private:
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
+    // Shared auxiliary layer id -> source model layer id.
+    std::unordered_map<int32_t, int32_t> shared_layer_ids;
+
+    bool uses_shared_tail() const;
+    bool is_shared_layer(int32_t il) const;
+    int32_t shared_layer_id(int32_t il) const;
 
     size_t total_size() const;
 

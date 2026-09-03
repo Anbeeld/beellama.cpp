@@ -4,12 +4,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 ISWA_CACHE = ROOT / "src/llama-kv-cache-iswa.cpp"
 KVAR_N_CACHE = ROOT / "src/llama-kv-cache-kvarn.cpp"
+STANDARD_CACHE = ROOT / "src/llama-kv-cache.cpp"
 LLAMA_GRAPH = ROOT / "src/llama-graph.cpp"
 
 
 def main() -> None:
     iswa = ISWA_CACHE.read_text(encoding="utf-8")
     kvarn = KVAR_N_CACHE.read_text(encoding="utf-8")
+    standard = STANDARD_CACHE.read_text(encoding="utf-8")
     graph = LLAMA_GRAPH.read_text(encoding="utf-8")
 
     assert "static_cast<llama_kv_cache_iswa *>(mem_other)" not in iswa, (
@@ -41,6 +43,24 @@ def main() -> None:
     )
     assert "get_tail_query_order(swa), get_tail_run_desc(swa), mask" in graph, (
         "iSWA tail planning must use the query order for the selected cache group"
+    )
+    assert "source.k ? source.k : source.k_tail" in standard, (
+        "MTP sharing must accept a bodyless native-exact SWA source"
+    )
+    assert "layers.back().k_tail = layer_share.k_tail" in standard, (
+        "MTP sharing must retain the target's exact K tail payload"
+    )
+    assert "return other->set_input_kq_mask_tail" in standard, (
+        "shared MTP reads must use the target's multi-slot tail metadata"
+    )
+    assert "compact_tail && k_cur && v_cur" in graph, (
+        "read-only shared compact tails must not require assistant K/V projections"
+    )
+    assert "tail_route == LLAMA_KV_TAIL_ROUTE_NONE ? nullptr" in graph, (
+        "layers without a tail route must not receive group-wide tail masks"
+    )
+    assert "Shared MTP reads have no graph-local current segment" in standard, (
+        "shared tail extents must exclude assistant query rollback rows"
     )
 
 
