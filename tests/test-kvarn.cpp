@@ -417,6 +417,27 @@ static void kvarn_compact_read_plan_skips_ownership_holes() {
             "sparse KVarN read plan did not retain separate physical record segments");
 }
 
+static void kvarn_live_stage_groups_match_recent_position_order() {
+    const llama_pos none = std::numeric_limits<llama_pos>::min();
+    // Two sequences, five physical groups. Group zero participates in the
+    // recent-two selection but is not backed by an assignable stage slot.
+    std::vector<llama_pos> latest = {
+        100, 90, 80, none, none,
+        none, 70, 70, 60, none,
+    };
+
+    const auto live = llama_kvarn_live_stage_groups(latest, 2, 5, 2);
+    require(live == std::vector<uint32_t>({ 1, 2 }),
+            "live stage selection must preserve position/group tie ordering and group-zero semantics");
+
+    // Updating an older physical group with a newer logical position must
+    // promote it without requiring an ordered map allocation.
+    latest[3] = 110;
+    const auto promoted = llama_kvarn_live_stage_groups(latest, 2, 5, 2);
+    require(promoted == std::vector<uint32_t>({ 1, 2, 3 }),
+            "flat live-stage metadata must promote a reused group by logical position");
+}
+
 static void kvarn_planning_reservations_preserve_group_ownership() {
     const std::vector<llama_seq_id> seq0 = { 0 };
     const std::vector<llama_seq_id> seq1 = { 1 };
@@ -5060,6 +5081,7 @@ int main() {
     kvarn_unified_restore_requires_exclusive_stream();
     kvarn_selective_state_owns_only_live_stage_rows();
     kvarn_compact_read_plan_skips_ownership_holes();
+    kvarn_live_stage_groups_match_recent_position_order();
     kvarn_planning_reservations_preserve_group_ownership();
     kvarn_stage_assignment_is_collision_free_and_stable();
     kvarn_stage_indices_carry_authoritative_assignment();

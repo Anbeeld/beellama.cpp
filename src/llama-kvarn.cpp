@@ -339,6 +339,46 @@ bool llama_kvarn_reconcile_stage_slots(
     return true;
 }
 
+std::vector<uint32_t> llama_kvarn_live_stage_groups(
+        const std::vector<llama_pos> & latest_by_seq_group,
+        uint32_t n_seq,
+        uint32_t n_groups,
+        uint32_t retained_per_seq) {
+    if (n_seq == 0 || n_groups == 0 || retained_per_seq == 0 ||
+            latest_by_seq_group.size() != size_t(n_seq)*n_groups) {
+        throw std::invalid_argument("invalid KVarN live-stage metadata shape");
+    }
+
+    std::vector<uint32_t> live;
+    live.reserve(size_t(n_seq)*retained_per_seq);
+    for (uint32_t seq = 0; seq < n_seq; ++seq) {
+        std::vector<std::pair<llama_pos, uint32_t>> recent;
+        recent.reserve(retained_per_seq);
+        const size_t base = size_t(seq)*n_groups;
+        for (uint32_t group = 0; group < n_groups; ++group) {
+            const llama_pos pos = latest_by_seq_group[base + group];
+            if (pos == std::numeric_limits<llama_pos>::min()) {
+                continue;
+            }
+            const std::pair<llama_pos, uint32_t> candidate = { pos, group };
+            const auto where = std::lower_bound(recent.begin(), recent.end(), candidate,
+                    std::greater<std::pair<llama_pos, uint32_t>>());
+            recent.insert(where, candidate);
+            if (recent.size() > retained_per_seq) {
+                recent.pop_back();
+            }
+        }
+        for (const auto & entry : recent) {
+            if (entry.second > 0) {
+                live.push_back(entry.second);
+            }
+        }
+    }
+    std::sort(live.begin(), live.end());
+    live.erase(std::unique(live.begin(), live.end()), live.end());
+    return live;
+}
+
 std::vector<llama_kvarn_state_stage_cell> llama_kvarn_select_state_stage_cells(
         const std::vector<uint32_t> & source_cells,
         uint32_t live_cell_max_p1,

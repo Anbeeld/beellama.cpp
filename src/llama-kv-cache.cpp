@@ -2375,6 +2375,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
         /*.strm        =*/ { },
         /*.idxs        =*/ { },
         /*.stage_slots =*/ { },
+        /*.group_stage_slots =*/ { },
     };
 
     if (allocation_group_size > 1 && n_stream == 1 && !cont) {
@@ -2388,12 +2389,82 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
         const auto & cells = v_cells[0];
         std::vector<uint32_t> heads = allocation_seq_heads;
-        std::vector<bool> reserved(cells.size(), false);
         const uint32_t n_groups = uint32_t(cells.size()/allocation_group_size);
+
+        // The common single-slot case is a monotonic append at its structured
+        // allocation cursor. Existing stage assignments already identify the
+        // only record groups whose F16 rows remain live, so validating those
+        // groups and the candidate records costs O(stage_groups*group_size)
+        // instead of rescanning every occupied cache cell on every token.
+        bool append_fast = n_seq_max == 1 && !allocation_seq_heads.empty() &&
+                ubatch.n_tokens <= cells.size() && ubatch.n_tokens > 0 &&
+                ubatch.pos[0] == cells.seq_pos_max(0) + 1;
+        for (uint32_t i = 0; append_fast && i < ubatch.n_tokens; ++i) {
+            append_fast = ubatch.n_seq_id[i] == 1 && ubatch.seq_id[i][0] == 0 &&
+                    ubatch.pos[i] == ubatch.pos[0] + llama_pos(i);
+        }
+        if (append_fast) {
+            slot_info fast = res;
+            std::vector<int32_t> stage_slots = allocation_group_stage_slots;
+            const llama_pos no_group_pos = std::numeric_limits<llama_pos>::min();
+            std::vector<llama_pos> latest_by_group(n_groups, no_group_pos);
+            const auto scan_live_group = [&](uint32_t group) {
+                const uint32_t begin = group*allocation_group_size;
+                const uint32_t end = std::min<uint32_t>(begin + allocation_group_size, cells.size());
+                for (uint32_t cell = begin; cell < end; ++cell) {
+                    if (!cells.is_empty(cell) && cells.seq_has(cell, 0)) {
+                        latest_by_group[group] = std::max(latest_by_group[group], cells.pos_get(cell));
+                    }
+                }
+            };
+            scan_live_group(0);
+            for (uint32_t group = 1; group < n_groups; ++group) {
+                if (stage_slots[group] > 0) {
+                    scan_live_group(group);
+                }
+            }
+
+            uint32_t head_cur = heads[0];
+            for (uint32_t i = 0; append_fast && i < ubatch.n_tokens; ++i) {
+                if (head_cur >= cells.size()) {
+                    head_cur = 0;
+                }
+                const uint32_t idx = head_cur++;
+                if (!cells.is_empty(idx)) {
+                    append_fast = false;
+                    break;
+                }
+                const uint32_t group = idx/allocation_group_size;
+                latest_by_group[group] = std::max(latest_by_group[group], ubatch.pos[i]);
+                const auto live = llama_kvarn_live_stage_groups(latest_by_group, 1, n_groups, 2);
+                if (!llama_kvarn_reconcile_stage_slots(
+                            live, n_groups, allocation_stage_groups, stage_slots)) {
+                    append_fast = false;
+                    break;
+                }
+                const int32_t slot = group == 0 ? 0 : stage_slots[group];
+                if (slot < 0) {
+                    append_fast = false;
+                    break;
+                }
+                fast.idxs[0].push_back(idx);
+                fast.stage_slots[0].push_back(uint32_t(slot));
+            }
+            if (append_fast) {
+                fast.group_stage_slots = std::move(stage_slots);
+                return fast;
+            }
+        }
+
+        std::vector<bool> reserved(cells.size(), false);
         std::vector<uint32_t> group_used(n_groups, 0);
         std::vector<std::vector<llama_seq_id>> group_owners(n_groups);
         std::vector<bool> group_mixed(n_groups, false);
-        std::vector<std::map<uint32_t, llama_pos>> latest_by_seq(n_seq_max);
+        // A flat sequence/group matrix preserves the exact max-position data
+        // used for stage liveness without allocating one red-black-tree node
+        // per occupied record group on every decoded token.
+        const llama_pos no_group_pos = std::numeric_limits<llama_pos>::min();
+        std::vector<llama_pos> latest_by_seq_group(size_t(n_seq_max)*n_groups, no_group_pos);
         for (uint32_t cell = 0; cell < cells.size(); ++cell) {
             if (cells.is_empty(cell)) {
                 continue;
@@ -2403,7 +2474,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
             for (llama_seq_id seq_id = 0; uint32_t(seq_id) < n_seq_max; ++seq_id) {
                 if (cells.seq_has(cell, seq_id)) {
                     cell_owners.push_back(seq_id);
-                    auto & latest = latest_by_seq[size_t(seq_id)][group];
+                    auto & latest = latest_by_seq_group[size_t(seq_id)*n_groups + group];
                     latest = std::max(latest, cells.pos_get(cell));
                 }
             }
@@ -2414,25 +2485,11 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
             }
             ++group_used[group];
         }
-        const auto live_groups = [](const auto & latest) {
-            std::set<uint32_t> live;
-            for (const auto & by_group : latest) {
-                std::vector<std::pair<llama_pos, uint32_t>> ordered;
-                ordered.reserve(by_group.size());
-                for (const auto & entry : by_group) {
-                    ordered.emplace_back(entry.second, entry.first);
-                }
-                std::sort(ordered.begin(), ordered.end(), std::greater<>());
-                for (size_t i = 0; i < std::min<size_t>(2, ordered.size()); ++i) {
-                    if (ordered[i].second > 0) {
-                        live.insert(ordered[i].second);
-                    }
-                }
-            }
-            return std::vector<uint32_t>(live.begin(), live.end());
+        const auto live_groups = [&](const auto & latest) {
+            return llama_kvarn_live_stage_groups(latest, n_seq_max, n_groups, 2);
         };
         std::vector<int32_t> group_stage_slots = allocation_group_stage_slots;
-        const auto live_initial = live_groups(latest_by_seq);
+        const auto live_initial = live_groups(latest_by_seq_group);
         if (!llama_kvarn_reconcile_stage_slots(
                     live_initial, n_groups, allocation_stage_groups, group_stage_slots)) {
             LLAMA_LOG_ERROR("structured KV stage planning refused %zu live groups with capacity %u\n",
@@ -2476,9 +2533,9 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                     continue;
                 }
 
-                auto candidate_latest = latest_by_seq;
+                auto candidate_latest = latest_by_seq_group;
                 for (int32_t j = 0; j < n_cell_seqs; ++j) {
-                    auto & latest = candidate_latest[size_t(cell_seqs[j])][group];
+                    auto & latest = candidate_latest[size_t(cell_seqs[j])*n_groups + group];
                     latest = std::max(latest, ubatch.pos[i]);
                 }
                 auto candidate_slots = group_stage_slots;
@@ -2497,7 +2554,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                     continue;
                 }
 
-                latest_by_seq = std::move(candidate_latest);
+                latest_by_seq_group = std::move(candidate_latest);
                 group_stage_slots = std::move(candidate_slots);
                 if (group_used[group] == 0) {
                     group_owners[group] = desired_owners;
@@ -2550,11 +2607,12 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                         "(used = %u, capacity = %u, live_stage_groups = %zu, "
                         "empty_groups = %u, compatible_groups = %u, mixed_groups = %u;%s)\n",
                         i + 1u, ubatch.n_tokens, cells.get_used(), uint32_t(cells.size()),
-                        live_groups(latest_by_seq).size(), empty_groups, compatible_groups,
+                        live_groups(latest_by_seq_group).size(), empty_groups, compatible_groups,
                         mixed_groups, ownership.str().c_str());
                 return {};
             }
         }
+        res.group_stage_slots = std::move(group_stage_slots);
         return res;
     }
 
@@ -2858,7 +2916,12 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
         head = sinfo.idxs[s].back() + 1;
     }
-    GGML_ASSERT(reconcile_allocation_stage_slots());
+    if (!sinfo.group_stage_slots.empty()) {
+        GGML_ASSERT(sinfo.group_stage_slots.size() == allocation_group_stage_slots.size());
+        allocation_group_stage_slots = sinfo.group_stage_slots;
+    } else {
+        GGML_ASSERT(reconcile_allocation_stage_slots());
+    }
 }
 
 void llama_kv_cache::finish_tail_batch(bool success, bool payload_may_be_modified) {
@@ -5871,33 +5934,27 @@ void llama_kv_cache::set_allocation_group_size(uint32_t group_size, uint32_t sta
 }
 
 std::vector<uint32_t> llama_kv_cache::allocation_live_stage_groups() const {
-    std::set<uint32_t> live;
     if (allocation_group_size <= 1 || n_stream != 1) {
         return {};
     }
     const auto & cells = v_cells[0];
-    for (llama_seq_id seq_id = 0; uint32_t(seq_id) < n_seq_max; ++seq_id) {
-        std::map<llama_pos, uint32_t, std::greater<llama_pos>> newest;
-        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
-            if (cells.seq_has(cell, seq_id)) {
-                newest.emplace(cells.pos_get(cell), cell/allocation_group_size);
-            }
+    const uint32_t n_groups = uint32_t(cells.size()/allocation_group_size);
+    const llama_pos no_group_pos = std::numeric_limits<llama_pos>::min();
+    std::vector<llama_pos> latest_by_seq_group(size_t(n_seq_max)*n_groups, no_group_pos);
+    for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+        if (cells.is_empty(cell)) {
+            continue;
         }
-        uint32_t retained = 0;
-        std::set<uint32_t> seen;
-        for (const auto & entry : newest) {
-            if (!seen.insert(entry.second).second) {
-                continue;
-            }
-            if (entry.second > 0) {
-                live.insert(entry.second);
-            }
-            if (++retained == 2) {
-                break;
+        const uint32_t group = cell/allocation_group_size;
+        const llama_pos pos = cells.pos_get(cell);
+        for (llama_seq_id seq_id = 0; uint32_t(seq_id) < n_seq_max; ++seq_id) {
+            if (cells.seq_has(cell, seq_id)) {
+                auto & latest = latest_by_seq_group[size_t(seq_id)*n_groups + group];
+                latest = std::max(latest, pos);
             }
         }
     }
-    return { live.begin(), live.end() };
+    return llama_kvarn_live_stage_groups(latest_by_seq_group, n_seq_max, n_groups, 2);
 }
 
 bool llama_kv_cache::reconcile_allocation_stage_slots() {

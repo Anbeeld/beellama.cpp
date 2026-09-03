@@ -45,9 +45,10 @@ public:
         uint32_t s0;
         uint32_t s1;
 
-        std::vector<llama_seq_id> strm;        // [ns]
-        std::vector<idx_vec_t>    idxs;        // [ns]
-        std::vector<idx_vec_t>    stage_slots; // [ns], structured caches only
+        std::vector<llama_seq_id> strm;              // [ns]
+        std::vector<idx_vec_t>    idxs;              // [ns]
+        std::vector<idx_vec_t>    stage_slots;       // [ns], structured caches only
+        std::vector<int32_t>      group_stage_slots; // complete post-allocation assignment
 
         uint32_t head() const {
             GGML_ASSERT(idxs.size() == 1);
@@ -79,6 +80,7 @@ public:
         void clear() {
             idxs.clear();
             stage_slots.clear();
+            group_stage_slots.clear();
         }
 
         // check if indices are contiguous starting from head()

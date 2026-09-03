@@ -156,6 +156,16 @@ bool llama_kvarn_reconcile_stage_slots(
         uint32_t stage_slot_capacity,
         std::vector<int32_t> & group_slots);
 
+// Selects the most recent physical groups for every logical sequence from a
+// flat [sequence][group] matrix of maximum logical positions. Group zero
+// participates in recency selection but has a permanent stage slot, so it is
+// omitted from the returned assignable group set.
+std::vector<uint32_t> llama_kvarn_live_stage_groups(
+        const std::vector<llama_pos> & latest_by_seq_group,
+        uint32_t n_seq,
+        uint32_t n_groups,
+        uint32_t retained_per_seq);
+
 std::vector<llama_kvarn_state_stage_cell> llama_kvarn_select_state_stage_cells(
         const std::vector<uint32_t> & source_cells,
         uint32_t live_cell_max_p1,
