@@ -1461,6 +1461,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // llama_batch_init allocates only one of token/embd; MTP needs both.
         // TODO: fix, how to call without malloc
         batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
+        if (batch.token != nullptr) {
+            std::memset(batch.token, 0, sizeof(llama_token) * (size_t) n_b);
+        }
+        if (batch.embd != nullptr) {
+            std::memset(batch.embd, 0, sizeof(float) * (size_t) n_b * (size_t) n_embd);
+        }
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
@@ -1533,11 +1539,35 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_batch_free(batch);
     }
 
+    // Per-sequence carry-over state belongs to one request. In particular,
+    // process() feeds pending_h into the first draft batch, so retaining it
+    // would make a reused server slot depend on its previous request.
+    void reset_seq_state(llama_seq_id seq_id) {
+        if (seq_id < 0 || (size_t) seq_id >= pending_h.size()) {
+            return;
+        }
+        std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+        if ((size_t) seq_id < verify_h.size()) {
+            verify_h[seq_id].clear();
+        }
+        if ((size_t) seq_id < verify_h_rows.size()) {
+            verify_h_rows[seq_id] = 0;
+        }
+        if ((size_t) seq_id < i_last.size()) {
+            i_last[seq_id] = -1;
+        }
+        if ((size_t) seq_id < chain_h.size()) {
+            chain_h[seq_id].clear();
+        }
+    }
+
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
         }
+
+        reset_seq_state(seq_id);
 
         auto * ctx_dft = this->params.ctx_dft;
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);

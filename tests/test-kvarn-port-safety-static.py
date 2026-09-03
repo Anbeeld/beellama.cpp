@@ -132,4 +132,42 @@ assert "uint32_t(payload)" in live_index, \
 assert "single_stream" in live_index, \
     "KVarN descriptor scan lacks the single-stream division-free path"
 
+plan_tile = function_body(DECODE, "ggml_cuda_fattn_kvarn_decode_plan_tile(")
+assert "const int g1" in plan_tile and "g0 == g1" in plan_tile, \
+    "KVarN fast decode does not reject tiles crossing a physical record boundary"
+
+combine = function_body(DECODE_COMBINE, "ggml_cuda_fattn_kvarn_decode_combine_kernel(")
+max_read = combine.index("const float m = reduce_sh[0];")
+denominator = combine.index("float local_denom", max_read)
+assert "__syncthreads();" in combine[max_read:denominator], \
+    "KVarN decode combine can overwrite the shared maximum before every warp reads it"
+
+for signature in (
+    "static bool ggml_cuda_flash_attn_ext_kvarn_vec_d(",
+    "static bool ggml_cuda_flash_attn_ext_kvarn_decode_d(",
+):
+    dispatch_body = function_body(DISPATCH, signature)
+    assert re.search(
+        r"ggml_cuda_pool_alloc<float2> partial_meta\(pool, meta_count\);\s*"
+        r"CUDA_CHECK\(cudaMemsetAsync\(partial_meta\.get\(\), 0,\s*"
+        r"meta_count \* sizeof\(float2\), stream\)\);",
+        dispatch_body,
+    ), f"{signature} does not initialize pooled split metadata"
+
+selector = function_body(DECODE, "ggml_cuda_fattn_kvarn_decode_select(")
+assert "const int n_q_geometry = 1;" in selector, \
+    "KVarN split geometry still depends on the verification query count"
+assert "only_split" in selector and "only_nwarps" in selector and "only_gqa" in selector, \
+    "KVarN split geometry lacks the query-tile-only second selection pass"
+
+STATE = (ROOT / "src/llama-kv-cache-kvarn.cpp").read_text(encoding="utf-8")
+STATE_TEST = (ROOT / "tests/test-save-load-state.cpp").read_text(encoding="utf-8")
+state_version = int(re.search(r"KVAR_N_STATE_VERSION\s*=\s*(\d+);", STATE).group(1))
+expected_version = int(re.search(r"version != (\d+)\)", STATE_TEST).group(1))
+unsupported_version = int(re.search(r"unsupported_version = (\d+);", STATE_TEST).group(1))
+assert expected_version == state_version, \
+    f"KVarN state test expects v{expected_version}, production writes v{state_version}"
+assert unsupported_version == state_version + 1, \
+    "KVarN state test must reject the version immediately after the current format"
+
 print("KVarN port safety source invariants: OK")

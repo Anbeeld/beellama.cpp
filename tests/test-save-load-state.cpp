@@ -776,20 +776,20 @@ static bool test_kvarn_partial_checkpoint_history(
     if (kvarn_frame != std::string::npos) {
         std::memcpy(&version, checkpoint_b.data() + kvarn_frame + sizeof(uint32_t), sizeof(version));
     }
-    if (kvarn_frame == std::string::npos || version != 15) {
-        LOG_ERR("%s: expected KVarN partial checkpoint format v15, found v%u\n", __func__, version);
+    if (kvarn_frame == std::string::npos || version != 16) {
+        LOG_ERR("%s: expected KVarN partial checkpoint format v16, found v%u\n", __func__, version);
         return false;
     }
 
     auto corrupt = checkpoint_b;
-    const uint32_t unsupported_version = 16;
+    const uint32_t unsupported_version = 17;
     std::memcpy(corrupt.data() + kvarn_frame + sizeof(uint32_t), &unsupported_version, sizeof(unsupported_version));
     std::unique_ptr<llama_state_seq_restore_plan, decltype(&llama_state_seq_restore_plan_free)> corrupt_plan(
             llama_state_seq_prepare_data_ext(
                     context.get(), corrupt.data(), corrupt.size(), 0, partial_flags),
             llama_state_seq_restore_plan_free);
     if (corrupt_plan) {
-        LOG_ERR("%s: corrupt KVarN v15 frame produced a restore plan\n", __func__);
+        LOG_ERR("%s: corrupt KVarN v16 frame produced a restore plan\n", __func__);
         return false;
     }
     if (llama_state_seq_set_data_ext(

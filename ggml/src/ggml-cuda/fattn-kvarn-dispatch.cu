@@ -618,6 +618,8 @@ static bool ggml_cuda_flash_attn_ext_kvarn_vec_d(
     const size_t meta_count = (size_t) plan.n_stream * n_q_heads * n_splits;
     ggml_cuda_pool_alloc<float> partial(pool, partial_count);
     ggml_cuda_pool_alloc<float2> partial_meta(pool, meta_count);
+    CUDA_CHECK(cudaMemsetAsync(partial_meta.get(), 0,
+            meta_count * sizeof(float2), stream));
     ggml_cuda_kv_memory_transient_stats_record_kvarn(
             k_desc.actual_size + v_desc.actual_size,
             partial.actual_size,
@@ -779,6 +781,8 @@ static bool ggml_cuda_flash_attn_ext_kvarn_decode_d(
     const size_t meta_count = (size_t) plan.n_stream * n_q_heads * n_q * n_splits;
     ggml_cuda_pool_alloc<float> partial(pool, partial_count);
     ggml_cuda_pool_alloc<float2> partial_meta(pool, meta_count);
+    CUDA_CHECK(cudaMemsetAsync(partial_meta.get(), 0,
+            meta_count * sizeof(float2), stream));
     ggml_cuda_kv_memory_transient_stats_record_kvarn(
             k_desc.actual_size + v_desc.actual_size,
             partial.actual_size,

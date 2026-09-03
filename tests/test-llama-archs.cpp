@@ -6,6 +6,7 @@
 #include "ggml-cpp.h"
 #include "llama.h"
 #include "llama-cpp.h"
+#include "speculative.h"
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
@@ -65,7 +66,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v/--verbose] [-h/--help] [--test-mtp-ubatch-sync]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v/--verbose] [-h/--help] [--test-mtp-ubatch-sync] [--test-mtp-request-reset]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -458,6 +459,128 @@ static int test_mtp_ubatch_sync(const size_t seed) {
     return 0;
 }
 
+static int test_mtp_request_reset(const size_t seed) {
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN35, false, true);
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    model_params.load_mtp = true;
+
+    size_t tmp = seed;
+    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tmp, model_params));
+    if (!model) {
+        throw std::runtime_error("failed to create MTP model");
+    }
+
+    llama_context_params target_params = llama_context_default_params();
+    target_params.n_ctx = 8;
+    target_params.n_batch = 4;
+    target_params.n_ubatch = 4;
+    llama_context_ptr ctx_tgt(llama_init_from_model(model.get(), target_params));
+    if (!ctx_tgt) {
+        throw std::runtime_error("failed to create target context");
+    }
+
+    llama_context_params draft_params = target_params;
+    draft_params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    llama_context_ptr ctx_dft(llama_init_from_model(model.get(), draft_params));
+    if (!ctx_dft) {
+        throw std::runtime_error("failed to create MTP context");
+    }
+
+    common_params_speculative params;
+    params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+    params.draft.ctx_tgt = ctx_tgt.get();
+    params.draft.ctx_dft = ctx_dft.get();
+    params.draft.backend_sampling = false;
+    common_speculative_ptr spec(common_speculative_init(params, 1));
+    if (!spec) {
+        throw std::runtime_error("failed to create MTP speculative driver");
+    }
+
+    std::vector<uint8_t> state;
+    if (!common_speculative_get_state(spec.get(), 0, state)) {
+        throw std::runtime_error("failed to read initial MTP state");
+    }
+
+    size_t cursor = 0;
+    const auto read_u32 = [&]() {
+        uint32_t value;
+        std::memcpy(&value, state.data() + cursor, sizeof(value));
+        cursor += sizeof(value);
+        return value;
+    };
+    const auto read_i32 = [&]() {
+        int32_t value;
+        std::memcpy(&value, state.data() + cursor, sizeof(value));
+        cursor += sizeof(value);
+        return value;
+    };
+    const auto read_u64 = [&]() {
+        uint64_t value;
+        std::memcpy(&value, state.data() + cursor, sizeof(value));
+        cursor += sizeof(value);
+        return value;
+    };
+
+    const uint32_t magic = read_u32();
+    const uint32_t version = read_u32();
+    const uint32_t type = read_u32();
+    const int32_t seq_id = read_i32();
+    const uint64_t payload_size = read_u64();
+    const size_t checksum_offset = cursor;
+    (void) read_u64();
+    const size_t payload_offset = cursor;
+    if (magic != 0x43455053 || version != 1 ||
+            type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP || seq_id != 0 ||
+            payload_offset + payload_size != state.size() || payload_size < 3*sizeof(uint32_t)) {
+        throw std::runtime_error("unexpected serialized MTP state format");
+    }
+
+    uint32_t width;
+    std::memcpy(&width, state.data() + payload_offset + 2*sizeof(uint32_t), sizeof(width));
+    if (payload_size != 3*sizeof(uint32_t) + size_t(width)*sizeof(float)) {
+        throw std::runtime_error("unexpected serialized MTP state width");
+    }
+    std::vector<float> stale(width, 1.0f);
+    std::memcpy(state.data() + payload_offset + 3*sizeof(uint32_t), stale.data(), stale.size()*sizeof(float));
+
+    uint64_t checksum = 1469598103934665603ULL;
+    const auto hash_bytes = [&](const void * ptr, size_t size) {
+        const auto * bytes = static_cast<const uint8_t *>(ptr);
+        for (size_t i = 0; i < size; ++i) {
+            checksum = (checksum ^ bytes[i])*1099511628211ULL;
+        }
+    };
+    hash_bytes(&magic, sizeof(magic));
+    hash_bytes(&version, sizeof(version));
+    hash_bytes(&type, sizeof(type));
+    hash_bytes(&seq_id, sizeof(seq_id));
+    hash_bytes(&payload_size, sizeof(payload_size));
+    hash_bytes(state.data() + payload_offset, payload_size);
+    std::memcpy(state.data() + checksum_offset, &checksum, sizeof(checksum));
+
+    if (!common_speculative_set_state(spec.get(), 0, state)) {
+        throw std::runtime_error("failed to inject stale MTP state");
+    }
+    common_speculative_begin(spec.get(), 0, { 1 });
+
+    std::vector<uint8_t> reset_state;
+    if (!common_speculative_get_state(spec.get(), 0, reset_state) || reset_state.size() != state.size()) {
+        throw std::runtime_error("failed to read reset MTP state");
+    }
+    const size_t pending_offset = payload_offset + 3*sizeof(uint32_t);
+    for (size_t i = 0; i < width; ++i) {
+        float value;
+        std::memcpy(&value, reset_state.data() + pending_offset + i*sizeof(float), sizeof(value));
+        if (value != 0.0f) {
+            fprintf(stderr, "MTP request begin retained stale hidden state at element %zu\n", i);
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
 static std::vector<float> get_logits(
         llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false) {
     const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
@@ -843,6 +966,7 @@ int main(int argc, char ** argv) {
     ggml_log_level log_level = GGML_LOG_LEVEL_ERROR;
     std::string out;
     bool test_mtp_sync = false;
+    bool test_mtp_reset = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -885,6 +1009,9 @@ int main(int argc, char ** argv) {
         if (strcmp(argv[i], "--test-mtp-ubatch-sync") == 0) {
             test_mtp_sync = true;
         }
+        if (strcmp(argv[i], "--test-mtp-request-reset") == 0) {
+            test_mtp_reset = true;
+        }
     }
     printf("%s: using seed %zu\n", __func__, seed);
 
@@ -894,6 +1021,9 @@ int main(int argc, char ** argv) {
         }
         if (test_mtp_sync) {
             return test_mtp_ubatch_sync(seed);
+        }
+        if (test_mtp_reset) {
+            return test_mtp_request_reset(seed);
         }
         return test_backends(arch, seed, log_level);
     } catch (const std::exception & err) {

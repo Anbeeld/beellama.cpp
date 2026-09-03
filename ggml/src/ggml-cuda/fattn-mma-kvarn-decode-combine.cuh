@@ -39,6 +39,9 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_combine_kernel(
         __syncthreads();
     }
     const float m = reduce_sh[0];
+    // Every warp must consume the shared maximum before thread 0 can reuse
+    // reduce_sh[0] for its partial denominator below.
+    __syncthreads();
 
     float local_denom = 0.0f;
     for (int split = tid; split < n_splits; split += blockDim.x) {

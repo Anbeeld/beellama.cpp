@@ -357,6 +357,12 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         LABEL main
         ARGS --test-mtp-ubatch-sync
     )
+    llama_test(
+        test-llama-archs
+        NAME test-mtp-request-reset
+        LABEL main
+        ARGS --test-mtp-request-reset
+    )
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
