@@ -363,6 +363,12 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         LABEL main
         ARGS --test-mtp-request-reset
     )
+    llama_test(
+        test-llama-archs
+        NAME test-mtp-kvarn-routing
+        LABEL main
+        ARGS --test-mtp-kvarn-routing
+    )
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")

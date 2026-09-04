@@ -2648,8 +2648,50 @@ const std::vector<double> & common_speculative_get_synth_probs(const common_spec
     return spec->synth_probs;
 }
 
+static bool common_speculative_type_owns_draft_context(common_speculative_type type) {
+    switch (type) {
+        case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
+        case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
+        case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
+        case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
+        case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static void common_validate_draft_kvarn_mode(const common_params_speculative & params) {
+    if (params.draft.kvarn.type == LLAMA_KVARN_TYPE_DISABLED) {
+        return;
+    }
+
+    bool has_mtp = false;
+    std::vector<std::string> unsupported;
+    for (const common_speculative_type type : params.types) {
+        if (type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+            has_mtp = true;
+        } else if (common_speculative_type_owns_draft_context(type)) {
+            unsupported.push_back(common_speculative_type_to_str(type));
+        }
+    }
+
+    if (!has_mtp || !unsupported.empty()) {
+        std::string modes = common_speculative_type_name_str(params.types);
+        if (modes.empty()) {
+            modes = "none";
+        }
+        throw std::invalid_argument(string_format(
+                "draft KVarN is supported only for draft-mtp owned-KV contexts; selected speculative mode(s): %s. "
+                "Choose an ordinary --spec-draft-type-k/v cache type for this mode",
+                modes.c_str()));
+    }
+}
+
 common_params common_base_params_to_speculative(const common_params & params) {
     const bool has_draft = params.speculative.has_dft();
+
+    common_validate_draft_kvarn_mode(params.speculative);
 
     const auto & params_spec = params.speculative.draft;
     common_params result = params;
@@ -2682,8 +2724,15 @@ common_params common_base_params_to_speculative(const common_params & params) {
         }
     }
 
-    result.cache_type_k  = params_spec.cache_type_k;
-    result.cache_type_v  = params_spec.cache_type_v;
+    result.cache_type_k = params_spec.cache_type_k;
+    result.cache_type_v = params_spec.cache_type_v;
+    result.cache_kvarn_bits_k = params_spec.cache_kvarn_bits_k;
+    result.cache_kvarn_bits_v = params_spec.cache_kvarn_bits_v;
+    result.cache_kvarn_swa_bits_k = 0;
+    result.cache_kvarn_swa_bits_v = 0;
+    result.kvarn = params_spec.kvarn;
+    result.kvarn.swa_key_bits = 0;
+    result.kvarn.swa_value_bits = 0;
     result.kv_tail_tokens = "0";
     result.kv_tail_type   = GGML_TYPE_F16;
     result.n_outputs_max = params.n_parallel;

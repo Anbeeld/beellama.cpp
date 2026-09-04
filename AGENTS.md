@@ -11,8 +11,9 @@ small:
 
 - Upstream speculative decoding, including `draft-dflash`, `draft-mtp`,
   EAGLE3, and n-gram modes.
-- KVarN target KV-cache compression for Qwen3.6 and Gemma 4, selected with
-  `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`, `kvarn6`, or `kvarn8`.
+- KVarN KV-cache compression for target contexts and supported draft-owned
+  Qwen MTP contexts, selected with `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`,
+  `kvarn6`, or `kvarn8`.
 - Standard low-bit KV cache formats `q2_0`, `q2_1`, `q3_0`, `q3_1`,
   `q6_0`, and `q6_1`. Bee's cache-facing `q2_0` uses the internal enum
   `GGML_TYPE_Q2_0S` so it cannot collide with upstream's serialized Q2_0 weight
@@ -116,7 +117,9 @@ Key binaries are `llama-server`, `llama-cli`, `llama-bench`, and
 
 ### Invariants
 
-- KVarN is target-context only. Draft and auxiliary contexts use normal cache
+- KVarN is supported for target caches and draft-owned MTP caches on Qwen3.5,
+  Qwen3.6, and Qwen3.8/Qwen4Exp. Shared Gemma 4 MTP continues to use the target
+  cache representation. Other draft and auxiliary contexts use normal cache
   types.
 - CUDA, CPU, Vulkan, and HIP/ROCm consume KVarN records directly in native
   attention paths. Vulkan native attention requires shader Int64 and

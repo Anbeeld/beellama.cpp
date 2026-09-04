@@ -4400,17 +4400,38 @@ llama_context * llama_init_from_model(
     }
 
     if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
-        if (params.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || model->arch == LLM_ARCH_DFLASH) {
-            LLAMA_LOG_WARN("%s: KVarN is target-context-only; disabling it for this auxiliary context\n", __func__);
+        const llama_kvarn_context_route route = llama_kvarn_context_route_for(params.ctx_type, model->arch);
+        if (route != LLAMA_KVARN_CONTEXT_ROUTE_OWNED) {
+            const std::string reason = route == LLAMA_KVARN_CONTEXT_ROUTE_SHARED_TARGET
+                ? "this MTP topology shares target K/V and has no independent draft KV representation; "
+                  "configure target --cache-type-k/v kvarn* instead"
+                : format("context type %d for architecture %s is not an audited draft-owned KVarN route; "
+                         "choose an ordinary draft cache type",
+                         int(params.ctx_type), llm_arch_name(model->arch));
+            if (params.kvarn.fail_if_unsupported) {
+                LLAMA_LOG_ERROR("%s: cannot enable %s: %s\n",
+                        __func__, llama_kvarn_type_name(params.kvarn.type), reason.c_str());
+                return nullptr;
+            }
+            LLAMA_LOG_WARN("%s: cannot enable %s: %s; falling back to the normal KV cache\n",
+                    __func__, llama_kvarn_type_name(params.kvarn.type), reason.c_str());
             params.kvarn = llama_kvarn_default_params();
         } else {
+            const uint32_t layer_begin = params.ctx_type == LLAMA_CONTEXT_TYPE_MTP
+                ? model->hparams.n_layer()
+                : 0;
+            const uint32_t layer_end = params.ctx_type == LLAMA_CONTEXT_TYPE_MTP
+                ? model->hparams.n_layer_all
+                : model->hparams.n_layer();
+            uint32_t cached_layer_count = 0;
             bool head_dims_supported = true;
             bool backend_ops_supported = true;
-            for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
+            for (uint32_t il = layer_begin; il < layer_end; ++il) {
                 if (!model->hparams.has_kv(il)) {
                     continue;
                 }
 
+                ++cached_layer_count;
                 head_dims_supported = head_dims_supported &&
                     llama_kvarn_head_dim_supported(model->hparams.n_embd_head_k(il)) &&
                     llama_kvarn_head_dim_supported(model->hparams.n_embd_head_v(il));
@@ -4425,7 +4446,7 @@ llama_context * llama_init_from_model(
                     : params.attention_type == LLAMA_ATTENTION_TYPE_CAUSAL;
             const bool attention_supported =
                 causal_attn &&
-                model->hparams.n_layer_kv() > 0 &&
+                cached_layer_count > 0 &&
                 !model->hparams.is_mla() &&
                 !llm_arch_is_recurrent(model->arch) &&
                 model->arch != LLM_ARCH_DEEPSEEK32 &&
@@ -4454,8 +4475,10 @@ llama_context * llama_init_from_model(
                     params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
                 }
 
-                LLAMA_LOG_INFO("%s: enabling structured KVarN cache type %s\n",
-                        __func__, llama_kvarn_type_name(params.kvarn.type));
+                LLAMA_LOG_INFO("%s: enabling structured KVarN cache type %s for %s layers [%u, %u)\n",
+                        __func__, llama_kvarn_type_name(params.kvarn.type),
+                        params.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "draft MTP" : "target",
+                        layer_begin, layer_end);
             }
         }
     }

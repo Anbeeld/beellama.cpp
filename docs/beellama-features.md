@@ -130,8 +130,12 @@ reservation and zero cumulative per-context growth.
 
 ### Backend support and limitations
 
-KVarN is target-context-only. CUDA selects specialized descriptor-native
-FlashAttention on Turing and newer GPUs, then falls back to a portable
+KVarN supports target contexts and draft-owned MTP caches for Qwen3.5/Qwen3.6
+dense and MoE models and standalone Qwen3.8/Qwen4Exp MTP sidecars. Shared Gemma
+4 MTP reads the target cache representation and does not allocate an independent
+draft record store. Other draft and auxiliary modes remain on standard caches.
+CUDA selects specialized descriptor-native FlashAttention on Turing and newer
+GPUs, then falls back to a portable
 direct-record route when those matrix instructions are unavailable or the
 complete body-plus-tail request does not fit a specialized route. The portable
 CUDA route consumes rotated compressed records and attached F16 or BF16 tails
@@ -213,8 +217,9 @@ current budget.
 
 Each selected layer must be owned by a backend that implements KVarN store and
 attention, or an explicitly supported materialization fallback. Unsupported or
-tensor-split placements fail closed; draft and auxiliary contexts use standard
-cache types.
+tensor-split placements fail closed. Explicit draft KVarN is fail-closed outside
+the audited draft-owned MTP architectures; it never silently runs the ordinary
+quantized backing cache.
 
 ## Standard low-bit KV caches
 
@@ -227,15 +232,16 @@ FlashAttention vector coverage. Cache-facing `q2_0` is internally
 
 ### When to use them
 
-Use these types for draft caches, for target models that cannot use KVarN, or
-when a conventional quantized KV layout is easier to compare across backends.
+Use these types for draft modes outside the supported owned-MTP route, for
+target models that cannot use KVarN, or when a conventional quantized KV layout
+is easier to compare across backends.
 
 ### Key arguments
 
 - [`--cache-type-k`](beellama-args.md#kvarn-cache-types-and-swa-overrides)
 - [`--cache-type-v`](beellama-args.md#kvarn-cache-types-and-swa-overrides)
-- Upstream `--spec-draft-type-k`
-- Upstream `--spec-draft-type-v`
+- `--spec-draft-type-k` (including `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`, `kvarn6`, and `kvarn8` for supported owned-MTP contexts)
+- `--spec-draft-type-v` (same values and routing rule)
 - [`GGML_CUDA_FA_ALL_QUANTS`](beellama-args.md#cuda-flashattention-build-policy)
 
 ### Measurement and validation

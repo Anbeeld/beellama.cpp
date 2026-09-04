@@ -227,6 +227,31 @@ const char * llama_kvarn_validate_runtime(
     return nullptr;
 }
 
+llama_kvarn_context_route llama_kvarn_context_route_for(
+        llama_context_type ctx_type,
+        llm_arch arch) {
+    if (ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
+        return arch == LLM_ARCH_DFLASH
+            ? LLAMA_KVARN_CONTEXT_ROUTE_UNSUPPORTED
+            : LLAMA_KVARN_CONTEXT_ROUTE_OWNED;
+    }
+
+    if (ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        switch (arch) {
+            case LLM_ARCH_QWEN35:
+            case LLM_ARCH_QWEN35MOE:
+            case LLM_ARCH_QWEN4EXP:
+                return LLAMA_KVARN_CONTEXT_ROUTE_OWNED;
+            case LLM_ARCH_GEMMA4_ASSISTANT:
+                return LLAMA_KVARN_CONTEXT_ROUTE_SHARED_TARGET;
+            default:
+                return LLAMA_KVARN_CONTEXT_ROUTE_UNSUPPORTED;
+        }
+    }
+
+    return LLAMA_KVARN_CONTEXT_ROUTE_UNSUPPORTED;
+}
+
 llama_kvarn_iswa_policy llama_kvarn_iswa_policy_for(
         bool enabled,
         bool has_swa,

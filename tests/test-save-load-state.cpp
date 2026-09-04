@@ -902,7 +902,7 @@ static bool test_kvarn_partial_checkpoint_history(
         LOG(" %.3f", time_ms);
     }
     LOG("\n");
-    LOG("\nPASS: KVarN v15 host partial checkpoints are transactional with a live body anchor\n");
+    LOG("\nPASS: KVarN v16 host partial checkpoints are transactional with a live body anchor\n");
     return true;
 }
 

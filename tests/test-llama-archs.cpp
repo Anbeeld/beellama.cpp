@@ -8,6 +8,9 @@
 #include "llama-cpp.h"
 #include "speculative.h"
 
+#include "../src/llama-context.h"
+#include "../src/llama-kv-cache-kvarn.h"
+
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
 #include "../src/llama-model-saver.h"
@@ -66,7 +69,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v/--verbose] [-h/--help] [--test-mtp-ubatch-sync] [--test-mtp-request-reset]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v/--verbose] [-h/--help] [--test-mtp-ubatch-sync] [--test-mtp-request-reset] [--test-mtp-kvarn-routing]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -581,6 +584,74 @@ static int test_mtp_request_reset(const size_t seed) {
     return 0;
 }
 
+static llama_model_ptr make_synthetic_mtp_model(llm_arch arch, bool moe, size_t seed) {
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe, true);
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    model_params.load_mtp = true;
+    return llama_model_ptr(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &seed, model_params));
+}
+
+static int test_mtp_kvarn_routing(const size_t seed) {
+    struct route_case {
+        llm_arch arch;
+        bool moe;
+    };
+    // Qwen4Exp is covered by the pure route policy and real-model acceptance.
+    // Its synthetic full-model fixture does not represent its standalone sidecar topology.
+    for (const route_case & test : {
+            route_case{ LLM_ARCH_QWEN35, false },
+            route_case{ LLM_ARCH_QWEN35MOE, true } }) {
+        fprintf(stderr, "checking owned MTP KVarN route for %s\n", llm_arch_name(test.arch));
+        llama_model_ptr model = make_synthetic_mtp_model(test.arch, test.moe, seed);
+        if (!model) {
+            throw std::runtime_error(std::string("failed to create synthetic MTP model for ") + llm_arch_name(test.arch));
+        }
+
+        llama_context_params params = llama_context_default_params();
+        params.n_ctx = 256;
+        params.n_batch = 64;
+        params.n_ubatch = 32;
+        params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        params.offload_kqv = false;
+        params.kvarn = llama_kvarn_params_for_type(LLAMA_KVARN_K4V2_G128);
+        params.kv_tail_tokens = 0;
+
+        llama_context_ptr ctx(llama_init_from_model(model.get(), params));
+        if (!ctx) {
+            fprintf(stderr, "owned MTP KVarN route rejected %s\n", llm_arch_name(test.arch));
+            return 1;
+        }
+        if (dynamic_cast<llama_kv_cache_kvarn *>(llama_get_memory(ctx.get())) == nullptr) {
+            fprintf(stderr, "owned MTP route did not construct KVarN storage for %s\n", llm_arch_name(test.arch));
+            return 1;
+        }
+        if (ctx->get_cparams().kv_tail_tokens != 128 || llama_get_memory(ctx.get())->get_kv_tail_group_count() != 1) {
+            fprintf(stderr, "owned MTP KVarN route did not retain one intrinsic 128-token exact suffix for %s\n",
+                    llm_arch_name(test.arch));
+            return 1;
+        }
+    }
+
+    llama_model_ptr unsupported = make_synthetic_mtp_model(LLM_ARCH_QWEN3NEXT, true, seed);
+    if (!unsupported) {
+        throw std::runtime_error("failed to create unsupported synthetic MTP model");
+    }
+    llama_context_params params = llama_context_default_params();
+    params.n_ctx = 256;
+    params.n_batch = 64;
+    params.n_ubatch = 32;
+    params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    params.offload_kqv = false;
+    params.kvarn = llama_kvarn_params_for_type(LLAMA_KVARN_K4V2_G128);
+    if (llama_init_from_model(unsupported.get(), params) != nullptr) {
+        fprintf(stderr, "unclassified MTP architecture accepted draft KVarN\n");
+        return 1;
+    }
+
+    return 0;
+}
+
 static std::vector<float> get_logits(
         llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false) {
     const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
@@ -967,6 +1038,7 @@ int main(int argc, char ** argv) {
     std::string out;
     bool test_mtp_sync = false;
     bool test_mtp_reset = false;
+    bool test_mtp_kvarn = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -1012,6 +1084,9 @@ int main(int argc, char ** argv) {
         if (strcmp(argv[i], "--test-mtp-request-reset") == 0) {
             test_mtp_reset = true;
         }
+        if (strcmp(argv[i], "--test-mtp-kvarn-routing") == 0) {
+            test_mtp_kvarn = true;
+        }
     }
     printf("%s: using seed %zu\n", __func__, seed);
 
@@ -1024,6 +1099,9 @@ int main(int argc, char ** argv) {
         }
         if (test_mtp_reset) {
             return test_mtp_request_reset(seed);
+        }
+        if (test_mtp_kvarn) {
+            return test_mtp_kvarn_routing(seed);
         }
         return test_backends(arch, seed, log_level);
     } catch (const std::exception & err) {

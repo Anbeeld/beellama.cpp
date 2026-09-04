@@ -55,6 +55,28 @@ static void test_type_table() {
     require(llama_kvarn_type_desc_from_name("kvarn_k7v2_g128") == nullptr, "invalid type parsed");
 }
 
+static void test_context_route_policy() {
+    require(llama_kvarn_context_route_for(LLAMA_CONTEXT_TYPE_DEFAULT, LLM_ARCH_QWEN35) ==
+                LLAMA_KVARN_CONTEXT_ROUTE_OWNED,
+            "default target contexts must keep their owned KVarN route");
+    require(llama_kvarn_context_route_for(LLAMA_CONTEXT_TYPE_DEFAULT, LLM_ARCH_DFLASH) ==
+                LLAMA_KVARN_CONTEXT_ROUTE_UNSUPPORTED,
+            "DFlash contexts must remain unsupported");
+
+    for (const llm_arch arch : { LLM_ARCH_QWEN35, LLM_ARCH_QWEN35MOE, LLM_ARCH_QWEN4EXP }) {
+        require(llama_kvarn_context_route_for(LLAMA_CONTEXT_TYPE_MTP, arch) ==
+                    LLAMA_KVARN_CONTEXT_ROUTE_OWNED,
+                "audited Qwen MTP context must own KVarN storage");
+    }
+
+    require(llama_kvarn_context_route_for(LLAMA_CONTEXT_TYPE_MTP, LLM_ARCH_GEMMA4_ASSISTANT) ==
+                LLAMA_KVARN_CONTEXT_ROUTE_SHARED_TARGET,
+            "Gemma 4 assistant must retain target-cache sharing");
+    require(llama_kvarn_context_route_for(LLAMA_CONTEXT_TYPE_MTP, LLM_ARCH_QWEN3NEXT) ==
+                LLAMA_KVARN_CONTEXT_ROUTE_UNSUPPORTED,
+            "unclassified MTP architectures must fail closed");
+}
+
 static void test_attention_domain_policy() {
     const auto portable_decode = llama_kvarn_plan_attention(true, false, 16, 1);
     require(portable_decode.native_attention,
@@ -5086,6 +5108,7 @@ int main() {
     kvarn_stage_assignment_is_collision_free_and_stable();
     kvarn_stage_indices_carry_authoritative_assignment();
     test_type_table();
+    test_context_route_policy();
     test_attention_domain_policy();
     test_vulkan_decode_route_policy();
     test_stage_policy();

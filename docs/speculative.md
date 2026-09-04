@@ -291,11 +291,13 @@ Use exactly one of these options:
 ```
 --spec-draft-type-k, -ctkd, --cache-type-k-draft  TYPE
                                         KV cache data type for K for the draft model
-                                        allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1, q6_0, q6_1, q3_0, q3_1, q2_0, q2_1
+                                        allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1, q6_0, q6_1, q3_0, q3_1, q2_0, q2_1, kvarn2, kvarn3, kvarn4, kvarn5, kvarn6, kvarn8
+                                        KVarN values require a supported draft-owned Qwen MTP context
                                         (env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K)
 --spec-draft-type-v, -ctvd, --cache-type-v-draft  TYPE
                                         KV cache data type for V for the draft model
-                                        allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1, q6_0, q6_1, q3_0, q3_1, q2_0, q2_1
+                                        allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1, q6_0, q6_1, q3_0, q3_1, q2_0, q2_1, kvarn2, kvarn3, kvarn4, kvarn5, kvarn6, kvarn8
+                                        KVarN values require a supported draft-owned Qwen MTP context
                                         (env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V)
 --spec-draft-override-tensor, -otd, --override-tensor-draft  <tensor name pattern>=<buffer type>,...
                                         override tensor buffer type for draft model

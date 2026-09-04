@@ -190,7 +190,8 @@ llama-server -m target.gguf --spec-type draft-dflash \
   --flash-attn on --cache-type-k q5_0 --cache-type-v q4_1
 ```
 
-Keep the draft context on a standard cache type; KVarN is target-cache only.
+DFlash draft contexts remain on standard cache types. KVarN draft caches are
+supported only for the draft-owned MTP route described below.
 
 ### KVarN Target Cache
 
@@ -200,6 +201,25 @@ llama-server -m model.gguf --flash-attn on \
   --cache-type-k kvarn5 --cache-type-v kvarn4 \
   --kv-tail-tokens 1024
 ```
+
+### KVarN MTP Draft Cache
+
+Qwen3.5/Qwen3.6 dense and MoE MTP, and standalone Qwen3.8/Qwen4Exp MTP
+sidecars, can select an independent draft-owned KVarN cache:
+
+```sh
+llama-server -m target.gguf --spec-type draft-mtp \
+  --spec-draft-model mtp.gguf \
+  --spec-draft-type-k kvarn4 --spec-draft-type-v kvarn2
+```
+
+The target and draft cache types are independent. A one-sided draft KVarN
+selection promotes the other side to the same width with a warning. There is no
+draft precision-tail option: the explicit draft tail request stays zero and
+KVarN retains its intrinsic exact suffix of up to 128 tokens. Gemma 4 MTP shares
+the target cache, so configure target `--cache-type-k/v kvarn*` instead of a
+draft cache type. DFlash, DSpark, Eagle3, draft-simple, and unclassified MTP
+architectures reject explicit draft KVarN requests.
 
 ### Router Mode With Presets
 
