@@ -1572,6 +1572,7 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
         }
         common_params_kvarn_normalize(ctx_arg.params);
         common_params_draft_kvarn_normalize(ctx_arg.params);
+        common_validate_draft_kvarn_mode(ctx_arg.params.speculative);
         ctx_arg.params.lr.init();
         common_validate_reasoning_loop_guard_params(ctx_arg.params.reasoning_loop_guard);
         ctx_arg.params.sampling.reasoning_budget_tracking =

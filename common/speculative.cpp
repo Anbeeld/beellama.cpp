@@ -2687,7 +2687,7 @@ static bool common_speculative_type_owns_draft_context(common_speculative_type t
     }
 }
 
-static void common_validate_draft_kvarn_mode(const common_params_speculative & params) {
+void common_validate_draft_kvarn_mode(const common_params_speculative & params) {
     if (params.draft.kvarn.type == LLAMA_KVARN_TYPE_DISABLED) {
         return;
     }

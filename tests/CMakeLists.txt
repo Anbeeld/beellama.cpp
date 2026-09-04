@@ -144,6 +144,12 @@ if (Python3_Interpreter_FOUND)
     set_property(TEST test-kvarn-mtp-sharing-static PROPERTY LABELS main)
 
     add_test(
+        NAME test-kvarn-fit-fail-closed-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-kvarn-fit-fail-closed-static.py)
+    set_property(TEST test-kvarn-fit-fail-closed-static PROPERTY LABELS main)
+
+    add_test(
         NAME test-kvarn-port-safety-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-kvarn-port-safety-static.py)

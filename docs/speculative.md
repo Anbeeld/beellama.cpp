@@ -75,7 +75,7 @@ llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DFlash.gguf \
 `--spec-draft-n-max` is clamped to the draft model's trained block size.
 
 Model-backed speculative modes with owned draft caches—including draft-simple,
-EAGLE3, audited Qwen MTP, DFlash1/DFlash2, and DSpark—may use KVarN:
+EAGLE3, audited Qwen MTP, DFlash1/DFlash2, and non-MLA DSpark—may use KVarN:
 
 ```bash
 llama-server -m target.gguf --spec-type draft-dflash \
@@ -86,7 +86,10 @@ llama-server -m target.gguf --spec-type draft-dflash \
 The draft pair is independent of the target cache and applies to both
 full-attention and SWA draft layers. There is no draft precision-tail option;
 the explicit tail request stays zero and KVarN retains its intrinsic exact
-suffix of up to 128 tokens. Non-causal DFlash-family block attention uses
+suffix of up to 128 tokens. Exact describes the stored K/V precision; the KVarN
+attention transform and speculative batch shape can still produce normal
+floating-point differences from an F16-cache run, including a different greedy
+choice when logits are nearly tied. Non-causal DFlash-family block attention uses
 materialized KVarN attention while the persistent draft cache remains compressed.
 
 See:
@@ -94,6 +97,11 @@ See:
 - #22105
 
 ### DSpark (`draft-dspark`)
+
+Dense-attention DSpark drafts can use the owned KVarN route. DSV4/MLA DSpark
+fails closed because its latent cache is not a dense K/V cache. When a DSpark
+sidecar borrows target tensors, automatic memory fitting cannot safely measure
+an explicit KVarN draft context; pass `-fit off` and size placement explicitly.
 
 DSpark extends DFlash with a semi-autoregressive _Markov head_: the draft still emits a whole
 block per forward pass, but each block position's logits are biased by a low-rank term keyed on

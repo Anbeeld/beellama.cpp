@@ -22,7 +22,10 @@ layers.
 There is no draft precision-tail option. KVarN supplies an intrinsic exact
 suffix of up to 128 tokens while the explicit draft tail request remains zero.
 Non-causal DFlash block attention uses materialized attention over compressed
-persistent KVarN storage. DSpark uses the same owned draft-cache route.
+persistent KVarN storage. Non-MLA DSpark uses the same owned draft-cache route;
+DSV4/MLA DSpark fails closed because its latent cache is not dense K/V. Use
+`-fit off` and explicit placement for a KVarN DSpark sidecar that borrows target
+tensors.
 
 CUDA is the runtime-qualified DFlash draft-KVarN backend for this release.
 HIP/ROCm, Vulkan, real multi-GPU, and multimodal DFlash routes remain

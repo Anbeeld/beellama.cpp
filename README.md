@@ -190,7 +190,7 @@ llama-server -m target.gguf --spec-type draft-dflash \
   --flash-attn on --cache-type-k q5_0 --cache-type-v q4_1
 ```
 
-DFlash1, DFlash2, and DSpark can use an owned draft KVarN cache with
+DFlash1, DFlash2, and non-MLA DSpark can use an owned draft KVarN cache with
 `--spec-draft-type-k/v kvarnN`. Non-causal block attention retains compressed
 persistent storage and uses the qualified materialized attention route.
 
@@ -206,7 +206,7 @@ llama-server -m model.gguf --flash-attn on \
 ### KVarN Draft Cache
 
 Model-backed speculative modes with an owned cache—draft-simple, EAGLE3,
-audited Qwen MTP, DFlash1/DFlash2, and DSpark—can select an independent
+audited Qwen MTP, DFlash1/DFlash2, and non-MLA DSpark—can select an independent
 KVarN draft cache:
 
 ```sh

@@ -599,7 +599,7 @@ static void test(void) {
             params = common_params();
             const std::string option = key ? "--spec-draft-type-k" : "--spec-draft-type-v";
             const std::string value = "kvarn" + std::to_string(bits);
-            argv = {"binary_name", "-m", "model_file.gguf", option, value};
+            argv = {"binary_name", "-m", "model_file.gguf", "--spec-type", "draft-simple", option, value};
             assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
             const auto & draft = params.speculative.draft;
             assert(draft.cache_kvarn_bits_k == bits);
@@ -614,19 +614,19 @@ static void test(void) {
     }
 
     params = common_params();
-    argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-type-k", "kvarn4", "--spec-draft-type-v", "kvarn2"};
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-type", "draft-simple", "--spec-draft-type-k", "kvarn4", "--spec-draft-type-v", "kvarn2"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
     assert(params.speculative.draft.kvarn.type == LLAMA_KVARN_K4V2_G128);
     assert(params.speculative.draft.cache_type_k == GGML_TYPE_Q4_0);
     assert(params.speculative.draft.cache_type_v == GGML_TYPE_Q2_0S);
 
     params = common_params();
-    argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-type-k", "kvarn2", "--spec-draft-type-v", "kvarn4"};
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-type", "draft-simple", "--spec-draft-type-k", "kvarn2", "--spec-draft-type-v", "kvarn4"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
     assert(params.speculative.draft.kvarn.type == LLAMA_KVARN_K2V4_G128);
 
     params = common_params();
-    argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-type-k", "turbo2_tcq", "--spec-draft-type-v", "turbo4"};
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-type", "draft-simple", "--spec-draft-type-k", "turbo2_tcq", "--spec-draft-type-v", "turbo4"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
     assert(params.speculative.draft.kvarn.type == LLAMA_KVARN_K2V4_G128);
     assert(params.speculative.draft.cache_type_k == GGML_TYPE_Q2_0S);
@@ -1023,6 +1023,22 @@ static void test_draft_cache_configuration_is_independent() {
     independent.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP, COMMON_SPECULATIVE_TYPE_NGRAM_CACHE };
     draft = common_base_params_to_speculative(independent);
     assert(draft.kvarn.type == LLAMA_KVARN_K6V4_G128);
+
+    for (const char * unsupported : { "none", "ngram-simple", "ngram-map-k", "ngram-map-k4v", "ngram-mod", "ngram-cache" }) {
+        common_params parsed;
+        std::vector<std::string> argv = {
+            "binary_name", "-m", "model.gguf", "--spec-type", unsupported,
+            "--spec-draft-type-k", "kvarn4", "--spec-draft-type-v", "kvarn2",
+        };
+        std::vector<char *> argv_ptrs;
+        for (std::string & arg : argv) {
+            argv_ptrs.push_back(arg.data());
+        }
+        const std::string error = capture_stderr([&]() {
+            assert(!common_params_parse((int) argv_ptrs.size(), argv_ptrs.data(), parsed, LLAMA_EXAMPLE_SPECULATIVE));
+        });
+        assert(error.find("requires exactly one model-backed speculative mode") != std::string::npos);
+    }
 
     independent.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP, COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE };
     try {

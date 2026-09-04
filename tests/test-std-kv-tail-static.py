@@ -148,8 +148,11 @@ def main() -> None:
     )[1].split("llama_model * model = llama_model_load_from_file", 1)[0]
     if "common_fit_params(" not in fit_callsite:
         raise AssertionError("common init no longer invokes upstream parameter fitting")
-    if "fit_status" in fit_callsite or "failed to fit parameters with exact Bee validation" in fit_callsite:
+    if "fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS" in fit_callsite or \
+            "failed to fit parameters with exact Bee validation" in fit_callsite:
         raise AssertionError("common init hard-fails an advisory upstream fit conflict")
+    if "fit_status == COMMON_PARAMS_FIT_STATUS_UNSAFE_EXTRA" not in fit_callsite:
+        raise AssertionError("unsafe KVarN extra-context measurements do not fail closed")
 
     server_tests = (ROOT / "tests/test-server-prompt-checkpoint.cpp").read_text(encoding="utf-8")
     for regression in (

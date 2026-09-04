@@ -132,11 +132,14 @@ reservation and zero cumulative per-context growth.
 
 KVarN supports target contexts and owned draft caches for draft-simple, EAGLE3,
 Qwen3.5/Qwen3.6 dense and MoE MTP, standalone Qwen3.8/Qwen4Exp MTP sidecars,
-DFlash1/DFlash2, and DSpark. DFlash-family modes use one K/V pair for both
+DFlash1/DFlash2, and non-MLA DSpark. DSV4/MLA DSpark fails closed because its
+latent cache is incompatible with KVarN's dense K/V records. DFlash-family modes
+use one K/V pair for both
 full-attention and SWA sub-caches. Their non-causal block attention uses the
 materialized correctness route while persistent K/V remains compressed. Shared
 Gemma 4 MTP reads the target cache representation and does not allocate an
-independent draft record store. N-gram modes have no draft model cache.
+independent draft record store. N-gram modes have no draft model cache and
+reject explicit draft KVarN selections during argument validation.
 CUDA selects specialized descriptor-native FlashAttention on Turing and newer
 GPUs, then falls back to a portable
 direct-record route when those matrix instructions are unavailable or the

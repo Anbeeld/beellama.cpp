@@ -45,6 +45,7 @@ std::vector<double> common_speculative_synth_rates_resolve(const common_params_s
 // return the conditional synthetic acceptance probabilities
 const std::vector<double> & common_speculative_get_synth_probs(const common_speculative * spec);
 
+void common_validate_draft_kvarn_mode(const common_params_speculative & params);
 common_params common_base_params_to_speculative(const common_params & params);
 
 struct common_speculative_output_limits {

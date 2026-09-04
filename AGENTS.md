@@ -118,7 +118,8 @@ Key binaries are `llama-server`, `llama-cli`, `llama-bench`, and
 ### Invariants
 
 - KVarN is supported for target caches and owned draft caches used by
-  draft-simple, EAGLE3, audited Qwen MTP, DFlash1/DFlash2, and DSpark. Shared
+  draft-simple, EAGLE3, audited Qwen MTP, DFlash1/DFlash2, and non-MLA DSpark.
+  DSV4/MLA DSpark remains unsupported because its latent cache is not dense K/V. Shared
   Gemma 4 MTP continues to use the target cache representation; n-gram modes
   have no draft model cache.
 - Non-causal DFlash KVarN attention uses the materialized correctness route;
