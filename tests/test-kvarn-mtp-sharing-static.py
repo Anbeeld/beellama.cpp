@@ -6,6 +6,8 @@ ISWA_CACHE = ROOT / "src/llama-kv-cache-iswa.cpp"
 KVAR_N_CACHE = ROOT / "src/llama-kv-cache-kvarn.cpp"
 STANDARD_CACHE = ROOT / "src/llama-kv-cache.cpp"
 LLAMA_GRAPH = ROOT / "src/llama-graph.cpp"
+SPECULATIVE = ROOT / "common/speculative.cpp"
+SERVER_CONTEXT = ROOT / "tools/server/server-context.cpp"
 
 
 def main() -> None:
@@ -13,6 +15,8 @@ def main() -> None:
     kvarn = KVAR_N_CACHE.read_text(encoding="utf-8")
     standard = STANDARD_CACHE.read_text(encoding="utf-8")
     graph = LLAMA_GRAPH.read_text(encoding="utf-8")
+    speculative = SPECULATIVE.read_text(encoding="utf-8")
+    server = SERVER_CONTEXT.read_text(encoding="utf-8")
 
     assert "static_cast<llama_kv_cache_iswa *>(mem_other)" not in iswa, (
         "auxiliary cache sharing must validate the outer cache type before dereferencing it"
@@ -41,6 +45,12 @@ def main() -> None:
     assert "shared_graph_layers.empty() && cache->uses_native_attention" in kvarn, (
         "shared MTP reads must use the materialization path until segmented tail sharing is available"
     )
+    assert "metadata.swap(*prepared_owner)" not in kvarn, (
+        "KVarN restore must preserve metadata object identity for shared MTP views"
+    )
+    assert "metadata->swap_logical_state_from(**prepared_owner)" in kvarn, (
+        "KVarN restore must install validated logical state into the stable metadata object"
+    )
     assert "get_tail_query_order(swa), get_tail_run_desc(swa), mask" in graph, (
         "iSWA tail planning must use the query order for the selected cache group"
     )
@@ -58,6 +68,15 @@ def main() -> None:
     )
     assert "tail_route == LLAMA_KV_TAIL_ROUTE_NONE ? nullptr" in graph, (
         "layers without a tail route must not receive group-wide tail masks"
+    )
+    assert "common_speculative_draft_memory_is_shared" in speculative, (
+        "the speculative owner must expose shared draft-memory ownership"
+    )
+    assert "slot.mem.init(ctx_tgt, slot.draft_owns_state ? ctx_dft : nullptr)" in server, (
+        "server memory mutations must not apply a second time through a shared MTP view"
+    )
+    assert "llama_context * ctx_dft_state = draft_owns_state ? ctx_dft : nullptr" in server, (
+        "prompt and checkpoint state must omit independently serialized shared MTP memory"
     )
     assert "Shared MTP reads have no graph-local current segment" in standard, (
         "shared tail extents must exclude assistant query rollback rows"

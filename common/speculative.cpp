@@ -172,6 +172,7 @@ struct common_speculative_impl {
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
 
     virtual bool adaptive_dm_supported() const { return false; }
+    virtual bool draft_memory_is_shared() const { return false; }
 
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
@@ -1941,6 +1942,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         return true;
     }
 
+    bool draft_memory_is_shared() const override {
+        return is_mem_shared;
+    }
 };
 
 // state of self-speculation (simple implementation, not ngram-map)
@@ -2586,6 +2590,20 @@ bool common_speculative_adaptive_dm_supported(const common_speculative * spec) {
 
     for (const auto & impl : spec->impls) {
         if (impl->adaptive_dm_supported()) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool common_speculative_draft_memory_is_shared(const common_speculative * spec) {
+    if (spec == nullptr) {
+        return false;
+    }
+
+    for (const auto & impl : spec->impls) {
+        if (impl->draft_memory_is_shared()) {
             return true;
         }
     }

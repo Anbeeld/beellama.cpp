@@ -727,6 +727,10 @@ static inline server_prompt_reuse_plan server_prompt_plan_reuse(
     return result;
 }
 
+inline bool server_draft_context_owns_state(bool has_draft_context, bool draft_memory_is_shared) {
+    return has_draft_context && !draft_memory_is_shared;
+}
+
 struct server_prompt_cache_state_io {
     bool has_draft;
     bool has_speculative;

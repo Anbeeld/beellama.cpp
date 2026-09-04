@@ -283,6 +283,7 @@ struct server_slot {
 
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
+    bool draft_owns_state = false;
 
     common_memory mem;
 
@@ -369,10 +370,11 @@ struct server_slot {
         std::vector<uint8_t> speculative_state;
         common_speculative_get_state(spec, id, speculative_state);
         constexpr llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED;
-        const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, flags);
-        const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, flags) : 0;
+        llama_context * ctx_dft_state = draft_owns_state ? ctx_dft : nullptr;
+        const size_t cur_size_tgt =                 llama_state_seq_get_size_ext(ctx_tgt, id, flags);
+        const size_t cur_size_dft = ctx_dft_state ? llama_state_seq_get_size_ext(ctx_dft_state, id, flags) : 0;
 
-        if (cur_size_tgt == 0 || (ctx_dft && cur_size_dft == 0)) {
+        if (cur_size_tgt == 0 || (ctx_dft_state && cur_size_dft == 0)) {
             return false;
         }
 
@@ -392,9 +394,9 @@ struct server_slot {
 
         const size_t saved_tgt = llama_state_seq_get_data_ext(
                 ctx_tgt, data.main.data(), cur_size_tgt, id, flags);
-        const size_t saved_dft = ctx_dft ? llama_state_seq_get_data_ext(
-                ctx_dft, data.drft.data(), cur_size_dft, id, flags) : 0;
-        if (saved_tgt != cur_size_tgt || (ctx_dft && saved_dft != cur_size_dft)) {
+        const size_t saved_dft = ctx_dft_state ? llama_state_seq_get_data_ext(
+                ctx_dft_state, data.drft.data(), cur_size_dft, id, flags) : 0;
+        if (saved_tgt != cur_size_tgt || (ctx_dft_state && saved_dft != cur_size_dft)) {
             return false;
         }
 
@@ -408,7 +410,7 @@ struct server_slot {
             int32_t reuse_alignment) {
         const uint64_t restored_before = prompt_cache.restore_successes;
         bool res = prompt_cache.load(
-                prompt, tokens, ctx_tgt, ctx_dft, spec, id,
+                prompt, tokens, ctx_tgt, draft_owns_state ? ctx_dft : nullptr, spec, id,
                 live_native_restorable_tokens, reuse_alignment);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
@@ -1046,6 +1048,7 @@ private:
 
     llama_model   * model_dft = nullptr;
     llama_context * ctx_dft   = nullptr;
+    bool draft_owns_state = false;
 
     common_speculative_init_result_ptr spec_init;
 
@@ -1099,8 +1102,9 @@ private:
         spec.reset();
         spec_init.reset();
 
-        ctx_dft   = nullptr;
-        model_dft = nullptr;
+        ctx_dft          = nullptr;
+        model_dft        = nullptr;
+        draft_owns_state = false;
 
         llama_init.reset();
 
@@ -1433,10 +1437,6 @@ private:
             }
         }
 
-        if (ctx_dft) {
-            ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
-        }
-
         if (spec) {
             SRV_TRC("%s", "speculative decoding context initialized\n");
         } else {
@@ -1444,6 +1444,11 @@ private:
             ctx_dft   = nullptr;
             model_dft = nullptr;
         }
+
+        draft_owns_state = server_draft_context_owns_state(
+                ctx_dft != nullptr, common_speculative_draft_memory_is_shared(spec.get()));
+        ctx_dft_seq_rm_type = draft_owns_state ?
+                common_context_can_seq_rm(ctx_dft) : COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
         if (!spec && params_base.speculative.has_synth()) {
             SRV_ERR("%s", "synthetic acceptance requires an initialized speculative decoding context\n");
@@ -1456,7 +1461,8 @@ private:
             slot.id      = i;
             slot.ctx_tgt = ctx_tgt;
             slot.ctx_dft = ctx_dft;
-            slot.mem.init(ctx_tgt, ctx_dft);
+            slot.draft_owns_state = draft_owns_state;
+            slot.mem.init(ctx_tgt, slot.draft_owns_state ? ctx_dft : nullptr);
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot();
 
@@ -2605,14 +2611,14 @@ private:
         const bool target_planned = llama_memory_seq_rm_plan(
                 llama_get_memory(slot.ctx_tgt), slot.id, requested_p0, -1,
                 &target_p0, &target_p1);
-        const bool draft_planned = !slot.ctx_dft || llama_memory_seq_rm_plan(
+        const bool draft_planned = !slot.draft_owns_state || llama_memory_seq_rm_plan(
                 llama_get_memory(slot.ctx_dft), slot.id, requested_p0, -1,
                 &draft_p0, &draft_p1);
         if (!target_planned || !draft_planned || target_p1 >= 0 ||
-                (slot.ctx_dft && draft_p1 >= 0)) {
+                (slot.draft_owns_state && draft_p1 >= 0)) {
             return 0;
         }
-        const llama_pos common_p0 = slot.ctx_dft ? std::min(target_p0, draft_p0) : target_p0;
+        const llama_pos common_p0 = slot.draft_owns_state ? std::min(target_p0, draft_p0) : target_p0;
         return common_p0 > 0 && common_p0 <= requested_p0 ?
                 slot.prompt.tokens.size_up_to_pos(common_p0) : 0;
     }
@@ -2684,7 +2690,7 @@ private:
 
         constexpr llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
         const auto target = cur.update_tgt(ctx_tgt, slot.id, flags);
-        const auto draft  = cur.update_dft(ctx_dft, slot.id, flags);
+        const auto draft  = cur.update_dft(draft_owns_state ? ctx_dft : nullptr, slot.id, flags);
         if (!target.ok() || !draft.ok() || cur.empty()) {
             SLT_WRN(slot,
                     "rejected context checkpoint (target_status = %d, draft_status = %d, target_bytes = %zu, draft_bytes = %zu)\n",
@@ -3488,7 +3494,7 @@ private:
             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-            if (ctx_dft) {
+            if (slot.draft_owns_state) {
                 if (use_ckpt_dft) {
                     if (!restore_checkpoint_transaction(
                                 slot, ckpt, nullptr, ctx_dft,
@@ -3534,7 +3540,7 @@ private:
                 const bool use_ckpt_tgt = server_speculative_rollback_requires_checkpoint(
                         ctx_tgt_seq_rm_type, common_context_seq_rm_max_rollback(ctx_tgt), draft.size());
 
-                const bool use_ckpt_dft = server_speculative_rollback_requires_checkpoint(
+                const bool use_ckpt_dft = slot.draft_owns_state && server_speculative_rollback_requires_checkpoint(
                         ctx_dft_seq_rm_type, common_context_seq_rm_max_rollback(ctx_dft), draft.size());
 
                 if (use_ckpt_tgt) {
@@ -3791,7 +3797,7 @@ private:
                                             n_past, (int) slot.prompt.tokens.size());
                                     const bool target_cleared = llama_memory_seq_rm(
                                             llama_get_memory(slot.ctx_tgt), slot.id, -1, -1);
-                                    const bool draft_cleared = !slot.ctx_dft || llama_memory_seq_rm(
+                                    const bool draft_cleared = !slot.draft_owns_state || llama_memory_seq_rm(
                                             llama_get_memory(slot.ctx_dft), slot.id, -1, -1);
                                     if (!target_cleared || !draft_cleared) {
                                         SLT_ERR(slot,
@@ -3856,11 +3862,11 @@ private:
                                 llama_pos draft_p1 = -1;
                                 const bool main_planned = llama_memory_seq_rm_plan(
                                         llama_get_memory(ctx_tgt), slot.id, pos_next, -1, &main_p0, &main_p1);
-                                const bool draft_planned = !ctx_dft || llama_memory_seq_rm_plan(
+                                const bool draft_planned = !slot.draft_owns_state || llama_memory_seq_rm_plan(
                                         llama_get_memory(ctx_dft), slot.id, pos_next, -1, &draft_p0, &draft_p1);
-                                const llama_pos common_p0 = ctx_dft ? std::min(main_p0, draft_p0) : main_p0;
+                                const llama_pos common_p0 = slot.draft_owns_state ? std::min(main_p0, draft_p0) : main_p0;
                                 const bool use_live_plan = main_planned && draft_planned &&
-                                        main_p1 < 0 && (!ctx_dft || draft_p1 < 0) &&
+                                        main_p1 < 0 && (!slot.draft_owns_state || draft_p1 < 0) &&
                                         common_p0 > 0 && common_p0 <= pos_next;
                                 const bool extends_complete_prompt = n_past == slot.prompt.n_tokens();
                                 const bool state_required = !extends_complete_prompt && !use_live_plan;
@@ -3902,8 +3908,8 @@ private:
 
                                         if (!do_reset) {
                                             do_reset = !restore_checkpoint_transaction(
-                                                    slot, *it, ctx_tgt, ctx_dft,
-                                                    true, ctx_dft != nullptr, true);
+                                                    slot, *it, ctx_tgt, slot.draft_owns_state ? ctx_dft : nullptr,
+                                                    true, slot.draft_owns_state, true);
                                             if (!do_reset) {
                                                 pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                                 n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
@@ -4295,7 +4301,7 @@ private:
                         send_error(slot, err, ERROR_TYPE_SERVER);
                         const bool target_cleared = llama_memory_seq_rm(
                                 llama_get_memory(slot.ctx_tgt), slot.id, -1, -1);
-                        const bool draft_cleared = !slot.ctx_dft || llama_memory_seq_rm(
+                        const bool draft_cleared = !slot.draft_owns_state || llama_memory_seq_rm(
                                 llama_get_memory(slot.ctx_dft), slot.id, -1, -1);
                         if (target_cleared && draft_cleared) {
                             slot.prompt_reset_after_memory_clear();
@@ -4568,7 +4574,7 @@ private:
 
                 const bool use_ckpt_tgt = server_speculative_rollback_requires_checkpoint(
                         ctx_tgt_seq_rm_type, common_context_seq_rm_max_rollback(ctx_tgt), n_rollback);
-                const bool use_ckpt_dft = ctx_dft && server_speculative_rollback_requires_checkpoint(
+                const bool use_ckpt_dft = slot.draft_owns_state && server_speculative_rollback_requires_checkpoint(
                         ctx_dft_seq_rm_type, common_context_seq_rm_max_rollback(ctx_dft), n_rollback);
 
                 // check for partial draft acceptance
@@ -4587,7 +4593,7 @@ private:
                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
                         if (!restore_checkpoint_transaction(
-                                    slot, ckpt, slot.ctx_tgt, slot.ctx_dft,
+                                    slot, ckpt, slot.ctx_tgt, slot.draft_owns_state ? slot.ctx_dft : nullptr,
                                     true, use_ckpt_dft, true)) {
                             SLT_ERR(slot, "%s", "failed to restore speculative checkpoint transaction\n");
                             slot.release();

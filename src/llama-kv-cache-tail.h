@@ -514,6 +514,7 @@ public:
             const std::vector<llama_kv_tail_provenance> & provenance,
             llama_seq_id dest_seq_id = -1);
     void clone_logical_state_from(const llama_kv_tail_store & source);
+    void swap_logical_state_from(llama_kv_tail_store & source);
     std::unique_ptr<llama_kv_tail_store> clone_logical_state() const;
 
 private:

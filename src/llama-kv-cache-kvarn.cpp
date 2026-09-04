@@ -2914,7 +2914,7 @@ void llama_kv_cache_kvarn::state_read_sinfo(
                   n_selective_stage_cells, selective_stage_bytes,
                   log_function,
                   exact_payload_bytes, exact_destination_runs, exact_tensor_ops, on_device]() mutable {
-        metadata.swap(*prepared_owner);
+        metadata->swap_logical_state_from(**prepared_owner);
         LLAMA_LOG_DEBUG(
                 "%s: KVarN state restore: kind=%s version=%u stage_rows=%u stage_bytes=%llu "
                 "payloads=%u tail_bytes=%llu runs=%zu tensor_ops=%zu device=%s\n",

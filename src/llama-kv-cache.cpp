@@ -6142,6 +6142,51 @@ void llama_kv_cache::clone_logical_state_from(const llama_kv_cache & source) {
     }
 }
 
+void llama_kv_cache::swap_logical_state_from(llama_kv_cache & source) {
+    if (n_seq_max != source.n_seq_max || n_stream != source.n_stream ||
+            v_cells.size() != source.v_cells.size() ||
+            tail_generations.size() != source.tail_generations.size() ||
+            bool(tail) != bool(source.tail) ||
+            allocation_group_size != source.allocation_group_size ||
+            allocation_stage_groups != source.allocation_stage_groups) {
+        throw std::runtime_error("cannot swap incompatible KV cache logical state");
+    }
+    if (tail_preparing || tail_graph_started || source.tail_preparing || source.tail_graph_started ||
+            (tail && (tail->has_batch_transaction() || tail->has_pending_seq_cp())) ||
+            (source.tail && (source.tail->has_batch_transaction() || source.tail->has_pending_seq_cp()))) {
+        throw std::runtime_error("cannot swap KV cache logical state during a transaction");
+    }
+
+    for (uint32_t stream = 0; stream < n_stream; ++stream) {
+        if (v_cells[stream].size() != source.v_cells[stream].size()) {
+            throw std::runtime_error("cannot swap KV cache with a different stream capacity");
+        }
+    }
+
+    using std::swap;
+    for (uint32_t stream = 0; stream < n_stream; ++stream) {
+        swap(v_cells[stream], source.v_cells[stream]);
+    }
+    swap(v_heads, source.v_heads);
+    swap(allocation_seq_heads, source.allocation_seq_heads);
+    swap(allocation_group_stage_slots, source.allocation_group_stage_slots);
+    swap(seq_to_stream, source.seq_to_stream);
+    swap(tail_generations, source.tail_generations);
+    swap(tail_generations_before_batch, source.tail_generations_before_batch);
+    swap(tail_ordinal, source.tail_ordinal);
+    swap(tail_write_slots, source.tail_write_slots);
+    swap(restored_tail_payload_slots, source.restored_tail_payload_slots);
+    swap(state_remap_group_size, source.state_remap_group_size);
+    swap(state_cell_remap, source.state_cell_remap);
+    swap(tail_write_levels, source.tail_write_levels);
+    swap(tail_preparing, source.tail_preparing);
+    swap(tail_graph_started, source.tail_graph_started);
+    swap(sc_info, source.sc_info);
+    if (tail) {
+        tail->swap_logical_state_from(*source.tail);
+    }
+}
+
 void llama_kv_cache::state_write_tail(llama_io_write_i & io, llama_seq_id seq_id) const {
     GGML_ASSERT(tail);
 

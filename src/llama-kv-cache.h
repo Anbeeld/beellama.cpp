@@ -281,6 +281,7 @@ public:
     std::vector<uint32_t> state_source_cells(llama_seq_id seq_id) const;
     std::vector<std::vector<int32_t>> take_restored_tail_payload_slots();
     void clone_logical_state_from(const llama_kv_cache & source);
+    void swap_logical_state_from(llama_kv_cache & source);
     void set_allocation_group_size(uint32_t group_size, uint32_t stage_groups = 1);
     bool allocation_cell_uses_stage(uint32_t cell) const;
     int32_t allocation_cell_stage_slot(uint32_t cell) const;

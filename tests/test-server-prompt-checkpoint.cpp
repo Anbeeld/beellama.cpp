@@ -28,6 +28,10 @@ static void speculative_rollback_checkpoint_boundary() {
     assert(server_prompt_checkpoint_boundary(795, 132, 128) == 640);
     assert(server_prompt_checkpoint_boundary(795,   4, 128) == 768);
     assert(server_prompt_checkpoint_boundary(3,     4, 128) == 0);
+
+    assert(!server_draft_context_owns_state(false, false));
+    assert( server_draft_context_owns_state(true,  false));
+    assert(!server_draft_context_owns_state(true,  true));
 }
 
 static server_prompt make_prompt(const llama_tokens & tokens) {

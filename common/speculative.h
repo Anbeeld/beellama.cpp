@@ -39,6 +39,9 @@ bool common_speculative_dflash_backend_sampling_allowed(
         bool requested, int32_t target_device_count, bool is_dflash2);
 bool common_speculative_adaptive_dm_supported(const common_speculative * spec);
 
+// True when a model-backed draft context is a non-owning view of target KV state.
+bool common_speculative_draft_memory_is_shared(const common_speculative * spec);
+
 // validate and resolve the unconditional synthetic acceptance rates
 std::vector<double> common_speculative_synth_rates_resolve(const common_params_speculative * spec, int32_t n_max);
 

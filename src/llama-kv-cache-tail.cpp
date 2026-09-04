@@ -1332,6 +1332,30 @@ void llama_kv_tail_store::clone_logical_state_from(const llama_kv_tail_store & s
     }
 }
 
+void llama_kv_tail_store::swap_logical_state_from(llama_kv_tail_store & source) {
+    if (n_tokens != source.n_tokens || rollback_tokens != source.rollback_tokens ||
+            history_limit != source.history_limit || arena_stride != source.arena_stride ||
+            n_slots != source.n_slots || compact_storage != source.compact_storage ||
+            sequences.size() != source.sequences.size()) {
+        throw std::runtime_error("cannot swap incompatible KV tail logical state");
+    }
+    if (in_batch || pending_seq_cp || batch_transaction ||
+            source.in_batch || source.pending_seq_cp || source.batch_transaction) {
+        throw std::runtime_error("cannot swap KV tail logical state during a transaction");
+    }
+
+    using std::swap;
+    swap(sequences, source.sequences);
+    swap(entry_by_cell, source.entry_by_cell);
+    swap(slot_used, source.slot_used);
+    swap(write_cursors, source.write_cursors);
+    swap(degradation, source.degradation);
+    swap(recovery_commits, source.recovery_commits);
+    swap(pending_seq_cp, source.pending_seq_cp);
+    swap(batch_transaction, source.batch_transaction);
+    swap(in_batch, source.in_batch);
+}
+
 std::unique_ptr<llama_kv_tail_store> llama_kv_tail_store::clone_logical_state() const {
     const uint32_t n_seq_max = uint32_t(sequences.size());
     const uint32_t sink_slots = n_slots - arena_stride*n_seq_max;
