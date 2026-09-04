@@ -1061,7 +1061,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         // offload draft sampling to the backend
         backend_chains.assign(n_seq, nullptr);
-        if (this->params.backend_sampling && !is_dflash2) {
+        int32_t target_device_count = 0;
+        for (int32_t i = 0; i < llama_model_n_devices(model_tgt); ++i) {
+            ggml_backend_dev_t dev = llama_model_get_device(model_tgt, i);
+            target_device_count += ggml_backend_dev_is_meta(dev)
+                ? (int32_t) ggml_backend_meta_device_count(dev)
+                : 1;
+        }
+        const bool use_backend_sampling = common_speculative_dflash_backend_sampling_allowed(
+                this->params.backend_sampling, target_device_count, is_dflash2);
+        if (this->params.backend_sampling && !use_backend_sampling && !is_dflash2) {
+            SPC_WRN("%s\n", "target output is split across devices; using CPU draft sampler");
+        }
+        if (use_backend_sampling) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
                 llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
@@ -2557,6 +2569,14 @@ bool common_speculative_dflash_causal_attn(const llama_model * model) {
 
 bool common_speculative_dflash_adaptive_dm_supported(int32_t selector_top_k) {
     return selector_top_k <= 0;
+}
+
+bool common_speculative_dflash_backend_sampling_allowed(
+        bool requested, int32_t target_device_count, bool is_dflash2) {
+    // DFlash1 borrows the target output projection. Tensor-parallel targets
+    // therefore produce vocabulary-axis split logits, which TOP_K cannot
+    // consume independently on each shard. DFlash2 uses its selector lattice.
+    return requested && target_device_count <= 1 && !is_dflash2;
 }
 
 bool common_speculative_adaptive_dm_supported(const common_speculative * spec) {

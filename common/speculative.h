@@ -35,6 +35,8 @@ bool common_speculative_dflash_causal_attn(const llama_model * model);
 
 // Bee's variable-depth adaptive draft-max is limited to the original DFlash path.
 bool common_speculative_dflash_adaptive_dm_supported(int32_t selector_top_k);
+bool common_speculative_dflash_backend_sampling_allowed(
+        bool requested, int32_t target_device_count, bool is_dflash2);
 bool common_speculative_adaptive_dm_supported(const common_speculative * spec);
 
 // validate and resolve the unconditional synthetic acceptance rates

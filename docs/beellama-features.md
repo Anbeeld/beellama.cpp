@@ -220,12 +220,13 @@ heap, including the valid high-pressure case where reported usage exceeds the
 current budget.
 
 Each selected layer must be owned by a backend that implements KVarN store and
-attention, or an explicitly supported materialization fallback. Unsupported or
-tensor-split placements fail closed. Explicit draft KVarN is fail-closed outside
-the audited owned-MTP and DFlash1/DFlash2 routes; it never silently runs the
-ordinary quantized backing cache. CUDA is runtime-qualified for DFlash draft
-KVarN. HIP/ROCm, Vulkan, real multi-GPU, and multimodal DFlash routes remain
-unqualified.
+attention, or an explicitly supported materialization fallback. Unsupported
+placements fail closed. Explicit draft KVarN is fail-closed outside the audited
+owned-MTP and DFlash1/DFlash2 routes; it never silently runs the ordinary
+quantized backing cache. CUDA is runtime-qualified for DFlash draft KVarN,
+including two-device tensor-parallel target, draft, and combined placements on
+RTX 3090. HIP/ROCm, Vulkan, heterogeneous multi-GPU, and multimodal DFlash
+routes remain unqualified.
 
 ## Standard low-bit KV caches
 

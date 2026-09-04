@@ -111,6 +111,20 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-upstream-merge-keepers-static.py)
     set_property(TEST test-upstream-merge-keepers-static PROPERTY LABELS main)
 
+    foreach(meta_static_test IN ITEMS
+            meta-context-headroom
+            meta-gqa-split
+            meta-softmax-split
+            meta-host-boundary
+            dflash2-selector-placement
+            windows-meta-stack)
+        add_test(
+            NAME test-${meta_static_test}-static
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-${meta_static_test}-static.py)
+        set_property(TEST test-${meta_static_test}-static PROPERTY LABELS main)
+    endforeach()
+
     add_test(
         NAME test-kvarn-eager-workspace-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}

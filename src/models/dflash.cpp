@@ -471,7 +471,9 @@ static ggml_tensor * build_dflash2_conv(
 
 // DFlash2 selector: top-k candidates per block position plus the pairwise
 // transition scores, packed into the nextn output slot for the CPU-side walk.
-static void build_dflash2_selector(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
+static void build_dflash2_selector(
+        llm_graph_context & g, const llama_model & model, ggml_tensor * tokens,
+        const ggml_tensor * output_projection) {
     ggml_context * ctx0 = g.ctx0;
     auto         & res  = g.res;
 
@@ -492,8 +494,19 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
     const int64_t block_size = std::min<int64_t>(tokens_per_block, hparams.dflash_block_size);
     const int64_t row_used   = top_k + top_k * top_k;
 
-    ggml_tensor * candidates  = ggml_top_k(ctx0, res->t_logits, top_k);
-    ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, res->t_logits, 1, res->t_logits->ne[0], n_tokens);
+    const ggml_backend_dev_t output_dev = ggml_backend_buft_get_device(
+            ggml_backend_buffer_get_type(output_projection->buffer));
+    bool graph_is_split = false;
+    for (const llama_device & device : model.devices) {
+        graph_is_split |= device.is_meta && ggml_backend_meta_device_count(device.dev) > 1;
+    }
+    const bool output_is_split = ggml_backend_dev_is_meta(output_dev) &&
+            ggml_backend_meta_device_count(output_dev) > 1;
+    ggml_tensor * selector_logits = ggml_cont(ctx0, res->t_logits);
+    g.cb(selector_logits, output_is_split || graph_is_split
+            ? "dflash2_logits_global" : "dflash2_logits_local", -1);
+    ggml_tensor * candidates  = ggml_top_k(ctx0, selector_logits, top_k);
+    ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, selector_logits, 1, selector_logits->ne[0], n_tokens);
     ggml_tensor * unary       = ggml_reshape_2d(ctx0,
             ggml_get_rows(ctx0, logits_rows, candidates), top_k, n_tokens);
     ggml_tensor * gate        = g.build_lora_mm(model.dflash_selector_hidden, res->t_embd);
@@ -815,7 +828,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     }
 
     if (model.dflash_selector_hidden) {
-        build_dflash2_selector(*this, model, inp_tokens);
+        build_dflash2_selector(*this, model, inp_tokens, output);
     }
 }
 

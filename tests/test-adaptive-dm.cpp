@@ -47,6 +47,11 @@ int main() {
     assert(!common_speculative_dflash_adaptive_dm_supported(16));
     assert(!common_speculative_adaptive_dm_supported(nullptr));
 
+    assert(common_speculative_dflash_backend_sampling_allowed(true, 1, false));
+    assert(!common_speculative_dflash_backend_sampling_allowed(true, 2, false));
+    assert(!common_speculative_dflash_backend_sampling_allowed(false, 1, false));
+    assert(!common_speculative_dflash_backend_sampling_allowed(true, 1, true));
+
     assert(server_adaptive_dm_probe_n_max(8, 0.25f) == 2);
     assert(server_adaptive_dm_probe_n_max(16, 0.25f) == 4);
     assert(server_adaptive_dm_probe_n_max(8, 0.50f) == 4);
