@@ -260,6 +260,39 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+// Whether `dev` provides a NATIVE KV-tail attention kernel.
+//
+// Only the presence of the entry point is checked, not whether it accepts a
+// particular type pair: the per-layer planner in llama-kv-cache.cpp already
+// asks that finer question. This answers the coarser one -- can this device
+// ever serve a precision tail natively -- so that a backend which implements
+// no tail attention at all can be recognised before the cache is built.
+static bool kv_tail_device_has_native_attention(ggml_backend_dev_t dev) {
+    if (dev == nullptr) {
+        dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    }
+    if (dev && ggml_backend_dev_is_meta(dev)) {
+        const size_t count = ggml_backend_meta_device_count(dev);
+        for (size_t i = 0; i < count; ++i) {
+            if (kv_tail_device_has_native_attention(ggml_backend_meta_device_get(dev, i))) {
+                return true;
+            }
+        }
+        return false;
+    }
+    const auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (!reg) {
+        return false;
+    }
+    return ggml_backend_reg_get_proc_address(
+                   reg, "ggml_backend_kv_tail_segmented_attention_supported") != nullptr ||
+           ggml_backend_reg_get_proc_address(
+                   reg, "ggml_backend_kv_tail_attention_supported") != nullptr ||
+           ggml_backend_reg_get_proc_address(
+                   reg, "ggml_backend_kvarn_tail_attention_supported") != nullptr;
+}
+
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -412,6 +445,52 @@ llama_context::llama_context(
                 }
                 LLAMA_LOG_INFO("KV tail: group=%s layers=%u requested=%u effective=%u\n",
                         group.id.c_str(), uint32_t(group.layers.size()), requested, resolved);
+            }
+        }
+    }
+
+    // A KV precision tail is only a win where some device can serve it with NATIVE
+    // tail attention. Where none can, planning still SUCCEEDS: every layer falls back
+    // to the generic tail route, which llama-kv-cache.cpp itself logs as "catastrophic
+    // generic attention". That is not a quality/size trade, it is a large throughput
+    // loss for a feature the user asked for expecting the opposite -- and the Metal
+    // backend exports no tail-attention entry point at all, so every Metal build pays
+    // it in full. Measured on an M1 Max, Qwen3.8-27B IQ4_XS at 100k ctx, k=v=q5_0:
+    // prompt 39 -> 112 tok/s and decode 5.8 -> 9.0 tok/s simply by dropping
+    // --kv-tail-tokens.
+    //
+    // So decline the tail here, the same way KVarN declines itself just below when its
+    // requirements do not hold. LLAMA_KV_TAIL_ALLOW_GENERIC=1 keeps the old behaviour
+    // for anyone who wants the exact tail regardless of what it costs.
+    if (cparams.kv_tail_tokens > 0 || cparams.kv_tail_tokens_swa > 0) {
+        bool any_native = false;
+        for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+            if (!model.hparams.has_kv(il)) {
+                continue;
+            }
+            if (kv_tail_device_has_native_attention(model.dev_layer(il))) {
+                any_native = true;
+                break;
+            }
+        }
+
+        if (!any_native) {
+            const uint32_t requested = std::max(cparams.kv_tail_tokens, cparams.kv_tail_tokens_swa);
+            const char * allow_generic = getenv("LLAMA_KV_TAIL_ALLOW_GENERIC");
+            if (allow_generic && allow_generic[0] != '\0' && strcmp(allow_generic, "0") != 0) {
+                LLAMA_LOG_WARN("%s: no device provides native KV tail attention, but "
+                        "LLAMA_KV_TAIL_ALLOW_GENERIC is set; keeping the %u-token precision "
+                        "tail on the generic route, which is much slower\n", __func__, requested);
+            } else {
+                LLAMA_LOG_WARN("%s: no device provides native KV tail attention; disabling the "
+                        "%u-token KV precision tail. The generic tail route costs several times "
+                        "more than plain quantized attention, so it is not enabled by default. "
+                        "Set LLAMA_KV_TAIL_ALLOW_GENERIC=1 to keep it anyway.\n",
+                        __func__, requested);
+                cparams.kv_tail_tokens = 0;
+                cparams.kv_tail_tokens_swa = 0;
+                cparams.kv_tail_tokens_requested = 0;
+                cparams.kv_tail_tokens_swa_requested = 0;
             }
         }
     }
