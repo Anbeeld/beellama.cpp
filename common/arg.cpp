@@ -4554,7 +4554,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format(
             "KV cache data type for K for the draft model\n"
             "allowed values: %s\n"
-            "KVarN values require an audited owned Qwen MTP or DFlash1/DFlash2 draft context\n"
+            "KVarN values require one model-backed speculative mode with an owned draft KV cache\n"
             "(default: %s)",
             get_all_kv_cache_types(/*include_kvarn_pseudo_types =*/ true).c_str(),
             kv_cache_type_name(params.speculative.draft.cache_type_k)
@@ -4568,7 +4568,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format(
             "KV cache data type for V for the draft model\n"
             "allowed values: %s\n"
-            "KVarN values require an audited owned Qwen MTP or DFlash1/DFlash2 draft context\n"
+            "KVarN values require one model-backed speculative mode with an owned draft KV cache\n"
             "(default: %s)",
             get_all_kv_cache_types(/*include_kvarn_pseudo_types =*/ true).c_str(),
             kv_cache_type_name(params.speculative.draft.cache_type_v)

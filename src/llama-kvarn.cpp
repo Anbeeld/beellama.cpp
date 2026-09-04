@@ -241,11 +241,11 @@ llama_kvarn_context_route llama_kvarn_context_route_for(
             return LLAMA_KVARN_CONTEXT_ROUTE_OWNED;
         }
 
-        // DFlash and DSpark intentionally share one architecture. Only a
-        // target-backed ordinary DFlash model owns an audited draft K/V cache.
-        // A Markov head identifies DSpark; the impossible Markov+selector
-        // combination also fails closed instead of guessing ownership.
-        return traits.has_ctx_other && !traits.dflash_has_dspark_head
+        // DFlash and DSpark intentionally share one architecture. A target-backed
+        // draft owns its K/V cache; the impossible Markov+selector combination
+        // still fails closed instead of guessing the graph contract.
+        return (traits.has_ctx_other || traits.dflash_has_dspark_head) &&
+                !(traits.dflash_has_dspark_head && traits.dflash_has_selector)
             ? LLAMA_KVARN_CONTEXT_ROUTE_OWNED
             : LLAMA_KVARN_CONTEXT_ROUTE_UNSUPPORTED;
     }

@@ -2695,14 +2695,11 @@ static void common_validate_draft_kvarn_mode(const common_params_speculative & p
     bool has_supported_owner = false;
     std::vector<std::string> unsupported;
     for (const common_speculative_type type : params.types) {
-        if (type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP ||
-                type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) {
+        if (common_speculative_type_owns_draft_context(type)) {
             if (has_supported_owner) {
                 unsupported.push_back(common_speculative_type_to_str(type));
             }
             has_supported_owner = true;
-        } else if (common_speculative_type_owns_draft_context(type)) {
-            unsupported.push_back(common_speculative_type_to_str(type));
         }
     }
 
@@ -2712,7 +2709,7 @@ static void common_validate_draft_kvarn_mode(const common_params_speculative & p
             modes = "none";
         }
         throw std::invalid_argument(string_format(
-                "draft KVarN is supported only for audited draft-mtp or draft-dflash owned-KV contexts; selected speculative mode(s): %s. "
+                "draft KVarN requires exactly one model-backed speculative mode with an owned KV context; selected speculative mode(s): %s. "
                 "Choose an ordinary --spec-draft-type-k/v cache type for this mode",
                 modes.c_str()));
     }

@@ -69,8 +69,12 @@ static void test_context_route_policy() {
             "selector-based DFlash2 draft contexts must own KVarN storage");
     require(llama_kvarn_context_route_for({
                 LLAMA_CONTEXT_TYPE_DEFAULT, LLM_ARCH_DFLASH, true, true, false }) ==
-                LLAMA_KVARN_CONTEXT_ROUTE_UNSUPPORTED,
-            "DSpark draft contexts must remain unsupported");
+                LLAMA_KVARN_CONTEXT_ROUTE_OWNED,
+            "DSpark draft contexts must own KVarN storage");
+    require(llama_kvarn_context_route_for({
+                LLAMA_CONTEXT_TYPE_DEFAULT, LLM_ARCH_DFLASH, false, true, false }) ==
+                LLAMA_KVARN_CONTEXT_ROUTE_OWNED,
+            "the DSpark Markov head must qualify memory-fit draft contexts before target binding");
     require(llama_kvarn_context_route_for({
                 LLAMA_CONTEXT_TYPE_DEFAULT, LLM_ARCH_DFLASH, true, true, true }) ==
                 LLAMA_KVARN_CONTEXT_ROUTE_UNSUPPORTED,

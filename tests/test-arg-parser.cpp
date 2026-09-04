@@ -1009,19 +1009,15 @@ static void test_draft_cache_configuration_is_independent() {
     draft = common_base_params_to_speculative(independent);
     assert(draft.kvarn.type == LLAMA_KVARN_K6V4_G128);
 
-    for (const auto unsupported : {
+    for (const auto supported : {
             COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,
             COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,
             COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK }) {
-        independent.speculative.types = { unsupported };
-        try {
-            (void) common_base_params_to_speculative(independent);
-            assert(false && "unsupported draft KVarN mode must fail closed");
-        } catch (const std::invalid_argument & error) {
-            const std::string message = error.what();
-            assert(message.find("draft KVarN") != std::string::npos);
-            assert(message.find(common_speculative_type_to_str(unsupported)) != std::string::npos);
-        }
+        independent.speculative.types = { supported };
+        draft = common_base_params_to_speculative(independent);
+        assert(draft.kvarn.type == LLAMA_KVARN_K6V4_G128);
+        assert(draft.kv_tail_tokens == "0");
+        assert(draft.kv_tail_type == GGML_TYPE_F16);
     }
 
     independent.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP, COMMON_SPECULATIVE_TYPE_NGRAM_CACHE };

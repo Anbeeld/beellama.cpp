@@ -4418,9 +4418,6 @@ llama_context * llama_init_from_model(
             const std::string reason = route == LLAMA_KVARN_CONTEXT_ROUTE_SHARED_TARGET
                 ? "this MTP topology shares target K/V and has no independent draft KV representation; "
                   "configure target --cache-type-k/v kvarn* instead"
-                : model->arch == LLM_ARCH_DFLASH && model->dspark_markov_w1 != nullptr
-                ? "the loaded DFlash-family model is DSpark, which does not support draft KVarN; "
-                  "choose an ordinary draft cache type"
                 : format("context type %d for architecture %s is not an audited draft-owned KVarN route; "
                          "choose an ordinary draft cache type",
                          int(params.ctx_type), llm_arch_name(model->arch));

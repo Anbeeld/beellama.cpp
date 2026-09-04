@@ -22,19 +22,19 @@ body-plus-tail route and require a CUDA 12.4 build or release package. CUDA
 |---|---|---|---|
 | `-ctk TYPE`, `--cache-type-k TYPE` | `LLAMA_ARG_CACHE_TYPE_K` | `f16` | Selects the target K cache. Bee adds the six KVarN values and standard `q6_0`, `q6_1`, `q3_0`, `q3_1`, `q2_0`, and `q2_1`. If only K or V is KVarN, the other side is promoted to the same KVarN width with a warning. |
 | `-ctv TYPE`, `--cache-type-v TYPE` | `LLAMA_ARG_CACHE_TYPE_V` | `f16` | Selects the target V cache with the same values and one-sided promotion rule as `--cache-type-k`. |
-| `-ctkd TYPE`, `--spec-draft-type-k TYPE` | `LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K` | `f16` | Selects the draft K cache. Bee accepts the six KVarN values for owned DFlash1/DFlash2, draft-owned Qwen3.5/Qwen3.6 dense or MoE MTP, and Qwen3.8/Qwen4Exp MTP. A one-sided KVarN selection promotes draft V to the same width with a warning. |
+| `-ctkd TYPE`, `--spec-draft-type-k TYPE` | `LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K` | `f16` | Selects the draft K cache. Bee accepts the six KVarN values for draft-simple, EAGLE3, audited owned Qwen MTP, DFlash1/DFlash2, and DSpark contexts. A one-sided KVarN selection promotes draft V to the same width with a warning. |
 | `-ctvd TYPE`, `--spec-draft-type-v TYPE` | `LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V` | `f16` | Selects the draft V cache with the same values and one-sided promotion rule. Target and draft cache selections remain independent. |
 | `--cache-type-k-swa TYPE` | `LLAMA_ARG_CACHE_TYPE_K_SWA` | Same as `--cache-type-k` | Overrides KVarN K precision for SWA layers. Accepts only the six `kvarnN` values, requires target KVarN, and must be paired with the V override. |
 | `--cache-type-v-swa TYPE` | `LLAMA_ARG_CACHE_TYPE_V_SWA` | Same as `--cache-type-v` | Overrides KVarN V precision for SWA layers. Accepts only the six `kvarnN` values, requires target KVarN, and must be paired with the K override. |
 
-Draft KVarN is runtime-qualified on CUDA for owned DFlash1/DFlash2 and on CUDA
-and the CPU reference route for the owned MTP allowlist. Non-causal DFlash keeps
-KVarN persistent storage but uses materialized attention; the direct
-record-consuming route is not enabled. DSpark, Eagle3, draft-simple, shared
-Gemma 4 MTP, and MTP architectures outside the allowlist fail closed. For Gemma
-4 MTP, select target KVarN with `--cache-type-k/v`; the assistant reads that
-shared persistent cache. HIP/ROCm and Vulkan DFlash draft KVarN remain
-unqualified until backend runtime tests pass.
+Draft KVarN is runtime-qualified on CUDA for draft-simple, EAGLE3, the owned
+MTP allowlist, DFlash1/DFlash2, and DSpark. The CPU reference route is qualified
+for owned MTP. Non-causal DFlash-family models keep KVarN persistent storage but
+use materialized attention; the direct record-consuming route is not enabled.
+Shared Gemma 4 MTP and MTP architectures outside the allowlist fail closed. For
+Gemma 4 MTP, select target KVarN with `--cache-type-k/v`; the assistant reads
+that shared persistent cache. HIP/ROCm and Vulkan DFlash-family draft KVarN
+remain unqualified until backend runtime tests pass.
 
 ## KV cache precision tail for quantized caches
 

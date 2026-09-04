@@ -11,8 +11,8 @@ small:
 
 - Upstream speculative decoding, including `draft-dflash`, `draft-mtp`,
   EAGLE3, and n-gram modes.
-- KVarN KV-cache compression for target contexts, supported draft-owned Qwen
-  MTP contexts, and owned DFlash1/DFlash2 draft contexts, selected with
+- KVarN KV-cache compression for target contexts and model-backed speculative
+  contexts with owned draft K/V caches, selected with
   `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`, `kvarn6`, or `kvarn8`.
 - Standard low-bit KV cache formats `q2_0`, `q2_1`, `q3_0`, `q3_1`,
   `q6_0`, and `q6_1`. Bee's cache-facing `q2_0` uses the internal enum
@@ -117,10 +117,10 @@ Key binaries are `llama-server`, `llama-cli`, `llama-bench`, and
 
 ### Invariants
 
-- KVarN is supported for target caches, draft-owned MTP caches on Qwen3.5,
-  Qwen3.6, and Qwen3.8/Qwen4Exp, and owned DFlash1/DFlash2 draft caches. Shared
-  Gemma 4 MTP continues to use the target cache representation. DSpark and
-  other draft or auxiliary contexts use normal cache types.
+- KVarN is supported for target caches and owned draft caches used by
+  draft-simple, EAGLE3, audited Qwen MTP, DFlash1/DFlash2, and DSpark. Shared
+  Gemma 4 MTP continues to use the target cache representation; n-gram modes
+  have no draft model cache.
 - Non-causal DFlash KVarN attention uses the materialized correctness route;
   direct record-consuming attention remains disabled for that path until it is
   independently qualified.
