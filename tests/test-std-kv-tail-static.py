@@ -376,6 +376,24 @@ def main() -> None:
     context_source = (ROOT / "src/llama-context.cpp").read_text(encoding="utf-8")
     if "llama_kv_tail_resolve_groups" not in context_source or "config.automatic ? automatic_standard : true" not in context_source:
         raise AssertionError("automatic and explicit group resolution are not separated at context construction")
+    decline_block = context_source.split("if (cparams.kv_tail_tokens > 0 || cparams.kv_tail_tokens_swa > 0)", 1)[1].split(
+        "if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED && !tail_request_resolved)", 1
+    )[0]
+    if "cparams.offload_kqv ? model.dev_layer(il) : nullptr" not in decline_block:
+        raise AssertionError("KV-tail decline probe does not follow CPU placement for --no-kv-offload")
+    if "cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP" not in decline_block or "hparams.n_layer_all" not in decline_block:
+        raise AssertionError("KV-tail decline probe does not inspect the owned MTP layer range")
+    if ("params.ctx_other->get_cparams()" not in decline_block or
+            "shared_cparams.kv_tail_tokens" not in decline_block or
+            "shared_cparams.kv_tail_tokens_swa" not in decline_block):
+        raise AssertionError("shared Gemma MTP tails do not preserve the target cache decision")
+    for reset in (
+        "cparams.kv_tail_native_exact = false",
+        "cparams.kv_tail_native_exact_swa = false",
+        "tail_request_resolved = false",
+    ):
+        if reset not in decline_block:
+            raise AssertionError(f"KV-tail decline leaves derived KVarN state stale: missing {reset}")
 
     iswa_source = (ROOT / "src/llama-kv-cache-iswa.cpp").read_text(encoding="utf-8")
     if "llama_kv_tail_storage_plan_for" in iswa_source or "LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT" in iswa_source:

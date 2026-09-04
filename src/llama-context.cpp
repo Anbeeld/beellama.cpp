@@ -464,13 +464,26 @@ llama_context::llama_context(
     // for anyone who wants the exact tail regardless of what it costs.
     if (cparams.kv_tail_tokens > 0 || cparams.kv_tail_tokens_swa > 0) {
         bool any_native = false;
-        for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
-            if (!model.hparams.has_kv(il)) {
-                continue;
-            }
-            if (kv_tail_device_has_native_attention(model.dev_layer(il))) {
-                any_native = true;
-                break;
+        if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT && params.ctx_other != nullptr) {
+            const auto & shared_cparams = params.ctx_other->get_cparams();
+            // Shared Gemma MTP reads the target cache's representation, so preserve
+            // the target context's already-resolved tail decision.
+            any_native = shared_cparams.kv_tail_tokens > 0 ||
+                    shared_cparams.kv_tail_tokens_swa > 0;
+        } else {
+            const uint32_t layer_begin = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ?
+                    hparams.n_layer() : 0;
+            const uint32_t layer_end = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ?
+                    hparams.n_layer_all : hparams.n_layer();
+            for (uint32_t il = layer_begin; il < layer_end; ++il) {
+                if (!hparams.has_kv(il)) {
+                    continue;
+                }
+                if (kv_tail_device_has_native_attention(
+                            cparams.offload_kqv ? model.dev_layer(il) : nullptr)) {
+                    any_native = true;
+                    break;
+                }
             }
         }
 
@@ -491,6 +504,13 @@ llama_context::llama_context(
                 cparams.kv_tail_tokens_swa = 0;
                 cparams.kv_tail_tokens_requested = 0;
                 cparams.kv_tail_tokens_swa_requested = 0;
+                cparams.kv_tail_native_exact = false;
+                cparams.kv_tail_native_exact_swa = false;
+                if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
+                    // Reapply KVarN's zero-request policy below so its intrinsic
+                    // exact suffix and native-exact state remain consistent.
+                    tail_request_resolved = false;
+                }
             }
         }
     }
