@@ -29,6 +29,10 @@ int32_t common_speculative_n_max(const common_params_speculative * spec);
 // return the max number of draft tokens from the initialized implementations
 int32_t common_speculative_n_max(const common_speculative * spec);
 
+// Resolve the model-declared DFlash block-attention policy. DFlash defaults to
+// non-causal when the optional metadata key is absent.
+bool common_speculative_dflash_causal_attn(const llama_model * model);
+
 // Bee's variable-depth adaptive draft-max is limited to the original DFlash path.
 bool common_speculative_dflash_adaptive_dm_supported(int32_t selector_top_k);
 bool common_speculative_adaptive_dm_supported(const common_speculative * spec);

@@ -61,6 +61,13 @@ static constexpr std::array<llama_kvarn_type_desc, LLAMA_KVARN_TYPE_COUNT> KVAR_
     LLAMA_KVARN_DESC(8, 8),
 }};
 
+bool llama_kvarn_native_attention_allowed(bool causal_attn, llm_arch arch) {
+    // DFlash non-causal block masks are qualified through the materialized
+    // oracle. Keep native record-consuming attention for causal DFlash and
+    // all existing architectures.
+    return causal_attn || arch != LLM_ARCH_DFLASH;
+}
+
 llama_kvarn_attention_plan llama_kvarn_plan_attention(
         bool native_attention,
         bool native_original_v,
@@ -228,16 +235,23 @@ const char * llama_kvarn_validate_runtime(
 }
 
 llama_kvarn_context_route llama_kvarn_context_route_for(
-        llama_context_type ctx_type,
-        llm_arch arch) {
-    if (ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
-        return arch == LLM_ARCH_DFLASH
-            ? LLAMA_KVARN_CONTEXT_ROUTE_UNSUPPORTED
-            : LLAMA_KVARN_CONTEXT_ROUTE_OWNED;
+        const llama_kvarn_context_traits & traits) {
+    if (traits.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
+        if (traits.arch != LLM_ARCH_DFLASH) {
+            return LLAMA_KVARN_CONTEXT_ROUTE_OWNED;
+        }
+
+        // DFlash and DSpark intentionally share one architecture. Only a
+        // target-backed ordinary DFlash model owns an audited draft K/V cache.
+        // A Markov head identifies DSpark; the impossible Markov+selector
+        // combination also fails closed instead of guessing ownership.
+        return traits.has_ctx_other && !traits.dflash_has_dspark_head
+            ? LLAMA_KVARN_CONTEXT_ROUTE_OWNED
+            : LLAMA_KVARN_CONTEXT_ROUTE_UNSUPPORTED;
     }
 
-    if (ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
-        switch (arch) {
+    if (traits.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        switch (traits.arch) {
             case LLM_ARCH_QWEN35:
             case LLM_ARCH_QWEN35MOE:
             case LLM_ARCH_QWEN4EXP:
@@ -250,6 +264,12 @@ llama_kvarn_context_route llama_kvarn_context_route_for(
     }
 
     return LLAMA_KVARN_CONTEXT_ROUTE_UNSUPPORTED;
+}
+
+llama_kvarn_context_route llama_kvarn_context_route_for(
+        llama_context_type ctx_type,
+        llm_arch arch) {
+    return llama_kvarn_context_route_for({ ctx_type, arch, false, false, false });
 }
 
 llama_kvarn_iswa_policy llama_kvarn_iswa_policy_for(

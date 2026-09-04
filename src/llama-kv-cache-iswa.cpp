@@ -232,7 +232,15 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                           const llama_kvarn_params & cache_kvarn,
                           const layer_share_cb & cache_share) -> std::unique_ptr<llama_memory_i> {
         const bool is_swa_group = n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE;
-        const bool kvarn_ok = cache_kvarn.type != LLAMA_KVARN_TYPE_DISABLED &&
+        bool has_group_layers = false;
+        for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+            if (hparams.has_kv(il) && (!layer_filter || layer_filter(il))) {
+                has_group_layers = true;
+                break;
+            }
+        }
+        const bool kvarn_ok = has_group_layers &&
+            cache_kvarn.type != LLAMA_KVARN_TYPE_DISABLED &&
             (!is_swa_group || kvarn_policy == LLAMA_KVARN_ISWA_ALL_LAYERS);
         if (kvarn_ok) {
             const uint32_t exact_tokens = n_swa > 0 ? tail_tokens_swa : tail_tokens;
@@ -291,12 +299,17 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
             throw std::runtime_error("cannot share auxiliary KV caches with incompatible representations");
         }
 
+        const uint32_t exact_tokens = has_group_layers
+            ? (n_swa > 0 ? tail_tokens_swa : tail_tokens)
+            : 0;
+        const uint32_t exact_requested = has_group_layers
+            ? (n_swa > 0 ? tail_tokens_swa_requested : tail_tokens_requested)
+            : 0;
         return std::make_unique<llama_kv_cache>(
                 model, hparams, type_k, type_v,
                 v_trans, offload, unified, size, n_seq_max, n_pad,
                 n_swa, swa_type, cache_mem_other, layer_filter, reuse, cache_share,
-                n_ubatch, n_swa > 0 ? tail_tokens_swa : tail_tokens, tail_type,
-                n_swa > 0 ? tail_tokens_swa_requested : tail_tokens_requested,
+                n_ubatch, exact_tokens, tail_type, exact_requested,
                 false, tail_rollback_tokens);
     };
 

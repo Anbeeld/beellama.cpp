@@ -4400,11 +4400,20 @@ llama_context * llama_init_from_model(
     }
 
     if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
-        const llama_kvarn_context_route route = llama_kvarn_context_route_for(params.ctx_type, model->arch);
+        const llama_kvarn_context_route route = llama_kvarn_context_route_for({
+            params.ctx_type,
+            model->arch,
+            params.ctx_other != nullptr,
+            model->dspark_markov_w1 != nullptr,
+            model->hparams.dflash_selector_top_k > 0,
+        });
         if (route != LLAMA_KVARN_CONTEXT_ROUTE_OWNED) {
             const std::string reason = route == LLAMA_KVARN_CONTEXT_ROUTE_SHARED_TARGET
                 ? "this MTP topology shares target K/V and has no independent draft KV representation; "
                   "configure target --cache-type-k/v kvarn* instead"
+                : model->arch == LLM_ARCH_DFLASH && model->dspark_markov_w1 != nullptr
+                ? "the loaded DFlash-family model is DSpark, which does not support draft KVarN; "
+                  "choose an ordinary draft cache type"
                 : format("context type %d for architecture %s is not an audited draft-owned KVarN route; "
                          "choose an ordinary draft cache type",
                          int(params.ctx_type), llm_arch_name(model->arch));
@@ -4444,13 +4453,15 @@ llama_context * llama_init_from_model(
                 params.attention_type == LLAMA_ATTENTION_TYPE_UNSPECIFIED
                     ? model->hparams.causal_attn
                     : params.attention_type == LLAMA_ATTENTION_TYPE_CAUSAL;
+            const bool owned_dflash =
+                model->arch == LLM_ARCH_DFLASH &&
+                route == LLAMA_KVARN_CONTEXT_ROUTE_OWNED;
             const bool attention_supported =
-                causal_attn &&
+                (causal_attn || owned_dflash) &&
                 cached_layer_count > 0 &&
                 !model->hparams.is_mla() &&
                 !llm_arch_is_recurrent(model->arch) &&
-                model->arch != LLM_ARCH_DEEPSEEK32 &&
-                model->arch != LLM_ARCH_DFLASH;
+                model->arch != LLM_ARCH_DEEPSEEK32;
             const llama_kvarn_runtime_requirements requirements = {
                 /*.attention_supported      =*/ attention_supported,
                 /*.head_dims_supported      =*/ head_dims_supported,
@@ -4475,10 +4486,12 @@ llama_context * llama_init_from_model(
                     params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
                 }
 
+                const char * context_label = params.ctx_type == LLAMA_CONTEXT_TYPE_MTP
+                    ? "draft MTP"
+                    : owned_dflash ? "draft DFlash" : "target";
                 LLAMA_LOG_INFO("%s: enabling structured KVarN cache type %s for %s layers [%u, %u)\n",
                         __func__, llama_kvarn_type_name(params.kvarn.type),
-                        params.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "draft MTP" : "target",
-                        layer_begin, layer_end);
+                        context_label, layer_begin, layer_end);
             }
         }
     }

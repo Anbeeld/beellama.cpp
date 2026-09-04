@@ -90,6 +90,17 @@ enum llama_kvarn_context_route {
     LLAMA_KVARN_CONTEXT_ROUTE_UNSUPPORTED,
 };
 
+struct llama_kvarn_context_traits {
+    llama_context_type ctx_type;
+    llm_arch arch;
+    bool has_ctx_other;
+    bool dflash_has_dspark_head;
+    bool dflash_has_selector;
+};
+
+llama_kvarn_context_route llama_kvarn_context_route_for(
+        const llama_kvarn_context_traits & traits);
+
 llama_kvarn_context_route llama_kvarn_context_route_for(
         llama_context_type ctx_type,
         llm_arch arch);
@@ -113,6 +124,8 @@ struct llama_kvarn_attention_plan {
     bool native_attention;
     enum ggml_flash_attn_ext_kvarn_domain domain;
 };
+
+bool llama_kvarn_native_attention_allowed(bool causal_attn, llm_arch arch);
 
 llama_kvarn_attention_plan llama_kvarn_plan_attention(
         bool native_attention,

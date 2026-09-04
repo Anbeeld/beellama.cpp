@@ -130,10 +130,14 @@ reservation and zero cumulative per-context growth.
 
 ### Backend support and limitations
 
-KVarN supports target contexts and draft-owned MTP caches for Qwen3.5/Qwen3.6
-dense and MoE models and standalone Qwen3.8/Qwen4Exp MTP sidecars. Shared Gemma
-4 MTP reads the target cache representation and does not allocate an independent
-draft record store. Other draft and auxiliary modes remain on standard caches.
+KVarN supports target contexts, draft-owned MTP caches for Qwen3.5/Qwen3.6
+dense and MoE models and standalone Qwen3.8/Qwen4Exp MTP sidecars, and owned
+DFlash1/DFlash2 draft contexts. DFlash uses one K/V pair for both full-attention
+and SWA sub-caches. Its non-causal block attention uses the materialized
+correctness route while persistent K/V remains compressed. Shared Gemma 4 MTP
+reads the target cache representation and does not allocate an independent
+draft record store. DSpark and other draft or auxiliary modes remain on
+standard caches.
 CUDA selects specialized descriptor-native FlashAttention on Turing and newer
 GPUs, then falls back to a portable
 direct-record route when those matrix instructions are unavailable or the
@@ -218,8 +222,10 @@ current budget.
 Each selected layer must be owned by a backend that implements KVarN store and
 attention, or an explicitly supported materialization fallback. Unsupported or
 tensor-split placements fail closed. Explicit draft KVarN is fail-closed outside
-the audited draft-owned MTP architectures; it never silently runs the ordinary
-quantized backing cache.
+the audited owned-MTP and DFlash1/DFlash2 routes; it never silently runs the
+ordinary quantized backing cache. CUDA is runtime-qualified for DFlash draft
+KVarN. HIP/ROCm, Vulkan, real multi-GPU, and multimodal DFlash routes remain
+unqualified.
 
 ## Standard low-bit KV caches
 
@@ -232,15 +238,15 @@ FlashAttention vector coverage. Cache-facing `q2_0` is internally
 
 ### When to use them
 
-Use these types for draft modes outside the supported owned-MTP route, for
-target models that cannot use KVarN, or when a conventional quantized KV layout
-is easier to compare across backends.
+Use these types for draft modes outside the supported owned-MTP and
+DFlash1/DFlash2 routes, for target models that cannot use KVarN, or when a
+conventional quantized KV layout is easier to compare across backends.
 
 ### Key arguments
 
 - [`--cache-type-k`](beellama-args.md#kvarn-cache-types-and-swa-overrides)
 - [`--cache-type-v`](beellama-args.md#kvarn-cache-types-and-swa-overrides)
-- `--spec-draft-type-k` (including `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`, `kvarn6`, and `kvarn8` for supported owned-MTP contexts)
+- `--spec-draft-type-k` (including `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`, `kvarn6`, and `kvarn8` for supported owned-MTP and DFlash1/DFlash2 contexts)
 - `--spec-draft-type-v` (same values and routing rule)
 - [`GGML_CUDA_FA_ALL_QUANTS`](beellama-args.md#cuda-flashattention-build-policy)
 

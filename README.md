@@ -190,8 +190,10 @@ llama-server -m target.gguf --spec-type draft-dflash \
   --flash-attn on --cache-type-k q5_0 --cache-type-v q4_1
 ```
 
-DFlash draft contexts remain on standard cache types. KVarN draft caches are
-supported only for the draft-owned MTP route described below.
+DFlash1 and DFlash2 can use an owned draft KVarN cache with
+`--spec-draft-type-k/v kvarnN`. Non-causal DFlash block attention retains
+compressed persistent storage and uses the qualified materialized attention
+route; DSpark remains unsupported.
 
 ### KVarN Target Cache
 
@@ -202,24 +204,26 @@ llama-server -m model.gguf --flash-attn on \
   --kv-tail-tokens 1024
 ```
 
-### KVarN MTP Draft Cache
+### KVarN Draft Cache
 
-Qwen3.5/Qwen3.6 dense and MoE MTP, and standalone Qwen3.8/Qwen4Exp MTP
-sidecars, can select an independent draft-owned KVarN cache:
+Owned DFlash1/DFlash2 contexts, Qwen3.5/Qwen3.6 dense and MoE MTP, and
+standalone Qwen3.8/Qwen4Exp MTP sidecars can select an independent draft-owned
+KVarN cache:
 
 ```sh
-llama-server -m target.gguf --spec-type draft-mtp \
-  --spec-draft-model mtp.gguf \
+llama-server -m target.gguf --spec-type draft-dflash \
+  --spec-draft-model dflash.gguf \
   --spec-draft-type-k kvarn4 --spec-draft-type-v kvarn2
 ```
 
 The target and draft cache types are independent. A one-sided draft KVarN
 selection promotes the other side to the same width with a warning. There is no
 draft precision-tail option: the explicit draft tail request stays zero and
-KVarN retains its intrinsic exact suffix of up to 128 tokens. Gemma 4 MTP shares
-the target cache, so configure target `--cache-type-k/v kvarn*` instead of a
-draft cache type. DFlash, DSpark, Eagle3, draft-simple, and unclassified MTP
-architectures reject explicit draft KVarN requests.
+KVarN retains its intrinsic exact suffix of up to 128 tokens. The same draft
+K/V pair applies to full-attention and SWA sub-caches. Gemma 4 MTP shares the
+target cache, so configure target `--cache-type-k/v kvarn*` instead of a draft
+cache type. DSpark, Eagle3, draft-simple, and unclassified MTP architectures
+reject explicit draft KVarN requests.
 
 ### Router Mode With Presets
 
@@ -232,6 +236,8 @@ llama-server --models-preset presets.ini
 
 - [BeeLlama features and public repo diff](docs/beellama-features.md)
 - [BeeLlama args reference](docs/beellama-args.md)
+- [Qwen3.6 DFlash quickstart](docs/quickstart-qwen36-dflash.md)
+- [Gemma 4 31B DFlash quickstart](docs/quickstart-gemma-4-31b-dflash.md)
 - [Build docs](docs/build.md)
 - [Server docs](tools/server/README.md)
 - [Docker docs](docs/docker.md)

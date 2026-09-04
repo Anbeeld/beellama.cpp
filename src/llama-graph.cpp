@@ -3455,6 +3455,59 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }
 
+void llm_graph_context::build_kv_store(
+        const llama_kv_cache_context * mctx_cur,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+        ggml_tensor * k_idxs,
+        ggml_tensor * v_idxs,
+        ggml_tensor * tail_idxs,
+        int32_t il) const {
+    GGML_ASSERT(mctx_cur != nullptr);
+    GGML_ASSERT(k_cur != nullptr && v_cur != nullptr);
+    GGML_ASSERT(k_idxs != nullptr && v_idxs != nullptr);
+
+    const bool has_exact_tail = mctx_cur->get_tail_tokens() > 0;
+    bool k_tail_scheduled = false;
+    bool v_tail_scheduled = false;
+
+    ggml_tensor * k_written = mctx_cur->cpy_k_with_tail(ctx0, k_cur, k_idxs, tail_idxs, il);
+    if (k_written == nullptr) {
+        k_written = mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il);
+        if (k_written != nullptr) {
+            ggml_build_forward_expand(gf, k_written);
+        }
+        if (ggml_tensor * tail_written = mctx_cur->cpy_k_tail(
+                    ctx0, k_cur, tail_idxs, il, k_written)) {
+            ggml_build_forward_expand(gf, tail_written);
+            k_tail_scheduled = true;
+        }
+    } else {
+        ggml_build_forward_expand(gf, k_written);
+        k_tail_scheduled = has_exact_tail;
+    }
+
+    ggml_tensor * v_written = mctx_cur->cpy_v_with_tail(ctx0, v_cur, v_idxs, tail_idxs, il);
+    if (v_written == nullptr) {
+        v_written = mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il);
+        if (v_written != nullptr) {
+            ggml_build_forward_expand(gf, v_written);
+        }
+        if (ggml_tensor * tail_written = mctx_cur->cpy_v_tail(
+                    ctx0, v_cur, tail_idxs, il, v_written)) {
+            ggml_build_forward_expand(gf, tail_written);
+            v_tail_scheduled = true;
+        }
+    } else {
+        ggml_build_forward_expand(gf, v_written);
+        v_tail_scheduled = has_exact_tail;
+    }
+
+    GGML_ASSERT(!has_exact_tail || (k_tail_scheduled && v_tail_scheduled));
+    LLAMA_LOG_DEBUG("%s: layer %d body K/V and exact-tail K/V scheduled=%s\n",
+            __func__, il, has_exact_tail ? "yes" : "not-configured");
+}
+
 ggml_tensor * llm_graph_context::build_attn(
         llm_graph_input_attn_kv * inp,
         ggml_tensor * wo,
@@ -3478,13 +3531,18 @@ ggml_tensor * llm_graph_context::build_attn(
     // they must not veto direct KVarN attention and force full materialization.
     // validate_native_tail_operation() proves the actual attached-tail shape.
     const bool kvarn_native_attention = use_kvarn &&
-        kvarn_ctx->uses_native_attention(il);
+        kvarn_ctx->uses_native_attention(il) &&
+        llama_kvarn_native_attention_allowed(cparams.causal_attn, arch);
     const auto kvarn_plan = use_kvarn ? llama_kvarn_plan_attention(
         kvarn_native_attention,
         kvarn_ctx->native_attention_uses_original_v(il),
         kvarn_ctx->native_rotated_max_query_tokens(il),
         (uint32_t) q_cur->ne[2]) : llama_kvarn_attention_plan {
             false, GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO };
+    if (use_kvarn && arch == LLM_ARCH_DFLASH && !cparams.causal_attn) {
+        LLAMA_LOG_DEBUG("%s: DFlash layer %d KVarN attention route=%s\n", __func__, il,
+                kvarn_plan.native_attention ? "native" : "materialized");
+    }
     const auto kvarn_domain = kvarn_plan.domain;
     const bool use_kvarn_rotated_domain = use_kvarn &&
         kvarn_domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED;
@@ -3911,13 +3969,18 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto * kvarn_ctx = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur);
     const bool use_kvarn = kvarn_ctx != nullptr;
     const bool kvarn_native_attention = use_kvarn &&
-        kvarn_ctx->uses_native_attention(il);
+        kvarn_ctx->uses_native_attention(il) &&
+        llama_kvarn_native_attention_allowed(cparams.causal_attn, arch);
     const auto kvarn_plan = use_kvarn ? llama_kvarn_plan_attention(
         kvarn_native_attention,
         kvarn_ctx->native_attention_uses_original_v(il),
         kvarn_ctx->native_rotated_max_query_tokens(il),
         (uint32_t) q_cur->ne[2]) : llama_kvarn_attention_plan {
             false, GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO };
+    if (use_kvarn && arch == LLM_ARCH_DFLASH && !cparams.causal_attn) {
+        LLAMA_LOG_DEBUG("%s: DFlash layer %d KVarN attention route=%s\n", __func__, il,
+                kvarn_plan.native_attention ? "native" : "materialized");
+    }
     const auto kvarn_domain = kvarn_plan.domain;
     const bool use_kvarn_rotated_domain = use_kvarn &&
         kvarn_domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED;

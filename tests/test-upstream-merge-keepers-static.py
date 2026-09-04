@@ -262,6 +262,11 @@ def main() -> None:
         raise AssertionError("DFlash must rotate injected K for both base and ISWA quantized caches")
     if dflash.count("Vcur = llama_mul_mat_hadamard(ctx0, Vcur") != 2:
         raise AssertionError("DFlash must rotate injected V for both base and ISWA quantized caches")
+    injection = dflash.split("// KV cache injection", 1)[1].split("// tok_embd from the target model", 1)[0]
+    if injection.count("build_kv_store(") != 2:
+        raise AssertionError("DFlash base and iSWA injection must use the generic body+exact-tail KV store helper")
+    if "->cpy_k(" in injection or "->cpy_v(" in injection:
+        raise AssertionError("DFlash injection must not bypass exact-tail storage with direct body-only writes")
 
     server_context = (ROOT / "tools/server/server-context.cpp").read_text(encoding="utf-8")
     load_model = server_context.split("bool load_model(common_params & params)", 1)[1].split("bool init()", 1)[0]

@@ -1005,10 +1005,13 @@ static void test_draft_cache_configuration_is_independent() {
     assert(independent.kvarn.type == LLAMA_KVARN_K4V2_G128);
     assert(draft.kvarn.type == LLAMA_KVARN_K6V4_G128);
 
+    independent.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
+    draft = common_base_params_to_speculative(independent);
+    assert(draft.kvarn.type == LLAMA_KVARN_K6V4_G128);
+
     for (const auto unsupported : {
             COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,
             COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,
-            COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,
             COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK }) {
         independent.speculative.types = { unsupported };
         try {

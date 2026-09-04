@@ -59,9 +59,26 @@ static void test_context_route_policy() {
     require(llama_kvarn_context_route_for(LLAMA_CONTEXT_TYPE_DEFAULT, LLM_ARCH_QWEN35) ==
                 LLAMA_KVARN_CONTEXT_ROUTE_OWNED,
             "default target contexts must keep their owned KVarN route");
-    require(llama_kvarn_context_route_for(LLAMA_CONTEXT_TYPE_DEFAULT, LLM_ARCH_DFLASH) ==
+    require(llama_kvarn_context_route_for({
+                LLAMA_CONTEXT_TYPE_DEFAULT, LLM_ARCH_DFLASH, true, false, false }) ==
+                LLAMA_KVARN_CONTEXT_ROUTE_OWNED,
+            "ordinary DFlash1 draft contexts must own KVarN storage");
+    require(llama_kvarn_context_route_for({
+                LLAMA_CONTEXT_TYPE_DEFAULT, LLM_ARCH_DFLASH, true, false, true }) ==
+                LLAMA_KVARN_CONTEXT_ROUTE_OWNED,
+            "selector-based DFlash2 draft contexts must own KVarN storage");
+    require(llama_kvarn_context_route_for({
+                LLAMA_CONTEXT_TYPE_DEFAULT, LLM_ARCH_DFLASH, true, true, false }) ==
                 LLAMA_KVARN_CONTEXT_ROUTE_UNSUPPORTED,
-            "DFlash contexts must remain unsupported");
+            "DSpark draft contexts must remain unsupported");
+    require(llama_kvarn_context_route_for({
+                LLAMA_CONTEXT_TYPE_DEFAULT, LLM_ARCH_DFLASH, true, true, true }) ==
+                LLAMA_KVARN_CONTEXT_ROUTE_UNSUPPORTED,
+            "ambiguous DFlash-family contexts must fail closed");
+    require(llama_kvarn_context_route_for({
+                LLAMA_CONTEXT_TYPE_DEFAULT, LLM_ARCH_DFLASH, false, false, false }) ==
+                LLAMA_KVARN_CONTEXT_ROUTE_UNSUPPORTED,
+            "standalone DFlash models must not be mistaken for owned speculative drafts");
 
     for (const llm_arch arch : { LLM_ARCH_QWEN35, LLM_ARCH_QWEN35MOE, LLM_ARCH_QWEN4EXP }) {
         require(llama_kvarn_context_route_for(LLAMA_CONTEXT_TYPE_MTP, arch) ==
@@ -78,6 +95,13 @@ static void test_context_route_policy() {
 }
 
 static void test_attention_domain_policy() {
+    require(!llama_kvarn_native_attention_allowed(false, LLM_ARCH_DFLASH),
+            "non-causal DFlash must use materialized KVarN attention until native parity is qualified");
+    require(llama_kvarn_native_attention_allowed(true, LLM_ARCH_DFLASH),
+            "causal DFlash may use the qualified native KVarN route");
+    require(llama_kvarn_native_attention_allowed(false, LLM_ARCH_QWEN35),
+            "the DFlash qualification gate must not alter other architecture routes");
+
     const auto portable_decode = llama_kvarn_plan_attention(true, false, 16, 1);
     require(portable_decode.native_attention,
             "portable single-token decode must use native KVarN attention");
@@ -2051,7 +2075,8 @@ static std::vector<float> test_native_flash_attention_output(
         bool           exact_tail_bodyless = false,
         bool           production_query_layout = false,
         int            explicit_stage_slot = -1,
-        bool           eager_records = false) {
+        bool           eager_records = false,
+        bool           non_causal_mask = false) {
     ggml_init_params params = {
         /*.mem_size   =*/ 32 * 1024 * 1024,
         /*.mem_buffer =*/ nullptr,
@@ -2284,8 +2309,14 @@ static std::vector<float> test_native_flash_attention_output(
     std::vector<ggml_fp16_t> mask_data((size_t) n_kv * n_q * n_stream);
     for (int iq = 0; iq < n_q; ++iq) {
         for (int ikv = 0; ikv < n_kv; ++ikv) {
+            // DFlash non-causal blocks can see every live row in their stream;
+            // retain a short masked suffix to represent empty/padded cache cells.
+            const bool dflash_visible = ikv + 4 < n_kv;
+            const bool visible = non_causal_mask
+                ? dflash_visible
+                : ikv <= iq + n_kv - n_q;
             mask_data[(size_t) iq * n_kv + ikv] = ggml_fp32_to_fp16(
-                    !exact_tail_bodyless && ikv <= iq + n_kv - n_q ? 0.0f : -INFINITY);
+                    !exact_tail_bodyless && visible ? 0.0f : -INFINITY);
         }
     }
 
@@ -2338,7 +2369,9 @@ static std::vector<float> test_native_flash_attention_output(
         }
         std::vector<ggml_fp16_t> tail_mask_data(ggml_nelements(tail_mask), ggml_fp32_to_fp16(-INFINITY));
         for (int iq = 0; iq < n_q; ++iq) {
-            const int last_visible = exact_tail_tokens - n_q + iq;
+            const int last_visible = non_causal_mask
+                ? exact_tail_tokens - 1
+                : exact_tail_tokens - n_q + iq;
             for (int t = 0; t < exact_tail_tokens; ++t) {
                 if (t <= last_visible &&
                         (exact_tail_bodyless ||
@@ -3265,6 +3298,57 @@ static void test_native_flash_attention_portable_backend(
 static void test_native_flash_attention_cpu() {
     ggml_backend_t cpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_CPU, true);
     test_native_flash_attention_portable_backend(cpu_backend, cpu_backend, "CPU");
+    ggml_backend_free(cpu_backend);
+}
+
+static void test_dflash_non_causal_attention_parity() {
+    ggml_backend_t cpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_CPU, true);
+    ggml_backend_t gpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
+
+    const auto check = [&](ggml_backend_t backend, int head_dim, int bits_k, int bits_v,
+                           int n_q, int n_kv, bool exact_tail) {
+        if (std::getenv("GGML_KVARN_TEST_TRACE_NATIVE") != nullptr) {
+            std::fprintf(stderr, "DFlash non-causal trace: %s D%d K%dV%d nq=%d nkv=%d tail=%d\n",
+                    backend == cpu_backend ? "CPU" : "GPU",
+                    head_dim, bits_k, bits_v, n_q, n_kv, int(exact_tail));
+        }
+        const std::vector<float> expected = test_native_flash_attention_output(
+                cpu_backend, false, false, head_dim, bits_k, bits_v, n_q,
+                4, 1, n_kv, 3, false, nullptr, false, exact_tail ? 128 : 0,
+                false, GGML_TYPE_F16, 0, false, true, -1, true, true);
+        const std::vector<float> actual = test_native_flash_attention_output(
+                backend, false, false, head_dim, bits_k, bits_v, n_q,
+                4, 1, n_kv, 3, false, nullptr, false, exact_tail ? 128 : 0,
+                false, GGML_TYPE_F16, 0, false, true, -1, true, true);
+        require_close_f32_rmse(actual, expected, 1e-3f,
+                "DFlash non-causal materialized KVarN fallback differs from reference");
+    };
+
+    for (ggml_backend_t backend : { cpu_backend, gpu_backend }) {
+        if (backend == nullptr) {
+            continue;
+        }
+        for (int n_q : { 1, 2, 4, 8, 9, 15, 16 }) {
+            for (const auto bits : { std::pair<int, int>{2, 2}, {4, 2}, {8, 8} }) {
+                check(backend, 128, bits.first, bits.second, n_q, 257, true);
+            }
+        }
+        for (int n_kv : { 127, 128, 129, 255, 256, 257 }) {
+            check(backend, 256, 4, 2, std::min(16, n_kv), n_kv, false);
+        }
+    }
+
+    if (gpu_backend != nullptr && std::getenv("GGML_KVARN_TEST_DFLASH_ALL_PAIRS") != nullptr) {
+        for (int bits_k : { 2, 3, 4, 5, 6, 8 }) {
+            for (int bits_v : { 2, 3, 4, 5, 6, 8 }) {
+                check(gpu_backend, 128, bits_k, bits_v, 9, 129, true);
+            }
+        }
+    }
+
+    if (gpu_backend != nullptr) {
+        ggml_backend_free(gpu_backend);
+    }
     ggml_backend_free(cpu_backend);
 }
 
@@ -5096,6 +5180,12 @@ int main() {
         return 0;
     }
 
+    if (std::getenv("GGML_KVARN_TEST_DFLASH_NONCAUSAL_ONLY") != nullptr) {
+        test_dflash_non_causal_attention_parity();
+        std::printf("test-kvarn: DFlash non-causal attention parity OK\n");
+        return 0;
+    }
+
     kvarn_suffix_rollback_capability_contract();
     kvarn_composite_exclusivity_forwards();
     kvarn_composite_removal_plan_forwards();
@@ -5193,6 +5283,7 @@ int main() {
     test_native_flash_attention_cpu();
     test_native_flash_attention_gpu();
     test_native_flash_attention_prefill_route_parity();
+    test_dflash_non_causal_attention_parity();
     test_rotated_decode_transform_consistency(GGML_BACKEND_DEVICE_TYPE_CPU, true);
     test_rotated_decode_transform_consistency(GGML_BACKEND_DEVICE_TYPE_GPU, false);
 

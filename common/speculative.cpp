@@ -1004,10 +1004,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (llama_model_meta_val_str(model_dft, "dflash.sample_from_anchor", buf, sizeof(buf)) >= 0) {
                 sample_from_anchor = std::strcmp(buf, "true") == 0;
             }
-            if (llama_model_meta_val_str(model_dft, "dflash.attention.causal", buf, sizeof(buf)) >= 0) {
-                causal_attn = std::strcmp(buf, "true") == 0;
-            }
         }
+        causal_attn = common_speculative_dflash_causal_attn(model_dft);
 
         selector_top_k = llama_model_dflash_selector_top_k(model_dft);
         is_dflash2     = selector_top_k > 0;
@@ -2549,6 +2547,14 @@ int32_t common_speculative_n_max(const common_speculative * spec) {
     return n_max;
 }
 
+bool common_speculative_dflash_causal_attn(const llama_model * model) {
+    GGML_ASSERT(model != nullptr);
+    char buf[16] = {};
+    return llama_model_meta_val_str(
+               model, "dflash.attention.causal", buf, sizeof(buf)) >= 0 &&
+           std::strcmp(buf, "true") == 0;
+}
+
 bool common_speculative_dflash_adaptive_dm_supported(int32_t selector_top_k) {
     return selector_top_k <= 0;
 }
@@ -2666,23 +2672,27 @@ static void common_validate_draft_kvarn_mode(const common_params_speculative & p
         return;
     }
 
-    bool has_mtp = false;
+    bool has_supported_owner = false;
     std::vector<std::string> unsupported;
     for (const common_speculative_type type : params.types) {
-        if (type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
-            has_mtp = true;
+        if (type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP ||
+                type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) {
+            if (has_supported_owner) {
+                unsupported.push_back(common_speculative_type_to_str(type));
+            }
+            has_supported_owner = true;
         } else if (common_speculative_type_owns_draft_context(type)) {
             unsupported.push_back(common_speculative_type_to_str(type));
         }
     }
 
-    if (!has_mtp || !unsupported.empty()) {
+    if (!has_supported_owner || !unsupported.empty()) {
         std::string modes = common_speculative_type_name_str(params.types);
         if (modes.empty()) {
             modes = "none";
         }
         throw std::invalid_argument(string_format(
-                "draft KVarN is supported only for draft-mtp owned-KV contexts; selected speculative mode(s): %s. "
+                "draft KVarN is supported only for audited draft-mtp or draft-dflash owned-KV contexts; selected speculative mode(s): %s. "
                 "Choose an ordinary --spec-draft-type-k/v cache type for this mode",
                 modes.c_str()));
     }
@@ -2776,6 +2786,12 @@ common_speculative_init_result::common_speculative_init_result(
     const bool spec_mtp = std::find(params.speculative.types.begin(),
                                     params.speculative.types.end(),
                                     COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    const bool spec_dflash = std::any_of(
+        params.speculative.types.begin(), params.speculative.types.end(),
+        [](common_speculative_type type) {
+            return type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+                   type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+        });
 
     common_params params_dft = common_base_params_to_speculative(params);
     auto mparams = common_model_params_to_llama(params_dft);
@@ -2808,9 +2824,18 @@ common_speculative_init_result::common_speculative_init_result(
 
         pimpl->model.reset(model_dft);
 
+        // DFlash block attention is non-causal unless the model explicitly
+        // declares otherwise. Bind this before context validation, graph
+        // reservation, and KVarN memory construction.
+        if (spec_dflash) {
+            cparams.attention_type = common_speculative_dflash_causal_attn(model_dft)
+                ? LLAMA_ATTENTION_TYPE_CAUSAL
+                : LLAMA_ATTENTION_TYPE_NON_CAUSAL;
+        }
+
         llama_context * ctx_dft = llama_init_from_model(model_dft, cparams);
         if (ctx_dft == nullptr) {
-            LOG_ERR("%s: failed to create MTP context\n", __func__);
+            LOG_ERR("%s: failed to create draft context\n", __func__);
             return;
         }
 
