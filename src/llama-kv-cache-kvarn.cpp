@@ -2070,7 +2070,7 @@ bool llama_kv_cache_kvarn::state_seq_can_save(
     }
     const bool selective = (flags & (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY |
                                      LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED)) != 0;
-    if (swa && (flags & LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED) != 0 && !stream_is_exclusive_for(seq_id)) {
+    if (swa && !stream_is_exclusive_for(seq_id)) {
         return false;
     }
     return !has_pending_stream_copies() && (selective || stream_is_exclusive_for(seq_id));
@@ -2083,7 +2083,7 @@ bool llama_kv_cache_kvarn::state_seq_can_restore(
     }
     const bool selective = (flags & (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY |
                                      LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED)) != 0;
-    if (swa && (flags & LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED) != 0 && !stream_is_exclusive_for(seq_id)) {
+    if (swa && !stream_is_exclusive_for(seq_id)) {
         return false;
     }
     return !has_pending_stream_copies() && (selective || stream_is_exclusive_for(seq_id));
@@ -2227,6 +2227,14 @@ uint64_t llama_kv_cache_kvarn::get_kv_tail_planner_timing_ns() const {
 }
 
 void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    // Unlike the dense cache, a sliding ring overwrites its historical body.
+    // A partial checkpoint must own that ring, not reference its live records.
+    if (swa && (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0) {
+        if ((flags & LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED) != 0 || !stream_is_exclusive_for(seq_id)) {
+            throw std::invalid_argument("KVarN SWA partial state requires an exclusive stream and non-conflicting flags");
+        }
+        flags &= ~LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+    }
     metadata->state_write(io, seq_id, flags);
     const bool partial_state = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0 && seq_id >= 0;
     const bool self_contained = (flags & LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED) != 0 && seq_id >= 0;
@@ -2507,6 +2515,13 @@ void llama_kv_cache_kvarn::state_read_sinfo(
         throw std::runtime_error("cannot restore KVarN state while a stream copy is pending");
     }
 
+    if (swa && (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0) {
+        if ((flags & LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED) != 0 || !stream_is_exclusive_for(seq_id)) {
+            throw std::invalid_argument("KVarN SWA partial state requires an exclusive stream and non-conflicting flags");
+        }
+        flags &= ~LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+    }
+
     // Parse into a restore-only metadata cache. The live metadata remains
     // untouched until every KVarN descriptor and payload has validated and the
     // outer state reader commits its queued tensor writes.
@@ -2684,6 +2699,9 @@ void llama_kv_cache_kvarn::state_read_sinfo(
         throw std::runtime_error("invalid KVarN sequence stream");
     }
     if (state_kind == KVAR_N_STATE_STAGE_ONLY_PARTIAL) {
+        if (swa) {
+            throw std::runtime_error("legacy KVarN SWA partial state lacks checkpoint-owned ring records; re-save the checkpoint");
+        }
         if (seq_id < 0) {
             throw std::runtime_error("KVarN stage-only state requires a destination sequence");
         }
