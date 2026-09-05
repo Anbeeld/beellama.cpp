@@ -1428,7 +1428,7 @@ static bool run_save_load_tests_for_model(const std::string & model_path, const 
         auto ctx = llama_context_ptr{llama_init_from_model(model, common_context_params_to_llama(params))};
         if (!ctx) {
             LOG_ERR("%s: failed to create prompt-tokenization context\n", __func__);
-            return 1;
+            return false;
         }
         tokens = common_tokenize(ctx.get(), params.prompt, true);
     }
@@ -1441,31 +1441,31 @@ static bool run_save_load_tests_for_model(const std::string & model_path, const 
         return false;
     }
     if (!test_kvarn_partial_checkpoint_history(model, params, tokens)) {
-        return 1;
+        return false;
     }
     if (!test_kvarn_unified_capacity(model, params, tokens)) {
-        return 1;
+        return false;
     }
     if (!test_kvarn_unified_reuses_freed_groups(model, params, tokens)) {
-        return 1;
+        return false;
     }
 
     if (!test_tail_state_contract(model, params, tokens)) {
-        return 1;
+        return false;
     }
     if (!test_cross_ubatch_tail_state(model, params, tokens, 128, 512) ||
             !test_cross_ubatch_tail_state(model, params, tokens, 512, 128)) {
-        return 1;
+        return false;
     }
     if (!test_tail_copy_is_immediately_saveable(model, params, tokens, true) ||
             !test_tail_copy_is_immediately_saveable(model, params, tokens, false)) {
-        return 1;
+        return false;
     }
     if (!test_tail_state_v1_compatibility(model, params)) {
-        return 1;
+        return false;
     }
     if (!test_kvarn_full_window_native_exact(model, params, tokens)) {
-        return 1;
+        return false;
     }
     // Test 2: sequence removal isolation
     if (!test_seq_rm_isolated(model, params, tokens)) {

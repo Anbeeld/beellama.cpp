@@ -464,6 +464,8 @@ static int test_mtp_ubatch_sync(const size_t seed) {
 
 static int test_mtp_request_reset(const size_t seed) {
     gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN35, false, true);
+    // Two trunk layers (recurrent + attention) followed by the MTP block.
+    gguf_set_val_u32(gguf_ctx.get(), "qwen35.block_count", 3);
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
     model_params.load_mtp = true;
@@ -505,6 +507,7 @@ static int test_mtp_request_reset(const size_t seed) {
         throw std::runtime_error("failed to read initial MTP state");
     }
 
+    const std::vector<uint8_t> initial_state = state;
     size_t cursor = 0;
     const auto read_u32 = [&]() {
         uint32_t value;
@@ -562,23 +565,63 @@ static int test_mtp_request_reset(const size_t seed) {
     hash_bytes(state.data() + payload_offset, payload_size);
     std::memcpy(state.data() + checksum_offset, &checksum, sizeof(checksum));
 
-    if (!common_speculative_set_state(spec.get(), 0, state)) {
-        throw std::runtime_error("failed to inject stale MTP state");
-    }
-    common_speculative_begin(spec.get(), 0, { 1 });
-
-    std::vector<uint8_t> reset_state;
-    if (!common_speculative_get_state(spec.get(), 0, reset_state) || reset_state.size() != state.size()) {
-        throw std::runtime_error("failed to read reset MTP state");
-    }
-    const size_t pending_offset = payload_offset + 3*sizeof(uint32_t);
-    for (size_t i = 0; i < width; ++i) {
-        float value;
-        std::memcpy(&value, reset_state.data() + pending_offset + i*sizeof(float), sizeof(value));
-        if (value != 0.0f) {
-            fprintf(stderr, "MTP request begin retained stale hidden state at element %zu\n", i);
-            return 1;
+    const auto prefill = [&](const std::vector<uint8_t> & carry) {
+        llama_memory_clear(llama_get_memory(ctx_tgt.get()), true);
+        llama_memory_clear(llama_get_memory(ctx_dft.get()), true);
+        if (!common_speculative_set_state(spec.get(), 0, carry)) {
+            throw std::runtime_error("failed to initialize MTP carry state");
         }
+
+        llama_batch batch = llama_batch_init(2, 0, 1);
+        common_batch_add(batch, 1, 0, { 0 }, true);
+        common_batch_add(batch, 2, 1, { 0 }, true);
+        const bool ok = llama_decode(ctx_tgt.get(), batch) == 0 &&
+                common_speculative_process(spec.get(), batch);
+        llama_batch_free(batch);
+        if (!ok) {
+            throw std::runtime_error("failed to prefill MTP request");
+        }
+
+        std::vector<uint8_t> pending;
+        if (!common_speculative_get_state(spec.get(), 0, pending)) {
+            throw std::runtime_error("failed to read prefilled MTP state");
+        }
+        const float * expected = llama_get_embeddings_nextn_ith(ctx_tgt.get(), 1);
+        const size_t pending_offset = payload_offset + 3*sizeof(uint32_t);
+        if (!expected || std::memcmp(pending.data() + pending_offset, expected, width*sizeof(float)) != 0) {
+            throw std::runtime_error("MTP prefill did not retain the final target hidden state");
+        }
+
+        // The server (and speculative-simple) calls begin AFTER prompt processing.
+        common_speculative_begin(spec.get(), 0, { 1, 2 });
+        std::vector<uint8_t> after_begin;
+        if (!common_speculative_get_state(spec.get(), 0, after_begin) || after_begin != pending) {
+            throw std::runtime_error("MTP begin erased freshly prefilled hidden state");
+        }
+
+        // A checkpoint's restored carry is also valid, not previous-request residue.
+        if (!common_speculative_set_state(spec.get(), 0, state) ||
+                !common_speculative_set_state(spec.get(), 0, pending)) {
+            throw std::runtime_error("failed to restore MTP checkpoint carry");
+        }
+        common_speculative_begin(spec.get(), 0, { 1, 2 });
+        if (!common_speculative_get_state(spec.get(), 0, after_begin) || after_begin != pending) {
+            throw std::runtime_error("MTP begin erased restored checkpoint carry");
+        }
+
+        constexpr auto flags = LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED;
+        const size_t size = llama_state_seq_get_size_ext(ctx_dft.get(), 0, flags);
+        std::vector<uint8_t> cache(size);
+        if (size == 0 || llama_state_seq_get_data_ext(ctx_dft.get(), cache.data(), size, 0, flags) != size) {
+            throw std::runtime_error("failed to save prefilled draft cache");
+        }
+        return cache;
+    };
+
+    const auto fresh = prefill(initial_state);
+    const auto reused = prefill(state);
+    if (fresh != reused) {
+        throw std::runtime_error("previous-request MTP carry contaminated the new prompt's draft cache");
     }
 
     return 0;

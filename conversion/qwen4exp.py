@@ -68,6 +68,10 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
         )
 
+        # MTP-only sidecars contain no trunk PLE tensors or constants.
+        if self.mtp_only:
+            return
+
         # ple_layer_ids is 1-based in the HF config; empty means no n-gram table,
         # so emit no PLE keys rather than optional ones
         ple_layers = [i - 1 for i in hp["ple_layer_ids"]]

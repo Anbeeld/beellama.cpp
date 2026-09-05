@@ -1550,9 +1550,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_batch_free(batch);
     }
 
-    // Per-sequence carry-over state belongs to one request. In particular,
-    // process() feeds pending_h into the first draft batch, so retaining it
-    // would make a reused server slot depend on its previous request.
+    // Reset carry before processing a sequence from position zero. Nonzero
+    // continuations retain the carry restored with their prompt checkpoint.
     void reset_seq_state(llama_seq_id seq_id) {
         if (seq_id < 0 || (size_t) seq_id >= pending_h.size()) {
             return;
@@ -1577,8 +1576,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (N <= 0) {
             return;
         }
-
-        reset_seq_state(seq_id);
 
         auto * ctx_dft = this->params.ctx_dft;
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
@@ -1618,6 +1615,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                         i_batch_beg[seq_id] = k;
                     }
                 }
+            }
+        }
+
+        // begin() is called after prefill, so resetting there would discard
+        // the final prompt hidden state needed by the first draft.
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            const int32_t first = i_batch_beg[seq_id];
+            if (first >= 0 && batch_in.pos[first] == 0) {
+                reset_seq_state(seq_id);
             }
         }
 
