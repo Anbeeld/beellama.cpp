@@ -6,6 +6,7 @@ python tests/test-dflash-kvarn-memory.py --server build/bin/llama-server \
 Uses fresh servers per cache pair. Does not download models or require Hub access.
 """
 import argparse
+import base64
 import json
 import os
 from pathlib import Path
@@ -28,6 +29,8 @@ def run(args, cache):
                "--spec-draft-type-k", key, "--spec-draft-type-v", value,
                "--spec-draft-n-max", "8", "--parallel", "1", "--kv-unified",
                "--host", "127.0.0.1", "--port", str(args.port), "--no-warmup", "-lv", "5"]
+    if args.mmproj:
+        command += ["--mmproj", str(args.mmproj.resolve()), "--image-min-tokens", "1024"]
     result = {"command": command, "cache": cache,
               "cuda_launch_blocking": os.getenv("CUDA_LAUNCH_BLOCKING"),
               "version": subprocess.check_output([str(args.server.resolve()), "--version"],
@@ -62,7 +65,18 @@ def run(args, cache):
                 prompt += "\nWrite the first forty positive integers separated by commas."
                 payload = {"prompt": prompt, "n_predict": 128, "temperature": 0,
                            "seed": 4242, "cache_prompt": False, "ignore_eos": True}
-                request = urllib.request.Request(f"http://127.0.0.1:{args.port}/completion",
+                endpoint = "completion"
+                if args.image:
+                    image = base64.b64encode(args.image.read_bytes()).decode()
+                    content = [{"type": "text", "text": prompt},
+                               {"type": "image_url", "image_url": {"url": "data:image/png;base64," + image}}]
+                    if attempt % 2 == 0:
+                        content.reverse()
+                    payload = {"messages": [{"role": "user", "content": content}],
+                               "max_tokens": 128, "temperature": 0, "seed": 4242,
+                               "cache_prompt": False, "ignore_eos": True}
+                    endpoint = "v1/chat/completions"
+                request = urllib.request.Request(f"http://127.0.0.1:{args.port}/{endpoint}",
                     data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
                 with urllib.request.urlopen(request, timeout=300) as response:
                     output = json.load(response)
@@ -90,6 +104,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("server", "target", "draft"):
         parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--mmproj", type=Path)
+    parser.add_argument("--image", type=Path, help="PNG image; exercises image-first and text-first requests")
     parser.add_argument("--output", type=Path, default=Path("tmp/dflash-kvarn-memory"))
     parser.add_argument("--profiles", nargs="+", default=["q8_0", "kvarn2", "kvarn3", "kvarn4", "kvarn5", "kvarn6", "kvarn8", "kvarn4:kvarn2"])
     parser.add_argument("--context", type=int, default=64000)
@@ -98,6 +114,8 @@ def main():
     parser.add_argument("--requests", type=int, default=2)
     parser.add_argument("--port", type=int, default=18340)
     args = parser.parse_args()
+    if bool(args.mmproj) != bool(args.image):
+        parser.error("--mmproj and --image must be supplied together")
     args.output.mkdir(parents=True, exist_ok=True)
     for cache in args.profiles:
         run(args, cache)

@@ -9,7 +9,8 @@
 #include <algorithm>
 #include <sstream>
 
-llama_batch_allocr::llama_batch_allocr(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {
+llama_batch_allocr::llama_batch_allocr(uint32_t n_pos_per_embd, bool allow_sparse_positions) :
+    n_pos_per_embd(n_pos_per_embd), allow_sparse_positions(allow_sparse_positions) {
     const char * LLAMA_BATCH_DEBUG = getenv("LLAMA_BATCH_DEBUG");
     debug = LLAMA_BATCH_DEBUG ? atoi(LLAMA_BATCH_DEBUG) : 0;
 
@@ -252,8 +253,10 @@ bool llama_batch_allocr::init(
     // consistency checks
     //
 
-    if (n_pos_per_embd > 1) {
-        // M-RoPE case: allow position to "jump" forward only (non-continuous positions are allowed)
+    if (n_pos_per_embd > 1 || allow_sparse_positions) {
+        // M-RoPE and DFlash feature injection preserve the target's logical
+        // image positions: embeddings may overlap, subsequent text may jump.
+        // This does not change the number of rotary-coordinate input rows.
         for (uint32_t s = 0; s < n_seq_max; ++s) {
             if (seq_pos[s].empty()) {
                 continue;
@@ -267,7 +270,7 @@ bool llama_batch_allocr::init(
                             "%s: the tokens of sequence %d in the input batch have inconsistent sequence positions:\n"
                             " - the last position stored in the memory module of the context (i.e. the KV cache) for sequence %d is X = %d\n"
                             " - the tokens for sequence %d in the input batch have a starting position of Y = %d\n"
-                            " for M-RoPE, it is required that the position satisfies: X < Y\n",
+                            " for sparse positions, it is required that the position satisfies: X < Y\n",
                             __func__, s, s, p0, s, seq_pos_min(s));
 
                     return false;
@@ -279,7 +282,7 @@ bool llama_batch_allocr::init(
                             "%s: the tokens of sequence %d in the input batch have inconsistent sequence positions:\n"
                             " - the last position stored in the memory module of the context (i.e. the KV cache) for sequence %d is X = %d\n"
                             " - the tokens for sequence %d in the input batch have a starting position of Y = %d\n"
-                            " for M-RoPE, it is required that the position satisfies: X <= Y\n",
+                            " for sparse positions, it is required that the position satisfies: X <= Y\n",
                             __func__, s, s, p0, s, seq_pos_min(s));
 
                     return false;
