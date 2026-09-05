@@ -124,6 +124,24 @@ assert "const dim3 dequant_block((uint32_t) (2 * plan.slices * warp_size_host), 
     "window kernel getter refactor changed dequant or finalize block geometry"
 
 DISPATCH = (ROOT / "ggml/src/ggml-cuda/fattn-kvarn-dispatch.cu").read_text(encoding="utf-8")
+# Route diagnostics must report a successful wide launch, not shape eligibility.
+wide_dispatch = function_body(DISPATCH, "static bool ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols2(")
+assert re.search(
+    r"wide_mma = ggml_cuda_flash_attn_ext_mma_kvarn_launch_case<DKQ, DV, 16, 8>\(ctx, dst\);\s*"
+    r"return wide_mma;", wide_dispatch,
+), "wide_mma must reflect the actual wide-kernel launch result"
+assert wide_dispatch.count("wide_mma =") == 1, "ordinary MMA must not report a wide launch"
+assert "ggml_cuda_fattn_kvarn_wide_mma_supported<DKQ, DV, 16, 8>(ctx, dst)" in wide_dispatch
+mma_dispatch = function_body(DISPATCH, "static bool ggml_cuda_flash_attn_ext_mma_kvarn(")
+assert "wide_mma = false;" in mma_dispatch, "rejected and ordinary MMA must reset wide_mma"
+for dim in (128, 256, 512):
+    assert f"switch_ncols2<{dim}, {dim}>(ctx, dst, wide_mma)" in mma_dispatch
+route_log = function_body(DISPATCH, "static void ggml_cuda_fattn_kvarn_debug_route(")
+assert "wide_mma=%d" in route_log and "int(wide_mma)" in route_log
+assert "const bool wide_mma = false)" in DISPATCH, "non-MMA routes must default to wide_mma=0"
+assert "generic_shape_supported = ggml_cuda_flash_attn_ext_mma_kvarn(ctx, dst, wide_mma);" in DISPATCH
+assert 'split_eligible ? "split-geometry-rejected" : nullptr, wide_mma);' in DISPATCH
+
 assert "GGML_CUDA_FATTN_KVARN_DESCS_THREADS = 1024" in DISPATCH, \
     "KVarN descriptor scan does not use the profiled 1024-thread reduction"
 live_index = function_body(DISPATCH, "static __device__ __forceinline__ int ggml_cuda_fattn_kvarn_live_index_for_thread")
