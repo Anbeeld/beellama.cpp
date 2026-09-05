@@ -344,6 +344,8 @@ def main() -> None:
         raise AssertionError("standard cache must validate its realized meta split before allocating tail metadata/tensors")
     if "realized %s body uses a tensor/meta split buffer" in constructor:
         raise AssertionError("standard precision tails still reject a valid upstream tensor/meta owner")
+    if "for (const auto & [il, il_share] : shared_layer_ids)" in constructor:
+        raise AssertionError("C++17 code must not capture structured-binding names in the shared-tail route lambda")
 
     model_source = (ROOT / "src/llama-model.cpp").read_text(encoding="utf-8")
     placement_header = (ROOT / "src/llama-kv-cache-placement.h").read_text(encoding="utf-8")

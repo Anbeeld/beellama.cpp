@@ -1076,7 +1076,9 @@ llama_kv_cache::llama_kv_cache(
     }
 
     if (other) {
-        for (const auto & [il, il_share] : shared_layer_ids) {
+        for (const auto & shared_layer : shared_layer_ids) {
+            const int32_t il = shared_layer.first;
+            const int32_t il_share = shared_layer.second;
             const auto found = std::find_if(tail_plan.layer_routes.begin(), tail_plan.layer_routes.end(),
                     [&](const auto & route) { return route.layer_id == uint32_t(il); });
             if (found == tail_plan.layer_routes.end()) {
