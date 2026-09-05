@@ -575,10 +575,10 @@ def main() -> None:
         raise AssertionError("non-native backends lack the bounded history/current composition route")
     if graph.count(
             "tail_route == LLAMA_KV_TAIL_ROUTE_NATIVE &&\n"
-            "            !kvarn_plan.native_attention") != 2:
+            "            !kvarn_plan.native_attention && (arch != LLM_ARCH_DFLASH || cparams.causal_attn))") != 2:
         raise AssertionError(
-            "KVarN full/iSWA graphs do not fail closed to the generic tail oracle "
-            "outside the backend's bounded native query matrix")
+            "KVarN full/iSWA graphs must retain the generic backend-query fallback, "
+            "but preserve the validated native F16 tail merge for materialized non-causal DFlash")
 
     tail_build_calls = re.findall(r"build_attn_inp_tail\((?:(?!\);).)*\);", graph, re.DOTALL)[1:]
     if not tail_build_calls or any(not re.search(r",\s*true\s*\);$", call) for call in tail_build_calls):

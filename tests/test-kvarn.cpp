@@ -1221,6 +1221,14 @@ static std::vector<ggml_fp16_t> test_kvarn_reference_decode(
                     stage_pos    = stage_base + (group == 0 ? pos : 128 + ((group - 1) % tail_groups) * 128 + pos);
                     record_group = (int64_t) stream * groups_per_stream + group;
                 }
+                // Eager stores publish completed groups immediately, even
+                // while their lossless staging slots have not been reused.
+                if (stage->op_params[9] != 0) {
+                    const bool incomplete_live = group == live_group && n_kv % 128 != 0;
+                    from_stage = (!swa && group == 0) || incomplete_live;
+                    from_record = !from_stage && group <= live_group &&
+                        (swa ? live_group - group < groups_per_stream : group < groups_per_stream);
+                }
                 if (from_stage) {
                     require(stage_pos >= 0 && stage_pos < stage->ne[2], "reference decode stage offset out of range");
                     for (int d = 0; d < 128; ++d) {
@@ -2080,7 +2088,8 @@ static std::vector<float> test_native_flash_attention_output(
         bool           production_query_layout = false,
         int            explicit_stage_slot = -1,
         bool           eager_records = false,
-        bool           non_causal_mask = false) {
+        bool           non_causal_mask = false,
+        bool           materialized_graph = false) {
     ggml_init_params params = {
         /*.mem_size   =*/ 32 * 1024 * 1024,
         /*.mem_buffer =*/ nullptr,
@@ -2099,7 +2108,7 @@ static std::vector<float> test_native_flash_attention_output(
     ggml_tensor * q_in = production_query_layout ?
         ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_dim, n_q_heads, n_q, n_stream) :
         ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_dim, n_q, n_q_heads, n_stream);
-    const bool use_q_rot = native_view && rotate_graph;
+    const bool use_q_rot = rotate_graph && (native_view || materialized_graph || non_causal_mask);
     const bool use_output_rot = use_q_rot && !original_value_domain;
     ggml_tensor * q = use_q_rot ? apply_kvarn_wht_head(ctx, q_in, head_dim) : q_in;
     if (production_query_layout) {
@@ -2160,7 +2169,18 @@ static std::vector<float> test_native_flash_attention_output(
         v->op_params[10] = 1;
     }
 
-    if (native_view && slices > 1) {
+    if (materialized_graph) {
+        require(!native_view, "materialized test must not consume native record views");
+        k = ggml_kvarn_materialize(ctx, k_records, stored_k, read_indices,
+                n_kv, 0, n_stream, bits_k, false, stage_groups);
+        v = ggml_kvarn_materialize(ctx, v_records, stored_v, read_indices,
+                n_kv, 0, n_stream, bits_v, true, stage_groups);
+        k->op_params[4] = rotate_graph ? 1 : 0;
+        v->op_params[4] = rotate_graph ? 1 : 0;
+        k->op_params[5] = slices;
+        v->op_params[5] = slices;
+    }
+    if ((native_view || materialized_graph) && slices > 1) {
         k = ggml_reshape_4d(ctx, k, head_dim, n_kv_heads, n_kv, n_stream);
         v = ggml_reshape_4d(ctx, v, head_dim, n_kv_heads, n_kv, n_stream);
     }
@@ -2429,9 +2449,9 @@ static std::vector<float> test_native_flash_attention_output(
         require(ggml_backend_graph_compute(backend, store_graph) == GGML_STATUS_SUCCESS,
                 "native FA: reference store graph compute failed");
         const std::vector<ggml_fp16_t> k_ref_data = test_kvarn_reference_decode(
-                k_records, stored_k, idx, n_kv, 0, n_stream, bits_k, false, stage_groups, false, swa, slices);
+                k_records, stored_k, idx, n_kv, 0, n_stream, bits_k, false, stage_groups, use_q_rot, swa, slices);
         const std::vector<ggml_fp16_t> v_ref_data = test_kvarn_reference_decode(
-                v_records, stored_v, idx, n_kv, 0, n_stream, bits_v, true, stage_groups, false, swa, slices);
+                v_records, stored_v, idx, n_kv, 0, n_stream, bits_v, true, stage_groups, use_output_rot, swa, slices);
         ggml_backend_tensor_set(k_ref, k_ref_data.data(), 0, ggml_nbytes(k_ref));
         ggml_backend_tensor_set(v_ref, v_ref_data.data(), 0, ggml_nbytes(v_ref));
     }
@@ -3316,14 +3336,17 @@ static void test_dflash_non_causal_attention_parity() {
                     backend == cpu_backend ? "CPU" : "GPU",
                     head_dim, bits_k, bits_v, n_q, n_kv, int(exact_tail));
         }
+        // Decode this backend's records with the independent host oracle.
+        // CPU/CUDA sealers can quantize differently; that is not a
+        // materialization or attention-route error.
         const std::vector<float> expected = test_native_flash_attention_output(
-                cpu_backend, false, false, head_dim, bits_k, bits_v, n_q,
+                backend, false, true, head_dim, bits_k, bits_v, n_q,
                 4, 1, n_kv, 3, false, nullptr, false, exact_tail ? 128 : 0,
                 false, GGML_TYPE_F16, 0, false, true, -1, true, true);
         const std::vector<float> actual = test_native_flash_attention_output(
-                backend, false, false, head_dim, bits_k, bits_v, n_q,
+                backend, false, true, head_dim, bits_k, bits_v, n_q,
                 4, 1, n_kv, 3, false, nullptr, false, exact_tail ? 128 : 0,
-                false, GGML_TYPE_F16, 0, false, true, -1, true, true);
+                false, GGML_TYPE_F16, 0, false, true, -1, true, true, true);
         require_close_f32_rmse(actual, expected, 1e-3f,
                 "DFlash non-causal materialized KVarN fallback differs from reference");
     };

@@ -3647,13 +3647,12 @@ ggml_tensor * llm_graph_context::build_attn(
     const bool gather_v_tail = v_tail != nullptr;
     ggml_tensor * tail_read_idxs = inp->get_tail_read_idxs();
     llama_kv_tail_route tail_route = mctx_cur->get_tail_route(il);
-    // Vulkan and other portable KVarN backends advertise a bounded rotated
-    // query width. Outside that matrix the body is materialized, and the exact
-    // tail must use the same explicit generic oracle instead of attaching
-    // segmented sources to a standard FlashAttention operation that the
-    // backend did not advertise.
+    // A backend query-width fallback still requires the generic tail oracle.
+    // Non-causal DFlash is different: only record-consuming attention is
+    // unqualified. Its materialized F16 body can retain the advertised native
+    // exact-tail merge (validated below), avoiding a full F32 QK matrix.
     if (use_kvarn && tail_route == LLAMA_KV_TAIL_ROUTE_NATIVE &&
-            !kvarn_plan.native_attention) {
+            !kvarn_plan.native_attention && (arch != LLM_ARCH_DFLASH || cparams.causal_attn)) {
         tail_route = LLAMA_KV_TAIL_ROUTE_GENERIC;
     }
     if (tail_route != LLAMA_KV_TAIL_ROUTE_NONE) {
@@ -4099,7 +4098,7 @@ ggml_tensor * llm_graph_context::build_attn(
     llama_kv_tail_route tail_route = mctx_cur->get_tail_route(il);
     // Keep the iSWA route decision identical to the non-iSWA path above.
     if (use_kvarn && tail_route == LLAMA_KV_TAIL_ROUTE_NATIVE &&
-            !kvarn_plan.native_attention) {
+            !kvarn_plan.native_attention && (arch != LLM_ARCH_DFLASH || cparams.causal_attn)) {
         tail_route = LLAMA_KV_TAIL_ROUTE_GENERIC;
     }
     if (tail_route != LLAMA_KV_TAIL_ROUTE_NONE) {
