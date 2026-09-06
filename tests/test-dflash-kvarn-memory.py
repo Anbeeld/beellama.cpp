@@ -22,7 +22,7 @@ def run(args, cache):
     command = [str(args.server.resolve()), "-m", str(args.target.resolve()),
                "--spec-draft-model", str(args.draft.resolve()), "--spec-type", "draft-dflash",
                "--device", "CUDA0,CUDA1", "--spec-draft-device", "CUDA0,CUDA1",
-               "--split-mode", "layer", "--tensor-split", "51,49", "--main-gpu", "1",
+               "--split-mode", args.split_mode, "--tensor-split", "51,49", "--main-gpu", "1",
                "-ngl", "all", "--spec-draft-ngl", "all", "--load-mode", "dio", "--fit", "off",
                "-c", str(args.context), "-b", "2048", "-ub", "512", "-fa", "on",
                "--cache-type-k", "kvarn6", "--cache-type-v", "kvarn6", "--kv-tail-tokens", "1024",
@@ -30,7 +30,9 @@ def run(args, cache):
                "--spec-draft-n-max", "8", "--parallel", "1", "--kv-unified",
                "--host", "127.0.0.1", "--port", str(args.port), "--no-warmup", "-lv", "5"]
     if args.mmproj:
-        command += ["--mmproj", str(args.mmproj.resolve()), "--image-min-tokens", "1024"]
+        command += ["--mmproj", str(args.mmproj.resolve()), "--image-min-tokens", str(args.image_min_tokens)]
+    if args.swa_full:
+        command += ["--swa-full"]
     result = {"command": command, "cache": cache,
               "cuda_launch_blocking": os.getenv("CUDA_LAUNCH_BLOCKING"),
               "version": subprocess.check_output([str(args.server.resolve()), "--version"],
@@ -51,8 +53,14 @@ def run(args, cache):
             else:
                 raise TimeoutError(f"{cache}: readiness timeout")
             text = stem.with_suffix(".log").read_text(encoding="utf-8", errors="replace")
-            allocations = re.findall(r"sched_reserve:\s+(CUDA[01]) compute buffer size =\s+([\d.]+) MiB", text)
+            allocations = re.findall(r"sched_reserve:\s+(CUDA[01]|Meta\(\)) compute buffer size =\s+([\d.]+) MiB", text)
             result["compute_mib"] = allocations
+            swa_cells = re.findall(r"creating\s+SWA KV cache, size = (\d+) cells", text)
+            result["startup_swa_cells"] = [int(cells) for cells in swa_cells]
+            if args.max_startup_swa_cells is not None:
+                assert swa_cells, "missing SWA capacity diagnostics"
+                assert max(map(int, swa_cells)) <= args.max_startup_swa_cells, (
+                    f"{cache}: oversized startup SWA capacity: {swa_cells}")
             assert allocations, "missing compute allocation diagnostics"
             # A full QK/softmax matrix costs multiple GiB at 64K with ubatch 512.
             # F16 K/V plus FlashAttention and tail merge must stay below this bound.
@@ -84,6 +92,10 @@ def run(args, cache):
                 timings = output["timings"]
                 assert timings["predicted_n"] >= 128, timings
                 assert timings.get("draft_n", 0) > 0, "test did not exercise draft generation"
+            if args.require_swa_growth:
+                text = stem.with_suffix(".log").read_text(encoding="utf-8", errors="replace")
+                assert "grew owned DFlash SWA cache" in text, "test did not exercise SWA growth"
+                assert "could not grow DFlash SWA cache" not in text, "SWA growth failed"
         except Exception as exc:
             result["error"] = repr(exc)
             raise
@@ -106,10 +118,16 @@ def main():
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--mmproj", type=Path)
     parser.add_argument("--image", type=Path, help="PNG image; exercises image-first and text-first requests")
+    parser.add_argument("--image-min-tokens", type=int, default=1024)
+    parser.add_argument("--swa-full", action="store_true", help="explicit full-SWA reference configuration")
+    parser.add_argument("--require-swa-growth", action="store_true", help="assert image requests grow the compact ring")
     parser.add_argument("--output", type=Path, default=Path("tmp/dflash-kvarn-memory"))
     parser.add_argument("--profiles", nargs="+", default=["q8_0", "kvarn2", "kvarn3", "kvarn4", "kvarn5", "kvarn6", "kvarn8", "kvarn4:kvarn2"])
     parser.add_argument("--context", type=int, default=64000)
+    parser.add_argument("--split-mode", choices=["layer", "tensor"], default="layer")
     parser.add_argument("--max-compute-mib", type=float, default=2048)
+    parser.add_argument("--max-startup-swa-cells", type=int,
+                        help="bound startup SWA rows independently of the full context")
     parser.add_argument("--prompt-repeats", type=int, default=1200)
     parser.add_argument("--requests", type=int, default=2)
     parser.add_argument("--port", type=int, default=18340)

@@ -178,7 +178,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         return !hparams.is_swa(il);
     };
 
-    const layer_filter_cb filter_swa  = [&](int32_t il) {
+    const layer_filter_cb filter_swa  = [filter, hparams](int32_t il) {
         if (filter && !filter(il)) {
             return false;
         }
@@ -227,7 +227,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                 __func__, llama_kvarn_type_name(kvarn.type), llama_kvarn_type_name(kvarn_swa.type));
     }
 
-    auto make_cache = [&](uint32_t size, uint32_t n_swa, llama_swa_type swa_type,
+    auto make_cache = [=, &model, &hparams](uint32_t size, uint32_t n_swa, llama_swa_type swa_type,
                           const layer_filter_cb & layer_filter, llama_memory_t cache_mem_other,
                           const llama_kvarn_params & cache_kvarn,
                           const layer_share_cb & cache_share) -> std::unique_ptr<llama_memory_i> {
@@ -331,6 +331,29 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
 
     kv_swa = make_cache(size_swa, hparams.n_swa, hparams.swa_type, filter_swa, mem_other_swa, kvarn_swa, share);
+
+    if (model.arch == LLM_ARCH_DFLASH && &hparams == &model.hparams &&
+            !swa_full && !mem_other_swa && !share && !filter && !reuse) {
+        swa_capacity = size_swa;
+        swa_capacity_max = size_base;
+        make_swa = [=](uint32_t size) {
+            return make_cache(size, hparams.n_swa, hparams.swa_type, filter_swa, nullptr, kvarn_swa, share);
+        };
+    }
+}
+
+bool llama_kv_cache_iswa::grow_swa(
+        const std::function<void(llama_memory_i &, llama_memory_i &)> & transfer) {
+    if (!swa_growth_pending || !make_swa || swa_capacity >= swa_capacity_max) {
+        return false;
+    }
+    const uint32_t size = uint32_t(std::min<uint64_t>(swa_capacity_max, uint64_t(swa_capacity)*2));
+    auto replacement = make_swa(size);
+    transfer(*kv_swa, *replacement);
+    kv_swa = std::move(replacement);
+    LLAMA_LOG_INFO("%s: grew owned DFlash SWA cache from %u to %u cells\n", __func__, swa_capacity, size);
+    swa_capacity = size;
+    return true;
 }
 
 void llama_kv_cache_iswa::clear(bool data) {
@@ -461,6 +484,7 @@ bool llama_kv_cache_iswa::requires_state_for_partial_restore() const {
 
 llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     GGML_UNUSED(embd_all);
+    swa_growth_pending = false;
 
     // first try simple split
     do {
@@ -494,6 +518,7 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & ba
 
         auto ctx_swa = kv_swa->init_kv_batch(ubatches);
         if (!ctx_swa || llama_memory_status_is_fail(ctx_swa->get_status())) {
+            swa_growth_pending = true;
             break;
         }
 
@@ -528,6 +553,7 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & ba
 
         auto ctx_swa = kv_swa->init_kv_batch(ubatches);
         if (!ctx_swa || llama_memory_status_is_fail(ctx_swa->get_status())) {
+            swa_growth_pending = true;
             break;
         }
 

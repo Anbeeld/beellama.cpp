@@ -2852,15 +2852,6 @@ common_speculative_init_result::common_speculative_init_result(
     cparams.kv_tail_tokens = 0;
     cparams.kv_tail_type   = GGML_TYPE_F16;
 
-    // Image feature rows can share logical positions. A position-sized SWA
-    // ring cannot bound their physical row count; retain full capacity for
-    // image-enabled DFlash drafts, just as for an explicit --swa-full cache.
-    const auto target_rope = llama_model_rope_type(llama_get_model(ctx_tgt));
-    if (spec_dflash && !params.mmproj.path.empty() &&
-            (target_rope == LLAMA_ROPE_TYPE_MROPE || target_rope == LLAMA_ROPE_TYPE_IMROPE)) {
-        cparams.swa_full = true;
-    }
-
     std::string model_path;
     if (has_draft) {
         model_path = params.speculative.draft.mparams.path;

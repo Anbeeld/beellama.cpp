@@ -7,6 +7,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-kv-cache-kvarn.h"
+#include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-tail.h"
 #include "llama-kv-tail-request.h"
 #include "llama-kvarn.h"
@@ -2315,6 +2316,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         }
                     }
 
+                    mctx.reset();
+                    if (grow_dflash_swa()) {
+                        continue;
+                    }
+
                     LLAMA_LOG_WARN("%s: failed to find a memory slot for batch of size %d\n", __func__, balloc->get_n_tokens());
 
                     return 1;
@@ -3338,6 +3344,42 @@ private:
     std::vector<read_info> rinfos;
     std::vector<std::function<void()>> callbacks;
 };
+
+bool llama_context::grow_dflash_swa() {
+    if (model.arch != LLM_ARCH_DFLASH) {
+        return false;
+    }
+    auto * iswa = dynamic_cast<llama_kv_cache_iswa *>(memory.get());
+    if (!iswa) {
+        return false;
+    }
+    synchronize();
+    ggml_backend_sched_reset(sched.get());
+    gf_res_prev->reset();
+    try {
+        return iswa->grow_swa([](llama_memory_i & source, llama_memory_i & destination) {
+            llama_io_write_dummy sizing(false);
+            source.state_write(sizing, -1, 0);
+            std::vector<uint8_t> state(sizing.n_bytes());
+            {
+                llama_io_write_host writer(state.data(), state.size());
+                source.state_write(writer, -1, 0);
+                if (writer.n_bytes() != state.size()) {
+                    throw std::runtime_error("DFlash SWA growth state size changed");
+                }
+            }
+            llama_io_read_host reader(state.data(), state.size());
+            destination.state_read(reader, -1, 0);
+            if (reader.n_bytes() != state.size()) {
+                throw std::runtime_error("DFlash SWA growth state was not fully consumed");
+            }
+            reader.commit();
+        });
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: could not grow DFlash SWA cache: %s\n", __func__, err.what());
+        return false;
+    }
+}
 
 class llama_io_write_file : public llama_io_write_i {
 public:
