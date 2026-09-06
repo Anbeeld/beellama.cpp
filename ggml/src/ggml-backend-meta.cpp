@@ -568,6 +568,37 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return true;
     };
 
+    auto split_states_proportional = [&](const ggml_backend_meta_split_state & a,
+                                          const ggml_backend_meta_split_state & b) -> bool {
+        if (a.axis != b.axis || a.axis < 0 || a.axis >= GGML_MAX_DIMS) {
+            return false;
+        }
+        std::vector<int64_t> per_device_a(n_bufs, 0);
+        std::vector<int64_t> per_device_b(n_bufs, 0);
+        int64_t total_a = 0;
+        int64_t total_b = 0;
+        for (size_t j = 0; j < n_bufs; ++j) {
+            for (size_t s = 0; s < a.n_segments; ++s) {
+                per_device_a[j] += a.ne[s*n_bufs + j] * a.nr[s];
+            }
+            for (size_t s = 0; s < b.n_segments; ++s) {
+                per_device_b[j] += b.ne[s*n_bufs + j] * b.nr[s];
+            }
+            total_a += per_device_a[j];
+            total_b += per_device_b[j];
+        }
+        if (total_a <= 0 || total_b <= 0) {
+            return false;
+        }
+        for (size_t j = 0; j < n_bufs; ++j) {
+            if ((long double) per_device_a[j] * total_b !=
+                    (long double) per_device_b[j] * total_a) {
+                return false;
+            }
+        }
+        return true;
+    };
+
     auto handle_generic = [&](const std::vector<ggml_backend_meta_split_state> & src_ss, bool scalar_only) -> ggml_backend_meta_split_state {
         ggml_backend_meta_split_state ret = {GGML_BACKEND_SPLIT_AXIS_NONE, {0}, {1}, 1};
         for (size_t i = 0; i < GGML_MAX_SRC; i++) {
@@ -589,6 +620,18 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         }
         GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
         return ret;
+    };
+
+    auto handle_src0_with_mirrored_inputs = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        GGML_ASSERT(tensor->src[0] != nullptr);
+        for (size_t i = 1; i < GGML_MAX_SRC; ++i) {
+            if (tensor->src[i] == nullptr || tensor->src[i] == tensor) {
+                continue;
+            }
+            GGML_ASSERT(src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED ||
+                    split_states_equal(src_ss[i], src_ss[0]));
+        }
+        return src_ss[0];
     };
 
     // Some ops process data on a per-row bases:
@@ -647,8 +690,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         }
         if (src_ss[0].axis == src_ss[1].axis && src_ss[0].axis >= GGML_BACKEND_SPLIT_AXIS_2 &&
                 src_ss[0].axis < GGML_MAX_DIMS) {
-            GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
-            return src_ss[0];
+            GGML_ASSERT(split_states_proportional(src_ss[0], src_ss[1]));
+            return src_ss[1]; // output follows the query-head split
         }
         // batched matmul with the batches split across devices and a replicated activation
         if (src_ss[0].axis >= GGML_BACKEND_SPLIT_AXIS_2 && src_ss[0].axis < GGML_MAX_DIMS &&
@@ -1062,7 +1105,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             } break;
             case GGML_OP_SOFT_MAX:
             case GGML_OP_SOFT_MAX_BACK: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ false);
+                split_state = handle_src0_with_mirrored_inputs(src_ss);
             } break;
             case GGML_OP_ROPE: {
                 split_state = handle_rope(src_ss);
@@ -1849,14 +1892,17 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
 struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft) {
     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
 
-    constexpr size_t compute_headroom = 16; // Maximum number of views per statically allocated tensor that can be created between evals.
+    // Speculative graphs can create more than 16 transient views per source
+    // tensor when a target or draft uses tensor-parallel Meta placement.
+    constexpr size_t compute_headroom = 32;
     const ggml_init_params params_static = {
         /*.mem_size   =*/ ggml_get_mem_size(ctx),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
     const ggml_init_params params_compute = {
-        /*.mem_size   =*/ compute_headroom*ggml_get_mem_size(ctx),
+        // Alignment can consume the final slot; reserve one full header.
+        /*.mem_size   =*/ compute_headroom*ggml_get_mem_size(ctx) + ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
@@ -2201,16 +2247,24 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         size_t n_subgraphs  = 0;
         size_t max_tmp_size = 0;
 
+        auto meta_tensor_is_external_host = [](const ggml_tensor * tensor) {
+            if (tensor->buffer != nullptr && !ggml_backend_buffer_is_meta(tensor->buffer) &&
+                    ggml_backend_buffer_is_host(tensor->buffer)) {
+                return true;
+            }
+            return tensor->view_src != nullptr && tensor->view_src->op == GGML_OP_NONE &&
+                    !ggml_backend_buffer_is_meta(tensor->view_src->buffer) &&
+                    ggml_backend_buffer_is_host(tensor->view_src->buffer);
+        };
+
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-                if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE &&
-                        !ggml_backend_buffer_is_meta(node->view_src->buffer) &&
-                        ggml_backend_buffer_is_host(node->view_src->buffer)) {
-                    // FIXME s_copy_main is on the CPU and its view seems to be incorrectly added to the graph nodes.
-                    // For regular usage this doesn't matter since it's a noop but trying to call ggml_backend_meta_buffer_simple_tensor results in a crash.
+                if (meta_tensor_is_external_host(node)) {
+                    // External CPU scheduler boundaries are already materialized;
+                    // inner device schedulers consume them as ordinary inputs.
                     bcj.nodes[i] = node;
                     continue;
                 }
@@ -2380,9 +2434,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             int i_start = 0;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-                if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE &&
-                        !ggml_backend_buffer_is_meta(node->view_src->buffer) &&
-                        ggml_backend_buffer_is_host(node->view_src->buffer)) {
+                if (meta_tensor_is_external_host(node)) {
                     continue;
                 }
                 const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(node, /*assume_sync =*/ false);

@@ -45,9 +45,10 @@ public:
         uint32_t s0;
         uint32_t s1;
 
-        std::vector<llama_seq_id> strm;        // [ns]
-        std::vector<idx_vec_t>    idxs;        // [ns]
-        std::vector<idx_vec_t>    stage_slots; // [ns], structured caches only
+        std::vector<llama_seq_id> strm;              // [ns]
+        std::vector<idx_vec_t>    idxs;              // [ns]
+        std::vector<idx_vec_t>    stage_slots;       // [ns], structured caches only
+        std::vector<int32_t>      group_stage_slots; // complete post-allocation assignment
 
         uint32_t head() const {
             GGML_ASSERT(idxs.size() == 1);
@@ -79,6 +80,7 @@ public:
         void clear() {
             idxs.clear();
             stage_slots.clear();
+            group_stage_slots.clear();
         }
 
         // check if indices are contiguous starting from head()
@@ -127,7 +129,9 @@ public:
                  uint32_t   tail_tokens_requested = UINT32_MAX,
                      bool   tail_metadata_only = false,
                  uint32_t   tail_rollback_tokens = 0,
-                 uint32_t   tail_visibility_window = 0);
+                 uint32_t   tail_visibility_window = 0,
+                 const char * name_tag = "",
+                     bool   disable_attn_rot = false);
 
     ~llama_kv_cache() = default;
 
@@ -186,6 +190,9 @@ public:
     bool requires_state_for_partial_restore() const override;
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
+    void state_read_sinfo(
+            llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags,
+            slot_info_vec_t * sinfos_out, const slot_info_vec_t * sinfos_in);
 
     //
     // llama_kv_cache specific API
@@ -222,30 +229,36 @@ public:
     ggml_tensor * get_k_tail_fallback(ggml_context * ctx, int32_t il, ggml_tensor * body_idxs) const;
     ggml_tensor * get_v_tail_fallback(ggml_context * ctx, int32_t il, ggml_tensor * body_idxs) const;
     uint32_t get_tail_slots() const {
-        return has_tail_overlay() ? tail_slots : 0;
+        return uses_shared_tail() ? other->get_tail_slots() : (has_tail_overlay() ? tail_slots : 0);
     }
-    ggml_type get_tail_type() const { return tail_type; }
+    ggml_type get_tail_type() const { return uses_shared_tail() ? other->get_tail_type() : tail_type; }
     uint32_t get_tail_tokens() const {
-        return has_tail_overlay() ? tail_plan.effective_tokens : 0;
+        return uses_shared_tail() ? other->get_tail_tokens() : (has_tail_overlay() ? tail_plan.effective_tokens : 0);
     }
     uint32_t get_tail_arena_stride() const {
-        return has_tail_overlay() ? tail_arena_stride : 0;
+        return uses_shared_tail() ? other->get_tail_arena_stride() : (has_tail_overlay() ? tail_arena_stride : 0);
     }
-    uint32_t get_tail_rollback_tokens() const { return tail_plan.compact_layout.rollback_tokens; }
-    llama_kv_tail_storage_kind get_tail_storage_kind() const { return tail_plan.kind; }
+    uint32_t get_tail_rollback_tokens() const {
+        return uses_shared_tail() ? other->get_tail_rollback_tokens() : tail_plan.compact_layout.rollback_tokens;
+    }
+    llama_kv_tail_storage_kind get_tail_storage_kind() const {
+        return uses_shared_tail() ? other->get_tail_storage_kind() : tail_plan.kind;
+    }
     bool has_kv_body() const {
-        return tail_plan.kind != LLAMA_KV_TAIL_STORAGE_COMPACT_NATIVE_EXACT;
+        return uses_shared_tail() ? other->has_kv_body() : tail_plan.kind != LLAMA_KV_TAIL_STORAGE_COMPACT_NATIVE_EXACT;
     }
     bool has_kv_body(int32_t il) const;
     bool has_tail_current(int32_t il) const;
     ggml_backend_dev_t get_tail_backend(int32_t il) const;
     bool has_tail_overlay() const {
-        return tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY ||
+        return uses_shared_tail() ? other->has_tail_overlay() :
+                tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY ||
                 tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_OVERLAY ||
                 tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_NATIVE_EXACT;
     }
     bool has_compact_tail() const {
-        return tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_OVERLAY ||
+        return uses_shared_tail() ? other->has_compact_tail() :
+                tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_OVERLAY ||
                 tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_NATIVE_EXACT;
     }
     uint32_t get_tail_attention_stride(uint32_t n_query_tokens = 0) const;
@@ -263,10 +276,12 @@ public:
     stream_copy_info take_pending_tail_copies();
     void commit_pending_tail_copy();
     void cancel_pending_tail_copy();
+    std::vector<int32_t> state_tail_cell_ordinals(llama_seq_id seq_id, uint32_t stream) const;
     std::vector<int32_t> state_tail_payload_slots(llama_seq_id seq_id) const;
     std::vector<uint32_t> state_source_cells(llama_seq_id seq_id) const;
     std::vector<std::vector<int32_t>> take_restored_tail_payload_slots();
     void clone_logical_state_from(const llama_kv_cache & source);
+    void swap_logical_state_from(llama_kv_cache & source);
     void set_allocation_group_size(uint32_t group_size, uint32_t stage_groups = 1);
     bool allocation_cell_uses_stage(uint32_t cell) const;
     int32_t allocation_cell_stage_slot(uint32_t cell) const;
@@ -503,6 +518,12 @@ private:
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
+    // Shared auxiliary layer id -> source model layer id.
+    std::unordered_map<int32_t, int32_t> shared_layer_ids;
+
+    bool uses_shared_tail() const;
+    bool is_shared_layer(int32_t il) const;
+    int32_t shared_layer_id(int32_t il) const;
 
     size_t total_size() const;
 
@@ -545,7 +566,7 @@ private:
             uint32_t version) const;
     void state_v2_write_body_payload(llama_io_write_i & io, const state_v2_manifest & manifest) const;
     void state_v2_write_tail_payload(llama_io_write_i & io, const state_v2_manifest & manifest) const;
-    void state_v2_read_payload_and_install(
+    std::vector<std::vector<uint32_t>> state_v2_read_payload_and_install(
             llama_io_read_i & io,
             llama_seq_id seq_id,
             llama_state_seq_flags flags,
@@ -555,15 +576,18 @@ private:
             uint32_t version);
     void materialize_pending_copies();
     std::vector<std::vector<uint32_t>> state_read_body(
-            llama_io_read_i & io, llama_seq_id seq_id, uint32_t n_stream_cur);
-    void state_read_impl(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags);
+            llama_io_read_i & io, llama_seq_id seq_id, uint32_t n_stream_cur,
+            slot_info_vec_t * sinfos_out, const slot_info_vec_t * sinfos_in);
+    void state_read_impl(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags,
+            slot_info_vec_t * sinfos_out, const slot_info_vec_t * sinfos_in);
     void state_read_tail(
             llama_io_read_i & io,
             llama_seq_id seq_id,
             const std::vector<std::vector<uint32_t>> & restored_cells,
             llama_state_seq_flags flags);
 
-    bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1);
+    bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,
+            slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr);
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
 };
 
@@ -614,6 +638,7 @@ public:
     virtual uint32_t get_n_kv() const;
     virtual llama_kv_cache * get_kv() const;
     virtual const llama_kv_cache::slot_info & current_sinfo() const;
+    virtual const slot_info_vec_t & get_sinfos() const;
 
     virtual ggml_type type_k() const;
     virtual ggml_type type_v() const;
@@ -700,7 +725,7 @@ public:
     virtual void set_input_v_rot_backend(ggml_tensor * dst) const;
 
     // see llama_kv_cache::get_prev_tokens()
-    void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
+    virtual void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
 private:
     llama_memory_status status;

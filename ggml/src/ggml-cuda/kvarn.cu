@@ -50,12 +50,15 @@ static __device__ __forceinline__ int64_t kvarn_read_cell(
         int64_t encoded, bool read_indirect, bool swa, bool & explicitly_staged,
         int * assigned_slot = nullptr) {
     GGML_UNUSED(read_indirect);
-    GGML_UNUSED(swa);
-    explicitly_staged = encoded < -1;
+    explicitly_staged = !swa && encoded < -1;
     if (assigned_slot != nullptr) {
-        *assigned_slot = kvarn_index_stage_slot(encoded);
+        *assigned_slot = swa ? -1 : kvarn_index_stage_slot(encoded);
     }
     return kvarn_index_cell(encoded);
+}
+
+static __device__ __forceinline__ int kvarn_swa_stream(int64_t encoded) {
+    return int(uint64_t(encoded) >> 32u);
 }
 
 static std::atomic<uint64_t> g_kvarn_store_headwide_workspace{0};
@@ -995,13 +998,13 @@ static __global__ void kvarn_store_kernel_hishmem(
 
     for (int token = 0; token < n_tokens; ++token) {
         const int64_t encoded_idx = indices[token];
-        const int assigned_slot = kvarn_index_stage_slot(encoded_idx);
+        const int assigned_slot = swa ? -1 : kvarn_index_stage_slot(encoded_idx);
         const int64_t idx = kvarn_index_cell(encoded_idx);
         const int group_global = (int) (idx / KVAR_N_DIM);
         const int pos = (int) (idx % KVAR_N_DIM);
-        // SWA: idx is the absolute token position; records form a ring and there
-        // is no permanent group-0 sink (single stream).
-        const int stream = swa ? 0 : group_global / groups_per_stream;
+        // SWA: idx is the absolute token position; records form an independent
+        // ring per encoded stream and there is no permanent group-0 sink.
+        const int stream = swa ? kvarn_swa_stream(encoded_idx) : group_global / groups_per_stream;
         const int group = swa ? group_global : group_global - stream * groups_per_stream;
         if (stream < 0 || stream >= n_stream || group < 0 || (!swa && group >= groups_per_stream)) {
             return;
@@ -1013,7 +1016,8 @@ static __global__ void kvarn_store_kernel_hishmem(
             const int flush_ring = swa ? flush_group % groups_per_stream : flush_group;
             const int flush_record_group = stream * groups_per_stream + flush_ring;
             uint8_t * record = records + (flush_record_group * n_heads + head) * record_bytes;
-            kvarn_quantize_stage(stage, record, n_heads, head, stage_base, flush_group, bits, iterations, value, swa, stage_groups, tail_groups, shared);
+            kvarn_quantize_stage(stage, record, n_heads, head, stage_base, flush_group,
+                    bits, iterations, value, swa, stage_groups, tail_groups, shared, assigned_slot);
         }
 
         shared[threadIdx.x] = current[(token * n_heads + head) * KVAR_N_DIM + threadIdx.x];
@@ -1065,11 +1069,11 @@ static __global__ void kvarn_store_kernel_headwide(
 
     for (int token = 0; token < n_tokens; ++token) {
         const int64_t encoded_idx = indices[token];
-        const int assigned_slot = kvarn_index_stage_slot(encoded_idx);
+        const int assigned_slot = swa ? -1 : kvarn_index_stage_slot(encoded_idx);
         const int64_t idx = kvarn_index_cell(encoded_idx);
         const int group_global = (int) (idx / KVAR_N_DIM);
         const int pos = (int) (idx % KVAR_N_DIM);
-        const int stream = swa ? 0 : group_global / groups_per_stream;
+        const int stream = swa ? kvarn_swa_stream(encoded_idx) : group_global / groups_per_stream;
         const int group = swa ? group_global : group_global - stream * groups_per_stream;
         if (stream < 0 || stream >= n_stream || group < 0 || (!swa && group >= groups_per_stream)) {
             return;
@@ -1083,7 +1087,8 @@ static __global__ void kvarn_store_kernel_headwide(
             for (int slice = 0; slice < head_slices; ++slice) {
                 const int head = head0 + slice;
                 uint8_t * record = records + ((int64_t) flush_record_group * n_heads + head) * record_bytes;
-            kvarn_quantize_stage(stage, record, n_heads, head, stage_base, flush_group, bits, iterations, value, swa, stage_groups, tail_groups, shared);
+                kvarn_quantize_stage(stage, record, n_heads, head, stage_base, flush_group,
+                        bits, iterations, value, swa, stage_groups, tail_groups, shared, assigned_slot);
             }
         }
 
@@ -1145,10 +1150,10 @@ static __global__ void kvarn_store_kernel_lowshmem(
 
     for (int token = 0; token < n_tokens; ++token) {
         const int64_t encoded_idx = indices[token];
-        const int assigned_slot = kvarn_index_stage_slot(encoded_idx);
+        const int assigned_slot = swa ? -1 : kvarn_index_stage_slot(encoded_idx);
         const int64_t idx = kvarn_index_cell(encoded_idx);
         const int group_global = (int) (idx / KVAR_N_DIM);
-        const int stream = swa ? 0 : group_global / groups_per_stream;
+        const int stream = swa ? kvarn_swa_stream(encoded_idx) : group_global / groups_per_stream;
         const int group = swa ? group_global : group_global - stream * groups_per_stream;
         const int pos = (int) (idx % KVAR_N_DIM);
         if (stream < 0 || stream >= n_stream || group < 0 || (!swa && group >= groups_per_stream)) {
@@ -1165,7 +1170,7 @@ static __global__ void kvarn_store_kernel_lowshmem(
                 uint8_t * record = records + ((int64_t) flush_record_group * n_heads + head) * record_bytes;
                 kvarn_quantize_stage_lowshmem(
                         stage, record, n_heads, head, stage_base, flush_group, bits, iterations,
-                        value, swa, stage_groups, tail_groups, shared);
+                        value, swa, stage_groups, tail_groups, shared, assigned_slot);
             }
         }
 
@@ -1223,9 +1228,11 @@ static __global__ void kvarn_store_direct_flush_kernel(
         return;
     }
 
-    const int64_t idx = kvarn_index_cell(indices[token]);
+    const int64_t encoded_idx = indices[token];
+    const int assigned_slot = swa ? -1 : kvarn_index_stage_slot(encoded_idx);
+    const int64_t idx = kvarn_index_cell(encoded_idx);
     const int group_global = (int) (idx / KVAR_N_DIM);
-    const int stream = swa ? 0 : group_global / groups_per_stream;
+    const int stream = swa ? kvarn_swa_stream(encoded_idx) : group_global / groups_per_stream;
     const int group = swa ? group_global : group_global - stream * groups_per_stream;
     const int pos = (int) (idx % KVAR_N_DIM);
     if (stream < 0 || stream >= n_stream || group < 0 || (!swa && group >= groups_per_stream) || pos != 0) {
@@ -1240,7 +1247,8 @@ static __global__ void kvarn_store_direct_flush_kernel(
     const int flush_ring = swa ? flush_group % groups_per_stream : flush_group;
     const int flush_record_group = stream * groups_per_stream + flush_ring;
     uint8_t * record = records + ((int64_t) flush_record_group * n_heads + head) * record_bytes;
-    kvarn_quantize_stage(stage, record, n_heads, head, stage_base, flush_group, bits, iterations, value, swa, stage_groups, tail_groups, shared);
+    kvarn_quantize_stage(stage, record, n_heads, head, stage_base, flush_group,
+            bits, iterations, value, swa, stage_groups, tail_groups, shared, assigned_slot);
 }
 
 static __global__ void kvarn_store_direct_stage_kernel(
@@ -1271,10 +1279,10 @@ static __global__ void kvarn_store_direct_stage_kernel(
     int assigned_slot = -1;
     if (valid) {
         const int64_t encoded_idx = indices[token];
-        assigned_slot = kvarn_index_stage_slot(encoded_idx);
+        assigned_slot = swa ? -1 : kvarn_index_stage_slot(encoded_idx);
         const int64_t idx = kvarn_index_cell(encoded_idx);
         const int group_global = (int) (idx / KVAR_N_DIM);
-        stream = swa ? 0 : group_global / groups_per_stream;
+        stream = swa ? kvarn_swa_stream(encoded_idx) : group_global / groups_per_stream;
         group = swa ? group_global : group_global - stream * groups_per_stream;
         pos = (int) (idx % KVAR_N_DIM);
         valid = stream >= 0 && stream < n_stream && group >= 0 && (swa || group < groups_per_stream);
@@ -1394,18 +1402,20 @@ static __global__ void kvarn_store_workspace_validate_kernel(
             break;
         }
         const int token_base = active_stream * tokens_per_stream;
-        const int64_t first_idx = kvarn_index_cell(indices[token_base]);
+        const int64_t first_encoded = indices[token_base];
+        const int64_t first_idx = kvarn_index_cell(first_encoded);
 
         for (int t = threadIdx.x; t < tokens_per_stream; t += blockDim.x) {
-            const int64_t idx = kvarn_index_cell(indices[token_base + t]);
+            const int64_t encoded = indices[token_base + t];
+            const int64_t idx = kvarn_index_cell(encoded);
             const int64_t prev = t > 0 ? kvarn_index_cell(indices[token_base + t - 1]) : idx;
             const bool continues = t == 0 || idx == prev + 1;
             const bool next_group = t > 0 && idx > prev &&
                     prev % KVAR_N_DIM == KVAR_N_DIM - 1 && idx % KVAR_N_DIM == 0;
             const int group_global = (int) (idx / KVAR_N_DIM);
             const int first_group_global = (int) (first_idx / KVAR_N_DIM);
-            const int stream = swa ? 0 : group_global / groups_per_stream;
-            const int first_stream = swa ? 0 : first_group_global / groups_per_stream;
+            const int stream = swa ? kvarn_swa_stream(encoded) : group_global / groups_per_stream;
+            const int first_stream = swa ? kvarn_swa_stream(first_encoded) : first_group_global / groups_per_stream;
             const bool allowed_jump = next_group && !swa && eager_records;
             if ((!continues && !allowed_jump) || stream != first_stream) {
                 atomicExch(&valid, 0);
@@ -1415,12 +1425,13 @@ static __global__ void kvarn_store_workspace_validate_kernel(
 
         if (threadIdx.x == 0 && valid != 0) {
             const int first_group_global = (int) (first_idx / KVAR_N_DIM);
-            const int stream = swa ? 0 : first_group_global / groups_per_stream;
+            const int stream = swa ? kvarn_swa_stream(first_encoded) : first_group_global / groups_per_stream;
             const int first_group = swa ? first_group_global : first_group_global - stream * groups_per_stream;
             const int first_pos = (int) (first_idx % KVAR_N_DIM);
-            const int64_t last_idx = kvarn_index_cell(indices[token_base + tokens_per_stream - 1]);
+            const int64_t last_encoded = indices[token_base + tokens_per_stream - 1];
+            const int64_t last_idx = kvarn_index_cell(last_encoded);
             const int last_group_global = (int) (last_idx / KVAR_N_DIM);
-            const int last_stream = swa ? 0 : last_group_global / groups_per_stream;
+            const int last_stream = swa ? kvarn_swa_stream(last_encoded) : last_group_global / groups_per_stream;
             if (stream < 0 || stream >= n_stream ||
                     first_group < 0 || (!swa && first_group >= groups_per_stream) ||
                     first_pos < 0 || first_pos >= KVAR_N_DIM ||
@@ -1466,7 +1477,8 @@ static __global__ void kvarn_store_workspace_flush_kernel(
         return;
     }
 
-    const int64_t first_idx = kvarn_index_cell(indices[token_base]);
+    const int64_t first_encoded = indices[token_base];
+    const int64_t first_idx = kvarn_index_cell(first_encoded);
     const int64_t last_idx = kvarn_index_cell(indices[token_base + tokens_per_stream - 1]);
     const bool contiguous = last_idx == first_idx + tokens_per_stream - 1;
     if (!contiguous && (swa || !eager_records)) {
@@ -1474,7 +1486,7 @@ static __global__ void kvarn_store_workspace_flush_kernel(
     }
 
     const int first_group_global = (int) (first_idx / KVAR_N_DIM);
-    const int stream = swa ? 0 : first_group_global / groups_per_stream;
+    const int stream = swa ? kvarn_swa_stream(first_encoded) : first_group_global / groups_per_stream;
     const int first_group = swa ? first_group_global : first_group_global - stream * groups_per_stream;
     const int first_pos = (int) (first_idx % KVAR_N_DIM);
     if (stream < 0 || stream >= n_stream || first_group < 0 || (!swa && first_group >= groups_per_stream) || first_pos < 0) {
@@ -1576,11 +1588,17 @@ static __global__ void kvarn_store_workspace_flush_kernel(
     const int flush_group_global = stream * groups_per_stream + record_group;
     int source_stage_slot = swa ? record_group % stage_groups :
             1 + ((record_group - 1) % tail_groups);
-    const int first_store_token = flush_start > start_local ? flush_start - start_local : 0;
-    if (first_store_token < tokens_per_stream) {
-        const int64_t first_store_encoded = indices[token_base + first_store_token];
-        if (kvarn_index_cell(first_store_encoded) / KVAR_N_DIM == flush_group_global) {
-            const int assigned_slot = kvarn_index_stage_slot(first_store_encoded);
+    // Delayed sealing reads the slot that the boundary group is about to
+    // reuse, not the flushed group's modulo slot. Host stage assignments are
+    // stable for live groups but need not follow that modulo mapping.
+    const int source_group = eager_records ? record_group : record_group + tail_groups;
+    const int source_start = source_group * KVAR_N_DIM;
+    const int source_token = source_start > start_local ? source_start - start_local : 0;
+    if (source_token < tokens_per_stream) {
+        const int64_t source_encoded = indices[token_base + source_token];
+        const int source_group_global = stream * groups_per_stream + source_group;
+        if (kvarn_index_cell(source_encoded) / KVAR_N_DIM == source_group_global) {
+            const int assigned_slot = kvarn_index_stage_slot(source_encoded);
             if (assigned_slot >= 0) {
                 source_stage_slot = assigned_slot;
             }
@@ -1640,7 +1658,7 @@ static __global__ void kvarn_store_workspace_commit_kernel(
             continue;
         }
         const int group_global = int(idx / KVAR_N_DIM);
-        const int stream = swa ? 0 : group_global / groups_per_stream;
+        const int stream = swa ? kvarn_swa_stream(encoded) : group_global / groups_per_stream;
         const int group = swa ? group_global : group_global - stream * groups_per_stream;
         if (stream < 0 || stream >= n_stream || group < 0 ||
                 (!swa && group >= groups_per_stream)) {
@@ -1697,9 +1715,6 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     GGML_ASSERT(n_stream > 0);
     GGML_ASSERT(records->ne[2] % n_stream == 0);
     const int groups_per_stream = (int) (records->ne[2] / n_stream);
-    if (swa) {
-        GGML_ASSERT(n_stream == 1 && "SWA KVarN ring requires a single stream");
-    }
     size_t smpbo = ggml_cuda_info().devices[ctx.device].smpbo;
     if (std::getenv("GGML_KVARN_TEST_FORCE_LOWSHMEM") != nullptr) {
         smpbo = std::min(smpbo, (size_t) KVAR_N_LOWSHMEM_BYTES);
@@ -2125,7 +2140,7 @@ static __global__ void kvarn_materialize_live_kernel(
         bool explicitly_staged;
         const int64_t idx = kvarn_read_cell(encoded, read_indirect, swa, explicitly_staged);
         const int64_t group_global = idx / KVAR_N_DIM;
-        const int idx_stream = swa ? stream : int(group_global / groups_per_stream);
+        const int idx_stream = swa ? kvarn_swa_stream(encoded) : int(group_global / groups_per_stream);
         if (idx_stream != stream) {
             continue;
         }
@@ -2188,7 +2203,8 @@ static __global__ void kvarn_materialize_kernel(
     }
     extern __shared__ float shared_rows[];
     float values[4] = {};
-    const int64_t encoded = (swa || read_indirect) ? indices[cell] : cell;
+    const int64_t encoded = swa ? indices[int64_t(stream_start + out_stream) * n_kv + cell] :
+        (read_indirect ? indices[cell] : cell);
     if (encoded != -1) {
         bool explicitly_staged;
         int assigned_slot = -1;

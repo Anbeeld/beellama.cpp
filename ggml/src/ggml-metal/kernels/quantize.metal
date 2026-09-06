@@ -296,7 +296,7 @@ kernel void kernel_get_rows_f(
     auto pdst = (      device T  *) ((      device char *)  dst + i12*args.nb3  + i11*args.nb2  + i10*args.nb1);
 
     for (int ind = iw0*ntg.x + tiitg; ind < args.ne00t;) {
-        pdst[ind] = psrc[ind];
+        pdst[ind] = (T) psrc[ind];
 
         break;
     }

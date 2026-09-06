@@ -117,6 +117,7 @@ struct clip_encode_params {
     const std::vector<uint8_t> * state_in  = nullptr; // state from previous call, null or wrong size means cold start
     std::vector<uint8_t> *       state_out = nullptr; // state for the next call
 };
+size_t clip_set_n_threads(const std::vector<ggml_backend_t> & backends, int n_threads);
 bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params);
 
 bool clip_is_llava(const struct clip_ctx * ctx);

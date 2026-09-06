@@ -278,31 +278,39 @@ bool ggml_cuda_flash_attn_ext_kvarn(
 
 #else
 
+static constexpr int GGML_CUDA_FATTN_KVARN_DESCS_THREADS = 1024;
+
 static __device__ __forceinline__ int ggml_cuda_fattn_kvarn_live_index_for_thread(
         const int64_t * indices,
         const int n_indices,
         const int stream,
         const int groups_per_stream,
         const bool swa,
-        const bool read_indirect) {
+        const bool read_indirect,
+        const bool single_stream) {
     int live_index = 0;
-    for (int i = threadIdx.x; i < n_indices; i += blockDim.x) {
-        const int64_t encoded = indices[i];
-        GGML_UNUSED(read_indirect);
-        const uint64_t payload = uint64_t(encoded < -1 ? -(encoded + 2) : encoded);
-        const int64_t idx = int64_t(uint32_t(payload));
-        if (swa) {
+    GGML_UNUSED(read_indirect);
+    if (swa || single_stream) {
+        for (int i = threadIdx.x; i < n_indices; i += blockDim.x) {
+            const int64_t encoded = indices[i];
+            const uint64_t payload = uint64_t(encoded < -1 ? -(encoded + 2) : encoded);
+            const int64_t idx = int64_t(uint32_t(payload));
             if (idx >= 0) {
                 live_index = max(live_index, (int) idx);
             }
-        } else {
-            const int group_global = (int) (idx / GGML_CUDA_FATTN_KVARN_DIM);
-            const int idx_stream = group_global / groups_per_stream;
-            if (idx_stream == stream) {
-                const int local_index = (group_global - stream * groups_per_stream) *
-                    GGML_CUDA_FATTN_KVARN_DIM + (int) (idx % GGML_CUDA_FATTN_KVARN_DIM);
-                live_index = max(live_index, local_index);
-            }
+        }
+        return live_index;
+    }
+    for (int i = threadIdx.x; i < n_indices; i += blockDim.x) {
+        const int64_t encoded = indices[i];
+        const uint64_t payload = uint64_t(encoded < -1 ? -(encoded + 2) : encoded);
+        const int64_t idx = int64_t(uint32_t(payload));
+        const int group_global = (int) (idx / GGML_CUDA_FATTN_KVARN_DIM);
+        const int idx_stream = group_global / groups_per_stream;
+        if (idx_stream == stream) {
+            const int local_index = (group_global - stream * groups_per_stream) *
+                GGML_CUDA_FATTN_KVARN_DIM + (int) (idx % GGML_CUDA_FATTN_KVARN_DIM);
+            live_index = max(live_index, local_index);
         }
     }
     return live_index;
@@ -353,15 +361,17 @@ static __global__ void ggml_cuda_fattn_kvarn_init_descs_kernel(
 
     const int k_stream = k_stream_start + out_stream;
     const int v_stream = v_stream_start + out_stream;
-    __shared__ int k_partial[GGML_CUDA_FATTN_KVARN_DIM];
-    __shared__ int v_partial[GGML_CUDA_FATTN_KVARN_DIM];
+    __shared__ int k_partial[GGML_CUDA_FATTN_KVARN_DESCS_THREADS];
+    __shared__ int v_partial[GGML_CUDA_FATTN_KVARN_DESCS_THREADS];
     k_partial[threadIdx.x] = ggml_cuda_fattn_kvarn_live_index_for_thread(
-        k_indices, k_n_indices, k_stream, k_groups_per_stream, k_swa, k_read_indirect);
+        k_indices, k_n_indices, k_stream, k_groups_per_stream, k_swa, k_read_indirect,
+        n_stream == 1 && k_stream == 0);
     v_partial[threadIdx.x] = ggml_cuda_fattn_kvarn_live_index_for_thread(
-        v_indices, v_n_indices, v_stream, v_groups_per_stream, v_swa, v_read_indirect);
+        v_indices, v_n_indices, v_stream, v_groups_per_stream, v_swa, v_read_indirect,
+        n_stream == 1 && v_stream == 0);
     __syncthreads();
 
-    for (int stride = GGML_CUDA_FATTN_KVARN_DIM / 2; stride > 0; stride >>= 1) {
+    for (int stride = GGML_CUDA_FATTN_KVARN_DESCS_THREADS / 2; stride > 0; stride >>= 1) {
         if (threadIdx.x < stride) {
             k_partial[threadIdx.x] = max(k_partial[threadIdx.x], k_partial[threadIdx.x + stride]);
             v_partial[threadIdx.x] = max(v_partial[threadIdx.x], v_partial[threadIdx.x + stride]);
@@ -425,7 +435,7 @@ void ggml_cuda_fattn_kvarn_init_descs(
         int k_original_domain,
         int v_original_domain,
         cudaStream_t stream) {
-    ggml_cuda_fattn_kvarn_init_descs_kernel<<<plan.n_stream, GGML_CUDA_FATTN_KVARN_DIM, 0, stream>>>(
+    ggml_cuda_fattn_kvarn_init_descs_kernel<<<plan.n_stream, GGML_CUDA_FATTN_KVARN_DESCS_THREADS, 0, stream>>>(
         (const uint8_t *) plan.k.records->data,
         (const half *) plan.k.stage->data,
         (const int64_t *) plan.k.indices->data,
@@ -608,6 +618,8 @@ static bool ggml_cuda_flash_attn_ext_kvarn_vec_d(
     const size_t meta_count = (size_t) plan.n_stream * n_q_heads * n_splits;
     ggml_cuda_pool_alloc<float> partial(pool, partial_count);
     ggml_cuda_pool_alloc<float2> partial_meta(pool, meta_count);
+    CUDA_CHECK(cudaMemsetAsync(partial_meta.get(), 0,
+            meta_count * sizeof(float2), stream));
     ggml_cuda_kv_memory_transient_stats_record_kvarn(
             k_desc.actual_size + v_desc.actual_size,
             partial.actual_size,
@@ -710,6 +722,9 @@ static bool ggml_cuda_flash_attn_ext_kvarn_decode_supported(
     if (sinks != nullptr || max_bias != 0.0f) {
         return false;
     }
+    if (Q->ne[1] > 1 && dst->src[3] == nullptr) {
+        return false;
+    }
     if (Q->ne[2] % plan.n_kv_heads != 0) {
         return false;
     }
@@ -766,6 +781,8 @@ static bool ggml_cuda_flash_attn_ext_kvarn_decode_d(
     const size_t meta_count = (size_t) plan.n_stream * n_q_heads * n_q * n_splits;
     ggml_cuda_pool_alloc<float> partial(pool, partial_count);
     ggml_cuda_pool_alloc<float2> partial_meta(pool, meta_count);
+    CUDA_CHECK(cudaMemsetAsync(partial_meta.get(), 0,
+            meta_count * sizeof(float2), stream));
     ggml_cuda_kv_memory_transient_stats_record_kvarn(
             k_desc.actual_size + v_desc.actual_size,
             partial.actual_size,
@@ -777,11 +794,12 @@ static bool ggml_cuda_flash_attn_ext_kvarn_decode_d(
             "CUDA_FA_ROUTE_EXEC_DISPATCH kernel=KVARN_DECODE_SPLIT "
             "Q=[%lld,%lld,%lld,%lld] bits=[%d,%d] n_kv=%d n_kv_heads=%d n_stream=%d "
             "gqa=%d gqa_blocks=%d max_gqa=%d n_splits=%d split_tokens=%d nwarps=%d "
-            "active_blocks_per_sm=%d wave_efficiency=%d waves=%d\n",
+            "active_blocks_per_sm=%d wave_efficiency=%d waves=%d q_tile=%d\n",
             (long long) Q->ne[0], (long long) Q->ne[1], (long long) Q->ne[2], (long long) Q->ne[3],
             plan.k.bits, plan.v.bits, plan.n_kv, plan.n_kv_heads, plan.n_stream,
             gqa_ratio, n_gqa_blocks, gqa_per_block, n_splits, split_tokens, geometry.nwarps,
-            geometry.max_blocks_per_sm, geometry.wave_efficiency_percent, geometry.n_waves);
+            geometry.max_blocks_per_sm, geometry.wave_efficiency_percent, geometry.n_waves,
+            geometry.q_tile > 0 ? geometry.q_tile : 1);
         fflush(stderr);
     }
 
@@ -814,6 +832,7 @@ static bool ggml_cuda_flash_attn_ext_kvarn_decode_d(
     args.n_splits = n_splits;
     args.split_tokens = split_tokens;
     args.nwarps = geometry.nwarps;
+    args.q_tile = geometry.q_tile > 0 ? geometry.q_tile : 1;
     args.wave_size = ggml_cuda_info().devices[ctx.device].warp_size;
     args.stream = stream;
 
@@ -901,7 +920,9 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols1(ggml_backend_cuda_c
 }
 
 template <int DKQ, int DV>
-static bool ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+static bool ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols2(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool & wide_mma) {
+    GGML_UNUSED(wide_mma); // The MUSA build does not instantiate the wide case.
     const ggml_tensor * KQV  = dst;
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
@@ -921,7 +942,8 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols2(ggml_backend_cuda_c
         if (use_gqa_opt && use_wide_shape &&
             ggml_cuda_fattn_kvarn_mma_case_eligible<DKQ, DV, 16, 8>(ctx) &&
             ggml_cuda_fattn_kvarn_wide_mma_supported<DKQ, DV, 16, 8>(ctx, dst)) {
-            return ggml_cuda_flash_attn_ext_mma_kvarn_launch_case<DKQ, DV, 16, 8>(ctx, dst);
+            wide_mma = ggml_cuda_flash_attn_ext_mma_kvarn_launch_case<DKQ, DV, 16, 8>(ctx, dst);
+            return wide_mma;
         }
     }
 #endif
@@ -941,20 +963,22 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols2(ggml_backend_cuda_c
     return ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols1<DKQ, DV, 1>(ctx, dst);
 }
 
-static bool ggml_cuda_flash_attn_ext_mma_kvarn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+static bool ggml_cuda_flash_attn_ext_mma_kvarn(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool & wide_mma) {
+    wide_mma = false;
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * V = dst->src[2];
 
     switch (Q->ne[0]) {
         case 128:
             GGML_ASSERT(V->ne[0] == 128);
-            return ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols2<128, 128>(ctx, dst);
+            return ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols2<128, 128>(ctx, dst, wide_mma);
         case 256:
             GGML_ASSERT(V->ne[0] == 256);
-            return ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols2<256, 256>(ctx, dst);
+            return ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols2<256, 256>(ctx, dst, wide_mma);
         case 512:
             GGML_ASSERT(V->ne[0] == 512);
-            return ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols2<512, 512>(ctx, dst);
+            return ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols2<512, 512>(ctx, dst, wide_mma);
         default:
             GGML_ABORT("unsupported KVarN native FlashAttention head_dim");
     }
@@ -1043,7 +1067,8 @@ static void ggml_cuda_fattn_kvarn_debug_route(
         const ggml_tensor * dst,
         ggml_cuda_fattn_kvarn_entry_path entry_path,
         const char * route,
-        const char * fallback_reason) {
+        const char * fallback_reason,
+        const bool wide_mma = false) {
     if (!ggml_cuda_fattn_kvarn_debug_routes_enabled()) {
         return;
     }
@@ -1056,7 +1081,7 @@ static void ggml_cuda_fattn_kvarn_debug_route(
     std::fprintf(stderr,
         "kvarn-route backend=%s cc=%d wave=%d D=%d k=%d v=%d gqa=%d nq=%d nkv=%d "
         "domain=%s tail_type=%s tail_history=%d tail_current=%d "
-        "route=%s entry=%s fallback=%s\n",
+        "route=%s entry=%s fallback=%s wide_mma=%d\n",
 #if defined(GGML_USE_MUSA)
         "MUSA",
 #elif defined(GGML_USE_HIP)
@@ -1070,7 +1095,7 @@ static void ggml_cuda_fattn_kvarn_debug_route(
         k_tail != nullptr ? int(k_tail->ne[1]) : 0,
         k_tail_current != nullptr ? int(k_tail_current->ne[1]) : 0, route,
         entry_path == GGML_CUDA_FATTN_KVARN_ENTRY_COMPACT_TAIL ? "compact-tail" : "direct",
-        fallback_reason != nullptr ? fallback_reason : "none");
+        fallback_reason != nullptr ? fallback_reason : "none", int(wide_mma));
 }
 
 bool ggml_cuda_flash_attn_ext_kvarn(
@@ -1122,6 +1147,7 @@ bool ggml_cuda_flash_attn_ext_kvarn(
         int(Q->ne[0]), int(Q->ne[1]), gqa, plan.k.bits, plan.v.bits,
         plan.k.swa && plan.v.swa, dst->src[8] != nullptr,
         vector_eligible, split_eligible, prompt_prefill,
+        GGML_CUDA_FATTN_KVARN_SPLIT_DEFAULT_MAX_Q,
     });
 
     if (route == GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_VECTOR) {
@@ -1154,8 +1180,9 @@ bool ggml_cuda_flash_attn_ext_kvarn(
     const bool portable_supported = capabilities.portable_native &&
         ggml_cuda_fattn_kvarn_portable_supported(plan, dst);
     bool generic_shape_supported = false;
+    bool wide_mma = false;
     if (capabilities.generic_mma) {
-        generic_shape_supported = ggml_cuda_flash_attn_ext_mma_kvarn(ctx, dst);
+        generic_shape_supported = ggml_cuda_flash_attn_ext_mma_kvarn(ctx, dst, wide_mma);
         if (!generic_shape_supported) {
             g_kvarn_route_generic_shape_rejected.fetch_add(1, std::memory_order_relaxed);
         }
@@ -1176,7 +1203,7 @@ bool ggml_cuda_flash_attn_ext_kvarn(
         ggml_cuda_fattn_kvarn_debug_route(
             ctx.device, plan, dst, entry_path,
             prompt_prefill ? "prompt-generic-mma" : "generic-mma",
-            split_eligible ? "split-geometry-rejected" : nullptr);
+            split_eligible ? "split-geometry-rejected" : nullptr, wide_mma);
         return true;
     }
 

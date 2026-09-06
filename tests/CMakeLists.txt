@@ -4,6 +4,12 @@ find_package(Python3 COMPONENTS Interpreter QUIET)
 
 if (Python3_Interpreter_FOUND)
     add_test(
+        NAME test-save-load-state-result-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-save-load-state-result-static.py)
+    set_property(TEST test-save-load-state-result-static PROPERTY LABELS main)
+
+    add_test(
         NAME test-release-workflow-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-release-workflow-static.py)
@@ -26,6 +32,12 @@ if (Python3_Interpreter_FOUND)
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-backend-ops-seed-static.py)
     set_property(TEST test-backend-ops-seed-static PROPERTY LABELS main)
+
+    add_test(
+        NAME test-metal-low-bit-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-metal-low-bit-static.py)
+    set_property(TEST test-metal-low-bit-static PROPERTY LABELS main)
 
     add_test(
         NAME test-arm-cpu-feats-static
@@ -105,6 +117,20 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-upstream-merge-keepers-static.py)
     set_property(TEST test-upstream-merge-keepers-static PROPERTY LABELS main)
 
+    foreach(meta_static_test IN ITEMS
+            meta-context-headroom
+            meta-gqa-split
+            meta-softmax-split
+            meta-host-boundary
+            dflash2-selector-placement
+            windows-meta-stack)
+        add_test(
+            NAME test-${meta_static_test}-static
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-${meta_static_test}-static.py)
+        set_property(TEST test-${meta_static_test}-static PROPERTY LABELS main)
+    endforeach()
+
     add_test(
         NAME test-kvarn-eager-workspace-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
@@ -118,10 +144,34 @@ if (Python3_Interpreter_FOUND)
     set_property(TEST test-kvarn-rollback-static PROPERTY LABELS main)
 
     add_test(
+        NAME test-kvarn-mtp-sharing-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-kvarn-mtp-sharing-static.py)
+    set_property(TEST test-kvarn-mtp-sharing-static PROPERTY LABELS main)
+
+    add_test(
+        NAME test-kvarn-fit-fail-closed-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-kvarn-fit-fail-closed-static.py)
+    set_property(TEST test-kvarn-fit-fail-closed-static PROPERTY LABELS main)
+
+    add_test(
+        NAME test-kvarn-port-safety-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-kvarn-port-safety-static.py)
+    set_property(TEST test-kvarn-port-safety-static PROPERTY LABELS cuda)
+
+    add_test(
         NAME test-kvarn-hip-tail-capability-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-kvarn-hip-tail-capability-static.py)
     set_property(TEST test-kvarn-hip-tail-capability-static PROPERTY LABELS hip)
+
+    add_test(
+        NAME test-cuda-binary-equivalence
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-cuda-binary-equivalence.py)
+    set_property(TEST test-cuda-binary-equivalence PROPERTY LABELS cuda)
 
     add_test(
         NAME test-kvarn-hip-runtime-validation
@@ -279,6 +329,7 @@ if (LLAMA_LLGUIDANCE)
 endif ()
 
 llama_build(test-recurrent-state-rollback.cpp)
+llama_build(test-save-load-state.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
@@ -332,6 +383,18 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         LABEL main
         ARGS --test-mtp-ubatch-sync
     )
+    llama_test(
+        test-llama-archs
+        NAME test-mtp-request-reset
+        LABEL main
+        ARGS --test-mtp-request-reset
+    )
+    llama_test(
+        test-llama-archs
+        NAME test-mtp-kvarn-routing
+        LABEL main
+        ARGS --test-mtp-kvarn-routing
+    )
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
@@ -373,6 +436,15 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-recurrent-state-rollback-dsv4 PROPERTIES
         FIXTURES_REQUIRED generate-models
     )
+
+    # Test state save/load functionality across all architectures, using the generated dummy models
+    llama_test(
+        test-save-load-state
+        NAME test-save-load-state-archs
+        LABEL main
+        ARGS --models "${MODEL_DIR}"
+    )
+    set_tests_properties(test-save-load-state-archs PROPERTIES FIXTURES_REQUIRED generate-models)
 endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
@@ -481,8 +553,9 @@ llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 llama_build_and_test(test-state-restore-fragmented.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED test-download-model)
 
-# Test state save/load functionality
-llama_build_and_test(test-save-load-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
+# Bee regression test against the downloaded model; the upstream architecture
+# matrix is registered above against the same executable.
+llama_test(test-save-load-state LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 # QuantFactory packages the Apache-2.0 SmolLM2 base model at a pinned revision.

@@ -384,7 +384,19 @@ const llama_ubatch & llama_memory_hybrid_context::get_ubatch() const {
 }
 
 const llama_kv_cache_context * llama_memory_hybrid_context::get_attn() const {
-    return static_cast<const llama_kv_cache_context *>(ctx_attn.get());
+    auto * result = dynamic_cast<const llama_kv_cache_context *>(ctx_attn.get());
+    GGML_ASSERT(result != nullptr);
+    return result;
+}
+
+const llama_memory_context_i * llama_memory_hybrid_context::get_attn_memory_context() const {
+    return ctx_attn.get();
+}
+
+const llama_kv_cache_context * llama_memory_hybrid_context::get_attn_kv_context() const {
+    auto * result = dynamic_cast<const llama_kv_cache_context *>(ctx_attn.get());
+    GGML_ASSERT(result != nullptr);
+    return result;
 }
 
 const llama_memory_recurrent_context * llama_memory_hybrid_context::get_recr() const {

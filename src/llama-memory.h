@@ -223,6 +223,25 @@ struct llama_memory_i {
     virtual llama_memory_context_ptr init_kv_batch(const std::vector<llama_ubatch> & /* ubatches */) { return nullptr; }
 };
 
+inline llama_memory_i::seq_rm_capability llama_memory_suffix_rollback_capability(
+        bool has_compact_tail, bool suffix_unbounded, uint32_t bounded_tokens) {
+    if (!has_compact_tail) {
+        return {};
+    }
+    return {
+        /* .full_clear = */ true,
+        /* .arbitrary_ranges = */ false,
+        /* .suffix_rollback_tokens = */ suffix_unbounded ? UINT32_MAX : bounded_tokens,
+    };
+}
+
+inline llama_memory_i::seq_rm_capability llama_memory_clamp_suffix_rollback_capability(
+        llama_memory_i::seq_rm_capability capability, uint32_t max_tokens) {
+    capability.arbitrary_ranges = false;
+    capability.suffix_rollback_tokens = std::min(capability.suffix_rollback_tokens, max_tokens);
+    return capability;
+}
+
 inline bool llama_memory_seq_rm_plan_all(
         llama_seq_id seq_id, llama_pos p0, llama_pos p1,
         std::initializer_list<const llama_memory_i *> children,

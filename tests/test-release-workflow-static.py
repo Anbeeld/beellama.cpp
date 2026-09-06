@@ -35,6 +35,13 @@ def main() -> None:
         f"release workflows still pass removed GGML_HIP_ROCWMMA_FATTN: {stale_rocwmma}",
     )
 
+    cmake = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
+    for component, value in (("MAJOR", 0), ("MINOR", 4), ("PATCH", 5)):
+        require(
+            f"set(LLAMA_VERSION_{component} {value})" in cmake,
+            f"v0.4.5 release metadata has the wrong {component.lower()} version",
+        )
+
     release = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
     preview_dispatch = (WORKFLOWS / "release-preview-dispatch.yml").read_text(encoding="utf-8")
     stable_dispatch = (WORKFLOWS / "release-dispatch.yml").read_text(encoding="utf-8")

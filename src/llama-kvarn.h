@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama.h"
+#include "llama-arch.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -34,6 +35,17 @@ constexpr uint32_t llama_kvarn_decode_cell(int64_t index) {
 constexpr int32_t llama_kvarn_decode_stage_slot(int64_t index) {
     const uint32_t encoded = uint32_t(llama_kvarn_index_payload(index) >> 32u);
     return encoded == 0 ? -1 : int32_t(encoded - 1u);
+}
+
+// SWA indices retain the absolute position in the low word and identify the
+// independent KV stream in the high word. SWA never uses explicit stage-slot
+// encoding, so the two representations cannot collide within one operation.
+constexpr int64_t llama_kvarn_encode_swa_position(uint32_t stream, uint32_t pos) {
+    return int64_t(uint64_t(stream) << 32u | uint64_t(pos));
+}
+
+constexpr uint32_t llama_kvarn_decode_swa_stream(int64_t index) {
+    return uint32_t(uint64_t(index) >> 32u);
 }
 
 struct llama_kvarn_type_desc {
@@ -70,8 +82,28 @@ struct llama_kvarn_runtime_requirements {
 enum llama_kvarn_iswa_policy {
     LLAMA_KVARN_ISWA_DISABLED,
     LLAMA_KVARN_ISWA_ALL_LAYERS,
-    LLAMA_KVARN_ISWA_STANDARD_SWA_FALLBACK,
 };
+
+enum llama_kvarn_context_route {
+    LLAMA_KVARN_CONTEXT_ROUTE_OWNED,
+    LLAMA_KVARN_CONTEXT_ROUTE_SHARED_TARGET,
+    LLAMA_KVARN_CONTEXT_ROUTE_UNSUPPORTED,
+};
+
+struct llama_kvarn_context_traits {
+    llama_context_type ctx_type;
+    llm_arch arch;
+    bool has_ctx_other;
+    bool dflash_has_dspark_head;
+    bool dflash_has_selector;
+};
+
+llama_kvarn_context_route llama_kvarn_context_route_for(
+        const llama_kvarn_context_traits & traits);
+
+llama_kvarn_context_route llama_kvarn_context_route_for(
+        llama_context_type ctx_type,
+        llm_arch arch);
 
 llama_kvarn_iswa_policy llama_kvarn_iswa_policy_for(
         bool enabled,
@@ -92,6 +124,8 @@ struct llama_kvarn_attention_plan {
     bool native_attention;
     enum ggml_flash_attn_ext_kvarn_domain domain;
 };
+
+bool llama_kvarn_native_attention_allowed(bool causal_attn, llm_arch arch);
 
 llama_kvarn_attention_plan llama_kvarn_plan_attention(
         bool native_attention,
@@ -146,6 +180,16 @@ bool llama_kvarn_reconcile_stage_slots(
         uint32_t stage_slot_capacity,
         std::vector<int32_t> & group_slots);
 
+// Selects the most recent physical groups for every logical sequence from a
+// flat [sequence][group] matrix of maximum logical positions. Group zero
+// participates in recency selection but has a permanent stage slot, so it is
+// omitted from the returned assignable group set.
+std::vector<uint32_t> llama_kvarn_live_stage_groups(
+        const std::vector<llama_pos> & latest_by_seq_group,
+        uint32_t n_seq,
+        uint32_t n_groups,
+        uint32_t retained_per_seq);
+
 std::vector<llama_kvarn_state_stage_cell> llama_kvarn_select_state_stage_cells(
         const std::vector<uint32_t> & source_cells,
         uint32_t live_cell_max_p1,
@@ -160,14 +204,15 @@ std::vector<uint32_t> llama_kvarn_select_state_record_groups(
         const std::vector<llama_kvarn_state_stage_cell> & stage_cells,
         uint32_t groups_per_stream);
 
-// Builds the dense physical-cell index used by KVarN attention. Unified record
+// Builds the physical-cell index used by KVarN attention. Unified record
 // ownership can leave holes in the physical arena; those holes are storage
 // ownership, not attention rows.
 std::vector<int64_t> llama_kvarn_compact_read_plan(
         const std::vector<uint32_t> & occupied_cells,
         const std::vector<uint32_t> & pending_cells,
         uint32_t capacity,
-        uint32_t padding);
+        uint32_t padding,
+        uint32_t group_align = 0);
 
 template<typename SeqPosMax>
 bool llama_kvarn_stream_is_exclusive_for(

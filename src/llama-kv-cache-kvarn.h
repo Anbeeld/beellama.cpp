@@ -88,7 +88,8 @@ public:
     llama_kv_cache_kvarn_context(
             llama_kv_cache_kvarn * cache,
             llama_memory_context_ptr base,
-            llama_context * update_lctx = nullptr);
+            llama_context * update_lctx = nullptr,
+            std::vector<int32_t> shared_graph_layers = {});
 
     bool next() override;
     bool apply() override;
@@ -101,6 +102,8 @@ public:
     uint32_t get_n_kv() const override;
     llama_kv_cache * get_kv() const override;
     const llama_kv_cache::slot_info & current_sinfo() const override;
+    const slot_info_vec_t & get_sinfos() const override;
+    void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const override;
 
     ggml_type type_k() const override;
     ggml_type type_v() const override;
@@ -136,6 +139,7 @@ public:
     bool native_attention_uses_original_v(int32_t il) const;
     uint32_t native_rotated_max_query_tokens(int32_t il) const;
     bool uses_compact_read_indices() const;
+    bool uses_materialization_indices() const;
 
     // SWA sliding-window ring: per-cell absolute positions for KVarN reads.
     // Built as a graph input sized [n_kv]; set on the host from cells.pos_get(cell).
@@ -190,10 +194,14 @@ public:
 
 private:
     llama_kv_cache_context * base() const;
+    int32_t graph_layer_for(int32_t il) const;
+    bool uses_shared_live_indices() const;
     const std::vector<int64_t> & compact_read_plan() const;
+    std::vector<int64_t> shared_live_indices() const;
 
     llama_kv_cache_kvarn * cache;
     llama_memory_context_ptr base_ctx;
+    std::vector<int32_t> shared_graph_layers;
     mutable std::vector<int64_t> compact_read_plan_cache;
     llama_context * update_lctx;
 
@@ -271,8 +279,14 @@ public:
     bool state_seq_can_restore(llama_seq_id seq_id, llama_state_seq_flags flags) const override;
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read(llama_io_read_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
+    void state_read_sinfo(
+            llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags,
+            llama_kv_cache::slot_info_vec_t * sinfos_out,
+            const llama_kv_cache::slot_info_vec_t * sinfos_in);
 
     llama_kv_cache * get_metadata_cache() const;
+    ggml_tensor * get_materialization_source(int32_t il, bool value) const;
+    std::unique_ptr<llama_kv_cache> make_shared_metadata_cache(const llama_model & model_view) const;
     int32_t mapped_layer_id(int32_t il) const;
     llama_kv_tail_route get_tail_route(int32_t il) const;
     bool get_tail_explicit_bias(int32_t il) const;
@@ -322,7 +336,8 @@ public:
             uint32_t n_kv,
             const llama_kv_cache::slot_info & sinfo,
             bool value,
-            ggml_tensor * mat_idxs = nullptr) const;
+            ggml_tensor * mat_idxs = nullptr,
+            bool read_indirect = true) const;
     ggml_tensor * get_tail(ggml_context * ctx, int32_t il, bool value) const;
     ggml_tensor * store_tail(
             ggml_context * ctx, ggml_tensor * current, ggml_tensor * indices,

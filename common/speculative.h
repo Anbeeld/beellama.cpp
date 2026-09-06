@@ -29,9 +29,18 @@ int32_t common_speculative_n_max(const common_params_speculative * spec);
 // return the max number of draft tokens from the initialized implementations
 int32_t common_speculative_n_max(const common_speculative * spec);
 
+// Resolve the model-declared DFlash block-attention policy. DFlash defaults to
+// non-causal when the optional metadata key is absent.
+bool common_speculative_dflash_causal_attn(const llama_model * model);
+
 // Bee's variable-depth adaptive draft-max is limited to the original DFlash path.
 bool common_speculative_dflash_adaptive_dm_supported(int32_t selector_top_k);
+bool common_speculative_dflash_backend_sampling_allowed(
+        bool requested, int32_t target_device_count, bool is_dflash2);
 bool common_speculative_adaptive_dm_supported(const common_speculative * spec);
+
+// True when a model-backed draft context is a non-owning view of target KV state.
+bool common_speculative_draft_memory_is_shared(const common_speculative * spec);
 
 // validate and resolve the unconditional synthetic acceptance rates
 std::vector<double> common_speculative_synth_rates_resolve(const common_params_speculative * spec, int32_t n_max);
@@ -39,6 +48,7 @@ std::vector<double> common_speculative_synth_rates_resolve(const common_params_s
 // return the conditional synthetic acceptance probabilities
 const std::vector<double> & common_speculative_get_synth_probs(const common_speculative * spec);
 
+void common_validate_draft_kvarn_mode(const common_params_speculative & params);
 common_params common_base_params_to_speculative(const common_params & params);
 
 struct common_speculative_output_limits {

@@ -63,6 +63,19 @@ def main() -> None:
     assert "/*.stage_slots =*/ { }" in initializer, (
         "slot_info aggregate initialization must include stage_slots so warning-as-error GCC/Clang builds remain valid"
     )
+    assert "/*.group_stage_slots =*/ { }" in initializer, (
+        "slot_info aggregate initialization must include the complete structured-stage assignment"
+    )
+    assert "ubatch.pos[0] == cells.seq_pos_max(0) + 1" in allocation, (
+        "single-sequence monotonic decode must avoid rebuilding metadata across the full cache"
+    )
+    assert "fast.group_stage_slots = std::move(stage_slots)" in allocation, (
+        "the fast allocator must carry its reconciled host-assigned stage slots into mutation"
+    )
+    apply = function_body(allocation_source, "void llama_kv_cache::apply_ubatch(")
+    assert "allocation_group_stage_slots = sinfo.group_stage_slots" in apply, (
+        "cache mutation must commit the allocator's complete stage assignment without a second full scan"
+    )
 
 
 if __name__ == "__main__":

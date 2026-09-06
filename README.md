@@ -13,8 +13,10 @@ BeeLlama.cpp (or just Bee) is a performance-focused llama.cpp fork for squeezing
 - **Variance-normalized KV-cache quantization (KVarN)**: provides higher precision at similar memory costs. Independent K and V bit widths at `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`, `kvarn6`, and `kvarn8`, set with `--cache-type-k` and `--cache-type-v`.
 - **KV cache precision tail**: keep most of the KV cache quantized while storing recent tokens in F16/BF16, enabled with `--kv-tail-tokens`. A single global softmax merges the quantized body and the precision tail under FlashAttention, without materializing the whole cache.
 - **Standard low-bit KV cache types**: `q2_0`, `q2_1`, `q3_0`, `q3_1`, `q6_0`, and `q6_1`, usable for either target or draft caches alongside the upstream `q4`/`q5`/`q8` types.
-- **Adaptive draft-max for DFlash**: adjusts the active DFlash draft horizon at runtime instead of using a fixed `--spec-draft-n-max`, comparing speculative throughput against a no-spec baseline.
-- **Reasoning-loop protection**: the server detects repeated hidden reasoning output and intervenes.
+- **KVarN for speculative decoding**: compress supported owned MTP, DFlash, EAGLE3, and non-MLA DSpark caches independently of the target with `--spec-draft-type-k` and `--spec-draft-type-v`.
+- **Adaptive draft-max for DFlash**: adjusts the active draft horizon at runtime instead of using a fixed `--spec-draft-n-max`, comparing speculative throughput against a no-spec baseline.
+- **Reasoning-loop protection**: the server detects repeated hidden reasoning and visible output, forcing reasoning to close or stopping generation when a loop triggers.
+- **Reworked KV cache and prompt reuse**: transactional state restore, capability-aware speculative rollback, and reusable RAM snapshots. Cached prompts are selected by their safely restorable prefix, including with ordinary KV cache types.
 
 For the full feature and public-repo comparison, read [docs/beellama-features.md](docs/beellama-features.md). For the complete argument reference, read [docs/beellama-args.md](docs/beellama-args.md).
 
@@ -190,7 +192,9 @@ llama-server -m target.gguf --spec-type draft-dflash \
   --flash-attn on --cache-type-k q5_0 --cache-type-v q4_1
 ```
 
-Keep the draft context on a standard cache type; KVarN is target-cache only.
+DFlash1, DFlash2, and non-MLA DSpark can use an owned draft KVarN cache with
+`--spec-draft-type-k/v kvarnN`. Non-causal block attention retains compressed
+persistent storage and uses the qualified materialized attention route.
 
 ### KVarN Target Cache
 
@@ -200,6 +204,27 @@ llama-server -m model.gguf --flash-attn on \
   --cache-type-k kvarn5 --cache-type-v kvarn4 \
   --kv-tail-tokens 1024
 ```
+
+### KVarN Draft Cache
+
+Model-backed speculative modes with an owned cache—draft-simple, EAGLE3,
+audited Qwen MTP, DFlash1/DFlash2, and non-MLA DSpark—can select an independent
+KVarN draft cache:
+
+```sh
+llama-server -m target.gguf --spec-type draft-dflash \
+  --spec-draft-model dflash.gguf \
+  --spec-draft-type-k kvarn4 --spec-draft-type-v kvarn2
+```
+
+The target and draft cache types are independent. A one-sided draft KVarN
+selection promotes the other side to the same width with a warning. There is no
+draft precision-tail option: the explicit draft tail request stays zero and
+KVarN retains its intrinsic exact suffix of up to 128 tokens. The same draft
+K/V pair applies to full-attention and SWA sub-caches. Gemma 4 MTP shares the
+target cache, so configure target `--cache-type-k/v kvarn*` instead of a draft
+cache type. Unclassified or shared-cache MTP architectures reject explicit
+draft KVarN requests.
 
 ### Router Mode With Presets
 
@@ -212,6 +237,8 @@ llama-server --models-preset presets.ini
 
 - [BeeLlama features and public repo diff](docs/beellama-features.md)
 - [BeeLlama args reference](docs/beellama-args.md)
+- [Qwen3.6 DFlash quickstart](docs/quickstart-qwen36-dflash.md)
+- [Gemma 4 31B DFlash quickstart](docs/quickstart-gemma-4-31b-dflash.md)
 - [Build docs](docs/build.md)
 - [Server docs](tools/server/README.md)
 - [Docker docs](docs/docker.md)

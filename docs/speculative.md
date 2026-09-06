@@ -74,11 +74,34 @@ llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DFlash.gguf \
 
 `--spec-draft-n-max` is clamped to the draft model's trained block size.
 
+Model-backed speculative modes with owned draft caches—including draft-simple,
+EAGLE3, audited Qwen MTP, DFlash1/DFlash2, and non-MLA DSpark—may use KVarN:
+
+```bash
+llama-server -m target.gguf --spec-type draft-dflash \
+    --spec-draft-model dflash.gguf \
+    --spec-draft-type-k kvarn4 --spec-draft-type-v kvarn2 -fa on
+```
+
+The draft pair is independent of the target cache and applies to both
+full-attention and SWA draft layers. There is no draft precision-tail option;
+the explicit tail request stays zero and KVarN retains its intrinsic exact
+suffix of up to 128 tokens. Exact describes the stored K/V precision; the KVarN
+attention transform and speculative batch shape can still produce normal
+floating-point differences from an F16-cache run, including a different greedy
+choice when logits are nearly tied. Non-causal DFlash-family block attention uses
+materialized KVarN attention while the persistent draft cache remains compressed.
+
 See:
 
 - #22105
 
 ### DSpark (`draft-dspark`)
+
+Dense-attention DSpark drafts can use the owned KVarN route. DSV4/MLA DSpark
+fails closed because its latent cache is not a dense K/V cache. When a DSpark
+sidecar borrows target tensors, automatic memory fitting cannot safely measure
+an explicit KVarN draft context; pass `-fit off` and size placement explicitly.
 
 DSpark extends DFlash with a semi-autoregressive _Markov head_: the draft still emits a whole
 block per forward pass, but each block position's logits are biased by a low-rank term keyed on
@@ -291,11 +314,13 @@ Use exactly one of these options:
 ```
 --spec-draft-type-k, -ctkd, --cache-type-k-draft  TYPE
                                         KV cache data type for K for the draft model
-                                        allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1, q6_0, q6_1, q3_0, q3_1, q2_0, q2_1
+                                        allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1, q6_0, q6_1, q3_0, q3_1, q2_0, q2_1, kvarn2, kvarn3, kvarn4, kvarn5, kvarn6, kvarn8
+                                        KVarN values require one model-backed speculative mode with an owned draft KV cache
                                         (env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K)
 --spec-draft-type-v, -ctvd, --cache-type-v-draft  TYPE
                                         KV cache data type for V for the draft model
-                                        allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1, q6_0, q6_1, q3_0, q3_1, q2_0, q2_1
+                                        allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1, q6_0, q6_1, q3_0, q3_1, q2_0, q2_1, kvarn2, kvarn3, kvarn4, kvarn5, kvarn6, kvarn8
+                                        KVarN values require one model-backed speculative mode with an owned draft KV cache
                                         (env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V)
 --spec-draft-override-tensor, -otd, --override-tensor-draft  <tensor name pattern>=<buffer type>,...
                                         override tensor buffer type for draft model

@@ -1,6 +1,6 @@
-# BeeLlama v0.4.4 features
+# BeeLlama v0.4.5 features
 
-BeeLlama v0.4.4 keeps a small fork surface on top of upstream llama.cpp. Use
+BeeLlama v0.4.5 keeps a small fork surface on top of upstream llama.cpp. Use
 this page to choose a feature; use the [argument reference](beellama-args.md)
 for exact names, environment variables, defaults, and validation ranges.
 
@@ -130,8 +130,18 @@ reservation and zero cumulative per-context growth.
 
 ### Backend support and limitations
 
-KVarN is target-context-only. CUDA selects specialized descriptor-native
-FlashAttention on Turing and newer GPUs, then falls back to a portable
+KVarN supports target contexts and owned draft caches for draft-simple, EAGLE3,
+Qwen3.5/Qwen3.6 dense and MoE MTP, standalone Qwen3.8/Qwen4Exp MTP sidecars,
+DFlash1/DFlash2, and non-MLA DSpark. DSV4/MLA DSpark fails closed because its
+latent cache is incompatible with KVarN's dense K/V records. DFlash-family modes
+use one K/V pair for both
+full-attention and SWA sub-caches. Their non-causal block attention uses the
+materialized correctness route while persistent K/V remains compressed. Shared
+Gemma 4 MTP reads the target cache representation and does not allocate an
+independent draft record store. N-gram modes have no draft model cache and
+reject explicit draft KVarN selections during argument validation.
+CUDA selects specialized descriptor-native FlashAttention on Turing and newer
+GPUs, then falls back to a portable
 direct-record route when those matrix instructions are unavailable or the
 complete body-plus-tail request does not fit a specialized route. The portable
 CUDA route consumes rotated compressed records and attached F16 or BF16 tails
@@ -212,9 +222,14 @@ heap, including the valid high-pressure case where reported usage exceeds the
 current budget.
 
 Each selected layer must be owned by a backend that implements KVarN store and
-attention, or an explicitly supported materialization fallback. Unsupported or
-tensor-split placements fail closed; draft and auxiliary contexts use standard
-cache types.
+attention, or an explicitly supported materialization fallback. Unsupported
+placements fail closed. Explicit draft KVarN requires exactly one model-backed
+speculative mode with an owned draft cache; it never silently runs the ordinary
+quantized backing cache. CUDA is runtime-qualified for draft-simple, EAGLE3,
+audited Qwen MTP, DFlash1/DFlash2, and DSpark. DFlash is also qualified for
+two-device tensor-parallel target, draft, and combined placements on RTX 3090.
+HIP/ROCm, Vulkan, heterogeneous multi-GPU, and multimodal DFlash-family routes
+remain unqualified.
 
 ## Standard low-bit KV caches
 
@@ -227,15 +242,16 @@ FlashAttention vector coverage. Cache-facing `q2_0` is internally
 
 ### When to use them
 
-Use these types for draft caches, for target models that cannot use KVarN, or
-when a conventional quantized KV layout is easier to compare across backends.
+Use these types for shared or unsupported draft-cache routes, for target models
+that cannot use KVarN, or when a
+conventional quantized KV layout is easier to compare across backends.
 
 ### Key arguments
 
 - [`--cache-type-k`](beellama-args.md#kvarn-cache-types-and-swa-overrides)
 - [`--cache-type-v`](beellama-args.md#kvarn-cache-types-and-swa-overrides)
-- Upstream `--spec-draft-type-k`
-- Upstream `--spec-draft-type-v`
+- `--spec-draft-type-k` (including `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`, `kvarn6`, and `kvarn8` for supported owned model-backed speculative contexts)
+- `--spec-draft-type-v` (same values and routing rule)
 - [`GGML_CUDA_FA_ALL_QUANTS`](beellama-args.md#cuda-flashattention-build-policy)
 
 ### Measurement and validation

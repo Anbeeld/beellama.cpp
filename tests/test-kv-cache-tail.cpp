@@ -1,4 +1,5 @@
 #include "llama-kv-cache-tail.h"
+#include "llama-kv-cache-state.h"
 #include "llama-kv-cells.h"
 
 #include <cmath>
@@ -23,6 +24,14 @@ static llama_kv_tail_identity id(uint32_t cell, uint64_t generation = 1) {
 }
 
 int main() {
+    int ordinal_visits = 0;
+    const auto ordinals = llama_kv_cache_state_cell_ordinals(8, [&](uint32_t cell) {
+        ++ordinal_visits;
+        return cell == 1 || cell == 4 || cell == 7;
+    });
+    CHECK(ordinal_visits == 8);
+    CHECK(ordinals == std::vector<int32_t>({ -1, 0, -1, -1, 1, -1, -1, 2 }));
+
     const auto empty_slot_runs = llama_kv_tail_contiguous_slot_runs({});
     CHECK(empty_slot_runs.empty());
 

@@ -148,8 +148,11 @@ def main() -> None:
     )[1].split("llama_model * model = llama_model_load_from_file", 1)[0]
     if "common_fit_params(" not in fit_callsite:
         raise AssertionError("common init no longer invokes upstream parameter fitting")
-    if "fit_status" in fit_callsite or "failed to fit parameters with exact Bee validation" in fit_callsite:
+    if "fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS" in fit_callsite or \
+            "failed to fit parameters with exact Bee validation" in fit_callsite:
         raise AssertionError("common init hard-fails an advisory upstream fit conflict")
+    if "fit_status == COMMON_PARAMS_FIT_STATUS_UNSAFE_EXTRA" not in fit_callsite:
+        raise AssertionError("unsafe KVarN extra-context measurements do not fail closed")
 
     server_tests = (ROOT / "tests/test-server-prompt-checkpoint.cpp").read_text(encoding="utf-8")
     for regression in (
@@ -172,7 +175,7 @@ def main() -> None:
         raise AssertionError("standard exact-tail device restore does not use the device tensor protocol")
 
     state_v2_installer = state_cache_source.split(
-        "void llama_kv_cache::state_v2_read_payload_and_install(", 1
+        "llama_kv_cache::state_v2_read_payload_and_install(", 1
     )[1].split("void llama_kv_cache::state_write(", 1)[0]
     if "if (manifest.body_only)" not in state_v2_installer:
         raise AssertionError("v2 state restore does not distinguish an explicit body-only frame")
@@ -341,6 +344,8 @@ def main() -> None:
         raise AssertionError("standard cache must validate its realized meta split before allocating tail metadata/tensors")
     if "realized %s body uses a tensor/meta split buffer" in constructor:
         raise AssertionError("standard precision tails still reject a valid upstream tensor/meta owner")
+    if "for (const auto & [il, il_share] : shared_layer_ids)" in constructor:
+        raise AssertionError("C++17 code must not capture structured-binding names in the shared-tail route lambda")
 
     model_source = (ROOT / "src/llama-model.cpp").read_text(encoding="utf-8")
     placement_header = (ROOT / "src/llama-kv-cache-placement.h").read_text(encoding="utf-8")
@@ -373,6 +378,24 @@ def main() -> None:
     context_source = (ROOT / "src/llama-context.cpp").read_text(encoding="utf-8")
     if "llama_kv_tail_resolve_groups" not in context_source or "config.automatic ? automatic_standard : true" not in context_source:
         raise AssertionError("automatic and explicit group resolution are not separated at context construction")
+    decline_block = context_source.split("if (cparams.kv_tail_tokens > 0 || cparams.kv_tail_tokens_swa > 0)", 1)[1].split(
+        "if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED && !tail_request_resolved)", 1
+    )[0]
+    if "cparams.offload_kqv ? model.dev_layer(il) : nullptr" not in decline_block:
+        raise AssertionError("KV-tail decline probe does not follow CPU placement for --no-kv-offload")
+    if "cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP" not in decline_block or "hparams.n_layer_all" not in decline_block:
+        raise AssertionError("KV-tail decline probe does not inspect the owned MTP layer range")
+    if ("params.ctx_other->get_cparams()" not in decline_block or
+            "shared_cparams.kv_tail_tokens" not in decline_block or
+            "shared_cparams.kv_tail_tokens_swa" not in decline_block):
+        raise AssertionError("shared Gemma MTP tails do not preserve the target cache decision")
+    for reset in (
+        "cparams.kv_tail_native_exact = false",
+        "cparams.kv_tail_native_exact_swa = false",
+        "tail_request_resolved = false",
+    ):
+        if reset not in decline_block:
+            raise AssertionError(f"KV-tail decline leaves derived KVarN state stale: missing {reset}")
 
     iswa_source = (ROOT / "src/llama-kv-cache-iswa.cpp").read_text(encoding="utf-8")
     if "llama_kv_tail_storage_plan_for" in iswa_source or "LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT" in iswa_source:
@@ -552,10 +575,10 @@ def main() -> None:
         raise AssertionError("non-native backends lack the bounded history/current composition route")
     if graph.count(
             "tail_route == LLAMA_KV_TAIL_ROUTE_NATIVE &&\n"
-            "            !kvarn_plan.native_attention") != 2:
+            "            !kvarn_plan.native_attention && (arch != LLM_ARCH_DFLASH || cparams.causal_attn))") != 2:
         raise AssertionError(
-            "KVarN full/iSWA graphs do not fail closed to the generic tail oracle "
-            "outside the backend's bounded native query matrix")
+            "KVarN full/iSWA graphs must retain the generic backend-query fallback, "
+            "but preserve the validated native F16 tail merge for materialized non-causal DFlash")
 
     tail_build_calls = re.findall(r"build_attn_inp_tail\((?:(?!\);).)*\);", graph, re.DOTALL)[1:]
     if not tail_build_calls or any(not re.search(r",\s*true\s*\);$", call) for call in tail_build_calls):

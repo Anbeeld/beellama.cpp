@@ -46,12 +46,14 @@ uint read_index_high(uint token) { return data_indices[2 * token + 1u]; }
 int read_cell(uint token, out bool explicitly_staged, out uint assigned_slot) {
     const uint64_t raw = (uint64_t(read_index_high(token)) << 32u) | read_index_low(token);
     const int64_t encoded = int64_t(raw);
-    explicitly_staged = encoded < -1l;
+    explicitly_staged = p.swa == 0u && encoded < -1l;
     const uint64_t payload = explicitly_staged ? uint64_t(-(encoded + 2l)) : raw;
     const uint packed_slot = uint(payload >> 32u);
-    assigned_slot = packed_slot == 0u ? 0xffffffffu : packed_slot - 1u;
+    assigned_slot = p.swa != 0u || packed_slot == 0u ? 0xffffffffu : packed_slot - 1u;
     return int(uint(payload));
 }
+
+uint read_swa_stream(uint token) { return read_index_high(token); }
 
 float load_stage_value(uint stage_pos, uint head, uint dim) {
     const uint word = data_stage[(stage_pos * p.n_heads + head) * 64 + (dim >> 1)];
@@ -84,7 +86,7 @@ void compute_live(uint stream, uint lane, out uint group_out, out uint pos_out) 
         const int idx = read_cell(i, explicitly_staged, assigned_slot);
         if (idx == -1) { continue; }
         const uint group_global = uint(idx) / KVAR_N_DIM;
-        const uint idx_stream = p.swa != 0u ? stream : group_global / p.groups_per_stream;
+        const uint idx_stream = p.swa != 0u ? read_swa_stream(i) : group_global / p.groups_per_stream;
         if (idx_stream != stream) { continue; }
         const uint group = p.swa != 0u ? group_global : group_global - stream * p.groups_per_stream;
         const uint pos = uint(idx) % KVAR_N_DIM;
@@ -152,8 +154,9 @@ float load_materialized(
         uint lane) {
     bool explicitly_staged = false;
     uint assigned_slot = 0xffffffffu;
+    const uint index = p.swa != 0u ? stream * p.n_kv + token : token;
     const int abs_pos_i = (p.swa != 0u || p.read_indirect != 0u) ?
-        read_cell(token, explicitly_staged, assigned_slot) : int(token);
+        read_cell(index, explicitly_staged, assigned_slot) : int(token);
     if (abs_pos_i == -1) {
         return 0.0;
     }

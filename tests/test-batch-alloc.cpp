@@ -652,6 +652,35 @@ static void test_mrope(testing & t) {
     });
 }
 
+static void test_dflash_positions(testing & t) {
+    llama_vocab vocab;
+    mock_memory mem;
+    mem.ranges[0] = {0, 4};
+
+    t.test("scalar_image_overlap_and_text_gap", [&](testing & t) {
+        llama_batch_allocr draft(1, true);
+        llama_batch_allocr ordinary(1);
+        batch_builder image;
+        image.add(4, {0}, false);
+        image.add(4, {0}, false);
+        t.assert_true(draft.init(image.make(), vocab, &mem, 2, 1, true));
+        auto ub = draft.split_simple(2);
+        t.assert_equal(1u, ub.n_pos);
+        t.assert_equal(4, ub.pos[0]);
+        t.assert_equal(4, ub.pos[1]);
+        t.assert_true(!ordinary.init(image.make(), vocab, &mem, 2, 1, true));
+
+        batch_builder after_image;
+        after_image.add(36, {0}, true);
+        t.assert_true(draft.init(after_image.make(), vocab, &mem, 2, 1, true));
+        t.assert_true(!ordinary.init(after_image.make(), vocab, &mem, 2, 1, true));
+
+        batch_builder backwards;
+        backwards.add(3, {0}, true);
+        t.assert_true(!draft.init(backwards.make(), vocab, &mem, 2, 1, true));
+    });
+}
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -671,6 +700,7 @@ int main(int argc, char ** argv) {
     t.test("split",     test_split);
     t.test("keep_tail", test_keep_tail);
     t.test("mrope",     test_mrope);
+    t.test("dflash",    test_dflash_positions);
 
     return t.summary();
 }

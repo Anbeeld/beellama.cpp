@@ -66,6 +66,169 @@ f16vec4 dequantFuncQ2_0_v(const in decodeBufQ2_0 bl, const in uint blockCoords[2
     return f16vec4((vec4(bits & 3u, (bits >> 2u) & 3u, (bits >> 4u) & 3u, bits >> 6u) - 1.0f) * float(d));
 }
 
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufQ6_0 {
+   block_q6_0 block;
+};
+
+float16_t dequantFuncQ6_0(const in decodeBufQ6_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const uint idx = coordInBlock[1];
+    const uint j = idx & 15u;
+    const uint h = uint(bl.block.qh[j & 7u]) >> (4u * (j >> 3u));
+    const uint q = idx < 16u ?
+        ((uint(bl.block.qs[j]) & 0x0fu) | ((h & 0x03u) << 4u)) :
+        ((uint(bl.block.qs[j]) >> 4u)   | ((h & 0x0cu) << 2u));
+    return (float16_t(q) - float16_t(32.0)) * bl.block.d;
+}
+
+f16vec4 dequantFuncQ6_0_v(const in decodeBufQ6_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const uint idx = coordInBlock[1];
+    const uint j = idx & 15u;
+    const uint h0 = uint(bl.block.qh[(j + 0u) & 7u]) >> (4u * ((j + 0u) >> 3u));
+    const uint h1 = uint(bl.block.qh[(j + 1u) & 7u]) >> (4u * ((j + 1u) >> 3u));
+    const uint h2 = uint(bl.block.qh[(j + 2u) & 7u]) >> (4u * ((j + 2u) >> 3u));
+    const uint h3 = uint(bl.block.qh[(j + 3u) & 7u]) >> (4u * ((j + 3u) >> 3u));
+    uvec4 q;
+    if (idx < 16u) {
+        q = uvec4(
+            (uint(bl.block.qs[j + 0u]) & 0x0fu) | ((h0 & 0x03u) << 4u),
+            (uint(bl.block.qs[j + 1u]) & 0x0fu) | ((h1 & 0x03u) << 4u),
+            (uint(bl.block.qs[j + 2u]) & 0x0fu) | ((h2 & 0x03u) << 4u),
+            (uint(bl.block.qs[j + 3u]) & 0x0fu) | ((h3 & 0x03u) << 4u));
+    } else {
+        q = uvec4(
+            (uint(bl.block.qs[j + 0u]) >> 4u) | ((h0 & 0x0cu) << 2u),
+            (uint(bl.block.qs[j + 1u]) >> 4u) | ((h1 & 0x0cu) << 2u),
+            (uint(bl.block.qs[j + 2u]) >> 4u) | ((h2 & 0x0cu) << 2u),
+            (uint(bl.block.qs[j + 3u]) >> 4u) | ((h3 & 0x0cu) << 2u));
+    }
+    return f16vec4((vec4(q) - vec4(32.0)) * float(bl.block.d));
+}
+
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufQ6_1 {
+   block_q6_1 block;
+};
+
+uint q6_1Raw(const in decodeBufQ6_1 bl, uint idx)
+{
+    const uint j = idx & 15u;
+    const uint h = uint(bl.block.qh[j & 7u]) >> (4u * (j >> 3u));
+    return idx < 16u ?
+        ((uint(bl.block.qs[j]) & 0x0fu) | ((h & 0x03u) << 4u)) :
+        ((uint(bl.block.qs[j]) >> 4u)   | ((h & 0x0cu) << 2u));
+}
+
+float16_t dequantFuncQ6_1(const in decodeBufQ6_1 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    return float16_t(q6_1Raw(bl, coordInBlock[1])) * bl.block.d + bl.block.m;
+}
+
+f16vec4 dequantFuncQ6_1_v(const in decodeBufQ6_1 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    f16vec4 result;
+    [[unroll]] for (uint lane = 0; lane < 4u; ++lane) {
+        result[lane] = float16_t(q6_1Raw(bl, coordInBlock[1] + lane)) * bl.block.d + bl.block.m;
+    }
+    return result;
+}
+
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufQ3_0 {
+   block_q3_0 block;
+};
+
+uint q3_0Raw(const in decodeBufQ3_0 bl, uint idx)
+{
+    const uint low = (uint(bl.block.qs[idx & 7u]) >> (2u * (idx >> 3u))) & 0x03u;
+    const uint high = (uint(bl.block.qh[idx >> 3u]) >> (idx & 7u)) & 1u;
+    return low | (high << 2u);
+}
+
+float16_t dequantFuncQ3_0(const in decodeBufQ3_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    return (float16_t(q3_0Raw(bl, coordInBlock[1])) - float16_t(4.0)) * bl.block.d;
+}
+
+f16vec4 dequantFuncQ3_0_v(const in decodeBufQ3_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    f16vec4 result;
+    [[unroll]] for (uint lane = 0; lane < 4u; ++lane) {
+        result[lane] = (float16_t(q3_0Raw(bl, coordInBlock[1] + lane)) - float16_t(4.0)) * bl.block.d;
+    }
+    return result;
+}
+
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufQ3_1 {
+   block_q3_1 block;
+};
+
+uint q3_1Raw(const in decodeBufQ3_1 bl, uint idx)
+{
+    const uint low = (uint(bl.block.qs[idx & 7u]) >> (2u * (idx >> 3u))) & 0x03u;
+    const uint high = (uint(bl.block.qh[idx >> 3u]) >> (idx & 7u)) & 1u;
+    return low | (high << 2u);
+}
+
+float16_t dequantFuncQ3_1(const in decodeBufQ3_1 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    return float16_t(q3_1Raw(bl, coordInBlock[1])) * bl.block.d + bl.block.m;
+}
+
+f16vec4 dequantFuncQ3_1_v(const in decodeBufQ3_1 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    f16vec4 result;
+    [[unroll]] for (uint lane = 0; lane < 4u; ++lane) {
+        result[lane] = float16_t(q3_1Raw(bl, coordInBlock[1] + lane)) * bl.block.d + bl.block.m;
+    }
+    return result;
+}
+
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufQ2_0S {
+   block_q2_0s block;
+};
+
+uint q2_0sRaw(const in decodeBufQ2_0S bl, uint idx)
+{
+    return (uint(bl.block.qs[idx & 7u]) >> (2u * (idx >> 3u))) & 0x03u;
+}
+
+float16_t dequantFuncQ2_0S(const in decodeBufQ2_0S bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    return (float16_t(q2_0sRaw(bl, coordInBlock[1])) - float16_t(2.0)) * bl.block.d;
+}
+
+f16vec4 dequantFuncQ2_0S_v(const in decodeBufQ2_0S bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    f16vec4 result;
+    [[unroll]] for (uint lane = 0; lane < 4u; ++lane) {
+        result[lane] = (float16_t(q2_0sRaw(bl, coordInBlock[1] + lane)) - float16_t(2.0)) * bl.block.d;
+    }
+    return result;
+}
+
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufQ2_1 {
+   block_q2_1 block;
+};
+
+uint q2_1Raw(const in decodeBufQ2_1 bl, uint idx)
+{
+    return (uint(bl.block.qs[idx & 7u]) >> (2u * (idx >> 3u))) & 0x03u;
+}
+
+float16_t dequantFuncQ2_1(const in decodeBufQ2_1 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    return float16_t(q2_1Raw(bl, coordInBlock[1])) * bl.block.d + bl.block.m;
+}
+
+f16vec4 dequantFuncQ2_1_v(const in decodeBufQ2_1 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    f16vec4 result;
+    [[unroll]] for (uint lane = 0; lane < 4u; ++lane) {
+        result[lane] = float16_t(q2_1Raw(bl, coordInBlock[1] + lane)) * bl.block.d + bl.block.m;
+    }
+    return result;
+}
+
 layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufQ4_0 {
    block_q4_0_packed16 block;
 };

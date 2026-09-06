@@ -10,6 +10,18 @@ void ggml_cuda_fattn_kvarn_init_descs(
         int v_original_domain,
         cudaStream_t stream);
 
+using ggml_cuda_fattn_kvarn_window_dequant_kernel_t = void (*)(
+        const ggml_cuda_fattn_kvarn_desc *, const ggml_cuda_fattn_kvarn_desc *,
+        half *, half *, int, int, int);
+using ggml_cuda_fattn_kvarn_window_finalize_kernel_t = void (*)(
+        float *, const float2 *, float2 *, int);
+
+template <int D>
+ggml_cuda_fattn_kvarn_window_dequant_kernel_t ggml_cuda_fattn_kvarn_window_dequant_get_kernel();
+
+template<int D>
+ggml_cuda_fattn_kvarn_window_finalize_kernel_t ggml_cuda_fattn_kvarn_window_finalize_get_kernel();
+
 static inline enum ggml_flash_attn_ext_kvarn_domain ggml_cuda_fattn_kvarn_domain(const ggml_tensor * dst) {
     return (enum ggml_flash_attn_ext_kvarn_domain) ggml_get_op_params_i32(
             dst, GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN);

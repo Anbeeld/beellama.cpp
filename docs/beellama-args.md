@@ -1,4 +1,4 @@
-# BeeLlama v0.4.4 argument reference
+# BeeLlama v0.4.5 argument reference
 
 This page covers Bee-owned arguments and the upstream arguments whose behavior
 BeeLlama extends. Run `llama-server --help` or `llama-cli --help` for the full
@@ -22,8 +22,22 @@ body-plus-tail route and require a CUDA 12.4 build or release package. CUDA
 |---|---|---|---|
 | `-ctk TYPE`, `--cache-type-k TYPE` | `LLAMA_ARG_CACHE_TYPE_K` | `f16` | Selects the target K cache. Bee adds the six KVarN values and standard `q6_0`, `q6_1`, `q3_0`, `q3_1`, `q2_0`, and `q2_1`. If only K or V is KVarN, the other side is promoted to the same KVarN width with a warning. |
 | `-ctv TYPE`, `--cache-type-v TYPE` | `LLAMA_ARG_CACHE_TYPE_V` | `f16` | Selects the target V cache with the same values and one-sided promotion rule as `--cache-type-k`. |
+| `-ctkd TYPE`, `--spec-draft-type-k TYPE` | `LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K` | `f16` | Selects the draft K cache. Bee accepts the six KVarN values for draft-simple, EAGLE3, audited owned Qwen MTP, DFlash1/DFlash2, and non-MLA DSpark contexts. A one-sided KVarN selection promotes draft V to the same width with a warning. |
+| `-ctvd TYPE`, `--spec-draft-type-v TYPE` | `LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V` | `f16` | Selects the draft V cache with the same values and one-sided promotion rule. Target and draft cache selections remain independent. |
 | `--cache-type-k-swa TYPE` | `LLAMA_ARG_CACHE_TYPE_K_SWA` | Same as `--cache-type-k` | Overrides KVarN K precision for SWA layers. Accepts only the six `kvarnN` values, requires target KVarN, and must be paired with the V override. |
 | `--cache-type-v-swa TYPE` | `LLAMA_ARG_CACHE_TYPE_V_SWA` | Same as `--cache-type-v` | Overrides KVarN V precision for SWA layers. Accepts only the six `kvarnN` values, requires target KVarN, and must be paired with the K override. |
+
+Draft KVarN is runtime-qualified on CUDA for draft-simple, EAGLE3, the owned
+MTP allowlist, DFlash1/DFlash2, and non-MLA DSpark. The CPU reference route is qualified
+for owned MTP. Non-causal DFlash-family models keep KVarN persistent storage but
+use materialized attention; the direct record-consuming route is not enabled.
+DSV4/MLA DSpark is incompatible with KVarN's dense K/V representation and fails
+closed. Shared Gemma 4 MTP and MTP architectures outside the allowlist fail closed. For
+Gemma 4 MTP, select target KVarN with `--cache-type-k/v`; the assistant reads
+that shared persistent cache. HIP/ROCm and Vulkan DFlash-family draft KVarN
+remain unqualified until backend runtime tests pass. N-gram modes do not own a
+KV context and reject explicit KVarN `--spec-draft-type-k/v` selections during
+argument validation.
 
 ## KV cache precision tail for quantized caches
 
@@ -31,8 +45,12 @@ The KV cache precision tail (KVCPT) makes the newest attention-visible entries e
 standard quantized and KVarN target caches. A partial tail keeps the complete
 quantized body and adds a compact exact-history ring. The active ubatch remains
 a separate graph-local exact source. A full-window SWA request uses a compact
-native-exact ring and omits the unread compressed SWA body. Draft and auxiliary
-contexts remain on standard cache types and do not inherit the target tail.
+native-exact ring and omits the unread compressed SWA body. Supported draft-owned
+MTP and DFlash KVarN caches do not inherit the target
+tail or expose a draft-tail argument: their explicit request remains zero,
+while KVarN supplies an intrinsic exact suffix of up to 128 tokens. DFlash uses
+the same K/V pair for full-attention and SWA sub-caches. Other draft and
+auxiliary contexts remain on standard cache types.
 
 | Argument | Env var | Default | Behavior |
 |---|---|---|---|
@@ -53,6 +71,16 @@ rows, graph-local body execution rows, owner backend, current-segment
 presence, transient estimate, and memory increments. Native routes are checked
 again against the final constructed operation. A mismatch fails context/graph
 construction instead of allowing the scheduler to move that layer silently.
+
+Before caches are built, Bee also checks whether at least one device serving the
+tail's layers advertises a native KV-tail attention entry point. If none does,
+every layer would run the generic tail route, which costs several times more
+than plain quantized attention, so the context warns and declines the request:
+`--kv-tail-tokens` resolves to zero and KVarN keeps its intrinsic 128-token
+exact suffix. Shared Gemma 4 MTP follows the target context's already-resolved
+decision. Set `LLAMA_KV_TAIL_ALLOW_GENERIC=1` to keep the requested tail on the
+slower generic route anyway; any value other than an empty string or `0` enables
+it.
 
 The CLI is parsed once into an immutable, model-independent request. Fit probes
 and the final context bind that same request to the model's canonical cache
@@ -266,7 +294,7 @@ tests.
 | Earlier spelling or surface | v0.4.0 behavior | Replacement |
 |---|---|---|
 | Target cache `turbo2`, `turbo3`, `turbo4`, or `_tcq` variants | Warns and redirects by width to `kvarn2`, `kvarn3`, or `kvarn4`. | Use the `kvarnN` name directly. |
-| Draft cache `turbo2`, `turbo3`, `turbo4`, or `_tcq` variants | Warns and redirects by width to `q2_0`, `q3_0`, or `q4_0`. | Use the standard q-cache name directly. |
+| Draft cache `turbo2`, `turbo3`, `turbo4`, or `_tcq` variants | Warns and redirects by width to `kvarn2`, `kvarn3`, or `kvarn4`; runtime accepts them only on supported owned-MTP or DFlash1/DFlash2 routes. | Use the `kvarnN` name for a supported route, or an ordinary q-cache name for other draft modes. |
 | TurboQuant/TCQ GGUF cache formats and TQ3/TQ4 weight formats | Unsupported; legacy TQ file-type ids fail with a re-quantization error. | Re-quantize from source into a retained format. |
 | `--spec-type dflash` | Rejected as an unknown speculative type. | `--spec-type draft-dflash` |
 | `copyspec`, `suffix`, or `recycle` speculative types | Rejected with a migration error. | Use `draft-dflash` or an upstream n-gram mode. |

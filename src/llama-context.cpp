@@ -7,6 +7,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-kv-cache-kvarn.h"
+#include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-tail.h"
 #include "llama-kv-tail-request.h"
 #include "llama-kvarn.h"
@@ -260,13 +261,46 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+// Whether `dev` provides a NATIVE KV-tail attention kernel.
+//
+// Only the presence of the entry point is checked, not whether it accepts a
+// particular type pair: the per-layer planner in llama-kv-cache.cpp already
+// asks that finer question. This answers the coarser one -- can this device
+// ever serve a precision tail natively -- so that a backend which implements
+// no tail attention at all can be recognised before the cache is built.
+static bool kv_tail_device_has_native_attention(ggml_backend_dev_t dev) {
+    if (dev == nullptr) {
+        dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    }
+    if (dev && ggml_backend_dev_is_meta(dev)) {
+        const size_t count = ggml_backend_meta_device_count(dev);
+        for (size_t i = 0; i < count; ++i) {
+            if (kv_tail_device_has_native_attention(ggml_backend_meta_device_get(dev, i))) {
+                return true;
+            }
+        }
+        return false;
+    }
+    const auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (!reg) {
+        return false;
+    }
+    return ggml_backend_reg_get_proc_address(
+                   reg, "ggml_backend_kv_tail_segmented_attention_supported") != nullptr ||
+           ggml_backend_reg_get_proc_address(
+                   reg, "ggml_backend_kv_tail_attention_supported") != nullptr ||
+           ggml_backend_reg_get_proc_address(
+                   reg, "ggml_backend_kvarn_tail_attention_supported") != nullptr;
+}
+
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
     model(model),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
-    balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
+    balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd(), model.arch == LLM_ARCH_DFLASH)) {
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
@@ -416,6 +450,72 @@ llama_context::llama_context(
         }
     }
 
+    // A KV precision tail is only a win where some device can serve it with NATIVE
+    // tail attention. Where none can, planning still SUCCEEDS: every layer falls back
+    // to the generic tail route, which llama-kv-cache.cpp itself logs as "catastrophic
+    // generic attention". That is not a quality/size trade, it is a large throughput
+    // loss for a feature the user asked for expecting the opposite -- and the Metal
+    // backend exports no tail-attention entry point at all, so every Metal build pays
+    // it in full. Measured on an M1 Max, Qwen3.8-27B IQ4_XS at 100k ctx, k=v=q5_0:
+    // prompt 39 -> 112 tok/s and decode 5.8 -> 9.0 tok/s simply by dropping
+    // --kv-tail-tokens.
+    //
+    // So decline the tail here, the same way KVarN declines itself just below when its
+    // requirements do not hold. LLAMA_KV_TAIL_ALLOW_GENERIC=1 keeps the old behaviour
+    // for anyone who wants the exact tail regardless of what it costs.
+    if (cparams.kv_tail_tokens > 0 || cparams.kv_tail_tokens_swa > 0) {
+        bool any_native = false;
+        if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT && params.ctx_other != nullptr) {
+            const auto & shared_cparams = params.ctx_other->get_cparams();
+            // Shared Gemma MTP reads the target cache's representation, so preserve
+            // the target context's already-resolved tail decision.
+            any_native = shared_cparams.kv_tail_tokens > 0 ||
+                    shared_cparams.kv_tail_tokens_swa > 0;
+        } else {
+            const uint32_t layer_begin = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ?
+                    hparams.n_layer() : 0;
+            const uint32_t layer_end = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ?
+                    hparams.n_layer_all : hparams.n_layer();
+            for (uint32_t il = layer_begin; il < layer_end; ++il) {
+                if (!hparams.has_kv(il)) {
+                    continue;
+                }
+                if (kv_tail_device_has_native_attention(
+                            cparams.offload_kqv ? model.dev_layer(il) : nullptr)) {
+                    any_native = true;
+                    break;
+                }
+            }
+        }
+
+        if (!any_native) {
+            const uint32_t requested = std::max(cparams.kv_tail_tokens, cparams.kv_tail_tokens_swa);
+            const char * allow_generic = getenv("LLAMA_KV_TAIL_ALLOW_GENERIC");
+            if (allow_generic && allow_generic[0] != '\0' && strcmp(allow_generic, "0") != 0) {
+                LLAMA_LOG_WARN("%s: no device provides native KV tail attention, but "
+                        "LLAMA_KV_TAIL_ALLOW_GENERIC is set; keeping the %u-token precision "
+                        "tail on the generic route, which is much slower\n", __func__, requested);
+            } else {
+                LLAMA_LOG_WARN("%s: no device provides native KV tail attention; disabling the "
+                        "%u-token KV precision tail. The generic tail route costs several times "
+                        "more than plain quantized attention, so it is not enabled by default. "
+                        "Set LLAMA_KV_TAIL_ALLOW_GENERIC=1 to keep it anyway.\n",
+                        __func__, requested);
+                cparams.kv_tail_tokens = 0;
+                cparams.kv_tail_tokens_swa = 0;
+                cparams.kv_tail_tokens_requested = 0;
+                cparams.kv_tail_tokens_swa_requested = 0;
+                cparams.kv_tail_native_exact = false;
+                cparams.kv_tail_native_exact_swa = false;
+                if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
+                    // Reapply KVarN's zero-request policy below so its intrinsic
+                    // exact suffix and native-exact state remain consistent.
+                    tail_request_resolved = false;
+                }
+            }
+        }
+    }
+
     if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED && !tail_request_resolved) {
         const uint32_t full_window = cparams.n_ctx;
         const uint32_t swa_window = std::min(cparams.n_ctx,
@@ -539,10 +639,10 @@ llama_context::llama_context(
 
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
-    cparams.auto_fgdn    = true;
+    cparams.auto_fgdn    = false;
 
-    cparams.fused_lid    = true;
-    cparams.auto_flid    = true;
+    cparams.fused_lid = true;
+    cparams.auto_flid = false;
 
     cparams.fused_dsv4_hc_pre  = true;
     cparams.fused_dsv4_hc_comb = true;
@@ -1025,11 +1125,19 @@ void llama_context::sched_reserve() {
 
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
     {
-        // TODO: not sure if the following graph would be worst case for multi-stream KV caches:
-        //
-        // auto * gf = graph_reserve(n_tokens, 1, n_tokens, mctx.get());
-        //
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+        // TODO: the worst case graph is not always reached for `n_seqs > 1`
+        //       need to implement a more robust mechanism that tries a few different inputs and analyzes the results
+        ggml_cgraph * gf = nullptr;
+        switch (model.arch) {
+            case LLM_ARCH_MINIMAX_01:
+                // the `inp_diag_decay` tensor size scales with `n_seq_tokens^2` which
+                // makes `n_seqs == 1` use more memory for the compute graph compared to `n_seqs > 1`
+                gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+                break;
+            default:
+                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+        };
+
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
         }
@@ -2208,6 +2316,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         }
                     }
 
+                    mctx.reset();
+                    if (grow_dflash_swa()) {
+                        continue;
+                    }
+
                     LLAMA_LOG_WARN("%s: failed to find a memory slot for batch of size %d\n", __func__, balloc->get_n_tokens());
 
                     return 1;
@@ -2765,6 +2878,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_BAILINGMOE3 ||
         model.arch == LLM_ARCH_QWEN35 ||
         model.arch == LLM_ARCH_QWEN35MOE ||
+        model.arch == LLM_ARCH_QWEN4EXP ||
         model.arch == LLM_ARCH_DEEPSEEK4 ||
         (model.arch == LLM_ARCH_DFLASH && model.hparams.dsv4_hc_mult > 0) ||
         model.arch == LLM_ARCH_NANBEIGE ||
@@ -2977,6 +3091,13 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
             ggml_set_name(cur, name);
+        }
+
+        // DFlash2 requires a global vocabulary top-k. Tensor-parallel output
+        // logits are vocabulary-axis split, so gather them through the CPU
+        // scheduler boundary before selecting candidates.
+        if (backend_cpu != nullptr && strcmp(name, "dflash2_logits_global") == 0) {
+            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_cpu);
         }
 
         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
@@ -3223,6 +3344,42 @@ private:
     std::vector<read_info> rinfos;
     std::vector<std::function<void()>> callbacks;
 };
+
+bool llama_context::grow_dflash_swa() {
+    if (model.arch != LLM_ARCH_DFLASH) {
+        return false;
+    }
+    auto * iswa = dynamic_cast<llama_kv_cache_iswa *>(memory.get());
+    if (!iswa) {
+        return false;
+    }
+    synchronize();
+    ggml_backend_sched_reset(sched.get());
+    gf_res_prev->reset();
+    try {
+        return iswa->grow_swa([](llama_memory_i & source, llama_memory_i & destination) {
+            llama_io_write_dummy sizing(false);
+            source.state_write(sizing, -1, 0);
+            std::vector<uint8_t> state(sizing.n_bytes());
+            {
+                llama_io_write_host writer(state.data(), state.size());
+                source.state_write(writer, -1, 0);
+                if (writer.n_bytes() != state.size()) {
+                    throw std::runtime_error("DFlash SWA growth state size changed");
+                }
+            }
+            llama_io_read_host reader(state.data(), state.size());
+            destination.state_read(reader, -1, 0);
+            if (reader.n_bytes() != state.size()) {
+                throw std::runtime_error("DFlash SWA growth state was not fully consumed");
+            }
+            reader.commit();
+        });
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: could not grow DFlash SWA cache: %s\n", __func__, err.what());
+        return false;
+    }
+}
 
 class llama_io_write_file : public llama_io_write_i {
 public:
@@ -3502,13 +3659,83 @@ public:
         for (auto & [buft, mbuf] : mbufs_new) {
             const auto & mbuf_cur = mbufs.at(buft);
 
-            if (!mbuf_cur.buf || mbuf_cur.n_tensors != mbuf.n_tensors || mbuf_cur.total_size != mbuf.total_size) {
+            if (!mbuf_cur.buf || mbuf_cur.total_size != mbuf.total_size) {
                 GGML_ABORT("%s: memory buffer mismatch\n", __func__);
             }
 
-            for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
-                ggml_backend_tensor_copy(mbuf_cur.cpy[i], mbuf.org[i]);
+            if (mbuf_cur.n_tensors == mbuf.n_tensors) {
+                // same chunking: copy 1:1 by index
+                for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
+                    GGML_ASSERT(ggml_nbytes(mbuf_cur.cpy[i]) == ggml_nbytes(mbuf.org[i]));
+                    ggml_backend_tensor_copy(mbuf_cur.cpy[i], mbuf.org[i]);
+                }
+                continue;
             }
+
+            // different chunking: copy the write-side data (mbuf_cur.cpy) into the read-side targets (mbuf.org)
+            // with a byte cursor. Write and read enumerate the same logical data in the same order but may chunk
+            // it differently, so copy across tensor boundaries rather than 1:1 by index.
+            const size_t total = mbuf_cur.total_size;
+
+            ggml_init_params params_scratch = {
+                /*.mem_size   =*/ 2*(mbuf_cur.cpy.size() + mbuf.org.size())*ggml_tensor_overhead(),
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+            ggml_context * ctx_scratch = ggml_init(params_scratch);
+
+            size_t src_pos  = 0;
+            size_t dst_pos  = 0;
+            size_t src_j    = 0;
+            size_t dst_i    = 0;
+            size_t src_base = 0;
+            size_t dst_base = 0;
+
+            while (src_pos < total) {
+                const auto & src_t = mbuf_cur.cpy[src_j];
+                const auto & dst_t = mbuf.org[dst_i];
+
+                const size_t src_size = ggml_nbytes(src_t);
+                const size_t dst_size = ggml_nbytes(dst_t);
+
+                const size_t src_off  = src_pos - src_base;
+                const size_t dst_off  = dst_pos - dst_base;
+
+                const size_t n_copy = std::min(src_size - src_off, dst_size - dst_off);
+
+                const size_t   el   = ggml_element_size(src_t);
+                const int64_t n_el = (int64_t) (n_copy / el);
+
+                auto * src_v = ggml_view_1d(ctx_scratch, src_t, n_el, src_off);
+                ggml_backend_view_init(src_v);
+                auto * dst_v = ggml_view_1d(ctx_scratch, dst_t, n_el, dst_off);
+                ggml_backend_view_init(dst_v);
+
+                ggml_backend_tensor_copy(src_v, dst_v);
+
+                src_pos += n_copy;
+                dst_pos += n_copy;
+
+                if (src_pos - src_base == src_size) {
+                    src_base = src_pos;
+                    ++src_j;
+                }
+                if (dst_pos - dst_base == dst_size) {
+                    dst_base = dst_pos;
+                    ++dst_i;
+                }
+            }
+
+            GGML_ASSERT(src_pos == total && dst_pos == total);
+            // any tensors left unvisited hold no data
+            for (size_t i = src_j; i < mbuf_cur.cpy.size(); ++i) {
+                GGML_ASSERT(ggml_nbytes(mbuf_cur.cpy[i]) == 0);
+            }
+            for (size_t i = dst_i; i < mbuf.org.size(); ++i) {
+                GGML_ASSERT(ggml_nbytes(mbuf.org[i]) == 0);
+            }
+
+            ggml_free(ctx_scratch);
         }
 
         GGML_ASSERT(buf_size == 0);
@@ -4321,17 +4548,44 @@ llama_context * llama_init_from_model(
     }
 
     if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
-        if (params.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || model->arch == LLM_ARCH_DFLASH) {
-            LLAMA_LOG_WARN("%s: KVarN is target-context-only; disabling it for this auxiliary context\n", __func__);
+        const llama_kvarn_context_route route = llama_kvarn_context_route_for({
+            params.ctx_type,
+            model->arch,
+            params.ctx_other != nullptr,
+            model->dspark_markov_w1 != nullptr,
+            model->hparams.dflash_selector_top_k > 0,
+        });
+        if (route != LLAMA_KVARN_CONTEXT_ROUTE_OWNED) {
+            const std::string reason = route == LLAMA_KVARN_CONTEXT_ROUTE_SHARED_TARGET
+                ? "this MTP topology shares target K/V and has no independent draft KV representation; "
+                  "configure target --cache-type-k/v kvarn* instead"
+                : format("context type %d for architecture %s is not an audited draft-owned KVarN route; "
+                         "choose an ordinary draft cache type",
+                         int(params.ctx_type), llm_arch_name(model->arch));
+            if (params.kvarn.fail_if_unsupported) {
+                LLAMA_LOG_ERROR("%s: cannot enable %s: %s\n",
+                        __func__, llama_kvarn_type_name(params.kvarn.type), reason.c_str());
+                return nullptr;
+            }
+            LLAMA_LOG_WARN("%s: cannot enable %s: %s; falling back to the normal KV cache\n",
+                    __func__, llama_kvarn_type_name(params.kvarn.type), reason.c_str());
             params.kvarn = llama_kvarn_default_params();
         } else {
+            const uint32_t layer_begin = params.ctx_type == LLAMA_CONTEXT_TYPE_MTP
+                ? model->hparams.n_layer()
+                : 0;
+            const uint32_t layer_end = params.ctx_type == LLAMA_CONTEXT_TYPE_MTP
+                ? model->hparams.n_layer_all
+                : model->hparams.n_layer();
+            uint32_t cached_layer_count = 0;
             bool head_dims_supported = true;
             bool backend_ops_supported = true;
-            for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
+            for (uint32_t il = layer_begin; il < layer_end; ++il) {
                 if (!model->hparams.has_kv(il)) {
                     continue;
                 }
 
+                ++cached_layer_count;
                 head_dims_supported = head_dims_supported &&
                     llama_kvarn_head_dim_supported(model->hparams.n_embd_head_k(il)) &&
                     llama_kvarn_head_dim_supported(model->hparams.n_embd_head_v(il));
@@ -4344,13 +4598,15 @@ llama_context * llama_init_from_model(
                 params.attention_type == LLAMA_ATTENTION_TYPE_UNSPECIFIED
                     ? model->hparams.causal_attn
                     : params.attention_type == LLAMA_ATTENTION_TYPE_CAUSAL;
+            const bool owned_dflash =
+                model->arch == LLM_ARCH_DFLASH &&
+                route == LLAMA_KVARN_CONTEXT_ROUTE_OWNED;
             const bool attention_supported =
-                causal_attn &&
-                model->hparams.n_layer_kv() > 0 &&
+                (causal_attn || owned_dflash) &&
+                cached_layer_count > 0 &&
                 !model->hparams.is_mla() &&
                 !llm_arch_is_recurrent(model->arch) &&
-                model->arch != LLM_ARCH_DEEPSEEK32 &&
-                model->arch != LLM_ARCH_DFLASH;
+                model->arch != LLM_ARCH_DEEPSEEK32;
             const llama_kvarn_runtime_requirements requirements = {
                 /*.attention_supported      =*/ attention_supported,
                 /*.head_dims_supported      =*/ head_dims_supported,
@@ -4375,8 +4631,12 @@ llama_context * llama_init_from_model(
                     params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
                 }
 
-                LLAMA_LOG_INFO("%s: enabling structured KVarN cache type %s\n",
-                        __func__, llama_kvarn_type_name(params.kvarn.type));
+                const char * context_label = params.ctx_type == LLAMA_CONTEXT_TYPE_MTP
+                    ? "draft MTP"
+                    : owned_dflash ? "draft DFlash" : "target";
+                LLAMA_LOG_INFO("%s: enabling structured KVarN cache type %s for %s layers [%u, %u)\n",
+                        __func__, llama_kvarn_type_name(params.kvarn.type),
+                        context_label, layer_begin, layer_end);
             }
         }
     }

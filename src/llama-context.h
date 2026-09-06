@@ -76,6 +76,7 @@ struct llama_context {
 
     // return true if the memory was updated
     llama_memory_status memory_update(bool optimize);
+    bool grow_dflash_swa();
 
     enum llama_pooling_type pooling_type() const;
 

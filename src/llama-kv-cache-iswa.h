@@ -134,11 +134,19 @@ public:
     llama_memory_i * get_base() const;
     llama_memory_i * get_swa () const;
 
+    // Owned DFlash image rows can outnumber their logical SWA positions.
+    // Replacement is published only after the caller has transferred state.
+    bool grow_swa(const std::function<void(llama_memory_i &, llama_memory_i &)> & transfer);
+
 private:
     const bool unified;
 
     std::unique_ptr<llama_memory_i> kv_base;
     std::unique_ptr<llama_memory_i> kv_swa;
+    std::function<std::unique_ptr<llama_memory_i>(uint32_t)> make_swa;
+    uint32_t swa_capacity = 0;
+    uint32_t swa_capacity_max = 0;
+    bool swa_growth_pending = false;
 };
 
 class llama_kv_cache_iswa_context : public llama_memory_context_i {

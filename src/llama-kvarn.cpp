@@ -61,6 +61,13 @@ static constexpr std::array<llama_kvarn_type_desc, LLAMA_KVARN_TYPE_COUNT> KVAR_
     LLAMA_KVARN_DESC(8, 8),
 }};
 
+bool llama_kvarn_native_attention_allowed(bool causal_attn, llm_arch arch) {
+    // DFlash non-causal block masks are qualified through the materialized
+    // oracle. Keep native record-consuming attention for causal DFlash and
+    // all existing architectures.
+    return causal_attn || arch != LLM_ARCH_DFLASH;
+}
+
 llama_kvarn_attention_plan llama_kvarn_plan_attention(
         bool native_attention,
         bool native_original_v,
@@ -227,6 +234,44 @@ const char * llama_kvarn_validate_runtime(
     return nullptr;
 }
 
+llama_kvarn_context_route llama_kvarn_context_route_for(
+        const llama_kvarn_context_traits & traits) {
+    if (traits.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
+        if (traits.arch != LLM_ARCH_DFLASH) {
+            return LLAMA_KVARN_CONTEXT_ROUTE_OWNED;
+        }
+
+        // DFlash and DSpark intentionally share one architecture. A target-backed
+        // draft owns its K/V cache; the impossible Markov+selector combination
+        // still fails closed instead of guessing the graph contract.
+        return (traits.has_ctx_other || traits.dflash_has_dspark_head) &&
+                !(traits.dflash_has_dspark_head && traits.dflash_has_selector)
+            ? LLAMA_KVARN_CONTEXT_ROUTE_OWNED
+            : LLAMA_KVARN_CONTEXT_ROUTE_UNSUPPORTED;
+    }
+
+    if (traits.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        switch (traits.arch) {
+            case LLM_ARCH_QWEN35:
+            case LLM_ARCH_QWEN35MOE:
+            case LLM_ARCH_QWEN4EXP:
+                return LLAMA_KVARN_CONTEXT_ROUTE_OWNED;
+            case LLM_ARCH_GEMMA4_ASSISTANT:
+                return LLAMA_KVARN_CONTEXT_ROUTE_SHARED_TARGET;
+            default:
+                return LLAMA_KVARN_CONTEXT_ROUTE_UNSUPPORTED;
+        }
+    }
+
+    return LLAMA_KVARN_CONTEXT_ROUTE_UNSUPPORTED;
+}
+
+llama_kvarn_context_route llama_kvarn_context_route_for(
+        llama_context_type ctx_type,
+        llm_arch arch) {
+    return llama_kvarn_context_route_for({ ctx_type, arch, false, false, false });
+}
+
 llama_kvarn_iswa_policy llama_kvarn_iswa_policy_for(
         bool enabled,
         bool has_swa,
@@ -234,10 +279,9 @@ llama_kvarn_iswa_policy llama_kvarn_iswa_policy_for(
     if (!enabled) {
         return LLAMA_KVARN_ISWA_DISABLED;
     }
-    if (!has_swa || n_seq_max <= 1) {
-        return LLAMA_KVARN_ISWA_ALL_LAYERS;
-    }
-    return LLAMA_KVARN_ISWA_STANDARD_SWA_FALLBACK;
+    GGML_UNUSED(has_swa);
+    GGML_UNUSED(n_seq_max);
+    return LLAMA_KVARN_ISWA_ALL_LAYERS;
 }
 
 bool llama_kvarn_can_remove_range(llama_pos pos_max, llama_pos p0, llama_pos p1, uint32_t group) {
@@ -340,6 +384,46 @@ bool llama_kvarn_reconcile_stage_slots(
     return true;
 }
 
+std::vector<uint32_t> llama_kvarn_live_stage_groups(
+        const std::vector<llama_pos> & latest_by_seq_group,
+        uint32_t n_seq,
+        uint32_t n_groups,
+        uint32_t retained_per_seq) {
+    if (n_seq == 0 || n_groups == 0 || retained_per_seq == 0 ||
+            latest_by_seq_group.size() != size_t(n_seq)*n_groups) {
+        throw std::invalid_argument("invalid KVarN live-stage metadata shape");
+    }
+
+    std::vector<uint32_t> live;
+    live.reserve(size_t(n_seq)*retained_per_seq);
+    for (uint32_t seq = 0; seq < n_seq; ++seq) {
+        std::vector<std::pair<llama_pos, uint32_t>> recent;
+        recent.reserve(retained_per_seq);
+        const size_t base = size_t(seq)*n_groups;
+        for (uint32_t group = 0; group < n_groups; ++group) {
+            const llama_pos pos = latest_by_seq_group[base + group];
+            if (pos == std::numeric_limits<llama_pos>::min()) {
+                continue;
+            }
+            const std::pair<llama_pos, uint32_t> candidate = { pos, group };
+            const auto where = std::lower_bound(recent.begin(), recent.end(), candidate,
+                    std::greater<std::pair<llama_pos, uint32_t>>());
+            recent.insert(where, candidate);
+            if (recent.size() > retained_per_seq) {
+                recent.pop_back();
+            }
+        }
+        for (const auto & entry : recent) {
+            if (entry.second > 0) {
+                live.push_back(entry.second);
+            }
+        }
+    }
+    std::sort(live.begin(), live.end());
+    live.erase(std::unique(live.begin(), live.end()), live.end());
+    return live;
+}
+
 std::vector<llama_kvarn_state_stage_cell> llama_kvarn_select_state_stage_cells(
         const std::vector<uint32_t> & source_cells,
         uint32_t live_cell_max_p1,
@@ -416,7 +500,8 @@ std::vector<int64_t> llama_kvarn_compact_read_plan(
         const std::vector<uint32_t> & occupied_cells,
         const std::vector<uint32_t> & pending_cells,
         uint32_t capacity,
-        uint32_t padding) {
+        uint32_t padding,
+        uint32_t group_align) {
     if (capacity == 0 || padding == 0) {
         throw std::invalid_argument("invalid KVarN compact read-plan extent");
     }
@@ -425,18 +510,62 @@ std::vector<int64_t> llama_kvarn_compact_read_plan(
     cells.reserve(occupied_cells.size() + pending_cells.size());
     cells.insert(cells.end(), occupied_cells.begin(), occupied_cells.end());
     cells.insert(cells.end(), pending_cells.begin(), pending_cells.end());
-    std::set<uint32_t> seen;
+    std::vector<bool> seen(capacity, false);
     cells.erase(std::remove_if(cells.begin(), cells.end(), [&](uint32_t cell) {
         if (cell >= capacity) {
             throw std::invalid_argument("KVarN compact read-plan cell exceeds cache capacity");
         }
-        return !seen.insert(cell).second;
+        if (seen[cell]) {
+            return true;
+        }
+        seen[cell] = true;
+        return false;
     }), cells.end());
     if (cells.size() > capacity) {
         throw std::invalid_argument("KVarN compact read plan exceeds cache capacity");
     }
 
     const uint32_t used = uint32_t(cells.size());
+    if (group_align > 0) {
+        // Sort physical groups and reserve one complete plan segment for each
+        // record. This keeps every segment monotonic and prevents interleaved
+        // unified-cache sequences from resembling a contiguous physical tile.
+        // Falling back to logical order for sparse groups would reintroduce
+        // that ambiguity, so every selected group receives its own segment.
+        std::vector<uint32_t> groups;
+        groups.reserve(cells.size()/group_align + 8);
+        std::vector<bool> group_seen((capacity + group_align - 1u)/group_align, false);
+        for (const uint32_t cell : cells) {
+            const uint32_t group = cell/group_align;
+            if (!group_seen[group]) {
+                group_seen[group] = true;
+                groups.push_back(group);
+            }
+        }
+        std::sort(groups.begin(), groups.end());
+        uint64_t aligned_used = 0;
+        for (const uint32_t group : groups) {
+            const uint32_t begin = group*group_align;
+            aligned_used += std::min(group_align, capacity - begin);
+        }
+        const uint32_t aligned_padded = std::min<uint64_t>(capacity,
+                std::max<uint64_t>(padding,
+                    ((aligned_used + padding - 1u)/padding)*padding));
+        std::vector<int64_t> aligned(aligned_padded, -1);
+        size_t out = 0;
+        for (const uint32_t group : groups) {
+            const uint32_t begin = group*group_align;
+            const uint32_t end = std::min(begin + group_align, capacity);
+            size_t slot = out;
+            for (uint32_t cell = begin; cell < end; ++cell) {
+                if (seen[cell]) {
+                    aligned[slot++] = int64_t(cell);
+                }
+            }
+            out += end - begin;
+        }
+        return aligned;
+    }
     const uint32_t padded = std::min(capacity,
             std::max(padding, ((used + padding - 1u)/padding)*padding));
     std::vector<int64_t> result(padded, -1);

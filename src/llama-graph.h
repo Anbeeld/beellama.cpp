@@ -1290,6 +1290,17 @@ struct llm_graph_context {
 
     llm_graph_input_attn_kv * build_attn_inp_kv() const;
 
+    // Store K/V without computing attention while preserving both the cache
+    // body and any exact-tail representation owned by the memory context.
+    void build_kv_store(
+            const llama_kv_cache_context * mctx_cur,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
+            ggml_tensor * k_idxs,
+            ggml_tensor * v_idxs,
+            ggml_tensor * tail_idxs,
+            int32_t il) const;
+
     ggml_tensor * build_attn(
             llm_graph_input_attn_kv * inp,
             ggml_tensor * wo,
@@ -1302,7 +1313,8 @@ struct llm_graph_context {
             ggml_tensor * sinks, // [n_head_q]
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v] // TODO: remove
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * kq_mask_override = nullptr) const;
 
     llm_graph_input_attn_k  * build_attn_inp_k() const;
 

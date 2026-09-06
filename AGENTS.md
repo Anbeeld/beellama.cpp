@@ -11,7 +11,8 @@ small:
 
 - Upstream speculative decoding, including `draft-dflash`, `draft-mtp`,
   EAGLE3, and n-gram modes.
-- KVarN target KV-cache compression for Qwen3.6 and Gemma 4, selected with
+- KVarN KV-cache compression for target contexts and model-backed speculative
+  contexts with owned draft K/V caches, selected with
   `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`, `kvarn6`, or `kvarn8`.
 - Standard low-bit KV cache formats `q2_0`, `q2_1`, `q3_0`, `q3_1`,
   `q6_0`, and `q6_1`. Bee's cache-facing `q2_0` uses the internal enum
@@ -116,8 +117,14 @@ Key binaries are `llama-server`, `llama-cli`, `llama-bench`, and
 
 ### Invariants
 
-- KVarN is target-context only. Draft and auxiliary contexts use normal cache
-  types.
+- KVarN is supported for target caches and owned draft caches used by
+  draft-simple, EAGLE3, audited Qwen MTP, DFlash1/DFlash2, and non-MLA DSpark.
+  DSV4/MLA DSpark remains unsupported because its latent cache is not dense K/V. Shared
+  Gemma 4 MTP continues to use the target cache representation; n-gram modes
+  have no draft model cache.
+- Non-causal DFlash KVarN attention uses the materialized correctness route;
+  direct record-consuming attention remains disabled for that path until it is
+  independently qualified.
 - CUDA, CPU, Vulkan, and HIP/ROCm consume KVarN records directly in native
   attention paths. Vulkan native attention requires shader Int64 and
   buffer-device-address support. Materialization is an explicit fallback, not
@@ -144,11 +151,12 @@ build/bin/llama-perplexity -m model.gguf -f test.txt -c 4096 -b 512 -ub 256
 # Decode speed
 build/bin/llama-bench -m model.gguf -p 0 -n 64 -t 1
 
-# Upstream DFlash with recommended standard q cache
+# Upstream DFlash with an owned KVarN draft cache
 build/bin/llama-server -m target.gguf \
   --spec-type draft-dflash \
   --spec-draft-model drafter.gguf \
   --spec-draft-n-max 8 \
+  --spec-draft-type-k kvarn4 --spec-draft-type-v kvarn2 \
   --flash-attn on --cache-type-k q5_0 --cache-type-v q4_1 \
   --port 8080
 ```

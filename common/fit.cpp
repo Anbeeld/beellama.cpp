@@ -29,6 +29,10 @@ class common_params_fit_exception : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+class common_params_fit_unsafe_extra_exception : public common_params_fit_exception {
+    using common_params_fit_exception::common_params_fit_exception;
+};
+
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         const char * path_model,
         const llama_model_params * mparams,
@@ -225,7 +229,14 @@ static void common_params_fit_impl(
                 measured = common_get_device_memory_data_impl(
                     extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
             } catch (const std::runtime_error & e) {
-                // the extra model is optional, fit the main model alone rather than giving up
+                // Omitting an explicitly compressed draft context can undercount both its
+                // model allocation and KVarN working set. Fail closed instead of selecting
+                // a target layout that may OOM during real speculative initialization.
+                if (extra->cparams->kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
+                    throw common_params_fit_unsafe_extra_exception(
+                        "cannot safely fit the KVarN draft context without its target context; rerun with -fit off");
+                }
+                // Ordinary extra models retain the upstream best-effort behavior.
                 LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
                 dmds_extra = dmds_t(devs.size() + 1);
                 n_ctx_extra = cparams->n_ctx;
@@ -1048,6 +1059,9 @@ enum common_params_fit_status common_fit_params(
             }
         }
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
+    } catch (const common_params_fit_unsafe_extra_exception & e) {
+        LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());
+        status = COMMON_PARAMS_FIT_STATUS_UNSAFE_EXTRA;
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());
         status = COMMON_PARAMS_FIT_STATUS_FAILURE;
