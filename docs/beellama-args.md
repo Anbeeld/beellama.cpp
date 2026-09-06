@@ -72,6 +72,16 @@ presence, transient estimate, and memory increments. Native routes are checked
 again against the final constructed operation. A mismatch fails context/graph
 construction instead of allowing the scheduler to move that layer silently.
 
+Before caches are built, Bee also checks whether at least one device serving the
+tail's layers advertises a native KV-tail attention entry point. If none does,
+every layer would run the generic tail route, which costs several times more
+than plain quantized attention, so the context warns and declines the request:
+`--kv-tail-tokens` resolves to zero and KVarN keeps its intrinsic 128-token
+exact suffix. Shared Gemma 4 MTP follows the target context's already-resolved
+decision. Set `LLAMA_KV_TAIL_ALLOW_GENERIC=1` to keep the requested tail on the
+slower generic route anyway; any value other than an empty string or `0` enables
+it.
+
 The CLI is parsed once into an immutable, model-independent request. Fit probes
 and the final context bind that same request to the model's canonical cache
 groups, so `auto`, positional, named, and KVarN-minimum policies cannot diverge
