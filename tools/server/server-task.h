@@ -29,8 +29,8 @@ static inline bool server_speculative_rollback_requires_checkpoint(
 }
 
 static inline llama_pos server_speculative_draft_rollback_p0(
-        size_t checkpoint_tokens, llama_pos target_pos_max) {
-    return checkpoint_tokens > 0 ? llama_pos(checkpoint_tokens) : target_pos_max + 1;
+        llama_pos checkpoint_position, llama_pos target_pos_max) {
+    return checkpoint_position > 0 ? checkpoint_position : target_pos_max + 1;
 }
 
 enum server_speculative_draft_rollback_result {

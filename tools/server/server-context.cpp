@@ -3449,7 +3449,9 @@ private:
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
                             /* .n_max    = */ n_draft_max,
-                            /* .n_past   = */ slot.prompt.n_tokens(),
+                            // Image token counts can exceed their M-RoPE position span.
+                            // Draft RoPE and verification must start at the same position.
+                            /* .n_past   = */ slot.prompt.tokens.pos_next(),
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
@@ -3505,8 +3507,9 @@ private:
                 }
 
                 auto * mem_dft = llama_get_memory(ctx_dft);
+                // The checkpoint stores a token index; draft memory uses positions.
                 const llama_pos rm_p0 = server_speculative_draft_rollback_p0(
-                        ckpt.n_tokens, ckpt.pos_max);
+                        slot.prompt.tokens.pos_next(ckpt.n_tokens), ckpt.pos_max);
                 const server_speculative_draft_rollback_io rollback_io {
                     /*.plan =*/ [&](llama_pos p0, llama_pos p1,
                                      llama_pos & planned_p0, llama_pos & planned_p1) {

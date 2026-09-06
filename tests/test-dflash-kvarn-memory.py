@@ -4,6 +4,13 @@ python tests/test-dflash-kvarn-memory.py --server build/bin/llama-server \
     --target target.gguf --draft dflash.gguf
 
 Uses fresh servers per cache pair. Does not download models or require Hub access.
+
+Image-position/acceptance regression with Qwen3.8-27B-UD-IQ4_XS and
+Qwen3.8-27B-DFlash2-Q4_K_M: add matching --mmproj, --image media/llama1-icon.png,
+--profiles q8_0 kvarn6 --prompt-repeats 20 --predict 256 --min-draft-acceptance 0.5
+--instruction "Ignore the image if present. Write the integers from 1 through 100
+in ascending order, separated by commas. Do not explain."
+The acceptance floor is workload-specific, not a general quality guarantee.
 """
 import argparse
 import base64
@@ -70,8 +77,8 @@ def run(args, cache):
                 assert "KVarN attention route=materialized" in text, "DFlash must retain materialized KVarN"
             for attempt in range(args.requests):
                 prompt = "alpha beta gamma delta epsilon zeta eta theta. " * args.prompt_repeats
-                prompt += "\nWrite the first forty positive integers separated by commas."
-                payload = {"prompt": prompt, "n_predict": 128, "temperature": 0,
+                prompt += "\n" + args.instruction
+                payload = {"prompt": prompt, "n_predict": args.predict, "temperature": 0,
                            "seed": 4242, "cache_prompt": False, "ignore_eos": True}
                 endpoint = "completion"
                 if args.image:
@@ -81,7 +88,7 @@ def run(args, cache):
                     if attempt % 2 == 0:
                         content.reverse()
                     payload = {"messages": [{"role": "user", "content": content}],
-                               "max_tokens": 128, "temperature": 0, "seed": 4242,
+                               "max_tokens": args.predict, "temperature": 0, "seed": 4242,
                                "cache_prompt": False, "ignore_eos": True}
                     endpoint = "v1/chat/completions"
                 request = urllib.request.Request(f"http://127.0.0.1:{args.port}/{endpoint}",
@@ -90,8 +97,13 @@ def run(args, cache):
                     output = json.load(response)
                 result.setdefault("responses", []).append(output)
                 timings = output["timings"]
-                assert timings["predicted_n"] >= 128, timings
+                assert timings["predicted_n"] >= args.predict, timings
                 assert timings.get("draft_n", 0) > 0, "test did not exercise draft generation"
+                if args.min_draft_acceptance is not None:
+                    acceptance = timings.get("draft_n_accepted", 0) / timings["draft_n"]
+                    assert acceptance >= args.min_draft_acceptance, (
+                        f"{cache}: draft acceptance {acceptance:.4f} below "
+                        f"{args.min_draft_acceptance}: {timings}")
             if args.require_swa_growth:
                 text = stem.with_suffix(".log").read_text(encoding="utf-8", errors="replace")
                 assert "grew owned DFlash SWA cache" in text, "test did not exercise SWA growth"
@@ -130,6 +142,10 @@ def main():
                         help="bound startup SWA rows independently of the full context")
     parser.add_argument("--prompt-repeats", type=int, default=1200)
     parser.add_argument("--requests", type=int, default=2)
+    parser.add_argument("--predict", type=int, default=128)
+    parser.add_argument("--instruction", default="Write the first forty positive integers separated by commas.")
+    parser.add_argument("--min-draft-acceptance", type=float,
+                        help="optional acceptance floor for a known predictable prompt/model pair")
     parser.add_argument("--port", type=int, default=18340)
     args = parser.parse_args()
     if bool(args.mmproj) != bool(args.image):
