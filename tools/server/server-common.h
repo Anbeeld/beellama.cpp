@@ -277,6 +277,53 @@ server_tokens process_mtmd_prompt(
                                         const mtmd_helper_init_opt & init_opt,
                                         bool is_placeholder = false);
 
+// A segment of the mtmd part list built for mtmd_tokenize_from_parts():
+// either a text segment (keeping its is_input provenance) or a placeholder
+// for one media file; bitmaps are interleaved in order of marker occurrence.
+struct server_mtmd_seg {
+    bool        is_bitmap = false;
+    std::string text;
+    bool        is_input  = false;
+};
+
+/**
+ * Build the text/bitmap segment layout for mtmd_tokenize_from_parts() from
+ * prompt parts and the media marker: the text is split at every marker
+ * occurrence (keeping the is_input metadata of each part) and one bitmap
+ * segment is inserted per media file, in order of marker occurrence.
+ * A marker may span two adjacent parts.
+ * Returns false if the number of markers in the prompt does not match n_files.
+ */
+bool server_build_mtmd_part_layout(
+        const std::string & marker,
+        const std::vector<jinja::string_part> & parts,
+        size_t n_files,
+        std::vector<server_mtmd_seg> & out_segs);
+
+/**
+ * Tokenize a provenance-tagged chat prompt (jinja string parts carrying the
+ * is_input metadata), optionally interleaving the media files at the media
+ * marker positions.
+ *
+ * This is the single input-marking-aware tokenization path shared by the
+ * inference route (handle_completions_impl) and the token counting route
+ * (handle_count_tokens), so both see identical tokenization:
+ * - request-provided parts (is_input) are never parsed for special tokens,
+ *   so stray special tokens in user/tool content cannot be injected;
+ * - when no is_input part contains special-token text, the prompt is
+ *   tokenized as a whole (single pass, or the legacy mtmd path when media
+ *   files are present), so the token ids are identical to the legacy
+ *   whole-prompt tokenization.
+ */
+server_tokens server_tokenize_prompt_parts(
+                                        const llama_vocab * vocab,
+                                        mtmd_context * mctx,
+                                        const std::vector<jinja::string_part> & parts,
+                                        const std::vector<raw_buffer> & files,
+                                        const mtmd_helper_init_opt & init_opt,
+                                        bool add_special,
+                                        bool is_placeholder = false);
+
 /**
  * break the input "prompt" object into multiple prompt if needed, then tokenize them
  * this supports these cases:

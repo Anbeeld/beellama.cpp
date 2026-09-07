@@ -7,6 +7,7 @@
 #include "jinja/parser.h"
 #include "jinja/runtime.h"
 #include "jinja/caps.h"
+#include "jinja/string.h"
 
 #include "json.h"
 
@@ -269,6 +270,7 @@ struct common_chat_templates_inputs {
 struct common_chat_params {
     common_chat_format                  format = COMMON_CHAT_FORMAT_CONTENT_ONLY;
     std::string                         prompt;
+    std::vector<jinja::string_part>    prompt_parts;  // preserves is_input metadata for safe tokenization
     std::string                         grammar;
     bool                                grammar_lazy         = false;
     std::string                         generation_prompt;
@@ -324,6 +326,30 @@ std::string common_chat_templates_source(const struct common_chat_templates * tm
 struct common_chat_params common_chat_templates_apply(const struct common_chat_templates *        tmpls,
                                                       const struct common_chat_templates_inputs & inputs);
 
+// Returns true if at least one is_input part of parts contains text that the
+// tokenizer would parse as special tokens (control/unknown tokens) when
+// parse_special=true, i.e. tokenizing the parts with per-part parse_special
+// would differ from a single parse_special=true pass over the concatenated
+// text.
+bool common_chat_parts_have_special_input(
+    const struct llama_vocab * vocab,
+    const std::vector<jinja::string_part> & parts);
+
+// Tokenize prompt parts with input marking awareness.
+// Parts marked as is_input (user/tool content) are tokenized with
+// parse_special=false so that stray special tokens in request-provided
+// content are not parsed as real special tokens (no special token injection).
+// Parts not marked as is_input (template text) keep parse_special=true.
+//
+// If no is_input part contains special-token text, the parts are tokenized in
+// a single pass over the concatenated text instead, so the resulting token
+// ids are identical to the legacy whole-prompt tokenization (in particular,
+// normal tokenizer merges across part boundaries are preserved).
+std::vector<llama_token> common_tokenize_parts(
+    const struct llama_vocab * vocab,
+    const std::vector<jinja::string_part> & parts,
+    bool add_special);
+
 // Format single message, while taking into account the position of that message in chat history
 std::string common_chat_format_single(const struct common_chat_templates * tmpls,
                                       const std::vector<common_chat_msg> & past_msg,
@@ -365,7 +391,8 @@ std::map<std::string, bool> common_chat_templates_get_caps(const common_chat_tem
 
 std::string common_chat_template_direct_apply(
     const common_chat_template & tmpl,
-    const autoparser::generation_params & inputs);
+    const autoparser::generation_params & inputs,
+    std::vector<jinja::string_part> *     out_parts = nullptr);
 
 std::string common_chat_template_generation_prompt(
     const common_chat_template &          tmpl,
