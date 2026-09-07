@@ -57,30 +57,40 @@ ggml_cuda_fattn_kvarn_portable_resolve(
     return result;
 }
 
-static __device__ __forceinline__ float ggml_cuda_fattn_kvarn_portable_block_reduce(
-        float partial,
+template<int QB>
+static __device__ __forceinline__ void ggml_cuda_fattn_kvarn_portable_block_reduce_qb(
+        float (&partials)[QB],
         float * warp_partials) {
-    // Warp-level reduction with shuffles (no sync), then a single
-    // cross-warp step through shared memory (one sync). Replaces the
-    // 7-stage shared-memory tree (7 syncs) on the per-token hot path.
+    // Reduce QB values concurrently: one warp-shuffle phase over all QB
+    // lanes (no sync), then a single cross-warp step (one sync) instead of
+    // QB sequential reductions (2 syncs each).
     const int lane = threadIdx.x % 32;
     const int wid = threadIdx.x / 32;
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
-        partial += __shfl_xor_sync(0xFFFFFFFFu, partial, offset, 32);
+#pragma unroll
+        for (int qb = 0; qb < QB; ++qb) {
+            partials[qb] += __shfl_xor_sync(0xFFFFFFFFu, partials[qb], offset, 32);
+        }
     }
     if (lane == 0) {
-        warp_partials[wid] = partial;
-    }
-    __syncthreads();
-    float total = threadIdx.x < (GGML_CUDA_FATTN_KVARN_DIM / 32) ?
-        warp_partials[threadIdx.x] : 0.0f;
 #pragma unroll
-    for (int offset = (GGML_CUDA_FATTN_KVARN_DIM / 64); offset > 0; offset >>= 1) {
-        total += __shfl_xor_sync(0xFFFFFFFFu, total, offset, 32);
+        for (int qb = 0; qb < QB; ++qb) {
+            warp_partials[qb * (GGML_CUDA_FATTN_KVARN_DIM / 32) + wid] = partials[qb];
+        }
     }
     __syncthreads();
-    return total;
+#pragma unroll
+    for (int qb = 0; qb < QB; ++qb) {
+        float total = threadIdx.x < (GGML_CUDA_FATTN_KVARN_DIM / 32) ?
+            warp_partials[qb * (GGML_CUDA_FATTN_KVARN_DIM / 32) + threadIdx.x] : 0.0f;
+#pragma unroll
+        for (int offset = (GGML_CUDA_FATTN_KVARN_DIM / 64); offset > 0; offset >>= 1) {
+            total += __shfl_xor_sync(0xFFFFFFFFu, total, offset, 32);
+        }
+        partials[qb] = total;
+    }
+    __syncthreads();
 }
 
 template<int D>
@@ -98,7 +108,7 @@ static __device__ __forceinline__ void ggml_cuda_fattn_kvarn_portable_stage_rota
     }
 }
 
-template<int D>
+template<int D, int QB>
 static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
         const char * q_data,
         const ggml_cuda_fattn_kvarn_desc * k_descs,
@@ -148,31 +158,64 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
         "portable KVarN attention supports 128/256/512-wide heads");
     constexpr int THREADS = GGML_CUDA_FATTN_KVARN_DIM;
     constexpr int SLICES = D / GGML_CUDA_FATTN_KVARN_DIM;
+    static_assert(QB >= 1 && QB <= 8, "portable query batch out of range");
 
-    const int query = (int) blockIdx.x;
+    const int query_base = (int) blockIdx.x * QB;
     const int query_head = (int) blockIdx.y;
     const int stream = (int) blockIdx.z;
     const int tid = (int) threadIdx.x;
-    if (query >= n_query || query_head >= n_query_heads) {
+    if (query_base >= n_query || query_head >= n_query_heads) {
         return;
+    }
+    // QB>1 fast path shares one K/V token stream across QB queries. That is
+    // only valid without packed per-query descriptors (no exact tail).
+    // The launcher guarantees k_tail_data == nullptr for QB > 1.
+    if constexpr (QB > 1) {
+        if (k_tail_data != nullptr) {
+            return;
+        }
     }
 
     const int gqa = n_query_heads / n_kv_heads;
     const int kv_head = query_head / gqa;
-    const float * q = (const float *) (
-        q_data + query * nbq1 + query_head * nbq2 + stream * nbq3);
+    // Per-batch query data. q_valid handles the ragged last group.
+    const float * q_ptr[QB];
+    bool q_valid[QB];
+#pragma unroll
+    for (int qb = 0; qb < QB; ++qb) {
+        const int query = query_base + qb;
+        q_valid[qb] = query < n_query;
+        q_ptr[qb] = (const float *) (
+            q_data + query * nbq1 + query_head * nbq2 + stream * nbq3);
+    }
 
-    __shared__ float maximum;
-    __shared__ float denominator;
-    __shared__ float old_scale_shared;
-    __shared__ float weight_shared;
-    // Warp-shuffle reduction scratch: one partial per warp (THREADS/32).
-    __shared__ float warp_partials[THREADS / 32];
+    __shared__ float maximum[QB];
+    __shared__ float denominator[QB];
+    __shared__ float old_scale_shared[QB];
+    __shared__ float weight_shared[QB];
+    // Token resolution (index math, pointer setup) is identical for all
+    // threads: resolve once per token, broadcast via shared.
+    __shared__ ggml_cuda_fattn_kvarn_resolved_token k_rt_shared;
+    __shared__ ggml_cuda_fattn_kvarn_resolved_token v_rt_shared;
+    // Warp-shuffle reduction scratch: QB sets of one partial per warp.
+    __shared__ float warp_partials[8 * (THREADS / 32)];
 
-    float accumulator[SLICES] = {};
+    float accumulator[QB][SLICES] = {};
+    float q_values[QB][SLICES];
+#pragma unroll
+    for (int qb = 0; qb < QB; ++qb) {
+#pragma unroll
+        for (int slice = 0; slice < SLICES; ++slice) {
+            const int dim = slice * GGML_CUDA_FATTN_KVARN_DIM + tid;
+            q_values[qb][slice] = q_valid[qb] ? q_ptr[qb][dim] : 0.0f;
+        }
+    }
     if (tid == 0) {
-        maximum = -FLT_MAX;
-        denominator = 0.0f;
+#pragma unroll
+        for (int qb = 0; qb < QB; ++qb) {
+            maximum[qb] = -FLT_MAX;
+            denominator[qb] = 0.0f;
+        }
     }
     __syncthreads();
 
@@ -190,21 +233,24 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
     const int32_t * desc = nullptr;
     bool body_packed = false;
     int n_body = n_kv;
-    if (k_tail_data != nullptr) {
-        const int query_id = stream * n_query + query;
-        int active = -1;
-        for (int packed = 0; packed < query_order_nelements; ++packed) {
-            if (query_order[packed] == query_id) {
-                active = packed / query_order_ne0;
-                break;
+    if constexpr (QB == 1) {
+        if (k_tail_data != nullptr) {
+            const int query = query_base;
+            const int query_id = stream * n_query + query;
+            int active = -1;
+            for (int packed = 0; packed < query_order_nelements; ++packed) {
+                if (query_order[packed] == query_id) {
+                    active = packed / query_order_ne0;
+                    break;
+                }
             }
+            if (active < 0) {
+                return;
+            }
+            desc = run_desc + (size_t) active * run_desc_ne0;
+            body_packed = run_desc_ne0 > 6 + tail_mask_ne0;
+            n_body = body_packed ? desc[5] : n_kv;
         }
-        if (active < 0) {
-            return;
-        }
-        desc = run_desc + (size_t) active * run_desc_ne0;
-        body_packed = run_desc_ne0 > 6 + tail_mask_ne0;
-        n_body = body_packed ? desc[5] : n_kv;
     }
 
     for (int packed = 0; packed < n_body; ++packed) {
@@ -216,82 +262,101 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
             k_descs[(size_t) body_stream * n_kv_heads + kv_head];
         const ggml_cuda_fattn_kvarn_desc & v_desc =
             v_descs[(size_t) body_stream * n_kv_heads + kv_head];
-        const auto k_ref = ggml_cuda_fattn_kvarn_portable_resolve(k_desc, token);
-        const auto v_ref = ggml_cuda_fattn_kvarn_portable_resolve(v_desc, token);
+        if (tid == 0) {
+            k_rt_shared = ggml_cuda_fattn_kvarn_resolve_token(k_desc, token);
+            v_rt_shared = ggml_cuda_fattn_kvarn_resolve_token(v_desc, token);
+        }
+        __syncthreads();
         float k_values[SLICES] = {};
-        if (k_ref.stage) {
+        if (k_rt_shared.from_stage) {
             ggml_cuda_fattn_kvarn_portable_stage_rotated<D>(
-                    k_desc, k_ref.stage_pos, tid, k_values);
+                    k_desc, k_rt_shared.stage_pos, tid, k_values);
         } else {
 #pragma unroll
             for (int slice = 0; slice < SLICES; ++slice) {
-                k_values[slice] = ggml_cuda_fattn_kvarn_load_rotated(
-                        k_desc, token, slice, tid);
+                k_values[slice] = ggml_cuda_fattn_kvarn_load_resolved(
+                        k_desc, k_rt_shared, slice, tid);
             }
         }
-        float partial = 0.0f;
+        // One shared K row serves all QB queries: dots, then a single
+        // combined reduction for all QB partials.
+        float totals[QB];
 #pragma unroll
-        for (int slice = 0; slice < SLICES; ++slice) {
-            const int dim = slice * GGML_CUDA_FATTN_KVARN_DIM + tid;
-            partial += q[dim] * k_values[slice];
+        for (int qb = 0; qb < QB; ++qb) {
+            totals[qb] = 0.0f;
+#pragma unroll
+            for (int slice = 0; slice < SLICES; ++slice) {
+                totals[qb] += q_values[qb][slice] * k_values[slice];
+            }
         }
-        const float total = ggml_cuda_fattn_kvarn_portable_block_reduce(
-            partial, warp_partials);
+        ggml_cuda_fattn_kvarn_portable_block_reduce_qb<QB>(totals, warp_partials);
 
         if (tid == 0) {
-            float mask_value = 0.0f;
-            if (mask_data != nullptr) {
-                const half * mask = (const half *) (
-                    mask_data + token * nbm0 + query * nbm1 +
-                    (query_head % nmask2) * nbm2 + (body_stream % nmask3) * nbm3);
-                mask_value = slope * __half2float(*mask);
-            }
+#pragma unroll
+            for (int qb = 0; qb < QB; ++qb) {
+                if (!q_valid[qb]) {
+                    continue;
+                }
+                const int query = query_base + qb;
+                float mask_value = 0.0f;
+                if (mask_data != nullptr) {
+                    const half * mask = (const half *) (
+                        mask_data + token * nbm0 + query * nbm1 +
+                        (query_head % nmask2) * nbm2 + (body_stream % nmask3) * nbm3);
+                    mask_value = slope * __half2float(*mask);
+                }
 
-            float score = total * scale;
-            if (logit_softcap != 0.0f) {
-                score = logit_softcap * tanhf(score);
-            }
-            score += mask_value;
-            if (mask_value == -INFINITY) {
-                old_scale_shared = 1.0f;
-                weight_shared = 0.0f;
-            } else {
-                const float next_maximum = fmaxf(maximum, score);
-                const float old_scale = maximum == -FLT_MAX ?
-                    0.0f : expf(maximum - next_maximum);
-                const float weight = expf(score - next_maximum);
-                maximum = next_maximum;
-                denominator = denominator * old_scale + weight;
-                old_scale_shared = old_scale;
-                weight_shared = weight;
+                float score = totals[qb] * scale;
+                if (logit_softcap != 0.0f) {
+                    score = logit_softcap * tanhf(score);
+                }
+                score += mask_value;
+                if (mask_value == -INFINITY) {
+                    old_scale_shared[qb] = 1.0f;
+                    weight_shared[qb] = 0.0f;
+                } else {
+                    const float next_maximum = fmaxf(maximum[qb], score);
+                    const float old_scale = maximum[qb] == -FLT_MAX ?
+                        0.0f : expf(maximum[qb] - next_maximum);
+                    const float weight = expf(score - next_maximum);
+                    maximum[qb] = next_maximum;
+                    denominator[qb] = denominator[qb] * old_scale + weight;
+                    old_scale_shared[qb] = old_scale;
+                    weight_shared[qb] = weight;
+                }
             }
         }
         __syncthreads();
 
         float v_values[SLICES] = {};
-        if (v_ref.stage) {
+        if (v_rt_shared.from_stage) {
             ggml_cuda_fattn_kvarn_portable_stage_rotated<D>(
-                    v_desc, v_ref.stage_pos, tid, v_values);
+                    v_desc, v_rt_shared.stage_pos, tid, v_values);
         } else {
 #pragma unroll
             for (int slice = 0; slice < SLICES; ++slice) {
-                v_values[slice] = ggml_cuda_fattn_kvarn_load_rotated(
-                        v_desc, token, slice, tid);
+                v_values[slice] = ggml_cuda_fattn_kvarn_load_resolved(
+                        v_desc, v_rt_shared, slice, tid);
             }
         }
 #pragma unroll
-        for (int slice = 0; slice < SLICES; ++slice) {
-            accumulator[slice] = accumulator[slice] * old_scale_shared +
-                v_values[slice] * weight_shared;
+        for (int qb = 0; qb < QB; ++qb) {
+#pragma unroll
+            for (int slice = 0; slice < SLICES; ++slice) {
+                accumulator[qb][slice] = accumulator[qb][slice] * old_scale_shared[qb] +
+                    v_values[slice] * weight_shared[qb];
+            }
         }
         __syncthreads();
     }
 
+    if constexpr (QB == 1) {
     if (k_tail_data != nullptr) {
+        const int query = query_base;
         const int n_tail = desc[4];
         for (int token = 0; token < n_tail; ++token) {
             const int slot = desc[6 + token];
-            float partial = 0.0f;
+            float tail_totals[1] = { 0.0f };
 #pragma unroll
             for (int slice = 0; slice < SLICES; ++slice) {
                 const int dim = slice * GGML_CUDA_FATTN_KVARN_DIM + tid;
@@ -300,10 +365,10 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
                     (size_t) dim * sizeof(uint16_t);
                 const float kval = ggml_cuda_fattn_kvarn_load_tail(
                     ptr, k_tail_bf16);
-                partial += q[dim] * kval;
+                tail_totals[0] += q_values[0][slice] * kval;
             }
-            const float total = ggml_cuda_fattn_kvarn_portable_block_reduce(
-                partial, warp_partials);
+            ggml_cuda_fattn_kvarn_portable_block_reduce_qb<1>(tail_totals, warp_partials);
+            const float total = tail_totals[0];
 
             if (tid == 0) {
                 const half * tail_mask = (const half *) (
@@ -316,17 +381,17 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
                 }
                 score += mask_value;
                 if (mask_value == -INFINITY) {
-                    old_scale_shared = 1.0f;
-                    weight_shared = 0.0f;
+                    old_scale_shared[0] = 1.0f;
+                    weight_shared[0] = 0.0f;
                 } else {
-                    const float next_maximum = fmaxf(maximum, score);
-                    const float old_scale = maximum == -FLT_MAX ?
-                        0.0f : expf(maximum - next_maximum);
+                    const float next_maximum = fmaxf(maximum[0], score);
+                    const float old_scale = maximum[0] == -FLT_MAX ?
+                        0.0f : expf(maximum[0] - next_maximum);
                     const float weight = expf(score - next_maximum);
-                    maximum = next_maximum;
-                    denominator = denominator * old_scale + weight;
-                    old_scale_shared = old_scale;
-                    weight_shared = weight;
+                    maximum[0] = next_maximum;
+                    denominator[0] = denominator[0] * old_scale + weight;
+                    old_scale_shared[0] = old_scale;
+                    weight_shared[0] = weight;
                 }
             }
             __syncthreads();
@@ -339,40 +404,55 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
                     (size_t) dim * sizeof(uint16_t);
                 const float vval = ggml_cuda_fattn_kvarn_load_tail(
                     ptr, v_tail_bf16);
-                accumulator[slice] =
-                    accumulator[slice] * old_scale_shared + vval * weight_shared;
+                accumulator[0][slice] =
+                    accumulator[0][slice] * old_scale_shared[0] + vval * weight_shared[0];
             }
             __syncthreads();
         }
     }
+    }
 
     if (tid == 0) {
-        if (sinks != nullptr) {
-            const float score = sinks[query_head];
-            const float next_maximum = fmaxf(maximum, score);
-            const float old_scale = maximum == -FLT_MAX ?
-                0.0f : expf(maximum - next_maximum);
-            const float weight = expf(score - next_maximum);
-            denominator = denominator * old_scale + weight;
-            maximum = next_maximum;
-            old_scale_shared = old_scale;
-        } else {
-            old_scale_shared = 1.0f;
+#pragma unroll
+        for (int qb = 0; qb < QB; ++qb) {
+            if (!q_valid[qb]) {
+                continue;
+            }
+            const int query = query_base + qb;
+            if (sinks != nullptr) {
+                const float score = sinks[query_head];
+                const float next_maximum = fmaxf(maximum[qb], score);
+                const float old_scale = maximum[qb] == -FLT_MAX ?
+                    0.0f : expf(maximum[qb] - next_maximum);
+                const float weight = expf(score - next_maximum);
+                denominator[qb] = denominator[qb] * old_scale + weight;
+                maximum[qb] = next_maximum;
+                old_scale_shared[qb] = old_scale;
+            } else {
+                old_scale_shared[qb] = 1.0f;
+            }
+            if (body_meta != nullptr) {
+                const size_t row = ((size_t) stream * n_query + query) * n_query_heads + query_head;
+                body_meta[row] = make_float2(maximum[qb], denominator[qb]);
+            }
+            weight_shared[qb] = denominator[qb] > 0.0f ? 1.0f / denominator[qb] : 0.0f;
         }
-        if (body_meta != nullptr) {
-            const size_t row = ((size_t) stream * n_query + query) * n_query_heads + query_head;
-            body_meta[row] = make_float2(maximum, denominator);
-        }
-        weight_shared = denominator > 0.0f ? 1.0f / denominator : 0.0f;
     }
     __syncthreads();
 
-    float * output = (float *) (
-        dst_data + query_head * nbd1 + query * nbd2 + stream * nbd3);
 #pragma unroll
-    for (int slice = 0; slice < SLICES; ++slice) {
-        const int dim = slice * GGML_CUDA_FATTN_KVARN_DIM + tid;
-        output[dim] = accumulator[slice] * old_scale_shared * weight_shared;
+    for (int qb = 0; qb < QB; ++qb) {
+        if (!q_valid[qb]) {
+            continue;
+        }
+        const int query = query_base + qb;
+        float * output = (float *) (
+            dst_data + query_head * nbd1 + query * nbd2 + stream * nbd3);
+#pragma unroll
+        for (int slice = 0; slice < SLICES; ++slice) {
+            const int dim = slice * GGML_CUDA_FATTN_KVARN_DIM + tid;
+            output[dim] = accumulator[qb][slice] * old_scale_shared[qb] * weight_shared[qb];
+        }
     }
 }
 
@@ -416,7 +496,7 @@ static inline bool ggml_cuda_fattn_kvarn_portable_supported(
         tail_ok && body_meta_ok;
 }
 
-template<int D>
+template<int D, int QB>
 static void ggml_cuda_fattn_kvarn_portable_launch(
         ggml_backend_cuda_context & ctx,
         ggml_tensor * dst,
@@ -454,8 +534,15 @@ static void ggml_cuda_fattn_kvarn_portable_launch(
         k_desc.actual_size + v_desc.actual_size);
 
     const dim3 blocks(
-        (uint32_t) q->ne[1], (uint32_t) q->ne[2], (uint32_t) q->ne[3]);
-    ggml_cuda_fattn_kvarn_portable_kernel<D>
+        (uint32_t) ((q->ne[1] + QB - 1) / QB), (uint32_t) q->ne[2], (uint32_t) q->ne[3]);
+    if (getenv("GGML_KVARN_PORTABLE_ATTRS") != nullptr) {
+        hipFuncAttributes attrs = {};
+        CUDA_CHECK(hipFuncGetAttributes(
+            &attrs, (const void *) ggml_cuda_fattn_kvarn_portable_kernel<D, QB>));
+        fprintf(stderr, "portable-attrs D=%d QB=%d numRegs=%d shared=%zu\n",
+            D, QB, attrs.numRegs, (size_t) attrs.sharedSizeBytes);
+    }
+    ggml_cuda_fattn_kvarn_portable_kernel<D, QB>
         <<<blocks, GGML_CUDA_FATTN_KVARN_DIM, 0, stream>>>(
             (const char *) q->data,
             k_desc.get(), v_desc.get(),
@@ -503,9 +590,24 @@ static bool ggml_cuda_flash_attn_ext_kvarn_portable(
         return false;
     }
     switch (dst->src[0]->ne[0]) {
-        case 128: ggml_cuda_fattn_kvarn_portable_launch<128>(ctx, dst, plan); return true;
-        case 256: ggml_cuda_fattn_kvarn_portable_launch<256>(ctx, dst, plan); return true;
-        case 512: ggml_cuda_fattn_kvarn_portable_launch<512>(ctx, dst, plan); return true;
+        case 128: ggml_cuda_fattn_kvarn_portable_launch<128, 1>(ctx, dst, plan); return true;
+        case 256: ggml_cuda_fattn_kvarn_portable_launch<256, 1>(ctx, dst, plan); return true;
+        case 512: ggml_cuda_fattn_kvarn_portable_launch<512, 1>(ctx, dst, plan); return true;
+        default: return false;
+    }
+}
+
+static bool ggml_cuda_flash_attn_ext_kvarn_portable_batched(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * dst,
+        const ggml_cuda_fattn_kvarn_plan & plan) {
+    if (!ggml_cuda_fattn_kvarn_portable_supported(plan, dst)) {
+        return false;
+    }
+    switch (dst->src[0]->ne[0]) {
+        case 128: ggml_cuda_fattn_kvarn_portable_launch<128, 8>(ctx, dst, plan); return true;
+        case 256: ggml_cuda_fattn_kvarn_portable_launch<256, 8>(ctx, dst, plan); return true;
+        case 512: ggml_cuda_fattn_kvarn_portable_launch<512, 8>(ctx, dst, plan); return true;
         default: return false;
     }
 }

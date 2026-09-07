@@ -1202,9 +1202,16 @@ bool ggml_cuda_flash_attn_ext_kvarn(
         if (prompt_prefill && portable_supported &&
                 (prompt_portable == nullptr || atoi(prompt_portable) != 0)) {
             g_kvarn_route_portable_native.fetch_add(1, std::memory_order_relaxed);
+            // Batch 4 queries per block when no exact tail is attached (shared
+            // token stream); otherwise the queries attend different token sets
+            // and sharing is invalid.
+            const bool batched = dst->src[5] == nullptr && dst->src[0]->ne[1] > 1;
             ggml_cuda_fattn_kvarn_debug_route(
                 ctx.device, plan, dst, entry_path, "portable-native",
-                "hip-prompt-precision");
+                batched ? "hip-prompt-precision-qb4" : "hip-prompt-precision");
+            if (batched) {
+                return ggml_cuda_flash_attn_ext_kvarn_portable_batched(ctx, dst, plan);
+            }
             return ggml_cuda_flash_attn_ext_kvarn_portable(ctx, dst, plan);
         }
     }
