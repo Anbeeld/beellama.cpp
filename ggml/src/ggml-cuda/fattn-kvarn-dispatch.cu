@@ -1190,6 +1190,25 @@ bool ggml_cuda_flash_attn_ext_kvarn(
     const ggml_cuda_fattn_kvarn_route fallback_route =
         ggml_cuda_fattn_kvarn_select_fallback_route(
             prompt_prefill, generic_shape_supported, portable_supported);
+#if defined(GGML_USE_HIP)
+    // RDNA WMMA prompt tiles accumulate in fp16 (RMSE ~3e-4 vs ~1e-5 for the
+    // portable fp32 path), and the error compounds through 64 layers into a
+    // visible KLD collapse. Route HIP prompt-prefill through portable-native
+    // direct-record attention (same records, exact math) until a float
+    // WMMA accumulator lands. Decode (nq<=16) stays on WMMA: its single
+    // iteration is exact. Opt out with GGML_KVARN_AMD_PROMPT_PORTABLE=0.
+    {
+        const char * prompt_portable = getenv("GGML_KVARN_AMD_PROMPT_PORTABLE");
+        if (prompt_prefill && portable_supported &&
+                (prompt_portable == nullptr || atoi(prompt_portable) != 0)) {
+            g_kvarn_route_portable_native.fetch_add(1, std::memory_order_relaxed);
+            ggml_cuda_fattn_kvarn_debug_route(
+                ctx.device, plan, dst, entry_path, "portable-native",
+                "hip-prompt-precision");
+            return ggml_cuda_flash_attn_ext_kvarn_portable(ctx, dst, plan);
+        }
+    }
+#endif
     if (fallback_route == GGML_CUDA_FATTN_KVARN_ROUTE_GENERIC_MMA ||
             fallback_route == GGML_CUDA_FATTN_KVARN_ROUTE_PROMPT_PREFILL) {
         if (prompt_prefill) {
