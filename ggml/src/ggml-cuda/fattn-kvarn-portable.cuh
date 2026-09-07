@@ -57,6 +57,32 @@ ggml_cuda_fattn_kvarn_portable_resolve(
     return result;
 }
 
+static __device__ __forceinline__ float ggml_cuda_fattn_kvarn_portable_block_reduce(
+        float partial,
+        float * warp_partials) {
+    // Warp-level reduction with shuffles (no sync), then a single
+    // cross-warp step through shared memory (one sync). Replaces the
+    // 7-stage shared-memory tree (7 syncs) on the per-token hot path.
+    const int lane = threadIdx.x % 32;
+    const int wid = threadIdx.x / 32;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        partial += __shfl_xor_sync(0xFFFFFFFFu, partial, offset, 32);
+    }
+    if (lane == 0) {
+        warp_partials[wid] = partial;
+    }
+    __syncthreads();
+    float total = threadIdx.x < (GGML_CUDA_FATTN_KVARN_DIM / 32) ?
+        warp_partials[threadIdx.x] : 0.0f;
+#pragma unroll
+    for (int offset = (GGML_CUDA_FATTN_KVARN_DIM / 64); offset > 0; offset >>= 1) {
+        total += __shfl_xor_sync(0xFFFFFFFFu, total, offset, 32);
+    }
+    __syncthreads();
+    return total;
+}
+
 template<int D>
 static __device__ __forceinline__ void ggml_cuda_fattn_kvarn_portable_stage_rotated(
         const ggml_cuda_fattn_kvarn_desc & desc,
@@ -136,11 +162,12 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
     const float * q = (const float *) (
         q_data + query * nbq1 + query_head * nbq2 + stream * nbq3);
 
-    __shared__ float reduction[THREADS];
     __shared__ float maximum;
     __shared__ float denominator;
     __shared__ float old_scale_shared;
     __shared__ float weight_shared;
+    // Warp-shuffle reduction scratch: one partial per warp (THREADS/32).
+    __shared__ float warp_partials[THREADS / 32];
 
     float accumulator[SLICES] = {};
     if (tid == 0) {
@@ -208,15 +235,8 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
             const int dim = slice * GGML_CUDA_FATTN_KVARN_DIM + tid;
             partial += q[dim] * k_values[slice];
         }
-        reduction[tid] = partial;
-        __syncthreads();
-
-        for (int stride = THREADS / 2; stride > 0; stride >>= 1) {
-            if (tid < stride) {
-                reduction[tid] += reduction[tid + stride];
-            }
-            __syncthreads();
-        }
+        const float total = ggml_cuda_fattn_kvarn_portable_block_reduce(
+            partial, warp_partials);
 
         if (tid == 0) {
             float mask_value = 0.0f;
@@ -227,7 +247,7 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
                 mask_value = slope * __half2float(*mask);
             }
 
-            float score = reduction[0] * scale;
+            float score = total * scale;
             if (logit_softcap != 0.0f) {
                 score = logit_softcap * tanhf(score);
             }
@@ -253,6 +273,7 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
             ggml_cuda_fattn_kvarn_portable_stage_rotated<D>(
                     v_desc, v_ref.stage_pos, tid, v_values);
         } else {
+#pragma unroll
             for (int slice = 0; slice < SLICES; ++slice) {
                 v_values[slice] = ggml_cuda_fattn_kvarn_load_rotated(
                         v_desc, token, slice, tid);
@@ -281,21 +302,15 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
                     ptr, k_tail_bf16);
                 partial += q[dim] * kval;
             }
-            reduction[tid] = partial;
-            __syncthreads();
-            for (int stride = THREADS / 2; stride > 0; stride >>= 1) {
-                if (tid < stride) {
-                    reduction[tid] += reduction[tid + stride];
-                }
-                __syncthreads();
-            }
+            const float total = ggml_cuda_fattn_kvarn_portable_block_reduce(
+                partial, warp_partials);
 
             if (tid == 0) {
                 const half * tail_mask = (const half *) (
                     tail_mask_data + (size_t) token * nbmt0 +
                     (size_t) query * nbmt1 + (size_t) stream * nbmt3);
                 const float mask_value = slope * __half2float(*tail_mask);
-                float score = reduction[0] * scale;
+                float score = total * scale;
                 if (logit_softcap != 0.0f) {
                     score = logit_softcap * tanhf(score);
                 }
