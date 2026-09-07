@@ -4104,6 +4104,41 @@ static void test_native_flash_attention_prefill_route_parity() {
     ggml_backend_free(gpu_backend);
 }
 
+static void test_kvarn_nkv_ladder() {
+    ggml_backend_t gpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
+    if (gpu_backend == nullptr) {
+        return;
+    }
+    ggml_backend_t cpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_CPU, true);
+    // Production proxy: D256, k6/v6, GQA 6 (24q/4kv Qwen), nq=256 prompt tile,
+    // production query layout + eager records (op_params[9]=1 in serving).
+    // Head-dim ladder decides which dims need the portable prompt route.
+    for (int head_dim : { 128, 256, 512 }) {
+    for (int n_kv : { 256, 512, 1024, 2048, 4096, 8192 }) {
+        const std::vector<float> expected = test_native_flash_attention_output(
+                cpu_backend, false, false, head_dim, 6, 6, 256,
+                6, 1, n_kv, 2, false, nullptr, false, 0, false,
+                GGML_TYPE_F16, 0, false, true, -1, true);
+        const std::vector<float> actual = test_native_flash_attention_output(
+                gpu_backend, true, true, head_dim, 6, 6, 256,
+                6, 1, n_kv, 2, false, nullptr, false, 0, false,
+                GGML_TYPE_F16, 0, false, true, -1, true);
+        double sum = 0.0;
+        double mx = 0.0;
+        for (size_t i = 0; i < actual.size(); ++i) {
+            const double d = double(actual[i]) - double(expected[i]);
+            sum += d * d;
+            mx = std::max(mx, std::fabs(d));
+        }
+        std::printf("kvarn-ladder: D=%d n_kv=%d rmse=%g maxabs=%g n=%zu\n",
+                head_dim, n_kv, std::sqrt(sum / actual.size()), mx, actual.size());
+        std::fflush(stdout);
+    }
+    }
+    ggml_backend_free(cpu_backend);
+    ggml_backend_free(gpu_backend);
+}
+
 static void test_store_paths_gpu() {
     ggml_backend_t gpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
     if (gpu_backend == nullptr) {
@@ -5204,6 +5239,12 @@ int main() {
     if (std::getenv("GGML_KVARN_TEST_PREFILL_PARITY_ONLY") != nullptr) {
         test_native_flash_attention_prefill_route_parity();
         std::printf("test-kvarn: prefill route parity OK\n");
+        return 0;
+    }
+
+    if (std::getenv("GGML_KVARN_TEST_NKV_LADDER_ONLY") != nullptr) {
+        test_kvarn_nkv_ladder();
+        std::printf("test-kvarn: nkv ladder OK\n");
         return 0;
     }
 
