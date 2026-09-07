@@ -498,6 +498,12 @@ target_include_directories(test-kv-tail-request PRIVATE ${PROJECT_SOURCE_DIR}/sr
 
 llama_build_and_test(test-fit-kvarn-tail.cpp ../common/fit-kvarn-tail.cpp)
 target_include_directories(test-fit-kvarn-tail PRIVATE ${PROJECT_SOURCE_DIR}/common)
+add_executable(test-meta-graph-reuse test-meta-graph-reuse.cpp)
+target_link_libraries(test-meta-graph-reuse PRIVATE ggml)
+llama_test(test-meta-graph-reuse)
+llama_test(test-meta-graph-reuse NAME test-meta-kvarn-graph-reuse ARGS kvarn)
+llama_test(test-meta-graph-reuse NAME test-meta-cuda-graph-reuse LABEL cuda ARGS cuda)
+llama_test(test-meta-graph-reuse NAME test-meta-kvarn-cuda-graph-reuse LABEL cuda ARGS kvarn-cuda)
 llama_build_and_test(test-kv-cache-placement.cpp ../src/llama-kv-cache-placement.cpp)
 target_include_directories(test-kv-cache-placement PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build_and_test(test-std-kv-tail-graph.cpp ../src/llama-kv-cache-tail.cpp)

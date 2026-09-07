@@ -1991,6 +1991,42 @@ struct ggml_backend_meta_context {
     size_t                      n_subgraphs   = 0;
     uint64_t                    uid           = 0;
 
+    // Parent UIDs do not describe in-place graph rewrites. Retain the reachable
+    // tensor metadata (not tensor contents) before reusing a projection.
+    struct tensor_snapshot {
+        const ggml_tensor * address;
+        ggml_tensor value;
+    };
+    std::vector<tensor_snapshot> graph_snapshot;
+    std::vector<const ggml_tensor *> graph_roots;
+    std::vector<int32_t> graph_use_counts;
+    int graph_n_nodes = 0;
+
+    bool projection_matches(const ggml_cgraph * graph) const {
+        if (graph->uid == 0 || graph->uid != uid || graph_n_nodes != graph->n_nodes ||
+                graph_roots.size() != size_t(graph->n_nodes + graph->n_leafs)) {
+            return false;
+        }
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            if (graph_roots[i] != graph->nodes[i] ||
+                    graph_use_counts[i] != ggml_node_get_use_count(graph, i)) {
+                return false;
+            }
+        }
+        for (int i = 0; i < graph->n_leafs; ++i) {
+            if (graph_roots[graph->n_nodes + i] != graph->leafs[i]) {
+                return false;
+            }
+        }
+        for (const auto & saved : graph_snapshot) {
+            if (memcmp(&saved.value, saved.address,
+                    GGML_TENSOR_SIZE - sizeof(ggml_tensor::padding)) != 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
 
@@ -2155,50 +2191,59 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
 
-    std::set<ggml_backend_buffer_t> dynamic_kvarn_buffers;
+    const bool needs_rebuild = !backend_ctx->projection_matches(cgraph);
+    std::set<ggml_backend_buffer_t> kvarn_dependency_buffers;
     std::set<ggml_backend_buffer_t> dependency_meta_buffers;
-    std::set<const ggml_tensor *> visited_dependencies;
-    std::vector<const ggml_tensor *> dependencies;
-    dependencies.reserve(cgraph->n_nodes + cgraph->n_leafs);
-    for (int i = 0; i < cgraph->n_nodes; ++i) {
-        dependencies.push_back(cgraph->nodes[i]);
-    }
-    for (int i = 0; i < cgraph->n_leafs; ++i) {
-        dependencies.push_back(cgraph->leafs[i]);
-    }
-    while (!dependencies.empty()) {
-        const ggml_tensor * tensor = dependencies.back();
-        dependencies.pop_back();
-        if (tensor == nullptr || !visited_dependencies.insert(tensor).second) {
-            continue;
+    if (needs_rebuild) {
+        // Retire consumers before projected tensor storage is reset or rewritten.
+        if (!backend_ctx->graph_snapshot.empty()) {
+            ggml_backend_meta_synchronize(backend);
         }
-        if (ggml_backend_buffer_t owner = ggml_backend_meta_tensor_owner_buffer(tensor)) {
-            dependency_meta_buffers.insert(owner);
+        backend_ctx->graph_snapshot.clear();
+        backend_ctx->graph_roots.clear();
+        backend_ctx->graph_use_counts.clear();
+        backend_ctx->graph_n_nodes = cgraph->n_nodes;
+        std::set<const ggml_tensor *> visited_dependencies;
+        std::vector<const ggml_tensor *> dependencies;
+        dependencies.reserve(cgraph->n_nodes + cgraph->n_leafs);
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            dependencies.push_back(cgraph->nodes[i]);
+            backend_ctx->graph_roots.push_back(cgraph->nodes[i]);
+            backend_ctx->graph_use_counts.push_back(ggml_node_get_use_count(cgraph, i));
         }
-        if (tensor->op == GGML_OP_KVARN_STORE ||
-                tensor->op == GGML_OP_KVARN_VIEW ||
-                tensor->op == GGML_OP_KVARN_MATERIALIZE) {
+        for (int i = 0; i < cgraph->n_leafs; ++i) {
+            dependencies.push_back(cgraph->leafs[i]);
+            backend_ctx->graph_roots.push_back(cgraph->leafs[i]);
+        }
+        // Visit parents before graph-external dependencies so a replaced source
+        // invalidates the snapshot before any detached source is dereferenced.
+        for (size_t cursor = 0; cursor < dependencies.size(); ++cursor) {
+            const ggml_tensor * tensor = dependencies[cursor];
+            if (tensor == nullptr || !visited_dependencies.insert(tensor).second) {
+                continue;
+            }
+            backend_ctx->graph_snapshot.push_back({tensor, *tensor});
             if (ggml_backend_buffer_t owner = ggml_backend_meta_tensor_owner_buffer(tensor)) {
-                dynamic_kvarn_buffers.insert(owner);
+                dependency_meta_buffers.insert(owner);
+            }
+            if (tensor->op == GGML_OP_KVARN_STORE ||
+                    tensor->op == GGML_OP_KVARN_VIEW ||
+                    tensor->op == GGML_OP_KVARN_MATERIALIZE) {
+                if (ggml_backend_buffer_t owner = ggml_backend_meta_tensor_owner_buffer(tensor)) {
+                    kvarn_dependency_buffers.insert(owner);
+                }
+            }
+            if (tensor->view_src != nullptr && tensor->view_src != tensor) {
+                dependencies.push_back(tensor->view_src);
+            }
+            for (size_t i = 0; i < GGML_MAX_SRC; ++i) {
+                if (tensor->src[i] != nullptr && tensor->src[i] != tensor) {
+                    dependencies.push_back(tensor->src[i]);
+                }
             }
         }
-        if (tensor->view_src != nullptr && tensor->view_src != tensor) {
-            dependencies.push_back(tensor->view_src);
-        }
-        for (size_t i = 0; i < GGML_MAX_SRC; ++i) {
-            if (tensor->src[i] != nullptr && tensor->src[i] != tensor) {
-                dependencies.push_back(tensor->src[i]);
-            }
-        }
-    }
 
-    // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
-    // KVarN graph-local nodes are rebuilt in place between decode steps while
-    // the scheduler intentionally retains the parent graph UID. Their source
-    // tensors and operation parameters are therefore part of the executable
-    // identity even when the parent UID is unchanged.
-    const bool needs_rebuild = (cgraph->uid == 0) ||
-            (cgraph->uid != backend_ctx->uid) || !dynamic_kvarn_buffers.empty();
+    }
 
     bool max_nnodes_raised = false;
     if (cgraph->n_nodes > backend_ctx->max_nnodes) {
@@ -2224,16 +2269,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 used_buffers.emplace(cgraph->nodes[i]->buffer);
             }
         }
-        used_buffers.insert(dynamic_kvarn_buffers.begin(), dynamic_kvarn_buffers.end());
+        used_buffers.insert(kvarn_dependency_buffers.begin(), kvarn_dependency_buffers.end());
         used_buffers.insert(dependency_meta_buffers.begin(), dependency_meta_buffers.end());
         for (ggml_backend_buffer_t buf : used_buffers) {
             ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buf->context;
-            // Ordinary scheduler-created views select the prepared container
-            // from init_tensor. A KVarN-triggered rebuild can happen without
-            // that callback, so advance every participating meta buffer as one
-            // graph generation before projecting any of its nodes.
-            if (!dynamic_kvarn_buffers.empty() &&
-                    buf_ctx->stc_compute_index != buf_ctx->stc_compute_index_next) {
+            // Scheduler allocation normally selects the prepared container in
+            // init_tensor. Property-only rewrites can happen without that
+            // callback, so always advance to the next graph generation before
+            // projecting any rewritten nodes.
+            if (buf_ctx->stc_compute_index != buf_ctx->stc_compute_index_next) {
                 buf_ctx->stc_compute_index = buf_ctx->stc_compute_index_next;
             }
             buf_ctx->stc_compute_index_next =
@@ -2532,12 +2576,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     const size_t hash_pos_ij = ggml_hash_insert(&cgraph_ij->visited_hash_set, node_ij);
                     cgraph_ij->use_counts[hash_pos_ij] = cgraph->use_counts[hash_pos_orig];
                 }
-                // A projected meta graph reuses tensor objects whose data
-                // pointers, view offsets, and shapes can change in place even
-                // while the parent graph UID remains stable. Keep the UID
-                // unset so backends such as CUDA compare node properties before
-                // reusing a captured executable graph.
-                cgraph_ij->uid = 0;
+                // Retain an executable identity only while every parent and
+                // dependency property matches. A rewrite rebuilds these projected
+                // tensors and assigns a new identity before capture can resume.
+                cgraph_ij->uid = ggml_graph_next_uid();
             }
         }
     }
