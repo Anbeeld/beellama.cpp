@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.4.6
+
+- Updated the llama.cpp base from `57291f264` (`b10689`) to `465e49b9c` (`b10830`) and ggml to 0.23.0. Notable inherited changes include sparse FlashAttention for DeepSeek V4 and GLM, fused DFlash encoder injection, concurrent CUDA streams for multi-GPU splits, CUDA MoE reduction and FlashAttention improvements, faster KV-cell history lookup and state restoration, new Tencent Hunyuan 4 and Spark 2.5 model support, expanded DeepSeek V4 vision and Nemotron support, broader OpenCL/Metal/SYCL/Vulkan/Hexagon backend coverage, and upstream server, conversion, RPC, multimodal, and Web UI updates through that merge point.
+- Restored property-safe CUDA graph reuse for tensor splits. Projected Meta graphs now keep stable nonzero identities for standard and KVarN execution, while snapshots of reachable tensor metadata, graph roots, use counts, and operation parameters force rebuilding when executable properties change. Consumer synchronization and generation-scoped projected storage preserve asynchronous tensor lifetimes instead of relying on the broad UID-zero capture suppression introduced with sharded precision tails.
+- Restored the default CUDA KVarN prefill materialization window to 65,536 tokens, avoiding an additional floating-point partial-softmax merge through 64K contexts. Memory-constrained concurrent workloads can select a smaller transient window with `GGML_KVARN_WINDOW_CHUNK` without changing persistent cache capacity.
+
 ## v0.4.5
 
 - Updated the llama.cpp base from `6fdd0ac89` to `57291f264` (`b10689`). Notable inherited changes include Qwen3.8 Flash Next (`qwen4exp`) target support with HyperConnections, QSA sparse attention, PLE n-gram embeddings, GGUF metadata and tensor mappings, conversion, multi-GPU placement, and graph lifecycle integration, plus `--kv-unified-per-slot` context limits, OpenVINO 2026.3.1, and upstream server, Web UI, conversion, model, and backend updates through that merge point. The public lazy-loading API now uses `llama_lazy_mode` and `llama_model_params::lazy_mode` instead of `llama_tensor_read_lazy` and `tensor_read_lazy`.

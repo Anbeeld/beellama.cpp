@@ -15,7 +15,7 @@ The BeeLlama version is set at the top of `CMakeLists.txt`:
 ```cmake
 set(LLAMA_VERSION_MAJOR 0)
 set(LLAMA_VERSION_MINOR 4)
-set(LLAMA_VERSION_PATCH 4)
+set(LLAMA_VERSION_PATCH 6)
 ```
 
 Development builds use the default `LLAMA_BUILD_IS_DEV=ON` and report a `-dev` suffix. The release workflow passes `-DLLAMA_BUILD_IS_DEV=OFF` for previews and stable packages, and rejects a requested `vX.Y.Z` that does not match these source version fields.
