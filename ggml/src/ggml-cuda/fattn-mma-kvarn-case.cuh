@@ -12,11 +12,10 @@ using ggml_cuda_fattn_kernel_attr_ptr_t = const void *;
 using ggml_cuda_fattn_kernel_attr_ptr_t = fattn_kernel_t;
 #endif
 
-// Bound transient K/V materialization for large unified caches. The partial
-// merge preserves the online-softmax numerator, maximum, and denominator;
-// keeping the window at 32K avoids full-window scratch exhaustion when two
-// long prompts share a 128K cache.
-static constexpr int GGML_CUDA_FATTN_KVARN_WINDOW_CHUNK = 32768;
+// Keep prefill single-window through 64K to avoid an additional floating-point
+// partial merge. Lower values remain available through GGML_KVARN_WINDOW_CHUNK
+// when concurrent long prompts require less transient K/V scratch.
+static constexpr int GGML_CUDA_FATTN_KVARN_WINDOW_CHUNK = 65536;
 
 static inline bool ggml_cuda_fattn_kvarn_window_enabled() {
     const char * env = getenv("GGML_KVARN_WINDOW");
