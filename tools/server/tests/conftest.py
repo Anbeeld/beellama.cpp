@@ -1,5 +1,15 @@
+import os
 import pytest
+from filelock import FileLock
 from utils import *
+
+
+@pytest.fixture(scope="session", autouse=True)
+def configure_worker_port(request):
+    worker_id = getattr(request.config, "workerinput", {}).get("workerid", "master")
+    if worker_id != "master":
+        worker_num = int(worker_id[2:])
+        os.environ["PORT"] = str(8080 + worker_num * 10)
 
 
 # ref: https://stackoverflow.com/questions/22627659/run-code-before-and-after-each-test-in-py-test
@@ -19,7 +29,7 @@ _server_presets_loaded = False
 
 
 @pytest.fixture(scope="module", autouse=True)
-def load_server_presets(request):
+def load_server_presets(request, configure_worker_port, tmp_path_factory):
     global _server_presets_loaded
 
     # Local-model suites validate and provide their own immutable fixture and
@@ -27,5 +37,8 @@ def load_server_presets(request):
     if getattr(request.module, "NO_PRELOAD_SERVER_PRESETS", False):
         return
     if not _server_presets_loaded:
-        ServerPreset.load_all()
+        # Serialize downloads across xdist workers, without preloading local-only suites.
+        root_tmp_dir = tmp_path_factory.getbasetemp().parent
+        with FileLock(str(root_tmp_dir / "load_all.lock")):
+            ServerPreset.load_all()
         _server_presets_loaded = True
