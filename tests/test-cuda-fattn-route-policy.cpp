@@ -217,10 +217,10 @@ int main(int argc, char ** argv) {
                      GGML_CUDA_FATTN_KVARN_MMA_ELIGIBLE,
         "RDNA WMMA must reject ncols2=1 and admit the same-width ncols2=2 tile");
     ok &= expect(mma_eligibility(GGML_CUDA_FATTN_KVARN_AMD_RDNA_WMMA, 256, 8, 2) ==
-                     GGML_CUDA_FATTN_KVARN_MMA_HEAD_DIM_UNSUPPORTED &&
-                 mma_eligibility(GGML_CUDA_FATTN_KVARN_AMD_RDNA_WMMA, 512, 8, 2) ==
-                     GGML_CUDA_FATTN_KVARN_MMA_HEAD_DIM_UNSUPPORTED,
-        "RDNA WMMA must reject D256 and D512 before template launch");
+                     GGML_CUDA_FATTN_KVARN_MMA_ELIGIBLE &&
+                  mma_eligibility(GGML_CUDA_FATTN_KVARN_AMD_RDNA_WMMA, 512, 8, 2) ==
+                      GGML_CUDA_FATTN_KVARN_MMA_HEAD_DIM_UNSUPPORTED,
+        "RDNA WMMA must admit D256 and reject D512 before template launch");
     for (int head_dim : {128, 256}) {
         ok &= expect(mma_eligibility(GGML_CUDA_FATTN_KVARN_AMD_CDNA_MFMA, head_dim, 5, 3) ==
                          GGML_CUDA_FATTN_KVARN_MMA_TILE_TOO_SMALL &&

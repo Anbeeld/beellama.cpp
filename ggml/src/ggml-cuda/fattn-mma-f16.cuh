@@ -908,12 +908,16 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         }
 #elif defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
         if constexpr (std::is_same_v<decltype(T_C_VKQ::x), half2[T_C_VKQ::ne]>) {
-            const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale[0], KQ_max_scale[0]);
+            // Rescale in fp32 to avoid double-rounding the scale to half first.
+            const float scale_f32 = KQ_max_scale[0];
 #pragma unroll
             for (int i = 0; i < (DV/2)/T_C_VKQ::J; ++i) {
 #pragma unroll
                 for (int l = 0; l < T_C_VKQ::ne; ++l) {
-                    VKQ_C[i].x[l] *= KQ_max_scale_h2;
+                    float2 acc_f32 = __half22float2(VKQ_C[i].x[l]);
+                    acc_f32.x *= scale_f32;
+                    acc_f32.y *= scale_f32;
+                    VKQ_C[i].x[l] = make_half2(acc_f32.x, acc_f32.y);
                 }
             }
         } else {
@@ -1447,12 +1451,16 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         }
 #elif defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
         if constexpr (std::is_same_v<decltype(T_C_VKQ::x), half2[T_C_VKQ::ne]>) {
-            const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale[0], KQ_max_scale[0]);
+            // Rescale in fp32 to avoid double-rounding the scale to half first.
+            const float scale_f32 = KQ_max_scale[0];
 #pragma unroll
             for (int i = 0; i < (DV/2)/T_C_VKQ::J; ++i) {
 #pragma unroll
                 for (int l = 0; l < T_C_VKQ::ne; ++l) {
-                    VKQ_C[i].x[l] *= KQ_max_scale_h2;
+                    float2 acc_f32 = __half22float2(VKQ_C[i].x[l]);
+                    acc_f32.x *= scale_f32;
+                    acc_f32.y *= scale_f32;
+                    VKQ_C[i].x[l] = make_half2(acc_f32.x, acc_f32.y);
                 }
             }
         } else {
@@ -1767,7 +1775,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 }
             }
         }
-        if (np > 1) {
+        // The tile_Q buffer is reused for the next k00 iteration, so all warps must sync here
+        // before its data is overwritten. With np > 1 only some warps read back, but they all write.
+        if (np > 1 || k00 + nbatch_combine < DV/2) {
             __syncthreads();
         }
     }
@@ -1844,7 +1854,7 @@ static __global__ void flash_attn_ext_f16(
 #if defined(AMD_WMMA_AVAILABLE)
     // Mirrored by ggml_cuda_fattn_kvarn_amd_mma_eligibility on the host.
     // Keep this final invariant for callers outside the KVarN dispatcher.
-    if (ncols1*ncols2 < 16 || ncols2 == 1 || DKQ > 128) {
+    if (ncols1*ncols2 < 16 || ncols2 == 1 || DKQ > 256) {
         NO_DEVICE_CODE;
         return;
     }
@@ -1925,6 +1935,11 @@ static __global__ void flash_attn_ext_f16(
                 (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, dst_final_meta_tile, scale, slope, logit_softcap,
                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
         }
+
+        // The next process_tile call reuses the tile_Q buffer for its Q/K tiles, so all warps must
+        // have finished reading the combined results before any of them starts the next call.
+        // (With np == 1 the end-of-k00 barrier does not fire, so this is required for correctness.)
+        __syncthreads();
 
         kbc += iter_k;
         kbc -= kbc % iter_k;

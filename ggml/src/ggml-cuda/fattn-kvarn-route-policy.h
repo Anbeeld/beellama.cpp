@@ -60,7 +60,7 @@ inline ggml_cuda_fattn_kvarn_mma_eligibility ggml_cuda_fattn_kvarn_amd_mma_eligi
         return GGML_CUDA_FATTN_KVARN_MMA_INVALID_COLUMNS;
     }
     if (input.head_dim <= 0 ||
-            (input.arch == GGML_CUDA_FATTN_KVARN_AMD_RDNA_WMMA && input.head_dim > 128) ||
+            (input.arch == GGML_CUDA_FATTN_KVARN_AMD_RDNA_WMMA && input.head_dim > 256) ||
             (input.arch == GGML_CUDA_FATTN_KVARN_AMD_CDNA_MFMA && input.head_dim > 256)) {
         return GGML_CUDA_FATTN_KVARN_MMA_HEAD_DIM_UNSUPPORTED;
     }
