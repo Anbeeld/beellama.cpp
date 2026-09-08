@@ -1,6 +1,6 @@
-# BeeLlama v0.4.5 features
+# BeeLlama v0.4.6 features
 
-BeeLlama v0.4.5 keeps a small fork surface on top of upstream llama.cpp. Use
+BeeLlama v0.4.6 keeps a small fork surface on top of upstream llama.cpp. Use
 this page to choose a feature; use the [argument reference](beellama-args.md)
 for exact names, environment variables, defaults, and validation ranges.
 
@@ -66,6 +66,15 @@ Run KLD or perplexity with the same corpus, context, batch size, and cache pair
 as the intended workload. Keep both `-b` and `-ub` identical between baseline
 and candidate runs. Record the model file, command, prompt or corpus, sampling
 settings, GPU, and commit with every result.
+
+CUDA multi-token KVarN prefill materializes transient F16 K/V windows. The
+v0.4.6 default keeps one window through 65,536 active tokens to avoid an
+additional partial-softmax merge. `GGML_KVARN_WINDOW_CHUNK` can select a smaller
+positive token count when concurrent long prompts require less transient
+scratch; the value does not change the context size, retained cache, KVarN bit
+width, or precision-tail length. Smaller windows remain mathematically
+online-softmax equivalent but change floating-point reduction order, so KLD
+comparisons must record this setting.
 
 The CUDA specialized split, SWA-vector, and tiled descriptor-native MMA routes
 publish the same optional FP32 `(maximum, denominator)` metadata as upstream

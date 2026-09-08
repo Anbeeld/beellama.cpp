@@ -35,6 +35,15 @@ def main() -> None:
         require(qwen4exp, needle, "Qwen4Exp standalone MTP draft-head support is incomplete")
     require(qwen4exp_h, "struct graph_mtp : public graph", "Qwen4Exp MTP graph declaration is missing")
 
+    hybrid_idx = (ROOT / "src/llama-memory-hybrid-idx.cpp").read_text(encoding="utf-8")
+    constructors = hybrid_idx.split("llama_memory_hybrid_idx::llama_memory_hybrid_idx(")[1:]
+    if len(constructors) != 2:
+        raise AssertionError("audit the indexer constructors after an upstream API change")
+    for constructor in constructors:
+        initialization = constructor.split("}()) {}", 1)[0]
+        require(initialization, "hparams_idx.rope_type = LLAMA_ROPE_TYPE_NONE;",
+                "every QSA indexer constructor must disable K-shift rotation of raw pooled keys")
+
     qwen4exp_converter = (ROOT / "conversion/qwen4exp.py").read_text(encoding="utf-8")
     require(
         qwen4exp_converter,

@@ -111,6 +111,8 @@ assert "GGML_CUDA_FATTN_KVARN_DECODE_RESOURCE_PAD" in DECODE and \
     "decode resource compensation is not restricted to the verified NVCC 13.1/sm_86 build"
 assert "__shared__ float denom_sh[Q_TILE][MAX_GQA + GGML_CUDA_FATTN_KVARN_DECODE_RESOURCE_PAD]" in DECODE, \
     "decode dedup no longer preserves the verified baseline shared-memory footprint"
+assert "static constexpr int GGML_CUDA_FATTN_KVARN_WINDOW_CHUNK = 65536;" in WINDOW_CASE, \
+    "default KVarN window must retain a single 64K materialization chunk"
 for duplicate in (
     "GGML_CUDA_FATTN_KVARN_WINDOW_CHUNK",
     "ggml_cuda_fattn_kvarn_window_enabled",

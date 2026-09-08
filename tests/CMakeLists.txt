@@ -488,6 +488,9 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp)
+llama_build_and_test(test-kv-history.cpp)
+target_include_directories(test-kv-history PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
 llama_build_and_test(test-kv-cache-tail.cpp ../src/llama-kv-cache-tail.cpp)
 target_include_directories(test-kv-cache-tail PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build_and_test(test-kv-tail-request.cpp ../src/llama-kv-tail-request.cpp ../src/llama-kvarn.cpp)
@@ -495,6 +498,12 @@ target_include_directories(test-kv-tail-request PRIVATE ${PROJECT_SOURCE_DIR}/sr
 
 llama_build_and_test(test-fit-kvarn-tail.cpp ../common/fit-kvarn-tail.cpp)
 target_include_directories(test-fit-kvarn-tail PRIVATE ${PROJECT_SOURCE_DIR}/common)
+add_executable(test-meta-graph-reuse test-meta-graph-reuse.cpp)
+target_link_libraries(test-meta-graph-reuse PRIVATE ggml)
+llama_test(test-meta-graph-reuse)
+llama_test(test-meta-graph-reuse NAME test-meta-kvarn-graph-reuse ARGS kvarn)
+llama_test(test-meta-graph-reuse NAME test-meta-cuda-graph-reuse LABEL cuda ARGS cuda)
+llama_test(test-meta-graph-reuse NAME test-meta-kvarn-cuda-graph-reuse LABEL cuda ARGS kvarn-cuda)
 llama_build_and_test(test-kv-cache-placement.cpp ../src/llama-kv-cache-placement.cpp)
 target_include_directories(test-kv-cache-placement PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build_and_test(test-std-kv-tail-graph.cpp ../src/llama-kv-cache-tail.cpp)
@@ -543,6 +552,14 @@ endif()
 llama_build_and_test(test-backend-ops.cpp)
 llama_build_and_test(test-kv-tail-copy-transaction.cpp)
 target_include_directories(test-kv-tail-copy-transaction PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+# the tensor API kernels come from a separate metallib - check they produce correct results
+# ref: https://github.com/ggml-org/llama.cpp/issues/27473
+if (GGML_METAL AND NOT GGML_METAL_EMBED_LIBRARY)
+    llama_test(test-backend-ops NAME test-backend-ops-metallib-tensor
+               ARGS test -b MTL0 -o MUL_MAT -p type_a=q6_K)
+    set_tests_properties(test-backend-ops-metallib-tensor PROPERTIES ENVIRONMENT GGML_METAL_TENSOR_ENABLE=1)
+endif()
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
