@@ -2298,6 +2298,13 @@ static std::vector<float> test_native_flash_attention_output(
 
     std::vector<float> k_data((size_t) 128 * record_heads * n_kv * n_stream);
     std::vector<float> v_data(k_data.size());
+    // GGML_KVARN_TEST_LADDER_OUTLIER=S replicates LLM outlier channels
+    // (Qwen K/V have a few channels at 10-100x the typical magnitude) to
+    // test half-narrowing sensitivity of WMMA tile loaders.
+    float ladder_outlier = 0.0f;
+    if (const char * outlier_env = std::getenv("GGML_KVARN_TEST_LADDER_OUTLIER")) {
+        ladder_outlier = strtof(outlier_env, nullptr);
+    }
     for (int t = 0; t < n_kv; ++t) {
         for (int h = 0; h < n_kv_heads; ++h) {
             for (int slice = 0; slice < slices; ++slice) {
@@ -2311,6 +2318,10 @@ static std::vector<float> test_native_flash_attention_output(
                     v_data[off] =
                         0.75f * std::cos(float(full_d) * 0.013f - float(t) * 0.019f) +
                         0.08f * std::sin(float(t) * 0.015f + float(h) * 0.23f);
+                    if (ladder_outlier != 0.0f && (full_d % 64) == 0) {
+                        k_data[off] *= ladder_outlier;
+                        v_data[off] *= ladder_outlier;
+                    }
                 }
             }
         }
@@ -4113,16 +4124,46 @@ static void test_kvarn_nkv_ladder() {
     // Production proxy: D256, k6/v6, GQA 6 (24q/4kv Qwen), nq=256 prompt tile,
     // production query layout + eager records (op_params[9]=1 in serving).
     // Head-dim ladder decides which dims need the portable prompt route.
+    // GGML_KVARN_TEST_LADDER_NQ overrides the prompt tile (32/128/256) to
+    // isolate ncols-dependent prefill paths.
+    int ladder_nq = 256;
+    if (const char * nq_env = std::getenv("GGML_KVARN_TEST_LADDER_NQ")) {
+        ladder_nq = std::atoi(nq_env);
+    }
+    int ladder_q_heads = 6, ladder_kv_heads = 1;
+    if (const char * heads_env = std::getenv("GGML_KVARN_TEST_LADDER_HEADS")) {
+        if (std::sscanf(heads_env, "%d,%d", &ladder_q_heads, &ladder_kv_heads) != 2) {
+            ladder_q_heads = 6;
+            ladder_kv_heads = 1;
+        }
+    }
+    int ladder_tail = 0;
+    if (const char * tail_env = std::getenv("GGML_KVARN_TEST_LADDER_TAIL")) {
+        ladder_tail = std::atoi(tail_env);
+    }
+    auto [route_reset, route_get] = get_kvarn_route_stats_fns(gpu_backend);
     for (int head_dim : { 128, 256, 512 }) {
     for (int n_kv : { 256, 512, 1024, 2048, 4096, 8192 }) {
         const std::vector<float> expected = test_native_flash_attention_output(
-                cpu_backend, false, false, head_dim, 6, 6, 256,
-                6, 1, n_kv, 2, false, nullptr, false, 0, false,
+                cpu_backend, false, false, head_dim, 6, 6, ladder_nq,
+                ladder_q_heads, ladder_kv_heads, n_kv, 2, false, nullptr, false, ladder_tail, ladder_tail > 0,
                 GGML_TYPE_F16, 0, false, true, -1, true);
+        if (route_reset != nullptr) {
+            route_reset();
+        }
         const std::vector<float> actual = test_native_flash_attention_output(
-                gpu_backend, true, true, head_dim, 6, 6, 256,
-                6, 1, n_kv, 2, false, nullptr, false, 0, false,
+                gpu_backend, true, true, head_dim, 6, 6, ladder_nq,
+                ladder_q_heads, ladder_kv_heads, n_kv, 2, false, nullptr, false, ladder_tail, ladder_tail > 0,
                 GGML_TYPE_F16, 0, false, true, -1, true);
+        if (route_get != nullptr && head_dim == 256 && n_kv == 512) {
+            test_kvarn_route_stats stats = make_test_kvarn_route_stats();
+            route_get(&stats);
+            std::printf("kvarn-ladder-routes: generic_mma=%llu prompt_prefill=%llu portable_native=%llu amd_generic_mma=%llu materialize=%llu vec=%llu\n",
+                    (unsigned long long) stats.generic_mma, (unsigned long long) stats.prompt_prefill,
+                    (unsigned long long) stats.portable_native, (unsigned long long) stats.amd_generic_mma,
+                    (unsigned long long) stats.materialize_fallback, (unsigned long long) stats.decode_vector);
+            std::fflush(stdout);
+        }
         double sum = 0.0;
         double mx = 0.0;
         for (size_t i = 0; i < actual.size(); ++i) {
