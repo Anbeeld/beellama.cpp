@@ -1,4 +1,4 @@
-# BeeLlama v0.4.6 argument reference
+# BeeLlama v0.4.7 argument reference
 
 This page covers Bee-owned arguments and the upstream arguments whose behavior
 BeeLlama extends. Run `llama-server --help` or `llama-cli --help` for the full
@@ -8,7 +8,9 @@ limits, and measurement guidance.
 ## KVarN cache types and SWA overrides
 
 KVarN values are `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`, `kvarn6`, and
-`kvarn8`. K and V may use different bit widths.
+`kvarn8`. K and V may use different bit widths. Logical 64-dimensional K/V heads are
+supported on the qualified CPU and CUDA routes with rectangular 64 x 128 K and
+128 x 64 V records. D128/D256/D512 retain their existing 128 x 128 record ABI.
 
 CUDA, ROCm/HIP, Vulkan, and CPU consume compressed KVarN records directly in
 native FlashAttention paths. Vulkan requires shader Int64 and

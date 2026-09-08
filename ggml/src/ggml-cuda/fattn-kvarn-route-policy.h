@@ -15,6 +15,7 @@ enum ggml_cuda_fattn_kvarn_head_dim : uint32_t {
     GGML_CUDA_FATTN_KVARN_HEAD_DIM_128 = 1u << 0,
     GGML_CUDA_FATTN_KVARN_HEAD_DIM_256 = 1u << 1,
     GGML_CUDA_FATTN_KVARN_HEAD_DIM_512 = 1u << 2,
+    GGML_CUDA_FATTN_KVARN_HEAD_DIM_64  = 1u << 3,
 };
 
 enum ggml_cuda_fattn_kvarn_route {
@@ -181,6 +182,7 @@ inline ggml_cuda_fattn_kvarn_capabilities ggml_cuda_fattn_kvarn_select_capabilit
     result.rotated_query_max_specialized =
         result.specialized_routes ? GGML_CUDA_FATTN_KVARN_SPECIALIZED_DECODE_MAX_Q : 0u;
     result.supported_head_dims = result.portable_native || result.specialized_routes ?
+        GGML_CUDA_FATTN_KVARN_HEAD_DIM_64  |
         GGML_CUDA_FATTN_KVARN_HEAD_DIM_128 |
         GGML_CUDA_FATTN_KVARN_HEAD_DIM_256 |
         GGML_CUDA_FATTN_KVARN_HEAD_DIM_512 : 0u;
@@ -196,6 +198,7 @@ inline bool ggml_cuda_fattn_kvarn_body_shape_supported(
         return false;
     }
     switch (d_k) {
+        case  64: head_dim = GGML_CUDA_FATTN_KVARN_HEAD_DIM_64;  break;
         case 128: head_dim = GGML_CUDA_FATTN_KVARN_HEAD_DIM_128; break;
         case 256: head_dim = GGML_CUDA_FATTN_KVARN_HEAD_DIM_256; break;
         case 512: head_dim = GGML_CUDA_FATTN_KVARN_HEAD_DIM_512; break;

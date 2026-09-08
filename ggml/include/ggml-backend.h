@@ -196,6 +196,7 @@ extern "C" {
         GGML_BACKEND_KVARN_HEAD_DIM_128 = 1u << 0,
         GGML_BACKEND_KVARN_HEAD_DIM_256 = 1u << 1,
         GGML_BACKEND_KVARN_HEAD_DIM_512 = 1u << 2,
+        GGML_BACKEND_KVARN_HEAD_DIM_64  = 1u << 3,
     };
 
     struct ggml_backend_kvarn_capabilities {

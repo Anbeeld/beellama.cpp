@@ -4608,7 +4608,7 @@ llama_context * llama_init_from_model(
             bool head_dims_supported = true;
             bool backend_ops_supported = true;
             for (uint32_t il = layer_begin; il < layer_end; ++il) {
-                if (!model->hparams.has_kv(il)) {
+                if (!model->hparams.has_kv(il) || model->hparams.is_recr(il)) {
                     continue;
                 }
 
@@ -4617,8 +4617,10 @@ llama_context * llama_init_from_model(
                     llama_kvarn_head_dim_supported(model->hparams.n_embd_head_k(il)) &&
                     llama_kvarn_head_dim_supported(model->hparams.n_embd_head_v(il));
 
-                backend_ops_supported = backend_ops_supported && llama_kvarn_backend_supports_ops(
-                    params.offload_kqv ? model->dev_layer(il) : nullptr);
+                auto * kvarn_dev = params.offload_kqv ? model->dev_layer(il) : nullptr;
+                backend_ops_supported = backend_ops_supported &&
+                    llama_kvarn_backend_supports_ops(kvarn_dev, model->hparams.n_embd_head_k(il)) &&
+                    llama_kvarn_backend_supports_ops(kvarn_dev, model->hparams.n_embd_head_v(il));
             }
 
             const bool causal_attn =

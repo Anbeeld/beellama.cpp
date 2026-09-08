@@ -55,7 +55,7 @@ static __device__ __forceinline__ float ggml_cuda_fattn_kvarn_load_stage_rotated
         const int record_head,
         const int dim) {
     const int64_t base = ((int64_t) stage_pos * desc.n_record_heads + record_head) *
-        GGML_CUDA_FATTN_KVARN_DIM;
+        desc.record_dim;
     return __half2float(desc.stage[base + dim]);
 }
 
@@ -113,14 +113,16 @@ static __device__ __forceinline__ float ggml_cuda_fattn_kvarn_load_rotated(
 
     const uint8_t * record = desc.records +
         ((int64_t) record_group * desc.n_record_heads + record_head) * desc.record_bytes;
-    const int payload_bytes = GGML_CUDA_FATTN_KVARN_DIM * GGML_CUDA_FATTN_KVARN_DIM * desc.bits / 8;
+    const int rows = desc.value ? GGML_CUDA_FATTN_KVARN_DIM : desc.record_dim;
+    const int cols = desc.value ? desc.record_dim : GGML_CUDA_FATTN_KVARN_DIM;
+    const int payload_bytes = desc.record_dim * GGML_CUDA_FATTN_KVARN_DIM * desc.bits / 8;
     const half * scale_axis = (const half *) (record + payload_bytes);
-    const half * zp_axis    = scale_axis + GGML_CUDA_FATTN_KVARN_DIM;
-    const half * other_axis = zp_axis + GGML_CUDA_FATTN_KVARN_DIM;
+    const half * zp_axis    = scale_axis + rows;
+    const half * other_axis = zp_axis + rows;
     const int row = desc.value ? pos : dim;
     const int col = desc.value ? dim : pos;
     const uint8_t q = ggml_cuda_fattn_kvarn_unpack_record(
-        record, row * GGML_CUDA_FATTN_KVARN_DIM + col, desc.bits);
+        record, row * cols + col, desc.bits);
     return (float(q) * __half2float(scale_axis[row]) + __half2float(zp_axis[row])) *
         __half2float(other_axis[col]);
 }

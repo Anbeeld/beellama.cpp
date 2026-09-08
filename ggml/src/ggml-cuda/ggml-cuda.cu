@@ -5217,6 +5217,30 @@ static uint32_t ggml_backend_cuda_kvarn_native_rotated_max_query_tokens(ggml_bac
 #endif
 }
 
+static bool ggml_backend_cuda_kvarn_head_dim_supported(ggml_backend_dev_t dev, int64_t head_dim) {
+#if !defined(GGML_CUDA_KVARN) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(dev);
+    GGML_UNUSED(head_dim);
+    return false;
+#else
+    if (dev == nullptr || dev->context == nullptr) {
+        return false;
+    }
+    uint32_t bit = 0;
+    switch (head_dim) {
+        case  64: bit = GGML_CUDA_FATTN_KVARN_HEAD_DIM_64;  break;
+        case 128: bit = GGML_CUDA_FATTN_KVARN_HEAD_DIM_128; break;
+        case 256: bit = GGML_CUDA_FATTN_KVARN_HEAD_DIM_256; break;
+        case 512: bit = GGML_CUDA_FATTN_KVARN_HEAD_DIM_512; break;
+        default: return false;
+    }
+    const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
+    const auto & info = ggml_cuda_info();
+    return device >= 0 && device < info.device_count &&
+        (ggml_cuda_fattn_kvarn_device_capabilities(device).supported_head_dims & bit) != 0;
+#endif
+}
+
 static bool ggml_backend_cuda_kvarn_ops(ggml_backend_dev_t dev) {
 #if !defined(GGML_CUDA_KVARN) || defined(GGML_USE_MUSA)
     GGML_UNUSED(dev);
@@ -5760,10 +5784,23 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_KVARN_WHT:
+#if defined(GGML_CUDA_KVARN)
+            return ggml_backend_cuda_kvarn_ops(dev) &&
+                ggml_backend_cuda_kvarn_head_dim_supported(
+                    dev, ggml_get_op_params_i32(op, 0));
+#else
+            return false;
+#endif
         case GGML_OP_KVARN_STORE:
         case GGML_OP_KVARN_MATERIALIZE:
 #if defined(GGML_CUDA_KVARN)
-            return ggml_backend_cuda_kvarn_ops(dev);
+            {
+                const ggml_tensor * stage = op->op == GGML_OP_KVARN_STORE ? op->src[2] : op->src[1];
+                const int head_slices = std::max(1, ggml_get_op_params_i32(op, 5));
+                return stage != nullptr && ggml_backend_cuda_kvarn_ops(dev) &&
+                    ggml_backend_cuda_kvarn_head_dim_supported(
+                        dev, stage->ne[0] * head_slices);
+            }
 #else
             return false;
 #endif

@@ -56,6 +56,25 @@ struct llama_kvarn_type_desc {
     int group;
 };
 
+struct llama_kvarn_geometry {
+    uint32_t token_group;
+    uint32_t record_dim;
+    uint32_t head_dim;
+    uint32_t head_slices;
+};
+
+struct llama_kvarn_record_layout {
+    uint32_t token_group;
+    uint32_t record_dim;
+    uint32_t rows;
+    uint32_t cols;
+    size_t payload_bytes;
+    size_t scale_off;
+    size_t zp_off;
+    size_t other_off;
+    size_t record_bytes;
+};
+
 struct llama_kvarn_tile_layout {
     size_t k_payload_off;
     size_t v_payload_off;
@@ -116,6 +135,8 @@ const llama_kvarn_type_desc * llama_kvarn_type_desc_from_name(const char * name)
 const llama_kvarn_type_desc * llama_kvarn_type_desc_from_type(llama_kvarn_type type);
 
 llama_kvarn_tile_layout llama_kvarn_make_layout(int head_dim, int group, int key_bits, int value_bits);
+llama_kvarn_record_layout llama_kvarn_make_record_layout(int record_dim, int bits, bool value);
+bool llama_kvarn_geometry_for(int head_dim, llama_kvarn_geometry & geometry);
 
 int  llama_kvarn_head_slices(int head_dim);
 bool llama_kvarn_head_dim_supported(int head_dim);
@@ -234,6 +255,7 @@ bool llama_kvarn_stream_is_exclusive_for(
     return true;
 }
 
+void llama_kvarn_hadamard_64(float * values);
 void llama_kvarn_hadamard_128(float * values);
 
 void llama_kvarn_quantize_k_tile(

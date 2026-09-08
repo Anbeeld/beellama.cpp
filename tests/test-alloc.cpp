@@ -425,7 +425,8 @@ static void test_kvarn_view_keeps_indirect_plan_alive() {
     auto [ctx, graph, ctx_ptr] = make_context();
 
     constexpr int64_t n_kv = 128;
-    ggml_tensor * records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, 64, 1, 1);
+    constexpr int64_t kvarn4_record_bytes = 128 * 128 * 4 / 8 + 3 * 128 * 2;
+    ggml_tensor * records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, kvarn4_record_bytes, 1, 1);
     ggml_tensor * stage = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, 1, 256);
     ggml_tensor * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_kv);
     ggml_set_input(records);

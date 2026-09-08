@@ -62,13 +62,14 @@ static __device__ __forceinline__ void ggml_cuda_fattn_kvarn_portable_stage_rota
         const ggml_cuda_fattn_kvarn_desc & desc,
         int stage_pos,
         int tid,
-        float (&values)[D/GGML_CUDA_FATTN_KVARN_DIM]) {
-    constexpr int SLICES = D/GGML_CUDA_FATTN_KVARN_DIM;
+        float (&values)[D/(D == 64 ? 64 : GGML_CUDA_FATTN_KVARN_DIM)]) {
+    constexpr int RECORD_DIM = D == 64 ? 64 : GGML_CUDA_FATTN_KVARN_DIM;
+    constexpr int SLICES = D/RECORD_DIM;
 #pragma unroll
     for (int slice = 0; slice < SLICES; ++slice) {
         const int head = desc.head_base + slice;
         values[slice] = __half2float(desc.stage[
-            ((int64_t) stage_pos*desc.n_record_heads + head)*GGML_CUDA_FATTN_KVARN_DIM + tid]);
+            ((int64_t) stage_pos*desc.n_record_heads + head)*RECORD_DIM + tid]);
     }
 }
 
@@ -114,14 +115,16 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
         int tail_mask_ne0,
         bool k_tail_bf16,
         bool v_tail_bf16,
+        bool v_original_domain,
         int n_kv,
         int n_query,
         int n_query_heads,
         int n_kv_heads) {
-    static_assert(D == 128 || D == 256 || D == 512,
-        "portable KVarN attention supports 128/256/512-wide heads");
-    constexpr int THREADS = GGML_CUDA_FATTN_KVARN_DIM;
-    constexpr int SLICES = D / GGML_CUDA_FATTN_KVARN_DIM;
+    static_assert(D == 64 || D == 128 || D == 256 || D == 512,
+        "portable KVarN attention supports 64/128/256/512-wide heads");
+    constexpr int RECORD_DIM = D == 64 ? 64 : GGML_CUDA_FATTN_KVARN_DIM;
+    constexpr int THREADS = RECORD_DIM;
+    constexpr int SLICES = D / RECORD_DIM;
 
     const int query = (int) blockIdx.x;
     const int query_head = (int) blockIdx.y;
@@ -137,6 +140,7 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
         q_data + query * nbq1 + query_head * nbq2 + stream * nbq3);
 
     __shared__ float reduction[THREADS];
+    __shared__ float transform[THREADS];
     __shared__ float maximum;
     __shared__ float denominator;
     __shared__ float old_scale_shared;
@@ -205,7 +209,7 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
         float partial = 0.0f;
 #pragma unroll
         for (int slice = 0; slice < SLICES; ++slice) {
-            const int dim = slice * GGML_CUDA_FATTN_KVARN_DIM + tid;
+            const int dim = slice * RECORD_DIM + tid;
             partial += q[dim] * k_values[slice];
         }
         reduction[tid] = partial;
@@ -258,6 +262,23 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
                         v_desc, token, slice, tid);
             }
         }
+        if (v_original_domain) {
+#pragma unroll
+            for (int slice = 0; slice < SLICES; ++slice) {
+                reduction[tid] = v_values[slice];
+                __syncthreads();
+#pragma unroll
+                for (int stride = 1; stride < THREADS; stride <<= 1) {
+                    const float self = reduction[tid];
+                    const float other = reduction[tid ^ stride];
+                    transform[tid] = (tid & stride) ? other - self : self + other;
+                    __syncthreads();
+                    reduction[tid] = transform[tid];
+                    __syncthreads();
+                }
+                v_values[slice] = reduction[tid] * rsqrtf(float(THREADS));
+            }
+        }
 #pragma unroll
         for (int slice = 0; slice < SLICES; ++slice) {
             accumulator[slice] = accumulator[slice] * old_scale_shared +
@@ -273,7 +294,7 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
             float partial = 0.0f;
 #pragma unroll
             for (int slice = 0; slice < SLICES; ++slice) {
-                const int dim = slice * GGML_CUDA_FATTN_KVARN_DIM + tid;
+                const int dim = slice * RECORD_DIM + tid;
                 const char * ptr = k_tail_data +
                     (size_t) slot * nbkt1 + (size_t) kv_head * nbkt2 +
                     (size_t) dim * sizeof(uint16_t);
@@ -318,7 +339,7 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
 
 #pragma unroll
             for (int slice = 0; slice < SLICES; ++slice) {
-                const int dim = slice * GGML_CUDA_FATTN_KVARN_DIM + tid;
+                const int dim = slice * RECORD_DIM + tid;
                 const char * ptr = v_tail_data +
                     (size_t) slot * nbvt1 + (size_t) kv_head * nbvt2 +
                     (size_t) dim * sizeof(uint16_t);
@@ -356,7 +377,7 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
         dst_data + query_head * nbd1 + query * nbd2 + stream * nbd3);
 #pragma unroll
     for (int slice = 0; slice < SLICES; ++slice) {
-        const int dim = slice * GGML_CUDA_FATTN_KVARN_DIM + tid;
+        const int dim = slice * RECORD_DIM + tid;
         output[dim] = accumulator[slice] * old_scale_shared * weight_shared;
     }
 }
@@ -390,8 +411,11 @@ static inline bool ggml_cuda_fattn_kvarn_portable_supported(
         (body_meta->type == GGML_TYPE_F32 && body_meta->ne[0] == 2 &&
          body_meta->ne[1] == q->ne[2] && body_meta->ne[2] == q->ne[1] &&
          body_meta->ne[3] == q->ne[3] && ggml_is_contiguous(body_meta));
-    return ggml_cuda_fattn_kvarn_rotated_decode_domain(dst) &&
-        (q->ne[0] == 128 || q->ne[0] == 256 || q->ne[0] == 512) &&
+    const bool domain_ok = ggml_cuda_fattn_kvarn_rotated_decode_domain(dst) ||
+        (q->ne[0] == 64 &&
+         ggml_cuda_fattn_kvarn_domain(dst) == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V);
+    return domain_ok &&
+        (q->ne[0] == 64 || q->ne[0] == 128 || q->ne[0] == 256 || q->ne[0] == 512) &&
         q->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
         q->ne[0] == dst->src[1]->ne[0] && q->ne[0] == dst->src[2]->ne[0] &&
         q->ne[1] > 0 && q->ne[2] > 0 && q->ne[3] == plan.n_stream &&
@@ -432,16 +456,18 @@ static void ggml_cuda_fattn_kvarn_portable_launch(
     const size_t n_desc = (size_t) plan.n_stream * plan.n_kv_heads;
     ggml_cuda_pool_alloc<ggml_cuda_fattn_kvarn_desc> k_desc(pool, n_desc);
     ggml_cuda_pool_alloc<ggml_cuda_fattn_kvarn_desc> v_desc(pool, n_desc);
+    const bool v_original_domain = ggml_cuda_fattn_kvarn_v_original_domain(dst);
     ggml_cuda_fattn_kvarn_init_descs(
-        plan, k_desc.get(), v_desc.get(), 0, 0, stream);
+        plan, k_desc.get(), v_desc.get(), 0, v_original_domain ? 1 : 0, stream);
     ggml_cuda_kv_memory_transient_stats_record_kvarn(
         k_desc.actual_size + v_desc.actual_size, 0, 0,
         k_desc.actual_size + v_desc.actual_size);
 
     const dim3 blocks(
         (uint32_t) q->ne[1], (uint32_t) q->ne[2], (uint32_t) q->ne[3]);
+    constexpr int RECORD_DIM = D == 64 ? 64 : GGML_CUDA_FATTN_KVARN_DIM;
     ggml_cuda_fattn_kvarn_portable_kernel<D>
-        <<<blocks, GGML_CUDA_FATTN_KVARN_DIM, 0, stream>>>(
+        <<<blocks, RECORD_DIM, 0, stream>>>(
             (const char *) q->data,
             k_desc.get(), v_desc.get(),
             mask ? (const char *) mask->data : nullptr,
@@ -475,6 +501,7 @@ static void ggml_cuda_fattn_kvarn_portable_launch(
             mt ? (int) mt->ne[0] : 0,
             kt && kt->type == GGML_TYPE_BF16,
             vt && vt->type == GGML_TYPE_BF16,
+            v_original_domain,
             plan.n_kv, (int) q->ne[1], (int) q->ne[2],
             plan.n_kv_heads);
     CUDA_CHECK(cudaGetLastError());
@@ -488,6 +515,7 @@ static bool ggml_cuda_flash_attn_ext_kvarn_portable(
         return false;
     }
     switch (dst->src[0]->ne[0]) {
+        case  64: ggml_cuda_fattn_kvarn_portable_launch< 64>(ctx, dst, plan); return true;
         case 128: ggml_cuda_fattn_kvarn_portable_launch<128>(ctx, dst, plan); return true;
         case 256: ggml_cuda_fattn_kvarn_portable_launch<256>(ctx, dst, plan); return true;
         case 512: ggml_cuda_fattn_kvarn_portable_launch<512>(ctx, dst, plan); return true;
