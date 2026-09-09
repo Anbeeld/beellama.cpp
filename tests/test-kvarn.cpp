@@ -129,11 +129,23 @@ static void test_attention_domain_policy() {
     require(cuda_portable_prefill.domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED,
             "portable-only CUDA prompt processing must remain in the rotated domain");
 
-    const auto cuda_prefill = llama_kvarn_plan_attention(true, true, 16, 17);
-    require(cuda_prefill.native_attention,
-            "backends with original-domain V support must retain native prefill");
-    require(cuda_prefill.domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V,
-            "native large-query prefill must use original-domain V");
+    const auto cuda_d64_decode = llama_kvarn_plan_attention(true, true, 16, 1, 64);
+    require(cuda_d64_decode.native_attention,
+            "D64 decode must retain direct-record attention independent of KV length");
+    require(cuda_d64_decode.domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED,
+            "native D64 decode must remain in the rotated domain");
+
+    const auto cuda_d64_prefill = llama_kvarn_plan_attention(true, true, 16, 17, 64);
+    require(!cuda_d64_prefill.native_attention,
+            "D64 large-query prefill must materialize for tiled backend attention");
+    require(cuda_d64_prefill.domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED,
+            "materialized D64 prefill must remain in the rotated domain");
+
+    const auto cuda_d128_prefill = llama_kvarn_plan_attention(true, true, 16, 17, 128);
+    require(cuda_d128_prefill.native_attention,
+            "D128 original-domain V support must retain native prefill");
+    require(cuda_d128_prefill.domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V,
+            "native D128 large-query prefill must use original-domain V");
 
     require(llama_kvarn_attention_domain(false, false, 0, 64) ==
                 GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED,
@@ -2153,7 +2165,8 @@ static std::vector<float> test_native_flash_attention_output(
         int            explicit_stage_slot = -1,
         bool           eager_records = false,
         bool           non_causal_mask = false,
-        bool           materialized_graph = false) {
+        bool           materialized_graph = false,
+        int            indirect_offset = 0) {
     ggml_init_params params = {
         /*.mem_size   =*/ 32 * 1024 * 1024,
         /*.mem_buffer =*/ nullptr,
@@ -2180,7 +2193,7 @@ static std::vector<float> test_native_flash_attention_output(
         q = ggml_permute(ctx, q, 0, 2, 1, 3);
     }
     ggml_tensor * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_kv * n_stream);
-    ggml_tensor * read_indices = explicit_stage_slot >= 0 ?
+    ggml_tensor * read_indices = explicit_stage_slot >= 0 || indirect_offset != 0 ?
         ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_kv * n_stream) : indices;
     ggml_tensor * current_k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, record_dim, record_heads, n_kv * n_stream);
     ggml_tensor * current_v = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, record_dim, record_heads, n_kv * n_stream);
@@ -2229,7 +2242,7 @@ static std::vector<float> test_native_flash_attention_output(
         k->op_params[6] = 1;
         v->op_params[6] = 1;
     }
-    if (native_view && explicit_stage_slot >= 0) {
+    if (native_view && (explicit_stage_slot >= 0 || indirect_offset != 0)) {
         k->op_params[10] = 1;
         v->op_params[10] = 1;
     }
@@ -2244,6 +2257,8 @@ static std::vector<float> test_native_flash_attention_output(
         v->op_params[4] = rotate_graph ? 1 : 0;
         k->op_params[5] = slices;
         v->op_params[5] = slices;
+        k->op_params[6] = swa ? 1 : 0;
+        v->op_params[6] = swa ? 1 : 0;
     }
     if ((native_view || materialized_graph) && slices > 1) {
         k = ggml_reshape_4d(ctx, k, head_dim, n_kv_heads, n_kv, n_stream);
@@ -2400,8 +2415,10 @@ static std::vector<float> test_native_flash_attention_output(
         idx[i] = explicit_stage_slot >= 0 ?
             llama_kvarn_encode_store_cell(
                     uint32_t(i), i/128 == 0 ? 0u : uint32_t(explicit_stage_slot)) : i;
-        read_idx[i] = explicit_stage_slot >= 0 && i/128 == 0 ?
-            llama_kvarn_encode_stage_cell(uint32_t(i), 0u) :
+        read_idx[i] = indirect_offset != 0 ?
+            (i + indirect_offset) % (n_kv * n_stream) :
+            explicit_stage_slot >= 0 && i/128 == 0 ?
+                llama_kvarn_encode_stage_cell(uint32_t(i), 0u) :
             explicit_stage_slot >= 0 && live_group_incomplete && i/128 == live_group ?
                 llama_kvarn_encode_stage_cell(uint32_t(i), uint32_t(explicit_stage_slot)) : i;
     }
@@ -2524,10 +2541,11 @@ static std::vector<float> test_native_flash_attention_output(
     if (!native_view) {
         require(ggml_backend_graph_compute(backend, store_graph) == GGML_STATUS_SUCCESS,
                 "native FA: reference store graph compute failed");
+        const std::vector<int64_t> & reference_idx = read_indices == indices ? idx : read_idx;
         const std::vector<ggml_fp16_t> k_ref_data = test_kvarn_reference_decode(
-                k_records, stored_k, idx, n_kv, 0, n_stream, bits_k, false, stage_groups, use_q_rot, swa, slices);
+                k_records, stored_k, reference_idx, n_kv, 0, n_stream, bits_k, false, stage_groups, use_q_rot, swa, slices);
         const std::vector<ggml_fp16_t> v_ref_data = test_kvarn_reference_decode(
-                v_records, stored_v, idx, n_kv, 0, n_stream, bits_v, true, stage_groups, use_output_rot, swa, slices);
+                v_records, stored_v, reference_idx, n_kv, 0, n_stream, bits_v, true, stage_groups, use_output_rot, swa, slices);
         ggml_backend_tensor_set(k_ref, k_ref_data.data(), 0, ggml_nbytes(k_ref));
         ggml_backend_tensor_set(v_ref, v_ref_data.data(), 0, ggml_nbytes(v_ref));
     }
@@ -3498,6 +3516,72 @@ static void test_dflash_non_causal_attention_parity() {
         ggml_backend_free(gpu_backend);
     }
     ggml_backend_free(cpu_backend);
+}
+
+static void test_odd_offset_record_decode_gpu() {
+    ggml_backend_t gpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
+    if (gpu_backend == nullptr ||
+            !backend_supports_kvarn_flash_attention_shape(gpu_backend, 128)) {
+        if (gpu_backend != nullptr) {
+            ggml_backend_free(gpu_backend);
+        }
+        return;
+    }
+
+    const auto route_stats_fns = get_kvarn_route_stats_fns(gpu_backend);
+    require(route_stats_fns.first != nullptr && route_stats_fns.second != nullptr,
+            "odd-offset KVarN decode requires CUDA route telemetry");
+
+    // Shift the indirect read plan by one absolute row. Decoder-fragment
+    // offsets stay even, but each record-backed tile starts at packed position
+    // one and therefore exercises odd K indices through the production planner.
+    for (int bits_k : { 2, 4 }) {
+        const std::vector<float> expected = test_native_flash_attention_output(
+                gpu_backend, true, true, 256, bits_k, bits_k, 1,
+                6, 1, 1024, 5, false, nullptr, true, 0, false,
+                GGML_TYPE_F16, 0, false, false, -1, true, false, false, 1);
+        route_stats_fns.first();
+        const std::vector<float> actual = test_native_flash_attention_output(
+                gpu_backend, true, true, 256, bits_k, bits_k, 1,
+                6, 1, 1024, 5, false, nullptr, false, 0, false,
+                GGML_TYPE_F16, 0, false, false, -1, true, false, false, 1);
+        test_kvarn_route_stats stats = make_test_kvarn_route_stats();
+        route_stats_fns.second(&stats);
+
+        require_close_f32_rmse(actual, expected, 1e-2f,
+                "odd-offset record-backed indirect decode differs from materialized reference");
+        require(stats.decode_split > 0 && stats.materialize_fallback == 0,
+                "odd-offset indirect regression did not exercise direct split decode");
+    }
+
+    ggml_backend_free(gpu_backend);
+}
+
+static void test_d64_materialized_body_exact_tail_gpu() {
+    ggml_backend_t gpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
+    if (gpu_backend == nullptr ||
+            !backend_supports_kvarn_flash_attention_shape(gpu_backend, 64)) {
+        if (gpu_backend != nullptr) {
+            ggml_backend_free(gpu_backend);
+        }
+        return;
+    }
+
+    for (bool swa : { false, true }) {
+        const std::vector<float> expected = test_native_flash_attention_output(
+                gpu_backend, false, true, 64, 4, 4, 17,
+                32, 8, 512, 5, swa, nullptr, false, 128);
+        const std::vector<float> actual = test_native_flash_attention_output(
+                gpu_backend, false, true, 64, 4, 4, 17,
+                32, 8, 512, 5, swa, nullptr, false, 128,
+                false, GGML_TYPE_F16, 0, false, false, -1, true,
+                false, true);
+        require_close_f32_rmse(actual, expected, 1e-2f,
+                swa ? "D64 iSWA materialized body plus exact tail differs from reference" :
+                      "D64 full-cache materialized body plus exact tail differs from reference");
+    }
+
+    ggml_backend_free(gpu_backend);
 }
 
 static void test_native_flash_attention_gpu() {
@@ -5405,6 +5489,18 @@ int main() {
         return 0;
     }
 
+    if (std::getenv("GGML_KVARN_TEST_ODD_OFFSET_DECODE_ONLY") != nullptr) {
+        test_odd_offset_record_decode_gpu();
+        std::printf("test-kvarn: odd-offset record decode parity OK\n");
+        return 0;
+    }
+
+    if (std::getenv("GGML_KVARN_TEST_D64_MATERIALIZED_TAIL_ONLY") != nullptr) {
+        test_d64_materialized_body_exact_tail_gpu();
+        std::printf("test-kvarn: D64 materialized exact-tail parity OK\n");
+        return 0;
+    }
+
     kvarn_suffix_rollback_capability_contract();
     kvarn_composite_exclusivity_forwards();
     kvarn_composite_removal_plan_forwards();
@@ -5520,6 +5616,8 @@ int main() {
     test_native_flash_attention_support_gates();
     test_native_flash_attention_cpu();
     test_native_flash_attention_gpu();
+    test_odd_offset_record_decode_gpu();
+    test_d64_materialized_body_exact_tail_gpu();
     test_native_flash_attention_prefill_route_parity();
     test_dflash_non_causal_attention_parity();
     test_rotated_decode_transform_consistency(GGML_BACKEND_DEVICE_TYPE_CPU, true);

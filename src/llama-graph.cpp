@@ -3599,7 +3599,8 @@ ggml_tensor * llm_graph_context::build_attn(
         kvarn_native_attention,
         kvarn_ctx->native_attention_uses_original_v(il),
         kvarn_ctx->native_rotated_max_query_tokens(il),
-        (uint32_t) q_cur->ne[2]) : llama_kvarn_attention_plan {
+        (uint32_t) q_cur->ne[2],
+        (int) q_cur->ne[0]) : llama_kvarn_attention_plan {
             false, GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO };
     if (use_kvarn && arch == LLM_ARCH_DFLASH && !cparams.causal_attn) {
         LLAMA_LOG_DEBUG("%s: DFlash layer %d KVarN attention route=%s\n", __func__, il,
@@ -3710,11 +3711,12 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * tail_read_idxs = inp->get_tail_read_idxs();
     llama_kv_tail_route tail_route = mctx_cur->get_tail_route(il);
     // A backend query-width fallback still requires the generic tail oracle.
-    // Non-causal DFlash is different: only record-consuming attention is
-    // unqualified. Its materialized F16 body can retain the advertised native
-    // exact-tail merge (validated below), avoiding a full F32 QK matrix.
+    // Non-causal DFlash and D64 are different: only record-consuming attention
+    // is unqualified. Their materialized F16 body can retain the advertised
+    // native exact-tail merge, avoiding a full F32 QK matrix.
     if (use_kvarn && tail_route == LLAMA_KV_TAIL_ROUTE_NATIVE &&
-            !kvarn_plan.native_attention && (arch != LLM_ARCH_DFLASH || cparams.causal_attn)) {
+            !kvarn_plan.native_attention && q->ne[0] != 64 &&
+            (arch != LLM_ARCH_DFLASH || cparams.causal_attn)) {
         tail_route = LLAMA_KV_TAIL_ROUTE_GENERIC;
     }
     if (tail_route != LLAMA_KV_TAIL_ROUTE_NONE) {
@@ -4036,7 +4038,8 @@ ggml_tensor * llm_graph_context::build_attn(
         kvarn_native_attention,
         kvarn_ctx->native_attention_uses_original_v(il),
         kvarn_ctx->native_rotated_max_query_tokens(il),
-        (uint32_t) q_cur->ne[2]) : llama_kvarn_attention_plan {
+        (uint32_t) q_cur->ne[2],
+        (int) q_cur->ne[0]) : llama_kvarn_attention_plan {
             false, GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO };
     if (use_kvarn && arch == LLM_ARCH_DFLASH && !cparams.causal_attn) {
         LLAMA_LOG_DEBUG("%s: DFlash layer %d KVarN attention route=%s\n", __func__, il,
@@ -4160,7 +4163,8 @@ ggml_tensor * llm_graph_context::build_attn(
     llama_kv_tail_route tail_route = mctx_cur->get_tail_route(il);
     // Keep the iSWA route decision identical to the non-iSWA path above.
     if (use_kvarn && tail_route == LLAMA_KV_TAIL_ROUTE_NATIVE &&
-            !kvarn_plan.native_attention && (arch != LLM_ARCH_DFLASH || cparams.causal_attn)) {
+            !kvarn_plan.native_attention && q->ne[0] != 64 &&
+            (arch != LLM_ARCH_DFLASH || cparams.causal_attn)) {
         tail_route = LLAMA_KV_TAIL_ROUTE_GENERIC;
     }
     if (tail_route != LLAMA_KV_TAIL_ROUTE_NONE) {

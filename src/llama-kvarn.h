@@ -154,6 +154,13 @@ llama_kvarn_attention_plan llama_kvarn_plan_attention(
         uint32_t native_rotated_max_query_tokens,
         uint32_t n_query_tokens);
 
+llama_kvarn_attention_plan llama_kvarn_plan_attention(
+        bool native_attention,
+        bool native_original_v,
+        uint32_t native_rotated_max_query_tokens,
+        uint32_t n_query_tokens,
+        int head_dim);
+
 enum ggml_flash_attn_ext_kvarn_domain llama_kvarn_attention_domain(
         bool native_attention,
         bool native_original_v,

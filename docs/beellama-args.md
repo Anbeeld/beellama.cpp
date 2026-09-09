@@ -42,6 +42,8 @@ KV context and reject explicit KVarN `--spec-draft-type-k/v` selections during
 argument validation.
 
 CUDA multi-token KVarN prefill uses transient F16 K/V materialization windows.
+D64 uses this tiled route when a query batch exceeds the backend's native
+rotated-query limit. Decode remains record-native at every KV length.
 `GGML_KVARN_WINDOW_CHUNK` sets the positive token count per window and defaults
 to `65536`; missing, zero, and negative values use that default, while values
 above the active KV length are capped to that length. A smaller value reduces

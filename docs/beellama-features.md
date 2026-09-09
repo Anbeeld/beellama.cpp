@@ -156,11 +156,11 @@ GPUs, then falls back to a portable
 direct-record route when those matrix instructions are unavailable or the
 complete body-plus-tail request does not fit a specialized route. The portable
 CUDA route consumes rotated compressed records and attached F16 or BF16 tails
-directly for D64, D128, D256, and D512 heads. D64 also supports the mixed
-rotated-K/original-V prefill domain without materializing persistent records.
-Its correctness limit is not the
-specialized decode threshold of 16 queries, so prompt-sized query batches stay
-native instead of creating a full F32 KQ tensor.
+directly for D64, D128, D256, and D512 heads. CUDA D64 decode remains on that
+direct route at every KV length. Query batches above the backend's native
+rotated-query limit transiently materialize the rectangular records and use
+tiled FlashAttention. Persistent KVarN storage remains compressed, and the
+native exact-tail merge avoids a full F32 KQ tensor.
 
 ROCm/HIP selects between record-tiled split decode, eligible descriptor-native
 WMMA/MFMA, and the same portable direct-record kernel. Unsupported AMD matrix

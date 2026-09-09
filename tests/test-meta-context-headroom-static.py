@@ -8,4 +8,8 @@ assert needle in src, (
     "tensor-parallel speculative decode before the first prompt"
 )
 assert "compute_headroom*ggml_get_mem_size(ctx) + ggml_tensor_overhead()" in src
-print("meta compute context headroom invariant OK")
+assert "for (size_t i = 0; i < backend_ctx->max_subgraphs; i++)" in src, (
+    "resetting the meta graph context must recreate every reserved main-graph slot; "
+    "otherwise a later topology can reactivate a pointer freed by ctx.reset"
+)
+print("meta compute context headroom and graph-slot lifetime invariants OK")

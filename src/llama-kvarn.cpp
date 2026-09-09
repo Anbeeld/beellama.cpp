@@ -73,6 +73,20 @@ llama_kvarn_attention_plan llama_kvarn_plan_attention(
         bool native_original_v,
         uint32_t native_rotated_max_query_tokens,
         uint32_t n_query_tokens) {
+    return llama_kvarn_plan_attention(
+            native_attention,
+            native_original_v,
+            native_rotated_max_query_tokens,
+            n_query_tokens,
+            /*head_dim =*/ 0);
+}
+
+llama_kvarn_attention_plan llama_kvarn_plan_attention(
+        bool native_attention,
+        bool native_original_v,
+        uint32_t native_rotated_max_query_tokens,
+        uint32_t n_query_tokens,
+        int head_dim) {
     if (!native_attention) {
         return { false, GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED };
     }
@@ -80,6 +94,11 @@ llama_kvarn_attention_plan llama_kvarn_plan_attention(
     // A backend that predates the extended capability still supports the
     // established one-row rotated decode contract.
     const uint32_t rotated_limit = std::max(1u, native_rotated_max_query_tokens);
+    // D64 decode stays record-native at every context length. Prompt
+    // processing materializes into the regular tiled FlashAttention route.
+    if (head_dim == 64 && n_query_tokens > rotated_limit) {
+        return { false, GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED };
+    }
     if (n_query_tokens <= rotated_limit) {
         return { true, GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED };
     }
