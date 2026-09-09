@@ -307,7 +307,12 @@ static ggml_cuda_device_info ggml_cuda_init() {
         info.default_tensor_split[id] = total_vram;
         total_vram += device_vram;
 #if defined(GGML_USE_HIP)
-        info.devices[id].integrated = prop.integrated;
+        // Fork divergence from PR #24233: integrated=true enables the CUDA
+        // host-buffer path (zero-copy UMA weights) on APUs, which corrupts
+        // full-model results under async execution on this box (PPL 5.9243
+        // -> 8.51+ without HIP_LAUNCH_BLOCKING). The back-out restores
+        // async-safe operation at no decode/prefill cost.
+        info.devices[id].integrated = false; // Temporarily disabled due to issues with corrupted output (e.g. #15034)
 #else
         info.devices[id].integrated = false; // Temporarily disabled due to issues with corrupted output (e.g. #15034)
 #endif
