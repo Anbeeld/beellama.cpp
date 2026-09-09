@@ -144,6 +144,7 @@ static __global__ void mul_mat_f(
             if (threadIdx.x == 0) {
                 slot_map[j] = -1;
             }
+            ggml_cuda_syncwarp();
 
             if (col_base + j >= ncols_dst_total) {
                 continue;
@@ -172,10 +173,12 @@ static __global__ void mul_mat_f(
         tile_A A[ntA][warp_size / tile_A::J];
 #pragma unroll
         for (int itA = 0; itA < ntA; ++itA) {
+            ggml_cuda_syncwarp();
 #pragma unroll
             for (int i = 0; i < tile_A::I; ++i) {
                 tile_xy[i*tile_k_padded + threadIdx.x] = x[(itA*tile_A::I + i)*stride_row  + col];
             }
+            ggml_cuda_syncwarp();
 #pragma unroll
             for (int k0 = 0; k0 < warp_size; k0 += tile_A::J) {
                 load_ldmatrix(A[itA][k0/tile_A::J], tile_xy + k0, tile_k_padded);
@@ -184,6 +187,7 @@ static __global__ void mul_mat_f(
 
 #pragma unroll
         for (int itB = 0; itB < ntB; ++itB) {
+            ggml_cuda_syncwarp();
             if constexpr (std::is_same_v<T, float>) {
 #pragma unroll
                 for (int j0 = 0; j0 < tile_B::I; ++j0) {
@@ -213,6 +217,7 @@ static __global__ void mul_mat_f(
             } else {
                 static_assert(std::is_same_v<T, void>, "unsupported type");
             }
+            ggml_cuda_syncwarp();
 #pragma unroll
             for (int k0 = 0; k0 < warp_size; k0 += tile_B::J) {
                 tile_B B;
@@ -230,6 +235,8 @@ static __global__ void mul_mat_f(
 
     if (nwarps > 1) {
         __syncthreads();
+    } else {
+        ggml_cuda_syncwarp();
     }
 #pragma unroll
     for (int itB = 0; itB < ntB; ++itB) {
@@ -246,6 +253,8 @@ static __global__ void mul_mat_f(
 
     if (nwarps > 1) {
         __syncthreads();
+    } else {
+        ggml_cuda_syncwarp();
     }
 
 #pragma unroll
@@ -383,10 +392,12 @@ static __global__ void mul_mat_f_ids(
         tile_A A[ntA][warp_size / tile_A::J];
 #pragma unroll
         for (int itA = 0; itA < ntA; ++itA) {
+            ggml_cuda_syncwarp();
 #pragma unroll
             for (int i = 0; i < tile_A::I; ++i) {
                 tile_xy[i*tile_k_padded + threadIdx.x] = x[(itA*tile_A::I + i)*stride_row  + col];
             }
+            ggml_cuda_syncwarp();
 #pragma unroll
             for (int k0 = 0; k0 < warp_size; k0 += tile_A::J) {
                 load_ldmatrix(A[itA][k0/tile_A::J], tile_xy + k0, tile_k_padded);
@@ -420,6 +431,7 @@ static __global__ void mul_mat_f_ids(
             int next_buf = 1;
 #pragma unroll
             for (int itB = 0; itB < ntB; ++itB) {
+                ggml_cuda_syncwarp();
 #pragma unroll
                 for (int j0 = 0; j0 < tile_B::I; ++j0) {
                     tile_xy[j0*tile_k_padded + threadIdx.x] = vals_buf[curr_buf][j0];
@@ -429,6 +441,7 @@ static __global__ void mul_mat_f_ids(
                     gather_tile(itB + 1, vals_buf[next_buf]);
                 }
 
+                ggml_cuda_syncwarp();
 #pragma unroll
                 for (int k0 = 0; k0 < warp_size; k0 += tile_B::J) {
                     tile_B B;
@@ -473,6 +486,7 @@ static __global__ void mul_mat_f_ids(
             int next_buf = 1;
 #pragma unroll
             for (int itB = 0; itB < ntB; ++itB) {
+                ggml_cuda_syncwarp();
 #pragma unroll
                 for (int j0 = 0; j0 < tile_B::I; ++j0) {
                     const float2 tmp = vals_buf[curr_buf][j0];
@@ -483,6 +497,7 @@ static __global__ void mul_mat_f_ids(
                     gather_tile(itB + 1, vals_buf[next_buf]);
                 }
 
+                ggml_cuda_syncwarp();
 #pragma unroll
                 for (int k0 = 0; k0 < warp_size; k0 += tile_B::J) {
                     tile_B B;
@@ -508,6 +523,8 @@ static __global__ void mul_mat_f_ids(
 
     if (nwarps > 1) {
         __syncthreads();
+    } else {
+        ggml_cuda_syncwarp();
     }
 #pragma unroll
     for (int itB = 0; itB < ntB; ++itB) {
@@ -524,6 +541,8 @@ static __global__ void mul_mat_f_ids(
 
     if (nwarps > 1) {
         __syncthreads();
+    } else {
+        ggml_cuda_syncwarp();
     }
 
 #pragma unroll

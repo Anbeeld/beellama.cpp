@@ -257,16 +257,24 @@ bool llama_kvarn_backend_mixed_tail_native_preferred(ggml_backend_dev_t dev) {
     return fn == nullptr || fn(dev);
 }
 
-bool llama_kvarn_backend_supports_ops(ggml_backend_dev_t dev) {
+bool llama_kvarn_backend_supports_ops(ggml_backend_dev_t dev, int head_dim) {
+    uint32_t head_dim_bit = 0;
+    switch (head_dim) {
+        case  64: head_dim_bit = GGML_BACKEND_KVARN_HEAD_DIM_64;  break;
+        case 128: head_dim_bit = GGML_BACKEND_KVARN_HEAD_DIM_128; break;
+        case 256: head_dim_bit = GGML_BACKEND_KVARN_HEAD_DIM_256; break;
+        case 512: head_dim_bit = GGML_BACKEND_KVARN_HEAD_DIM_512; break;
+        default: return false;
+    }
     if (dev == nullptr) {
-        return true; // the built-in CPU backend implements store + materialize
+        return true; // the built-in CPU backend implements every admitted geometry
     }
 
     if (ggml_backend_dev_is_meta(dev)) {
         const size_t count = ggml_backend_meta_device_count(dev);
         for (size_t i = 0; i < count; ++i) {
             if (!llama_kvarn_backend_supports_ops(
-                        ggml_backend_meta_device_get(dev, i))) {
+                        ggml_backend_meta_device_get(dev, i), head_dim)) {
                 return false;
             }
         }
@@ -275,7 +283,13 @@ bool llama_kvarn_backend_supports_ops(ggml_backend_dev_t dev) {
     if (auto * capabilities_fn = kvarn_capabilities_proc(dev)) {
         ggml_backend_kvarn_capabilities capabilities = {};
         return query_kvarn_capabilities(dev, capabilities_fn, capabilities) &&
-            capabilities.store_materialize;
+            capabilities.store_materialize &&
+            (capabilities.supported_head_dims & head_dim_bit) != 0;
+    }
+    // Legacy boolean-only backends predate rectangular records. Preserve their
+    // legacy geometry support, but never infer D64 support from that boolean.
+    if (head_dim == 64) {
+        return false;
     }
     using ggml_backend_kvarn_ops_t = bool (*)(ggml_backend_dev_t dev);
     auto * reg = ggml_backend_dev_backend_reg(dev);
@@ -286,9 +300,8 @@ bool llama_kvarn_backend_supports_ops(ggml_backend_dev_t dev) {
 
 namespace {
 
-size_t kvarn_record_bytes(int bits) {
-    return llama_kvarn_packed_bytes(KVAR_N_GROUP * KVAR_N_GROUP, bits) +
-        3 * KVAR_N_GROUP * sizeof(ggml_fp16_t);
+size_t kvarn_record_bytes(int record_dim, int bits, bool value) {
+    return llama_kvarn_make_record_layout(record_dim, bits, value).record_bytes;
 }
 
 void write_kvarn_tensor(llama_io_write_i & io, ggml_tensor * tensor) {
@@ -381,7 +394,11 @@ struct kvarn_tail_tensor_span {
 kvarn_tail_tensor_span kvarn_tail_checked_span(
         ggml_tensor * tensor, int32_t slot_begin, uint32_t length, uint64_t row_size) {
     if (!tensor || slot_begin < 0 || length == 0 || row_size == 0) {
-        throw std::runtime_error("invalid KVarN exact-tail tensor span");
+        throw std::runtime_error(format(
+            "invalid KVarN exact-tail tensor span (tensor=%s type=%s ne0=%lld slot=%d length=%u row=%llu)",
+            tensor ? tensor->name : "null", tensor ? ggml_type_name(tensor->type) : "none",
+            tensor ? (long long) tensor->ne[0] : -1LL, slot_begin, length,
+            (unsigned long long) row_size));
     }
     const uint64_t slot = uint64_t(slot_begin);
     if (slot > uint64_t(std::numeric_limits<size_t>::max())/row_size ||
@@ -566,7 +583,7 @@ int32_t kvarn_workspace_tokens_per_stream_hint(const llama_kv_cache::slot_info &
 }
 
 void kvarn_gen_hadamard(std::vector<float> & data, int n) {
-    GGML_ASSERT(n == 128 || n == 256 || n == 512);
+    GGML_ASSERT(n == 64 || n == 128 || n == 256 || n == 512);
     data.assign(n * n, 0.0f);
     data[0] = 1.0f / std::sqrt(float(n));
 
@@ -584,6 +601,11 @@ void kvarn_gen_hadamard(std::vector<float> & data, int n) {
 }
 
 const std::vector<float> & kvarn_hadamard(int n) {
+    static const std::vector<float> h64 = [] {
+        std::vector<float> result;
+        kvarn_gen_hadamard(result, 64);
+        return result;
+    }();
     static const std::vector<float> h128 = [] {
         std::vector<float> result;
         kvarn_gen_hadamard(result, 128);
@@ -601,6 +623,7 @@ const std::vector<float> & kvarn_hadamard(int n) {
     }();
 
     switch (n) {
+        case  64: return h64;
         case 128: return h128;
         case 256: return h256;
         case 512: return h512;
@@ -933,7 +956,7 @@ ggml_tensor * llama_kv_cache_kvarn_context::get_v_native(ggml_context * ctx, int
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::build_input_kvarn_rot(ggml_context * ctx, int n_rot) const {
-    GGML_ASSERT(n_rot == 128 || n_rot == 256 || n_rot == 512);
+    GGML_ASSERT(n_rot == 64 || n_rot == 128 || n_rot == 256 || n_rot == 512);
     ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_rot, n_rot);
     ggml_set_input(res);
     ggml_set_name(res, "attn_inp_kvarn_rot");
@@ -1284,7 +1307,7 @@ void llama_kv_cache_kvarn_context::set_input_v_rot_backend(ggml_tensor * dst) co
 void llama_kv_cache_kvarn_context::set_input_kvarn_rot(ggml_tensor * dst) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
-    GGML_ASSERT((dst->ne[0] == 128 || dst->ne[0] == 256 || dst->ne[0] == 512) && dst->ne[1] == dst->ne[0]);
+    GGML_ASSERT((dst->ne[0] == 64 || dst->ne[0] == 128 || dst->ne[0] == 256 || dst->ne[0] == 512) && dst->ne[1] == dst->ne[0]);
 
     const auto & data = kvarn_hadamard((int) dst->ne[0]);
     memcpy(dst->data, data.data(), ggml_nbytes(dst));
@@ -1412,8 +1435,6 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         return result;
     };
 
-    const size_t k_record_size = kvarn_record_bytes(this->params.key_bits);
-    const size_t v_record_size = kvarn_record_bytes(this->params.value_bits);
     const int64_t n_record_groups = int64_t(n_groups_per_stream) * n_stream;
     // Stage depth is a cache property derived from position semantics. Non-SWA
     // caches cover the logical scheduler batch plus one physical ubatch; SWA
@@ -1423,7 +1444,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     size_t raw_bytes = 0;
 
     for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
-        if (!hparams.has_kv(il)) {
+        if (!hparams.has_kv(il) || hparams.is_recr(il)) {
             continue;
         }
         if (filter && !filter(il)) {
@@ -1431,11 +1452,6 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         }
 
         auto * dev = offload ? model.dev_layer(il) : nullptr;
-        if (!llama_kvarn_backend_supports_ops(dev)) {
-            throw std::runtime_error(format(
-                "KVarN cache layer %u is assigned to backend %s, which cannot store and materialize KVarN records",
-                il, dev ? ggml_backend_dev_name(dev) : "unknown"));
-        }
         auto * buft = offload ? ggml_backend_dev_buffer_type(dev) : ggml_backend_cpu_buffer_type();
         auto * ctx = ctx_for_buft(buft);
         if (!ctx) {
@@ -1445,13 +1461,26 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         const uint32_t n_head_kv = hparams.n_head_kv(il);
         const uint32_t head_dim_k = hparams.n_embd_head_k(il);
         const uint32_t head_dim_v = hparams.n_embd_head_v(il);
-        const int k_slices = llama_kvarn_head_slices(head_dim_k);
-        const int v_slices = llama_kvarn_head_slices(head_dim_v);
-        if (k_slices <= 0 || v_slices <= 0) {
+        llama_kvarn_geometry k_geometry = {};
+        llama_kvarn_geometry v_geometry = {};
+        if (!llama_kvarn_geometry_for(head_dim_k, k_geometry) ||
+                !llama_kvarn_geometry_for(head_dim_v, v_geometry)) {
             throw std::runtime_error(format(
                 "KVarN cache layer %u has unsupported K/V head dimensions %u/%u",
                 il, head_dim_k, head_dim_v));
         }
+        if (!llama_kvarn_backend_supports_ops(dev, head_dim_k) ||
+                !llama_kvarn_backend_supports_ops(dev, head_dim_v)) {
+            throw std::runtime_error(format(
+                "KVarN cache layer %u is assigned to backend %s, which cannot store and attend KVarN dimensions %u/%u",
+                il, dev ? ggml_backend_dev_name(dev) : "CPU", head_dim_k, head_dim_v));
+        }
+        const int k_slices = int(k_geometry.head_slices);
+        const int v_slices = int(v_geometry.head_slices);
+        const int k_record_dim = int(k_geometry.record_dim);
+        const int v_record_dim = int(v_geometry.record_dim);
+        const size_t k_record_size = kvarn_record_bytes(k_record_dim, this->params.key_bits, false);
+        const size_t v_record_size = kvarn_record_bytes(v_record_dim, this->params.value_bits, true);
         const bool explicit_bias = model.self_attention_uses_explicit_bias(il);
         const bool native_tail = exact_tail_tokens == 0 ||
             (!explicit_bias && kvarn_backend_supports_native_tail(
@@ -1469,8 +1498,8 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         const uint32_t n_head_v_sliced = n_head_kv * (uint32_t) v_slices;
         auto * k_records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, k_record_size, n_head_k_sliced, n_record_groups);
         auto * v_records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, v_record_size, n_head_v_sliced, n_record_groups);
-        auto * k_stage = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, KVAR_N_GROUP, n_head_k_sliced, n_stage_tokens);
-        auto * v_stage = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, KVAR_N_GROUP, n_head_v_sliced, n_stage_tokens);
+        auto * k_stage = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, k_record_dim, n_head_k_sliced, n_stage_tokens);
+        auto * v_stage = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, v_record_dim, n_head_v_sliced, n_stage_tokens);
         ggml_tensor * k_tail = nullptr;
         ggml_tensor * v_tail = nullptr;
 
@@ -1501,12 +1530,12 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
                     size_t(s) * n_groups_per_stream * v_records->nb[2]);
             auto * k_stage_view = ggml_view_3d(
                     ctx, k_stage,
-                    KVAR_N_GROUP, n_head_k_sliced, KVAR_N_GROUP * stage_groups,
+                    k_record_dim, n_head_k_sliced, KVAR_N_GROUP * stage_groups,
                     k_stage->nb[1], k_stage->nb[2],
                     size_t(s) * KVAR_N_GROUP * stage_groups * k_stage->nb[2]);
             auto * v_stage_view = ggml_view_3d(
                     ctx, v_stage,
-                    KVAR_N_GROUP, n_head_v_sliced, KVAR_N_GROUP * stage_groups,
+                    v_record_dim, n_head_v_sliced, KVAR_N_GROUP * stage_groups,
                     v_stage->nb[1], v_stage->nb[2],
                     size_t(s) * KVAR_N_GROUP * stage_groups * v_stage->nb[2]);
 
@@ -1551,7 +1580,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     if (reuse) {
         for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
             const int32_t il_reuse = reuse(il);
-            if (il_reuse < 0) {
+            if (il_reuse < 0 || !hparams.has_kv(il) || hparams.is_recr(il)) {
                 continue;
             }
             if (filter && !filter(il)) {

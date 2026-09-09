@@ -361,8 +361,15 @@ def main() -> None:
         raise AssertionError("upstream split callback does not consume the typed cache component adapter")
     if "handle_kvarn_cache" not in meta_source:
         raise AssertionError("meta dispatch does not preserve KVarN's sharded payload state")
-    if "cgraph_ij->uid = 0" not in meta_source:
-        raise AssertionError("projected meta graphs must declare that they have no stable identity")
+    for marker in (
+        "projection_matches(cgraph)",
+        "graph_snapshot.push_back({tensor, *tensor})",
+        "cgraph_ij->uid = ggml_graph_next_uid()",
+    ):
+        if marker not in meta_source:
+            raise AssertionError(
+                f"projected meta graphs lack property-safe executable identity: missing {marker}"
+            )
     cuda_graph_source = (ROOT / "ggml/src/ggml-cuda/ggml-cuda.cu").read_text(encoding="utf-8")
     cuda_graph_compatibility = cuda_graph_source.split(
         "static bool ggml_cuda_graph_check_compability", 1

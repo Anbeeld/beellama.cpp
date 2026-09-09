@@ -16,7 +16,7 @@ BeeLlama.cpp (or just Bee) is a performance-focused llama.cpp fork for squeezing
 - **KVarN for speculative decoding**: compress supported owned MTP, DFlash, EAGLE3, and non-MLA DSpark caches independently of the target with `--spec-draft-type-k` and `--spec-draft-type-v`.
 - **Adaptive draft-max for DFlash**: adjusts the active draft horizon at runtime instead of using a fixed `--spec-draft-n-max`, comparing speculative throughput against a no-spec baseline.
 - **Reasoning-loop protection**: the server detects repeated hidden reasoning and visible output, forcing reasoning to close or stopping generation when a loop triggers.
-- **Reworked KV cache and prompt reuse**: transactional state restore, capability-aware speculative rollback, and reusable RAM snapshots. Cached prompts are selected by their safely restorable prefix, including with ordinary KV cache types.
+- **Reworked KV cache and prompt reuse**: transactional state restore, capability-aware speculative rollback, and reusable RAM snapshots. Cached prompts are selected by their safely restorable prefix.
 
 For the full feature and public-repo comparison, read [docs/beellama-features.md](docs/beellama-features.md). For the complete argument reference, read [docs/beellama-args.md](docs/beellama-args.md).
 

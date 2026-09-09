@@ -73,7 +73,7 @@ ggml_cuda_fattn_kvarn_capabilities ggml_cuda_fattn_kvarn_device_capabilities(int
     constexpr bool kvarn_instances = false;
     constexpr uint64_t minimum_dynamic_shared_bytes = 0;
 #endif
-    return ggml_cuda_fattn_kvarn_select_capabilities({
+    auto capabilities = ggml_cuda_fattn_kvarn_select_capabilities({
         backend,
         device_info.warp_size,
         matrix_mma,
@@ -82,6 +82,18 @@ ggml_cuda_fattn_kvarn_capabilities ggml_cuda_fattn_kvarn_device_capabilities(int
         device_info.smpbo,
         minimum_dynamic_shared_bytes,
     });
+    // Rectangular D64 sealing uses a 64x128 tile plus six 128-element
+    // work axes. Do not advertise D64 on devices that cannot launch it, while
+    // preserving the established D128/D256/D512 capability contract.
+    constexpr uint64_t d64_store_dynamic_shared_bytes =
+        uint64_t(64 * 128 + 6 * 128) * sizeof(float);
+    if (backend != GGML_CUDA_FATTN_KVARN_BACKEND_CUDA ||
+            device_info.smpbo < d64_store_dynamic_shared_bytes) {
+        // HIP and MUSA share the implementation source, but D64 remains
+        // fail-closed until each backend has independent runtime qualification.
+        capabilities.supported_head_dims &= ~GGML_CUDA_FATTN_KVARN_HEAD_DIM_64;
+    }
+    return capabilities;
 }
 
 uint32_t ggml_cuda_fattn_kvarn_decode_max_q() {
@@ -350,6 +362,7 @@ static __global__ void ggml_cuda_fattn_kvarn_init_descs_kernel(
         int n_stream,
         int n_kv_heads,
         int slices,
+        int record_dim,
         int k_head_slices,
         int v_head_slices,
         int k_original_domain,
@@ -395,6 +408,7 @@ static __global__ void ggml_cuda_fattn_kvarn_init_descs_kernel(
         k_desc.head_base = h * slices;
         k_desc.groups_per_stream = k_groups_per_stream;
         k_desc.record_bytes = k_record_bytes;
+        k_desc.record_dim = record_dim;
         k_desc.stage_groups = k_stage_groups;
         k_desc.tail_groups = k_tail_groups;
         k_desc.bits = k_bits;
@@ -416,6 +430,7 @@ static __global__ void ggml_cuda_fattn_kvarn_init_descs_kernel(
         v_desc.head_base = h * slices;
         v_desc.groups_per_stream = v_groups_per_stream;
         v_desc.record_bytes = v_record_bytes;
+        v_desc.record_dim = record_dim;
         v_desc.stage_groups = v_stage_groups;
         v_desc.tail_groups = v_tail_groups;
         v_desc.bits = v_bits;
@@ -469,6 +484,7 @@ void ggml_cuda_fattn_kvarn_init_descs(
         plan.n_stream,
         plan.n_kv_heads,
         plan.slices,
+        plan.k.record_dim,
         plan.k.head_slices,
         plan.v.head_slices,
         k_original_domain,
@@ -1005,6 +1021,10 @@ bool ggml_cuda_flash_attn_ext_kvarn_supported(
         return false;
     }
     const auto capabilities = ggml_cuda_fattn_kvarn_device_capabilities(device);
+    if (!ggml_cuda_fattn_kvarn_body_shape_supported(
+                capabilities, plan.head_dim, plan.head_dim)) {
+        return false;
+    }
 #if defined(GGML_USE_HIP)
     // HIP graphs stay in the rotated domain. The portable operation predicate
     // is therefore the complete executable support contract; generic WMMA or
@@ -1031,6 +1051,8 @@ bool ggml_cuda_flash_attn_ext_kvarn_portable_supported(
     ggml_cuda_fattn_kvarn_plan plan;
     return capabilities.portable_native &&
         ggml_cuda_fattn_kvarn_supported(device, dst, &plan) &&
+        ggml_cuda_fattn_kvarn_body_shape_supported(
+            capabilities, plan.head_dim, plan.head_dim) &&
         ggml_cuda_fattn_kvarn_portable_supported(plan, dst);
 #endif
 }
@@ -1104,10 +1126,29 @@ bool ggml_cuda_flash_attn_ext_kvarn(
         ggml_cuda_fattn_kvarn_entry_path entry_path) {
     ggml_cuda_fattn_kvarn_plan plan;
     if (!ggml_cuda_fattn_kvarn_supported(ctx.device, dst, &plan)) {
+        if (ggml_cuda_fattn_kvarn_debug_routes_enabled()) {
+            const ggml_tensor * q = dst != nullptr ? dst->src[0] : nullptr;
+            const ggml_tensor * k = dst != nullptr ? dst->src[1] : nullptr;
+            const ggml_tensor * v = dst != nullptr ? dst->src[2] : nullptr;
+            std::fprintf(stderr,
+                "kvarn-route unsupported-view q=%p k=%p v=%p q-shape=%lld/%lld/%lld/%lld "
+                "k-shape=%lld/%lld/%lld/%lld v-shape=%lld/%lld/%lld/%lld\n",
+                (const void *) q, (const void *) k, (const void *) v,
+                q ? (long long) q->ne[0] : -1LL, q ? (long long) q->ne[1] : -1LL,
+                q ? (long long) q->ne[2] : -1LL, q ? (long long) q->ne[3] : -1LL,
+                k ? (long long) k->ne[0] : -1LL, k ? (long long) k->ne[1] : -1LL,
+                k ? (long long) k->ne[2] : -1LL, k ? (long long) k->ne[3] : -1LL,
+                v ? (long long) v->ne[0] : -1LL, v ? (long long) v->ne[1] : -1LL,
+                v ? (long long) v->ne[2] : -1LL, v ? (long long) v->ne[3] : -1LL);
+        }
         return false;
     }
 
     const auto capabilities = ggml_cuda_fattn_kvarn_device_capabilities(ctx.device);
+    if (!ggml_cuda_fattn_kvarn_body_shape_supported(
+                capabilities, plan.head_dim, plan.head_dim)) {
+        return false;
+    }
     ggml_cuda_fattn_kvarn_record_entry(entry_path);
 
     const char * force_portable = getenv("GGML_KVARN_TEST_FORCE_PORTABLE_FATTN");
@@ -1181,7 +1222,7 @@ bool ggml_cuda_flash_attn_ext_kvarn(
         ggml_cuda_fattn_kvarn_portable_supported(plan, dst);
     bool generic_shape_supported = false;
     bool wide_mma = false;
-    if (capabilities.generic_mma) {
+    if (capabilities.generic_mma && Q->ne[0] != 64) {
         generic_shape_supported = ggml_cuda_flash_attn_ext_mma_kvarn(ctx, dst, wide_mma);
         if (!generic_shape_supported) {
             g_kvarn_route_generic_shape_rejected.fetch_add(1, std::memory_order_relaxed);

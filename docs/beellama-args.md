@@ -1,4 +1,4 @@
-# BeeLlama v0.4.5 argument reference
+# BeeLlama v0.4.7 argument reference
 
 This page covers Bee-owned arguments and the upstream arguments whose behavior
 BeeLlama extends. Run `llama-server --help` or `llama-cli --help` for the full
@@ -8,7 +8,9 @@ limits, and measurement guidance.
 ## KVarN cache types and SWA overrides
 
 KVarN values are `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`, `kvarn6`, and
-`kvarn8`. K and V may use different bit widths.
+`kvarn8`. K and V may use different bit widths. Logical 64-dimensional K/V heads are
+supported on the qualified CPU and CUDA routes with rectangular 64 x 128 K and
+128 x 64 V records. D128/D256/D512 retain their existing 128 x 128 record ABI.
 
 CUDA, ROCm/HIP, Vulkan, and CPU consume compressed KVarN records directly in
 native FlashAttention paths. Vulkan requires shader Int64 and
@@ -38,6 +40,14 @@ that shared persistent cache. HIP/ROCm and Vulkan DFlash-family draft KVarN
 remain unqualified until backend runtime tests pass. N-gram modes do not own a
 KV context and reject explicit KVarN `--spec-draft-type-k/v` selections during
 argument validation.
+
+CUDA multi-token KVarN prefill uses transient F16 K/V materialization windows.
+`GGML_KVARN_WINDOW_CHUNK` sets the positive token count per window and defaults
+to `65536`; missing, zero, and negative values use that default, while values
+above the active KV length are capped to that length. A smaller value reduces
+peak transient scratch for concurrent long prompts but adds partial-softmax
+merges and changes floating-point reduction order. It does not alter context or
+persistent KV-cache capacity.
 
 ## KV cache precision tail for quantized caches
 

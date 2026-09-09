@@ -612,12 +612,36 @@ llama_kvarn_tile_layout llama_kvarn_make_layout(int head_dim, int group, int key
     return layout;
 }
 
-int llama_kvarn_head_slices(int head_dim) {
-    if (head_dim != 128 && head_dim != 256 && head_dim != 512) {
-        return 0;
-    }
+llama_kvarn_record_layout llama_kvarn_make_record_layout(int record_dim, int bits, bool value) {
+    assert(record_dim == 64 || record_dim == 128);
+    assert(llama_kvarn_valid_bits(bits));
 
-    return head_dim / 128;
+    llama_kvarn_record_layout layout = {};
+    layout.token_group = KVAR_N_GROUP;
+    layout.record_dim = uint32_t(record_dim);
+    layout.rows = value ? KVAR_N_GROUP : uint32_t(record_dim);
+    layout.cols = value ? uint32_t(record_dim) : KVAR_N_GROUP;
+    layout.payload_bytes = llama_kvarn_packed_bytes(int(layout.rows * layout.cols), bits);
+    layout.scale_off = layout.payload_bytes;
+    layout.zp_off = layout.scale_off + size_t(layout.rows) * sizeof(uint16_t);
+    layout.other_off = layout.zp_off + size_t(layout.rows) * sizeof(uint16_t);
+    layout.record_bytes = layout.other_off + size_t(layout.cols) * sizeof(uint16_t);
+    return layout;
+}
+
+bool llama_kvarn_geometry_for(int head_dim, llama_kvarn_geometry & geometry) {
+    switch (head_dim) {
+        case 64:  geometry = { KVAR_N_GROUP,  64,  64, 1 }; return true;
+        case 128: geometry = { KVAR_N_GROUP, 128, 128, 1 }; return true;
+        case 256: geometry = { KVAR_N_GROUP, 128, 256, 2 }; return true;
+        case 512: geometry = { KVAR_N_GROUP, 128, 512, 4 }; return true;
+        default:  geometry = {}; return false;
+    }
+}
+
+int llama_kvarn_head_slices(int head_dim) {
+    llama_kvarn_geometry geometry = {};
+    return llama_kvarn_geometry_for(head_dim, geometry) ? int(geometry.head_slices) : 0;
 }
 
 bool llama_kvarn_head_dim_supported(int head_dim) {
@@ -663,6 +687,26 @@ uint8_t llama_kvarn_unpack_bits_value(const uint8_t * src, int index, int bits) 
     }
 
     return value;
+}
+
+void llama_kvarn_hadamard_64(float * values) {
+    assert(values != nullptr);
+
+    for (int stride = 1; stride < 64; stride *= 2) {
+        for (int base = 0; base < 64; base += 2 * stride) {
+            for (int i = 0; i < stride; ++i) {
+                const float a = values[base + i];
+                const float b = values[base + stride + i];
+                values[base + i] = a + b;
+                values[base + stride + i] = a - b;
+            }
+        }
+    }
+
+    constexpr float INV_SQRT_64 = 0.125f;
+    for (int i = 0; i < 64; ++i) {
+        values[i] *= INV_SQRT_64;
+    }
 }
 
 void llama_kvarn_hadamard_128(float * values) {
