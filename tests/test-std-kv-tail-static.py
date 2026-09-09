@@ -582,10 +582,18 @@ def main() -> None:
         raise AssertionError("non-native backends lack the bounded history/current composition route")
     if graph.count(
             "tail_route == LLAMA_KV_TAIL_ROUTE_NATIVE &&\n"
-            "            !kvarn_plan.native_attention && (arch != LLM_ARCH_DFLASH || cparams.causal_attn))") != 2:
+            "            !kvarn_plan.native_attention && q->ne[0] != 64 &&\n"
+            "            (arch != LLM_ARCH_DFLASH || cparams.causal_attn))") != 2:
         raise AssertionError(
             "KVarN full/iSWA graphs must retain the generic backend-query fallback, "
-            "but preserve the validated native F16 tail merge for materialized non-causal DFlash")
+            "but preserve the validated native F16 tail merge for materialized D64 and non-causal DFlash")
+    for regression in (
+        "test_d64_materialized_body_exact_tail_gpu",
+        "D64 full-cache materialized body plus exact tail differs from reference",
+        "D64 iSWA materialized body plus exact tail differs from reference",
+    ):
+        if regression not in kvarn_tests:
+            raise AssertionError(f"test-kvarn lacks D64 materialized exact-tail coverage: {regression}")
 
     tail_build_calls = re.findall(r"build_attn_inp_tail\((?:(?!\);).)*\);", graph, re.DOTALL)[1:]
     if not tail_build_calls or any(not re.search(r",\s*true\s*\);$", call) for call in tail_build_calls):

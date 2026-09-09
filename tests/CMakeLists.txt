@@ -138,6 +138,12 @@ if (Python3_Interpreter_FOUND)
     set_property(TEST test-kvarn-eager-workspace-static PROPERTY LABELS cuda)
 
     add_test(
+        NAME test-kvarn-d64-parallel-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-kvarn-d64-parallel-static.py)
+    set_property(TEST test-kvarn-d64-parallel-static PROPERTY LABELS cuda)
+
+    add_test(
         NAME test-kvarn-rollback-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-kvarn-rollback-static.py)

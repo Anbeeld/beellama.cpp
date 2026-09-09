@@ -642,6 +642,7 @@ static bool test_kvarn_partial_checkpoint_history(
     }
 
     const auto partial_flags = llama_state_seq_flags(LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    const auto self_flags = llama_state_seq_flags(LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED);
     std::vector<double> save_times_ms;
     std::vector<double> restore_times_ms;
     const auto save_partial = [&](std::vector<uint8_t> & state) {
@@ -719,6 +720,20 @@ static bool test_kvarn_partial_checkpoint_history(
         LOG_ERR("%s: failed to establish checkpoint B oracle\n", __func__);
         return false;
     }
+    if (const char * path = std::getenv("KVARN_TEST_EXPORT_SELF_STATE")) {
+        std::vector<uint8_t> checkpoint_b_self(llama_state_seq_get_size_ext(context.get(), 0, self_flags));
+        if (checkpoint_b_self.empty() || llama_state_seq_get_data_ext(
+                context.get(), checkpoint_b_self.data(), checkpoint_b_self.size(), 0, self_flags) != checkpoint_b_self.size()) {
+            LOG_ERR("%s: failed to capture self-contained compatibility fixture\n", __func__);
+            return false;
+        }
+        std::ofstream output(path, std::ios::binary);
+        output.write(reinterpret_cast<const char *>(checkpoint_b_self.data()), checkpoint_b_self.size());
+        if (!output) {
+            LOG_ERR("%s: failed to export self-contained compatibility fixture '%s'\n", __func__, path);
+            return false;
+        }
+    }
 
     llama_batch_ptr mutation_batch(2, 0, 1);
     common_batch_add(mutation_batch.get(), extension, checkpoint_b_past, { 0 }, false);
@@ -739,7 +754,6 @@ static bool test_kvarn_partial_checkpoint_history(
         return false;
     }
 
-    const auto self_flags = llama_state_seq_flags(LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED);
     std::vector<uint8_t> live_self(llama_state_seq_get_size_ext(context.get(), 0, self_flags));
     if (live_self.empty() || llama_state_seq_get_data_ext(
                 context.get(), live_self.data(), live_self.size(), 0, self_flags) != live_self.size()) {
@@ -806,6 +820,26 @@ static bool test_kvarn_partial_checkpoint_history(
             !logits_match(live_oracle, live_after_reject)) {
         LOG_ERR("%s: rejected KVarN frame changed live tensor state\n", __func__);
         return false;
+    }
+
+    if (const char * path = std::getenv("KVARN_TEST_SELF_STATE")) {
+        std::ifstream input(path, std::ios::binary | std::ios::ate);
+        std::streamsize size = input ? static_cast<std::streamsize>(input.tellg()) : -1;
+        if (size <= 0) {
+            LOG_ERR("%s: failed to open self-contained compatibility fixture '%s'\n", __func__, path);
+            return false;
+        }
+        input.seekg(0);
+        std::vector<uint8_t> state(static_cast<size_t>(size));
+        input.read(reinterpret_cast<char *>(state.data()), size);
+        std::vector<float> restored;
+        if (!input || llama_state_seq_set_data_ext(
+                    context.get(), state.data(), state.size(), 0, self_flags) != state.size() ||
+                !decode_probe(probe_b, checkpoint_b_past, restored) || !logits_match(oracle_b, restored)) {
+            LOG_ERR("%s: self-contained compatibility fixture continuation changed\n", __func__);
+            return false;
+        }
+        LOG("\nPASS: self-contained KVarN compatibility fixture restored with matching continuation.\n");
     }
 
     if (const char * path = std::getenv("KVARN_TEST_V12_STATE")) {
@@ -1595,6 +1629,10 @@ static bool run_save_load_tests_for_model(const std::string & model_path, const 
     }
     if (!test_kvarn_partial_checkpoint_history(model, params, tokens)) {
         return false;
+    }
+    if (std::getenv("KVARN_TEST_PARTIAL_CHECKPOINT_ONLY")) {
+        LOG("\nPASS: targeted KVarN partial checkpoint validation completed.\n");
+        return true;
     }
     if (!test_kvarn_unified_capacity(model, params, tokens)) {
         return false;

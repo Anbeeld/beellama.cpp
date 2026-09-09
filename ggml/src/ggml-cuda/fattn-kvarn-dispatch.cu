@@ -82,11 +82,12 @@ ggml_cuda_fattn_kvarn_capabilities ggml_cuda_fattn_kvarn_device_capabilities(int
         device_info.smpbo,
         minimum_dynamic_shared_bytes,
     });
-    // Rectangular D64 sealing uses a 64x128 tile plus six 128-element
-    // work axes. Do not advertise D64 on devices that cannot launch it, while
-    // preserving the established D128/D256/D512 capability contract.
+    // Rectangular D64 sealing uses a 64x128 tile, eight 128-element work
+    // axes, and 18 block-reduction scalars. Do not advertise D64 on devices
+    // that cannot launch it, while preserving the established D128/D256/D512
+    // capability contract.
     constexpr uint64_t d64_store_dynamic_shared_bytes =
-        uint64_t(64 * 128 + 6 * 128) * sizeof(float);
+        uint64_t(64 * 128 + 8 * 128 + 18) * sizeof(float);
     if (backend != GGML_CUDA_FATTN_KVARN_BACKEND_CUDA ||
             device_info.smpbo < d64_store_dynamic_shared_bytes) {
         // HIP and MUSA share the implementation source, but D64 remains
@@ -723,7 +724,7 @@ static bool ggml_cuda_flash_attn_ext_kvarn_decode_supported(
     float max_bias = 0.0f;
     memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
 
-    if ((Q->ne[0] != 128 && Q->ne[0] != 256 && Q->ne[0] != 512) || V->ne[0] != Q->ne[0] || K->ne[0] != Q->ne[0]) {
+    if ((Q->ne[0] != 64 && Q->ne[0] != 128 && Q->ne[0] != 256 && Q->ne[0] != 512) || V->ne[0] != Q->ne[0] || K->ne[0] != Q->ne[0]) {
         return false;
     }
     if (Q->ne[1] <= 0 || Q->ne[3] != plan.n_stream || plan.n_stream <= 0) {
@@ -870,6 +871,7 @@ static bool ggml_cuda_flash_attn_ext_kvarn_decode(
 
     const ggml_tensor * Q = dst->src[0];
     switch ((int) Q->ne[0]) {
+        case  64: return ggml_cuda_flash_attn_ext_kvarn_decode_d< 64>(ctx, dst, plan);
         case 128: return ggml_cuda_flash_attn_ext_kvarn_decode_d<128>(ctx, dst, plan);
         case 256: return ggml_cuda_flash_attn_ext_kvarn_decode_d<256>(ctx, dst, plan);
         case 512: return ggml_cuda_flash_attn_ext_kvarn_decode_d<512>(ctx, dst, plan);
@@ -1066,6 +1068,7 @@ bool ggml_cuda_flash_attn_ext_kvarn_direct_tail_supported(
         !capabilities.specialized_routes ||
         (force_portable != nullptr && atoi(force_portable) != 0);
     return dst != nullptr && dst->src[10] == nullptr &&
+        dst->src[0]->ne[0] != 64 &&
         capabilities.portable_native && portable_route &&
         ggml_cuda_flash_attn_ext_kvarn_portable_supported(device, dst);
 }
