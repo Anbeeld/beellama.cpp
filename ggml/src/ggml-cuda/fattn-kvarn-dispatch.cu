@@ -1248,16 +1248,11 @@ bool ggml_cuda_flash_attn_ext_kvarn(
         if (prompt_prefill && portable_supported &&
                 (prompt_portable != nullptr && atoi(prompt_portable) == 1)) {
             g_kvarn_route_portable_native.fetch_add(1, std::memory_order_relaxed);
-            // Batch 4 queries per block when no exact tail is attached (shared
-            // token stream); otherwise the queries attend different token sets
-            // and sharing is invalid.
-            const bool batched = dst->src[5] == nullptr && dst->src[0]->ne[1] > 1;
+            // QB-batching was superseded by upstream's complete optimized D64
+            // rewrite (v0.4.7); the fallback uses the standard portable kernel.
             ggml_cuda_fattn_kvarn_debug_route(
                 ctx.device, plan, dst, entry_path, "portable-native",
-                batched ? "hip-prompt-precision-optin-qb4" : "hip-prompt-precision-optin");
-            if (batched) {
-                return ggml_cuda_flash_attn_ext_kvarn_portable_batched(ctx, dst, plan);
-            }
+                "hip-prompt-precision-optin");
             return ggml_cuda_flash_attn_ext_kvarn_portable(ctx, dst, plan);
         }
     }
