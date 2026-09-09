@@ -3364,6 +3364,17 @@ static void test_native_flash_attention_portable_backend(
     }
 
     if (std::strcmp(backend_label, "GPU") == 0) {
+        // Qwen3-style D128/GQA2 decode selects the exact-width, split-128 CTA.
+        // Compare its staged packed-record path against materialized attention.
+        const std::vector<float> expected_d128_gqa2 = test_native_flash_attention_output(
+                reference_backend, false, false, 128, 5, 5, 1,
+                16, 8, 4352, 5);
+        const std::vector<float> actual_d128_gqa2 = test_native_flash_attention_output(
+                backend, true, true, 128, 5, 5, 1,
+                16, 8, 4352, 5);
+        require_close_f32_rmse(actual_d128_gqa2, expected_d128_gqa2, 1e-2f,
+                "D128 GQA2 split-128 KVarN decode differs from materialized reference");
+
         const std::vector<float> expected = test_native_flash_attention_output(
                 reference_backend, false, false, 64, 4, 3, 22,
                 32, 8, 256, 5, false, nullptr, false, 0, true);
