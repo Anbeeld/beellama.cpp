@@ -1540,7 +1540,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 float2 * dstk_fixup_meta = dstk_fixup + (gridDim.x + blockIdx.x)*ncols;
                 dstk_fixup_meta[jc_cwm] = KQ_cmr;
             }
-            if (!is_kvarn_kv && !needs_fixup && !is_fixup && dst_final_meta && threadIdx.x < T_B_KQ::I) {
+            // KVarN whole-tile blocks must publish final (max, rowsum) too: the
+            // tail merge reads body_meta for every row, and the stream-k fixup
+            // skips tiles whose K range aligns exactly to tile boundaries, so
+            // without this store those rows keep zero meta and their (correct)
+            // body values are silently discarded by the merge.
+            if (!needs_fixup && !is_fixup && dst_final_meta && threadIdx.x < T_B_KQ::I) {
                 const int j = jc_cwm / ncols2;
                 const int c = jc_cwm % ncols2;
                 if (jt*ncols1 + j < int(ne01.z) && zt_gqa*ncols2 + c < gqa_ratio) {
@@ -1582,7 +1587,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 float2 * dstk_fixup_meta = dstk_fixup + (gridDim.x + blockIdx.x)*ncols;
                 dstk_fixup_meta[jc_cwm] = KQ_cmr;
             }
-            if (!is_kvarn_kv && !needs_fixup && !is_fixup && dst_final_meta && thread_should_write) {
+            // KVarN whole-tile blocks must publish final (max, rowsum) too: the
+            // tail merge reads body_meta for every row, and the stream-k fixup
+            // skips tiles whose K range aligns exactly to tile boundaries, so
+            // without this store those rows keep zero meta and their (correct)
+            // body values are silently discarded by the merge.
+            if (!needs_fixup && !is_fixup && dst_final_meta && thread_should_write) {
                 const int j = jc_cwm / ncols2;
                 const int c = jc_cwm % ncols2;
                 if (jt*ncols1 + j < int(ne01.z) && zt_gqa*ncols2 + c < gqa_ratio) {
@@ -1658,7 +1668,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             float2 * dstk_fixup_meta = dstk_fixup + (gridDim.x + blockIdx.x)*ncols;
             dstk_fixup_meta[(threadIdx.y/np)*cols_per_warp + threadIdx.x] = make_float2(KQ_cmn, KQ_crs);
         }
-        if (!is_kvarn_kv && !needs_fixup && !is_fixup && dst_final_meta &&
+        // KVarN whole-tile blocks must publish final (max, rowsum) too: the
+        // tail merge reads body_meta for every row, and the stream-k fixup
+        // skips tiles whose K range aligns exactly to tile boundaries, so
+        // without this store those rows keep zero meta and their (correct)
+        // body values are silently discarded by the merge.
+        if (!needs_fixup && !is_fixup && dst_final_meta &&
                 (cols_per_warp == warp_size || threadIdx.x < cols_per_warp)) {
             const int jc = (threadIdx.y/np)*cols_per_warp + threadIdx.x;
             if (jc < ncols) {
