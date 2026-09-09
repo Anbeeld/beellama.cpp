@@ -1232,16 +1232,18 @@ bool ggml_cuda_flash_attn_ext_kvarn(
         ggml_cuda_fattn_kvarn_select_fallback_route(
             prompt_prefill, generic_shape_supported, portable_supported);
 #if defined(GGML_USE_HIP)
-    // RDNA WMMA prompt tiles accumulate in fp16 (RMSE ~3e-4 vs ~1e-5 for the
-    // portable fp32 path), and the error compounds through 64 layers into a
-    // visible KLD collapse. Route HIP prompt-prefill through portable-native
-    // direct-record attention (same records, exact math) until a float
-    // WMMA accumulator lands. Decode (nq<=16) stays on WMMA: its single
-    // iteration is exact. Opt out with GGML_KVARN_AMD_PROMPT_PORTABLE=0.
+    // RDNA WMMA prompt tiles now accumulate in fp32 for DV=128/256 (mirroring
+    // the proven DV=80/112 fp32-PV tiles), so the WMMA path is both the fast
+    // and the exact route (~1e-5 ladder RMSE, 32k KLD at portable parity).
+    // It is therefore the default for HIP KVarN prompt-prefill. Decode
+    // (nq<=16) stays on WMMA as before. Portable-native direct-record
+    // attention remains as the fallback for unsupported shapes, or opt in
+    // explicitly with GGML_KVARN_AMD_PROMPT_PORTABLE=1. CUDA, Vulkan, and all
+    // non-KVarN paths are untouched by this block.
     {
         const char * prompt_portable = getenv("GGML_KVARN_AMD_PROMPT_PORTABLE");
         if (prompt_prefill && portable_supported &&
-                (prompt_portable == nullptr || atoi(prompt_portable) != 0)) {
+                (prompt_portable != nullptr && atoi(prompt_portable) == 1)) {
             g_kvarn_route_portable_native.fetch_add(1, std::memory_order_relaxed);
             // Batch 4 queries per block when no exact tail is attached (shared
             // token stream); otherwise the queries attend different token sets
@@ -1249,7 +1251,7 @@ bool ggml_cuda_flash_attn_ext_kvarn(
             const bool batched = dst->src[5] == nullptr && dst->src[0]->ne[1] > 1;
             ggml_cuda_fattn_kvarn_debug_route(
                 ctx.device, plan, dst, entry_path, "portable-native",
-                batched ? "hip-prompt-precision-qb4" : "hip-prompt-precision");
+                batched ? "hip-prompt-precision-optin-qb4" : "hip-prompt-precision-optin");
             if (batched) {
                 return ggml_cuda_flash_attn_ext_kvarn_portable_batched(ctx, dst, plan);
             }
