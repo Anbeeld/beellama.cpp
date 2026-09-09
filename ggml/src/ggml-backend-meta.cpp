@@ -1895,7 +1895,12 @@ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struc
 
     // Speculative graphs can create more than 16 transient views per source
     // tensor when a target or draft uses tensor-parallel Meta placement.
-    constexpr size_t compute_headroom = 32;
+    // Views of the static tensors that are created between graph evals are stored in the compute
+    // containers. The number of such views is proportional to the number of tensors in the graph
+    // that share the buffer, which for hybrid recurrent models with n_rs_seq snapshotting can be
+    // much larger than 16 per static tensor (e.g. Qwen35: ~2*(n_rs_seq+1) views per recurrent
+    // layer are created for the conv-state snapshot copies). Size the headroom accordingly.
+    constexpr size_t compute_headroom = 128;
     const ggml_init_params params_static = {
         /*.mem_size   =*/ ggml_get_mem_size(ctx),
         /*.mem_buffer =*/ nullptr,
