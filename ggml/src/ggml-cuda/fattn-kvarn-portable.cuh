@@ -572,9 +572,15 @@ static void ggml_cuda_fattn_kvarn_portable_launch(
         (uint32_t) ((q->ne[1] + QB - 1) / QB), (uint32_t) q->ne[2], (uint32_t) q->ne[3]);
     constexpr int RECORD_DIM = D == 64 ? 64 : GGML_CUDA_FATTN_KVARN_DIM;
     if (getenv("GGML_KVARN_PORTABLE_ATTRS") != nullptr) {
+#if defined(GGML_USE_HIP)
         hipFuncAttributes attrs = {};
         CUDA_CHECK(hipFuncGetAttributes(
             &attrs, (const void *) ggml_cuda_fattn_kvarn_portable_kernel<D, QB>));
+#else
+        cudaFuncAttributes attrs = {};
+        CUDA_CHECK(cudaFuncGetAttributes(
+            &attrs, (const void *) ggml_cuda_fattn_kvarn_portable_kernel<D, QB>));
+#endif
         fprintf(stderr, "portable-attrs D=%d QB=%d numRegs=%d shared=%zu\n",
             D, QB, attrs.numRegs, (size_t) attrs.sharedSizeBytes);
     }
