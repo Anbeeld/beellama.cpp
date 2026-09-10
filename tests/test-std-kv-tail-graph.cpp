@@ -6,6 +6,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <unordered_set>
 #include <vector>
 
 [[noreturn]] static void fail(const char * message) {
@@ -915,6 +916,135 @@ static void test_sparse_swa_packed_oracle(ggml_backend_t backend, llama_swa_type
     ggml_free(ctx);
 }
 
+static void test_cpu_set_rows_last_write_filter() {
+    constexpr uint32_t n_tokens = 512;
+    constexpr uint32_t n_slots = 129;
+    constexpr uint32_t n_levels = 2;
+    constexpr int64_t width = 4;
+
+    ggml_backend_t backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    if (!backend) {
+        fail("failed to initialize CPU backend for duplicate tail-write test");
+    }
+    ggml_backend_dev_t device = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
+    auto set_n_threads = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(
+            reg, "ggml_backend_set_n_threads");
+    if (!set_n_threads) {
+        fail("CPU backend has no thread-count control for duplicate tail-write test");
+    }
+    set_n_threads(backend, 8);
+
+    ggml_init_params params = { 16*1024*1024, nullptr, true };
+    ggml_context * ctx = ggml_init(params);
+    ggml_tensor * storage = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, width, n_slots);
+    ggml_tensor * source = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, n_tokens);
+    ggml_tensor * indices = ggml_new_tensor_2d(ctx, GGML_TYPE_I64, n_tokens, n_levels);
+    ggml_tensor * write = nullptr;
+    for (uint32_t level = 0; level < n_levels; ++level) {
+        ggml_tensor * level_indices = ggml_view_1d(
+                ctx, indices, n_tokens, size_t(level)*indices->nb[1]);
+        write = ggml_set_rows_ordered(ctx, storage, source, level_indices, write);
+    }
+    ggml_tensor * lhs = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, width);
+    ggml_tensor * rhs = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, width);
+    ggml_tensor * dummy = ggml_mul_mat(ctx, lhs, rhs);
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, write);
+    ggml_build_forward_expand(graph, dummy);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buffer) {
+        fail("failed to allocate duplicate tail-write graph tensors");
+    }
+
+    std::vector<int64_t> original(size_t(n_tokens)*n_levels);
+    for (uint32_t level = 0; level < n_levels; ++level) {
+        for (uint32_t row = 0; row < n_tokens; ++row) {
+            // Interleave the two slot streams and include body skips.
+            int64_t slot = int64_t((2*row + level) % n_slots);
+            if ((row + 17*level) % 67 == 0) {
+                slot = LLAMA_KV_TAIL_BODY_SLOT;
+            }
+            original[size_t(level)*n_tokens + row] = slot;
+        }
+    }
+    std::vector<float> source_data(size_t(width)*n_tokens);
+    for (uint32_t row = 0; row < n_tokens; ++row) {
+        for (int64_t col = 0; col < width; ++col) {
+            source_data[size_t(row)*width + col] = float(row + 1);
+        }
+    }
+
+    std::vector<float> expected(n_slots, -777.0f);
+    for (uint32_t level = 0; level < n_levels; ++level) {
+        for (uint32_t row = 0; row < n_tokens; ++row) {
+            const int64_t slot = original[size_t(level)*n_tokens + row];
+            if (slot >= 0) {
+                expected[size_t(slot)] = float(row + 1);
+            }
+        }
+    }
+    std::vector<int64_t> filtered = original;
+    llama_kv_tail_keep_last_writes(filtered.data(), n_tokens, n_levels);
+    for (uint32_t level = 0; level < n_levels; ++level) {
+        std::unordered_set<int64_t> expected_live;
+        std::unordered_set<int64_t> live;
+        for (uint32_t row = 0; row < n_tokens; ++row) {
+            const int64_t before = original[size_t(level)*n_tokens + row];
+            const int64_t after = filtered[size_t(level)*n_tokens + row];
+            if (before < 0) {
+                if (after != before) fail("tail-write filter changed a negative skip");
+            } else {
+                expected_live.insert(before);
+                if (after >= 0 && !live.insert(after).second) {
+                    fail("tail-write filter retained a duplicate");
+                }
+            }
+        }
+        if (live.size() != expected_live.size()) {
+            fail("tail-write filter changed the number of live slots");
+        }
+    }
+
+    const int64_t encoded[] = {
+        (int64_t(1) << 32) | 3, (int64_t(2) << 32) | 7, (int64_t(1) << 32) | 3,
+        -1, (int64_t(2) << 32) | 7, (int64_t(3) << 32) | 1,
+    };
+    int64_t encoded_copy[6];
+    std::memcpy(encoded_copy, encoded, sizeof(encoded));
+    llama_kv_tail_keep_last_writes(encoded_copy, 3, 2);
+    if (encoded_copy[0] != -1 || encoded_copy[1] != encoded[1] ||
+            encoded_copy[2] != encoded[2] || encoded_copy[3] != -1 ||
+            encoded_copy[4] != encoded[4] || encoded_copy[5] != encoded[5]) {
+        fail("tail-write filter mishandled interleaved encoded slots");
+    }
+
+    std::vector<ggml_fp16_t> initial(size_t(width)*n_slots, ggml_fp32_to_fp16(-777.0f));
+    ggml_backend_tensor_set(storage, initial.data(), 0, initial.size()*sizeof(ggml_fp16_t));
+    ggml_backend_tensor_set(source, source_data.data(), 0, source_data.size()*sizeof(float));
+    ggml_backend_tensor_set(indices, filtered.data(), 0, filtered.size()*sizeof(int64_t));
+    std::vector<float> zeros(ggml_nelements(lhs), 0.0f);
+    ggml_backend_tensor_set(lhs, zeros.data(), 0, ggml_nbytes(lhs));
+    ggml_backend_tensor_set(rhs, zeros.data(), 0, ggml_nbytes(rhs));
+    if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+        fail("duplicate tail-write graph compute failed");
+    }
+    std::vector<ggml_fp16_t> got_f16(ggml_nelements(storage));
+    std::vector<float> got(got_f16.size());
+    ggml_backend_tensor_get(storage, got_f16.data(), 0, got_f16.size()*sizeof(ggml_fp16_t));
+    ggml_fp16_to_fp32_row(got_f16.data(), got.data(), got.size());
+    for (uint32_t slot = 0; slot < n_slots; ++slot) {
+        for (int64_t col = 0; col < width; ++col) {
+            if (got[size_t(slot)*width + col] != expected[slot]) {
+                fail("CPU mixed graph did not preserve sequential last tail write");
+            }
+        }
+    }
+    ggml_backend_buffer_free(buffer);
+    ggml_backend_free(backend);
+    ggml_free(ctx);
+}
+
 int main() {
     test_representation_topology();
     ggml_backend_load_all();
@@ -925,6 +1055,7 @@ int main() {
     test_attention_graph(backend);
     test_shadow_roundtrip(backend);
     ggml_backend_free(backend);
+    test_cpu_set_rows_last_write_filter();
 
     ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (!cpu) {

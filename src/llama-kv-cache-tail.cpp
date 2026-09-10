@@ -9,6 +9,20 @@
 #include <string>
 #include <unordered_set>
 
+void llama_kv_tail_keep_last_writes(int64_t * indices, uint32_t n_tokens, uint32_t n_levels) {
+    std::unordered_set<int64_t> written;
+    written.reserve(n_tokens);
+    for (uint32_t level = 0; level < n_levels; ++level) {
+        written.clear();
+        for (uint32_t row = n_tokens; row-- > 0;) {
+            auto & slot = indices[size_t(level)*n_tokens + row];
+            if (slot >= 0 && !written.insert(slot).second) {
+                slot = -1;
+            }
+        }
+    }
+}
+
 size_t llama_kv_tail_store::identity_hash::operator()(const llama_kv_tail_identity & value) const {
     size_t hash = value.stream;
     hash = hash * 0x9e3779b1u + value.cell;
