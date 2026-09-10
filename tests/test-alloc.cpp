@@ -674,6 +674,54 @@ static void test_graph_optimize_alloc_dep() {
     GGML_ASSERT(!graph_reuses_allocation(true));
 }
 
+// Regression test for https://github.com/Anbeeld/beellama.cpp/issues/150
+//
+// Probing the assigned backend of every node of a reserved graph (as
+// llama_context::record_backend_private_workspace() does) inserts those tensors into the
+// scheduler hash set. Such an insert must invalidate the scheduler reset state, otherwise
+// the next ggml_backend_sched_reset() is skipped, the stale entries stay in the hash set
+// and the following graph overflows it (ggml_hash_find_or_insert() aborts).
+static void test_probe_backend_keeps_reset_state() {
+    // the scheduler hash set has ggml_hash_size(24) = 37 slots
+    const int graph_size = 24;
+
+    dummy_backend backend = dummy_backend_init(SIZE_MAX);
+
+    ggml_backend_t             backend_ptr = &backend.context->backend;
+    ggml_backend_buffer_type_t buft        = &backend.buffer_type;
+
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(&backend_ptr, &buft, 1, graph_size, false, false));
+
+    // each graph has 20 nodes + 1 leaf: it fits on its own, but never together with another graph
+    ggml_cgraph * graphs[2] = { nullptr, nullptr };
+    std::vector<ggml_context_ptr> ctxs;
+    for (int g = 0; g < 2; ++g) {
+        auto [ctx, graph, ctx_ptr] = make_context();
+
+        ggml_tensor * cur = make_input_with_size(ctx, 16);
+        for (int i = 0; i < 20; ++i) {
+            cur = ggml_scale(ctx, cur, 2.0f);
+        }
+        ggml_set_output(cur);
+        ggml_build_forward_expand(graph, cur);
+
+        ctxs.push_back(std::move(ctx_ptr));
+        graphs[g] = graph;
+    }
+
+    // reserve a worst-case graph, like llama_context::sched_reserve() does
+    GGML_ASSERT(ggml_backend_sched_reserve(sched.get(), graphs[0]));
+
+    // probe the backend of every reserved node, like llama_context::record_backend_private_workspace() does
+    for (int i = 0; i < graphs[0]->n_nodes; ++i) {
+        ggml_backend_sched_get_tensor_backend(sched.get(), graphs[0]->nodes[i]);
+    }
+
+    // the first decode resets the scheduler and then allocates a graph with fresh tensors
+    ggml_backend_sched_reset(sched.get());
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graphs[1]));
+}
+
 static void run(const char * name, void (*f)()) {
     printf("%s ", name);
     fflush(stdout);
@@ -697,5 +745,6 @@ int main() {
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
+    run("test_probe_backend_keeps_reset_state", test_probe_backend_keeps_reset_state);
     return 0;
 }
