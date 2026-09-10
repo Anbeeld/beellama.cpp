@@ -2655,13 +2655,19 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                         kvarn_tail_type, 0, false, params.kv_tail_rollback_tokens,
                                         params.kv_tail_native_exact ? cparams.n_ctx : 0);
                             } else {
-                                mem_attn = std::make_unique<llama_kv_cache_kvarn>(
+                                auto kvarn_attn = std::make_unique<llama_kv_cache_kvarn>(
                                         *this, hparams, params.kvarn, cparams.offload_kqv,
                                         cparams.kv_unified, cparams.n_ctx_seq, cparams.n_seq_max,
                                         cparams.n_batch, cparams.n_ubatch, 1, hparams.n_swa,
                                         hparams.swa_type, filter_attn, nullptr, params.kv_tail_tokens,
                                         kvarn_tail_type, params.kv_tail_tokens_requested,
                                         params.kv_tail_rollback_tokens);
+                                // QSA's index cache mirrors the attention cells cell for cell,
+                                // which the compact read plan's reordered rows cannot represent.
+                                if (needs_mem_idx && filter_idx) {
+                                    kvarn_attn->set_indexer_mirror(true);
+                                }
+                                mem_attn = std::move(kvarn_attn);
                             }
                             auto mem_recr = std::make_unique<llama_memory_recurrent>(
                                     *this,

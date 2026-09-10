@@ -2964,7 +2964,10 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
         head = sinfo.idxs[s].back() + 1;
     }
-    if (!sinfo.group_stage_slots.empty()) {
+    // Ordinary mirrored caches (the qwen4exp QSA index cache) borrow the attention
+    // slot infos, KVarN-only allocation metadata included, but only a structured
+    // cache tracks post-allocation stage slots.
+    if (allocation_group_size > 1 && !sinfo.group_stage_slots.empty()) {
         GGML_ASSERT(sinfo.group_stage_slots.size() == allocation_group_stage_slots.size());
         allocation_group_stage_slots = sinfo.group_stage_slots;
     } else {
