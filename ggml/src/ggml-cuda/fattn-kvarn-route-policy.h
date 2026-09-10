@@ -30,6 +30,7 @@ enum ggml_cuda_fattn_kvarn_route {
 enum ggml_cuda_fattn_kvarn_amd_mma_arch {
     GGML_CUDA_FATTN_KVARN_AMD_NONE,
     GGML_CUDA_FATTN_KVARN_AMD_RDNA_WMMA,
+    GGML_CUDA_FATTN_KVARN_AMD_RDNA4_WMMA,
     GGML_CUDA_FATTN_KVARN_AMD_CDNA_MFMA,
 };
 
@@ -62,13 +63,15 @@ inline ggml_cuda_fattn_kvarn_mma_eligibility ggml_cuda_fattn_kvarn_amd_mma_eligi
     }
     if (input.head_dim <= 0 ||
             (input.arch == GGML_CUDA_FATTN_KVARN_AMD_RDNA_WMMA && input.head_dim > 256) ||
+            (input.arch == GGML_CUDA_FATTN_KVARN_AMD_RDNA4_WMMA && input.head_dim > 128) ||
             (input.arch == GGML_CUDA_FATTN_KVARN_AMD_CDNA_MFMA && input.head_dim > 256)) {
         return GGML_CUDA_FATTN_KVARN_MMA_HEAD_DIM_UNSUPPORTED;
     }
     if (input.ncols1 * input.ncols2 < 16) {
         return GGML_CUDA_FATTN_KVARN_MMA_TILE_TOO_SMALL;
     }
-    if (input.arch == GGML_CUDA_FATTN_KVARN_AMD_RDNA_WMMA && input.ncols2 == 1) {
+    if ((input.arch == GGML_CUDA_FATTN_KVARN_AMD_RDNA_WMMA ||
+            input.arch == GGML_CUDA_FATTN_KVARN_AMD_RDNA4_WMMA) && input.ncols2 == 1) {
         return GGML_CUDA_FATTN_KVARN_MMA_RDNA_SINGLE_GQA_COLUMN;
     }
     return GGML_CUDA_FATTN_KVARN_MMA_ELIGIBLE;

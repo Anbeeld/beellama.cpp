@@ -51,6 +51,14 @@ peak transient scratch for concurrent long prompts but adds partial-softmax
 merges and changes floating-point reduction order. It does not alter context or
 persistent KV-cache capacity.
 
+On HIP/ROCm, KVarN prompt prefill defaults to the F32-accumulator WMMA route
+on arches whose tiles accumulate in fp32 (RDNA3/gfx11); RDNA4 stays on the
+portable route until its fp32 tiles qualify. `GGML_KVARN_AMD_PROMPT_PORTABLE`
+opts a prompt back into portable-native direct-record attention: any nonzero
+value (conventionally `1`) selects portable, while unset, `0`, or
+non-numeric values keep the WMMA default. The check runs before the generic
+probe, so opting in does not pay for a discarded WMMA pass.
+
 ## KV cache precision tail for quantized caches
 
 The KV cache precision tail (KVCPT) makes the newest attention-visible entries exact in F16 or BF16 for

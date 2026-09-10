@@ -1965,9 +1965,10 @@ static __global__ void flash_attn_ext_f16(
 #if defined(AMD_WMMA_AVAILABLE)
     // Mirrored by ggml_cuda_fattn_kvarn_amd_mma_eligibility on the host.
     // RDNA WMMA D256 tiles are the validated configs in the RDNA table above
-    // (256, 320, 512, 576 keys); the host caps RDNA3_0/RDNA4 at 576 and
-    // RDNA3_5 at 320 (fattn.cu), so this bound must stay >= the largest
-    // selectable head. GGML_CUDA_FA_WMMA_MAX_HEAD overrides the host selection.
+    // (256, 320, 512, 576 keys). The KVarN dispatcher admits D256 only where
+    // the fp32 tiles compile (RDNA3/gfx11; RDNA4 stays fail-closed at D128),
+    // and standard FA keeps upstream's D128 cap, so this bound is reachable
+    // only through qualified shapes.
     if (ncols1*ncols2 < 16 || ncols2 == 1 || DKQ > 576) {
         NO_DEVICE_CODE;
         return;
