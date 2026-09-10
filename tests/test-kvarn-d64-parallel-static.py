@@ -60,7 +60,7 @@ assert "k_payload_bytes = RECORD_DIM * GGML_CUDA_FATTN_KVARN_DIM" in decode, \
     "optimized decode must preserve one-record payload offsets for D128+ slices"
 assert "v_row_bytes = RECORD_DIM * V_BITS / 8" in decode, \
     "optimized decode must preserve one-record row strides for D128+ slices"
-assert "payload_sh[D == 64" in decode, \
+assert "STAGE_PAYLOAD = D == 64 ||" in decode and "payload_sh[STAGE_PAYLOAD" in decode, \
     "optimized D64 decode must stage rectangular payloads cooperatively"
 generator = Path("ggml/src/ggml-cuda/template-instances/generate_cu_files.py").read_text(encoding="utf8")
 assert "KVARN_DECODE_HEAD_SIZES = [64, 128, 256, 512]" in generator, \

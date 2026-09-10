@@ -216,8 +216,17 @@ static __device__ __forceinline__ void ggml_cuda_fattn_kvarn_decode_unpack2(
         return;
     }
 
-    a = ggml_cuda_fattn_kvarn_decode_unpack<BITS>(raw, index, BITS);
-    b = ggml_cuda_fattn_kvarn_decode_unpack<BITS>(raw, index + 1, BITS);
+    const uint32_t * words = (const uint32_t *) raw;
+    const int bit_offset = index * BITS;
+    const int word_offset = bit_offset >> 5;
+    const int shift = bit_offset & 31;
+    uint64_t packed = (uint64_t) words[word_offset];
+    if (shift + 2 * BITS > 32) {
+        packed |= (uint64_t) words[word_offset + 1] << 32;
+    }
+    const uint32_t mask = (1u << BITS) - 1u;
+    a = (int) ((packed >> shift) & mask);
+    b = (int) ((packed >> (shift + BITS)) & mask);
 }
 
 // Q_TILE — сколько строк запроса обслуживает один блок. Раньше их всегда была
@@ -325,14 +334,15 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
     constexpr int AXES_HALVES = K_AXES_HALVES > V_AXES_HALVES ? K_AXES_HALVES : V_AXES_HALVES;
     constexpr int K_AXES_VEC = (K_AXES_HALVES * (int) sizeof(half)) / (int) sizeof(uint4);
     constexpr int V_AXES_VEC = (V_AXES_HALVES * (int) sizeof(half)) / (int) sizeof(uint4);
-    constexpr int D64_PAYLOAD_BYTES = RECORD_DIM * GGML_CUDA_FATTN_KVARN_DIM *
+    constexpr bool STAGE_PAYLOAD = D == 64 || (D == 128 && SPLIT_TOKENS == 128);
+    constexpr int MAX_PAYLOAD_BYTES = RECORD_DIM * GGML_CUDA_FATTN_KVARN_DIM *
         (K_BITS > V_BITS ? K_BITS : V_BITS) / 8;
-    constexpr int D64_PAYLOAD_VECS = D64_PAYLOAD_BYTES / (int) sizeof(uint4);
+    constexpr int MAX_PAYLOAD_VECS = MAX_PAYLOAD_BYTES / (int) sizeof(uint4);
     __shared__ __align__(16) half axes_sh[SLICES][AXES_HALVES];
-    // Rectangular D64 records are one payload per CTA. Stage their packed body
-    // cooperatively so the fragment layout reads shared memory instead of issuing
-    // sparse global loads from four distant rows in every lane.
-    __shared__ __align__(16) uint4 payload_sh[D == 64 ? D64_PAYLOAD_VECS : 1];
+    // Rectangular D64 records and full-group D128 splits stage their packed body
+    // cooperatively. This turns sparse fragment reads into coalesced global loads
+    // while retaining four resident CTAs for the D128 decode shape.
+    __shared__ __align__(16) uint4 payload_sh[STAGE_PAYLOAD ? MAX_PAYLOAD_VECS : 1];
 #define KVARN_K_AXIS_SCALE(sl, i) __half2float(axes_sh[sl][(i)])
 #define KVARN_K_AXIS_ZP(sl, i)    __half2float(axes_sh[sl][K_ROWS + (i)])
 #define KVARN_K_AXIS_OTHER(sl, i) __half2float(axes_sh[sl][2 * K_ROWS + (i)])
@@ -455,7 +465,7 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
             const uint4 * src = (const uint4 *) (k_records[slice] + k_payload_bytes);
             ((uint4 *) axes_sh[slice])[vec] = src[vec];
         }
-        if constexpr (D == 64) {
+        if constexpr (STAGE_PAYLOAD) {
             const uint4 * src = (const uint4 *) k_records[0];
             for (int i = tid; i < k_payload_bytes / (int) sizeof(uint4);
                     i += NWARPS * PHYSICAL_WAVE_SIZE) {
@@ -536,7 +546,7 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
                     const int pos = k_tile.pos_begin + chunk * TOKENS_PER_CHUNK + token_local;
                     float x00, x01, x10, x11;
                     if (k_split_in_group) {
-                        const uint8_t * k_payload = D == 64 ?
+                        const uint8_t * k_payload = STAGE_PAYLOAD ?
                             (const uint8_t *) payload_sh : k_records[slice];
                         const uint8_t * row0 = k_payload + (local_dim + 0) * k_row_bytes;
                         const uint8_t * row1 = k_payload + (local_dim + 1) * k_row_bytes;
@@ -733,7 +743,7 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
             const uint4 * src = (const uint4 *) (v_records[slice] + v_payload_bytes);
             ((uint4 *) axes_sh[slice])[vec] = src[vec];
         }
-        if constexpr (D == 64) {
+        if constexpr (STAGE_PAYLOAD) {
             const uint4 * src = (const uint4 *) v_records[0];
             for (int i = tid; i < v_payload_bytes / (int) sizeof(uint4);
                     i += NWARPS * PHYSICAL_WAVE_SIZE) {
@@ -791,7 +801,7 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
                 const int pos0 = v_tile.pos_begin + chunk * TOKENS_PER_CHUNK + token_local + 0;
                 const int pos1 = v_tile.pos_begin + chunk * TOKENS_PER_CHUNK + token_local + 1;
                 if (v_from_record && pos1 < GGML_CUDA_FATTN_KVARN_DIM) {
-                    const uint8_t * v_payload = D == 64 ?
+                    const uint8_t * v_payload = STAGE_PAYLOAD ?
                         (const uint8_t *) payload_sh : v_records[slice];
                     const uint8_t * row0 = v_payload + pos0 * v_row_bytes;
                     const uint8_t * row1 = v_payload + pos1 * v_row_bytes;
@@ -957,7 +967,10 @@ static void ggml_cuda_fattn_kvarn_decode_consider(
     // verification keeps split-128 at shorter depths because it enables query
     // tiling and avoids duplicated partial-output traffic.
     if constexpr (SPLIT_TOKENS == 128) {
-        if (n_q == 1 && n_kv < 32768) {
+        // A D128 CTA can assign its eight warps to both halves of the record;
+        // wider heads keep the measured deep-context crossover.
+        if (n_q == 1 && ((D == 128 && n_kv < 4096) ||
+                (D != 128 && n_kv < 32768))) {
             return;
         }
     }
@@ -1174,6 +1187,17 @@ ggml_cuda_fattn_kvarn_decode_geometry ggml_cuda_fattn_kvarn_decode_select(
         ggml_cuda_fattn_kvarn_decode_consider<D, 6, 128, 8, K_BITS, V_BITS, 3>(
             best, best_score, nsm, n_kv, n_q_geometry, n_q_heads, n_kv_heads, n_stream);
     } else if constexpr (D == 128) {
+        // Small Qwen3 models use GQA2/GQA4. Exact-width CTA shapes avoid
+        // reserving score accumulators and registers for six or eight query
+        // heads that do not exist, improving occupancy on latency-bound decode.
+        ggml_cuda_fattn_kvarn_decode_consider<D, 2, 64, 4, K_BITS, V_BITS>(
+            best, best_score, nsm, n_kv, n_q_geometry, n_q_heads, n_kv_heads, n_stream);
+        ggml_cuda_fattn_kvarn_decode_consider<D, 4, 64, 4, K_BITS, V_BITS>(
+            best, best_score, nsm, n_kv, n_q_geometry, n_q_heads, n_kv_heads, n_stream);
+        ggml_cuda_fattn_kvarn_decode_consider<D, 2, 128, 8, K_BITS, V_BITS>(
+            best, best_score, nsm, n_kv, n_q_geometry, n_q_heads, n_kv_heads, n_stream);
+        ggml_cuda_fattn_kvarn_decode_consider<D, 4, 128, 8, K_BITS, V_BITS>(
+            best, best_score, nsm, n_kv, n_q_geometry, n_q_heads, n_kv_heads, n_stream);
         ggml_cuda_fattn_kvarn_decode_consider<D, 6, 64, 4, K_BITS, V_BITS>(
             best, best_score, nsm, n_kv, n_q_geometry, n_q_heads, n_kv_heads, n_stream);
         ggml_cuda_fattn_kvarn_decode_consider<D, 8, 64, 4, K_BITS, V_BITS>(
@@ -1297,6 +1321,10 @@ static void ggml_cuda_fattn_kvarn_decode_launch_gqa(
             ggml_cuda_fattn_kvarn_decode_launch_geometry<D, MAX_GQA, 64, 4, K_BITS, V_BITS>(args, blocks_split);
             return;
         }
+        if (args.split_tokens == 128 && args.nwarps == 8) {
+            ggml_cuda_fattn_kvarn_decode_launch_geometry<D, MAX_GQA, 128, 8, K_BITS, V_BITS>(args, blocks_split);
+            return;
+        }
     }
     GGML_ABORT("unsupported KVarN decode geometry D=%d split=%d nwarps=%d max_gqa=%d",
         D, args.split_tokens, args.nwarps, MAX_GQA);
@@ -1314,7 +1342,9 @@ void ggml_cuda_fattn_kvarn_decode_launch(const ggml_cuda_fattn_kvarn_decode_args
         (uint32_t) (args.n_kv_heads * args.n_gqa_blocks * n_q_tiles),
         (uint32_t) args.n_stream);
 
-    if (args.gqa_per_block == 4) {
+    if (args.gqa_per_block == 2) {
+        ggml_cuda_fattn_kvarn_decode_launch_gqa<D, 2, K_BITS, V_BITS>(args, blocks_split);
+    } else if (args.gqa_per_block == 4) {
         ggml_cuda_fattn_kvarn_decode_launch_gqa<D, 4, K_BITS, V_BITS>(args, blocks_split);
     } else if (args.gqa_per_block == 6) {
         ggml_cuda_fattn_kvarn_decode_launch_gqa<D, 6, K_BITS, V_BITS>(args, blocks_split);

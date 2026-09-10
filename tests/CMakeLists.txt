@@ -168,6 +168,12 @@ if (Python3_Interpreter_FOUND)
     set_property(TEST test-kvarn-port-safety-static PROPERTY LABELS cuda)
 
     add_test(
+        NAME test-qwen4exp-qsa-kvarn-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-qwen4exp-qsa-kvarn-static.py)
+    set_property(TEST test-qwen4exp-qsa-kvarn-static PROPERTY LABELS main)
+
+    add_test(
         NAME test-kvarn-hip-tail-capability-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-kvarn-hip-tail-capability-static.py)
