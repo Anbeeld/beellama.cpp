@@ -4,7 +4,10 @@
 
 - Added true rectangular KVarN storage and attention for 64-dimensional K/V heads, including 64x128 K records, 128x64 V records, WHT64 transforms, target and owned draft caches, full-context and iSWA routing, and F16/BF16 precision tails. Existing D128, D256, and D512 record layouts and state formats remain compatible, while unsupported backend placements continue to fail closed.
 - Optimized CUDA D64 KVarN with block-parallel quantization, batched workspace staging and commit, grouped materialization, split portable/GQA attention, and generated split-MMA decode kernels. Decode consumes compressed records directly at every KV length; prompt batches above the native rotated-query limit use transient tiled materialization. Packed K2/K4 decoding now handles odd indirect and SWA offsets without slowing aligned pairs.
+- Optimized CUDA D128 KVarN decode for low GQA with exact GQA2/GQA4 geometries, an eight-warp split-128 route with a measured shallow-context crossover, cooperative staging of complete packed records, and shared-word unpacking of adjacent 3-, 5-, and 6-bit values, raising occupancy and halving deep-context split/combine work.
 - Fixed tensor-split speculative graph reuse after Meta context growth. Resetting the rotating graph context now recreates every reserved subgraph slot, preventing stale graph pointers when speculative topology changes. Attention planning uses the query-token dimension, and the original four-argument KVarN planner symbol remains available for binary compatibility.
+- Fixed Qwen4Exp QSA serving on KVarN caches. Index-mirroring hybrid memories keep one attention row per physical cache cell, KVarN-only stage slots no longer reach the plain index cache, and state save/restore selects stage rows with the mapping the store actually uses.
+- Fixed a first-decode abort from stale scheduler hash entries after graph reserve and tensor probing: inserting into the hash set now invalidates the reset state, so the next reset always clears it.
 
 ## v0.4.6
 
