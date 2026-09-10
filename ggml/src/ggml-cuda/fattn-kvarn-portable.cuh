@@ -182,8 +182,8 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
     const float * q = (const float *) (
         q_data + query * nbq1 + query_head * nbq2 + stream * nbq3);
 
-    __shared__ float reduction[RECORD_DIM];
-    __shared__ float transform[RECORD_DIM];
+    __shared__ float reduction[D];
+    __shared__ float transform[D];
     __shared__ float maximum;
     __shared__ float denominator;
     __shared__ float old_scale_shared;
