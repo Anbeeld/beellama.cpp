@@ -19,7 +19,7 @@
 constexpr int32_t LLAMA_KV_TAIL_BODY_SLOT = -1;
 
 // SET_ROWS requires unique destinations. Indices are [level][token]; retain
-// only the last write to each slot in each level, leaving negative skips intact.
+// only the globally last (token, level) write to each slot; preserve negative skips.
 void llama_kv_tail_keep_last_writes(int64_t * indices, uint32_t n_tokens, uint32_t n_levels);
 
 struct llama_kv_tail_identity {

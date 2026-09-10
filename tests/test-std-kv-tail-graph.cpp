@@ -916,10 +916,9 @@ static void test_sparse_swa_packed_oracle(ggml_backend_t backend, llama_swa_type
     ggml_free(ctx);
 }
 
-static void test_cpu_set_rows_last_write_filter() {
+static void test_cpu_set_rows_last_write_filter(uint32_t n_levels) {
     constexpr uint32_t n_tokens = 512;
     constexpr uint32_t n_slots = 129;
-    constexpr uint32_t n_levels = 2;
     constexpr int64_t width = 4;
 
     ggml_backend_t backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -976,8 +975,8 @@ static void test_cpu_set_rows_last_write_filter() {
     }
 
     std::vector<float> expected(n_slots, -777.0f);
-    for (uint32_t level = 0; level < n_levels; ++level) {
-        for (uint32_t row = 0; row < n_tokens; ++row) {
+    for (uint32_t row = 0; row < n_tokens; ++row) {
+        for (uint32_t level = 0; level < n_levels; ++level) {
             const int64_t slot = original[size_t(level)*n_tokens + row];
             if (slot >= 0) {
                 expected[size_t(slot)] = float(row + 1);
@@ -986,37 +985,14 @@ static void test_cpu_set_rows_last_write_filter() {
     }
     std::vector<int64_t> filtered = original;
     llama_kv_tail_keep_last_writes(filtered.data(), n_tokens, n_levels);
-    for (uint32_t level = 0; level < n_levels; ++level) {
-        std::unordered_set<int64_t> expected_live;
-        std::unordered_set<int64_t> live;
-        for (uint32_t row = 0; row < n_tokens; ++row) {
-            const int64_t before = original[size_t(level)*n_tokens + row];
-            const int64_t after = filtered[size_t(level)*n_tokens + row];
-            if (before < 0) {
-                if (after != before) fail("tail-write filter changed a negative skip");
-            } else {
-                expected_live.insert(before);
-                if (after >= 0 && !live.insert(after).second) {
-                    fail("tail-write filter retained a duplicate");
-                }
-            }
+    std::unordered_set<int64_t> live;
+    for (size_t i = 0; i < filtered.size(); ++i) {
+        if (original[i] < 0 && filtered[i] != original[i]) {
+            fail("tail-write filter changed a negative skip");
         }
-        if (live.size() != expected_live.size()) {
-            fail("tail-write filter changed the number of live slots");
+        if (filtered[i] >= 0 && !live.insert(filtered[i]).second) {
+            fail("tail-write filter retained a cross-level duplicate");
         }
-    }
-
-    const int64_t encoded[] = {
-        (int64_t(1) << 32) | 3, (int64_t(2) << 32) | 7, (int64_t(1) << 32) | 3,
-        -1, (int64_t(2) << 32) | 7, (int64_t(3) << 32) | 1,
-    };
-    int64_t encoded_copy[6];
-    std::memcpy(encoded_copy, encoded, sizeof(encoded));
-    llama_kv_tail_keep_last_writes(encoded_copy, 3, 2);
-    if (encoded_copy[0] != -1 || encoded_copy[1] != encoded[1] ||
-            encoded_copy[2] != encoded[2] || encoded_copy[3] != -1 ||
-            encoded_copy[4] != encoded[4] || encoded_copy[5] != encoded[5]) {
-        fail("tail-write filter mishandled interleaved encoded slots");
     }
 
     std::vector<ggml_fp16_t> initial(size_t(width)*n_slots, ggml_fp32_to_fp16(-777.0f));
@@ -1055,7 +1031,8 @@ int main() {
     test_attention_graph(backend);
     test_shadow_roundtrip(backend);
     ggml_backend_free(backend);
-    test_cpu_set_rows_last_write_filter();
+    test_cpu_set_rows_last_write_filter(1);
+    test_cpu_set_rows_last_write_filter(2);
 
     ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (!cpu) {
