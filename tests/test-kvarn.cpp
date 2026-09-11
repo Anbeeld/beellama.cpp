@@ -3777,8 +3777,7 @@ static void test_native_flash_attention_gpu() {
             require(stats.decode_split == 0 && stats.amd_decode_split == 0 &&
                     stats.decode_vector == 0 && stats.amd_decode_vector == 0,
                     "AMD route-boundary case entered a CUDA-only specialized decode route");
-            const bool known_invalid_generic = hip_physical_wave_size == 32 ?
-                head_dim > 128 : head_dim > 256;
+            const bool known_invalid_generic = head_dim > 256;
             if (known_invalid_generic) {
                 require(stats.generic_shape_rejected > 0 && stats.portable_native > 0 &&
                         stats.generic_mma == 0 && stats.prompt_prefill == 0,
@@ -4380,6 +4379,60 @@ static void test_kvarn_nkv_ladder() {
                 head_dim, n_kv, std::sqrt(sum / actual.size()), mx, actual.size());
         std::fflush(stdout);
     }
+    }
+    ggml_backend_free(cpu_backend);
+    ggml_backend_free(gpu_backend);
+}
+
+// Committed regression coverage for the ub>64 whole-tile body_meta fix:
+// D256 k6/v6 prompt prefill (nq=256, whole-tile K blocks) with an attached
+// 128-candidate exact tail, GPU native vs CPU materialized reference. With
+// the `!is_kvarn_kv` gate restored on the whole-tile dst_final_meta stores,
+// tail-merge rows keep zero meta and this diverges catastrophically.
+static void test_kvarn_d256_prompt_tail_regression() {
+    ggml_backend_t gpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
+    if (gpu_backend == nullptr) {
+        return;
+    }
+    ggml_backend_t cpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_CPU, true);
+    const std::vector<float> expected = test_native_flash_attention_output(
+            cpu_backend, false, false, 256, 6, 6, 256,
+            6, 1, 512, 2, false, nullptr, false, 128, false,
+            GGML_TYPE_F16, 0, false, true, -1, true);
+    const std::vector<float> actual = test_native_flash_attention_output(
+            gpu_backend, true, true, 256, 6, 6, 256,
+            6, 1, 512, 2, false, nullptr, false, 128, false,
+            GGML_TYPE_F16, 0, false, true, -1, true);
+    require_close_f32_rmse(actual, expected, 1e-2f,
+            "D256 WMMA prompt prefill with attached exact tail differs from CPU reference");
+    ggml_backend_free(cpu_backend);
+    ggml_backend_free(gpu_backend);
+}
+
+// Committed coverage for the portable shared-scratch sizing fix: portable
+// attention with original_value_domain=true at D256/D512 exercises the
+// full-head V-domain transform (reduction/transform indexed to D-1), which
+// silently ran out of bounds when the arrays were sized RECORD_DIM. HIP
+// stays rotated by policy, so the force-portable env pins the route here;
+// the CPU materialized reference is route-independent.
+static void test_native_flash_attention_portable_original_v() {
+    ggml_backend_t gpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
+    if (gpu_backend == nullptr) {
+        return;
+    }
+    ggml_backend_t cpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_CPU, true);
+    scoped_test_env force_portable("GGML_KVARN_TEST_FORCE_PORTABLE_FATTN", "1");
+    for (int head_dim : { 256, 512 }) {
+        const std::vector<float> expected = test_native_flash_attention_output(
+                cpu_backend, false, false, head_dim, 6, 6, 32,
+                6, 1, 512, 2, false, nullptr, false, 0, true,
+                GGML_TYPE_F16, 0, false, true, -1, true);
+        const std::vector<float> actual = test_native_flash_attention_output(
+                gpu_backend, true, true, head_dim, 6, 6, 32,
+                6, 1, 512, 2, false, nullptr, false, 0, true,
+                GGML_TYPE_F16, 0, false, true, -1, true);
+        require_close_f32_rmse(actual, expected, 1e-2f,
+                "portable original-V KVarN attention differs from CPU reference");
     }
     ggml_backend_free(cpu_backend);
     ggml_backend_free(gpu_backend);
@@ -5630,6 +5683,8 @@ int main() {
     test_odd_offset_record_decode_gpu();
     test_d64_materialized_body_exact_tail_gpu();
     test_native_flash_attention_prefill_route_parity();
+    test_kvarn_d256_prompt_tail_regression();
+    test_native_flash_attention_portable_original_v();
     test_dflash_non_causal_attention_parity();
     test_rotated_decode_transform_consistency(GGML_BACKEND_DEVICE_TYPE_CPU, true);
     test_rotated_decode_transform_consistency(GGML_BACKEND_DEVICE_TYPE_GPU, false);

@@ -167,17 +167,17 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 256, 2,  32, 128, 128,  32, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 128, 256, 1,  64, 128, 128,  64, 1, true);
 
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 32, 256, 2,  64,  96,  16,  16, 1, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 64, 256, 2,  64,  96,  16,  16, 1, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 32, 128, 2,  32, 160, 128, 128, 1, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 64, 128, 2,  32, 160, 128, 128, 1, true);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512,  8, 128, 3,  64,  96,  64, 128, 1, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 16, 128, 2,  64,  96,  16,  16, 1, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 32, 256, 2, 128,  96,  16,  16, 1, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 16, 128, 3,  64,  96,  64, 128, 1, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 32, 128, 2,  32, 128, 128, 128, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 64, 128, 2,  32, 128, 128, 128, 1, true);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512,  8, 128, 3,  64,  96,  64, 128, 1, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 16, 128, 2,  64,  96,  16,  16, 1, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 32, 256, 2, 128,  96,  64,  16, 1, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 16, 128, 3,  64,  96,  64, 128, 1, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 32, 128, 2,  32, 160, 128, 128, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 64, 128, 2,  32, 160, 128, 128, 1, true);
 
     return fattn_mma_config(32, 1, 0, 0, 0, 0, 0, false);
@@ -1121,7 +1121,7 @@ template<int DV> struct mma_tile_sizes<DV, 8> {
 };
 #elif defined(AMD_WMMA_AVAILABLE)
 #ifdef RDNA3
-template<int DV, int ncols> struct mma_tile_sizes {
+template<int DV, int ncols, bool kvarn_accum = false> struct mma_tile_sizes {
     using T_A_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // row-major
     using T_B_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // column-major
     using T_C_KQ  = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;          // column-major
@@ -1147,22 +1147,27 @@ template<int ncols> struct mma_tile_sizes<112, ncols> {
 };
 // Prototype (stew675 f32-VKQ guidance): DV=128/256 with fp16 PV accumulator show
 // ~3e-4/tile error compounding over 64 layers on gfx1100. Mirror the proven
-// DV=80/112 fp32-PV tiles here; generic path stays fp16 until qualified.
-template<int ncols> struct mma_tile_sizes<128, ncols> {
+// DV=80/112 fp32-PV tiles here for the KVarN path; the dense path keeps the
+// qualified half2 tile until its fp32 variant is measured.
+template<int ncols, bool kvarn_accum> struct mma_tile_sizes<128, ncols, kvarn_accum> {
     using T_A_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // row-major
     using T_B_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // column-major
     using T_C_KQ  = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;          // column-major
     using T_A_VKQ = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // row-major
     using T_B_VKQ = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // column-major
-    using T_C_VKQ = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;          // column-major
+    using T_C_VKQ = typename std::conditional<kvarn_accum,
+        tile<16, 16, float, DATA_LAYOUT_I_MAJOR>,
+        tile<16, 16, half2, DATA_LAYOUT_I_MAJOR>>::type;               // column-major
 };
-template<int ncols> struct mma_tile_sizes<256, ncols> {
+template<int ncols, bool kvarn_accum> struct mma_tile_sizes<256, ncols, kvarn_accum> {
     using T_A_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // row-major
     using T_B_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // column-major
     using T_C_KQ  = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;          // column-major
     using T_A_VKQ = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // row-major
     using T_B_VKQ = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // column-major
-    using T_C_VKQ = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;          // column-major
+    using T_C_VKQ = typename std::conditional<kvarn_accum,
+        tile<16, 16, float, DATA_LAYOUT_I_MAJOR>,
+        tile<16, 16, half2, DATA_LAYOUT_I_MAJOR>>::type;               // column-major
 };
 #else
 template<int DV, int ncols> struct mma_tile_sizes {
@@ -1243,12 +1248,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int ncols = ncols1 * ncols2;
-    using     T_A_KQ    = typename mma_tile_sizes<DV, ncols>::T_A_KQ;
-    using     T_B_KQ    = typename mma_tile_sizes<DV, ncols>::T_B_KQ;
-    using     T_C_KQ    = typename mma_tile_sizes<DV, ncols>::T_C_KQ;
-    using     T_A_VKQ   = typename mma_tile_sizes<DV, ncols>::T_A_VKQ;
-    using     T_B_VKQ   = typename mma_tile_sizes<DV, ncols>::T_B_VKQ;
-    using     T_C_VKQ   = typename mma_tile_sizes<DV, ncols>::T_C_VKQ;
+    constexpr bool is_kvarn_kv = ggml_cuda_fattn_kvarn_template_type(type_K) || ggml_cuda_fattn_kvarn_template_type(type_V);
+    using     T_A_KQ    = typename mma_tile_sizes<DV, ncols, is_kvarn_kv>::T_A_KQ;
+    using     T_B_KQ    = typename mma_tile_sizes<DV, ncols, is_kvarn_kv>::T_B_KQ;
+    using     T_C_KQ    = typename mma_tile_sizes<DV, ncols, is_kvarn_kv>::T_C_KQ;
+    using     T_A_VKQ   = typename mma_tile_sizes<DV, ncols, is_kvarn_kv>::T_A_VKQ;
+    using     T_B_VKQ   = typename mma_tile_sizes<DV, ncols, is_kvarn_kv>::T_B_VKQ;
+    using     T_C_VKQ   = typename mma_tile_sizes<DV, ncols, is_kvarn_kv>::T_C_VKQ;
 
     constexpr int  cols_per_warp   = T_B_KQ::I;
     constexpr int  cols_per_thread = get_cols_per_thread();
@@ -1258,7 +1264,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols);
     constexpr int  nbatch_combine  = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols);
-    constexpr bool is_kvarn_kv     = ggml_cuda_fattn_kvarn_template_type(type_K) || ggml_cuda_fattn_kvarn_template_type(type_V);
     constexpr int  nstages         = is_kvarn_kv ? 0 : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, use_sparse);
     static_assert(!is_kvarn_kv || !use_sparse, "sparse KVarN record loads are not qualified");
 
@@ -1964,12 +1969,8 @@ static __global__ void flash_attn_ext_f16(
 
 #if defined(AMD_WMMA_AVAILABLE)
     // Mirrored by ggml_cuda_fattn_kvarn_amd_mma_eligibility on the host.
-    // RDNA WMMA D256 tiles are the validated configs in the RDNA table above
-    // (256, 320, 512, 576 keys). The KVarN dispatcher admits D256 only where
-    // the fp32 tiles compile (RDNA3/gfx11; RDNA4 stays fail-closed at D128),
-    // and standard FA keeps upstream's D128 cap, so this bound is reachable
-    // only through qualified shapes.
-    if (ncols1*ncols2 < 16 || ncols2 == 1 || DKQ > 576) {
+    // Keep this final invariant for callers outside the KVarN dispatcher.
+    if (ncols1*ncols2 < 16 || ncols2 == 1 || DKQ > 256) {
         NO_DEVICE_CODE;
         return;
     }
