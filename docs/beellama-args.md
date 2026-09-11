@@ -301,6 +301,14 @@ build host cannot detect it. Pre-Turing support remains runtime-unqualified
 until matching real devices pass the KVarN parity, memory, and model-smoke
 tests.
 
+## CUDA/HIP dequant matvec knobs
+
+| Env var | Default | Behavior |
+|---|---|---|
+| `GGML_CUDA_DQ_MMV` | Arch default (on for RDNA3.5) | `0` forces the K-quant dequant-float matvec off, `1` forces it on. Unset or anything else warns (when set) and keeps the arch default. |
+| `GGML_CUDA_DQ_Q6K` | Arch default (on for RDNA3.5) | Same `0`/`1`/arch-default semantics for the Q6_K dequant-float matvec arm. |
+| `GGML_CUDA_DQ_ROWS` | `1` | Rows per block for the dequant matvec kernels. Only `1`/`2`/`4`/`8` are instantiated; anything else warns and uses `1`. |
+
 ## Migration from earlier versions
 
 | Earlier spelling or surface | v0.4.0 behavior | Replacement |

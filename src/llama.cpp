@@ -169,6 +169,10 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             }
             if (n_devs == 1) {
                 // single device: no tensor splitting is possible, skip the Meta wrapper
+                // (still publish single-device split state: the callback is user-reachable
+                // via explicit single-device -ts/--tensor-split).
+                model->get_split_state_ud.n_devices = 1;
+                model->get_split_state_ud.model = model;
                 model->devices.push_back({false, params.devices[0]});
             } else {
                 LLAMA_LOG_INFO("%s: creating a Meta device with %zu devices\n", __func__, n_devs);
@@ -219,6 +223,9 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             GGML_ASSERT(!devs.empty());
             if (devs.size() == 1) {
                 // single device: no tensor splitting is possible, skip the Meta wrapper
+                // (still publish single-device split state, as above).
+                model->get_split_state_ud.n_devices = 1;
+                model->get_split_state_ud.model     = model;
                 gpus.push_back({false, devs[0]});
             } else {
                 model->get_split_state_ud.n_devices = devs.size();

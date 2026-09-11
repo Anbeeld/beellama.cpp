@@ -1894,7 +1894,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
-    // GGML_CUDA_DQ_Q6K (unset = arch default, 0 = off, non-zero = on).
+    // GGML_CUDA_DQ_Q6K (unset/invalid = arch default, 0 = off, 1 = on).
     const bool dq_default = GGML_CUDA_CC_IS_RDNA3_5(cc);
     if (ggml_cuda_dq_mmv_enabled(dq_default) && ne11 == 1
             && (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K
@@ -4534,15 +4534,19 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
-            // PRE-FILL graphs (the graph key node[0].ne[1] > 1) use varying ubatch
-            // sizes, so each is a separate graph key and CUDA-graph capture never
-            // amortizes: the per-call update_required probe + failed capture is pure
-            // overhead. Measured pp512 is ~6.7% faster with graphs OFF. Only decode
-            // (ne[1]==1, stable shape) benefits from graph replay. Skip the whole
-            // graph path (incl. the update_required probe) for multi-token graphs.
+            // HIP-only: skip the graph path (incl. the update_required probe) for
+            // multi-token (prefill) graphs. Final-tree A/B (27B Q5_K_S, kvarn6,
+            // pp512, gfx1100: gate on 466.5 vs gate off 465.4-467.5) shows no
+            // measurable difference, so this is currently perf-neutral; the
+            // earlier ~6.7% dev-tree reading did not reproduce and is scheduled
+            // for investigation. Decode (ne[1]==1, stable shape) keeps replay.
+#if defined(GGML_USE_HIP)
             if (cgraph->n_nodes > 0 && cgraph->nodes[0]->ne[1] > 1) {
                 use_cuda_graph = false;
             } else {
+#else
+            {
+#endif
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
             if (!graph->warmup_complete) {

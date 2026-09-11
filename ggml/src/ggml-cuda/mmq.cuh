@@ -396,12 +396,40 @@ static constexpr __device__ int ggml_cuda_mmq_get_sram_stride(ggml_type type, in
     return ggml_cuda_mmq_get_sram_stride(ggml_cuda_mmq_get_sram_layout(type, J, fallback));
 }
 
+static __host__ int ggml_cuda_mmq_get_J_max_env() {
+    // Cached override cap: -1 = unset/invalid (no cap). Only multiples of 8 in
+    // 8..512 are accepted; anything else warns once and is ignored (raw atoi
+    // would turn non-numeric input into 0 and 4/5/0 into a J outside the
+    // 8..128 config table used below).
+    static const int cached = []() -> int {
+        const char * env = getenv("GGML_CUDA_MMQ_J_MAX");
+        if (env == nullptr) {
+            return -1;
+        }
+        bool digits = env[0] != '\0';
+        for (const char * p = env; *p != '\0'; ++p) {
+            if (*p < '0' || *p > '9') {
+                digits = false;
+                break;
+            }
+        }
+        const int v = digits ? std::atoi(env) : -1;
+        if (!digits || v < 8 || v > 512 || v % 8 != 0) {
+            GGML_LOG_WARN("ggml_cuda_mmq_get_J_max_env: unsupported GGML_CUDA_MMQ_J_MAX=%s (expected multiple of 8 in 8..512), ignoring\n",
+                env);
+            return -1;
+        }
+        return v;
+    }();
+    return cached;
+}
+
 static __host__ int ggml_cuda_mmq_get_J_max(const ggml_type type, const bool fallback, const int cc, const int64_t ne11) {
     int ret = std::min(ne11, int64_t(512));
     ret -= ret % 8;
-    const char * env = getenv("GGML_CUDA_MMQ_J_MAX");
-    if (env != nullptr) {
-        ret = std::min(ret, std::atoi(env));
+    const int env_cap = ggml_cuda_mmq_get_J_max_env();
+    if (env_cap > 0) {
+        ret = std::min(ret, env_cap);
     }
     for (;ret > 0; ret -= 8) {
         if (ggml_cuda_mmq_get_config(type, ret, fallback, cc).type != GGML_TYPE_COUNT) {

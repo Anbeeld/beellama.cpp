@@ -3,11 +3,14 @@
 
 #include <cstdlib>
 
-// -1 = unset (use arch default), 0 = force off, 1 = force on.
+// -1 = unset/invalid (use arch default), 0 = force off, 1 = force on.
 static int dq_env_override(const char * name) {
     const char * v = getenv(name);
     if (!v) return -1;
-    return (v[0] == '0' && v[1] == '\0') ? 0 : 1;
+    if (v[0] == '0' && v[1] == '\0') return 0;
+    if (v[0] == '1' && v[1] == '\0') return 1;
+    GGML_LOG_WARN("%s: unsupported %s=%s (expected 0/1), using arch default\n", __func__, name, v);
+    return -1;
 }
 
 bool ggml_cuda_dq_mmv_enabled(bool arch_default) {

@@ -5,12 +5,14 @@
 // Prototype: dequantize-to-float matvec for K-quant weights (decode, n=1).
 // Skips the q8_1 activation quantization pass that mul_mat_vec_q requires.
 // On by default where arch_default is true (RDNA3.5); GGML_CUDA_DQ_MMV overrides
-// (unset = arch default, 0 = force off, non-zero = force on).
+// (unset = arch default, 0 = force off, 1 = force on; anything else warns and
+// keeps the arch default).
 
 bool ggml_cuda_dq_mmv_enabled(bool arch_default);
 
 // Q6_K dequant-float matvec (bandwidth-bound, ~neutral vs mmvq). Same override
-// semantics via GGML_CUDA_DQ_Q6K (unset = arch default, 0 = off, non-zero = on).
+// semantics via GGML_CUDA_DQ_Q6K (unset = arch default, 0 = off, 1 = on;
+// anything else warns and keeps the arch default).
 bool ggml_cuda_dq_q6k_enabled(bool arch_default);
 
 void ggml_cuda_mul_mat_vec_dq_q4_K(
