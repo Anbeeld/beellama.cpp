@@ -1102,6 +1102,20 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 #endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 }
 
+// KVarN-only tile selector. Forwards to mma_tile_sizes except RDNA3 D128/D256,
+// which use the fp32-accumulator specializations below. Lets the dense path
+// keep its qualified tiles while KVarN uses the qualified fp32 ones. The
+// member lookups are dependent and resolve after the arch regions below.
+template<int DV, int ncols> struct mma_tile_sizes;
+template<int DV, int ncols> struct mma_tile_sizes_kvarn {
+    using T_A_KQ  = typename mma_tile_sizes<DV, ncols>::T_A_KQ;
+    using T_B_KQ  = typename mma_tile_sizes<DV, ncols>::T_B_KQ;
+    using T_C_KQ  = typename mma_tile_sizes<DV, ncols>::T_C_KQ;
+    using T_A_VKQ = typename mma_tile_sizes<DV, ncols>::T_A_VKQ;
+    using T_B_VKQ = typename mma_tile_sizes<DV, ncols>::T_B_VKQ;
+    using T_C_VKQ = typename mma_tile_sizes<DV, ncols>::T_C_VKQ;
+};
+
 #if defined(TURING_MMA_AVAILABLE)
 template<int DV, int ncols> struct mma_tile_sizes {
     using T_A_KQ  = tile<16,  8, half2>; // row-major
@@ -1121,7 +1135,7 @@ template<int DV> struct mma_tile_sizes<DV, 8> {
 };
 #elif defined(AMD_WMMA_AVAILABLE)
 #ifdef RDNA3
-template<int DV, int ncols, bool kvarn_accum = false> struct mma_tile_sizes {
+template<int DV, int ncols> struct mma_tile_sizes {
     using T_A_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // row-major
     using T_B_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // column-major
     using T_C_KQ  = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;          // column-major
@@ -1145,29 +1159,26 @@ template<int ncols> struct mma_tile_sizes<112, ncols> {
     using T_B_VKQ = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // column-major
     using T_C_VKQ = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;          // column-major
 };
-// Prototype (stew675 f32-VKQ guidance): DV=128/256 with fp16 PV accumulator show
-// ~3e-4/tile error compounding over 64 layers on gfx1100. Mirror the proven
-// DV=80/112 fp32-PV tiles here for the KVarN path; the dense path keeps the
-// qualified half2 tile until its fp32 variant is measured.
-template<int ncols, bool kvarn_accum> struct mma_tile_sizes<128, ncols, kvarn_accum> {
+// KVarN-only fp32-accumulator tiles (stew675 f32-VKQ guidance): DV=128/256
+// with fp16 PV accumulator show ~3e-4/tile error compounding over 64 layers
+// on gfx1100. Selected explicitly for the KVarN path via mma_tile_sizes_kvarn
+// (forwarding primary declared above the region chain); dense keeps the
+// primary half2 tile.
+template<int ncols> struct mma_tile_sizes_kvarn<128, ncols> {
     using T_A_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // row-major
     using T_B_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // column-major
     using T_C_KQ  = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;          // column-major
     using T_A_VKQ = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // row-major
     using T_B_VKQ = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // column-major
-    using T_C_VKQ = typename std::conditional<kvarn_accum,
-        tile<16, 16, float, DATA_LAYOUT_I_MAJOR>,
-        tile<16, 16, half2, DATA_LAYOUT_I_MAJOR>>::type;               // column-major
+    using T_C_VKQ = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;          // column-major
 };
-template<int ncols, bool kvarn_accum> struct mma_tile_sizes<256, ncols, kvarn_accum> {
+template<int ncols> struct mma_tile_sizes_kvarn<256, ncols> {
     using T_A_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // row-major
     using T_B_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // column-major
     using T_C_KQ  = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;          // column-major
     using T_A_VKQ = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // row-major
     using T_B_VKQ = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // column-major
-    using T_C_VKQ = typename std::conditional<kvarn_accum,
-        tile<16, 16, float, DATA_LAYOUT_I_MAJOR>,
-        tile<16, 16, half2, DATA_LAYOUT_I_MAJOR>>::type;               // column-major
+    using T_C_VKQ = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;          // column-major
 };
 #else
 template<int DV, int ncols> struct mma_tile_sizes {
@@ -1249,12 +1260,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int ncols = ncols1 * ncols2;
     constexpr bool is_kvarn_kv = ggml_cuda_fattn_kvarn_template_type(type_K) || ggml_cuda_fattn_kvarn_template_type(type_V);
-    using     T_A_KQ    = typename mma_tile_sizes<DV, ncols, is_kvarn_kv>::T_A_KQ;
-    using     T_B_KQ    = typename mma_tile_sizes<DV, ncols, is_kvarn_kv>::T_B_KQ;
-    using     T_C_KQ    = typename mma_tile_sizes<DV, ncols, is_kvarn_kv>::T_C_KQ;
-    using     T_A_VKQ   = typename mma_tile_sizes<DV, ncols, is_kvarn_kv>::T_A_VKQ;
-    using     T_B_VKQ   = typename mma_tile_sizes<DV, ncols, is_kvarn_kv>::T_B_VKQ;
-    using     T_C_VKQ   = typename mma_tile_sizes<DV, ncols, is_kvarn_kv>::T_C_VKQ;
+    using tile_sizes_sel = typename std::conditional<is_kvarn_kv,
+        mma_tile_sizes_kvarn<DV, ncols>, mma_tile_sizes<DV, ncols>>::type;
+    using     T_A_KQ    = typename tile_sizes_sel::T_A_KQ;
+    using     T_B_KQ    = typename tile_sizes_sel::T_B_KQ;
+    using     T_C_KQ    = typename tile_sizes_sel::T_C_KQ;
+    using     T_A_VKQ   = typename tile_sizes_sel::T_A_VKQ;
+    using     T_B_VKQ   = typename tile_sizes_sel::T_B_VKQ;
+    using     T_C_VKQ   = typename tile_sizes_sel::T_C_VKQ;
 
     constexpr int  cols_per_warp   = T_B_KQ::I;
     constexpr int  cols_per_thread = get_cols_per_thread();
