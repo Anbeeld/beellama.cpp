@@ -198,6 +198,12 @@ CDNA fast routing is compiled and selected by capability but remains
 experimental until hardware parity and performance results are published.
 MUSA explicitly remains on the portable route.
 
+On HIP, Bee reports `integrated = false`, backing out the upstream APU
+zero-copy host-buffer path after async-execution corruption was observed
+(PPL 5.9243 -> 8.51+ without `HIP_LAUNCH_BLOCKING`). This changes APU
+tensor placement off host-mapped memory and therefore VRAM headroom; the
+trade-off is unmeasured (no APU hardware available).
+
 Set `GGML_KVARN_DEBUG_ROUTES=1` to log the selected CUDA/HIP route, compute
 capability, rotated/original domain, K/V bit widths, query and KV counts,
 attached exact-tail rows and type for integrated entries, entry path, and

@@ -222,6 +222,15 @@ static __global__ void top_k_nary_search_cuda(
                 }
                 __syncthreads();
 
+                // Seed per iteration: both ballots below stay zero when the current range holds
+                // fewer than `limit` keys (e.g. all-+inf/NaN row, ordered keys >= 0xff800000
+                // excluded above), so no lane writes the shared selection. Zeroes keep the
+                // broadcast read deterministic instead of uninitialized (first pass) / stale.
+                if (tid == 0) {
+                    selected_bucket = 0;
+                    selected_total  = 0;
+                }
+
                 const uint32_t key = top_k_float_to_ordered(__int_as_float(value.y));
                 if (valid && key >= range_min && key < range_max) {
                     atomicAdd(&counts[(key & mask) >> shift], 1U);
