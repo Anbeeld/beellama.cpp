@@ -45,12 +45,18 @@ int main(int argc, char ** argv) {
 
     const std::string root = argv[1];
     const std::string perplexity = read_file(root + "/tools/perplexity/perplexity.cpp");
+    const std::string ppl = slice_between(perplexity,
+            "static results_perplexity perplexity(llama_context * ctx, const common_params & params, const int32_t n_ctx)",
+            "static bool decode_helper");
     const std::string kl = slice_between(perplexity,
             "static bool kl_divergence(llama_context * ctx, const common_params & params)",
             "if (kld.count < 100) return true;");
 
     ok &= expect(perplexity.find("static int ppl_max_logits_rows(int n_vocab, const common_params & params)") != std::string::npos,
         "perplexity must cap full-vocab logits rows to avoid multi-GiB output buffers");
+    ok &= expect(ppl.find("const int max_logits_rows = params.logits_file.empty()") != std::string::npos &&
+                 ppl.find(": std::max(1, std::min(n_ctx, params.n_batch))") != std::string::npos,
+        "logits baseline generation must bypass the ordinary perplexity row cap");
     ok &= expect(perplexity.find("logits_stream.write(\"_logits_\", 8)") != std::string::npos,
         "perplexity must write upstream-compatible v1 logits baselines");
     ok &= expect(perplexity.find("kld_logits::") == std::string::npos,
@@ -61,14 +67,14 @@ int main(int argc, char ** argv) {
         "KLD must retain the upstream v1 probability cutoff");
     ok &= expect(perplexity.find("if (!kl_divergence(ctx, params))") != std::string::npos,
         "perplexity KL failures must propagate to a nonzero process exit");
-    ok &= expect(kl.find("const int max_logits_rows = ppl_max_logits_rows(n_vocab, params)") != std::string::npos,
-        "KL divergence must use the bounded logits-row cap");
-    ok &= expect(kl.find("const int n_batch = std::max(1, std::min(n_ctx_i, std::min(params.n_batch, max_logits_rows)))") != std::string::npos,
-        "KL divergence batch size must be bounded by max_logits_rows");
+    ok &= expect(kl.find("ppl_max_logits_rows") == std::string::npos,
+        "KL divergence must not silently cap the requested batch by logits memory");
+    ok &= expect(kl.find("const int n_batch = std::max(1, std::min(n_ctx_i, params.n_batch))") != std::string::npos,
+        "KL divergence batch size must honor the requested batch size");
     ok &= expect(kl.find("llama_batch_init(n_batch, 0, 1)") != std::string::npos,
         "KL divergence batch allocation must match bounded n_batch");
-    ok &= expect(kl.find("std::vector<uint16_t> log_probs_uint16(size_t(max_logits_rows) * nv)") != std::string::npos,
-        "KL divergence base-logit buffer must be bounded by max_logits_rows");
+    ok &= expect(kl.find("std::vector<uint16_t> log_probs_uint16(size_t(n_batch) * nv)") != std::string::npos,
+        "KL divergence base-logit buffer must match the decode batch size");
     ok &= expect(kl.find("const int logits_first = std::max(first, pos_start)") != std::string::npos &&
                  kl.find("const int logits_end   = std::min(n_ctx_i - 1, pos_start + batch_size)") != std::string::npos,
         "KL divergence must process only the logits rows produced by the current decode slice");
