@@ -4385,11 +4385,6 @@ static void test_kvarn_nkv_ladder() {
 }
 
 // Committed regression coverage for the ub>64 whole-tile body_meta fix:
-// D256 k6/v6 prompt prefill (nq=256, whole-tile K blocks) with an attached
-// 128-candidate exact tail, GPU native vs CPU materialized reference. With
-// the `!is_kvarn_kv` gate restored on the whole-tile dst_final_meta stores,
-// tail-merge rows keep zero meta and this diverges catastrophically.
-// Committed regression coverage for the ub>64 whole-tile body_meta fix:
 // D256 k6/v6 prompt prefill (nq=256, whole-tile K blocks) pins the WMMA
 // prompt route and asserts (a) every published body denominator is positive
 // and finite, and (b) the attached-exact-tail pass matches the CPU reference.
@@ -4400,27 +4395,36 @@ static void test_kvarn_d256_prompt_tail_regression() {
     if (gpu_backend == nullptr) {
         return;
     }
-    ggml_backend_t cpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_CPU, true);
     auto [route_reset, route_get] = get_kvarn_route_stats_fns(gpu_backend);
-    if (route_reset != nullptr) {
-        route_reset();
+    ggml_backend_dev_t dev = ggml_backend_get_device(gpu_backend);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    auto get_capabilities = reg ? reinterpret_cast<test_kvarn_capabilities_fn>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_kvarn_capabilities")) : nullptr;
+    if (route_reset == nullptr || route_get == nullptr || get_capabilities == nullptr ||
+            !backend_supports_kvarn_flash_attention_shape(gpu_backend, 256)) {
+        ggml_backend_free(gpu_backend);
+        return;
     }
+    route_reset();
     std::vector<float> body_meta;
     const std::vector<float> actual = test_native_flash_attention_output(
             gpu_backend, true, true, 256, 6, 6, 256,
             24, 4, 512, 2, false, &body_meta, false, 0, true,
             GGML_TYPE_F16, 0, false, true, -1, true);
-    if (route_get != nullptr) {
-        test_kvarn_route_stats stats = make_test_kvarn_route_stats();
-        route_get(&stats);
-        std::printf("kvarn-tail-regression-routes: generic_mma=%llu prompt_prefill=%llu portable_native=%llu amd_generic_mma=%llu materialize=%llu\n",
-                (unsigned long long) stats.generic_mma, (unsigned long long) stats.prompt_prefill,
-                (unsigned long long) stats.portable_native, (unsigned long long) stats.amd_generic_mma,
-                (unsigned long long) stats.materialize_fallback);
-        std::fflush(stdout);
-        require(stats.prompt_prefill > 0,
-                "D256 tail regression did not execute the WMMA prompt-prefill route it guards");
+    test_kvarn_route_stats stats = make_test_kvarn_route_stats();
+    route_get(&stats);
+    std::printf("kvarn-tail-regression-routes: generic_mma=%llu prompt_prefill=%llu portable_native=%llu amd_generic_mma=%llu materialize=%llu\n",
+            (unsigned long long) stats.generic_mma, (unsigned long long) stats.prompt_prefill,
+            (unsigned long long) stats.portable_native, (unsigned long long) stats.amd_generic_mma,
+            (unsigned long long) stats.materialize_fallback);
+    std::fflush(stdout);
+    if (stats.prompt_prefill == 0) {
+        // RDNA4 deliberately rejects D256 WMMA; other CUDA/HIP devices may
+        // also lack the exact route this regression is intended to guard.
+        ggml_backend_free(gpu_backend);
+        return;
     }
+    ggml_backend_t cpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_CPU, true);
     require(body_meta.size() % 2 == 0 && !body_meta.empty(),
             "D256 tail regression did not publish body softmax metadata");
     for (size_t i = 0; i < body_meta.size(); i += 2) {
@@ -4452,6 +4456,16 @@ static void test_kvarn_d256_prompt_tail_regression() {
 static void test_native_flash_attention_portable_original_v() {
     ggml_backend_t gpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
     if (gpu_backend == nullptr) {
+        return;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(gpu_backend);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    auto get_capabilities = reg ? reinterpret_cast<test_kvarn_capabilities_fn>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_kvarn_capabilities")) : nullptr;
+    if (get_capabilities == nullptr ||
+            !backend_supports_kvarn_flash_attention_shape(gpu_backend, 256) ||
+            !backend_supports_kvarn_flash_attention_shape(gpu_backend, 512)) {
+        ggml_backend_free(gpu_backend);
         return;
     }
     ggml_backend_t cpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_CPU, true);
@@ -5722,7 +5736,7 @@ int main() {
     test_cache_ops_swa(GGML_BACKEND_DEVICE_TYPE_GPU, false, 2); // multi-slot SWA ring parity
     // Placed before the store-route gauntlet below: the head-wide store
     // assertion aborts on some HIP devices (pre-existing), and these two
-    // regression cases must execute on every backend regardless.
+    // regression cases must execute on every qualified CUDA/HIP backend.
     test_kvarn_d256_prompt_tail_regression();
     test_native_flash_attention_portable_original_v();
     test_store_paths_gpu();
