@@ -1699,6 +1699,7 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
     const int    id    = ggml_cuda_get_device();
     const int    cc    = ggml_cuda_info().devices[id].cc;
     const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
+    const int J_max = ggml_cuda_mmq_get_J_max(type, fallback, cc, 128);
 
     int64_t ncols_picker = args.ncols_max;
     if (args.expert_bounds != nullptr && args.nchannels_x > 0) {
@@ -1706,7 +1707,6 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
             const int64_t ncols_per_expert = (args.ncols_dst + args.nchannels_y - 1) / args.nchannels_y;
             ncols_picker = std::min(2*ncols_per_expert, args.ncols_max);
         } else {
-            const int J_max = ggml_cuda_mmq_get_J_max(type, fallback, cc, 128);
             const ggml_cuda_mmq_config config_max = ggml_cuda_mmq_get_config(type, J_max, fallback, cc);
             if (config_max.use_typical_moe_ncols) {
                 // Use the typical expert width only for tile selection.
@@ -1722,7 +1722,7 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;
 
-    for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
+    for (int J = 8; J <= J_max && ntiles_J_best > 1; J += 8) {
         const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
         if (config.type == GGML_TYPE_COUNT) {
             continue;
