@@ -35,6 +35,7 @@
 #include <ctime>
 #include <future>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -6506,16 +6507,17 @@ struct test_top_k : public test_case {
     const std::array<int64_t, 4> ne;
     const int k;
     const bool ties;
+    const int edge_case;
     ggml_tensor * input {};
 
     std::string vars() override {
-        return VARS_TO_STR4(type, ne, k, ties);
+        return VARS_TO_STR5(type, ne, k, ties, edge_case);
     }
 
     test_top_k(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne = {16, 10, 10, 10},
-            int k = 4, bool ties = false)
-        : type(type), ne(ne), k(k), ties(ties) {}
+            int k = 4, bool ties = false, int edge_case = 0)
+        : type(type), ne(ne), k(k), ties(ties), edge_case(edge_case) {}
 
     double max_err() override {
         return 0.0;
@@ -6602,6 +6604,19 @@ struct test_top_k : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         auto rng = make_test_rng();
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t == input && edge_case != 0) {
+                GGML_ASSERT(t->ne[0] == 4);
+                const float max = std::numeric_limits<float>::max();
+                const std::array<float, 4> data = edge_case == 1
+                    ? std::array<float, 4>{1.0f, std::numeric_limits<float>::infinity(),
+                                          std::numeric_limits<float>::infinity(), 0.0f}
+                    : std::array<float, 4>{0.0f, 0.75f * max, 0.875f * max, max};
+                for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                    ggml_backend_tensor_set(t, data.data(), r * t->nb[1], data.size() * sizeof(float));
+                }
+                continue;
+            }
+
             int tie_denom = std::max(1, std::min(10, k / 2));
             for (int64_t r = 0; r < ggml_nrows(t); r++) {
                 std::vector<float> data(t->ne[0]);
@@ -10708,6 +10723,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {n, 2, 1, 3}, k, true));
         }
     }
+    // HIP wave32 n-ary radix boundaries: +inf and the highest ordered-key bucket.
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {4, 1, 1, 1}, 2, false, 1));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {4, 1, 1, 1}, 2, false, 2));
     for (int i = 0; i < 20; ++i) {
         for (int k : {1, 2, 3, 7, 15, 100, 500, 1023, 9999}) {
             if (k <= 1<<i) {

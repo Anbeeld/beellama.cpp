@@ -211,8 +211,8 @@ static __global__ void top_k_nary_search_cuda(
             constexpr int radix_size = 1 << radix_bits;
             int shift = 32 - radix_bits;
             uint32_t mask = ((1U << radix_bits) - 1) << shift;
-            uint32_t range_min = 0;
-            uint32_t range_max = 0xff800000U;
+            uint32_t prefix = 0;
+            uint32_t prefix_mask = 0;
             uint32_t total = 0;
 
             while (mask != 0) {
@@ -222,17 +222,8 @@ static __global__ void top_k_nary_search_cuda(
                 }
                 __syncthreads();
 
-                // Seed per iteration: both ballots below stay zero when the current range holds
-                // fewer than `limit` keys (e.g. all-+inf/NaN row, ordered keys >= 0xff800000
-                // excluded above), so no lane writes the shared selection. Zeroes keep the
-                // broadcast read deterministic instead of uninitialized (first pass) / stale.
-                if (tid == 0) {
-                    selected_bucket = 0;
-                    selected_total  = 0;
-                }
-
                 const uint32_t key = top_k_float_to_ordered(__int_as_float(value.y));
-                if (valid && key >= range_min && key < range_max) {
+                if (valid && (key & prefix_mask) == prefix) {
                     atomicAdd(&counts[(key & mask) >> shift], 1U);
                 }
                 __syncthreads();
@@ -270,8 +261,8 @@ static __global__ void top_k_nary_search_cuda(
 
                 const uint32_t bucket = selected_bucket;
                 total = selected_total;
-                range_max = range_min + ((bucket + 1) << shift);
-                range_min = range_min + (bucket << shift);
+                prefix |= bucket << shift;
+                prefix_mask |= mask;
                 if (total == (uint32_t) limit) {
                     break;
                 }
@@ -284,8 +275,8 @@ static __global__ void top_k_nary_search_cuda(
             }
 
             const uint32_t key = top_k_float_to_ordered(__int_as_float(value.y));
-            const bool above = valid && key > range_min;
-            const bool equal = valid && key == range_min;
+            const bool above = valid && key > prefix;
+            const bool equal = valid && key == prefix;
             const unsigned long long above_mask = __ballot(above);
             const unsigned long long equal_mask = __ballot(equal);
             if (lane == 0) {
