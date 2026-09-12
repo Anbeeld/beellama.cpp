@@ -59,6 +59,103 @@ static __device__ __forceinline__ float ggml_cuda_fattn_kvarn_load_stage_rotated
     return __half2float(desc.stage[base + dim]);
 }
 
+// Block-shared resolution of a token to its storage location. All fields
+// depend only on (desc, token), so one thread can resolve per token and
+// broadcast to the block instead of all 128 threads repeating the index
+// math (64-bit div/mod, branches).
+struct ggml_cuda_fattn_kvarn_resolved_token {
+    bool from_stage;
+    bool from_record;
+    int pos;
+    int stage_pos;
+    const uint8_t * record;
+    const half * scale_axis;
+    const half * zp_axis;
+    const half * other_axis;
+};
+
+static __device__ __forceinline__ ggml_cuda_fattn_kvarn_resolved_token
+ggml_cuda_fattn_kvarn_resolve_token(
+        const ggml_cuda_fattn_kvarn_desc & desc,
+        const int token) {
+    ggml_cuda_fattn_kvarn_resolved_token out = {};
+    int group;
+    int pos;
+    bool from_stage;
+    bool from_record;
+    int stage_pos;
+    int record_group;
+
+    if (desc.swa || desc.read_indirect) {
+        const int64_t encoded = desc.indices[token];
+        if (encoded == -1) {
+            return out;
+        }
+        bool explicitly_staged;
+        int assigned_slot = -1;
+        const int64_t abs_pos = ggml_cuda_fattn_kvarn_read_cell(
+                desc, encoded, explicitly_staged, &assigned_slot);
+        group = (int) (abs_pos / GGML_CUDA_FATTN_KVARN_DIM);
+        pos   = (int) (abs_pos - (int64_t) group * GGML_CUDA_FATTN_KVARN_DIM);
+        from_stage = explicitly_staged ||
+            (!(desc.read_indirect && !desc.swa) && ggml_cuda_fattn_kvarn_group_from_stage(desc, group));
+        from_record = !explicitly_staged && (desc.read_indirect && !desc.swa ? true :
+            ggml_cuda_fattn_kvarn_group_from_record(desc, group));
+        stage_pos = ggml_cuda_fattn_kvarn_stage_pos(
+                desc, group, pos, assigned_slot);
+        record_group = desc.swa ? group % desc.groups_per_stream :
+            desc.stream * desc.groups_per_stream + group;
+    } else {
+        group = token / GGML_CUDA_FATTN_KVARN_DIM;
+        pos   = token - group * GGML_CUDA_FATTN_KVARN_DIM;
+        from_stage = ggml_cuda_fattn_kvarn_group_from_stage(desc, group);
+        from_record = ggml_cuda_fattn_kvarn_group_from_record(desc, group);
+        const int stage_base = desc.stream * GGML_CUDA_FATTN_KVARN_DIM * desc.stage_groups;
+        stage_pos = stage_base + (group == 0 ? pos :
+            GGML_CUDA_FATTN_KVARN_DIM + ((group - 1) % desc.tail_groups) * GGML_CUDA_FATTN_KVARN_DIM + pos);
+        record_group = desc.stream * desc.groups_per_stream + group;
+    }
+
+    out.pos = pos;
+    out.from_stage = from_stage;
+    out.from_record = from_record;
+    out.stage_pos = stage_pos;
+    if (from_record) {
+        // NOTE: record_head (slice) is applied by the caller.
+        out.record = desc.records + (int64_t) record_group * desc.n_record_heads * desc.record_bytes;
+        const int payload_bytes = GGML_CUDA_FATTN_KVARN_DIM * GGML_CUDA_FATTN_KVARN_DIM * desc.bits / 8;
+        out.scale_axis = (const half *) (out.record + payload_bytes);
+        out.zp_axis = out.scale_axis + GGML_CUDA_FATTN_KVARN_DIM;
+        out.other_axis = out.zp_axis + GGML_CUDA_FATTN_KVARN_DIM;
+    }
+    return out;
+}
+
+static __device__ __forceinline__ float ggml_cuda_fattn_kvarn_load_resolved(
+        const ggml_cuda_fattn_kvarn_desc & desc,
+        const ggml_cuda_fattn_kvarn_resolved_token & rt,
+        const int slice,
+        const int dim) {
+    const int record_head = desc.head_base + slice;
+    if (rt.from_stage) {
+        return ggml_cuda_fattn_kvarn_load_stage_rotated(desc, rt.stage_pos, record_head, dim);
+    }
+    if (!rt.from_record) {
+        return 0.0f;
+    }
+    const uint8_t * record = rt.record + (int64_t) record_head * desc.record_bytes;
+    const int payload_bytes = GGML_CUDA_FATTN_KVARN_DIM * GGML_CUDA_FATTN_KVARN_DIM * desc.bits / 8;
+    const half * scale_axis = (const half *) (record + payload_bytes);
+    const half * zp_axis    = scale_axis + GGML_CUDA_FATTN_KVARN_DIM;
+    const half * other_axis = zp_axis + GGML_CUDA_FATTN_KVARN_DIM;
+    const int row = desc.value ? rt.pos : dim;
+    const int col = desc.value ? dim : rt.pos;
+    const uint8_t q = ggml_cuda_fattn_kvarn_unpack_record(
+        record, row * GGML_CUDA_FATTN_KVARN_DIM + col, desc.bits);
+    return (float(q) * __half2float(scale_axis[row]) + __half2float(zp_axis[row])) *
+        __half2float(other_axis[col]);
+}
+
 static __device__ __forceinline__ float ggml_cuda_fattn_kvarn_load_rotated(
         const ggml_cuda_fattn_kvarn_desc & desc,
         const int token,

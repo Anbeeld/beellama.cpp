@@ -182,8 +182,8 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
     const float * q = (const float *) (
         q_data + query * nbq1 + query_head * nbq2 + stream * nbq3);
 
-    __shared__ float reduction[RECORD_DIM];
-    __shared__ float transform[RECORD_DIM];
+    __shared__ float reduction[D];
+    __shared__ float transform[D];
     __shared__ float maximum;
     __shared__ float denominator;
     __shared__ float old_scale_shared;
@@ -828,8 +828,7 @@ static inline bool ggml_cuda_fattn_kvarn_portable_supported(
          body_meta->ne[1] == q->ne[2] && body_meta->ne[2] == q->ne[1] &&
          body_meta->ne[3] == q->ne[3] && ggml_is_contiguous(body_meta));
     const bool domain_ok = ggml_cuda_fattn_kvarn_rotated_decode_domain(dst) ||
-        (q->ne[0] == 64 &&
-         ggml_cuda_fattn_kvarn_domain(dst) == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V);
+        ggml_cuda_fattn_kvarn_domain(dst) == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V;
     return domain_ok &&
         (q->ne[0] == 64 || q->ne[0] == 128 || q->ne[0] == 256 || q->ne[0] == 512) &&
         q->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&

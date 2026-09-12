@@ -880,6 +880,12 @@ static bool ggml_cuda_flash_attn_ext_kvarn_decode(
 }
 
 static ggml_cuda_fattn_kvarn_amd_mma_arch ggml_cuda_fattn_kvarn_amd_arch(int cc) {
+    if (GGML_CUDA_CC_IS_RDNA4(cc)) {
+        // RDNA4 compiles the half2 WMMA tiles only: the fp32-accumulator
+        // tiles that justify the raised D256 limit are RDNA3 (gfx11) builds.
+        // Keep RDNA4 fail-closed at D128 until its fp32 tiles are qualified.
+        return GGML_CUDA_FATTN_KVARN_AMD_RDNA4_WMMA;
+    }
     if (amd_wmma_available(cc)) {
         return GGML_CUDA_FATTN_KVARN_AMD_RDNA_WMMA;
     }
@@ -1225,6 +1231,31 @@ bool ggml_cuda_flash_attn_ext_kvarn(
         ggml_cuda_fattn_kvarn_portable_supported(plan, dst);
     bool generic_shape_supported = false;
     bool wide_mma = false;
+#if defined(GGML_USE_HIP)
+    // RDNA3 (gfx11) WMMA prompt tiles accumulate in fp32 for DV=128/256
+    // (mirroring the proven DV=80/112 fp32-PV tiles), so on fp32-tile arches
+    // the WMMA path is both the fast and the exact route (~1e-5 ladder RMSE,
+    // 32k KLD at portable parity). It is therefore the default for HIP KVarN
+    // prompt-prefill. RDNA4 compiles the half2 tiles only and stays
+    // fail-closed on portable (see the RDNA4 eligibility gate). Decode
+    // (nq<=16) stays on WMMA as before.
+    // Checked BEFORE the generic probe below: the probe launches the WMMA
+    // kernel to test the shape, so diverting first avoids running prompt
+    // prefill twice and discarding the WMMA pass.
+    {
+        const char * prompt_portable = getenv("GGML_KVARN_AMD_PROMPT_PORTABLE");
+        if (prompt_prefill && portable_supported &&
+                (prompt_portable != nullptr && atoi(prompt_portable) != 0)) {
+            g_kvarn_route_portable_native.fetch_add(1, std::memory_order_relaxed);
+            // QB-batching was superseded by upstream's complete optimized D64
+            // rewrite (v0.4.7); the fallback uses the standard portable kernel.
+            ggml_cuda_fattn_kvarn_debug_route(
+                ctx.device, plan, dst, entry_path, "portable-native",
+                "hip-prompt-precision-optin");
+            return ggml_cuda_flash_attn_ext_kvarn_portable(ctx, dst, plan);
+        }
+    }
+#endif
     if (capabilities.generic_mma && Q->ne[0] != 64) {
         generic_shape_supported = ggml_cuda_flash_attn_ext_mma_kvarn(ctx, dst, wide_mma);
         if (!generic_shape_supported) {

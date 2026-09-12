@@ -190,7 +190,8 @@ correctness, memory behavior, or performance on that GPU.
 
 | HIP architecture | Physical wave | Native KVarN route |
 |---|---:|---|
-| RDNA3, RDNA3.5, RDNA4 | 32 | WMMA generic/prefill and occupancy-selected split decode |
+| RDNA3, RDNA3.5 | 32 | WMMA generic/prefill (D256 on fp32-accumulator tiles, qualified on gfx1100) and occupancy-selected split decode |
+| RDNA4 | 32 | WMMA generic/prefill up to D128; D256+ stays on portable direct-record attention until its fp32 tiles qualify |
 | CDNA1-CDNA4 | 64 | MFMA generic/prefill and physical-wave split decode |
 | Older GCN, RDNA1, RDNA2 | device default | Portable direct-record attention |
 

@@ -164,7 +164,7 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256,  8,  64, 2,  32, 128, 128, 128, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 16,  64, 2,  32, 128, 128, 128, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 2,  64, 128, 128,  64, 1, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 128, 2,  64, 128, 128,  64, 1, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 256, 2,  32, 128, 128,  32, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 128, 256, 1,  64, 128, 128,  64, 1, true);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 32, 128, 2,  32, 160, 128, 128, 1, true);
@@ -950,12 +950,16 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         }
 #elif defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
         if constexpr (std::is_same_v<decltype(T_C_VKQ::x), half2[T_C_VKQ::ne]>) {
-            const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale[0], KQ_max_scale[0]);
+            // Rescale in fp32 to avoid double-rounding the scale to half first.
+            const float scale_f32 = KQ_max_scale[0];
 #pragma unroll
             for (int i = 0; i < (DV/2)/T_C_VKQ::J; ++i) {
 #pragma unroll
                 for (int l = 0; l < T_C_VKQ::ne; ++l) {
-                    VKQ_C[i].x[l] *= KQ_max_scale_h2;
+                    float2 acc_f32 = __half22float2(VKQ_C[i].x[l]);
+                    acc_f32.x *= scale_f32;
+                    acc_f32.y *= scale_f32;
+                    VKQ_C[i].x[l] = make_half2(acc_f32.x, acc_f32.y);
                 }
             }
         } else {
@@ -1098,6 +1102,20 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 #endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 }
 
+// KVarN-only tile selector. Forwards to mma_tile_sizes except RDNA3 D128/D256,
+// which use the fp32-accumulator specializations below. Lets the dense path
+// keep its qualified tiles while KVarN uses the qualified fp32 ones. The
+// member lookups are dependent and resolve after the arch regions below.
+template<int DV, int ncols> struct mma_tile_sizes;
+template<int DV, int ncols> struct mma_tile_sizes_kvarn {
+    using T_A_KQ  = typename mma_tile_sizes<DV, ncols>::T_A_KQ;
+    using T_B_KQ  = typename mma_tile_sizes<DV, ncols>::T_B_KQ;
+    using T_C_KQ  = typename mma_tile_sizes<DV, ncols>::T_C_KQ;
+    using T_A_VKQ = typename mma_tile_sizes<DV, ncols>::T_A_VKQ;
+    using T_B_VKQ = typename mma_tile_sizes<DV, ncols>::T_B_VKQ;
+    using T_C_VKQ = typename mma_tile_sizes<DV, ncols>::T_C_VKQ;
+};
+
 #if defined(TURING_MMA_AVAILABLE)
 template<int DV, int ncols> struct mma_tile_sizes {
     using T_A_KQ  = tile<16,  8, half2>; // row-major
@@ -1134,6 +1152,27 @@ template<int ncols> struct mma_tile_sizes<80, ncols> {
     using T_C_VKQ = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;          // column-major
 };
 template<int ncols> struct mma_tile_sizes<112, ncols> {
+    using T_A_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // row-major
+    using T_B_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // column-major
+    using T_C_KQ  = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;          // column-major
+    using T_A_VKQ = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // row-major
+    using T_B_VKQ = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // column-major
+    using T_C_VKQ = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;          // column-major
+};
+// KVarN-only fp32-accumulator tiles (stew675 f32-VKQ guidance): DV=128/256
+// with fp16 PV accumulator show ~3e-4/tile error compounding over 64 layers
+// on gfx1100. Selected explicitly for the KVarN path via mma_tile_sizes_kvarn
+// (forwarding primary declared above the region chain); dense keeps the
+// primary half2 tile.
+template<int ncols> struct mma_tile_sizes_kvarn<128, ncols> {
+    using T_A_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // row-major
+    using T_B_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // column-major
+    using T_C_KQ  = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;          // column-major
+    using T_A_VKQ = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // row-major
+    using T_B_VKQ = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // column-major
+    using T_C_VKQ = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;          // column-major
+};
+template<int ncols> struct mma_tile_sizes_kvarn<256, ncols> {
     using T_A_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // row-major
     using T_B_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // column-major
     using T_C_KQ  = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;          // column-major
@@ -1220,12 +1259,15 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int ncols = ncols1 * ncols2;
-    using     T_A_KQ    = typename mma_tile_sizes<DV, ncols>::T_A_KQ;
-    using     T_B_KQ    = typename mma_tile_sizes<DV, ncols>::T_B_KQ;
-    using     T_C_KQ    = typename mma_tile_sizes<DV, ncols>::T_C_KQ;
-    using     T_A_VKQ   = typename mma_tile_sizes<DV, ncols>::T_A_VKQ;
-    using     T_B_VKQ   = typename mma_tile_sizes<DV, ncols>::T_B_VKQ;
-    using     T_C_VKQ   = typename mma_tile_sizes<DV, ncols>::T_C_VKQ;
+    constexpr bool is_kvarn_kv = ggml_cuda_fattn_kvarn_template_type(type_K) || ggml_cuda_fattn_kvarn_template_type(type_V);
+    using tile_sizes_sel = typename std::conditional<is_kvarn_kv,
+        mma_tile_sizes_kvarn<DV, ncols>, mma_tile_sizes<DV, ncols>>::type;
+    using     T_A_KQ    = typename tile_sizes_sel::T_A_KQ;
+    using     T_B_KQ    = typename tile_sizes_sel::T_B_KQ;
+    using     T_C_KQ    = typename tile_sizes_sel::T_C_KQ;
+    using     T_A_VKQ   = typename tile_sizes_sel::T_A_VKQ;
+    using     T_B_VKQ   = typename tile_sizes_sel::T_B_VKQ;
+    using     T_C_VKQ   = typename tile_sizes_sel::T_C_VKQ;
 
     constexpr int  cols_per_warp   = T_B_KQ::I;
     constexpr int  cols_per_thread = get_cols_per_thread();
@@ -1235,7 +1277,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols);
     constexpr int  nbatch_combine  = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols);
-    constexpr bool is_kvarn_kv     = ggml_cuda_fattn_kvarn_template_type(type_K) || ggml_cuda_fattn_kvarn_template_type(type_V);
     constexpr int  nstages         = is_kvarn_kv ? 0 : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, use_sparse);
     static_assert(!is_kvarn_kv || !use_sparse, "sparse KVarN record loads are not qualified");
 
@@ -1279,7 +1320,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 #if defined(TURING_MMA_AVAILABLE)
     T_C_VKQ VKQ_C[cols_per_warp == 8 ? DV/T_C_VKQ::I : DV/(2*T_C_VKQ::J)];
 #elif defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
-    T_C_VKQ VKQ_C[DV % 32 != 0       ? DV/T_C_VKQ::J : DV/(2*T_C_VKQ::J)];
+    // Entry count mirrors the rescale loops: half2 accumulators fold two
+    // stacked K-halves per entry via the opsel pair (DV/32 for DV%32==0),
+    // float accumulators keep one 16-row tile per entry (DV/16 always).
+    static constexpr int VKQ_C_COUNT = std::is_same_v<decltype(T_C_VKQ::x), float[T_C_VKQ::ne]>
+        ? DV/T_C_VKQ::J
+        : (DV % 32 != 0 ? DV/T_C_VKQ::J : DV/(2*T_C_VKQ::J));
+    T_C_VKQ VKQ_C[VKQ_C_COUNT];
 #elif defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
     T_C_VKQ VKQ_C[                                     DV/(2*T_C_VKQ::J)];
 #else // Volta
@@ -1496,12 +1543,16 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         }
 #elif defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
         if constexpr (std::is_same_v<decltype(T_C_VKQ::x), half2[T_C_VKQ::ne]>) {
-            const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale[0], KQ_max_scale[0]);
+            // Rescale in fp32 to avoid double-rounding the scale to half first.
+            const float scale_f32 = KQ_max_scale[0];
 #pragma unroll
             for (int i = 0; i < (DV/2)/T_C_VKQ::J; ++i) {
 #pragma unroll
                 for (int l = 0; l < T_C_VKQ::ne; ++l) {
-                    VKQ_C[i].x[l] *= KQ_max_scale_h2;
+                    float2 acc_f32 = __half22float2(VKQ_C[i].x[l]);
+                    acc_f32.x *= scale_f32;
+                    acc_f32.y *= scale_f32;
+                    VKQ_C[i].x[l] = make_half2(acc_f32.x, acc_f32.y);
                 }
             }
         } else {
@@ -1562,7 +1613,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 float2 * dstk_fixup_meta = dstk_fixup + (gridDim.x + blockIdx.x)*ncols;
                 dstk_fixup_meta[jc_cwm] = KQ_cmr;
             }
-            if (!is_kvarn_kv && !needs_fixup && !is_fixup && dst_final_meta && threadIdx.x < T_B_KQ::I) {
+            // KVarN whole-tile blocks must publish final (max, rowsum) too: the
+            // tail merge reads body_meta for every row, and the stream-k fixup
+            // skips tiles whose K range aligns exactly to tile boundaries, so
+            // without this store those rows keep zero meta and their (correct)
+            // body values are silently discarded by the merge.
+            if (!needs_fixup && !is_fixup && dst_final_meta && threadIdx.x < T_B_KQ::I) {
                 const int j = jc_cwm / ncols2;
                 const int c = jc_cwm % ncols2;
                 if (jt*ncols1 + j < int(ne01.z) && zt_gqa*ncols2 + c < gqa_ratio) {
@@ -1608,7 +1664,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 float2 * dstk_fixup_meta = dstk_fixup + (gridDim.x + blockIdx.x)*ncols;
                 dstk_fixup_meta[jc_cwm] = KQ_cmr;
             }
-            if (!is_kvarn_kv && !needs_fixup && !is_fixup && dst_final_meta && thread_should_write) {
+            // KVarN whole-tile blocks must publish final (max, rowsum) too: the
+            // tail merge reads body_meta for every row, and the stream-k fixup
+            // skips tiles whose K range aligns exactly to tile boundaries, so
+            // without this store those rows keep zero meta and their (correct)
+            // body values are silently discarded by the merge.
+            if (!needs_fixup && !is_fixup && dst_final_meta && thread_should_write) {
                 const int j = jc_cwm / ncols2;
                 const int c = jc_cwm % ncols2;
                 if (jt*ncols1 + j < int(ne01.z) && zt_gqa*ncols2 + c < gqa_ratio) {
@@ -1684,7 +1745,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             float2 * dstk_fixup_meta = dstk_fixup + (gridDim.x + blockIdx.x)*ncols;
             dstk_fixup_meta[(threadIdx.y/np)*cols_per_warp + threadIdx.x] = make_float2(KQ_cmn, KQ_crs);
         }
-        if (!is_kvarn_kv && !needs_fixup && !is_fixup && dst_final_meta &&
+        // KVarN whole-tile blocks must publish final (max, rowsum) too: the
+        // tail merge reads body_meta for every row, and the stream-k fixup
+        // skips tiles whose K range aligns exactly to tile boundaries, so
+        // without this store those rows keep zero meta and their (correct)
+        // body values are silently discarded by the merge.
+        if (!needs_fixup && !is_fixup && dst_final_meta &&
                 (cols_per_warp == warp_size || threadIdx.x < cols_per_warp)) {
             const int jc = (threadIdx.y/np)*cols_per_warp + threadIdx.x;
             if (jc < ncols) {
@@ -1826,7 +1892,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 }
             }
         }
-        if (np > 1) {
+        // The tile_Q buffer is reused for the next k00 iteration, so all warps must sync here
+        // before its data is overwritten. With np > 1 only some warps read back, but they all write.
+        if (np > 1 || k00 + nbatch_combine < DV/2) {
             __syncthreads();
         }
     }
@@ -1915,7 +1983,7 @@ static __global__ void flash_attn_ext_f16(
 #if defined(AMD_WMMA_AVAILABLE)
     // Mirrored by ggml_cuda_fattn_kvarn_amd_mma_eligibility on the host.
     // Keep this final invariant for callers outside the KVarN dispatcher.
-    if (ncols1*ncols2 < 16 || ncols2 == 1 || DKQ > 128) {
+    if (ncols1*ncols2 < 16 || ncols2 == 1 || DKQ > 256) {
         NO_DEVICE_CODE;
         return;
     }
@@ -1997,6 +2065,11 @@ static __global__ void flash_attn_ext_f16(
                 (Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dst_meta, dst_final_meta_tile, scale, slope, logit_softcap,
                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
         }
+
+        // The next process_tile call reuses the tile_Q buffer for its Q/K tiles, so all warps must
+        // have finished reading the combined results before any of them starts the next call.
+        // (With np == 1 the end-of-k00 barrier does not fire, so this is required for correctness.)
+        __syncthreads();
 
         kbc += iter_k;
         kbc -= kbc % iter_k;
