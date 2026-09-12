@@ -4496,6 +4496,47 @@ static void test_native_flash_attention_portable_original_v() {
     ggml_backend_free(gpu_backend);
 }
 
+// Unsupported compact-tail KVarN body routes must degrade to the existing
+// materialized attention path instead of aborting the process. The force knob
+// makes this otherwise hardware/geometry-dependent boundary deterministic.
+static void test_native_flash_attention_tail_materialize_fallback() {
+    ggml_backend_t gpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
+    if (gpu_backend == nullptr) {
+        return;
+    }
+    const auto [route_stats_reset, route_stats_get] = get_kvarn_route_stats_fns(gpu_backend);
+    if (route_stats_reset == nullptr || route_stats_get == nullptr ||
+            !backend_supports_kvarn_flash_attention_shape(gpu_backend, 512)) {
+        ggml_backend_free(gpu_backend);
+        return;
+    }
+
+    ggml_backend_t cpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_CPU, true);
+    scoped_test_env force_materialize("GGML_KVARN_TEST_FORCE_MATERIALIZE_FATTN", "1");
+    for (bool original_value_domain : { false, true }) {
+        const std::vector<float> expected = test_native_flash_attention_output(
+                cpu_backend, false, false, 512, 6, 6, 4,
+                16, 2, 512, 3, false, nullptr, false, 128, original_value_domain,
+                GGML_TYPE_F16, 0, false, true, -1, true);
+        route_stats_reset();
+        const std::vector<float> actual = test_native_flash_attention_output(
+                gpu_backend, true, true, 512, 6, 6, 4,
+                16, 2, 512, 3, false, nullptr, false, 128, original_value_domain,
+                GGML_TYPE_F16, 0, false, true, -1, true);
+        test_kvarn_route_stats stats = make_test_kvarn_route_stats();
+        route_stats_get(&stats);
+
+        require_close_f32_rmse(actual, expected, 1e-2f,
+                "materialized compact-tail KVarN fallback differs from CPU reference");
+        require(stats.compact_tail_entry > 0 && stats.materialize_fallback > 0,
+                "unsupported compact-tail KVarN body did not use materialization fallback");
+    }
+    std::printf("test-kvarn: compact-tail materialization fallback OK\n");
+    std::fflush(stdout);
+    ggml_backend_free(cpu_backend);
+    ggml_backend_free(gpu_backend);
+}
+
 static void test_store_paths_gpu() {
     ggml_backend_t gpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
     if (gpu_backend == nullptr) {
@@ -5739,6 +5780,7 @@ int main() {
     // regression cases must execute on every qualified CUDA/HIP backend.
     test_kvarn_d256_prompt_tail_regression();
     test_native_flash_attention_portable_original_v();
+    test_native_flash_attention_tail_materialize_fallback();
     test_store_paths_gpu();
     test_native_flash_attention_support_gates();
     test_native_flash_attention_cpu();

@@ -1160,6 +1160,16 @@ bool ggml_cuda_flash_attn_ext_kvarn(
     }
     ggml_cuda_fattn_kvarn_record_entry(entry_path);
 
+    const char * force_materialize = getenv("GGML_KVARN_TEST_FORCE_MATERIALIZE_FATTN");
+    if (entry_path == GGML_CUDA_FATTN_KVARN_ENTRY_COMPACT_TAIL &&
+            force_materialize != nullptr && atoi(force_materialize) != 0) {
+        g_kvarn_route_materialize_fallback.fetch_add(1, std::memory_order_relaxed);
+        ggml_cuda_fattn_kvarn_debug_route(
+            ctx.device, plan, dst, entry_path,
+            "materialize-fallback", "forced");
+        return false;
+    }
+
     const char * force_portable = getenv("GGML_KVARN_TEST_FORCE_PORTABLE_FATTN");
     if (capabilities.portable_native &&
             force_portable != nullptr && atoi(force_portable) != 0 &&
