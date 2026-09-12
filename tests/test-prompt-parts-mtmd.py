@@ -89,6 +89,19 @@ def prompt_tokens(base, body, endpoint):
         return int(r["input_tokens"])
     return int(r["usage"]["prompt_tokens"])
 
+def make_injection_case(base, special):
+    """Build two inputs whose safe and unsafe token-count deltas differ."""
+    prefix = "Describe the image. "
+    suffix = " injected end"
+    reference = prefix + special + suffix
+    for repeats in (2, 4, 8, 16):
+        injected = prefix + special * repeats + suffix
+        safe_delta = len(tokenize(base, injected, False)) - len(tokenize(base, reference, False))
+        unsafe_delta = len(tokenize(base, injected, True)) - len(tokenize(base, reference, True))
+        if safe_delta != unsafe_delta:
+            return reference, injected, safe_delta, unsafe_delta
+    raise RuntimeError("could not construct a discriminating special-token injection case")
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--server", required=True, type=os.path.abspath)
@@ -157,28 +170,51 @@ def main():
             log(f"FAIL: media tokens not counted ({n_img_c} <= {n_base_c})")
             return 1
 
-        # special-token injection in ordinary user content (no media):
-        # with the protection the injected text is tokenized as normal text
-        # (several tokens), not as a single special token.
-        inj_text = f"Describe the image. {special}injected{special} end"
+        # Special-token injection in ordinary user content. Both the reference
+        # and injected inputs contain special-token text, so both must take the
+        # same provenance-aware path. Their exact count delta must match direct
+        # parse_special=false tokenization, not the unsafe parse_special=true
+        # delta. This avoids a false pass caused by merely checking that extra
+        # ordinary words increased the count.
+        ref_text, inj_text, safe_delta, unsafe_delta = make_injection_case(base, special)
+        log(f"expected injection delta: safe={safe_delta}, unsafe={unsafe_delta}")
+
+        ref_body = {
+            "messages": [{"role": "user", "content": ref_text}],
+            "max_tokens": args.predict,
+            "stream": False,
+        }
         inj_body = {
             "messages": [{"role": "user", "content": inj_text}],
             "max_tokens": args.predict,
             "stream": False,
         }
+        n_ref_c = prompt_tokens(base, ref_body, "/v1/chat/completions")
+        n_ref_t = prompt_tokens(base, ref_body, "/v1/chat/completions/input_tokens")
         n_inj_c = prompt_tokens(base, inj_body, "/v1/chat/completions")
         n_inj_t = prompt_tokens(base, inj_body, "/v1/chat/completions/input_tokens")
+        log(f"protected reference (no media): completion={n_ref_c} count={n_ref_t}")
         log(f"injected (no media): completion={n_inj_c} count={n_inj_t}")
-        if n_inj_c != n_inj_t:
+        if n_ref_c != n_ref_t or n_inj_c != n_inj_t:
             log("FAIL: completion and count endpoints disagree (injected, no media)")
             return 1
-        delta = n_inj_t - n_base_t
-        log(f"injection token delta: {delta} (1 would mean the special token was parsed)")
-        if delta <= 1:
-            log("FAIL: injected special token was parsed as a special token")
+        delta = n_inj_t - n_ref_t
+        log(f"injection token delta: {delta}")
+        if delta != safe_delta:
+            log(f"FAIL: expected protected delta {safe_delta}, got {delta} (unsafe delta is {unsafe_delta})")
             return 1
 
-        # same, but with media attached (mtmd part interleaving + protection)
+        # Same assertion with media attached (MTMD part interleaving plus
+        # provenance-aware text tokenization). The image contribution is equal
+        # in both requests and therefore cancels from the count delta.
+        ref_img_body = {
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": ref_text},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+            ]}],
+            "max_tokens": args.predict,
+            "stream": False,
+        }
         inj_img_body = {
             "messages": [{"role": "user", "content": [
                 {"type": "text", "text": inj_text},
@@ -187,16 +223,20 @@ def main():
             "max_tokens": args.predict,
             "stream": False,
         }
+        n_ref_img_c = prompt_tokens(base, ref_img_body, "/v1/chat/completions")
+        n_ref_img_t = prompt_tokens(base, ref_img_body, "/v1/chat/completions/input_tokens")
         n_inj_img_c = prompt_tokens(base, inj_img_body, "/v1/chat/completions")
         n_inj_img_t = prompt_tokens(base, inj_img_body, "/v1/chat/completions/input_tokens")
+        log(f"protected reference (with media): completion={n_ref_img_c} count={n_ref_img_t}")
         log(f"injected (with media): completion={n_inj_img_c} count={n_inj_img_t}")
-        if n_inj_img_c != n_inj_img_t:
+        if n_ref_img_c != n_ref_img_t or n_inj_img_c != n_inj_img_t:
             log("FAIL: completion and count endpoints disagree (injected, with media)")
             return 1
-        delta_img = n_inj_img_t - n_img_t
+        delta_img = n_inj_img_t - n_ref_img_t
         log(f"injection token delta with media: {delta_img}")
-        if delta_img <= 1:
-            log("FAIL: injected special token was parsed as a special token (with media)")
+        if delta_img != safe_delta:
+            log(f"FAIL: expected protected MTMD delta {safe_delta}, got {delta_img} "
+                f"(unsafe delta is {unsafe_delta})")
             return 1
 
         log("PASS: all MTMD prompt_parts checks succeeded")
