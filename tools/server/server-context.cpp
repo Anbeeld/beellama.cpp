@@ -4985,8 +4985,21 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // process prompt
         std::vector<server_tokens> inputs;
 
-        if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
-            // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
+        if (data.contains("prompt_parts") && data.at("prompt_parts").is_array() && !data.at("prompt_parts").empty()) {
+            // OAI-compat chat path with input-marking metadata from the jinja
+            // template: use the shared input-marking-aware tokenization, which
+            // also handles media interleaving. This must run before the MTMD
+            // branch so that chat requests served by multimodal-capable models
+            // (mctx != nullptr) receive the special-token protection too,
+            // even when no media is attached.
+            std::vector<jinja::string_part> parts;
+            for (const auto & p : data.at("prompt_parts")) {
+                parts.push_back({p.at("is_input").get<bool>(), p.at("text").get<std::string>()});
+            }
+            inputs.push_back(server_tokenize_prompt_parts(ctx_server.vocab, ctx_server.mctx, parts, files, ctx_server.init_opt, /*add_special=*/true));
+        } else if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
+            // This is the case used by OAI compatible chat path with MTMD (no prompt_parts, e.g. legacy templates).
+            // TODO It can be moved to the path below.
             inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt));
         } else {
             // Everything else, including multimodal completions.
@@ -6214,9 +6227,19 @@ std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const l
     json prompt = body_parsed.at("prompt");
     // SRV_DBG("prompt = %s\n", prompt.dump().c_str());
 
-    // TODO @ngxson : refactor this code block, move this to server-common and reuse it in other places
+    // Use the same input-marking-aware tokenization path as the inference
+    // route (handle_completions_impl) when the chat template application
+    // produced prompt parts, so the count matches the actual completion
+    // tokenization (including the special-token protection and media
+    // interleaving).
     size_t n_tokens;
-    if (mctx != nullptr) {
+    if (body_parsed.contains("prompt_parts") && body_parsed.at("prompt_parts").is_array() && !body_parsed.at("prompt_parts").empty()) {
+        std::vector<jinja::string_part> parts;
+        for (const auto & p : body_parsed.at("prompt_parts")) {
+            parts.push_back({p.at("is_input").get<bool>(), p.at("text").get<std::string>()});
+        }
+        n_tokens = server_tokenize_prompt_parts(vocab, mctx, parts, files, init_opt, /*add_special=*/true, /*is_placeholder=*/true).size();
+    } else if (mctx != nullptr) {
         if (!prompt.is_string()) {
             throw std::runtime_error("for mtmd, input prompt must be a string.");
         }

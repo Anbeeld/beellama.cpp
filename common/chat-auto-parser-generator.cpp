@@ -42,7 +42,7 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &  
                                                   const autoparser &              autoparser) {
     // Create the result structure
     common_chat_params data;
-    data.prompt            = common_chat_template_direct_apply(tmpl, inputs);
+    data.prompt            = common_chat_template_direct_apply(tmpl, inputs, &data.prompt_parts);
     data.generation_prompt = common_chat_template_generation_prompt(tmpl, inputs);
     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
     data.preserved_tokens  = autoparser.preserved_tokens;
@@ -52,11 +52,27 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &  
     std::string parser_generation_prompt = data.generation_prompt;
 
     if (inputs.continue_final_message != COMMON_CHAT_CONTINUATION_NONE && !inputs.continue_msg.empty()) {
-        // Build up generation prompt manually
+        // Build up generation prompt manually, keeping the provenance of the
+        // template delimiters and the request-provided continuation content
+        // separate (the latter must not be parsed for special tokens).
         const auto & msg = inputs.continue_msg;
 
+        std::vector<jinja::string_part> gen_parts;
+
         if (!autoparser.reasoning.start.empty()) {
-            data.generation_prompt = data.generation_prompt.substr(0, data.generation_prompt.find(autoparser.reasoning.start));
+            const size_t cut = data.generation_prompt.find(autoparser.reasoning.start);
+
+            // Template-derived prefix of the generation prompt
+            gen_parts.push_back({false, data.generation_prompt.substr(0, cut)});
+            // Reasoning markers are template text
+            gen_parts.push_back({false, autoparser.reasoning.start});
+            // Request-provided reasoning content
+            gen_parts.push_back({true, msg.reasoning_content});
+            if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+                gen_parts.push_back({false, autoparser.reasoning.end});
+            }
+
+            data.generation_prompt = data.generation_prompt.substr(0, cut);
             data.generation_prompt += autoparser.reasoning.start + msg.reasoning_content;
             if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
                 data.generation_prompt += autoparser.reasoning.end;
@@ -64,10 +80,19 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &  
         }
 
         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+            // Request-provided message content
+            gen_parts.push_back({true, msg.render_content()});
             data.generation_prompt += msg.render_content();
         }
 
+        if (gen_parts.empty()) {
+            // Reasoning-only continuation without a reasoning start marker:
+            // nothing request-provided was appended, the prompt is template text
+            gen_parts.push_back({false, data.generation_prompt});
+        }
+
         data.prompt += data.generation_prompt;
+        data.prompt_parts.insert(data.prompt_parts.end(), gen_parts.begin(), gen_parts.end());
     }
 
     auto parser = autoparser.build_parser(inputs, parser_generation_prompt);

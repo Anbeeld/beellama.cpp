@@ -957,6 +957,156 @@ server_tokens process_mtmd_prompt(
     return result;
 }
 
+bool server_build_mtmd_part_layout(
+        const std::string & marker,
+        const std::vector<jinja::string_part> & parts,
+        size_t n_files,
+        std::vector<server_mtmd_seg> & out_segs) {
+    std::string prompt;
+    // (start offset, is_input) ranges covering [0, prompt.size())
+    std::vector<std::pair<size_t, bool>> ranges;
+    size_t total = 0;
+    for (const auto & part : parts) {
+        if (!part.val.empty()) {
+            ranges.push_back({total, part.is_input});
+            total += part.val.size();
+        }
+    }
+    prompt.reserve(total);
+    for (const auto & part : parts) {
+        prompt += part.val;
+    }
+
+    // locate all media markers (a marker may span two adjacent parts)
+    std::vector<size_t> marker_starts;
+    for (size_t pos = prompt.find(marker); pos != std::string::npos; pos = prompt.find(marker, pos + marker.size())) {
+        marker_starts.push_back(pos);
+    }
+    if (marker_starts.size() != n_files) {
+        return false;
+    }
+
+    out_segs.clear();
+
+    auto add_text_range = [&](size_t begin, size_t end) {
+        for (size_t r = 0; r < ranges.size(); r++) {
+            const size_t r_end = (r + 1 < ranges.size()) ? ranges[r + 1].first : prompt.size();
+            const size_t s     = std::max(begin, ranges[r].first);
+            const size_t e     = std::min(end, r_end);
+            if (s < e) {
+                out_segs.push_back({false, prompt.substr(s, e - s), ranges[r].second});
+            }
+        }
+    };
+
+    size_t prev = 0;
+    for (size_t i = 0; i < marker_starts.size(); i++) {
+        add_text_range(prev, marker_starts[i]);
+        out_segs.push_back({true, "", false});
+        prev = marker_starts[i] + marker.size();
+    }
+    add_text_range(prev, prompt.size());
+
+    return true;
+}
+
+server_tokens server_tokenize_prompt_parts(
+        const llama_vocab * vocab,
+        mtmd_context * mctx,
+        const std::vector<jinja::string_part> & parts,
+        const std::vector<raw_buffer> & files,
+        const mtmd_helper_init_opt & init_opt,
+        bool add_special,
+        bool is_placeholder) {
+    const bool protect = common_chat_parts_have_special_input(vocab, parts);
+
+    // No media to interleave: plain input-marking-aware tokenization.
+    // Covers text-only models as well as multimodal-capable models without
+    // attachments, so the special-token protection applies in both cases.
+    if (mctx == nullptr || files.empty()) {
+        const auto tokens = common_tokenize_parts(vocab, parts, add_special);
+        return server_tokens(tokens, /*has_mtmd=*/mctx != nullptr);
+    }
+
+    // Media present, but no is_input part contains special-token text: keep
+    // the legacy mtmd path (single-pass tokenization of the flattened prompt)
+    // so the token ids are identical to the pre-input-marking behavior.
+    if (!protect) {
+        std::string prompt;
+        size_t total = 0;
+        for (const auto & part : parts) {
+            total += part.val.size();
+        }
+        prompt.reserve(total);
+        for (const auto & part : parts) {
+            prompt += part.val;
+        }
+        return process_mtmd_prompt(mctx, prompt, files, init_opt, is_placeholder);
+    }
+
+    // Media present and special-token text detected in request-provided
+    // content: interleave the media bitmaps at the marker positions and
+    // tokenize every text segment with its own parse_special flag.
+
+    const std::string marker = get_media_marker();
+
+    std::vector<server_mtmd_seg> segs;
+    if (!server_build_mtmd_part_layout(marker, parts, files.size(), segs)) {
+        throw std::runtime_error(string_format(
+            "number of media markers in prompt does not match number of files (%zu)",
+            files.size()));
+    }
+
+    // these will be freed upon going out of scope
+    mtmd::bitmaps bitmaps;
+    std::vector<mtmd_helper::video_ptr> videos;
+    for (auto & file : files) {
+        auto out = mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size(), is_placeholder, init_opt);
+        if (!out.bitmap) {
+            throw std::runtime_error("Failed to load image or audio file");
+        }
+        bitmaps.entries.emplace_back(out.bitmap);
+        if (out.video_ctx) {
+            videos.emplace_back(out.video_ctx);
+        }
+    }
+    auto bitmaps_c_ptr = bitmaps.c_ptr();
+
+    // Stable storage: segs is fully built here, so the text pointers it
+    // provides remain valid for the lifetime of mtmd_texts/mtmd_parts.
+    std::vector<mtmd_input_text> mtmd_texts;
+    std::vector<mtmd_input_part> mtmd_parts;
+    mtmd_texts.reserve(segs.size());
+    mtmd_parts.reserve(segs.size());
+    size_t i_bm = 0;
+    for (const auto & sg : segs) {
+        if (sg.is_bitmap) {
+            mtmd_parts.push_back({nullptr, bitmaps_c_ptr[i_bm++]});
+        } else if (!sg.text.empty()) {
+            mtmd_texts.push_back({
+                sg.text.data(),
+                sg.text.size(),
+                /* add_special   */ false, // per-part add_special is ignored
+                /* parse_special */ !sg.is_input,
+            });
+            mtmd_parts.push_back({&mtmd_texts.back(), nullptr});
+        }
+    }
+
+    mtmd::input_chunks chunks(mtmd_input_chunks_init());
+    std::vector<const mtmd_input_part *> part_ptrs(mtmd_parts.size());
+    for (size_t i = 0; i < mtmd_parts.size(); i++) {
+        part_ptrs[i] = &mtmd_parts[i];
+    }
+    const int32_t tokenized = mtmd_tokenize_from_parts(mctx, chunks.ptr.get(), part_ptrs.data(), part_ptrs.size(), add_special);
+    if (tokenized != 0) {
+        throw std::runtime_error("Failed to tokenize prompt");
+    }
+
+    auto result = server_tokens(chunks, true);
+    return result;
+}
+
 /**
  * break the input "prompt" object into multiple prompt if needed, then tokenize them
  * use tokenize_input_prompts() if the input could be an array.
@@ -1344,6 +1494,15 @@ json oaicompat_chat_params_parse(
 
     llama_params["chat_format"] = static_cast<int>(chat_params.format);
     llama_params["prompt"]      = chat_params.prompt;
+    // Store prompt parts with is_input metadata for safe tokenization
+    // (prevents special token injection from user content)
+    if (!chat_params.prompt_parts.empty()) {
+        json parts_arr = json::array();
+        for (const auto & part : chat_params.prompt_parts) {
+            parts_arr.push_back({{"is_input", part.is_input}, {"text", part.val}});
+        }
+        llama_params["prompt_parts"] = parts_arr;
+    }
     if (!chat_params.grammar.empty()) {
         llama_params["grammar"]      = chat_params.grammar;
         llama_params["grammar_type"] = std::string("tool_calls");

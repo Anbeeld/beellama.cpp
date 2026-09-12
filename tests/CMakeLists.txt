@@ -553,6 +553,19 @@ if (LLAMA_BUILD_SERVER)
     llama_build_and_test(test-server-prompt-checkpoint.cpp)
     target_include_directories(test-server-prompt-checkpoint PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)
     target_link_libraries(test-server-prompt-checkpoint PRIVATE server-context)
+
+    # input-marking-aware prompt tokenization (prompt_parts) regression tests;
+    # needs a vocab-only GGUF (the qwen2 vocab provides the control special
+    # tokens the tests rely on) and the GPT-OSS chat template
+    llama_build_and_test(
+        test-prompt-parts.cpp
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS
+            ${PROJECT_SOURCE_DIR}/models/ggml-vocab-qwen2.gguf
+            ${PROJECT_SOURCE_DIR}/models/templates/openai-gpt-oss-120b.jinja
+    )
+    target_include_directories(test-prompt-parts PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)
+    target_link_libraries(test-prompt-parts PRIVATE server-context)
 endif()
 # Upstream model-resolution coverage serves repositories through cpp-httplib.
 llama_build_and_test(test-model-resolution.cpp)
