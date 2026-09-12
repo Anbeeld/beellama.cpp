@@ -518,7 +518,9 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     const int n_chunk_max = tokens.size() / n_ctx;
 
     const int n_vocab = llama_vocab_n_tokens(vocab);
-    const int max_logits_rows = ppl_max_logits_rows(n_vocab, params);
+    const int max_logits_rows = params.logits_file.empty()
+            ? ppl_max_logits_rows(n_vocab, params)
+            : std::max(1, std::min(n_ctx, params.n_batch));
     const int n_seq_ctx = std::max(1, params.n_ctx / n_ctx);
     const int n_seq = params.logits_file.empty() ? std::min(n_seq_ctx, max_logits_rows) : 1;
     const int n_batch = std::max(1, std::min(n_ctx, std::min(
@@ -1796,8 +1798,7 @@ static bool kl_divergence(llama_context * ctx, const common_params & params) {
     }
 
     const int n_ctx_i = static_cast<int>(n_ctx);
-    const int max_logits_rows = ppl_max_logits_rows(n_vocab, params);
-    const int n_batch = std::max(1, std::min(n_ctx_i, std::min(params.n_batch, max_logits_rows)));
+    const int n_batch = std::max(1, std::min(n_ctx_i, params.n_batch));
     const int num_batches = (n_ctx_i + n_batch - 1) / n_batch;
     const int n_seq = 1;
     const int nv = 2*((n_vocab + 1)/2) + 4;
@@ -1806,7 +1807,7 @@ static bool kl_divergence(llama_context * ctx, const common_params & params) {
 
     llama_batch batch = llama_batch_init(n_batch, 0, 1);
 
-    std::vector<uint16_t> log_probs_uint16(size_t(max_logits_rows) * nv);
+    std::vector<uint16_t> log_probs_uint16(size_t(n_batch) * nv);
     std::vector<float>    kld_values(size_t(n_ctx - 1 - n_ctx/2)*n_chunk);
     std::vector<float> p_diff_values(size_t(n_ctx - 1 - n_ctx/2)*n_chunk);
 
