@@ -2075,7 +2075,11 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_kvarn::memory_breakd
 }
 
 bool llama_kv_cache_kvarn::requires_state_for_partial_restore() const {
-    return true;
+    // SWA rings overwrite historical records, so a partial checkpoint must own
+    // the live window. Dense KVarN keeps every surviving prefix group in the
+    // record body; suffixes inside the current and previous group can be
+    // trimmed in place, the same way a body-backed exact tail can.
+    return swa;
 }
 
 bool llama_kv_cache_kvarn::stream_is_exclusive_for(llama_seq_id seq_id) const {
