@@ -437,16 +437,61 @@ public:
         return pos[i] >= p0 && pos[i] < p1;
     }
 
+    // first cell holding seq_id at position p, or size() if none
+    // when want_ext is set, skip cells whose 2D position does not match
+    uint32_t seq_find_cell(llama_seq_id seq_id, llama_pos p, const llama_kv_cell_ext * want_ext = nullptr) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        const auto & sp = seq_pos[seq_id];
+        for (auto it = sp.lower_bound({ p, 0 }); it != sp.end() && it->first == p; ++it) {
+            const uint32_t i = it->second;
+            if (want_ext && !(ext[i].x == want_ext->x && ext[i].y == want_ext->y)) {
+                continue;
+            }
+            return i;
+        }
+        return uint32_t(pos.size());
+    }
+
     // return all cell indices that have seq_id and match the given position
     std::vector<uint32_t> cells_at(llama_seq_id seq_id, llama_pos p) const {
         assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
         std::vector<uint32_t> result;
-        for (const auto & i : used) {
-            if (pos[i] == p && seq[i].test(seq_id)) {
-                result.push_back(i);
-            }
+        const auto & sp = seq_pos[seq_id];
+        for (auto it = sp.lower_bound({ p, 0 }); it != sp.end() && it->first == p; ++it) {
+            result.push_back(it->second);
         }
         return result;
+    }
+
+    // Remove seq_id from occupied cells whose position is in [p0, p1).
+    // Returns the lowest emptied cell index, or size() if none were emptied.
+    uint32_t seq_rm_pos_range(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+        if (p0 < 0) {
+            p0 = 0;
+        }
+        if (p1 < 0) {
+            p1 = std::numeric_limits<llama_pos>::max();
+        }
+
+        auto & sp = seq_pos[seq_id];
+        std::vector<uint32_t> idxs;
+        for (auto it = sp.lower_bound({ p0, 0 }); it != sp.end() && it->first < p1; ++it) {
+            idxs.push_back(it->second);
+        }
+
+        uint32_t first_freed = uint32_t(pos.size());
+        for (uint32_t i : idxs) {
+            if (seq_has(i, seq_id) && seq_rm(i, seq_id) && i < first_freed) {
+                first_freed = i;
+            }
+        }
+        return first_freed;
     }
 
     // set the position of an empty cell
