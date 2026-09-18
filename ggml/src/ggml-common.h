@@ -99,6 +99,11 @@ typedef sycl::half2 ggml_half2;
 #define QI2_0 (QK2_0 / 32)
 #define QR2_0 1
 
+#define QI_PQ2_0 (QK_PQ2_0 / 32)
+#define QR_PQ2_0 1
+#define QI_PTQ1_0 (QK_PTQ1_0 / 32)
+#define QR_PTQ1_0 1
+
 
 #define QI4_0 (QK4_0 / (4 * QR4_0))
 #define QR4_0 2
@@ -191,6 +196,29 @@ typedef sycl::half2 ggml_half2;
 
 #ifdef _MSC_VER
 #define GGML_EXTENSION
+// PQ2_0: Prism-private Q2_0 at group size 128. Same 2-bit codec as Q2_0
+// (group 64) but one fp16 scale per 128 weights (~5% smaller). Distinct ggml
+// type (142) so it coexists with upstream's group-64 Q2_0 (type 42).
+#define QK_PQ2_0 128
+typedef struct {
+    ggml_half d;                   // delta (scale)
+    uint8_t qs[QK_PQ2_0 / 4];    // 2 bits per element
+} block_pq2_0;
+static_assert(sizeof(block_pq2_0) == sizeof(ggml_half) + QK_PQ2_0 / 4, "wrong pq2_0 block size/padding");
+
+// PTQ1_0: Prism-private ternary at group size 128. Same base-3 trit packing as
+// upstream TQ1_0 (type 34) but one fp16 scale per 128 weights instead of per 256.
+// 1.75 bpw vs PQ2_0's 2.125, and lossless for checkpoints that are already ternary
+// at group 128 -- TQ1_0 cannot represent those, because a 256-wide scale has to
+// discard one of the two group scales it straddles.
+#define QK_PTQ1_0 128
+typedef struct {
+    uint8_t qs[(QK_PTQ1_0 - 4*QK_PTQ1_0/64)/5]; // 24 B, 5 trits per byte -> 120 values
+    uint8_t qh[QK_PTQ1_0/64];                   //  2 B, 4 trits per byte ->   8 values
+    ggml_half d;                                // scale
+} block_ptq1_0;
+static_assert(sizeof(block_ptq1_0) == sizeof(ggml_half) + QK_PTQ1_0/64 + (QK_PTQ1_0 - 4*QK_PTQ1_0/64)/5, "wrong ptq1_0 block size/padding");
+
 #else // _MSC_VER
 #define GGML_EXTENSION __extension__
 #endif // _MSC_VER

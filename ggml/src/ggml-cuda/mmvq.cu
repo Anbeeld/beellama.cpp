@@ -12,6 +12,8 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
     switch (type) {
         case GGML_TYPE_Q1_0:    return vec_dot_q1_0_q8_1;
         case GGML_TYPE_Q2_0:    return vec_dot_q2_0_q8_1;
+        case GGML_TYPE_PQ2_0:   return vec_dot_pq2_0_q8_1;
+        case GGML_TYPE_PTQ1_0:  return vec_dot_ptq1_0_q8_1;
         case GGML_TYPE_Q4_0:    return vec_dot_q4_0_q8_1;
         case GGML_TYPE_Q4_1:    return vec_dot_q4_1_q8_1;
         case GGML_TYPE_Q5_0:    return vec_dot_q5_0_q8_1;
@@ -70,6 +72,8 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
         case GGML_TYPE_IQ2_S:   return VDR_IQ2_S_Q8_1_MMVQ;
         case GGML_TYPE_IQ3_XXS: return VDR_IQ3_XXS_Q8_1_MMVQ;
         case GGML_TYPE_IQ3_S:   return VDR_IQ3_S_Q8_1_MMVQ;
+        case GGML_TYPE_PQ2_0: return VDR_PQ2_0_Q8_1_MMVQ;
+        case GGML_TYPE_PTQ1_0: return VDR_PTQ1_0_Q8_1_MMVQ;
         case GGML_TYPE_IQ4_NL:  return VDR_IQ4_NL_Q8_1_MMVQ;
         case GGML_TYPE_IQ4_XS:  return VDR_IQ4_XS_Q8_1_MMVQ;
         default:                return 1;
@@ -314,6 +318,11 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     if (!ggml_is_quantized(type)) {
         return false;
     }
+#if !defined(GGML_USE_HIP)
+    if (type == GGML_TYPE_PTQ1_0 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING) {
+        return ne11 <= 7;
+    }
+#endif
     // k-quants cost more to decode and mvq redoes that per column, so MMQ wins sooner.
     // Only list quant-types MMQ supports, others would fall back to cuBLAS.
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_ADA_LOVELACE) {
@@ -540,6 +549,8 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         // Only worth the wider block when it actually retires the K loop in half the trips (Observation)
         if (ncols_dst == 1 && !small_k && halve_iters) {
             switch (type) {
+                case GGML_TYPE_PQ2_0:
+                    return generic + generic / 2;
                 case GGML_TYPE_Q4_0:
                 case GGML_TYPE_Q4_1:
                 case GGML_TYPE_Q5_0:
@@ -701,6 +712,34 @@ static __global__ void mul_mat_vec_q(
         // x block quant index when casting the quants to int
         const int kqs = vdr * (tid % (qi/vdr));
 
+#if !defined(GGML_USE_HIP)
+        // PTQ1_0 decodes a whole 128-wide block of trits at once, so a few columns can share that
+        // decode instead of paying for it per column.
+        if constexpr (type == GGML_TYPE_PTQ1_0 && ncols_dst > 1 && ncols_dst <= 3) {
+#    pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                float dots[ncols_dst];
+                vec_dot_ptq1_0_q8_1_multi<ncols_dst>(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs,
+                                                     stride_col_y, dots);
+#    pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    tmp[j][i] += dots[j];
+                }
+
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        vec_dot_ptq1_0_q8_1_multi<ncols_dst>(vgate, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs,
+                                                             stride_col_y, dots);
+#    pragma unroll
+                        for (int j = 0; j < ncols_dst; ++j) {
+                            tmp_gate[j][i] += dots[j];
+                        }
+                    }
+                }
+            }
+        } else
+#endif
+        {
 #pragma unroll
         for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
@@ -714,6 +753,7 @@ static __global__ void mul_mat_vec_q(
                     }
                 }
             }
+        }
         }
     }
 
@@ -1071,6 +1111,10 @@ static void mul_mat_vec_q_switch_ncols_dst(
         // Trigger when the full thread block covers all K blocks in a single loop iteration and few threads remain idle.
         const int  nwarps = calc_nwarps(type, c_ncols_dst, table_id);
         bool       use    = nwarps > 1 && blocks_per_row_x < nwarps * blocks_per_iter_1warp;
+        // on CDNA the small_k geometry (rows_per_block = nwarps) is several times slower than the default split-K geometry for these types, and with wave64 it triggers for every K < 4096 projection
+        if (GGML_CUDA_CC_IS_CDNA(cc) && (type == GGML_TYPE_Q1_0 || type == GGML_TYPE_Q2_0 || type == GGML_TYPE_PQ2_0)) {
+            use = false;
+        }
 
         constexpr std::array<ggml_type, 2> iq_slow_turing = {
             GGML_TYPE_IQ3_XXS,
@@ -1108,6 +1152,10 @@ static void mul_mat_vec_q_switch_ncols_dst(
         if (table_id != MMVQ_PARAMETERS_GB10) {
             return false;
         }
+        if (type == GGML_TYPE_PQ2_0 && ncols_x == 6144 && nrows_x == 2048) {
+            return false;
+        }
+
 
         // Expert rows are gathered per token, so a wider block adds reduction work without reuse.
         if (has_ids) {
@@ -1245,6 +1293,18 @@ static void mul_mat_vec_q_switch_type(
             break;
         case GGML_TYPE_Q2_0:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q2_0>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            break;
+        case GGML_TYPE_PQ2_0:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_PQ2_0>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            break;
+        case GGML_TYPE_PTQ1_0:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_PTQ1_0>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);

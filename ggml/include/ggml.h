@@ -438,7 +438,11 @@ extern "C" {
         GGML_TYPE_Q3_1    = 46,
         GGML_TYPE_Q2_0S   = 47,
         GGML_TYPE_Q2_1    = 48,
-        GGML_TYPE_COUNT   = 49,
+        // Prism-private formats from PrismML's fork, kept at their upstream-fork ids so
+        // Bonsai 2 files load unchanged. type_traits is sized to COUNT, 49..141 stay unused.
+        GGML_TYPE_PQ2_0   = 142, // ternary, group 128 (upstream Q2_0 is group 64)
+        GGML_TYPE_PTQ1_0  = 143, // ternary, group 128, trits packed base-3, five per byte
+        GGML_TYPE_COUNT   = 144,
     };
 
     // precision
@@ -499,6 +503,8 @@ extern "C" {
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
+        GGML_FTYPE_MOSTLY_PQ2_0   = 128, // except 1d tensors (Prism-private group-128 Q2_0)
+        GGML_FTYPE_MOSTLY_PTQ1_0  = 129, // except 1d tensors (Prism-private group-128 ternary)
     };
 
     // available tensor operations:
