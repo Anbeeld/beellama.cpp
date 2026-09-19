@@ -1156,6 +1156,11 @@ struct llm_graph_context {
     // do mat_mul, while optionally apply lora and per-tensor scale
     // if w is a Hadamard-folded weight, return the activation with its
     // transform applied (sign flip, then rotation); otherwise return it as is
+    // restore the primal basis of a Hadamard-latent embedding table after a row lookup
+    ggml_tensor * build_hadamard_inverse_embd(
+            ggml_tensor * w,
+            ggml_tensor * cur) const;
+
     ggml_tensor * build_hadamard_activation(
               ggml_tensor * w,
               ggml_tensor * cur) const;

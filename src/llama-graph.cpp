@@ -1904,6 +1904,29 @@ ggml_tensor * llm_graph_context::build_cvec(
     return cvec->apply_to(ctx0, cur, il);
 }
 
+// A Hadamard-latent embedding table stores rotated rows; restore the primal basis
+// right after the lookup: h = s * (H z). Both the trunk and the MTP graph do their
+// own row lookup, so both have to undo it.
+ggml_tensor * llm_graph_context::build_hadamard_inverse_embd(
+          ggml_tensor * w,
+          ggml_tensor * cur) const {
+    if (!hadamard_inverses) {
+        return cur;
+    }
+
+    const auto it = hadamard_inverses->find(w);
+    if (it == hadamard_inverses->end()) {
+        return cur;
+    }
+
+    cur = llama_mul_mat_hadamard(ctx0, cur, it->second.rot);
+    if (it->second.signs) {
+        cur = ggml_mul(ctx0, cur, it->second.signs);
+    }
+
+    return cur;
+}
+
 ggml_tensor * llm_graph_context::build_hadamard_activation(
           ggml_tensor * w,
           ggml_tensor * cur) const {
@@ -2822,17 +2845,7 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
 
         cur = ggml_get_rows(ctx0, tok_embd, inp->tokens);
 
-        // a Hadamard-latent embedding table stores rotated rows; restore the
-        // primal basis right after the lookup: h = s * (H z)
-        if (hadamard_inverses) {
-            const auto it = hadamard_inverses->find(tok_embd);
-            if (it != hadamard_inverses->end()) {
-                cur = llama_mul_mat_hadamard(ctx0, cur, it->second.rot);
-                if (it->second.signs) {
-                    cur = ggml_mul(ctx0, cur, it->second.signs);
-                }
-            }
-        }
+        cur = build_hadamard_inverse_embd(tok_embd, cur);
 
         // apply lora for embedding tokens if needed
         for (const auto & lora : *loras) {
