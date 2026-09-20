@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Iterable, cast
+from typing import Callable, Iterable, cast
 
 import torch
 from torch import Tensor
@@ -24,11 +24,25 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     """
 
     model_arch = gguf.MODEL_ARCH.QWEN4EXP
-    mtp_only_extra_tensor_prefixes = (
-        "model.hyper_connection_mixer.hc_norm",
-        "model.hyper_connection_mixer.input_mix_weight_down",
-        "model.hyper_connection_mixer.input_mix_weight_up",
-    )
+
+    _MTP_MIXER_PREFIX = "mtp.hyper_connection_mixer."
+
+    @classmethod
+    def filter_tensors(
+        cls, item: tuple[str, Callable[[], Tensor]]
+    ) -> tuple[str, Callable[[], Tensor]] | None:
+        # The MTP head carries its own copy of the trunk's output mixer. It is
+        # unindexed in the checkpoint but belongs to the trailing draft block.
+        name, gen = item
+        if name.startswith("model." + cls._MTP_MIXER_PREFIX):
+            name = name.replace("model.", "", 1)
+        if name.startswith(cls._MTP_MIXER_PREFIX):
+            if cls.no_mtp:
+                return None
+            assert cls._original_block_count is not None
+            suffix = name[len("mtp."):]
+            return f"model.layers.{cls._original_block_count}.{suffix}", gen
+        return super().filter_tensors((name, gen))
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

@@ -26,6 +26,8 @@ def main() -> None:
         "LLM_KV_NEXTN_PREDICT_LAYERS",
         "const bool mtp_only",
         "LLM_TENSOR_NEXTN_EH_PROJ",
+        "LLM_TENSOR_NEXTN_HC_HEAD_NORM",
+        "qwen4exp_shared_model",
         "LLM_GRAPH_TYPE_DECODER_MTP",
         "llama_model_qwen4exp::graph_mtp::graph_mtp",
         "mctx_hyb != nullptr && mctx_hyb->get_idx() != nullptr",
@@ -45,20 +47,14 @@ def main() -> None:
                 "every QSA indexer constructor must disable K-shift rotation of raw pooled keys")
 
     qwen4exp_converter = (ROOT / "conversion/qwen4exp.py").read_text(encoding="utf-8")
-    require(
-        qwen4exp_converter,
-        "mtp_only_extra_tensor_prefixes = (",
-        "Qwen4Exp conversion must export its complete standalone MTP draft head",
-    )
     for needle in (
-        "model.hyper_connection_mixer.hc_norm",
-        "model.hyper_connection_mixer.input_mix_weight_down",
-        "model.hyper_connection_mixer.input_mix_weight_up",
+        '_MTP_MIXER_PREFIX = "mtp.hyper_connection_mixer."',
+        'f"model.layers.{cls._original_block_count}.{suffix}"',
     ):
         require(
             qwen4exp_converter,
             needle,
-            "Qwen4Exp standalone MTP conversion must retain its output hyper-connection mixer",
+            "Qwen4Exp standalone MTP conversion must place its output mixer on the draft block",
         )
 
     qwen3next = (ROOT / "src/models/qwen3next.cpp").read_text(encoding="utf-8")
