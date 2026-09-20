@@ -362,9 +362,9 @@ struct server_slot {
         spec_ckpt.clear();
     }
 
-    bool prompt_save(server_prompt_cache & prompt_cache) const {
+    server_prompt_cache_state * prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
-            return false;
+            return nullptr;
         }
 
         std::vector<uint8_t> speculative_state;
@@ -375,7 +375,7 @@ struct server_slot {
         const size_t cur_size_dft = ctx_dft_state ? llama_state_seq_get_size_ext(ctx_dft_state, id, flags) : 0;
 
         if (cur_size_tgt == 0 || (ctx_dft_state && cur_size_dft == 0)) {
-            return false;
+            return nullptr;
         }
 
         const size_t cur_size = cur_size_tgt + cur_size_dft;
@@ -389,7 +389,7 @@ struct server_slot {
             data.drft.resize(cur_size_dft);
             data.spec = speculative_state;
         } catch (const std::bad_alloc &) {
-            return false;
+            return nullptr;
         }
 
         const size_t saved_tgt = llama_state_seq_get_data_ext(
@@ -397,21 +397,25 @@ struct server_slot {
         const size_t saved_dft = ctx_dft_state ? llama_state_seq_get_data_ext(
                 ctx_dft_state, data.drft.data(), cur_size_dft, id, flags) : 0;
         if (saved_tgt != cur_size_tgt || (ctx_dft_state && saved_dft != cur_size_dft)) {
-            return false;
+            return nullptr;
         }
 
-        return prompt_cache.insert(prompt, std::move(data)) != nullptr;
+        return prompt_cache.insert(prompt, std::move(data));
     }
 
     bool prompt_load(
             server_prompt_cache & prompt_cache,
             const server_tokens & tokens,
             size_t live_native_restorable_tokens,
-            int32_t reuse_alignment) {
+            int32_t reuse_alignment,
+            const server_prompt_cache_state * excluded = nullptr) {
         const uint64_t restored_before = prompt_cache.restore_successes;
+        server_prompt_restore_timings restore_timings;
         bool res = prompt_cache.load(
                 prompt, tokens, ctx_tgt, draft_owns_state ? ctx_dft : nullptr, spec, id,
-                live_native_restorable_tokens, reuse_alignment);
+                live_native_restorable_tokens, reuse_alignment, excluded, &restore_timings);
+        stats.cache_ram_restore_prepare_ms += restore_timings.prepare_us / 1000.0;
+        stats.cache_ram_restore_commit_ms += restore_timings.commit_us / 1000.0;
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
             prompt_cache_reason = "ram_restore_failed";
@@ -1717,6 +1721,7 @@ private:
     }
 
     server_slot * get_available_slot(const server_task & task) {
+        const int64_t t_slot_start = ggml_time_us();
         server_slot * ret = nullptr;
 
         bool update_cache = false;
@@ -1821,6 +1826,16 @@ private:
         }
 
         if (ret) {
+            ret->stats.cache_slot_ms = 0.0;
+            ret->stats.cache_ram_save_ms = 0.0;
+            ret->stats.cache_ram_load_ms = 0.0;
+            ret->stats.cache_ram_restore_prepare_ms = 0.0;
+            ret->stats.cache_ram_restore_commit_ms = 0.0;
+            ret->stats.cache_ram_update_ms = 0.0;
+            ret->stats.cache_checkpoint_restore_ms = 0.0;
+            ret->stats.cache_checkpoint_prepare_ms = 0.0;
+            ret->stats.cache_checkpoint_commit_ms = 0.0;
+
             update_cache = update_cache && prompt_cache;
 
             // cache prompts only for completion tasks
@@ -1832,19 +1847,27 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache);
+                int64_t t_phase = ggml_time_us();
+                const auto * admitted = ret->prompt_save(*prompt_cache);
+                ret->stats.cache_ram_save_ms = (ggml_time_us() - t_phase) / 1000.0;
 
+                t_phase = ggml_time_us();
                 if (!ret->prompt_load(
                             *prompt_cache, task.tokens,
                             prompt_live_native_restorable(*ret, task.tokens),
-                            prompt_reuse_alignment())) {
+                            prompt_reuse_alignment(), admitted)) {
                     ret->prompt_clear();
                 }
+                ret->stats.cache_ram_load_ms = (ggml_time_us() - t_phase) / 1000.0;
 
+                t_phase = ggml_time_us();
                 prompt_cache->update();
+                ret->stats.cache_ram_update_ms = (ggml_time_us() - t_phase) / 1000.0;
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             }
+
+            ret->stats.cache_slot_ms = (ggml_time_us() - t_slot_start) / 1000.0;
         }
 
         return ret;
@@ -2713,22 +2736,17 @@ private:
         // state return false and leave the payload empty.
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
-        const int32_t checkpoint_min_step = params_base.checkpoint_min_step;
-
-        // evict checkpoints within min-step of a previous checkpoint, unless they were
-        // created by the current task
-        int64_t last = -1;
+        // Replace only an exact boundary. Nearby checkpoints can straddle a
+        // later edit, so collapsing them after every request recreates the
+        // deep historical fallback this checkpoint set is meant to prevent.
         for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
-            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + checkpoint_min_step) {
-                SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+            if (it->n_tokens == n_tokens_checkpoint) {
+                SLT_TRC(slot, "replacing context checkpoint at the same boundary (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
-
                 it = slot.prompt.checkpoints.erase(it);
-                continue;
+            } else {
+                ++it;
             }
-
-            last = it->n_tokens;
-            ++it;
         }
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
@@ -2758,12 +2776,17 @@ private:
             bool restore_target,
             bool restore_draft,
             bool restore_speculative) {
+        const int64_t t_start = ggml_time_us();
+        server_prompt_restore_timings restore_timings;
         const auto result = server_prompt_restore_transaction_diagnostic(
                 target, draft, spec.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY,
                 { checkpoint.data_tgt.data(), checkpoint.data_tgt.size() },
                 { checkpoint.data_dft.data(), checkpoint.data_dft.size() },
                 { checkpoint.data_spec.data(), checkpoint.data_spec.size() },
-                restore_target, restore_draft, restore_speculative);
+                restore_target, restore_draft, restore_speculative, &restore_timings);
+        slot.stats.cache_checkpoint_restore_ms += (ggml_time_us() - t_start) / 1000.0;
+        slot.stats.cache_checkpoint_prepare_ms += restore_timings.prepare_us / 1000.0;
+        slot.stats.cache_checkpoint_commit_ms += restore_timings.commit_us / 1000.0;
         if (!result.success) {
             const char * component = !result.has_component ? "none" :
                     result.component == SERVER_PROMPT_STATE_MAIN ? "target" :
@@ -4068,6 +4091,14 @@ private:
 
                     bool do_checkpoint = params_base.n_ctx_checkpoints > 0;
                     const int32_t checkpoint_min_step = params_base.checkpoint_min_step;
+                    const auto & spans = slot.task->params.message_spans;
+                    // Structured chats already checkpoint user boundaries. Add
+                    // periodic anchors only for raw/unstructured prompts, where
+                    // no semantic edit boundary is available.
+                    const int64_t checkpoint_interval = spans.spans.empty() ?
+                            server_prompt_checkpoint_interval(
+                                    slot.n_ctx, params_base.n_ctx_checkpoints, checkpoint_min_step,
+                                    prompt_reuse_alignment()) : 0;
 
                     // make checkpoints only for completion tasks
                     do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
@@ -4127,7 +4158,6 @@ private:
                         has_mtmd = true;
                     }
 
-                    const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
 
                     // add prompt tokens for processing in the current batch
@@ -4166,6 +4196,14 @@ private:
                             }
                         }
 
+                        // Split long prompts at a budgeted cadence so the durable
+                        // checkpoint set covers historical edits even without
+                        // structured message spans.
+                        if (do_checkpoint && checkpoint_interval > 0 &&
+                                slot.prompt.n_tokens() % checkpoint_interval == 0) {
+                            break;
+                        }
+
                         // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
                         // create checkpoints that many tokens before the end of the prompt:
                         //  - 4 + n_ubatch
@@ -4200,6 +4238,8 @@ private:
 
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
+                    const bool is_periodic_checkpoint = checkpoint_interval > 0 &&
+                            n_tokens_start > 0 && n_tokens_start % checkpoint_interval == 0;
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
@@ -4216,7 +4256,7 @@ private:
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
+                        if (!is_user_start && !is_periodic_checkpoint && !near_prompt_end) {
                             do_checkpoint = false;
                         }
                     }
@@ -4238,7 +4278,7 @@ private:
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
                             is_last_user_message || near_prompt_end ||
-                            n_tokens_start > slot.prompt.checkpoints.back().n_tokens + checkpoint_min_step);
+                            n_tokens_start >= slot.prompt.checkpoints.back().n_tokens + checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not

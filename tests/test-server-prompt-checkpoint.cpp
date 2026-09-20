@@ -29,6 +29,12 @@ static void speculative_rollback_checkpoint_boundary() {
     assert(server_prompt_checkpoint_boundary(795,   4, 128) == 768);
     assert(server_prompt_checkpoint_boundary(3,     4, 128) == 0);
 
+    assert(server_prompt_checkpoint_interval(131072, 32,    0, 128) == 4096);
+    assert(server_prompt_checkpoint_interval(131072, 32, 8192, 128) == 8192);
+    assert(server_prompt_checkpoint_interval(120000, 32,    0, 128) == 3840);
+    assert(server_prompt_checkpoint_interval(0,      32, 8192, 128) == 0);
+    assert(server_prompt_checkpoint_interval(131072,  0, 8192, 128) == 0);
+
     assert(!server_draft_context_owns_state(false, false));
     assert( server_draft_context_owns_state(true,  false));
     assert(!server_draft_context_owns_state(true,  true));
@@ -201,6 +207,32 @@ static void prompt_cache_ranks_safe_restorable_prefix_before_lexical_lcp() {
     assert(cache.load(current, requested, 0, 128, io));
     assert(restored);
     assert(current.tokens.size() == 2);
+}
+
+static void prompt_cache_does_not_restore_just_admitted_live_state() {
+    server_prompt_cache cache(1, 0);
+    server_prompt current = make_prompt({1, 2, 3, 4});
+    server_prompt_data data;
+    data.main = {0x2a};
+    const auto * admitted = cache.insert(current, std::move(data));
+    assert(admitted != nullptr);
+
+    bool restored = false;
+    server_prompt_cache_state_io io {
+        /*.has_draft =*/ false,
+        /*.has_speculative =*/ false,
+        /*.restore_transaction =*/ [&](const uint8_t *, size_t,
+                                       const uint8_t *, size_t,
+                                       const uint8_t *, size_t) {
+            restored = true;
+            return true;
+        },
+    };
+    server_tokens requested(llama_tokens {1, 2, 9}, false);
+    assert(cache.load(current, requested, 0, 1, io, admitted));
+    assert(!restored);
+    assert(cache.restore_attempts == 0);
+    assert(current.tokens.size() == 4);
 }
 
 static void checkpoint_failed_target_save_cannot_reuse_stale_bytes() {
@@ -380,6 +412,30 @@ static void server_planned_removal_preserves_atomic_media_chunks() {
     assert(removed_p0 == media_end);
 }
 
+static void cache_phase_timings_are_public() {
+    server_slot_stats stats;
+    stats.cache_slot_ms = 12.5;
+    stats.cache_ram_save_ms = 3.0;
+    stats.cache_ram_load_ms = 7.0;
+    stats.cache_ram_restore_prepare_ms = 5.0;
+    stats.cache_ram_restore_commit_ms = 2.0;
+    stats.cache_ram_update_ms = 0.5;
+    stats.cache_checkpoint_restore_ms = 2.0;
+    stats.cache_checkpoint_prepare_ms = 1.5;
+    stats.cache_checkpoint_commit_ms = 0.5;
+
+    const auto value = stats.to_json();
+    assert(value.at("cache_slot_ms") == 12.5);
+    assert(value.at("cache_ram_save_ms") == 3.0);
+    assert(value.at("cache_ram_load_ms") == 7.0);
+    assert(value.at("cache_ram_restore_prepare_ms") == 5.0);
+    assert(value.at("cache_ram_restore_commit_ms") == 2.0);
+    assert(value.at("cache_ram_update_ms") == 0.5);
+    assert(value.at("cache_checkpoint_restore_ms") == 2.0);
+    assert(value.at("cache_checkpoint_prepare_ms") == 1.5);
+    assert(value.at("cache_checkpoint_commit_ms") == 0.5);
+}
+
 static void prompt_cache_snapshot_restore_evict_stress() {
     server_prompt_cache cache(0, 0);
 
@@ -426,6 +482,7 @@ static void prompt_cache_snapshot_restore_evict_stress() {
 int main() {
     prompt_cache_ranks_safe_restorable_prefix_before_lexical_lcp();
     prompt_cache_load_target_success_draft_failure_is_atomic();
+    prompt_cache_does_not_restore_just_admitted_live_state();
     restore_transaction_validation_failures_are_atomic();
     restore_transaction_validation_failure_identifies_prepare_leg();
     speculative_rollback_checkpoint_boundary();
@@ -434,6 +491,7 @@ int main() {
     server_unsupported_removal_falls_back_to_full_reprocess();
     server_post_preflight_mutation_failure_clears_both_contexts();
     server_planned_removal_preserves_atomic_media_chunks();
+    cache_phase_timings_are_public();
     prompt_cache_snapshot_restore_evict_stress();
     {
         common_prompt_checkpoint ckpt;

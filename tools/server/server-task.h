@@ -95,6 +95,23 @@ static inline int64_t server_prompt_checkpoint_boundary(
     return boundary > 0 ? boundary - boundary % alignment : 0;
 }
 
+// Keep durable checkpoints distributed across the context even when callers do
+// not provide chat message spans. This bounds historical reprocessing instead
+// of concentrating every checkpoint near the latest prompt tail.
+static inline int64_t server_prompt_checkpoint_interval(
+        int64_t n_ctx,
+        int32_t n_checkpoints,
+        int32_t min_step,
+        int32_t alignment) {
+    GGML_ASSERT(alignment > 0);
+    if (n_ctx <= 0 || n_checkpoints <= 0) {
+        return 0;
+    }
+    const int64_t budget_step = (n_ctx + n_checkpoints - 1) / n_checkpoints;
+    const int64_t requested = std::max<int64_t>(std::max(0, min_step), budget_step);
+    return ((requested + alignment - 1) / alignment) * alignment;
+}
+
 enum server_task_type {
     SERVER_TASK_TYPE_COMPLETION,
     SERVER_TASK_TYPE_EMBEDDING,
@@ -767,11 +784,17 @@ struct server_prompt_restore_result {
     server_prompt_restore_reason reason = SERVER_PROMPT_RESTORE_NONE;
 };
 
+struct server_prompt_restore_timings {
+    int64_t prepare_us = 0;
+    int64_t commit_us = 0;
+};
+
 server_prompt_restore_result server_prompt_restore_transaction_diagnostic(
         server_prompt_state_view target,
         server_prompt_state_view draft,
         server_prompt_state_view speculative,
-        const server_prompt_restore_transaction_io & io);
+        const server_prompt_restore_transaction_io & io,
+        server_prompt_restore_timings * timings = nullptr);
 
 bool server_prompt_restore_transaction(
         server_prompt_state_view target,
@@ -803,7 +826,8 @@ server_prompt_restore_result server_prompt_restore_transaction_diagnostic(
         server_prompt_state_view speculative_state,
         bool restore_target,
         bool restore_draft,
-        bool restore_speculative);
+        bool restore_speculative,
+        server_prompt_restore_timings * timings = nullptr);
 
 struct server_prompt_data {
     std::vector<uint8_t> main;
@@ -869,7 +893,8 @@ struct server_prompt_cache {
             const server_tokens & tokens_new,
             size_t live_native_restorable_tokens,
             int32_t reuse_alignment,
-            const server_prompt_cache_state_io & io);
+            const server_prompt_cache_state_io & io,
+            const server_prompt_cache_state * excluded = nullptr);
 
     bool load(
             server_prompt & prompt,
@@ -879,7 +904,9 @@ struct server_prompt_cache {
             common_speculative * spec,
             int32_t id_slot,
             size_t live_native_restorable_tokens,
-            int32_t reuse_alignment);
+            int32_t reuse_alignment,
+            const server_prompt_cache_state * excluded = nullptr,
+            server_prompt_restore_timings * timings = nullptr);
 
     void update();
 

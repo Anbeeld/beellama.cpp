@@ -1354,6 +1354,15 @@ The response contains a `timings` object, for example:
   // ...
   "timings": {
     "cache_n": 236, // number of prompt tokens reused from cache
+    "cache_slot_ms": 0.124, // pre-launch slot selection and RAM-cache work
+    "cache_ram_save_ms": 0.0,
+    "cache_ram_load_ms": 0.0,
+    "cache_ram_restore_prepare_ms": 0.0,
+    "cache_ram_restore_commit_ms": 0.0,
+    "cache_ram_update_ms": 0.0,
+    "cache_checkpoint_restore_ms": 0.0, // live durable-checkpoint restore work
+    "cache_checkpoint_prepare_ms": 0.0,
+    "cache_checkpoint_commit_ms": 0.0,
     "prompt_n": 1, // number of prompt tokens being processed
     "prompt_ms": 30.958,
     "prompt_per_token_ms": 30.958,
@@ -1366,7 +1375,7 @@ The response contains a `timings` object, for example:
 }
 ```
 
-This provides information on the performance of the server. It also allows calculating the current context usage.
+This provides information on the performance of the server. `cache_slot_ms` accounts for work before prompt processing starts. The RAM fields split admission (`save`), restore preparation, restore commit, and cache maintenance (`update`); `cache_ram_load_ms` covers the complete lookup and restore operation. `cache_checkpoint_restore_ms` is included in `prompt_ms`, with its preparation and commit phases reported separately. The timings also allow calculating current context usage.
 
 The total number of tokens in context is equal to `prompt_n + cache_n + predicted_n`
 

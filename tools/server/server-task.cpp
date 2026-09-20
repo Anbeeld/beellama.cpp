@@ -10,6 +10,7 @@
 #include "speculative.h"
 #include "server-common.h"
 
+#include <chrono>
 #include <sstream>
 
 //
@@ -1937,7 +1938,8 @@ server_prompt_restore_result server_prompt_restore_transaction_diagnostic(
         server_prompt_state_view target,
         server_prompt_state_view draft,
         server_prompt_state_view speculative,
-        const server_prompt_restore_transaction_io & io) {
+        const server_prompt_restore_transaction_io & io,
+        server_prompt_restore_timings * timings) {
     if (!io.prepare || !io.commit) {
         return { false, false, SERVER_PROMPT_STATE_MAIN, SERVER_PROMPT_RESTORE_INVALID_IO };
     }
@@ -1949,10 +1951,18 @@ server_prompt_restore_result server_prompt_restore_transaction_diagnostic(
     }
 
     const auto prepare = [&](bool enabled, server_prompt_state_kind kind, server_prompt_state_view state) {
-        if (enabled && !io.prepare(kind, state)) {
-            return server_prompt_restore_result {
-                false, true, kind, SERVER_PROMPT_RESTORE_PREPARE_REJECTED
-            };
+        if (enabled) {
+            const auto t_start = std::chrono::steady_clock::now();
+            const bool prepared = io.prepare(kind, state);
+            if (timings) {
+                timings->prepare_us += std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - t_start).count();
+            }
+            if (!prepared) {
+                return server_prompt_restore_result {
+                    false, true, kind, SERVER_PROMPT_RESTORE_PREPARE_REJECTED
+                };
+            }
         }
         return server_prompt_restore_result {
             true, false, SERVER_PROMPT_STATE_MAIN, SERVER_PROMPT_RESTORE_NONE
@@ -1972,15 +1982,20 @@ server_prompt_restore_result server_prompt_restore_transaction_diagnostic(
 
     // Speculative apply is prepared and no-fail. Memory commits likewise only
     // publish already-validated backend writes and metadata.
-    if (io.restore_speculative) {
-        io.commit(SERVER_PROMPT_STATE_SPECULATIVE);
-    }
-    if (io.restore_target) {
-        io.commit(SERVER_PROMPT_STATE_MAIN);
-    }
-    if (io.restore_draft) {
-        io.commit(SERVER_PROMPT_STATE_DRAFT);
-    }
+    const auto commit = [&](bool enabled, server_prompt_state_kind kind) {
+        if (!enabled) {
+            return;
+        }
+        const auto t_start = std::chrono::steady_clock::now();
+        io.commit(kind);
+        if (timings) {
+            timings->commit_us += std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - t_start).count();
+        }
+    };
+    commit(io.restore_speculative, SERVER_PROMPT_STATE_SPECULATIVE);
+    commit(io.restore_target, SERVER_PROMPT_STATE_MAIN);
+    commit(io.restore_draft, SERVER_PROMPT_STATE_DRAFT);
     return { true, false, SERVER_PROMPT_STATE_MAIN, SERVER_PROMPT_RESTORE_NONE };
 }
 
@@ -2003,7 +2018,8 @@ server_prompt_restore_result server_prompt_restore_transaction_diagnostic(
         server_prompt_state_view speculative_state,
         bool restore_target,
         bool restore_draft,
-        bool restore_speculative) {
+        bool restore_speculative,
+        server_prompt_restore_timings * timings) {
     using memory_plan_ptr = std::unique_ptr<
             llama_state_seq_restore_plan,
             decltype(&llama_state_seq_restore_plan_free)>;
@@ -2046,7 +2062,7 @@ server_prompt_restore_result server_prompt_restore_transaction_diagnostic(
         },
     };
     return server_prompt_restore_transaction_diagnostic(
-            target_state, draft_state, speculative_state, io);
+            target_state, draft_state, speculative_state, io, timings);
 }
 
 bool server_prompt_restore_transaction(
@@ -2072,7 +2088,8 @@ bool server_prompt_cache::load(
         const server_tokens & tokens_new,
         size_t live_native_restorable_tokens,
         int32_t reuse_alignment,
-        const server_prompt_cache_state_io & io) {
+        const server_prompt_cache_state_io & io,
+        const server_prompt_cache_state * excluded) {
     const auto live_plan = server_prompt_plan_reuse(
             prompt, tokens_new, reuse_alignment, live_native_restorable_tokens, false);
 
@@ -2087,6 +2104,9 @@ bool server_prompt_cache::load(
 
     // find the most similar cached prompt, that would also preserve the most context
     for (auto it = states.begin(); it != states.end(); ++it) {
+        if (&*it == excluded) {
+            continue;
+        }
         const auto plan_cur = server_prompt_plan_reuse(
                 it->prompt, tokens_new, reuse_alignment, 0, true);
         const size_t lcp_cur = plan_cur.lexical_tokens;
@@ -2149,7 +2169,9 @@ bool server_prompt_cache::load(
         common_speculative * spec,
         int32_t id_slot,
         size_t live_native_restorable_tokens,
-        int32_t reuse_alignment) {
+        int32_t reuse_alignment,
+        const server_prompt_cache_state * excluded,
+        server_prompt_restore_timings * timings) {
     constexpr llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED;
     server_prompt_cache_state_io io {
         /*.has_draft =*/ ctx_dft != nullptr,
@@ -2157,15 +2179,15 @@ bool server_prompt_cache::load(
         /*.restore_transaction =*/ [&](const uint8_t * main, size_t main_size,
                                        const uint8_t * drft, size_t drft_size,
                                        const uint8_t * speculative_state, size_t speculative_size) {
-            return server_prompt_restore_transaction(
+            return server_prompt_restore_transaction_diagnostic(
                     ctx_tgt, ctx_dft, spec, id_slot, flags,
                     { main, main_size }, { drft, drft_size },
                     { speculative_state, speculative_size },
-                    true, ctx_dft != nullptr, spec != nullptr);
+                    true, ctx_dft != nullptr, spec != nullptr, timings).success;
         },
     };
 
-    return load(prompt, tokens_new, live_native_restorable_tokens, reuse_alignment, io);
+    return load(prompt, tokens_new, live_native_restorable_tokens, reuse_alignment, io, excluded);
 }
 
 void server_prompt_cache::update() {

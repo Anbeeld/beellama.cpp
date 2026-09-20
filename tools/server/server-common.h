@@ -408,6 +408,19 @@ struct server_slot_stats {
     std::string cache_source     = "none";
     std::string cache_reason     = "none";
 
+    // Cache work that happens before or within prompt processing. Slot/RAM
+    // phases are outside prompt_ms; checkpoint restore is also exposed
+    // separately so user-visible wall time can be reconciled.
+    double cache_slot_ms               = 0.0;
+    double cache_ram_save_ms                 = 0.0;
+    double cache_ram_load_ms                 = 0.0;
+    double cache_ram_restore_prepare_ms      = 0.0;
+    double cache_ram_restore_commit_ms       = 0.0;
+    double cache_ram_update_ms               = 0.0;
+    double cache_checkpoint_restore_ms       = 0.0;
+    double cache_checkpoint_prepare_ms       = 0.0;
+    double cache_checkpoint_commit_ms        = 0.0;
+
     // speculative decoding stats
     // note: the per-position breakdown lives in server_slot, it is not needed in a task result
     uint64_t n_draft_tokens      = 0;

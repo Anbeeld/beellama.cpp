@@ -182,7 +182,10 @@ bool llama_memory_recurrent::can_seq_rm(llama_seq_id seq_id, llama_pos p0, llama
     const auto & cell = cells[tail_id];
     if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
         const llama_pos rollback = cell.pos - (p0 - 1);
-        return rollback >= 1 && rollback <= llama_pos(n_rs_seq);
+        // A recurrent snapshot rollback is consumed by the next graph input.
+        // Until then, a second partial rollback cannot be represented and
+        // must be rejected during planning, before mutation starts.
+        return rs_idx[seq_id] == 0 && rollback >= 1 && rollback <= llama_pos(n_rs_seq);
     }
     return true;
 }

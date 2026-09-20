@@ -100,10 +100,17 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
         ok = ok && llama_decode(ctx_roll, batch) == 0;
         llama_batch_free(batch);
 
-        ok = ok && llama_memory_seq_rm(llama_get_memory(ctx_roll), (llama_seq_id) s, p0, -1);
+        llama_memory_t memory = llama_get_memory(ctx_roll);
+        ok = ok && llama_memory_seq_rm(memory, (llama_seq_id) s, p0, -1);
 
-        // a second partial removal while one is pending must be refused
-        ok = ok && !llama_memory_seq_rm(llama_get_memory(ctx_roll), (llama_seq_id) s, p0 - 1, -1);
+        // A pending recurrent rollback is single-use. Planning must reject a
+        // second partial removal instead of promising a mutation that fails.
+        llama_pos planned_p0 = -1;
+        llama_pos planned_p1 = -1;
+        ok = ok && !llama_memory_can_seq_rm(memory, (llama_seq_id) s, p0 - 1, -1);
+        ok = ok && !llama_memory_seq_rm_plan(
+                memory, (llama_seq_id) s, p0 - 1, -1, &planned_p0, &planned_p1);
+        ok = ok && !llama_memory_seq_rm(memory, (llama_seq_id) s, p0 - 1, -1);
     }
     if (!ok) {
         fprintf(stderr, "%s : multi-seq prefill/rollback failed\n", __func__);

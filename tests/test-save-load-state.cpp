@@ -94,19 +94,21 @@ static bool test_tail_state_contract(
     const size_t body_size = llama_state_get_size_ext(source.get(), body_flag);
     const bool has_overlay_state = exact_size > body_size;
 
-    if (params.kvarn.type == LLAMA_KVARN_TYPE_DISABLED && has_overlay_state &&
-            !llama_get_memory(source.get())->requires_state_for_partial_restore()) {
-        LOG_ERR("%s: standard precision tail does not participate in partial checkpoints\n", __func__);
-        return false;
-    }
-
     if (params.kvarn.type == LLAMA_KVARN_TYPE_DISABLED && has_overlay_state) {
+        const bool needs_partial =
+                llama_get_memory(source.get())->requires_state_for_partial_restore();
         const auto partial_flag = llama_state_seq_flags(LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         const auto exact_flag = llama_state_seq_flags(LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED);
         const size_t partial_size = llama_state_seq_get_size_ext(source.get(), 0, partial_flag);
         const size_t self_contained_size = llama_state_seq_get_size_ext(source.get(), 0, exact_flag);
-        if (partial_size == 0 || partial_size >= self_contained_size) {
-            LOG_ERR("%s: standard precision-tail partial checkpoint copied the body (%zu >= %zu)\n",
+        if (needs_partial) {
+            if (partial_size == 0 || partial_size >= self_contained_size) {
+                LOG_ERR("%s: standard precision-tail partial checkpoint copied the body (%zu >= %zu)\n",
+                        __func__, partial_size, self_contained_size);
+                return false;
+            }
+        } else if (self_contained_size > 0 && partial_size >= self_contained_size) {
+            LOG_ERR("%s: overlay-with-body partial checkpoint copied the body (%zu >= %zu)\n",
                     __func__, partial_size, self_contained_size);
             return false;
         }
