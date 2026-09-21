@@ -322,6 +322,11 @@ Use exactly one of these options:
                                         allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1, q6_0, q6_1, q3_0, q3_1, q2_0, q2_1, kvarn2, kvarn3, kvarn4, kvarn5, kvarn6, kvarn8
                                         KVarN values require one model-backed speculative mode with an owned draft KV cache
                                         (env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V)
+--spec-draft-kvarn-window-chunk  N
+                                        CUDA KVarN prefill materialization window for an owned draft context
+                                        smaller values reduce transient VRAM but add partial-softmax merges
+                                        (default: 2048)
+                                        (env: LLAMA_ARG_SPEC_DRAFT_KVARN_WINDOW_CHUNK)
 --spec-draft-override-tensor, -otd, --override-tensor-draft  <tensor name pattern>=<buffer type>,...
                                         override tensor buffer type for draft model
 --spec-draft-cpu-moe, -cmoed, --cpu-moe-draft

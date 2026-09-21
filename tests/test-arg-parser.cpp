@@ -463,6 +463,7 @@ static void test(void) {
         "binary_name", "-m", "model_file.gguf",
         "--cache-type-k", "kvarn4",
         "--cache-type-v", "kvarn2",
+        "--kvarn-window-chunk", "4096",
     };
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.kvarn.type == LLAMA_KVARN_K4V2_G128);
@@ -472,6 +473,7 @@ static void test(void) {
     assert(params.kvarn.swa_value_bits == 0);
     assert(params.kvarn.sink_tokens == 128);
     assert(params.kvarn.sinkhorn_iters == 16);
+    assert(params.kvarn.window_chunk == 4096);
     assert(params.kvarn.fail_if_unsupported);
     assert(params.cache_kvarn_bits_k == 4);
     assert(params.cache_kvarn_bits_v == 2);
@@ -479,7 +481,12 @@ static void test(void) {
     assert(params.cache_type_v == GGML_TYPE_Q2_0S);
     assert(!params.kv_unified);
     assert(common_context_params_to_llama(params).kvarn.type == LLAMA_KVARN_K4V2_G128);
+    assert(common_context_params_to_llama(params).kvarn.window_chunk == 4096);
     assert(!common_context_params_to_llama(params).kv_unified);
+
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--kvarn-window-chunk", "0"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
     params = common_params();
     argv = {
@@ -614,9 +621,17 @@ static void test(void) {
     }
 
     params = common_params();
-    argv = {"binary_name", "-m", "model_file.gguf", "--spec-type", "draft-simple", "--spec-draft-type-k", "kvarn4", "--spec-draft-type-v", "kvarn2"};
+    assert(params.speculative.draft.kvarn.window_chunk == 2048);
+    argv = {
+        "binary_name", "-m", "model_file.gguf", "--spec-type", "draft-simple",
+        "--spec-draft-type-k", "kvarn4", "--spec-draft-type-v", "kvarn2",
+        "--spec-draft-kvarn-window-chunk", "4096",
+    };
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
     assert(params.speculative.draft.kvarn.type == LLAMA_KVARN_K4V2_G128);
+    assert(params.speculative.draft.kvarn.window_chunk == 4096);
+    assert(params.kvarn.window_chunk == 0);
+    assert(common_base_params_to_speculative(params).kvarn.window_chunk == 4096);
     assert(params.speculative.draft.cache_type_k == GGML_TYPE_Q4_0);
     assert(params.speculative.draft.cache_type_v == GGML_TYPE_Q2_0S);
 

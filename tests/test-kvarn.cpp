@@ -741,6 +741,7 @@ static void test_runtime_validation() {
         }
 
         const auto params = llama_kvarn_params_for_type(type);
+        require(params.window_chunk == 0, "KVarN preset overrides the environment/default window");
         require(llama_kvarn_validate_runtime(params, supported) == nullptr, "valid runtime rejected");
     }
 
@@ -2166,7 +2167,8 @@ static std::vector<float> test_native_flash_attention_output(
         bool           eager_records = false,
         bool           non_causal_mask = false,
         bool           materialized_graph = false,
-        int            indirect_offset = 0) {
+        int            indirect_offset = 0,
+        int            window_chunk = 0) {
     ggml_init_params params = {
         /*.mem_size   =*/ 32 * 1024 * 1024,
         /*.mem_buffer =*/ nullptr,
@@ -2271,6 +2273,7 @@ static std::vector<float> test_native_flash_attention_output(
     ggml_tensor * sinks = force_generic ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_q_heads) : nullptr;
     ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, mask, 1.0f / std::sqrt(float(head_dim)), 0.0f, 0.0f);
     ggml_flash_attn_ext_add_sinks(out, sinks);
+    out->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_WINDOW_CHUNK] = window_chunk;
     if (native_view) {
         out->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN] =
             rotate_graph ? (original_value_domain ?
@@ -4301,6 +4304,19 @@ static void test_native_flash_attention_prefill_route_parity() {
         // reduction order slightly while preserving the online-softmax result.
         require_close_f32_rmse(generic, chunked, 3e-4f,
                 "chunked KVarN prefill merge disagrees with generic attention");
+
+        std::vector<float> context_chunked;
+        {
+            const std::string global_chunk = std::to_string(n_kv);
+            scoped_test_env force_global_chunk("GGML_KVARN_WINDOW_CHUNK", global_chunk.c_str());
+            context_chunked = test_native_flash_attention_output(
+                    gpu_backend, true, true, 256, bits, bits, 512, 6, 1,
+                    n_kv, 3, false, nullptr, false, tail_candidates, true,
+                    GGML_TYPE_F16, 0, false, false, -1, false, false, false, 0,
+                    std::max(128, n_kv/2));
+        }
+        require_close_f32_rmse(chunked, context_chunked, 1e-7f,
+                "per-context KVarN window does not override the global environment fallback");
     };
 
     require_route_parity(4, 512, 128,

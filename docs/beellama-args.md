@@ -26,6 +26,8 @@ body-plus-tail route and require a CUDA 12.4 build or release package. CUDA
 | `-ctv TYPE`, `--cache-type-v TYPE` | `LLAMA_ARG_CACHE_TYPE_V` | `f16` | Selects the target V cache with the same values and one-sided promotion rule as `--cache-type-k`. |
 | `-ctkd TYPE`, `--spec-draft-type-k TYPE` | `LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K` | `f16` | Selects the draft K cache. Bee accepts the six KVarN values for draft-simple, EAGLE3, audited owned Qwen MTP, DFlash1/DFlash2, and non-MLA DSpark contexts. A one-sided KVarN selection promotes draft V to the same width with a warning. |
 | `-ctvd TYPE`, `--spec-draft-type-v TYPE` | `LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V` | `f16` | Selects the draft V cache with the same values and one-sided promotion rule. Target and draft cache selections remain independent. |
+| `--kvarn-window-chunk N` | `LLAMA_ARG_KVARN_WINDOW_CHUNK` | `GGML_KVARN_WINDOW_CHUNK` or `65536` | Sets the target context's CUDA KVarN prefill materialization window. |
+| `--spec-draft-kvarn-window-chunk N` | `LLAMA_ARG_SPEC_DRAFT_KVARN_WINDOW_CHUNK` | `2048` | Sets an owned draft context's CUDA KVarN prefill materialization window independently. |
 | `--cache-type-k-swa TYPE` | `LLAMA_ARG_CACHE_TYPE_K_SWA` | Same as `--cache-type-k` | Overrides KVarN K precision for SWA layers. Accepts only the six `kvarnN` values, requires target KVarN, and must be paired with the V override. |
 | `--cache-type-v-swa TYPE` | `LLAMA_ARG_CACHE_TYPE_V_SWA` | Same as `--cache-type-v` | Overrides KVarN V precision for SWA layers. Accepts only the six `kvarnN` values, requires target KVarN, and must be paired with the K override. |
 
@@ -44,12 +46,16 @@ argument validation.
 CUDA multi-token KVarN prefill uses transient F16 K/V materialization windows.
 D64 uses this tiled route when a query batch exceeds the backend's native
 rotated-query limit. Decode remains record-native at every KV length.
-`GGML_KVARN_WINDOW_CHUNK` sets the positive token count per window and defaults
-to `65536`; missing, zero, and negative values use that default, while values
-above the active KV length are capped to that length. A smaller value reduces
-peak transient scratch for concurrent long prompts but adds partial-softmax
-merges and changes floating-point reduction order. It does not alter context or
-persistent KV-cache capacity.
+`--kvarn-window-chunk N` and `--spec-draft-kvarn-window-chunk N` independently
+set the positive token count per window for the target and owned draft contexts.
+The draft option is useful for shallow speculative models whose transient F16
+materialization workspace can otherwise outweigh their persistent KVarN cache
+saving. The draft context defaults to `2048`; the target context falls back to
+`GGML_KVARN_WINDOW_CHUNK`, which defaults to `65536`. Missing, zero, and
+negative environment values use that target default. Values above the active KV
+length are capped to that length. A smaller value reduces peak transient scratch
+but adds partial-softmax merges and changes floating-point reduction order. It
+does not alter context or persistent KV-cache capacity.
 
 On HIP/ROCm, KVarN prompt prefill defaults to the F32-accumulator WMMA route
 on arches whose tiles accumulate in fp32 (RDNA3/gfx11); RDNA4 stays on the

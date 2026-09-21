@@ -354,6 +354,9 @@ llama_context::llama_context(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+    if (params.kvarn.window_chunk > uint32_t(std::numeric_limits<int32_t>::max())) {
+        throw std::invalid_argument("KVarN window chunk exceeds the supported range");
+    }
     cparams.kvarn             = params.kvarn;
     cparams.kv_tail_tokens    = std::min(params.kv_tail_tokens, cparams.n_ctx);
     cparams.kv_tail_tokens_swa = std::min(params.kv_tail_tokens,

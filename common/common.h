@@ -356,6 +356,7 @@ struct common_params_speculative_draft {
         /*.group               =*/ 128,
         /*.sinkhorn_iters      =*/ 16,
         /*.sink_tokens         =*/ 128,
+        /*.window_chunk        =*/ 2048,
         /*.fail_if_unsupported =*/ true,
     };
 
@@ -671,6 +672,7 @@ struct common_params {
         /*.group               =*/ 128,
         /*.sinkhorn_iters      =*/ 16,
         /*.sink_tokens         =*/ 128,
+        /*.window_chunk        =*/ 0,
         /*.fail_if_unsupported =*/ true,
     };
 

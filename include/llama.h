@@ -225,9 +225,10 @@ extern "C" {
         int32_t swa_key_bits;
         int32_t swa_value_bits;
         int32_t group;
-        int32_t sinkhorn_iters;
-        int32_t sink_tokens;
-        bool    fail_if_unsupported;
+        int32_t  sinkhorn_iters;
+        int32_t  sink_tokens;
+        uint32_t window_chunk; // CUDA prefill materialization window; 0 = environment/default
+        bool     fail_if_unsupported;
     };
 
     LLAMA_API const char *              llama_kvarn_type_name       (enum llama_kvarn_type type);

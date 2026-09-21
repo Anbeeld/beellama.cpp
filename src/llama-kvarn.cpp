@@ -159,6 +159,7 @@ llama_kvarn_params llama_kvarn_default_params() {
         /*.group               =*/ 128,
         /*.sinkhorn_iters      =*/ 16,
         /*.sink_tokens         =*/ 128,
+        /*.window_chunk        =*/ 0,
         /*.fail_if_unsupported =*/ true,
     };
 }

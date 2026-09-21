@@ -70,13 +70,16 @@ and candidate runs. Record the model file, command, prompt or corpus, sampling
 settings, GPU, and commit with every result.
 
 CUDA multi-token KVarN prefill materializes transient F16 K/V windows. The
-v0.4.6 default keeps one window through 65,536 active tokens to avoid an
-additional partial-softmax merge. `GGML_KVARN_WINDOW_CHUNK` can select a smaller
-positive token count when concurrent long prompts require less transient
-scratch; the value does not change the context size, retained cache, KVarN bit
-width, or precision-tail length. Smaller windows remain mathematically
-online-softmax equivalent but change floating-point reduction order, so KLD
-comparisons must record this setting.
+target-context default keeps one window through 65,536 active tokens to avoid an
+additional partial-softmax merge. `--kvarn-window-chunk` and
+`--spec-draft-kvarn-window-chunk` select positive token counts for the target
+and owned draft contexts independently. The draft context defaults to `2048`,
+which keeps its transient F16 workspace bounded for shallow speculative models;
+the target context falls back to `GGML_KVARN_WINDOW_CHUNK`. The value does not
+change the context size, retained cache, KVarN bit width, or precision-tail
+length. Smaller windows remain mathematically online-softmax equivalent but
+change floating-point reduction order, so KLD comparisons must record both
+context settings.
 
 The CUDA specialized split, SWA-vector, and tiled descriptor-native MMA routes
 publish the same optional FP32 `(maximum, denominator)` metadata as upstream

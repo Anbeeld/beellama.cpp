@@ -454,6 +454,7 @@ extern "C" {
         GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN = 4,
         GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_BODYLESS = 5,
         GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_HISTORY_SLOTS = 6,
+        GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_WINDOW_CHUNK = 7,
     };
 
     enum ggml_flash_attn_ext_kvarn_domain {

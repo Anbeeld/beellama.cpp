@@ -3092,6 +3092,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+        GGML_ASSERT(cparams.kvarn.window_chunk <= uint32_t(INT32_MAX));
+        cur->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_WINDOW_CHUNK] =
+                static_cast<int32_t>(cparams.kvarn.window_chunk);
         if (kvarn_domain != GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO) {
             cur->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN] = (int32_t) kvarn_domain;
         }
