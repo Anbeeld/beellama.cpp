@@ -327,11 +327,11 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         layer.nextn.hnorm   = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,   "weight", il), { hc_dim }, flags);
         layer.nextn.eh_proj = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", il), { 2 * n_embd, n_embd }, flags);
 
-        // The MTP head has its own output mixer; shared sidecars do not carry
-        // the trunk's model-level hc_head tensors.
-        layer.nextn.hc_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", il), { hc_dim }, flags);
-        layer.nextn.hc_head_down = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_DOWN, "weight", il), { hc_dim, hc_lr }, flags);
-        layer.nextn.hc_head_up   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_UP,   "weight", il), { hc_lr, hc_dim }, flags);
+        // New shared sidecars place the MTP output mixer on the draft block.
+        // Legacy self-contained sidecars use the equivalent model-level output_hc tensors.
+        layer.nextn.hc_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", il), { hc_dim },          TENSOR_NOT_REQUIRED | flags);
+        layer.nextn.hc_head_down = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_DOWN, "weight", il), { hc_dim, hc_lr },   TENSOR_NOT_REQUIRED | flags);
+        layer.nextn.hc_head_up   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_UP,   "weight", il), { hc_lr, hc_dim },   TENSOR_NOT_REQUIRED | flags);
     }
 
 }
@@ -361,10 +361,14 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     const int    il    = hparams.n_layer();
     const auto & layer = model.layers[il];
 
-    GGML_ASSERT(layer.nextn.eh_proj     && "MTP block is missing nextn.eh_proj");
-    GGML_ASSERT(layer.nextn.enorm       && "MTP block is missing nextn.enorm");
-    GGML_ASSERT(layer.nextn.hnorm       && "MTP block is missing nextn.hnorm");
-    GGML_ASSERT(layer.nextn.hc_head_norm && "MTP block is missing nextn.hc_head_norm");
+    GGML_ASSERT(layer.nextn.eh_proj && "MTP block is missing nextn.eh_proj");
+    GGML_ASSERT(layer.nextn.enorm   && "MTP block is missing nextn.enorm");
+    GGML_ASSERT(layer.nextn.hnorm   && "MTP block is missing nextn.hnorm");
+
+    ggml_tensor * hc_head_norm = layer.nextn.hc_head_norm ? layer.nextn.hc_head_norm : model.hc_head_norm;
+    ggml_tensor * hc_head_down = layer.nextn.hc_head_down ? layer.nextn.hc_head_down : model.hc_head_down;
+    ggml_tensor * hc_head_up   = layer.nextn.hc_head_up   ? layer.nextn.hc_head_up   : model.hc_head_up;
+    GGML_ASSERT(hc_head_norm && hc_head_down && hc_head_up && "MTP block is missing its output mixer");
 
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
@@ -450,9 +454,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         inpL = ggml_reshape_3d(ctx0, flat, n_embd, hc, n_outputs);
     }
 
-    cur = build_hc_mix(inpL,
-            layer.nextn.hc_head_norm, layer.nextn.hc_head_down, layer.nextn.hc_head_up,
-            nullptr, nullptr, -1);
+    cur = build_hc_mix(inpL, hc_head_norm, hc_head_down, hc_head_up, nullptr, nullptr, -1);
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 

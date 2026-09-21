@@ -27,6 +27,8 @@ def main() -> None:
         "const bool mtp_only",
         "LLM_TENSOR_NEXTN_EH_PROJ",
         "LLM_TENSOR_NEXTN_HC_HEAD_NORM",
+        "TENSOR_NOT_REQUIRED | flags",
+        "layer.nextn.hc_head_norm ? layer.nextn.hc_head_norm : model.hc_head_norm",
         "qwen4exp_shared_model",
         "LLM_GRAPH_TYPE_DECODER_MTP",
         "llama_model_qwen4exp::graph_mtp::graph_mtp",
