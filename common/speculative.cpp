@@ -2709,6 +2709,13 @@ common_params common_base_params_to_speculative(const common_params & params) {
     const auto & params_spec = params.speculative.draft;
     common_params result = params;
 
+    if (params_spec.n_batch > 0) {
+        result.n_batch = params_spec.n_batch;
+    }
+    if (params_spec.n_ubatch > 0) {
+        result.n_ubatch = params_spec.n_ubatch;
+    }
+
     result.embedding    = false;
     result.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;
 
@@ -2855,6 +2862,12 @@ common_speculative_init_result::common_speculative_init_result(
         }
 
         pimpl->context.reset(ctx_dft);
+    }
+
+    if (pimpl->context) {
+        LOG_INF("%s: target context: n_batch=%u, n_ubatch=%u; draft context: n_batch=%u, n_ubatch=%u\n",
+                __func__, llama_n_batch(ctx_tgt), llama_n_ubatch(ctx_tgt),
+                llama_n_batch(pimpl->context.get()), llama_n_ubatch(pimpl->context.get()));
     }
 }
 

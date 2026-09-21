@@ -597,6 +597,8 @@ static maximum and selector confidence against the target workload.
 - [`--spec-type draft-dflash`](beellama-args.md#dflash-and-adaptive-draft-depth)
 - [`--spec-draft-model`](beellama-args.md#dflash-and-adaptive-draft-depth)
 - [`--spec-draft-n-max`](beellama-args.md#dflash-and-adaptive-draft-depth)
+- [`--spec-draft-batch-size`, `-bd`](beellama-args.md#dflash-and-adaptive-draft-depth)
+- [`--spec-draft-ubatch-size`, `-ubd`](beellama-args.md#dflash-and-adaptive-draft-depth)
 - [`--spec-dm-controller`](beellama-args.md#dflash-and-adaptive-draft-depth)
 - [`--spec-dm-profit-baseline-interval`](beellama-args.md#dflash-and-adaptive-draft-depth)
 
@@ -605,7 +607,10 @@ static maximum and selector confidence against the target workload.
 Compare adaptive and fixed-depth runs with the same prompt, target and draft
 files, cache types, sampling settings, and GPU. Report generated and accepted
 draft tokens as well as wall-clock throughput; output bytes are not a stable
-cross-build oracle for speculative decoding.
+cross-build oracle for speculative decoding. Draft batch controls leave target
+`-b/-ub` unchanged: logical `-bd` sets draft capacity, while physical `-ubd`
+sets draft work per batch. Smaller draft ubatches can reduce draft graph and
+workspace memory at the cost of prompt catch-up throughput.
 
 ### Known limitations
 

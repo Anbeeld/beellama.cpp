@@ -74,8 +74,8 @@ llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DFlash.gguf \
 
 `--spec-draft-n-max` is clamped to the draft model's trained block size.
 
-Model-backed speculative modes with owned draft caches—including draft-simple,
-EAGLE3, audited Qwen MTP, DFlash1/DFlash2, and non-MLA DSpark—may use KVarN:
+Model-backed speculative modes with owned draft caches, including draft-simple,
+EAGLE3, audited Qwen MTP, DFlash1/DFlash2, and non-MLA DSpark, may use KVarN:
 
 ```bash
 llama-server -m target.gguf --spec-type draft-dflash \
@@ -83,7 +83,17 @@ llama-server -m target.gguf --spec-type draft-dflash \
     --spec-draft-type-k kvarn4 --spec-draft-type-v kvarn2 -fa on
 ```
 
-The draft pair is independent of the target cache and applies to both
+Draft context batch sizing is also independent. Use
+`--spec-draft-batch-size N` (`-bd N`) for logical capacity and
+`--spec-draft-ubatch-size N` (`-ubd N`) for physical capacity. Their environment
+variables are `LLAMA_ARG_SPEC_DRAFT_BATCH_SIZE` and
+`LLAMA_ARG_SPEC_DRAFT_UBATCH_SIZE`. Omitted values inherit target `-b` and `-ub`
+respectively; explicit values affect only the derived draft context. A smaller
+draft ubatch can reduce draft graph and workspace memory, but may reduce prompt
+catch-up throughput. Existing context normalization still caps physical ubatch
+to logical batch, and n-gram-only modes do not create a draft context.
+
+The draft cache pair is independent of the target cache and applies to both
 full-attention and SWA draft layers. There is no draft precision-tail option;
 the explicit tail request stays zero and KVarN retains its intrinsic exact
 suffix of up to 128 tokens. Exact describes the stored K/V precision; the KVarN
@@ -266,6 +276,12 @@ Use exactly one of these options:
 --spec-draft-n-min                      N
                                         minimum number of draft tokens to use for speculative decoding (default: 0)
                                         (env: LLAMA_ARG_SPEC_DRAFT_N_MIN)
+--spec-draft-batch-size, -bd            N
+                                        logical maximum batch size for the draft context (default: same as --batch-size)
+                                        (env: LLAMA_ARG_SPEC_DRAFT_BATCH_SIZE)
+--spec-draft-ubatch-size, -ubd          N
+                                        physical maximum batch size for the draft context (default: same as --ubatch-size)
+                                        (env: LLAMA_ARG_SPEC_DRAFT_UBATCH_SIZE)
 --spec-draft-p-split, --draft-p-split   P
                                         speculative decoding split probability (default: 0.10)
                                         (env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT)

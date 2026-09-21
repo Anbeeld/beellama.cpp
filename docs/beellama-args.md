@@ -239,6 +239,8 @@ behavior. The `--spec-dm-*` rows are Bee server additions.
 | `--spec-draft-model FNAME`, `-md FNAME` | `LLAMA_ARG_SPEC_DRAFT_MODEL` | Unused | Loads an upstream-format `dflash` draft GGUF. |
 | `--spec-draft-n-max N` | `LLAMA_ARG_SPEC_DRAFT_N_MAX` | Upstream: `3`; omitted DFlash: `dflash.block_size - 1` | Sets the maximum draft depth. An explicit CLI or env value always wins; upstream clamps values above the drafter's trained limit. A block-16 drafter therefore defaults to 15 only when this setting is omitted. |
 | `--spec-draft-n-min N` | `LLAMA_ARG_SPEC_DRAFT_N_MIN` | `0` | Sets the minimum number of draft tokens used by upstream speculation. |
+| `--spec-draft-batch-size N`, `-bd N` | `LLAMA_ARG_SPEC_DRAFT_BATCH_SIZE` | Same as `--batch-size` | Sets the logical batch capacity of a model-backed draft context without changing target `-b`. |
+| `--spec-draft-ubatch-size N`, `-ubd N` | `LLAMA_ARG_SPEC_DRAFT_UBATCH_SIZE` | Same as `--ubatch-size` | Sets the physical batch capacity of a model-backed draft context without changing target `-ub`. A smaller draft ubatch can reduce draft graph and workspace memory, but it can also reduce prompt catch-up throughput. |
 | `--spec-draft-p-min P`, `--draft-p-min P` | `LLAMA_ARG_SPEC_DRAFT_P_MIN` | `0.0` | Stops an individual greedy draft when its probability falls below `P`; this is independent of the profit controller. |
 | `--spec-dm-controller MODE` | `LLAMA_ARG_SPEC_DM_CONTROLLER` | `profit` | For DFlash1, `profit` adapts depth from measured cycle profit and `off` keeps the resolved or explicit maximum static. DFlash2 always uses its fixed trained block limit and selector confidence; other speculative modes are unchanged. |
 | `--spec-dm-profit-min F` | `LLAMA_ARG_SPEC_DM_PROFIT_MIN` | `0.05` | Sets the minimum margin over the no-spec baseline before clearing disable dwell. Range: `0.0` to `0.50`. |
@@ -248,6 +250,13 @@ behavior. The `--spec-dm-*` rows are Bee server additions.
 | `--spec-dm-profit-min-samples N` | `LLAMA_ARG_SPEC_DM_PROFIT_MIN_SAMPLES` | `3` | Sets the samples required before a depth's profit statistics are ready. Range: `1` to `64`. |
 | `--spec-dm-profit-warmup N` | `LLAMA_ARG_SPEC_DM_PROFIT_WARMUP` | `0` | Sets measured samples for each initial positive-depth probe. `0` uses `--spec-dm-profit-min-samples`; range: `0` to `64`. |
 | `--spec-dm-profit-baseline-interval N` | `LLAMA_ARG_SPEC_DM_PROFIT_BASELINE_INTERVAL` | `1024` | Sets active controller cycles between no-spec baseline probes. `0` disables periodic probes; range: `0` to `4096`. |
+
+The draft batch controls apply to the derived draft context for model-backed
+speculation. Omitting either option inherits the matching target request.
+`n_batch` is the logical capacity and `n_ubatch` is the physical capacity;
+existing context normalization still caps the physical size to the logical
+size. Target `-b/--batch-size` and `-ub/--ubatch-size` remain independent.
+N-gram-only modes do not create a draft context.
 
 ## Reasoning loop guard
 
