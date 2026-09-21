@@ -198,8 +198,8 @@
 | `--simple-io` | use basic IO for better compatibility in subprocesses and limited consoles |
 | `--log-prompts-dir PATH` | Log prompts to directory (auto-created if not present; only used for debugging, default: disabled) |
 | `--spec-draft-hf, -hfd, -hfrd, --hf-repo-draft <user>/<model>[:quant]` | Same as --hf-repo, but for the draft model (default: unused)<br/>(env: LLAMA_ARG_SPEC_DRAFT_HF_REPO) |
-| `--spec-draft-batch-size, -bd N` | logical maximum batch size for the draft context (default: same as --batch-size)<br/>(env: LLAMA_ARG_SPEC_DRAFT_BATCH_SIZE) |
-| `--spec-draft-ubatch-size, -ubd N` | physical maximum batch size for the draft context (default: same as --ubatch-size)<br/>(env: LLAMA_ARG_SPEC_DRAFT_UBATCH_SIZE) |
+| `--spec-draft-batch-size, -bd N` | logical maximum batch size for the draft context (default: 512)<br/>(env: LLAMA_ARG_SPEC_DRAFT_BATCH_SIZE) |
+| `--spec-draft-ubatch-size, -ubd N` | physical maximum batch size for the draft context (default: 128)<br/>(env: LLAMA_ARG_SPEC_DRAFT_UBATCH_SIZE) |
 | `--spec-draft-threads, -td, --threads-draft N` | number of threads to use during generation (default: same as --threads) |
 | `--spec-draft-threads-batch, -tbd, --threads-batch-draft N` | number of threads to use during batch and prompt processing (default: same as --threads-draft) |
 | `--spec-draft-cpu-mask, -Cd, --cpu-mask-draft M` | Draft model CPU affinity mask. Complements cpu-range-draft (default: same as --cpu-mask) |

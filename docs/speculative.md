@@ -87,9 +87,9 @@ Draft context batch sizing is also independent. Use
 `--spec-draft-batch-size N` (`-bd N`) for logical capacity and
 `--spec-draft-ubatch-size N` (`-ubd N`) for physical capacity. Their environment
 variables are `LLAMA_ARG_SPEC_DRAFT_BATCH_SIZE` and
-`LLAMA_ARG_SPEC_DRAFT_UBATCH_SIZE`. Omitted values inherit target `-b` and `-ub`
-respectively; explicit values affect only the derived draft context. A smaller
-draft ubatch can reduce draft graph and workspace memory, but may reduce prompt
+`LLAMA_ARG_SPEC_DRAFT_UBATCH_SIZE`. They default to 512 and 128 respectively;
+explicit values affect only the derived draft context. A smaller draft ubatch
+can reduce draft graph and workspace memory, but may reduce prompt
 catch-up throughput. Existing context normalization still caps physical ubatch
 to logical batch, and n-gram-only modes do not create a draft context.
 
@@ -277,10 +277,10 @@ Use exactly one of these options:
                                         minimum number of draft tokens to use for speculative decoding (default: 0)
                                         (env: LLAMA_ARG_SPEC_DRAFT_N_MIN)
 --spec-draft-batch-size, -bd            N
-                                        logical maximum batch size for the draft context (default: same as --batch-size)
+                                        logical maximum batch size for the draft context (default: 512)
                                         (env: LLAMA_ARG_SPEC_DRAFT_BATCH_SIZE)
 --spec-draft-ubatch-size, -ubd          N
-                                        physical maximum batch size for the draft context (default: same as --ubatch-size)
+                                        physical maximum batch size for the draft context (default: 128)
                                         (env: LLAMA_ARG_SPEC_DRAFT_UBATCH_SIZE)
 --spec-draft-p-split, --draft-p-split   P
                                         speculative decoding split probability (default: 0.10)

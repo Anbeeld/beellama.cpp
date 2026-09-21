@@ -984,30 +984,30 @@ static void test_draft_batch_configuration_is_independent() {
     };
 
     common_params params;
-    assert(params.speculative.draft.n_batch == 0);
-    assert(params.speculative.draft.n_ubatch == 0);
+    assert(params.speculative.draft.n_batch == 512);
+    assert(params.speculative.draft.n_ubatch == 128);
     params.n_batch  = 2048;
     params.n_ubatch = 512;
 
     common_params draft = common_base_params_to_speculative(params);
     assert(params.n_batch == 2048);
     assert(params.n_ubatch == 512);
-    assert(draft.n_batch == 2048);
-    assert(draft.n_ubatch == 512);
+    assert(draft.n_batch == 512);
+    assert(draft.n_ubatch == 128);
 
     assert(parse(params, {
         "binary_name", "-m", "model.gguf", "-b", "2048", "-ub", "512",
-        "--spec-draft-batch-size", "512", "--spec-draft-ubatch-size", "128",
+        "--spec-draft-batch-size", "768", "--spec-draft-ubatch-size", "192",
     }));
     assert(params.n_batch == 2048);
     assert(params.n_ubatch == 512);
-    assert(params.speculative.draft.n_batch == 512);
-    assert(params.speculative.draft.n_ubatch == 128);
+    assert(params.speculative.draft.n_batch == 768);
+    assert(params.speculative.draft.n_ubatch == 192);
     draft = common_base_params_to_speculative(params);
     assert(params.n_batch == 2048);
     assert(params.n_ubatch == 512);
-    assert(draft.n_batch == 512);
-    assert(draft.n_ubatch == 128);
+    assert(draft.n_batch == 768);
+    assert(draft.n_ubatch == 192);
 
     params = common_params();
     assert(parse(params, { "binary_name", "-m", "model.gguf", "-b", "2048", "-ub", "512", "-bd", "512", "-ubd", "128" }));
@@ -1025,14 +1025,14 @@ static void test_draft_batch_configuration_is_independent() {
     assert(params.n_batch == 2048);
     assert(params.n_ubatch == 512);
     assert(draft.n_batch == 256);
-    assert(draft.n_ubatch == 512);
+    assert(draft.n_ubatch == 128);
 
     params = common_params();
     assert(parse(params, { "binary_name", "-m", "model.gguf", "-b", "2048", "-ub", "512", "-ubd", "128" }));
     draft = common_base_params_to_speculative(params);
     assert(params.n_batch == 2048);
     assert(params.n_ubatch == 512);
-    assert(draft.n_batch == 2048);
+    assert(draft.n_batch == 512);
     assert(draft.n_ubatch == 128);
 
     for (const char * option : {
@@ -1052,7 +1052,7 @@ static void test_draft_batch_configuration_is_independent() {
     assert(params.n_batch == 2048);
     assert(params.n_ubatch == 512);
     assert(params.speculative.draft.n_batch == 384);
-    assert(params.speculative.draft.n_ubatch == 0);
+    assert(params.speculative.draft.n_ubatch == 128);
     unset_test_env("LLAMA_ARG_SPEC_DRAFT_BATCH_SIZE");
 
     set_test_env("LLAMA_ARG_SPEC_DRAFT_UBATCH_SIZE", "96");
@@ -1060,7 +1060,7 @@ static void test_draft_batch_configuration_is_independent() {
     assert(parse(params, { "binary_name", "-m", "model.gguf", "-b", "2048", "-ub", "512" }));
     assert(params.n_batch == 2048);
     assert(params.n_ubatch == 512);
-    assert(params.speculative.draft.n_batch == 0);
+    assert(params.speculative.draft.n_batch == 512);
     assert(params.speculative.draft.n_ubatch == 96);
     unset_test_env("LLAMA_ARG_SPEC_DRAFT_UBATCH_SIZE");
 }
