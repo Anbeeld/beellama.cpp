@@ -83,15 +83,13 @@ llama-server -m target.gguf --spec-type draft-dflash \
     --spec-draft-type-k kvarn4 --spec-draft-type-v kvarn2 -fa on
 ```
 
-Draft context batch sizing is also independent. Use
-`--spec-draft-batch-size N` (`-bd N`) for logical capacity and
-`--spec-draft-ubatch-size N` (`-ubd N`) for physical capacity. Their environment
-variables are `LLAMA_ARG_SPEC_DRAFT_BATCH_SIZE` and
-`LLAMA_ARG_SPEC_DRAFT_UBATCH_SIZE`. They default to 512 and 128 respectively;
-explicit values affect only the derived draft context. A smaller draft ubatch
-can reduce draft graph and workspace memory, but may reduce prompt
-catch-up throughput. Existing context normalization still caps physical ubatch
-to logical batch, and n-gram-only modes do not create a draft context.
+Model-backed draft contexts inherit the target logical batch capacity configured
+with `--batch-size` (`-b`). Use `--spec-draft-ubatch-size N` (`-ubd N`) to set an
+independent physical capacity; its environment variable is
+`LLAMA_ARG_SPEC_DRAFT_UBATCH_SIZE` and it defaults to 128. A smaller draft ubatch
+can reduce draft graph and workspace memory, but may reduce prompt catch-up
+throughput. Existing context normalization still caps physical ubatch to logical
+batch, and n-gram-only modes do not create a draft context.
 
 The draft cache pair is independent of the target cache and applies to both
 full-attention and SWA draft layers. There is no draft precision-tail option;
@@ -276,9 +274,6 @@ Use exactly one of these options:
 --spec-draft-n-min                      N
                                         minimum number of draft tokens to use for speculative decoding (default: 0)
                                         (env: LLAMA_ARG_SPEC_DRAFT_N_MIN)
---spec-draft-batch-size, -bd            N
-                                        logical maximum batch size for the draft context (default: 512)
-                                        (env: LLAMA_ARG_SPEC_DRAFT_BATCH_SIZE)
 --spec-draft-ubatch-size, -ubd          N
                                         physical maximum batch size for the draft context (default: 128)
                                         (env: LLAMA_ARG_SPEC_DRAFT_UBATCH_SIZE)

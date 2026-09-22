@@ -327,7 +327,6 @@ struct common_params_model {
 struct common_params_speculative_draft {
     int32_t n_max    = 3; // maximum number of tokens to draft during speculative decoding
     int32_t n_min    = 0; // minimum number of draft tokens to use for speculative decoding
-    int32_t n_batch  = 512; // logical batch size (0 = same as target)
     int32_t n_ubatch = 128; // physical batch size (0 = same as target)
 
     float p_split = 0.1f; // speculative decoding split probability

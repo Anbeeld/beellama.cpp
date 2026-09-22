@@ -2709,9 +2709,6 @@ common_params common_base_params_to_speculative(const common_params & params) {
     const auto & params_spec = params.speculative.draft;
     common_params result = params;
 
-    if (params_spec.n_batch > 0) {
-        result.n_batch = params_spec.n_batch;
-    }
     if (params_spec.n_ubatch > 0) {
         result.n_ubatch = params_spec.n_ubatch;
     }

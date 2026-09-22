@@ -974,7 +974,7 @@ static void test(void) {
     printf("test-arg-parser: all tests OK\n\n");
 }
 
-static void test_draft_batch_configuration_is_independent() {
+static void test_draft_ubatch_configuration_is_independent() {
     auto parse = [](common_params & params, std::vector<std::string> argv) {
         std::vector<char *> argv_ptrs;
         for (std::string & arg : argv) {
@@ -984,7 +984,6 @@ static void test_draft_batch_configuration_is_independent() {
     };
 
     common_params params;
-    assert(params.speculative.draft.n_batch == 512);
     assert(params.speculative.draft.n_ubatch == 128);
     params.n_batch  = 2048;
     params.n_ubatch = 512;
@@ -992,76 +991,53 @@ static void test_draft_batch_configuration_is_independent() {
     common_params draft = common_base_params_to_speculative(params);
     assert(params.n_batch == 2048);
     assert(params.n_ubatch == 512);
-    assert(draft.n_batch == 512);
+    assert(draft.n_batch == 2048);
     assert(draft.n_ubatch == 128);
 
     assert(parse(params, {
         "binary_name", "-m", "model.gguf", "-b", "2048", "-ub", "512",
-        "--spec-draft-batch-size", "768", "--spec-draft-ubatch-size", "192",
+        "--spec-draft-ubatch-size", "192",
     }));
     assert(params.n_batch == 2048);
     assert(params.n_ubatch == 512);
-    assert(params.speculative.draft.n_batch == 768);
     assert(params.speculative.draft.n_ubatch == 192);
     draft = common_base_params_to_speculative(params);
-    assert(params.n_batch == 2048);
-    assert(params.n_ubatch == 512);
-    assert(draft.n_batch == 768);
+    assert(draft.n_batch == 2048);
     assert(draft.n_ubatch == 192);
-
-    params = common_params();
-    assert(parse(params, { "binary_name", "-m", "model.gguf", "-b", "2048", "-ub", "512", "-bd", "512", "-ubd", "128" }));
-    assert(params.n_batch == 2048);
-    assert(params.n_ubatch == 512);
-    assert(params.speculative.draft.n_batch == 512);
-    assert(params.speculative.draft.n_ubatch == 128);
-    draft = common_base_params_to_speculative(params);
-    assert(draft.n_batch == 512);
-    assert(draft.n_ubatch == 128);
-
-    params = common_params();
-    assert(parse(params, { "binary_name", "-m", "model.gguf", "-b", "2048", "-ub", "512", "-bd", "256" }));
-    draft = common_base_params_to_speculative(params);
-    assert(params.n_batch == 2048);
-    assert(params.n_ubatch == 512);
-    assert(draft.n_batch == 256);
-    assert(draft.n_ubatch == 128);
 
     params = common_params();
     assert(parse(params, { "binary_name", "-m", "model.gguf", "-b", "2048", "-ub", "512", "-ubd", "128" }));
     draft = common_base_params_to_speculative(params);
     assert(params.n_batch == 2048);
     assert(params.n_ubatch == 512);
-    assert(draft.n_batch == 512);
+    assert(draft.n_batch == 2048);
     assert(draft.n_ubatch == 128);
 
-    for (const char * option : {
-            "--spec-draft-batch-size", "-bd", "--spec-draft-ubatch-size", "-ubd" }) {
-        for (const char * value : { "0", "-1" }) {
-            params = common_params();
-            const std::string error = capture_stderr([&]() {
-                assert(!parse(params, { "binary_name", option, value }));
-            });
-            assert(error.find(option) != std::string::npos);
-        }
+    for (const char * option : { "--spec-draft-batch-size", "-bd" }) {
+        params = common_params();
+        const std::string error = capture_stderr([&]() {
+            assert(!parse(params, { "binary_name", option, "512" }));
+        });
+        assert(error.find(option) != std::string::npos);
     }
 
-    set_test_env("LLAMA_ARG_SPEC_DRAFT_BATCH_SIZE", "384");
-    params = common_params();
-    assert(parse(params, { "binary_name", "-m", "model.gguf", "-b", "2048", "-ub", "512" }));
-    assert(params.n_batch == 2048);
-    assert(params.n_ubatch == 512);
-    assert(params.speculative.draft.n_batch == 384);
-    assert(params.speculative.draft.n_ubatch == 128);
-    unset_test_env("LLAMA_ARG_SPEC_DRAFT_BATCH_SIZE");
+    for (const char * value : { "0", "-1" }) {
+        params = common_params();
+        const std::string error = capture_stderr([&]() {
+            assert(!parse(params, { "binary_name", "--spec-draft-ubatch-size", value }));
+        });
+        assert(error.find("--spec-draft-ubatch-size") != std::string::npos);
+    }
 
     set_test_env("LLAMA_ARG_SPEC_DRAFT_UBATCH_SIZE", "96");
     params = common_params();
     assert(parse(params, { "binary_name", "-m", "model.gguf", "-b", "2048", "-ub", "512" }));
     assert(params.n_batch == 2048);
     assert(params.n_ubatch == 512);
-    assert(params.speculative.draft.n_batch == 512);
     assert(params.speculative.draft.n_ubatch == 96);
+    draft = common_base_params_to_speculative(params);
+    assert(draft.n_batch == 2048);
+    assert(draft.n_ubatch == 96);
     unset_test_env("LLAMA_ARG_SPEC_DRAFT_UBATCH_SIZE");
 }
 
@@ -1176,7 +1152,7 @@ static void test_single_device_draft_does_not_inherit_target_tensor_split() {
 int main(void) {
     try {
         test();
-        test_draft_batch_configuration_is_independent();
+        test_draft_ubatch_configuration_is_independent();
         test_draft_cache_configuration_is_independent();
         test_single_device_draft_does_not_inherit_target_tensor_split();
     } catch (std::exception & e) {
