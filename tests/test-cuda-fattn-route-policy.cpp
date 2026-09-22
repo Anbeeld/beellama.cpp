@@ -89,24 +89,38 @@ int main(int argc, char ** argv) {
             "optional body metadata changed an eligible KVarN route");
     };
 
-    expect_route({256, 1, 6, 4, 4, false, false, false, true, false, 8},
+    expect_route({256, 1, 6, 4, 4, false, false, false, true, false},
         GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_SPLIT,
         "Qwen-like D256 global decode did not select split decode");
-    expect_route({512, 1, 16, 4, 4, false, false, false, true, false, 8},
+    expect_route({512, 1, 16, 4, 4, false, false, false, true, false},
         GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_SPLIT,
         "Gemma-like D512 global decode did not select split decode");
-    expect_route({256, 1, 2, 4, 4, true, false, true, true, false, 8},
+    expect_route({256, 1, 2, 4, 4, true, false, true, true, false},
         GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_VECTOR,
         "Gemma-like D256 SWA decode did not select vector decode");
-    for (int n_q = 2; n_q <= GGML_CUDA_FATTN_KVARN_SPECIALIZED_DECODE_MAX_Q; ++n_q) {
-        expect_route({256, n_q, 6, 4, 4, false, false, false, true, false, 8},
-            n_q <= 8 ? GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_SPLIT : GGML_CUDA_FATTN_KVARN_ROUTE_GENERIC_MMA,
-            "multi-token verification shape selected the wrong KVarN decode route");
+    for (int head_dim : {128, 256, 512}) {
+        for (int n_q = 2; n_q <= GGML_CUDA_FATTN_KVARN_SPECIALIZED_DECODE_MAX_Q; ++n_q) {
+            expect_route({head_dim, n_q, 6, 4, 4, false, false, false, true, false},
+                n_q <= GGML_CUDA_FATTN_KVARN_SPLIT_DEFAULT_MAX_Q ?
+                    GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_SPLIT :
+                    GGML_CUDA_FATTN_KVARN_ROUTE_GENERIC_MMA,
+                "legacy head dimension selected the wrong multi-token KVarN decode route");
+        }
     }
-    expect_route({384, 1, 6, 4, 4, false, false, false, false, false, 8},
+    for (int n_q : {1, 8, 9, 10, 15, 16, 17}) {
+        expect_route({64, n_q, 4, 4, 4, false, false, false, true, false},
+            n_q <= GGML_CUDA_FATTN_KVARN_SPECIALIZED_DECODE_MAX_Q ?
+                GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_SPLIT :
+                GGML_CUDA_FATTN_KVARN_ROUTE_GENERIC_MMA,
+            "D64 split-eligible query width selected the wrong KVarN decode route");
+        expect_route({64, n_q, 4, 4, 4, false, false, false, false, false},
+            GGML_CUDA_FATTN_KVARN_ROUTE_GENERIC_MMA,
+            "D64 split-ineligible query width did not retain the generic fallback route");
+    }
+    expect_route({384, 1, 6, 4, 4, false, false, false, false, false},
         GGML_CUDA_FATTN_KVARN_ROUTE_GENERIC_MMA,
         "unsupported head shape did not remain on generic fallback");
-    expect_route({256, 64, 6, 4, 4, false, false, false, false, true, 8},
+    expect_route({256, 64, 6, 4, 4, false, false, false, false, true},
         GGML_CUDA_FATTN_KVARN_ROUTE_PROMPT_PREFILL,
         "prompt/prefill shape did not retain the prompt route");
     ok &= expect(ggml_cuda_fattn_kvarn_use_wide_mma(16, 6, true),

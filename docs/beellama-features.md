@@ -83,9 +83,13 @@ context settings.
 
 The CUDA specialized split, SWA-vector, and tiled descriptor-native MMA routes
 publish the same optional FP32 `(maximum, denominator)` metadata as upstream
-FlashAttention. Single-token generation uses split/vector decode, while short
-multi-token verification uses tiled MMA to reuse decoded K/V tiles across query
-rows. Q9-Q16 batches with GQA above four use a fused 128-column tile when the
+FlashAttention. For 64-dimensional heads, query widths 1 through 16 are eligible
+for split decode when the device and concrete geometry support it. Geometry
+selection keeps the single-query KV partition so autoregressive generation and
+speculative verification use the same online-softmax partitioning; if no valid
+geometry exists, dispatch retains the portable or materialized fallback. Other
+head dimensions keep their existing split limit of eight rows and generic-MMA
+policy. Q9-Q16 batches with GQA above four use a fused 128-column tile when the
 concrete kernel fits the device's opt-in shared-memory budget and has nonzero
 measured occupancy; all other devices and shapes retain the regular tile
 matrix. An attached precision tail therefore does not force KVarN away from its

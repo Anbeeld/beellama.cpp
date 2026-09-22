@@ -769,6 +769,15 @@ static bool ggml_cuda_flash_attn_ext_kvarn_decode_d(
     GGML_CUDA_FATTN_KVARN_FAST_DECODE_DISPATCH_K(GGML_CUDA_FATTN_KVARN_SELECT);
 #undef GGML_CUDA_FATTN_KVARN_SELECT
 
+    if (getenv("GGML_CUDA_FA_ROUTE_DEBUG") != nullptr) {
+        fprintf(stderr,
+            "CUDA_FA_ROUTE_GEOMETRY kernel=KVARN_DECODE_SPLIT D=%d bits=[%d,%d] "
+            "nq=%d nkv=%d gqa=%d available=%d candidates=%d split_tokens=%d nwarps=%d q_tile=%d\n",
+            D, plan.k.bits, plan.v.bits, n_q, plan.n_kv, gqa_ratio,
+            int(geometry.use_split), geometry.candidate_count, geometry.split_tokens,
+            geometry.nwarps, geometry.q_tile);
+        fflush(stderr);
+    }
     if (!geometry.use_split) {
         return false;
     }
@@ -1207,7 +1216,6 @@ bool ggml_cuda_flash_attn_ext_kvarn(
         int(Q->ne[0]), int(Q->ne[1]), gqa, plan.k.bits, plan.v.bits,
         plan.k.swa && plan.v.swa, dst->src[8] != nullptr,
         vector_eligible, split_eligible, prompt_prefill,
-        GGML_CUDA_FATTN_KVARN_SPLIT_DEFAULT_MAX_Q,
     });
 
     if (route == GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_VECTOR) {

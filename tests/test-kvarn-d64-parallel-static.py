@@ -43,6 +43,16 @@ assert "t -= KVAR_N_DIM" in src, \
 dispatch = Path("ggml/src/ggml-cuda/fattn-kvarn-dispatch.cu").read_text(encoding="utf8")
 assert "64 * 128 + 8 * 128 + 18" in dispatch, \
     "D64 capability admission must cover the production sealer's full shared workspace"
+route_policy = Path("ggml/src/ggml-cuda/fattn-kvarn-route-policy.h").read_text(encoding="utf8")
+assert re.search(
+    r"ggml_cuda_fattn_kvarn_split_max_q\(int head_dim\).*?head_dim == 64.*?"
+    r"GGML_CUDA_FATTN_KVARN_SPECIALIZED_DECODE_MAX_Q.*?"
+    r"GGML_CUDA_FATTN_KVARN_SPLIT_DEFAULT_MAX_Q",
+    route_policy,
+    re.S,
+), "D64 split policy must admit 16 queries without changing legacy dimensions"
+assert "ggml_cuda_fattn_kvarn_split_max_q(input.head_dim)" in route_policy, \
+    "route selection must derive its split limit from the head dimension"
 
 portable = Path("ggml/src/ggml-cuda/fattn-kvarn-portable.cuh").read_text(encoding="utf8")
 assert "GGML_CUDA_FATTN_KVARN_PORTABLE_SPLIT_TOKENS" in portable, \

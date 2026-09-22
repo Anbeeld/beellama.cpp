@@ -3571,6 +3571,60 @@ static void test_odd_offset_record_decode_gpu() {
     ggml_backend_free(gpu_backend);
 }
 
+static void test_d64_multi_query_split_parity_gpu() {
+    ggml_backend_t gpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
+    if (gpu_backend == nullptr ||
+            !backend_supports_kvarn_flash_attention_shape(gpu_backend, 64)) {
+        if (gpu_backend != nullptr) {
+            ggml_backend_free(gpu_backend);
+        }
+        return;
+    }
+
+    const auto route_stats_fns = get_kvarn_route_stats_fns(gpu_backend);
+    require(route_stats_fns.first != nullptr && route_stats_fns.second != nullptr,
+            "D64 multi-query split parity requires CUDA route telemetry");
+
+    for (const auto bits : { std::pair<int, int>{4, 4}, {8, 8} }) {
+        for (int n_q : {1, 2, 7, 8, 9, 10, 15, 16}) {
+            for (int n_kv : {127, 128, 129, 255, 256, 257, 4096, 16640, 32768}) {
+                const std::vector<float> expected = test_native_flash_attention_output(
+                        gpu_backend, false, true, 64, bits.first, bits.second, n_q,
+                        32, 8, n_kv, 5, false, nullptr, false, 0, false,
+                        GGML_TYPE_F16, 0, false, true, -1, true);
+                route_stats_fns.first();
+                const std::vector<float> actual = test_native_flash_attention_output(
+                        gpu_backend, true, true, 64, bits.first, bits.second, n_q,
+                        32, 8, n_kv, 5, false, nullptr, false, 0, false,
+                        GGML_TYPE_F16, 0, false, true, -1, true);
+                test_kvarn_route_stats stats = make_test_kvarn_route_stats();
+                route_stats_fns.second(&stats);
+
+                require_close_f32_rmse(actual, expected, 1e-2f,
+                        "D64 multi-query split decode differs from materialized reference");
+                std::printf("kvarn-d64-mq: k%d/v%d nq=%d nkv=%d split=%llu portable=%llu candidates=%llu compact=%llu direct=%llu\n",
+                        bits.first, bits.second, n_q, n_kv,
+                        (unsigned long long) stats.decode_split,
+                        (unsigned long long) stats.portable_native,
+                        (unsigned long long) stats.geometry_candidates,
+                        (unsigned long long) stats.compact_tail_entry,
+                        (unsigned long long) stats.direct_entry);
+                std::fflush(stdout);
+                require(stats.generic_mma == 0 && stats.materialize_fallback == 0 &&
+                            stats.decode_split + stats.portable_native > 0,
+                        "D64 multi-query verification did not use a direct-record route");
+                if (n_kv >= 4096) {
+                    require(stats.decode_split > 0 && stats.split_reduce > 0 &&
+                                stats.portable_native == 0 && stats.generic_shape_rejected == 0,
+                            "long-context D64 multi-query verification did not stay on split decode");
+                }
+            }
+        }
+    }
+
+    ggml_backend_free(gpu_backend);
+}
+
 static void test_d64_materialized_body_exact_tail_gpu() {
     ggml_backend_t gpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
     if (gpu_backend == nullptr ||
@@ -5680,6 +5734,12 @@ int main() {
         return 0;
     }
 
+    if (std::getenv("GGML_KVARN_TEST_D64_MULTI_QUERY_ONLY") != nullptr) {
+        test_d64_multi_query_split_parity_gpu();
+        std::printf("test-kvarn: D64 multi-query split parity OK\n");
+        return 0;
+    }
+
     kvarn_suffix_rollback_capability_contract();
     kvarn_composite_exclusivity_forwards();
     kvarn_composite_removal_plan_forwards();
@@ -5802,6 +5862,7 @@ int main() {
     test_native_flash_attention_cpu();
     test_native_flash_attention_gpu();
     test_odd_offset_record_decode_gpu();
+    test_d64_multi_query_split_parity_gpu();
     test_d64_materialized_body_exact_tail_gpu();
     test_native_flash_attention_prefill_route_parity();
     test_dflash_non_causal_attention_parity();

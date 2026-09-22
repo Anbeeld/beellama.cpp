@@ -222,8 +222,12 @@ struct ggml_cuda_fattn_kvarn_route_input {
     bool vector_eligible;
     bool split_eligible;
     bool prompt_prefill;
-    int  split_max_q;
 };
+
+inline int ggml_cuda_fattn_kvarn_split_max_q(int head_dim) {
+    return head_dim == 64 ? GGML_CUDA_FATTN_KVARN_SPECIALIZED_DECODE_MAX_Q :
+        GGML_CUDA_FATTN_KVARN_SPLIT_DEFAULT_MAX_Q;
+}
 
 // Optional softmax metadata is an output contract, not a route constraint.
 // Eligibility is computed by the shape/domain-specific dispatch helpers.
@@ -235,8 +239,7 @@ inline ggml_cuda_fattn_kvarn_route ggml_cuda_fattn_kvarn_select_route(
     if (input.vector_eligible) {
         return GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_VECTOR;
     }
-    const int split_max_q = input.split_max_q > 0 ? input.split_max_q : 1;
-    if (input.n_q <= split_max_q && input.split_eligible) {
+    if (input.n_q <= ggml_cuda_fattn_kvarn_split_max_q(input.head_dim) && input.split_eligible) {
         return GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_SPLIT;
     }
     return GGML_CUDA_FATTN_KVARN_ROUTE_GENERIC_MMA;
