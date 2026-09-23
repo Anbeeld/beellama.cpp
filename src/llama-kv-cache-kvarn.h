@@ -13,6 +13,7 @@ struct llama_hparams;
 struct llama_model;
 
 bool llama_kvarn_backend_supports_native_ops(ggml_backend_dev_t dev);
+bool llama_kvarn_backend_supports_non_causal_mask(ggml_backend_dev_t dev);
 bool llama_kvarn_backend_supports_ops(ggml_backend_dev_t dev, int head_dim);
 bool llama_kvarn_backend_native_attention_uses_original_v(ggml_backend_dev_t dev);
 uint32_t llama_kvarn_backend_native_rotated_max_query_tokens(ggml_backend_dev_t dev);
@@ -135,6 +136,8 @@ public:
     ggml_tensor * get_k_for_attention(ggml_context * ctx, int32_t il, bool native_attention) const;
     ggml_tensor * get_v_for_attention(ggml_context * ctx, int32_t il, bool native_attention) const;
     bool uses_native_attention(int32_t il) const;
+    bool has_qualified_dflash_mask() const;
+    ggml_backend_dev_t native_attention_backend(int32_t il) const;
     bool mixed_tail_native_preferred(int32_t il) const;
     bool native_attention_uses_original_v(int32_t il) const;
     uint32_t native_rotated_max_query_tokens(int32_t il) const;
@@ -300,6 +303,8 @@ public:
     void set_indexer_mirror(bool value) { indexer_mirror = value; }
     bool uses_compact_read_indices() const { return !indexer_mirror && !swa && n_stream == 1 && n_seq_max > 1; }
     bool uses_native_attention(int32_t il) const;
+    bool has_qualified_dflash_mask() const;
+    ggml_backend_dev_t native_attention_backend(int32_t il) const;
     bool mixed_tail_native_preferred(int32_t il) const;
     bool native_attention_uses_original_v(int32_t il) const;
     uint32_t native_rotated_max_query_tokens(int32_t il) const;
@@ -355,6 +360,7 @@ private:
         uint32_t k_slices;
         uint32_t v_slices;
         bool native_attention;
+        ggml_backend_dev_t native_attention_owner;
         bool mixed_tail_native;
         bool native_original_v;
         uint32_t native_rotated_max_query_tokens;

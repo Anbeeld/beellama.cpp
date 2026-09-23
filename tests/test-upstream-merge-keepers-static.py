@@ -183,7 +183,7 @@ def main() -> None:
     graph = (ROOT / "src/llama-graph.cpp").read_text(encoding="utf-8")
     for needle in (
         "llm_flash_attn_ext_set_kvarn_domain",
-        "kvarn_ctx->uses_native_attention",
+        "cache->uses_native_attention(il)",
         "kvarn_ctx->native_attention_uses_original_v",
         "mctx_cur->get_k(ctx0, il)",
         "mctx_cur->get_v(ctx0, il)",

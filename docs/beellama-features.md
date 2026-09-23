@@ -69,7 +69,8 @@ as the intended workload. Keep both `-b` and `-ub` identical between baseline
 and candidate runs. Record the model file, command, prompt or corpus, sampling
 settings, GPU, and commit with every result.
 
-CUDA multi-token KVarN prefill materializes transient F16 K/V windows. The
+CUDA KVarN prefill uses direct records for supported shapes and transient F16
+K/V windows for unsupported shapes. The
 target-context default keeps one window through 65,536 active tokens to avoid an
 additional partial-softmax merge. `--kvarn-window-chunk` and
 `--spec-draft-kvarn-window-chunk` select positive token counts for the target
@@ -152,9 +153,13 @@ KVarN supports target contexts and owned draft caches for draft-simple, EAGLE3,
 Qwen3.5/Qwen3.6 dense and MoE MTP, standalone Qwen3.8/Qwen4Exp MTP sidecars,
 DFlash1/DFlash2, and non-MLA DSpark. DSV4/MLA DSpark fails closed because its
 latent cache is incompatible with KVarN's dense K/V records. DFlash-family modes
-use one K/V pair for both
-full-attention and SWA sub-caches. Their non-causal block attention uses the
-materialized correctness route while persistent K/V remains compressed. Shared
+use one K/V pair for both full-attention and SWA sub-caches. On capable CUDA
+backends, owned DFlash1/DFlash2 D128/D256/D512 non-causal block attention can
+consume records directly for supported query/domain/tail shapes. Unqualified
+shapes and other backends retain materialized attention; persistent K/V remains
+compressed on either route. Multi-stream SWA (`--parallel 2` or higher without
+unified draft storage) stays materialized because record-native multi-slot
+parity is not qualified. Non-MLA DSpark remains materialized. Shared
 Gemma 4 MTP reads the target cache representation and does not allocate an
 independent draft record store. N-gram modes have no draft model cache and
 reject explicit draft KVarN selections during argument validation.

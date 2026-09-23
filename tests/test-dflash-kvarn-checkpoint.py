@@ -18,7 +18,7 @@ def run(args, cache):
     command = [str(args.server.resolve()), "-m", str(args.target.resolve()),
                "--spec-draft-model", str(args.draft.resolve()), "--spec-type", "draft-dflash",
                "--spec-draft-type-k", cache, "--spec-draft-type-v", cache,
-               "--cache-type-k", "q8_0", "--cache-type-v", "q8_0", "--kv-tail-tokens", "0",
+               "--cache-type-k", args.target_cache, "--cache-type-v", args.target_cache, "--kv-tail-tokens", "0",
                "-c", "64000", "-b", "2048", "-ub", "512", "-ngl", "all", "--spec-draft-ngl", "all",
                "--device", "CUDA0,CUDA1", "--spec-draft-device", "CUDA0,CUDA1", "--tensor-split", "51,49",
                "--load-mode", "dio", "--fit", "off", "--parallel", str(args.parallel),
@@ -53,7 +53,8 @@ def run(args, cache):
                 slot = 1 if args.parallel > 1 and index in (0, len(prompts) - 1) else 0
                 request = urllib.request.Request(url + "/completion", data=json.dumps({
                     "prompt": prompt, "n_predict": 128, "ignore_eos": True,
-                    "temperature": 0, "seed": 4242, "cache_prompt": True, "id_slot": slot,
+                    "temperature": 0, "seed": 4242, "cache_prompt": True,
+                    "return_tokens": True, "id_slot": slot,
                 }).encode(), headers={"Content-Type": "application/json"})
                 with urllib.request.urlopen(request, timeout=300) as response:
                     data = json.load(response)
@@ -72,13 +73,16 @@ def run(args, cache):
             restored = result["responses"][-2 if args.parallel > 1 else -1]
             request = urllib.request.Request(url + "/completion", data=json.dumps({
                 "prompt": prefix + " altered suffix.", "n_predict": 128, "ignore_eos": True,
-                "temperature": 0, "seed": 4242, "cache_prompt": False, "id_slot": 0,
+                "temperature": 0, "seed": 4242, "cache_prompt": False,
+                "return_tokens": True, "id_slot": 0,
             }).encode(), headers={"Content-Type": "application/json"})
             with urllib.request.urlopen(request, timeout=300) as response:
                 cold = json.load(response)
             result["cold_reference"] = cold
             assert cold["timings"]["cache_n"] == 0, cold["timings"]
             assert cold["content"] == restored["content"], "restored output differs from cold prefill"
+            assert len(restored["tokens"]) == len(cold["tokens"]) == 128, "missing checkpoint token IDs"
+            assert cold["tokens"] == restored["tokens"], "restored target tokens differ from cold prefill"
             text = (output / "server.log").read_text(encoding="utf-8", errors="replace")
             assert "checkpoint restore preparation failed" not in text, "checkpoint rejected"
             assert "partial KV state no longer" not in text, "checkpoint anchor lost"
@@ -103,6 +107,7 @@ def main():
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--output", type=Path, default=Path("tmp/dflash-kvarn-checkpoint"))
     parser.add_argument("--profiles", nargs="+", default=["q8_0", "kvarn2", "kvarn3", "kvarn4", "kvarn5", "kvarn6", "kvarn8"])
+    parser.add_argument("--target-cache", choices=["q8_0", "f16"], default="q8_0")
     parser.add_argument("--parallel", type=int, choices=[1, 2], default=1)
     parser.add_argument("--port", type=int, default=18341)
     args = parser.parse_args()

@@ -106,6 +106,24 @@ static void test_attention_domain_policy() {
     require(llama_kvarn_native_attention_allowed(false, LLM_ARCH_QWEN35),
             "the DFlash qualification gate must not alter other architecture routes");
 
+    const llama_kvarn_native_attention_request qualified = {
+        LLAMA_KVARN_MASK_DFLASH_BLOCK, true, true, true, 128,
+    };
+    require(llama_kvarn_native_attention_allowed(qualified),
+            "owned CUDA DFlash block must admit qualified native attention");
+    for (const auto & unqualified : {
+            llama_kvarn_native_attention_request{ LLAMA_KVARN_MASK_DFLASH_BLOCK, false, true, true, 128 },
+            llama_kvarn_native_attention_request{ LLAMA_KVARN_MASK_DFLASH_BLOCK, true, false, true, 128 },
+            llama_kvarn_native_attention_request{ LLAMA_KVARN_MASK_DFLASH_BLOCK, true, true, false, 128 },
+            llama_kvarn_native_attention_request{ LLAMA_KVARN_MASK_UNSUPPORTED, true, true, true, 128 },
+            llama_kvarn_native_attention_request{ LLAMA_KVARN_MASK_DFLASH_BLOCK, true, true, true, 64 },
+    }) {
+        require(!llama_kvarn_native_attention_allowed(unqualified),
+                "unqualified non-causal KVarN route must remain materialized");
+    }
+    require(llama_kvarn_native_attention_allowed({ LLAMA_KVARN_MASK_DFLASH_SWA, true, true, true, 256 }),
+            "owned CUDA DFlash SWA must admit qualified native attention");
+
     const auto portable_decode = llama_kvarn_plan_attention(true, false, 16, 1);
     require(portable_decode.native_attention,
             "portable single-token decode must use native KVarN attention");
@@ -2168,7 +2186,9 @@ static std::vector<float> test_native_flash_attention_output(
         bool           non_causal_mask = false,
         bool           materialized_graph = false,
         int            indirect_offset = 0,
-        int            window_chunk = 0) {
+        int            window_chunk = 0,
+        bool           non_causal_holes = false,
+        int            visible_from = 0) {
     ggml_init_params params = {
         /*.mem_size   =*/ 32 * 1024 * 1024,
         /*.mem_buffer =*/ nullptr,
@@ -2256,7 +2276,7 @@ static std::vector<float> test_native_flash_attention_output(
         v = ggml_kvarn_materialize(ctx, v_records, stored_v, read_indices,
                 n_kv, 0, n_stream, bits_v, true, stage_groups);
         k->op_params[4] = rotate_graph ? 1 : 0;
-        v->op_params[4] = rotate_graph ? 1 : 0;
+        v->op_params[4] = use_output_rot ? 1 : 0;
         k->op_params[5] = slices;
         v->op_params[5] = slices;
         k->op_params[6] = swa ? 1 : 0;
@@ -2351,6 +2371,9 @@ static std::vector<float> test_native_flash_attention_output(
                     "native compact segmented KVarN tail was rejected by its backend");
         }
     }
+    if (native_view && non_causal_mask) {
+        out->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_NON_CAUSAL_MASK] = 1;
+    }
     ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
     if (use_output_rot) {
         out = apply_kvarn_wht_head(ctx, out, head_dim);
@@ -2431,7 +2454,8 @@ static std::vector<float> test_native_flash_attention_output(
         for (int ikv = 0; ikv < n_kv; ++ikv) {
             // DFlash non-causal blocks can see every live row in their stream;
             // retain a short masked suffix to represent empty/padded cache cells.
-            const bool dflash_visible = ikv + 4 < n_kv;
+            const bool dflash_visible = ikv >= visible_from && ikv + 4 < n_kv &&
+                (!non_causal_holes || ikv % 11 != 3 || iq % 2 == 0);
             const bool visible = non_causal_mask
                 ? dflash_visible
                 : ikv <= iq + n_kv - n_q;
@@ -3483,7 +3507,10 @@ static void test_dflash_non_causal_attention_parity() {
     ggml_backend_t gpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
 
     const auto check = [&](ggml_backend_t backend, int head_dim, int bits_k, int bits_v,
-                           int n_q, int n_kv, bool exact_tail) {
+                           int n_q, int n_kv, bool exact_tail, bool swa = false,
+                           int current = 0, bool original_v = false, bool holes = false,
+                           ggml_type exact_type = GGML_TYPE_F16, bool eager = true,
+                           int visible_from = 0) {
         if (std::getenv("GGML_KVARN_TEST_TRACE_NATIVE") != nullptr) {
             std::fprintf(stderr, "DFlash non-causal trace: %s D%d K%dV%d nq=%d nkv=%d tail=%d\n",
                     backend == cpu_backend ? "CPU" : "GPU",
@@ -3494,14 +3521,38 @@ static void test_dflash_non_causal_attention_parity() {
         // materialization or attention-route error.
         const std::vector<float> expected = test_native_flash_attention_output(
                 backend, false, true, head_dim, bits_k, bits_v, n_q,
-                4, 1, n_kv, 3, false, nullptr, false, exact_tail ? 128 : 0,
-                false, GGML_TYPE_F16, 0, false, true, -1, true, true);
+                4, 1, n_kv, 3, swa, nullptr, false, exact_tail ? 128 : 0,
+                original_v, exact_type, current, false, true, -1, eager, true,
+                false, 0, 0, holes, visible_from);
         const std::vector<float> actual = test_native_flash_attention_output(
                 backend, false, true, head_dim, bits_k, bits_v, n_q,
-                4, 1, n_kv, 3, false, nullptr, false, exact_tail ? 128 : 0,
-                false, GGML_TYPE_F16, 0, false, true, -1, true, true, true);
+                4, 1, n_kv, 3, swa, nullptr, false, exact_tail ? 128 : 0,
+                original_v, exact_type, current, false, true, -1, eager, true,
+                true, 0, 0, holes, visible_from);
         require_close_f32_rmse(actual, expected, 1e-3f,
                 "DFlash non-causal materialized KVarN fallback differs from reference");
+        if (backend != gpu_backend) {
+            return;
+        }
+        const auto [reset_routes, get_routes] = get_kvarn_route_stats_fns(backend);
+        require(reset_routes && get_routes, "DFlash CUDA native route telemetry is unavailable");
+        reset_routes();
+        const std::vector<float> direct = test_native_flash_attention_output(
+                backend, true, true, head_dim, bits_k, bits_v, n_q,
+                4, 1, n_kv, 3, swa, nullptr, false, exact_tail ? 128 : 0,
+                original_v, exact_type, current, false, true, -1, eager, true,
+                false, 0, 0, holes, visible_from);
+        test_kvarn_route_stats routes = make_test_kvarn_route_stats();
+        get_routes(&routes);
+        require(routes.direct_entry + routes.compact_tail_entry > 0 &&
+                routes.materialize_fallback == 0,
+                "DFlash non-causal record-native attention did not execute");
+        if (swa && head_dim > 128) {
+            require(routes.portable_native > 0,
+                    "non-causal multi-slice SWA did not select the qualified portable route");
+        }
+        require_close_f32_rmse(direct, actual, 1e-3f,
+                "DFlash non-causal direct-record attention differs from materialized oracle");
     };
 
     for (ggml_backend_t backend : { cpu_backend, gpu_backend }) {
@@ -3515,6 +3566,28 @@ static void test_dflash_non_causal_attention_parity() {
         }
         for (int n_kv : { 127, 128, 129, 255, 256, 257 }) {
             check(backend, 256, 4, 2, std::min(16, n_kv), n_kv, false);
+        }
+        check(backend, 512, 8, 8, 9, 1024, false);
+        check(backend, 128, 4, 4, 4, 257, true, false, 4, false, true);
+        check(backend, 128, 4, 2, 4, 257, true, false, 0, false, false, GGML_TYPE_BF16);
+        check(backend, 256, 4, 2, 9, 1024, true, false, 0, false, false, GGML_TYPE_BF16);
+        check(backend, 256, 4, 2, 9, 257, true, true, 0, false, false, GGML_TYPE_F16);
+        check(backend, 256, 4, 2, 9, 384, true, true, 0, false, false, GGML_TYPE_F16);
+        check(backend, 256, 4, 2, 9, 512, false, false, 0, false, false, GGML_TYPE_F16);
+        check(backend, 128, 4, 2, 9, 512, false, true, 0, false, false, GGML_TYPE_F16);
+        check(backend, 256, 4, 2, 9, 512, false, true, 0, false, false, GGML_TYPE_F16, false, 256);
+        check(backend, 256, 4, 2, 9, 512, false, true, 0, false, false, GGML_TYPE_F16, false);
+        check(backend, 256, 4, 2, 9, 512, false, true, 0, false, false, GGML_TYPE_F16);
+        check(backend, 256, 4, 2, 9, 512, true, true, 0, false, false, GGML_TYPE_F16);
+        check(backend, 256, 4, 2, 9, 768, true, true, 0, false, false, GGML_TYPE_F16);
+        check(backend, 256, 4, 2, 9, 1024, true, true, 0, false, false, GGML_TYPE_F16);
+        check(backend, 256, 4, 2, 9, 1024, true, true, 0, false, false, GGML_TYPE_BF16);
+        check(backend, 256, 4, 2, 9, 1024, true, true, 1, false, false, GGML_TYPE_BF16);
+        check(backend, 256, 4, 2, 9, 1024, true, true, 1, false, true, GGML_TYPE_BF16);
+        check(backend, 512, 4, 2, 9, 512, true, true, 1, false, true, GGML_TYPE_BF16);
+        check(backend, 128, 4, 2, 8, 257, true, true, 0, false, true);
+        if (backend == gpu_backend) {
+            check(backend, 128, 4, 2, 64, 1024, true, false, 0, true, true);
         }
     }
 
@@ -3778,6 +3851,15 @@ static void test_native_flash_attention_gpu() {
                     capabilities.portable_integrated_tail_bf16 &&
                     capabilities.minimum_dynamic_shared_bytes > 0,
                     "native KVarN backend capability record omitted its portable body-plus-tail contract");
+            const bool is_cuda = std::strncmp(ggml_backend_dev_name(dev), "CUDA", 4) == 0;
+            const bool non_causal = (capabilities.route_families &
+                GGML_BACKEND_KVARN_ROUTE_NON_CAUSAL_MASK) != 0;
+            require(non_causal == (is_cuda && capabilities.original_v_domain &&
+                        capabilities.portable_direct_body &&
+                        capabilities.portable_integrated_tail_f16),
+                    "KVarN non-causal capability was advertised without a qualified CUDA route");
+            require(llama_kvarn_backend_supports_non_causal_mask(dev) == non_causal,
+                    "non-causal backend admission disagrees with the advertised capability");
             hip_safe_first = capabilities.specialized_generic_mma &&
                 !capabilities.original_v_domain;
             hip_physical_wave_size = capabilities.physical_warp_size;

@@ -5203,10 +5203,17 @@ static bool ggml_backend_cuda_kvarn_capabilities(
     }
 
     const auto capabilities = ggml_cuda_fattn_kvarn_device_capabilities(device);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    const uint32_t non_causal_mask = capabilities.portable_native &&
+            capabilities.portable_tail_f16 && capabilities.original_v_domain ?
+        GGML_BACKEND_KVARN_ROUTE_NON_CAUSAL_MASK : 0u;
+#else
+    const uint32_t non_causal_mask = 0u;
+#endif
     *result = {
         /* .struct_size                      = */ sizeof(*result),
         /* .abi_version                      = */ GGML_BACKEND_KVARN_CAPABILITIES_ABI_VERSION,
-        /* .route_families                   = */ capabilities.route_families,
+        /* .route_families                   = */ capabilities.route_families | non_causal_mask,
         /* .supported_head_dims              = */ capabilities.supported_head_dims,
         /* .store_materialize                = */ capabilities.store_materialize,
         /* .portable_direct_body             = */ capabilities.portable_native,

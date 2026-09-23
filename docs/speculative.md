@@ -97,8 +97,10 @@ the explicit tail request stays zero and KVarN retains its intrinsic exact
 suffix of up to 128 tokens. Exact describes the stored K/V precision; the KVarN
 attention transform and speculative batch shape can still produce normal
 floating-point differences from an F16-cache run, including a different greedy
-choice when logits are nearly tied. Non-causal DFlash-family block attention uses
-materialized KVarN attention while the persistent draft cache remains compressed.
+choice when logits are nearly tied. On capable CUDA devices, supported owned
+DFlash1/DFlash2 non-causal blocks consume KVarN records directly; unqualified
+shapes and backends materialize the body while persistent storage stays compressed.
+Multi-stream SWA draft caches and non-MLA DSpark remain materialized.
 
 See:
 

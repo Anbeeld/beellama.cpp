@@ -3252,6 +3252,21 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     return cur;
 }
 
+static void validate_native_kvarn_noncausal_operation(
+        const llama_kv_cache_context * mctx, int32_t il, ggml_tensor * op) {
+    const auto * cache = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx);
+    auto * dev = cache ? cache->native_attention_backend(il) : nullptr;
+    if (op && op->op == GGML_OP_FLASH_ATTN_EXT) {
+        op->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_NON_CAUSAL_MASK] = 1;
+    }
+    if (!dev || !op || op->op != GGML_OP_FLASH_ATTN_EXT ||
+            !ggml_backend_dev_supports_op(dev, op)) {
+        throw std::runtime_error(format(
+                "KVarN non-causal layer %d final native attention operation is unsupported by %s",
+                il, dev ? ggml_backend_dev_name(dev) : "unknown"));
+    }
+}
+
 static void validate_native_tail_operation(
         const llama_kv_cache_context * mctx, int32_t il, const ggml_tensor * op) {
     const auto * route = mctx->get_tail_layer_route(il);
@@ -3573,6 +3588,31 @@ void llm_graph_context::build_kv_store(
             __func__, il, has_exact_tail ? "yes" : "not-configured");
 }
 
+static bool llm_kvarn_native_attention_for(
+        const llama_kv_cache_kvarn_context * cache, llm_arch arch, bool causal,
+        bool swa, int il, int head_dim) {
+    if (!cache || !cache->uses_native_attention(il)) {
+        return false;
+    }
+    if (causal || arch != LLM_ARCH_DFLASH) {
+        return llama_kvarn_native_attention_allowed(causal, arch);
+    }
+    // Test-only materialized oracle for the same persistent records.
+    const char * force_materialized = getenv("LLAMA_KVARN_TEST_MATERIALIZE_NONCAUSAL");
+    if (force_materialized && atoi(force_materialized) != 0) {
+        return false;
+    }
+    const bool owned_dflash = cache->has_qualified_dflash_mask();
+    return llama_kvarn_native_attention_allowed({
+        owned_dflash ? (swa ? LLAMA_KVARN_MASK_DFLASH_SWA : LLAMA_KVARN_MASK_DFLASH_BLOCK) :
+            LLAMA_KVARN_MASK_UNSUPPORTED,
+        owned_dflash,
+        cache->uses_native_attention(il),
+        llama_kvarn_backend_supports_non_causal_mask(cache->native_attention_backend(il)),
+        head_dim,
+    });
+}
+
 ggml_tensor * llm_graph_context::build_attn(
         llm_graph_input_attn_kv * inp,
         ggml_tensor * wo,
@@ -3595,9 +3635,8 @@ ggml_tensor * llm_graph_context::build_attn(
     // Backend preferences choose an implementation inside the final operation;
     // they must not veto direct KVarN attention and force full materialization.
     // validate_native_tail_operation() proves the actual attached-tail shape.
-    const bool kvarn_native_attention = use_kvarn &&
-        kvarn_ctx->uses_native_attention(il) &&
-        llama_kvarn_native_attention_allowed(cparams.causal_attn, arch);
+    const bool kvarn_native_attention = llm_kvarn_native_attention_for(
+        kvarn_ctx, arch, cparams.causal_attn, false, il, (int) q_cur->ne[0]);
     const auto kvarn_plan = use_kvarn ? llama_kvarn_plan_attention(
         kvarn_native_attention,
         kvarn_ctx->native_attention_uses_original_v(il),
@@ -3805,6 +3844,10 @@ ggml_tensor * llm_graph_context::build_attn(
             mctx_cur->get_tail_slots(), !mctx_cur->has_kv_body(il), &final_tail_op);
     if (use_kvarn) {
         llm_flash_attn_ext_set_kvarn_domain(cur, kvarn_domain);
+    }
+    if (use_kvarn && arch == LLM_ARCH_DFLASH && !cparams.causal_attn &&
+            kvarn_plan.native_attention) {
+        validate_native_kvarn_noncausal_operation(mctx_cur, il, final_tail_op);
     }
     if (tail_route == LLAMA_KV_TAIL_ROUTE_NATIVE) {
         validate_native_tail_operation(mctx_cur, il, final_tail_op);
@@ -4034,9 +4077,8 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
     const auto * kvarn_ctx = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur);
     const bool use_kvarn = kvarn_ctx != nullptr;
-    const bool kvarn_native_attention = use_kvarn &&
-        kvarn_ctx->uses_native_attention(il) &&
-        llama_kvarn_native_attention_allowed(cparams.causal_attn, arch);
+    const bool kvarn_native_attention = llm_kvarn_native_attention_for(
+        kvarn_ctx, arch, cparams.causal_attn, is_swa, il, (int) q_cur->ne[0]);
     const auto kvarn_plan = use_kvarn ? llama_kvarn_plan_attention(
         kvarn_native_attention,
         kvarn_ctx->native_attention_uses_original_v(il),
@@ -4253,6 +4295,10 @@ ggml_tensor * llm_graph_context::build_attn(
             mctx_cur->get_tail_slots(), !mctx_cur->has_kv_body(il), &final_tail_op);
     if (use_kvarn) {
         llm_flash_attn_ext_set_kvarn_domain(cur, kvarn_domain);
+    }
+    if (use_kvarn && arch == LLM_ARCH_DFLASH && !cparams.causal_attn &&
+            kvarn_plan.native_attention) {
+        validate_native_kvarn_noncausal_operation(mctx_cur, il, final_tail_op);
     }
     if (tail_route == LLAMA_KV_TAIL_ROUTE_NATIVE) {
         validate_native_tail_operation(mctx_cur, il, final_tail_op);

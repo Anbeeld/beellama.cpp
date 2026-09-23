@@ -1,5 +1,7 @@
 #include "llama-kvarn.h"
 
+#include "ggml-backend.h"
+
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -61,11 +63,47 @@ static constexpr std::array<llama_kvarn_type_desc, LLAMA_KVARN_TYPE_COUNT> KVAR_
     LLAMA_KVARN_DESC(8, 8),
 }};
 
+bool llama_kvarn_backend_supports_non_causal_mask(ggml_backend_dev_t dev) {
+    if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return false;
+    }
+    if (ggml_backend_dev_is_meta(dev)) {
+        const size_t count = ggml_backend_meta_device_count(dev);
+        for (size_t i = 0; i < count; ++i) {
+            if (!llama_kvarn_backend_supports_non_causal_mask(
+                        ggml_backend_meta_device_get(dev, i))) {
+                return false;
+            }
+        }
+        return count > 0;
+    }
+    auto * reg = ggml_backend_dev_backend_reg(dev);
+    using capabilities_fn_t = bool (*)(ggml_backend_dev_t, ggml_backend_kvarn_capabilities *);
+    auto * fn = reg ? reinterpret_cast<capabilities_fn_t>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_kvarn_capabilities")) : nullptr;
+    if (!fn) {
+        return false;
+    }
+    ggml_backend_kvarn_capabilities capabilities = {};
+    capabilities.struct_size = sizeof(capabilities);
+    capabilities.abi_version = GGML_BACKEND_KVARN_CAPABILITIES_ABI_VERSION;
+    return fn(dev, &capabilities) && capabilities.struct_size == sizeof(capabilities) &&
+        capabilities.abi_version == GGML_BACKEND_KVARN_CAPABILITIES_ABI_VERSION &&
+        (capabilities.route_families & GGML_BACKEND_KVARN_ROUTE_NON_CAUSAL_MASK) != 0;
+}
+
 bool llama_kvarn_native_attention_allowed(bool causal_attn, llm_arch arch) {
-    // DFlash non-causal block masks are qualified through the materialized
-    // oracle. Keep native record-consuming attention for causal DFlash and
-    // all existing architectures.
+    // The pre-existing causal and other-architecture policy is independent of
+    // the separately qualified non-causal DFlash route.
     return causal_attn || arch != LLM_ARCH_DFLASH;
+}
+
+bool llama_kvarn_native_attention_allowed(const llama_kvarn_native_attention_request & request) {
+    return (request.mask == LLAMA_KVARN_MASK_DFLASH_BLOCK ||
+            request.mask == LLAMA_KVARN_MASK_DFLASH_SWA) &&
+        request.owned_dense_kv && request.native_body_and_tail &&
+        request.backend_non_causal_mask &&
+        (request.head_dim == 128 || request.head_dim == 256 || request.head_dim == 512);
 }
 
 llama_kvarn_attention_plan llama_kvarn_plan_attention(

@@ -42,6 +42,7 @@ def run(args, cache):
         command += ["--swa-full"]
     result = {"command": command, "cache": cache,
               "cuda_launch_blocking": os.getenv("CUDA_LAUNCH_BLOCKING"),
+              "expected_kvarn_route": args.expect_kvarn_route,
               "version": subprocess.check_output([str(args.server.resolve()), "--version"],
                                                  text=True, stderr=subprocess.STDOUT)}
     with stem.with_suffix(".log").open("w", encoding="utf-8") as log:
@@ -74,7 +75,8 @@ def run(args, cache):
             assert max(float(size) for _, size in allocations) < args.max_compute_mib, (
                 f"{cache}: unbounded attention compute allocation: {allocations}")
             if key.startswith("kvarn"):
-                assert "KVarN attention route=materialized" in text, "DFlash must retain materialized KVarN"
+                expected = "KVarN attention route=" + args.expect_kvarn_route
+                assert expected in text, f"DFlash did not exercise {expected}"
             for attempt in range(args.requests):
                 prompt = "alpha beta gamma delta epsilon zeta eta theta. " * args.prompt_repeats
                 prompt += "\n" + args.instruction
@@ -135,6 +137,7 @@ def main():
     parser.add_argument("--require-swa-growth", action="store_true", help="assert image requests grow the compact ring")
     parser.add_argument("--output", type=Path, default=Path("tmp/dflash-kvarn-memory"))
     parser.add_argument("--profiles", nargs="+", default=["q8_0", "kvarn2", "kvarn3", "kvarn4", "kvarn5", "kvarn6", "kvarn8", "kvarn4:kvarn2"])
+    parser.add_argument("--expect-kvarn-route", choices=["native", "materialized"], default="native")
     parser.add_argument("--context", type=int, default=64000)
     parser.add_argument("--split-mode", choices=["layer", "tensor"], default="layer")
     parser.add_argument("--max-compute-mib", type=float, default=2048)

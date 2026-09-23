@@ -194,8 +194,10 @@ llama-server -m target.gguf --spec-type draft-dflash \
 ```
 
 DFlash1, DFlash2, and non-MLA DSpark can use an owned draft KVarN cache with
-`--spec-draft-type-k/v kvarnN`. Non-causal block attention retains compressed
-persistent storage and uses the qualified materialized attention route.
+`--spec-draft-type-k/v kvarnN`. On capable CUDA devices, supported DFlash1/DFlash2
+non-causal block attention consumes compressed KVarN records directly; unsupported
+shapes and backends materialize the body. Multi-stream SWA draft caches retain
+the materialized route; non-MLA DSpark stays materialized.
 
 ### KVarN Target Cache
 
@@ -238,8 +240,6 @@ llama-server --models-preset presets.ini
 
 - [BeeLlama features and public repo diff](docs/beellama-features.md)
 - [BeeLlama args reference](docs/beellama-args.md)
-- [Qwen3.6 DFlash quickstart](docs/quickstart-qwen36-dflash.md)
-- [Gemma 4 31B DFlash quickstart](docs/quickstart-gemma-4-31b-dflash.md)
 - [Build docs](docs/build.md)
 - [Server docs](tools/server/README.md)
 - [Docker docs](docs/docker.md)

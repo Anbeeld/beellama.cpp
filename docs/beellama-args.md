@@ -33,8 +33,11 @@ body-plus-tail route and require a CUDA 12.4 build or release package. CUDA
 
 Draft KVarN is runtime-qualified on CUDA for draft-simple, EAGLE3, the owned
 MTP allowlist, DFlash1/DFlash2, and non-MLA DSpark. The CPU reference route is qualified
-for owned MTP. Non-causal DFlash-family models keep KVarN persistent storage but
-use materialized attention; the direct record-consuming route is not enabled.
+for owned MTP. Owned DFlash1/DFlash2 non-causal KVarN blocks use direct records
+on capable CUDA devices for supported D128/D256/D512 shapes; unsupported
+shapes and non-CUDA backends materialize without changing persistent storage.
+Multi-stream SWA draft caches also retain materialized attention. Non-MLA
+DSpark remains on the materialized route.
 DSV4/MLA DSpark is incompatible with KVarN's dense K/V representation and fails
 closed. Shared Gemma 4 MTP and MTP architectures outside the allowlist fail closed. For
 Gemma 4 MTP, select target KVarN with `--cache-type-k/v`; the assistant reads
@@ -43,7 +46,8 @@ remain unqualified until backend runtime tests pass. N-gram modes do not own a
 KV context and reject explicit KVarN `--spec-draft-type-k/v` selections during
 argument validation.
 
-CUDA multi-token KVarN prefill uses transient F16 K/V materialization windows.
+CUDA KVarN prefill uses direct records on supported shapes and transient F16
+K/V materialization windows on unsupported shapes.
 D64 uses this tiled route when a query batch exceeds the backend's native
 rotated-query limit. Decode remains record-native at every KV length.
 `--kvarn-window-chunk N` and `--spec-draft-kvarn-window-chunk N` independently

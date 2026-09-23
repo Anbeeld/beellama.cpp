@@ -148,6 +148,22 @@ struct llama_kvarn_attention_plan {
 
 bool llama_kvarn_native_attention_allowed(bool causal_attn, llm_arch arch);
 
+enum llama_kvarn_mask_semantics {
+    LLAMA_KVARN_MASK_UNSUPPORTED,
+    LLAMA_KVARN_MASK_DFLASH_BLOCK,
+    LLAMA_KVARN_MASK_DFLASH_SWA,
+};
+
+struct llama_kvarn_native_attention_request {
+    llama_kvarn_mask_semantics mask;
+    bool owned_dense_kv;
+    bool native_body_and_tail;
+    bool backend_non_causal_mask;
+    int head_dim;
+};
+
+bool llama_kvarn_native_attention_allowed(const llama_kvarn_native_attention_request & request);
+
 llama_kvarn_attention_plan llama_kvarn_plan_attention(
         bool native_attention,
         bool native_original_v,

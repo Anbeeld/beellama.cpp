@@ -1559,6 +1559,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
             (uint32_t) k_slices,
             (uint32_t) v_slices,
             native_attention,
+            dev,
             mixed_tail_native,
             native_original_v,
             native_rotated_max_query_tokens,
@@ -2528,6 +2529,14 @@ bool llama_kv_cache_kvarn_context::uses_native_attention(int32_t il) const {
     return shared_graph_layers.empty() && cache->uses_native_attention(graph_layer_for(il));
 }
 
+bool llama_kv_cache_kvarn_context::has_qualified_dflash_mask() const {
+    return shared_graph_layers.empty() && cache->has_qualified_dflash_mask();
+}
+
+ggml_backend_dev_t llama_kv_cache_kvarn_context::native_attention_backend(int32_t il) const {
+    return shared_graph_layers.empty() ? cache->native_attention_backend(graph_layer_for(il)) : nullptr;
+}
+
 bool llama_kv_cache_kvarn_context::mixed_tail_native_preferred(int32_t il) const {
     return shared_graph_layers.empty() && cache->mixed_tail_native_preferred(il);
 }
@@ -3038,6 +3047,15 @@ const llama_kv_cache_kvarn::layer & llama_kv_cache_kvarn::layer_for(int32_t il) 
 
 bool llama_kv_cache_kvarn::uses_native_attention(int32_t il) const {
     return layer_for(il).native_attention;
+}
+
+bool llama_kv_cache_kvarn::has_qualified_dflash_mask() const {
+    return model.arch == LLM_ARCH_DFLASH && model.dspark_markov_w1 == nullptr &&
+        hparams.dsv4_hc_mult == 0;
+}
+
+ggml_backend_dev_t llama_kv_cache_kvarn::native_attention_backend(int32_t il) const {
+    return layer_for(il).native_attention_owner;
 }
 
 bool llama_kv_cache_kvarn::mixed_tail_native_preferred(int32_t il) const {
