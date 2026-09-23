@@ -146,6 +146,7 @@ struct llama_kvarn_attention_plan {
     enum ggml_flash_attn_ext_kvarn_domain domain;
 };
 
+bool llama_kvarn_backend_supports_non_causal_mask(ggml_backend_dev_t dev);
 bool llama_kvarn_native_attention_allowed(bool causal_attn, llm_arch arch);
 
 enum llama_kvarn_mask_semantics {

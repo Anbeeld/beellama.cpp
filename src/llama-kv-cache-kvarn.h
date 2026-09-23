@@ -13,7 +13,6 @@ struct llama_hparams;
 struct llama_model;
 
 bool llama_kvarn_backend_supports_native_ops(ggml_backend_dev_t dev);
-bool llama_kvarn_backend_supports_non_causal_mask(ggml_backend_dev_t dev);
 bool llama_kvarn_backend_supports_ops(ggml_backend_dev_t dev, int head_dim);
 bool llama_kvarn_backend_native_attention_uses_original_v(ggml_backend_dev_t dev);
 uint32_t llama_kvarn_backend_native_rotated_max_query_tokens(ggml_backend_dev_t dev);
