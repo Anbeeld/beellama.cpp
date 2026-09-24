@@ -278,6 +278,10 @@ jobs:
     if: ${{ needs.release-meta.outputs.build_packages == 'true' }}
     runs-on: macos-14
     steps:
+      - name: Reserve cache save time
+        shell: bash
+        run: echo "CACHE_SAVE_DEADLINE=$(($(date +%s) + 330 * 60))" >> "$GITHUB_ENV"
+
       - name: Clone
         uses: actions/checkout@v6
         with:
@@ -296,6 +300,7 @@ jobs:
           restore-keys: release-${{ needs.release-meta.outputs.cache_parent_channel }}-macos-arm64
 
       - name: Build
+        id: build
         run: |
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
@@ -307,7 +312,13 @@ jobs:
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             ${{ env.CMAKE_ARGS }}
-          cmake --build build --config Release -j "$(sysctl -n hw.logicalcpu)"
+          if python3 .github/scripts/cache-build-deadline.py -- cmake --build build --config Release -j "$(sysctl -n hw.logicalcpu)"; then
+            :
+          else
+            result=$?
+            if [ "$result" -eq 75 ]; then exit 0; fi
+            exit "$result"
+          fi
           test -s build/tools/ui/dist/index.html
 
       - name: ccache stats
@@ -315,16 +326,18 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        # Skip on failure: a crashed build stores nothing and refreshes no entry
-        # mtimes, so evict-old-files could cull healthy entries and save a
-        # degraded cache. Cancelled (e.g. 6h timeout) jobs keep their partial
-        # progress so the next run resumes from it.
-        if: ${{ success() || cancelled() }}
+        # Only save once the build process tree has exited. A controlled build
+        # deadline keeps partial ccache progress without archiving live writes.
+        if: ${{ success() && !cancelled() }}
         uses: ./.github/actions/save-rolling-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-macos-arm64
           ref: refs/heads/main
           evict-old-files: 1d
+
+      - name: Report incomplete build
+        if: ${{ !cancelled() && steps.build.outputs.timed_out == 'true' }}
+        run: exit 1
 
       - name: Smoke package binaries
         run: |
@@ -358,6 +371,10 @@ jobs:
           - build: arm64
             os: ubuntu-24.04-arm
     steps:
+      - name: Reserve cache save time
+        shell: bash
+        run: echo "CACHE_SAVE_DEADLINE=$(($(date +%s) + 330 * 60))" >> "$GITHUB_ENV"
+
       - name: Clone
         uses: actions/checkout@v6
         with:
@@ -388,6 +405,7 @@ jobs:
           echo "CXX=g++-14" >> "${GITHUB_ENV}"
 
       - name: Build
+        id: build
         run: |
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
@@ -400,7 +418,13 @@ jobs:
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             ${{ env.CMAKE_ARGS }}
-          cmake --build build --config Release -j "$(nproc)"
+          if python3 .github/scripts/cache-build-deadline.py -- cmake --build build --config Release -j "$(nproc)"; then
+            :
+          else
+            result=$?
+            if [ "$result" -eq 75 ]; then exit 0; fi
+            exit "$result"
+          fi
           test -s build/tools/ui/dist/index.html
 
       - name: ccache stats
@@ -408,16 +432,18 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        # Skip on failure: a crashed build stores nothing and refreshes no entry
-        # mtimes, so evict-old-files could cull healthy entries and save a
-        # degraded cache. Cancelled (e.g. 6h timeout) jobs keep their partial
-        # progress so the next run resumes from it.
-        if: ${{ success() || cancelled() }}
+        # Only save once the build process tree has exited. A controlled build
+        # deadline keeps partial ccache progress without archiving live writes.
+        if: ${{ success() && !cancelled() }}
         uses: ./.github/actions/save-rolling-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-${{ matrix.os }}-cpu
           ref: refs/heads/main
           evict-old-files: 1d
+
+      - name: Report incomplete build
+        if: ${{ !cancelled() && steps.build.outputs.timed_out == 'true' }}
+        run: exit 1
 
       - name: Smoke package binaries
         run: |
@@ -444,6 +470,10 @@ jobs:
     if: ${{ needs.release-meta.outputs.build_packages == 'true' }}
     runs-on: ubuntu-22.04
     steps:
+      - name: Reserve cache save time
+        shell: bash
+        run: echo "CACHE_SAVE_DEADLINE=$(($(date +%s) + 330 * 60))" >> "$GITHUB_ENV"
+
       - name: Clone
         uses: actions/checkout@v6
         with:
@@ -469,6 +499,7 @@ jobs:
           sudo apt-get install -y build-essential mesa-vulkan-drivers vulkan-sdk libssl-dev
 
       - name: Build
+        id: build
         run: |
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
@@ -482,7 +513,13 @@ jobs:
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             ${{ env.CMAKE_ARGS }}
-          cmake --build build --config Release -j "$(nproc)"
+          if python3 .github/scripts/cache-build-deadline.py -- cmake --build build --config Release -j "$(nproc)"; then
+            :
+          else
+            result=$?
+            if [ "$result" -eq 75 ]; then exit 0; fi
+            exit "$result"
+          fi
           test -s build/tools/ui/dist/index.html
 
       - name: ccache stats
@@ -490,16 +527,18 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        # Skip on failure: a crashed build stores nothing and refreshes no entry
-        # mtimes, so evict-old-files could cull healthy entries and save a
-        # degraded cache. Cancelled (e.g. 6h timeout) jobs keep their partial
-        # progress so the next run resumes from it.
-        if: ${{ success() || cancelled() }}
+        # Only save once the build process tree has exited. A controlled build
+        # deadline keeps partial ccache progress without archiving live writes.
+        if: ${{ success() && !cancelled() }}
         uses: ./.github/actions/save-rolling-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-ubuntu-vulkan-x64
           ref: refs/heads/main
           evict-old-files: 1d
+
+      - name: Report incomplete build
+        if: ${{ !cancelled() && steps.build.outputs.timed_out == 'true' }}
+        run: exit 1
 
       - name: Smoke package binaries
         run: |
@@ -528,6 +567,10 @@ jobs:
       ROCM_VERSION: "7.2.1"
       GPU_TARGETS: "gfx908;gfx90a;gfx942;gfx1030;gfx1100;gfx1101;gfx1102;gfx1151;gfx1150;gfx1200;gfx1201"
     steps:
+      - name: Reserve cache save time
+        shell: bash
+        run: echo "CACHE_SAVE_DEADLINE=$(($(date +%s) + 330 * 60))" >> "$GITHUB_ENV"
+
       - name: Clone
         uses: actions/checkout@v6
         with:
@@ -572,6 +615,7 @@ jobs:
           sudo apt-get install -y rocm-hip-sdk
 
       - name: Build
+        id: build
         run: |
           cmake -B build -S . \
             -DCMAKE_HIP_COMPILER="$(hipconfig -l)/clang" \
@@ -590,7 +634,13 @@ jobs:
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_HIP_COMPILER_LAUNCHER=ccache \
             ${{ env.CMAKE_ARGS }}
-          cmake --build build --config Release -j "$(nproc)"
+          if python3 .github/scripts/cache-build-deadline.py -- cmake --build build --config Release -j "$(nproc)"; then
+            :
+          else
+            result=$?
+            if [ "$result" -eq 75 ]; then exit 0; fi
+            exit "$result"
+          fi
           test -s build/tools/ui/dist/index.html
 
       - name: ccache stats
@@ -598,16 +648,18 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        # Skip on failure: a crashed build stores nothing and refreshes no entry
-        # mtimes, so evict-old-files could cull healthy entries and save a
-        # degraded cache. Cancelled (e.g. 6h timeout) jobs keep their partial
-        # progress so the next run resumes from it.
-        if: ${{ success() || cancelled() }}
+        # Only save once the build process tree has exited. A controlled build
+        # deadline keeps partial ccache progress without archiving live writes.
+        if: ${{ success() && !cancelled() }}
         uses: ./.github/actions/save-rolling-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-ubuntu-rocm-${{ env.ROCM_VERSION }}-x64
           ref: refs/heads/main
           evict-old-files: 1d
+
+      - name: Report incomplete build
+        if: ${{ !cancelled() && steps.build.outputs.timed_out == 'true' }}
+        run: exit 1
 
       - name: Smoke package binaries
         run: |
@@ -640,6 +692,10 @@ jobs:
       LEVEL_ZERO_VERSION: "1.28.2"
       LEVEL_ZERO_UBUNTU_VERSION: "u24.04"
     steps:
+      - name: Reserve cache save time
+        shell: bash
+        run: echo "CACHE_SAVE_DEADLINE=$(($(date +%s) + 330 * 60))" >> "$GITHUB_ENV"
+
       - name: Clone
         uses: actions/checkout@v6
         with:
@@ -687,6 +743,7 @@ jobs:
           sudo apt-get -o Dpkg::Options::="--force-overwrite" install -y ./level-zero.deb ./level-zero-devel.deb
 
       - name: Build
+        id: build
         run: |
           source "${ONEAPI_ROOT}/setvars.sh"
           cmake -B build -G "Ninja" \
@@ -703,7 +760,13 @@ jobs:
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             ${{ env.CMAKE_ARGS }}
-          cmake --build build --config Release -j "$(nproc)"
+          if python3 .github/scripts/cache-build-deadline.py -- cmake --build build --config Release -j "$(nproc)"; then
+            :
+          else
+            result=$?
+            if [ "$result" -eq 75 ]; then exit 0; fi
+            exit "$result"
+          fi
           test -s build/tools/ui/dist/index.html
 
       - name: ccache stats
@@ -711,16 +774,18 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        # Skip on failure: a crashed build stores nothing and refreshes no entry
-        # mtimes, so evict-old-files could cull healthy entries and save a
-        # degraded cache. Cancelled (e.g. 6h timeout) jobs keep their partial
-        # progress so the next run resumes from it.
-        if: ${{ success() || cancelled() }}
+        # Only save once the build process tree has exited. A controlled build
+        # deadline keeps partial ccache progress without archiving live writes.
+        if: ${{ success() && !cancelled() }}
         uses: ./.github/actions/save-rolling-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-ubuntu-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
           ref: refs/heads/main
           evict-old-files: 1d
+
+      - name: Report incomplete build
+        if: ${{ !cancelled() && steps.build.outputs.timed_out == 'true' }}
+        run: exit 1
 
       - name: Smoke package binaries
         run: |
@@ -767,6 +832,10 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends build-essential ca-certificates cmake ninja-build ccache git file libssl-dev libgomp1
 
+      - name: Reserve cache save time
+        shell: bash
+        run: echo "CACHE_SAVE_DEADLINE=$(($(date +%s) + 330 * 60))" >> "$GITHUB_ENV"
+
       - name: Clone
         uses: actions/checkout@v6
         with:
@@ -786,6 +855,7 @@ jobs:
           sloppiness: time_macros
 
       - name: Build
+        id: build
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
@@ -803,7 +873,13 @@ jobs:
             ${{ matrix.cuda_cmake_args }} \
             ${{ env.CMAKE_ARGS }} \
             -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined
-          cmake --build build --config Release -j "$(nproc)"
+          if python3 .github/scripts/cache-build-deadline.py -- cmake --build build --config Release -j "$(nproc)"; then
+            :
+          else
+            result=$?
+            if [ "$result" -eq 75 ]; then exit 0; fi
+            exit "$result"
+          fi
           test -s build/tools/ui/dist/index.html
 
       - name: ccache stats
@@ -811,16 +887,18 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        # Skip on failure: a crashed build stores nothing and refreshes no entry
-        # mtimes, so evict-old-files could cull healthy entries and save a
-        # degraded cache. Cancelled (e.g. 6h timeout) jobs keep their partial
-        # progress so the next run resumes from it.
-        if: ${{ success() || cancelled() }}
+        # Only save once the build process tree has exited. A controlled build
+        # deadline keeps partial ccache progress without archiving live writes.
+        if: ${{ success() && !cancelled() }}
         uses: ./.github/actions/save-rolling-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-ubuntu-cuda-${{ matrix.cuda }}-x64
           ref: refs/heads/main
           evict-old-files: 1d
+
+      - name: Report incomplete build
+        if: ${{ !cancelled() && steps.build.outputs.timed_out == 'true' }}
+        run: exit 1
 
       - name: Smoke package binaries
         run: |
@@ -847,6 +925,10 @@ jobs:
     if: ${{ needs.release-meta.outputs.build_packages == 'true' }}
     runs-on: windows-2025
     steps:
+      - name: Reserve cache save time
+        shell: bash
+        run: echo "CACHE_SAVE_DEADLINE=$(($(date +%s) + 330 * 60))" >> "$GITHUB_ENV"
+
       - name: Clone
         uses: actions/checkout@v6
         with:
@@ -868,6 +950,7 @@ jobs:
         run: choco install ninja -y
 
       - name: Build
+        id: build
         shell: cmd
         run: |
           for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VS_INSTALL_DIR=%%i"
@@ -887,13 +970,16 @@ jobs:
             -DCMAKE_C_COMPILER_LAUNCHER=ccache ^
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache ^
             %CMAKE_ARGS%
-          cmake --build build --config Release -j %NUMBER_OF_PROCESSORS%
+          python .github\scripts\cache-build-deadline.py -- cmake --build build --config Release -j %NUMBER_OF_PROCESSORS%
+          if %errorlevel%==75 exit /b 0
+          if errorlevel 1 exit /b %errorlevel%
           if not exist build\tools\ui\dist\index.html (
             echo Source-built UI output is missing
             exit /b 1
           )
 
       - name: Verify OpenMP is enabled
+        if: ${{ steps.build.outputs.timed_out != 'true' }}
         shell: cmd
         run: |
           findstr /c:"GGML_OPENMP_ENABLED:INTERNAL=ON" build\CMakeCache.txt >nul || (
@@ -906,16 +992,18 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        # Skip on failure: a crashed build stores nothing and refreshes no entry
-        # mtimes, so evict-old-files could cull healthy entries and save a
-        # degraded cache. Cancelled (e.g. 6h timeout) jobs keep their partial
-        # progress so the next run resumes from it.
-        if: ${{ success() || cancelled() }}
+        # Only save once the build process tree has exited. A controlled build
+        # deadline keeps partial ccache progress without archiving live writes.
+        if: ${{ success() && !cancelled() }}
         uses: ./.github/actions/save-rolling-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-cpu-x64
           ref: refs/heads/main
           evict-old-files: 1d
+
+      - name: Report incomplete build
+        if: ${{ !cancelled() && steps.build.outputs.timed_out == 'true' }}
+        run: exit 1
 
       - name: Pack artifacts
         shell: pwsh
@@ -967,6 +1055,10 @@ jobs:
       ONEAPI_ROOT: 'C:\Program Files (x86)\Intel\oneAPI'
       ONEAPI_INSTALLER_VERSION: "2025.3.3"
     steps:
+      - name: Reserve cache save time
+        shell: bash
+        run: echo "CACHE_SAVE_DEADLINE=$(($(date +%s) + 330 * 60))" >> "$GITHUB_ENV"
+
       - name: Clone
         uses: actions/checkout@v6
         with:
@@ -1001,6 +1093,7 @@ jobs:
         run: choco install ninja -y
 
       - name: Build
+        id: build
         shell: cmd
         run: |
           call "%ONEAPI_ROOT%\setvars.bat" intel64 --force
@@ -1021,23 +1114,27 @@ jobs:
             -DLLAMA_BUILD_BORINGSSL=ON ^
             -DCMAKE_C_COMPILER_LAUNCHER=ccache ^
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-          cmake --build build --config Release -j %NUMBER_OF_PROCESSORS% --target ggml-sycl
+          python .github\scripts\cache-build-deadline.py -- cmake --build build --config Release -j %NUMBER_OF_PROCESSORS% --target ggml-sycl
+          if %errorlevel%==75 exit /b 0
+          if errorlevel 1 exit /b %errorlevel%
 
       - name: ccache stats
         if: always()
         run: ccache --show-stats
 
       - name: Save ccache
-        # Skip on failure: a crashed build stores nothing and refreshes no entry
-        # mtimes, so evict-old-files could cull healthy entries and save a
-        # degraded cache. Cancelled (e.g. 6h timeout) jobs keep their partial
-        # progress so the next run resumes from it.
-        if: ${{ success() || cancelled() }}
+        # Only save once the build process tree has exited. A controlled build
+        # deadline keeps partial ccache progress without archiving live writes.
+        if: ${{ success() && !cancelled() }}
         uses: ./.github/actions/save-rolling-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
           ref: refs/heads/main
           evict-old-files: 1d
+
+      - name: Report incomplete build
+        if: ${{ !cancelled() && steps.build.outputs.timed_out == 'true' }}
+        run: exit 1
 
       - name: Pack SYCL backend
         shell: pwsh
@@ -1097,6 +1194,10 @@ jobs:
     env:
       VULKAN_VERSION: 1.4.313.2
     steps:
+      - name: Reserve cache save time
+        shell: bash
+        run: echo "CACHE_SAVE_DEADLINE=$(($(date +%s) + 330 * 60))" >> "$GITHUB_ENV"
+
       - name: Clone
         uses: actions/checkout@v6
         with:
@@ -1128,6 +1229,7 @@ jobs:
         run: choco install ninja -y
 
       - name: Build
+        id: build
         shell: cmd
         run: |
           for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VS_INSTALL_DIR=%%i"
@@ -1145,23 +1247,27 @@ jobs:
             -DLLAMA_BUILD_BORINGSSL=ON ^
             -DCMAKE_C_COMPILER_LAUNCHER=ccache ^
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-          cmake --build build --config Release -j %NUMBER_OF_PROCESSORS% --target ggml-vulkan
+          python .github\scripts\cache-build-deadline.py -- cmake --build build --config Release -j %NUMBER_OF_PROCESSORS% --target ggml-vulkan
+          if %errorlevel%==75 exit /b 0
+          if errorlevel 1 exit /b %errorlevel%
 
       - name: ccache stats
         if: always()
         run: ccache --show-stats
 
       - name: Save ccache
-        # Skip on failure: a crashed build stores nothing and refreshes no entry
-        # mtimes, so evict-old-files could cull healthy entries and save a
-        # degraded cache. Cancelled (e.g. 6h timeout) jobs keep their partial
-        # progress so the next run resumes from it.
-        if: ${{ success() || cancelled() }}
+        # Only save once the build process tree has exited. A controlled build
+        # deadline keeps partial ccache progress without archiving live writes.
+        if: ${{ success() && !cancelled() }}
         uses: ./.github/actions/save-rolling-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-vulkan-${{ env.VULKAN_VERSION }}-x64
           ref: refs/heads/main
           evict-old-files: 1d
+
+      - name: Report incomplete build
+        if: ${{ !cancelled() && steps.build.outputs.timed_out == 'true' }}
+        run: exit 1
 
       - name: Pack Vulkan backend
         run: |
@@ -1187,6 +1293,10 @@ jobs:
           - cuda: "13.3"
             cuda_cmake_args: "-DGGML_CUDA_CUB_3DOT2=OFF"
     steps:
+      - name: Reserve cache save time
+        shell: bash
+        run: echo "CACHE_SAVE_DEADLINE=$(($(date +%s) + 330 * 60))" >> "$GITHUB_ENV"
+
       - name: Clone
         uses: actions/checkout@v6
         with:
@@ -1234,6 +1344,7 @@ jobs:
         run: choco install ninja -y
 
       - name: Build
+        id: build
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
@@ -1250,23 +1361,27 @@ jobs:
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache ^
             -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache ^
             ${{ matrix.cuda_cmake_args }}
-          cmake --build build --config Release -j %NUMBER_OF_PROCESSORS% --target ggml-cuda
+          python .github\scripts\cache-build-deadline.py -- cmake --build build --config Release -j %NUMBER_OF_PROCESSORS% --target ggml-cuda
+          if %errorlevel%==75 exit /b 0
+          if errorlevel 1 exit /b %errorlevel%
 
       - name: ccache stats
         if: always()
         run: ccache --show-stats
 
       - name: Save ccache
-        # Skip on failure: a crashed build stores nothing and refreshes no entry
-        # mtimes, so evict-old-files could cull healthy entries and save a
-        # degraded cache. Cancelled (e.g. 6h timeout) jobs keep their partial
-        # progress so the next run resumes from it.
-        if: ${{ success() || cancelled() }}
+        # Only save once the build process tree has exited. A controlled build
+        # deadline keeps partial ccache progress without archiving live writes.
+        if: ${{ success() && !cancelled() }}
         uses: ./.github/actions/save-rolling-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-cuda-${{ matrix.cuda }}
           ref: refs/heads/main
           evict-old-files: 1d
+
+      - name: Report incomplete build
+        if: ${{ !cancelled() && steps.build.outputs.timed_out == 'true' }}
+        run: exit 1
 
       - name: Pack CUDA backend
         shell: pwsh
@@ -1320,6 +1435,10 @@ jobs:
       HIPSDK_INSTALLER_VERSION: "26.Q1"
       GPU_TARGETS: "gfx1150;gfx1151;gfx1200;gfx1201;gfx1100;gfx1101;gfx1102;gfx1030;gfx1031;gfx1032"
     steps:
+      - name: Reserve cache save time
+        shell: bash
+        run: echo "CACHE_SAVE_DEADLINE=$(($(date +%s) + 330 * 60))" >> "$GITHUB_ENV"
+
       - name: Clone
         uses: actions/checkout@v6
         with:
@@ -1367,6 +1486,7 @@ jobs:
           & $clangPath.FullName --version
 
       - name: Build
+        id: build
         run: |
           $ErrorActionPreference = "Stop"
           $env:HIP_PATH=$(Resolve-Path 'C:\Program Files\AMD\ROCm\*\bin\clang.exe' | Split-Path | Split-Path)
@@ -1388,7 +1508,9 @@ jobs:
             -DCMAKE_HIP_COMPILER_LAUNCHER=ccache `
             -DLLAMA_BUILD_BORINGSSL=ON
           $buildJobs = [int]$env:NUMBER_OF_PROCESSORS
-          cmake --build build --target ggml-hip -j $buildJobs
+          python .github/scripts/cache-build-deadline.py -- cmake --build build --target ggml-hip -j $buildJobs
+          if ($LASTEXITCODE -eq 75) { exit 0 }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           New-Item -ItemType Directory -Force -Path "build\bin\rocblas\library" | Out-Null
           New-Item -ItemType Directory -Force -Path "build\bin\hipblaslt\library" | Out-Null
           Copy-Item "${env:HIP_PATH}\bin\libhipblas.dll" "build\bin\"
@@ -1410,16 +1532,18 @@ jobs:
         run: ccache --show-stats
 
       - name: Save ccache
-        # Skip on failure: a crashed build stores nothing and refreshes no entry
-        # mtimes, so evict-old-files could cull healthy entries and save a
-        # degraded cache. Cancelled (e.g. 6h timeout) jobs keep their partial
-        # progress so the next run resumes from it.
-        if: ${{ success() || cancelled() }}
+        # Only save once the build process tree has exited. A controlled build
+        # deadline keeps partial ccache progress without archiving live writes.
+        if: ${{ success() && !cancelled() }}
         uses: ./.github/actions/save-rolling-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-hip-${{ env.HIPSDK_INSTALLER_VERSION }}-x64
           ref: refs/heads/main
           evict-old-files: 1d
+
+      - name: Report incomplete build
+        if: ${{ !cancelled() && steps.build.outputs.timed_out == 'true' }}
+        run: exit 1
 
       - name: Pack artifacts
         run: |
