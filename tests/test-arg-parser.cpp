@@ -984,7 +984,7 @@ static void test_draft_ubatch_configuration_is_independent() {
     };
 
     common_params params;
-    assert(params.speculative.draft.n_ubatch == 128);
+    assert(params.speculative.draft.n_ubatch == 0); // automatic default
     params.n_batch  = 2048;
     params.n_ubatch = 512;
 
@@ -994,6 +994,26 @@ static void test_draft_ubatch_configuration_is_independent() {
     assert(draft.n_batch == 2048);
     assert(draft.n_ubatch == 128);
 
+    params.n_parallel = 16;
+    params.speculative.draft.n_max = 9;
+    params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK };
+    draft = common_base_params_to_speculative(params);
+    assert(draft.n_ubatch == 160); // enough for every slot's non-causal noise block
+
+    params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
+    draft = common_base_params_to_speculative(params);
+    assert(draft.n_ubatch == 160);
+
+    params.n_parallel = 8;
+    draft = common_base_params_to_speculative(params);
+    assert(draft.n_ubatch == 128);
+
+    params.n_parallel = 16;
+    params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+    draft = common_base_params_to_speculative(params);
+    assert(draft.n_ubatch == 128);
+
+    params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK };
     assert(parse(params, {
         "binary_name", "-m", "model.gguf", "-b", "2048", "-ub", "512",
         "--spec-draft-ubatch-size", "192",
@@ -1007,6 +1027,9 @@ static void test_draft_ubatch_configuration_is_independent() {
 
     params = common_params();
     assert(parse(params, { "binary_name", "-m", "model.gguf", "-b", "2048", "-ub", "512", "-ubd", "128" }));
+    params.n_parallel = 16;
+    params.speculative.draft.n_max = 9;
+    params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
     draft = common_base_params_to_speculative(params);
     assert(params.n_batch == 2048);
     assert(params.n_ubatch == 512);

@@ -86,10 +86,15 @@ llama-server -m target.gguf --spec-type draft-dflash \
 Model-backed draft contexts inherit the target logical batch capacity configured
 with `--batch-size` (`-b`). Use `--spec-draft-ubatch-size N` (`-ubd N`) to set an
 independent physical capacity; its environment variable is
-`LLAMA_ARG_SPEC_DRAFT_UBATCH_SIZE` and it defaults to 128. A smaller draft ubatch
-can reduce draft graph and workspace memory, but may reduce prompt catch-up
-throughput. Existing context normalization still caps physical ubatch to logical
-batch, and n-gram-only modes do not create a draft context.
+`LLAMA_ARG_SPEC_DRAFT_UBATCH_SIZE`. Without an explicit override, the draft
+ubatch defaults to 128; for DFlash/DSpark it grows to
+`max(128, parallel * (n_max + 1))` to fit all slots' noise blocks in one decode.
+An explicit
+`-ubd` remains unchanged, so values below the merged block size can fail for
+non-causal draft attention. A smaller draft ubatch can reduce draft graph and
+workspace memory, but may reduce prompt catch-up throughput. Existing context
+normalization still caps physical ubatch to logical batch: `-b` must also fit
+the merged block. N-gram-only modes do not create a draft context.
 
 The draft cache pair is independent of the target cache and applies to both
 full-attention and SWA draft layers. There is no draft precision-tail option;
@@ -277,7 +282,7 @@ Use exactly one of these options:
                                         minimum number of draft tokens to use for speculative decoding (default: 0)
                                         (env: LLAMA_ARG_SPEC_DRAFT_N_MIN)
 --spec-draft-ubatch-size, -ubd          N
-                                        physical maximum batch size for the draft context (default: 128)
+                                        physical maximum batch size for the draft context (default: 128 or larger for parallel DFlash/DSpark)
                                         (env: LLAMA_ARG_SPEC_DRAFT_UBATCH_SIZE)
 --spec-draft-p-split, --draft-p-split   P
                                         speculative decoding split probability (default: 0.10)

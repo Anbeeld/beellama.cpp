@@ -2709,9 +2709,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
     const auto & params_spec = params.speculative.draft;
     common_params result = params;
 
-    if (params_spec.n_ubatch > 0) {
-        result.n_ubatch = params_spec.n_ubatch;
-    }
+    result.n_ubatch = params_spec.n_ubatch > 0 ? params_spec.n_ubatch : 128;
 
     result.embedding    = false;
     result.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;
@@ -2766,6 +2764,11 @@ common_params common_base_params_to_speculative(const common_params & params) {
     if (has_block_draft) {
         // per-seq output positions: DFlash decodes anchor + n_max masks (n_max + 1); DSpark n_max -> +1 covers both
         const int32_t per_seq = std::max(1, params_spec.n_max + 1);
+        if (params_spec.n_ubatch == 0) {
+            // All active slots' non-causal noise blocks must fit in one micro-batch.
+            result.n_ubatch = (int32_t) std::max<int64_t>(128,
+                    std::min<int64_t>(INT32_MAX, (int64_t) params.n_parallel * per_seq));
+        }
         result.n_outputs_max = params.n_parallel * per_seq;
         if (params_spec.backend_sampling) {
             result.n_outputs_max_per_seq = per_seq;
