@@ -830,7 +830,7 @@ jobs:
       - name: Dependencies
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends build-essential ca-certificates cmake ninja-build ccache git file libssl-dev libgomp1
+          apt-get install -y --no-install-recommends build-essential ca-certificates cmake ninja-build ccache git file libssl-dev libgomp1 python3
 
       - name: Reserve cache save time
         shell: bash
