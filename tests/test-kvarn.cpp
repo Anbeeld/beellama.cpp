@@ -446,6 +446,47 @@ static void kvarn_selective_state_owns_only_live_stage_rows() {
             "selective KVarN state treated sealed records as live stage rows");
 }
 
+// Per-sequence (non-unified) streams have no allocation-owned stage slots.
+// Their F16-only rows are the permanent group-0 sink, which eager stores never
+// seal into a record, and an unsealed live group. A self-contained state must
+// carry exactly those rows plus every sealed record, like the 1,792-token
+// ordinary --cache-ram entry restored into a fresh or cleared slot.
+static void kvarn_per_stream_state_keeps_sink_and_unsealed_stage_rows() {
+    std::vector<uint32_t> aligned(1792);
+    for (uint32_t cell = 0; cell < aligned.size(); ++cell) {
+        aligned[cell] = cell;
+    }
+    const auto aligned_groups = llama_kvarn_stage_only_groups(aligned);
+    require(aligned_groups == std::vector<uint32_t>({ 0 }),
+            "per-stream KVarN state lost the group-0 sink or kept a sealed group in F16");
+    const auto aligned_rows = llama_kvarn_select_state_stage_cells(
+            aligned, 1792, 3, 2, false, &aligned_groups);
+    require(aligned_rows.size() == 128 && aligned_rows.front().stage_row == 0 &&
+            aligned_rows.back().source_cell == 127 && aligned_rows.back().stage_row == 127,
+            "per-stream KVarN state did not serialize the group-0 sink rows");
+    std::vector<uint32_t> sealed;
+    for (uint32_t group = 1; group < 14; ++group) {
+        sealed.push_back(group);
+    }
+    require(llama_kvarn_select_state_record_groups(aligned, aligned_rows, 32) == sealed,
+            "per-stream KVarN state did not serialize every sealed record");
+
+    std::vector<uint32_t> unaligned = aligned;
+    for (uint32_t cell = 1792; cell < 1799; ++cell) {
+        unaligned.push_back(cell);
+    }
+    const auto unaligned_groups = llama_kvarn_stage_only_groups(unaligned);
+    require(unaligned_groups == std::vector<uint32_t>({ 0, 14 }),
+            "per-stream KVarN state lost the unsealed live group");
+    const auto unaligned_rows = llama_kvarn_select_state_stage_cells(
+            unaligned, 1799, 3, 2, false, &unaligned_groups);
+    require(unaligned_rows.size() == 135 && unaligned_rows[128].source_cell == 1792 &&
+            unaligned_rows[128].stage_row == 256 && unaligned_rows.back().stage_row == 262,
+            "per-stream KVarN state mapped the unsealed group to the wrong stage slot");
+    require(llama_kvarn_select_state_record_groups(unaligned, unaligned_rows, 32) == sealed,
+            "per-stream KVarN state serialized a stale unsealed record");
+}
+
 static void kvarn_compact_read_plan_skips_ownership_holes() {
     std::vector<uint32_t> occupied;
     for (uint32_t group : { 3u, 7u, 11u }) {
@@ -5828,6 +5869,7 @@ int main() {
     kvarn_unified_save_requires_exclusive_stream();
     kvarn_unified_restore_requires_exclusive_stream();
     kvarn_selective_state_owns_only_live_stage_rows();
+    kvarn_per_stream_state_keeps_sink_and_unsealed_stage_rows();
     kvarn_compact_read_plan_skips_ownership_holes();
     kvarn_live_stage_groups_match_recent_position_order();
     kvarn_planning_reservations_preserve_group_ownership();
