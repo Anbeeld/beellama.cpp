@@ -561,6 +561,9 @@ struct server_metrics {
     uint64_t prompt_cache_restore_successes   = 0;
     uint64_t prompt_cache_restore_failures    = 0;
     uint64_t prompt_cache_accounted_bytes     = 0;
+    uint64_t prompt_cache_protected_entries   = 0;
+    uint64_t prompt_cache_protected_bytes     = 0;
+    uint64_t prompt_cache_protection_candidates = 0;
 
     void init() {
         t_start = ggml_time_us();

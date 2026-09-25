@@ -1999,6 +1999,46 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--cache-protect-ram"}, "MiB",
+        "RAM budget for automatically protected reusable prefixes, within --cache-ram (default: 0, disabled)",
+        [](common_params & params, int value) {
+            if (value < 0) { throw std::invalid_argument("cache-protect-ram must be non-negative"); }
+            params.cache_protect_ram_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_PROTECT_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--cache-protect-min-tokens"}, "N",
+        "minimum actually reused prefix length for automatic cache protection (default: 8192)",
+        [](common_params & params, int value) {
+            if (value < 1) { throw std::invalid_argument("cache-protect-min-tokens must be positive"); }
+            params.cache_protect_min_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_PROTECT_MIN_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--cache-protect-hits"}, "N",
+        "divergent prefix reuses needed before protection (default: 3; continuations only refresh existing protection)",
+        [](common_params & params, int value) {
+            if (value < 1) { throw std::invalid_argument("cache-protect-hits must be positive"); }
+            params.cache_protect_hits = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_PROTECT_HITS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--cache-protect-max"}, "N",
+        "maximum simultaneously protected prefix snapshots (default: 4)",
+        [](common_params & params, int value) {
+            if (value < 1) { throw std::invalid_argument("cache-protect-max must be positive"); }
+            params.cache_protect_max = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_PROTECT_MAX").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--cache-protect-replace-after"}, "SECONDS",
+        "minimum inactivity before replacing protected prefixes (default: 3600; 0 permits immediate LRU replacement)",
+        [](common_params & params, int value) {
+            if (value < 0) { throw std::invalid_argument("cache-protect-replace-after must be non-negative"); }
+            params.cache_protect_idle_seconds = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_PROTECT_REPLACE_AFTER").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",
