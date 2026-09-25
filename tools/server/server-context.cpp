@@ -281,6 +281,9 @@ struct server_batch {
 struct server_slot {
     int id;
 
+    bool cache_protection_branch = false;
+    size_t cache_protection_spec_boundary = 0;
+
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
     bool draft_owns_state = false;
@@ -362,13 +365,21 @@ struct server_slot {
         spec_ckpt.clear();
     }
 
-    server_prompt_cache_state * prompt_save(server_prompt_cache & prompt_cache) const {
+    server_prompt_cache_state * prompt_save(server_prompt_cache & prompt_cache, bool protect = false) const {
         if (prompt.tokens.size() == 0) {
             return nullptr;
         }
 
         std::vector<uint8_t> speculative_state;
         common_speculative_get_state(spec, id, speculative_state);
+        // Native suffix removal rewinds KV memory, but does not necessarily
+        // rewind a stateful drafter's pending hidden row. Only a transactionally
+        // restored checkpoint proves that such metadata belongs to this prefix.
+        if (protect && !speculative_state.empty() &&
+                cache_protection_spec_boundary != prompt.tokens.size()) {
+            SLT_DBG(*this, "%s", "cache protection skipped: no matching speculative boundary state\n");
+            return nullptr;
+        }
         constexpr llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED;
         llama_context * ctx_dft_state = draft_owns_state ? ctx_dft : nullptr;
         const size_t cur_size_tgt =                 llama_state_seq_get_size_ext(ctx_tgt, id, flags);
@@ -379,6 +390,13 @@ struct server_slot {
         }
 
         const size_t cur_size = cur_size_tgt + cur_size_dft;
+
+        // Avoid materializing a protection snapshot that cannot fit at all.
+        if (protect && (cur_size + speculative_state.size() > prompt_cache.protection.max_bytes ||
+                (prompt_cache.limit_size > 0 && cur_size + speculative_state.size() > prompt_cache.limit_size))) {
+            SLT_DBG(*this, "%s", "cache protection skipped: snapshot exceeds RAM budget\n");
+            return nullptr;
+        }
 
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
@@ -400,6 +418,15 @@ struct server_slot {
             return nullptr;
         }
 
+        if (protect) {
+            // This is an exact boundary snapshot, not a conversation history.
+            // SELF_CONTAINED includes its attention/recurrent state. Keeping
+            // older rollback checkpoints would retain many redundant states;
+            // a shorter-than-boundary request must use the ordinary cache.
+            server_prompt boundary;
+            boundary.tokens = prompt.tokens.clone();
+            return prompt_cache.insert(boundary, std::move(data), true, ggml_time_us());
+        }
         return prompt_cache.insert(prompt, std::move(data));
     }
 
@@ -1029,6 +1056,9 @@ public:
             result.prompt_cache_restore_successes   = prompt_cache->restore_successes;
             result.prompt_cache_restore_failures    = prompt_cache->restore_failures;
             result.prompt_cache_accounted_bytes     = prompt_cache->accounted_size();
+            result.prompt_cache_protected_entries   = prompt_cache->protected_count();
+            result.prompt_cache_protected_bytes     = prompt_cache->protected_size();
+            result.prompt_cache_protection_candidates = prompt_cache->protection_candidates.size();
         }
         return result;
     }
@@ -1533,8 +1563,25 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            prompt_cache->protection.max_bytes = size_t(params_base.cache_protect_ram_mib) * 1024 * 1024;
+            prompt_cache->protection.min_tokens = params_base.cache_protect_min_tokens;
+            prompt_cache->protection.min_hits = params_base.cache_protect_hits;
+            prompt_cache->protection.max_entries = params_base.cache_protect_max;
+            prompt_cache->protection.replace_after_us = int64_t(params_base.cache_protect_idle_seconds) * 1000000;
+            if (prompt_cache->protection_enabled()) {
+                SRV_INF("automatic cache protection enabled: budget = %d MiB, min_tokens = %d, hits = %d, max = %d\n",
+                        params_base.cache_protect_ram_mib, params_base.cache_protect_min_tokens,
+                        params_base.cache_protect_hits, params_base.cache_protect_max);
+                if (params_base.cache_ram_mib > 0 && params_base.cache_protect_ram_mib > params_base.cache_ram_mib) {
+                    SRV_WRN("cache protection budget (%d MiB) exceeds --cache-ram (%d MiB); effective protection budget is %d MiB\n",
+                            params_base.cache_protect_ram_mib, params_base.cache_ram_mib, params_base.cache_ram_mib);
+                }
+            }
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
+            if (params_base.cache_protect_ram_mib > 0) {
+                SRV_WRN("%s", "cache protection requires --cache-ram; protection disabled\n");
+            }
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
@@ -3696,6 +3743,8 @@ private:
 
                         // keep track how many tokens we can reuse from the previous state
                         int n_past = 0;
+                        slot.cache_protection_branch = false;
+                        slot.cache_protection_spec_boundary = 0;
 
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
@@ -3751,6 +3800,8 @@ private:
                             if (slot.task->params.cache_prompt) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+                                slot.cache_protection_branch = size_t(n_past) < slot.prompt.tokens.size() &&
+                                        size_t(n_past) < input_tokens.size();
                                 slot.n_prompt_tokens_lcp = n_past;
                                 if (n_past > 0 && slot.prompt_cache_source == "none") {
                                     slot.prompt_cache_source = "live";
@@ -3965,6 +4016,7 @@ private:
                                             if (!do_reset) {
                                                 pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                                 n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                                slot.cache_protection_spec_boundary = size_t(n_past) == size_t(it->n_tokens) ? size_t(n_past) : 0;
                                                 const bool restored_from_ram = slot.prompt_cache_source == "ram";
                                                 slot.prompt_cache_source = restored_from_ram ? "ram" : "checkpoint";
                                                 slot.prompt_cache_reason = restored_from_ram ?
@@ -4077,6 +4129,25 @@ private:
                     }
                     if (slot.n_prompt_tokens_cache > 0) {
                         slot.prompt_cache_reason = "committed";
+                    }
+
+                    // Observe the final committed boundary, not a lexical match
+                    // or a successful RAM load before later rollback failures.
+                    // A qualified boundary is captured through the existing
+                    // SELF_CONTAINED serializer while its state is still live.
+                    if (prompt_just_started && prompt_cache && prompt_cache->protection_enabled() &&
+                            slot.task->type == SERVER_TASK_TYPE_COMPLETION && slot.task->params.cache_prompt &&
+                            slot.task->params.n_cache_reuse == 0 && slot.lora.empty() &&
+                            !slot.prompt.tokens.has_mtmd && !input_tokens.has_mtmd) {
+                        try {
+                            if (prompt_cache->observe_reuse(input_tokens, slot.prompt.tokens.size(),
+                                        slot.cache_protection_branch, ggml_time_us())) {
+                                slot.prompt_save(*prompt_cache, true);
+                                prompt_cache->update();
+                            }
+                        } catch (const std::bad_alloc &) {
+                            SLT_WRN(slot, "%s", "cache protection skipped: allocation failed\n");
+                        }
                     }
 
                     // Signal streaming clients only after rollback planning and
