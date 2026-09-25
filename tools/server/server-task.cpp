@@ -2341,7 +2341,7 @@ bool server_prompt_cache::load(
         }
 
         // don't trash large prompts
-        if (!it->protected_entry && f_keep_cur < 0.25f) {
+        if (f_keep_cur < 0.25f) {
             continue;
         }
 
