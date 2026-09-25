@@ -2285,7 +2285,7 @@ bool server_prompt_cache::load(
         SRV_TRC("   - prompt with length %7zu, lcp = %7zu, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
 
         // don't trash large prompts
-        if (!it->protected_entry && f_keep_cur < 0.25f) {
+        if (f_keep_cur < 0.25f) {
             continue;
         }
 

@@ -643,6 +643,51 @@ static void prompt_cache_protection_requires_exact_boundary_and_loads_matching_p
     assert(current.tokens[2] == prefix[2]);
 }
 
+static void prompt_cache_protected_entry_is_not_restored_for_short_reuse() {
+    server_prompt_cache cache(0, 0);
+    cache.protection.max_bytes = 64;
+    cache.protection.min_tokens = 8;
+    cache.protection.min_hits = 1;
+
+    llama_tokens prefix;
+    for (llama_token token = 1; token <= 40; ++token) {
+        prefix.push_back(token);
+    }
+    assert(observe_divergent_boundary(cache, prefix, 900, 10));
+    assert(insert_fake_state(cache, prefix, 1, true, 11, 0x4a) != nullptr);
+
+    int restores = 0;
+    server_prompt_cache_state_io io {
+        /*.has_draft =*/ false,
+        /*.has_speculative =*/ false,
+        /*.restore_transaction =*/ [&](const uint8_t *, size_t, const uint8_t *, size_t,
+                                       const uint8_t *, size_t) {
+            ++restores;
+            return true;
+        },
+    };
+    const auto load_into_empty_slot = [&](const llama_tokens & request_ids) {
+        server_prompt current = make_prompt({});
+        server_tokens requested(request_ids, false);
+        assert(cache.load(current, requested, 0, 1, io));
+        return current.tokens.size();
+    };
+
+    // An empty slot must not restore the whole protected snapshot for an
+    // unrelated prompt or for a partial match: without checkpoints neither
+    // leaves a reusable prefix, so the restore would be discarded at once.
+    assert(load_into_empty_slot({ 500, 501, 502 }) == 0);
+    assert(load_into_empty_slot({ 1, 2, 3, 4, 5, 6, 7, 8, 700 }) == 0);
+    assert(restores == 0);
+    assert(cache.restore_attempts == 0);
+
+    // A request extending the full protected boundary still restores it.
+    llama_tokens extended = prefix;
+    extended.push_back(800);
+    assert(load_into_empty_slot(extended) == prefix.size());
+    assert(restores == 1);
+}
+
 static void prompt_cache_protected_entries_survive_subsumption_and_eviction() {
     {
         server_prompt_cache cache(0, 0);
@@ -902,6 +947,7 @@ int main() {
     prompt_cache_protection_continuation_refreshes_residency();
     prompt_cache_protection_requires_exact_boundary_and_loads_matching_prefix();
     prompt_cache_protected_entries_survive_subsumption_and_eviction();
+    prompt_cache_protected_entry_is_not_restored_for_short_reuse();
     prompt_cache_failed_ordinary_admission_preserves_existing_state();
     prompt_cache_ordinary_admission_reserves_protected_budget_atomically();
     prompt_cache_protection_caps_idle_replacement_and_demotes_old_state();
