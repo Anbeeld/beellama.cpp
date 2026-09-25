@@ -393,9 +393,33 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_input_rs::set_history() {
+    // Other recurrent architectures may not consume the DeltaNet history input.
+    // Unused graph inputs have no allocated backend buffer.
+    if (!s_history || !s_history->buffer) {
+        return;
+    }
+    GGML_ASSERT(ggml_backend_buffer_is_host(s_history->buffer));
+    const int64_t n_seqs = mctx->get_ubatch().n_seqs;
+    const int64_t n_history = s_history->ne[0] / n_seqs;
+    int32_t * data = (int32_t *) s_history->data;
+    for (int64_t age = 0; age < n_history; ++age) {
+        for (int64_t seq = 0; seq < n_seqs; ++seq) {
+            data[age*n_seqs + seq] = mctx->s_history(seq, age);
+        }
+    }
+}
+
+bool llm_graph_input_rs::can_reuse_history(const llm_graph_params & params) const {
+    const int64_t n_history = std::max<int64_t>(0,
+            (int64_t) params.cparams.n_rs_seq + 1 - params.ubatch.n_seq_tokens);
+    return s_history ? s_history->ne[0] == n_history*params.ubatch.n_seqs : n_history == 0;
+}
+
 void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
     GGML_UNUSED(ubatch);
 
+    set_history(); // s_copy consumes the pending rollback index
     const int64_t n_rs = mctx->get_n_rs();
 
     if (s_copy) {
@@ -423,6 +447,7 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
+    res &= can_reuse_history(params);
 
     return res;
 }
@@ -1471,6 +1496,7 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     inp_attn->mctx = mctx->get_attn();
     inp_attn->set_input(ubatch);
 
+    inp_rs->set_history();
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
     if (inp_rs->s_copy) {
@@ -1529,6 +1555,8 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->can_reuse_history(params);
+    inp_rs->mctx = mctx->get_recr();
 
     return res;
 }
@@ -1541,6 +1569,7 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
 
     mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
 
+    inp_rs->set_history();
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
     if (inp_rs->s_copy) {
@@ -1572,6 +1601,8 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->can_reuse_history(params);
+    inp_rs->mctx = mctx->get_recr();
 
     return res;
 }
@@ -1580,6 +1611,7 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
     inp_attn->mctx = mctx->get_attn();
     inp_attn->set_input(ubatch);
 
+    inp_rs->set_history();
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
     if (inp_rs->s_copy) {
@@ -1662,6 +1694,8 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->can_reuse_history(params);
+    inp_rs->mctx = mctx->get_recr();
 
     return res;
 }
@@ -4735,6 +4769,13 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     inp->s_copy = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
     ggml_set_input(inp->s_copy);
+
+    const int64_t n_history = std::max<int64_t>(0,
+            (int64_t) mctx_cur->get_n_rs_seq() + 1 - ubatch.n_seq_tokens);
+    if (n_history > 0) {
+        inp->s_history = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_history*n_seqs);
+        ggml_set_input(inp->s_history);
+    }
 
     inp->s_copy_main  = ggml_view_1d(ctx0, inp->s_copy, n_seqs, 0);
     inp->s_copy_extra = ggml_view_1d(ctx0, inp->s_copy, n_rs - n_seqs, n_seqs * inp->s_copy->nb[0]);

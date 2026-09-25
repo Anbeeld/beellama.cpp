@@ -76,6 +76,9 @@ struct llm_build_delta_net_base : public llm_graph_context {
                 ggml_tensor * s,
                         int   il);
 
+    // Carry the older recurrent snapshots across short decode batches.
+    void build_rs_history(llm_graph_input_rs * inp, ggml_tensor * states_all, int64_t state_size, int64_t n_written);
+
     // read conv state from cache, concat with qkv_mixed, write back (single slot or per-token)
     // qkv_mixed: (qkv_dim, n_seq_tokens, n_seqs); returns conv_input: (kernel_size + n_seq_tokens - 1, channels, n_seqs)
     ggml_tensor * build_conv_state(

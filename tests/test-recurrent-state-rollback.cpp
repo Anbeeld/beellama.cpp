@@ -299,7 +299,7 @@ int main(int argc, char ** argv) {
     ckpt.load_tgt(ctx_dst, 0, 0);
 
     constexpr float eps = 1e-5f;
-    std::vector<std::vector<float>> logits_src_replay(n_rollback);
+    std::vector<std::vector<float>> logits_full_replay(n_rollback);
     const auto replay_and_compare = [&](const char * mode) {
         for (uint32_t i = 0; i < n_rollback; ++i) {
             const llama_pos pos = rollback_pos + i;
@@ -316,8 +316,15 @@ int main(int argc, char ** argv) {
                 return false;
             }
 
-            logits_src_replay[i].assign(logits_src, logits_src + n_vocab);
+            if (mode[0] == 'f') {
+                logits_full_replay[i].assign(logits_src, logits_src + n_vocab);
+            }
             for (int token = 0; token < n_vocab; ++token) {
+                if (mode[0] != 'f' && std::fabs(logits_src[token] - logits_full_replay[i][token]) > eps) {
+                    fprintf(stderr, "%s : repeated rollback logits mismatch at position %d, token %d (%g != %g)\n",
+                            __func__, pos, token, (double) logits_src[token], (double) logits_full_replay[i][token]);
+                    return false;
+                }
                 if (std::fabs(logits_src[token] - logits_dst[token]) > eps) {
                     fprintf(stderr, "%s : %s logits mismatch at position %d, token %d (%g != %g)\n",
                             __func__, mode, pos, token, (double) logits_src[token], (double) logits_dst[token]);
@@ -387,9 +394,9 @@ int main(int argc, char ** argv) {
         }
 
         for (int token = 0; token < n_vocab; ++token) {
-            if (std::fabs(logits_src_replay[i][token] - logits_dirty[token]) > eps) {
+            if (std::fabs(logits_full_replay[i][token] - logits_dirty[token]) > eps) {
                 fprintf(stderr, "%s : dirty-ctx logits mismatch at position %d, token %d (%g != %g)\n",
-                        __func__, pos, token, (double) logits_src_replay[i][token], (double) logits_dirty[token]);
+                        __func__, pos, token, (double) logits_full_replay[i][token], (double) logits_dirty[token]);
                 return 1;
             }
         }

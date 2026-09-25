@@ -269,7 +269,11 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
-    ggml_tensor * s_copy;  // I32 [n_rs]
+    ggml_tensor * s_copy;     // I32 [n_rs]
+    ggml_tensor * s_history = nullptr; // I32 [(n_rs_seq + 1 - n_seq_tokens) * n_seqs] for short batches
+
+    void set_history();
+    bool can_reuse_history(const llm_graph_params & params) const;
 
     // views of s_copy, computed once per graph
     // and shared across layers which use build_rs

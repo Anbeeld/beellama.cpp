@@ -176,6 +176,7 @@ public:
     //
 
     uint32_t get_n_rs() const;
+    uint32_t get_n_rs_seq() const;
     uint32_t get_head() const;
     int32_t  get_rs_z() const;
     uint32_t get_size() const;
@@ -185,6 +186,7 @@ public:
     ggml_tensor * get_p_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
+    int32_t s_history(int i, uint32_t age) const;
 
 private:
     const llama_memory_status status;
