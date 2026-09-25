@@ -434,6 +434,16 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     llama_test(
         test-recurrent-state-rollback
+        NAME test-recurrent-state-rollback-lfm2
+        LABEL main
+        ARGS -m "${MODEL_DIR}/lfm2-dense.gguf"
+    )
+    set_tests_properties(test-recurrent-state-rollback-lfm2 PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+
+    llama_test(
+        test-recurrent-state-rollback
         NAME test-recurrent-state-rollback-nemotron-h
         LABEL main
         ARGS -m "${MODEL_DIR}/nemotron_h-dense.gguf"

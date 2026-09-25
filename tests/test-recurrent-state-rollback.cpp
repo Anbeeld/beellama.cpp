@@ -35,6 +35,19 @@ static bool decode_one(llama_context * ctx, llama_token tok, llama_pos pos) {
     return ok;
 }
 
+// A short first decode must work when the rollback reserve exceeds the batch.
+// Server warmup exercises this shape before the first speculative request.
+static bool test_short_initial_decode(const common_params & params, llama_model * model) {
+    llama_context * ctx = make_ctx(params, model);
+    if (ctx == nullptr) {
+        return false;
+    }
+    const std::vector<llama_token> tokens = { 1, 2 };
+    const bool ok = decode_tokens(ctx, tokens, 2) && decode_one(ctx, 3, 2);
+    llama_free(ctx);
+    return ok;
+}
+
 // Roll back multiple sequences, then replay them in a single batch whose
 // per-seq token count exceeds n_ubatch: each seq's replay spans several
 // ubatches while its rollback restore is still pending. Compared against a
@@ -239,6 +252,11 @@ int main(int argc, char ** argv) {
     if (!llama_model_is_recurrent(model) && !llama_model_is_hybrid(model)) {
         fprintf(stderr, "%s : skipping for non-recurrent model\n", __func__);
         return 0;
+    }
+
+    if (!test_short_initial_decode(params, model)) {
+        fprintf(stderr, "%s : short initial recurrent decode failed\n", __func__);
+        return 1;
     }
 
     const llama_vocab * vocab   = llama_model_get_vocab(model);
