@@ -934,7 +934,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (result.axis == GGML_BACKEND_SPLIT_AXIS_0) {
             int head_width;
             memcpy(&head_width, tensor->op_params, sizeof(head_width));
-            GGML_ASSERT(head_width == 128 || head_width == 256 || head_width == 512);
+            GGML_ASSERT(head_width == 64 || head_width == 128 ||
+                    head_width == 256 || head_width == 512);
 
             for (size_t segment = 0; segment < result.n_segments; ++segment) {
                 for (size_t buffer = 0; buffer < n_bufs; ++buffer) {
@@ -1894,7 +1895,12 @@ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struc
 
     // Speculative graphs can create more than 16 transient views per source
     // tensor when a target or draft uses tensor-parallel Meta placement.
-    constexpr size_t compute_headroom = 32;
+    // Views of the static tensors that are created between graph evals are stored in the compute
+    // containers. The number of such views is proportional to the number of tensors in the graph
+    // that share the buffer, which for hybrid recurrent models with n_rs_seq snapshotting can be
+    // much larger than 16 per static tensor (e.g. Qwen35: ~2*(n_rs_seq+1) views per recurrent
+    // layer are created for the conv-state snapshot copies). Size the headroom accordingly.
+    constexpr size_t compute_headroom = 128;
     const ggml_init_params params_static = {
         /*.mem_size   =*/ ggml_get_mem_size(ctx),
         /*.mem_buffer =*/ nullptr,
@@ -2547,8 +2553,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             backend_ctx->ctx.reset(ggml_init(params));
             for (size_t j = 0; j < n_backends; j++) {
                 auto & bcj = backend_ctx->backend_configs[j];
-                for (size_t i = 0; i < n_subgraphs; i++) {
-                    bcj.cgraphs[i].cgraph_main = ggml_new_graph_custom(backend_ctx->ctx.get(), cgraph->n_nodes, /*grads =*/ false);
+                // Reset invalidates every graph allocated from the old context,
+                // including currently unused slots that a later topology can
+                // reactivate without growing max_subgraphs.
+                for (size_t i = 0; i < backend_ctx->max_subgraphs; i++) {
+                    bcj.cgraphs[i].cgraph_main = ggml_new_graph_custom(
+                            backend_ctx->ctx.get(), backend_ctx->max_nnodes, /*grads =*/ false);
                 }
             }
             backend_ctx->cgraphs_aux.resize(n_backends*n_cgraphs_per_device*backend_ctx->max_subgraphs);

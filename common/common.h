@@ -325,8 +325,9 @@ struct common_params_model {
 
 // draft-model-based speculative decoding parameters
 struct common_params_speculative_draft {
-    int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
-    int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
+    int32_t n_max    = 3; // maximum number of tokens to draft during speculative decoding
+    int32_t n_min    = 0; // minimum number of draft tokens to use for speculative decoding
+    int32_t n_ubatch = 0; // physical batch size (0 = auto: at least 128)
 
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
@@ -356,6 +357,7 @@ struct common_params_speculative_draft {
         /*.group               =*/ 128,
         /*.sinkhorn_iters      =*/ 16,
         /*.sink_tokens         =*/ 128,
+        /*.window_chunk        =*/ 2048,
         /*.fail_if_unsupported =*/ true,
     };
 
@@ -671,6 +673,7 @@ struct common_params {
         /*.group               =*/ 128,
         /*.sinkhorn_iters      =*/ 16,
         /*.sink_tokens         =*/ 128,
+        /*.window_chunk        =*/ 0,
         /*.fail_if_unsupported =*/ true,
     };
 

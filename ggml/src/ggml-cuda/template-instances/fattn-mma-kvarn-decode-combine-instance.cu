@@ -6,6 +6,7 @@
     template ggml_cuda_fattn_kvarn_decode_combine_kernel_t \
         ggml_cuda_fattn_kvarn_decode_combine_get_kernel<D>()
 
+DECL_FATTN_KVARN_DECODE_COMBINE(64);
 DECL_FATTN_KVARN_DECODE_COMBINE(128);
 DECL_FATTN_KVARN_DECODE_COMBINE(256);
 DECL_FATTN_KVARN_DECODE_COMBINE(512);

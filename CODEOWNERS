@@ -144,8 +144,6 @@ requirements*.txt                       @CISC
 /tools/server/server-context.cpp         @Anbeeld
 /docs/beellama-features.md               @Anbeeld
 /docs/beellama-args.md                   @Anbeeld
-/docs/quickstart-qwen36-dflash.md        @Anbeeld
-/docs/quickstart-gemma-4-31b-dflash.md   @Anbeeld
 /docs/preset.md                          @Anbeeld
 /tests/test-kvarn.cpp                    @Anbeeld
 /tests/test-adaptive-dm.cpp              @Anbeeld

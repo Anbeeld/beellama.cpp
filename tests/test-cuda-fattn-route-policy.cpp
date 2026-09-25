@@ -89,24 +89,38 @@ int main(int argc, char ** argv) {
             "optional body metadata changed an eligible KVarN route");
     };
 
-    expect_route({256, 1, 6, 4, 4, false, false, false, true, false, 8},
+    expect_route({256, 1, 6, 4, 4, false, false, false, true, false},
         GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_SPLIT,
         "Qwen-like D256 global decode did not select split decode");
-    expect_route({512, 1, 16, 4, 4, false, false, false, true, false, 8},
+    expect_route({512, 1, 16, 4, 4, false, false, false, true, false},
         GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_SPLIT,
         "Gemma-like D512 global decode did not select split decode");
-    expect_route({256, 1, 2, 4, 4, true, false, true, true, false, 8},
+    expect_route({256, 1, 2, 4, 4, true, false, true, true, false},
         GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_VECTOR,
         "Gemma-like D256 SWA decode did not select vector decode");
-    for (int n_q = 2; n_q <= GGML_CUDA_FATTN_KVARN_SPECIALIZED_DECODE_MAX_Q; ++n_q) {
-        expect_route({256, n_q, 6, 4, 4, false, false, false, true, false, 8},
-            n_q <= 8 ? GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_SPLIT : GGML_CUDA_FATTN_KVARN_ROUTE_GENERIC_MMA,
-            "multi-token verification shape selected the wrong KVarN decode route");
+    for (int head_dim : {128, 256, 512}) {
+        for (int n_q = 2; n_q <= GGML_CUDA_FATTN_KVARN_SPECIALIZED_DECODE_MAX_Q; ++n_q) {
+            expect_route({head_dim, n_q, 6, 4, 4, false, false, false, true, false},
+                n_q <= GGML_CUDA_FATTN_KVARN_SPLIT_DEFAULT_MAX_Q ?
+                    GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_SPLIT :
+                    GGML_CUDA_FATTN_KVARN_ROUTE_GENERIC_MMA,
+                "legacy head dimension selected the wrong multi-token KVarN decode route");
+        }
     }
-    expect_route({384, 1, 6, 4, 4, false, false, false, false, false, 8},
+    for (int n_q : {1, 8, 9, 10, 15, 16, 17}) {
+        expect_route({64, n_q, 4, 4, 4, false, false, false, true, false},
+            n_q <= GGML_CUDA_FATTN_KVARN_SPECIALIZED_DECODE_MAX_Q ?
+                GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_SPLIT :
+                GGML_CUDA_FATTN_KVARN_ROUTE_GENERIC_MMA,
+            "D64 split-eligible query width selected the wrong KVarN decode route");
+        expect_route({64, n_q, 4, 4, 4, false, false, false, false, false},
+            GGML_CUDA_FATTN_KVARN_ROUTE_GENERIC_MMA,
+            "D64 split-ineligible query width did not retain the generic fallback route");
+    }
+    expect_route({384, 1, 6, 4, 4, false, false, false, false, false},
         GGML_CUDA_FATTN_KVARN_ROUTE_GENERIC_MMA,
         "unsupported head shape did not remain on generic fallback");
-    expect_route({256, 64, 6, 4, 4, false, false, false, false, true, 8},
+    expect_route({256, 64, 6, 4, 4, false, false, false, false, true},
         GGML_CUDA_FATTN_KVARN_ROUTE_PROMPT_PREFILL,
         "prompt/prefill shape did not retain the prompt route");
     ok &= expect(ggml_cuda_fattn_kvarn_use_wide_mma(16, 6, true),
@@ -217,10 +231,15 @@ int main(int argc, char ** argv) {
                      GGML_CUDA_FATTN_KVARN_MMA_ELIGIBLE,
         "RDNA WMMA must reject ncols2=1 and admit the same-width ncols2=2 tile");
     ok &= expect(mma_eligibility(GGML_CUDA_FATTN_KVARN_AMD_RDNA_WMMA, 256, 8, 2) ==
-                     GGML_CUDA_FATTN_KVARN_MMA_HEAD_DIM_UNSUPPORTED &&
-                 mma_eligibility(GGML_CUDA_FATTN_KVARN_AMD_RDNA_WMMA, 512, 8, 2) ==
-                     GGML_CUDA_FATTN_KVARN_MMA_HEAD_DIM_UNSUPPORTED,
-        "RDNA WMMA must reject D256 and D512 before template launch");
+                     GGML_CUDA_FATTN_KVARN_MMA_ELIGIBLE &&
+                  mma_eligibility(GGML_CUDA_FATTN_KVARN_AMD_RDNA_WMMA, 512, 8, 2) ==
+                      GGML_CUDA_FATTN_KVARN_MMA_HEAD_DIM_UNSUPPORTED,
+        "RDNA WMMA must admit D256 and reject D512 before template launch");
+    ok &= expect(mma_eligibility(GGML_CUDA_FATTN_KVARN_AMD_RDNA4_WMMA, 128, 8, 2) ==
+                     GGML_CUDA_FATTN_KVARN_MMA_ELIGIBLE &&
+                  mma_eligibility(GGML_CUDA_FATTN_KVARN_AMD_RDNA4_WMMA, 256, 8, 2) ==
+                      GGML_CUDA_FATTN_KVARN_MMA_HEAD_DIM_UNSUPPORTED,
+        "RDNA4 WMMA must stay fail-closed at D128 until its fp32 tiles qualify");
     for (int head_dim : {128, 256}) {
         ok &= expect(mma_eligibility(GGML_CUDA_FATTN_KVARN_AMD_CDNA_MFMA, head_dim, 5, 3) ==
                          GGML_CUDA_FATTN_KVARN_MMA_TILE_TOO_SMALL &&
@@ -288,6 +307,28 @@ int main(int argc, char ** argv) {
                  kvarn.find("generic_shape_rejected") != std::string::npos &&
                  kvarn.find("ggml_cuda_fattn_kvarn_select_fallback_route") != std::string::npos,
         "generic KVarN launch must report shape rejection and continue through operation fallback policy");
+    const std::string unpack_pair = slice_between(kvarn_decode,
+            "static __device__ __forceinline__ void ggml_cuda_fattn_kvarn_decode_unpack2(",
+            "// Q_TILE");
+    ok &= expect(!unpack_pair.empty() &&
+                 unpack_pair.find("uint64_t packed") != std::string::npos &&
+                 count_occurrences(unpack_pair, "ggml_cuda_fattn_kvarn_decode_unpack<BITS>") == 0,
+        "packed 3/5/6-bit pairs must share one word load instead of scalar reloads");
+    const std::string d128_decode = slice_between(kvarn_decode,
+            "} else if constexpr (D == 128) {",
+            "if (!best.use_split || best.n_splits <= 1)");
+    ok &= expect(!d128_decode.empty() &&
+                 d128_decode.find("decode_consider<D, 2, 64, 4") != std::string::npos &&
+                 d128_decode.find("decode_consider<D, 4, 64, 4") != std::string::npos,
+        "D128 split decode must offer exact GQA2/GQA4 CTA shapes");
+    ok &= expect(d128_decode.find("decode_consider<D, 2, 128, 8") != std::string::npos &&
+                 d128_decode.find("decode_consider<D, 4, 128, 8") != std::string::npos,
+        "D128 split decode must offer parallel split-128 CTA shapes");
+    ok &= expect(kvarn_decode.find("D == 128 && n_kv < 4096") != std::string::npos,
+        "D128 split-128 must retain split-64 for the measured shallow-context crossover");
+    ok &= expect(kvarn_decode.find("D == 128 && SPLIT_TOKENS == 128") != std::string::npos &&
+                 count_occurrences(kvarn_decode, "STAGE_PAYLOAD ?") >= 3,
+        "D128 split-128 must cooperatively stage packed K/V records");
     const std::string kvarn_dispatch = slice_between(kvarn,
             "bool ggml_cuda_flash_attn_ext_kvarn(",
             "#endif // GGML_CUDA_KVARN");

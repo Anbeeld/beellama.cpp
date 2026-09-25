@@ -269,7 +269,11 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
-    ggml_tensor * s_copy;  // I32 [n_rs]
+    ggml_tensor * s_copy;     // I32 [n_rs]
+    ggml_tensor * s_history = nullptr; // I32 [(n_rs_seq + 1 - n_seq_tokens) * n_seqs] for short batches
+
+    void set_history();
+    bool can_reuse_history(const llm_graph_params & params) const;
 
     // views of s_copy, computed once per graph
     // and shared across layers which use build_rs
@@ -386,6 +390,7 @@ public:
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
+    ggml_tensor * self_kvarn_rot_64  = nullptr;
     ggml_tensor * self_kvarn_rot_128 = nullptr;
     ggml_tensor * self_kvarn_rot_256 = nullptr;
     ggml_tensor * self_kvarn_rot_512 = nullptr;
@@ -581,6 +586,7 @@ public:
 
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
+    ggml_tensor * self_kvarn_rot_64  = nullptr;
     ggml_tensor * self_kvarn_rot_128 = nullptr;
     ggml_tensor * self_kvarn_rot_256 = nullptr;
     ggml_tensor * self_kvarn_rot_512 = nullptr;

@@ -354,6 +354,9 @@ llama_context::llama_context(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+    if (params.kvarn.window_chunk > uint32_t(std::numeric_limits<int32_t>::max())) {
+        throw std::invalid_argument("KVarN window chunk exceeds the supported range");
+    }
     cparams.kvarn             = params.kvarn;
     cparams.kv_tail_tokens    = std::min(params.kv_tail_tokens, cparams.n_ctx);
     cparams.kv_tail_tokens_swa = std::min(params.kv_tail_tokens,
@@ -560,7 +563,7 @@ llama_context::llama_context(
         cparams.ctx_other = params.ctx_other;
     }
 
-    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH) {
+    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH || model.arch == LLM_ARCH_QWEN4EXP) {
         if (model.tok_embd == nullptr || model.output == nullptr) {
             if (params.ctx_other == nullptr) {
                 throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
@@ -4608,7 +4611,7 @@ llama_context * llama_init_from_model(
             bool head_dims_supported = true;
             bool backend_ops_supported = true;
             for (uint32_t il = layer_begin; il < layer_end; ++il) {
-                if (!model->hparams.has_kv(il)) {
+                if (!model->hparams.has_kv(il) || model->hparams.is_recr(il)) {
                     continue;
                 }
 
@@ -4617,8 +4620,10 @@ llama_context * llama_init_from_model(
                     llama_kvarn_head_dim_supported(model->hparams.n_embd_head_k(il)) &&
                     llama_kvarn_head_dim_supported(model->hparams.n_embd_head_v(il));
 
-                backend_ops_supported = backend_ops_supported && llama_kvarn_backend_supports_ops(
-                    params.offload_kqv ? model->dev_layer(il) : nullptr);
+                auto * kvarn_dev = params.offload_kqv ? model->dev_layer(il) : nullptr;
+                backend_ops_supported = backend_ops_supported &&
+                    llama_kvarn_backend_supports_ops(kvarn_dev, model->hparams.n_embd_head_k(il)) &&
+                    llama_kvarn_backend_supports_ops(kvarn_dev, model->hparams.n_embd_head_v(il));
             }
 
             const bool causal_attn =

@@ -865,7 +865,15 @@ struct ggml_backend_sched {
     int debug_prev_graph_size;
 };
 
-#define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
+// note: this inserts the tensor into the hash set, so the scheduler can no longer be
+// considered reset - otherwise the next ggml_backend_sched_reset() would skip the clear
+// and the stale hash set entries would make a later graph overflow the hash set
+static size_t ggml_backend_sched_hash_id(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
+    sched->is_reset = false;
+    return ggml_hash_find_or_insert(&sched->hash_set, tensor);
+}
+
+#define hash_id(tensor) ggml_backend_sched_hash_id(sched, tensor)
 #define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
 #define tensor_id_copy(id, backend_id, copy_id) sched->hv_tensor_copies[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
 #define tensor_copy(tensor, backend_id, copy_id) tensor_id_copy(hash_id(tensor), backend_id, copy_id)

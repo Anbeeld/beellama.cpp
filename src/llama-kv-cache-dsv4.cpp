@@ -1491,6 +1491,33 @@ void llama_kv_cache_dsv4::clear(bool data) {
     clear_compressed(-1, true); // DSV4 compressed buffers must never expose stale/uninit rows
 }
 
+bool llama_kv_cache_dsv4::can_seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+    if (p1 >= 0) {
+        return false;
+    }
+    if (p0 <= 0) {
+        return true;
+    }
+    if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
+        return false;
+    }
+
+    const llama_pos pos_max = kv_raw->seq_pos_max(seq_id);
+    if (p0 > pos_max) {
+        return kv_raw->can_seq_rm(seq_id, p0, -1) &&
+                kv_csa->can_seq_rm(seq_id, p0/DSV4_CSA_RATIO, -1) &&
+                kv_hca->can_seq_rm(seq_id, p0/DSV4_HCA_RATIO, -1) &&
+                kv_lid->can_seq_rm(seq_id, p0/DSV4_CSA_RATIO, -1);
+    }
+    if (n_rs_seq == 0 || rs_idx[seq_id] != 0) {
+        return false;
+    }
+
+    const llama_pos rollback = pos_max - (p0 - 1);
+    return rollback >= 1 && rollback <= (llama_pos) n_rs_seq &&
+            kv_raw->can_seq_rm(seq_id, p0, p1);
+}
+
 bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     if (p1 >= 0) {
         return false;

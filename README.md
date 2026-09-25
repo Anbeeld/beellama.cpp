@@ -10,10 +10,11 @@ BeeLlama.cpp (or just Bee) is a performance-focused llama.cpp fork for squeezing
 
 ## Fork Features
 
-- **Variance-normalized KV-cache quantization (KVarN)**: provides higher precision at similar memory costs. Independent K and V bit widths at `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`, `kvarn6`, and `kvarn8`, set with `--cache-type-k` and `--cache-type-v`.
+- **Variance-normalized KV-cache quantization (KVarN)**: provides higher precision at similar memory costs. Independent K and V bit widths at `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`, `kvarn6`, and `kvarn8`, set with `--cache-type-k` and `--cache-type-v`. Supports 64-, 128-, 256-, and 512-dimensional K/V heads.
 - **KV cache precision tail**: keep most of the KV cache quantized while storing recent tokens in F16/BF16, enabled with `--kv-tail-tokens`. A single global softmax merges the quantized body and the precision tail under FlashAttention, without materializing the whole cache.
 - **Standard low-bit KV cache types**: `q2_0`, `q2_1`, `q3_0`, `q3_1`, `q6_0`, and `q6_1`, usable for either target or draft caches alongside the upstream `q4`/`q5`/`q8` types.
 - **KVarN for speculative decoding**: compress supported owned MTP, DFlash, EAGLE3, and non-MLA DSpark caches independently of the target with `--spec-draft-type-k` and `--spec-draft-type-v`.
+- **Independent draft micro-batch sizing**: MTP, DFlash, and other drafters get their own batch size setting, `-ubd`, which defaults to 128. This saves gigabytes of memory (especially with DFlash) with little to no performance loss.
 - **Adaptive draft-max for DFlash**: adjusts the active draft horizon at runtime instead of using a fixed `--spec-draft-n-max`, comparing speculative throughput against a no-spec baseline.
 - **Reasoning-loop protection**: the server detects repeated hidden reasoning and visible output, forcing reasoning to close or stopping generation when a loop triggers.
 - **Reworked KV cache and prompt reuse**: transactional state restore, capability-aware speculative rollback, and reusable RAM snapshots. Cached prompts are selected by their safely restorable prefix.
@@ -193,8 +194,10 @@ llama-server -m target.gguf --spec-type draft-dflash \
 ```
 
 DFlash1, DFlash2, and non-MLA DSpark can use an owned draft KVarN cache with
-`--spec-draft-type-k/v kvarnN`. Non-causal block attention retains compressed
-persistent storage and uses the qualified materialized attention route.
+`--spec-draft-type-k/v kvarnN`. On capable CUDA devices, supported DFlash1/DFlash2
+non-causal block attention consumes compressed KVarN records directly; unsupported
+shapes and backends materialize the body. Multi-stream SWA draft caches retain
+the materialized route; non-MLA DSpark stays materialized.
 
 ### KVarN Target Cache
 
@@ -237,8 +240,6 @@ llama-server --models-preset presets.ini
 
 - [BeeLlama features and public repo diff](docs/beellama-features.md)
 - [BeeLlama args reference](docs/beellama-args.md)
-- [Qwen3.6 DFlash quickstart](docs/quickstart-qwen36-dflash.md)
-- [Gemma 4 31B DFlash quickstart](docs/quickstart-gemma-4-31b-dflash.md)
 - [Build docs](docs/build.md)
 - [Server docs](tools/server/README.md)
 - [Docker docs](docs/docker.md)

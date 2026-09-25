@@ -35,6 +35,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/mmvdq.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -307,7 +308,14 @@ static ggml_cuda_device_info ggml_cuda_init() {
         info.default_tensor_split[id] = total_vram;
         total_vram += device_vram;
 #if defined(GGML_USE_HIP)
-        info.devices[id].integrated = prop.integrated;
+        // Fork divergence from PR #24233: integrated=true enables the CUDA
+        // host-buffer path (zero-copy UMA weights) on APUs, which corrupts
+        // full-model results under async execution on this box (PPL 5.9243
+        // -> 8.51+ without HIP_LAUNCH_BLOCKING). The back-out restores
+        // async-safe operation. Placement changes with it: supports_buft gates
+        // the CUDA-host buffer type on `integrated`, so APU tensors move off
+        // host-mapped memory and VRAM headroom changes (unmeasured, no APU HW here).
+        info.devices[id].integrated = false; // Temporarily disabled due to issues with corrupted output (e.g. #15034)
 #else
         info.devices[id].integrated = false; // Temporarily disabled due to issues with corrupted output (e.g. #15034)
 #endif
@@ -1891,6 +1899,22 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1, ne11, /*mul_mat_id =*/ false)) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    // GGML_CUDA_DQ_Q6K (unset/invalid = arch default, 0 = off, 1 = on).
+    const bool dq_default = GGML_CUDA_CC_IS_RDNA3_5(cc);
+    if (ggml_cuda_dq_mmv_enabled(dq_default) && ne11 == 1
+            && (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K
+                || (src0->type == GGML_TYPE_Q6_K && ggml_cuda_dq_q6k_enabled(dq_default)))
+            && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)
+            && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 && src0->ne[0] % QK_K == 0) {
+        if (src0->type == GGML_TYPE_Q4_K) {
+            ggml_cuda_mul_mat_vec_dq_q4_K(ctx, src0, src1, dst);
+        } else if (src0->type == GGML_TYPE_Q5_K) {
+            ggml_cuda_mul_mat_vec_dq_q5_K(ctx, src0, src1, dst);
+        } else {
+            ggml_cuda_mul_mat_vec_dq_q6_K(ctx, src0, src1, dst);
+        }
         return;
     }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
@@ -4025,6 +4049,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             }
 
             if (ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
+                const bool dq_default = GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc);
+                if (ggml_cuda_dq_mmv_enabled(dq_default) && ids == nullptr
+                        && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU
+                        && (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K
+                            || (src0->type == GGML_TYPE_Q6_K && ggml_cuda_dq_q6k_enabled(dq_default)))
+                        && gate->src[0]->type == src0->type && ggml_are_same_shape(src0, gate->src[0])
+                        && src1->type == GGML_TYPE_F32 && glu->type == GGML_TYPE_F32
+                        && src1->ne[1] == 1 && src0->ne[0] % QK_K == 0
+                        && ggml_is_contiguous(src0) && ggml_is_contiguous(gate->src[0])
+                        && ggml_is_contiguous(src1) && ggml_is_contiguous(glu)
+                        && src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1) {
+                    ggml_cuda_mul_mat_vec_dq_glu(*cuda_ctx, src0, gate->src[0], src1, glu);
+                    fused_mul_mat_vec = true;
+                    fused_node_count  = 3;
+                    break;
+                }
+
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate->src[0];
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
@@ -4500,6 +4541,19 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
+            // HIP-only: skip the graph path (incl. the update_required probe) for
+            // multi-token (prefill) graphs. Final-tree A/B (27B Q5_K_S, kvarn6,
+            // pp512, gfx1100: gate on 466.5 vs gate off 465.4-467.5) shows no
+            // measurable difference, so this is currently perf-neutral; the
+            // earlier ~6.7% dev-tree reading did not reproduce and is scheduled
+            // for investigation. Decode (ne[1]==1, stable shape) keeps replay.
+#if defined(GGML_USE_HIP)
+            if (cgraph->n_nodes > 0 && cgraph->nodes[0]->ne[1] > 1) {
+                use_cuda_graph = false;
+            } else {
+#else
+            {
+#endif
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
             if (!graph->warmup_complete) {
@@ -4522,6 +4576,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     cuda_graph_update_required = graph->instance == nullptr;
                 }
             }
+            } // else: not prefill
         }
     }
 #endif // USE_CUDA_GRAPH
@@ -4600,10 +4655,13 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     GGML_UNUSED(cgraph);
 #endif
 
-    static bool enable_graph_optimization = [] {
-        const char * env     = getenv("GGML_CUDA_GRAPH_OPT");
-        return env != nullptr && atoi(env) == 1;
+    static const int graph_optimization_override = [] {
+        const char * env = getenv("GGML_CUDA_GRAPH_OPT");
+        return env == nullptr ? -1 : atoi(env) == 1;
     }();
+    const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+    const bool enable_graph_optimization = graph_optimization_override < 0 ?
+        GGML_CUDA_CC_IS_RDNA3_5(cc) : graph_optimization_override;
 
     if (!enable_graph_optimization) {
         return;
@@ -5145,10 +5203,17 @@ static bool ggml_backend_cuda_kvarn_capabilities(
     }
 
     const auto capabilities = ggml_cuda_fattn_kvarn_device_capabilities(device);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    const uint32_t non_causal_mask = capabilities.portable_native &&
+            capabilities.portable_tail_f16 && capabilities.original_v_domain ?
+        GGML_BACKEND_KVARN_ROUTE_NON_CAUSAL_MASK : 0u;
+#else
+    const uint32_t non_causal_mask = 0u;
+#endif
     *result = {
         /* .struct_size                      = */ sizeof(*result),
         /* .abi_version                      = */ GGML_BACKEND_KVARN_CAPABILITIES_ABI_VERSION,
-        /* .route_families                   = */ capabilities.route_families,
+        /* .route_families                   = */ capabilities.route_families | non_causal_mask,
         /* .supported_head_dims              = */ capabilities.supported_head_dims,
         /* .store_materialize                = */ capabilities.store_materialize,
         /* .portable_direct_body             = */ capabilities.portable_native,
@@ -5214,6 +5279,30 @@ static uint32_t ggml_backend_cuda_kvarn_native_rotated_max_query_tokens(ggml_bac
     return capabilities.original_v_domain && capabilities.specialized_routes ?
         capabilities.rotated_query_max_specialized :
         capabilities.rotated_query_max_portable;
+#endif
+}
+
+static bool ggml_backend_cuda_kvarn_head_dim_supported(ggml_backend_dev_t dev, int64_t head_dim) {
+#if !defined(GGML_CUDA_KVARN) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(dev);
+    GGML_UNUSED(head_dim);
+    return false;
+#else
+    if (dev == nullptr || dev->context == nullptr) {
+        return false;
+    }
+    uint32_t bit = 0;
+    switch (head_dim) {
+        case  64: bit = GGML_CUDA_FATTN_KVARN_HEAD_DIM_64;  break;
+        case 128: bit = GGML_CUDA_FATTN_KVARN_HEAD_DIM_128; break;
+        case 256: bit = GGML_CUDA_FATTN_KVARN_HEAD_DIM_256; break;
+        case 512: bit = GGML_CUDA_FATTN_KVARN_HEAD_DIM_512; break;
+        default: return false;
+    }
+    const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
+    const auto & info = ggml_cuda_info();
+    return device >= 0 && device < info.device_count &&
+        (ggml_cuda_fattn_kvarn_device_capabilities(device).supported_head_dims & bit) != 0;
 #endif
 }
 
@@ -5760,10 +5849,23 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_KVARN_WHT:
+#if defined(GGML_CUDA_KVARN)
+            return ggml_backend_cuda_kvarn_ops(dev) &&
+                ggml_backend_cuda_kvarn_head_dim_supported(
+                    dev, ggml_get_op_params_i32(op, 0));
+#else
+            return false;
+#endif
         case GGML_OP_KVARN_STORE:
         case GGML_OP_KVARN_MATERIALIZE:
 #if defined(GGML_CUDA_KVARN)
-            return ggml_backend_cuda_kvarn_ops(dev);
+            {
+                const ggml_tensor * stage = op->op == GGML_OP_KVARN_STORE ? op->src[2] : op->src[1];
+                const int head_slices = std::max(1, ggml_get_op_params_i32(op, 5));
+                return stage != nullptr && ggml_backend_cuda_kvarn_ops(dev) &&
+                    ggml_backend_cuda_kvarn_head_dim_supported(
+                        dev, stage->ne[0] * head_slices);
+            }
 #else
             return false;
 #endif

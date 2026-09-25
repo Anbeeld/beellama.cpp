@@ -1492,19 +1492,7 @@ bool llama_kv_cache::seq_rm_unchecked(llama_seq_id seq_id, llama_pos p0, llama_p
         auto & cells = v_cells[seq_to_stream[seq_id]];
         auto & head  = v_heads[seq_to_stream[seq_id]];
 
-        uint32_t new_head = cells.size();
-
-        for (uint32_t i = 0; i < cells.size(); ++i) {
-            if (!cells.pos_in(i, p0, p1)) {
-                continue;
-            }
-
-            if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
-                if (new_head == cells.size()) {
-                    new_head = i;
-                }
-            }
-        }
+        const uint32_t new_head = cells.seq_rm_pos_range(seq_id, p0, p1);
 
         // If we freed up a slot, set head to it so searching can start there.
         if (new_head != cells.size() && new_head < head) {
@@ -2964,7 +2952,10 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
         head = sinfo.idxs[s].back() + 1;
     }
-    if (!sinfo.group_stage_slots.empty()) {
+    // Ordinary mirrored caches (the qwen4exp QSA index cache) borrow the attention
+    // slot infos, KVarN-only allocation metadata included, but only a structured
+    // cache tracks post-allocation stage slots.
+    if (allocation_group_size > 1 && !sinfo.group_stage_slots.empty()) {
         GGML_ASSERT(sinfo.group_stage_slots.size() == allocation_group_stage_slots.size());
         allocation_group_stage_slots = sinfo.group_stage_slots;
     } else {
@@ -3635,6 +3626,13 @@ void llama_kv_cache::set_input_tail_idxs(ggml_tensor * dst, const llama_ubatch *
     GGML_ASSERT(uint32_t(dst->ne[1]) == tail_write_levels);
     GGML_ASSERT(tail_write_slots.size() == size_t(ubatch->n_tokens)*tail_write_levels);
     std::memcpy(dst->data, tail_write_slots.data(), tail_write_slots.size()*sizeof(int64_t));
+    if (has_compact_tail()) {
+        // A batch can recycle compact slots several times. The tail is updated
+        // after attention, so only the final occupant needs to be stored.
+        // Passing all writes to SET_ROWS races on both CPU and GPU backends.
+        llama_kv_tail_keep_last_writes(
+                static_cast<int64_t *>(dst->data), ubatch->n_tokens, tail_write_levels);
+    }
 }
 
 void llama_kv_cache::set_input_tail_body_idxs(ggml_tensor * dst) const {
@@ -5064,21 +5062,14 @@ std::vector<std::vector<uint32_t>> llama_kv_cache::state_v2_read_payload_and_ins
             for (const auto & saved : stream.cells) {
                 uint32_t destination = saved.source_cell;
                 if (reference_only_partial) {
-                    destination = UINT32_MAX;
-                    for (uint32_t candidate = 0; candidate < cells.size(); ++candidate) {
-                        if (!cells.seq_has(candidate, seq_id) || cells.pos_get(candidate) != saved.pos ||
-                                (manifest.n_pos_per_embd > 1 &&
-                                 !(cells.ext_get(candidate).x == saved.ext.x &&
-                                   cells.ext_get(candidate).y == saved.ext.y))) {
-                            continue;
-                        }
-                        destination = candidate;
-                        break;
-                    }
-                    if (destination == UINT32_MAX) {
+                    const llama_kv_cell_ext * want_ext =
+                            manifest.n_pos_per_embd > 1 ? &saved.ext : nullptr;
+                    const uint32_t found = cells.seq_find_cell(seq_id, saved.pos, want_ext);
+                    if (found == cells.size()) {
                         throw std::runtime_error(
                                 "partial KV state no longer has its self-contained anchor record");
                     }
+                    destination = found;
                     reference_destinations.emplace(saved.source_cell, destination);
                 }
                 if (!destinations.insert(destination).second) {
@@ -5105,31 +5096,50 @@ std::vector<std::vector<uint32_t>> llama_kv_cache::state_v2_read_payload_and_ins
             }
         }
 
-        seq_rm(seq_id, -1, -1);
-        for (uint32_t s = 0; s < manifest.streams.size(); ++s) {
-            const auto & saved_stream = manifest.streams[s].cells;
-            restored_cells[s].reserve(saved_stream.size());
-            for (const auto & saved : saved_stream) {
-                const uint32_t dst_cell = reference_only_partial ?
-                        reference_destinations.at(saved.source_cell) : saved.source_cell;
-                if (cells.is_empty(dst_cell)) {
-                    cells.pos_set(dst_cell, saved.pos);
-                    if (manifest.n_pos_per_embd > 1) {
-                        cells.ext_set(dst_cell, saved.ext);
+        if (reference_only_partial) {
+            // The live body already holds the checkpoint payload. Retain exactly
+            // the manifest anchors and remove every later or divergent logical
+            // cell without clearing and rebuilding the surviving body.
+            const uint32_t new_head = cells.seq_rm_except(seq_id, destinations);
+            auto & head = v_heads[dst_stream];
+            if (new_head != cells.size() && new_head < head) {
+                head = new_head;
+            }
+            for (uint32_t s = 0; s < manifest.streams.size(); ++s) {
+                const auto & saved_stream = manifest.streams[s].cells;
+                restored_cells[s].reserve(saved_stream.size());
+                for (const auto & saved : saved_stream) {
+                    const uint32_t dst_cell = reference_destinations.at(saved.source_cell);
+                    if (tail) {
+                        tail_generations[dst_stream][dst_cell] = saved.generation;
                     }
-                } else if (cells.pos_get(dst_cell) != saved.pos ||
-                        (manifest.n_pos_per_embd > 1 &&
-                         !(cells.ext_get(dst_cell).x == saved.ext.x &&
-                           cells.ext_get(dst_cell).y == saved.ext.y))) {
-                    throw std::runtime_error("selective KV state conflicts with another logical sequence");
-                }
-                cells.seq_add(dst_cell, seq_id);
-                if (tail) {
-                    tail_generations[dst_stream][dst_cell] = saved.generation;
-                }
-                restored_cells[s].push_back(dst_cell);
-                if (reference_only_partial) {
+                    restored_cells[s].push_back(dst_cell);
                     state_cell_remap.emplace_back(saved.source_cell, dst_cell);
+                }
+            }
+        } else {
+            seq_rm(seq_id, -1, -1);
+            for (uint32_t s = 0; s < manifest.streams.size(); ++s) {
+                const auto & saved_stream = manifest.streams[s].cells;
+                restored_cells[s].reserve(saved_stream.size());
+                for (const auto & saved : saved_stream) {
+                    const uint32_t dst_cell = saved.source_cell;
+                    if (cells.is_empty(dst_cell)) {
+                        cells.pos_set(dst_cell, saved.pos);
+                        if (manifest.n_pos_per_embd > 1) {
+                            cells.ext_set(dst_cell, saved.ext);
+                        }
+                    } else if (cells.pos_get(dst_cell) != saved.pos ||
+                            (manifest.n_pos_per_embd > 1 &&
+                             !(cells.ext_get(dst_cell).x == saved.ext.x &&
+                               cells.ext_get(dst_cell).y == saved.ext.y))) {
+                        throw std::runtime_error("selective KV state conflicts with another logical sequence");
+                    }
+                    cells.seq_add(dst_cell, seq_id);
+                    if (tail) {
+                        tail_generations[dst_stream][dst_cell] = saved.generation;
+                    }
+                    restored_cells[s].push_back(dst_cell);
                 }
             }
         }
@@ -5330,7 +5340,14 @@ std::vector<std::vector<uint32_t>> llama_kv_cache::state_v2_read_payload_and_ins
 }
 
 bool llama_kv_cache::requires_state_for_partial_restore() const {
-    return has_tail_overlay();
+    // Overlay-with-body can reconstruct any surviving prefix by trimming a
+    // suffix; the exact tail is a precision cache, not the only copy.  SWA
+    // windows and bodyless exact tails cannot be recovered that way, so they
+    // still have to ride along in PARTIAL_ONLY snapshots.
+    if (n_swa > 0) {
+        return true;
+    }
+    return has_compact_tail() && !has_kv_body();
 }
 
 void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {

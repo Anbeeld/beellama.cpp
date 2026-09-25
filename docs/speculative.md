@@ -74,8 +74,8 @@ llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DFlash.gguf \
 
 `--spec-draft-n-max` is clamped to the draft model's trained block size.
 
-Model-backed speculative modes with owned draft caches—including draft-simple,
-EAGLE3, audited Qwen MTP, DFlash1/DFlash2, and non-MLA DSpark—may use KVarN:
+Model-backed speculative modes with owned draft caches, including draft-simple,
+EAGLE3, audited Qwen MTP, DFlash1/DFlash2, and non-MLA DSpark, may use KVarN:
 
 ```bash
 llama-server -m target.gguf --spec-type draft-dflash \
@@ -83,14 +83,29 @@ llama-server -m target.gguf --spec-type draft-dflash \
     --spec-draft-type-k kvarn4 --spec-draft-type-v kvarn2 -fa on
 ```
 
-The draft pair is independent of the target cache and applies to both
+Model-backed draft contexts inherit the target logical batch capacity configured
+with `--batch-size` (`-b`). Use `--spec-draft-ubatch-size N` (`-ubd N`) to set an
+independent physical capacity; its environment variable is
+`LLAMA_ARG_SPEC_DRAFT_UBATCH_SIZE`. Without an explicit override, the draft
+ubatch defaults to 128; for DFlash/DSpark it grows to
+`max(128, parallel * (n_max + 1))` to fit all slots' noise blocks in one decode.
+An explicit
+`-ubd` remains unchanged, so values below the merged block size can fail for
+non-causal draft attention. A smaller draft ubatch can reduce draft graph and
+workspace memory, but may reduce prompt catch-up throughput. Existing context
+normalization still caps physical ubatch to logical batch: `-b` must also fit
+the merged block. N-gram-only modes do not create a draft context.
+
+The draft cache pair is independent of the target cache and applies to both
 full-attention and SWA draft layers. There is no draft precision-tail option;
 the explicit tail request stays zero and KVarN retains its intrinsic exact
 suffix of up to 128 tokens. Exact describes the stored K/V precision; the KVarN
 attention transform and speculative batch shape can still produce normal
 floating-point differences from an F16-cache run, including a different greedy
-choice when logits are nearly tied. Non-causal DFlash-family block attention uses
-materialized KVarN attention while the persistent draft cache remains compressed.
+choice when logits are nearly tied. On capable CUDA devices, supported owned
+DFlash1/DFlash2 non-causal blocks consume KVarN records directly; unqualified
+shapes and backends materialize the body while persistent storage stays compressed.
+Multi-stream SWA draft caches and non-MLA DSpark remain materialized.
 
 See:
 
@@ -266,6 +281,9 @@ Use exactly one of these options:
 --spec-draft-n-min                      N
                                         minimum number of draft tokens to use for speculative decoding (default: 0)
                                         (env: LLAMA_ARG_SPEC_DRAFT_N_MIN)
+--spec-draft-ubatch-size, -ubd          N
+                                        physical maximum batch size for the draft context (default: 128 or larger for parallel DFlash/DSpark)
+                                        (env: LLAMA_ARG_SPEC_DRAFT_UBATCH_SIZE)
 --spec-draft-p-split, --draft-p-split   P
                                         speculative decoding split probability (default: 0.10)
                                         (env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT)
@@ -322,6 +340,11 @@ Use exactly one of these options:
                                         allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1, q6_0, q6_1, q3_0, q3_1, q2_0, q2_1, kvarn2, kvarn3, kvarn4, kvarn5, kvarn6, kvarn8
                                         KVarN values require one model-backed speculative mode with an owned draft KV cache
                                         (env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V)
+--spec-draft-kvarn-window-chunk  N
+                                        CUDA KVarN prefill materialization window for an owned draft context
+                                        smaller values reduce transient VRAM but add partial-softmax merges
+                                        (default: 2048)
+                                        (env: LLAMA_ARG_SPEC_DRAFT_KVARN_WINDOW_CHUNK)
 --spec-draft-override-tensor, -otd, --override-tensor-draft  <tensor name pattern>=<buffer type>,...
                                         override tensor buffer type for draft model
 --spec-draft-cpu-moe, -cmoed, --cpu-moe-draft

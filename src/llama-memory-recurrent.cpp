@@ -182,7 +182,10 @@ bool llama_memory_recurrent::can_seq_rm(llama_seq_id seq_id, llama_pos p0, llama
     const auto & cell = cells[tail_id];
     if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
         const llama_pos rollback = cell.pos - (p0 - 1);
-        return rollback >= 1 && rollback <= llama_pos(n_rs_seq);
+        // A recurrent snapshot rollback is consumed by the next graph input.
+        // Until then, a second partial rollback cannot be represented and
+        // must be rejected during planning, before mutation starts.
+        return rs_idx[seq_id] == 0 && rollback >= 1 && rollback <= llama_pos(n_rs_seq);
     }
     return true;
 }
@@ -1411,6 +1414,10 @@ uint32_t llama_memory_recurrent_context::get_n_rs() const {
     return is_full ? mem->size : mem->n;
 }
 
+uint32_t llama_memory_recurrent_context::get_n_rs_seq() const {
+    return mem->n_rs_seq;
+}
+
 uint32_t llama_memory_recurrent_context::get_head() const {
     return is_full ? 0 : mem->head;
 }
@@ -1433,6 +1440,22 @@ ggml_tensor * llama_memory_recurrent_context::get_s_l(int32_t il) const {
 
 ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
     return mem->p_l[il];
+}
+
+int32_t llama_memory_recurrent_context::s_history(int i, uint32_t age) const {
+    const uint32_t cell_idx = i + mem->head;
+    const auto & cell = mem->cells[cell_idx];
+    uint32_t idx = 0;
+    if (!cell.seq_id.empty()) {
+        const llama_seq_id seq = *cell.seq_id.begin();
+        if (seq >= 0 && (size_t) seq < mem->rs_idx.size()) {
+            idx = mem->rs_idx[seq];
+        }
+    }
+    // Older snapshots beyond the physical reserve are not used for rollback.
+    // Keep the read in bounds while the newest snapshots refill after replay.
+    idx = std::min(mem->n_rs_seq, idx + age);
+    return (int32_t)(idx * mem->size) + cell.src0;
 }
 
 int32_t llama_memory_recurrent_context::s_copy(int i) const {

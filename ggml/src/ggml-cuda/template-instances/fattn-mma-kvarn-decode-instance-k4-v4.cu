@@ -3,6 +3,7 @@
 #include "../fattn-mma-kvarn-decode.cuh"
 #include "../fattn-kvarn-vec.cuh"
 
+DECL_FATTN_KVARN_DECODE_CASE(64, 4, 4);
 DECL_FATTN_KVARN_DECODE_CASE(128, 4, 4);
 DECL_FATTN_KVARN_DECODE_CASE(256, 4, 4);
 DECL_FATTN_KVARN_DECODE_CASE(512, 4, 4);

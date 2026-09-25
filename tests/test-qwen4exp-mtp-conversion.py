@@ -58,8 +58,20 @@ def test_mtp_only_filters_ple_but_preserves_hyper_connection_mixer() -> None:
         assert Qwen4ExpTextModel.filter_tensors(
             ("model.ple_embedding.layer_multipliers", lambda: torch.zeros(1))
         ) is None
-        for name in Qwen4ExpTextModel.mtp_only_extra_tensor_prefixes:
-            assert Qwen4ExpTextModel.filter_tensors((name + ".weight", lambda: torch.zeros(1))) is not None
+        for suffix in ("hc_norm", "input_mix_weight_down", "input_mix_weight_up"):
+            filtered = Qwen4ExpTextModel.filter_tensors(
+                (f"model.mtp.hyper_connection_mixer.{suffix}.weight", lambda: torch.zeros(1))
+            )
+            assert filtered is not None
+            assert filtered[0] == f"model.layers.2.hyper_connection_mixer.{suffix}.weight"
+
+        tensor_map = gguf.get_tensor_name_map(gguf.MODEL_ARCH.QWEN4EXP, 3)
+        assert tensor_map.get_name("model.layers.2.hyper_connection_mixer.hc_norm") == \
+            "blk.2.nextn.hc_head_norm"
+        assert tensor_map.get_name("model.layers.2.hyper_connection_mixer.input_mix_weight_down") == \
+            "blk.2.nextn.hc_head_down"
+        assert tensor_map.get_name("model.layers.2.hyper_connection_mixer.input_mix_weight_up") == \
+            "blk.2.nextn.hc_head_up"
 
 
 def test_mtp_only_omits_ple_metadata_but_keeps_non_ple_parameters() -> None:

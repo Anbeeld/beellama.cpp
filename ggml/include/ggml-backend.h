@@ -190,12 +190,14 @@ extern "C" {
         GGML_BACKEND_KVARN_ROUTE_GENERIC_MMA     = 1u << 1,
         GGML_BACKEND_KVARN_ROUTE_DECODE_SPLIT    = 1u << 2,
         GGML_BACKEND_KVARN_ROUTE_DECODE_VECTOR   = 1u << 3,
+        GGML_BACKEND_KVARN_ROUTE_NON_CAUSAL_MASK = 1u << 4,
     };
 
     enum ggml_backend_kvarn_head_dim {
         GGML_BACKEND_KVARN_HEAD_DIM_128 = 1u << 0,
         GGML_BACKEND_KVARN_HEAD_DIM_256 = 1u << 1,
         GGML_BACKEND_KVARN_HEAD_DIM_512 = 1u << 2,
+        GGML_BACKEND_KVARN_HEAD_DIM_64  = 1u << 3,
     };
 
     struct ggml_backend_kvarn_capabilities {

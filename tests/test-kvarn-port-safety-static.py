@@ -9,6 +9,8 @@ DECODE_VEC = (ROOT / "ggml/src/ggml-cuda/fattn-kvarn-vec.cuh").read_text(encodin
 DECODE_COMBINE = (ROOT / "ggml/src/ggml-cuda/fattn-mma-kvarn-decode-combine.cuh").read_text(encoding="utf-8")
 WINDOW_CASE = (ROOT / "ggml/src/ggml-cuda/fattn-mma-kvarn-case.cuh").read_text(encoding="utf-8")
 WINDOW_COMMON = (ROOT / "ggml/src/ggml-cuda/fattn-mma-kvarn-window-common.cuh").read_text(encoding="utf-8")
+GGML_HEADER = (ROOT / "ggml/include/ggml.h").read_text(encoding="utf-8")
+LLAMA_GRAPH = (ROOT / "src/llama-graph.cpp").read_text(encoding="utf-8")
 GENERATOR = (ROOT / "ggml/src/ggml-cuda/template-instances/generate_cu_files.py").read_text(encoding="utf-8")
 DECODE_COMBINE_INSTANCE = (ROOT / "ggml/src/ggml-cuda/template-instances/fattn-mma-kvarn-decode-combine-instance.cu").read_text(encoding="utf-8")
 WINDOW_COMMON_INSTANCE = (ROOT / "ggml/src/ggml-cuda/template-instances/fattn-mma-kvarn-window-common-instance.cu").read_text(encoding="utf-8")
@@ -113,6 +115,18 @@ assert "__shared__ float denom_sh[Q_TILE][MAX_GQA + GGML_CUDA_FATTN_KVARN_DECODE
     "decode dedup no longer preserves the verified baseline shared-memory footprint"
 assert "static constexpr int GGML_CUDA_FATTN_KVARN_WINDOW_CHUNK = 65536;" in WINDOW_CASE, \
     "default KVarN window must retain a single 64K materialization chunk"
+assert "GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_WINDOW_CHUNK = 7" in GGML_HEADER, \
+    "KVarN context window lacks a dedicated FlashAttention operation parameter"
+window_chunk = function_body(
+    WINDOW_CASE,
+    "static inline int ggml_cuda_fattn_kvarn_window_chunk(const ggml_tensor * dst, const int n_kv)",
+)
+assert "GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_WINDOW_CHUNK" in window_chunk and \
+       window_chunk.index("GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_WINDOW_CHUNK") < window_chunk.index("getenv"), \
+    "CUDA KVarN window selection must prefer the per-context value before the environment fallback"
+assert "cur->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_WINDOW_CHUNK]" in LLAMA_GRAPH and \
+       "static_cast<int32_t>(cparams.kvarn.window_chunk)" in LLAMA_GRAPH, \
+    "llama graph construction does not propagate the context KVarN window into FlashAttention"
 for duplicate in (
     "GGML_CUDA_FATTN_KVARN_WINDOW_CHUNK",
     "ggml_cuda_fattn_kvarn_window_enabled",

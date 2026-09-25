@@ -1467,7 +1467,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
 
-        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
+        char arch[64] = {0};
+        llama_model_meta_val_str(llama_get_model(ctx_dft), "general.architecture", arch, sizeof(arch));
+        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt && std::strcmp(arch, "gemma4-assistant") == 0;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
         if (chain_heads) {
@@ -2707,6 +2709,8 @@ common_params common_base_params_to_speculative(const common_params & params) {
     const auto & params_spec = params.speculative.draft;
     common_params result = params;
 
+    result.n_ubatch = params_spec.n_ubatch > 0 ? params_spec.n_ubatch : 128;
+
     result.embedding    = false;
     result.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;
 
@@ -2760,6 +2764,11 @@ common_params common_base_params_to_speculative(const common_params & params) {
     if (has_block_draft) {
         // per-seq output positions: DFlash decodes anchor + n_max masks (n_max + 1); DSpark n_max -> +1 covers both
         const int32_t per_seq = std::max(1, params_spec.n_max + 1);
+        if (params_spec.n_ubatch == 0) {
+            // All active slots' non-causal noise blocks must fit in one micro-batch.
+            result.n_ubatch = (int32_t) std::max<int64_t>(128,
+                    std::min<int64_t>(INT32_MAX, (int64_t) params.n_parallel * per_seq));
+        }
         result.n_outputs_max = params.n_parallel * per_seq;
         if (params_spec.backend_sampling) {
             result.n_outputs_max_per_seq = per_seq;
@@ -2853,6 +2862,12 @@ common_speculative_init_result::common_speculative_init_result(
         }
 
         pimpl->context.reset(ctx_dft);
+    }
+
+    if (pimpl->context) {
+        LOG_INF("%s: target context: n_batch=%u, n_ubatch=%u; draft context: n_batch=%u, n_ubatch=%u\n",
+                __func__, llama_n_batch(ctx_tgt), llama_n_ubatch(ctx_tgt),
+                llama_n_batch(pimpl->context.get()), llama_n_ubatch(pimpl->context.get()));
     }
 }
 

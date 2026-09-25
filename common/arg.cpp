@@ -1443,9 +1443,11 @@ static void common_kvarn_pair_normalize(
         const char * option_v) {
     int32_t key_bits = cache_kvarn_bits_k;
     int32_t value_bits = cache_kvarn_bits_v;
+    const uint32_t window_chunk = kvarn.window_chunk;
 
     if (key_bits == 0 && value_bits == 0) {
         kvarn = llama_kvarn_default_params();
+        kvarn.window_chunk = window_chunk;
         return;
     }
 
@@ -1466,6 +1468,7 @@ static void common_kvarn_pair_normalize(
     }
 
     kvarn = llama_kvarn_params_for_type(type);
+    kvarn.window_chunk = window_chunk;
     cache_kvarn_bits_k = key_bits;
     cache_kvarn_bits_v = value_bits;
     cache_type_k = kvarn_fallback_cache_type(key_bits);
@@ -2734,6 +2737,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             parse_target_cache_type(params, /*key =*/ false, value);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
+    add_opt(common_arg(
+        {"--kvarn-window-chunk"}, "N",
+        "CUDA KVarN prefill materialization window for the target context\n"
+        "smaller values reduce transient VRAM but add partial-softmax merges\n"
+        "(default: GGML_KVARN_WINDOW_CHUNK or 65536)",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("kvarn-window-chunk must be positive");
+            }
+            params.kvarn.window_chunk = static_cast<uint32_t>(value);
+        }
+    ).set_env("LLAMA_ARG_KVARN_WINDOW_CHUNK"));
     add_opt(common_arg(
         {"--kv-tail-tokens"}, "SPEC",
         "exact KV-cache tail: 0, auto, N, positional list, or named group list\n"
@@ -4372,6 +4387,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_HF_REPO"));
     add_opt(common_arg(
+        {"--spec-draft-ubatch-size", "-ubd"}, "N",
+        "physical maximum batch size for the draft context (default: 128 or larger for parallel DFlash/DSpark)",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("spec-draft-ubatch-size must be positive");
+            }
+            params.speculative.draft.n_ubatch = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI})
+      .set_env("LLAMA_ARG_SPEC_DRAFT_UBATCH_SIZE"));
+    add_opt(common_arg(
         {"--spec-draft-threads", "-td", "--threads-draft"}, "N",
         "number of threads to use during generation (default: same as --threads)",
         [](common_params & params, int value) {
@@ -4596,6 +4622,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             parse_draft_cache_type(params, /*key =*/ false, value);
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V"));
+    add_opt(common_arg(
+        {"--spec-draft-kvarn-window-chunk"}, "N",
+        "CUDA KVarN prefill materialization window for an owned draft context\n"
+        "smaller values reduce transient VRAM but add partial-softmax merges\n"
+        "(default: 2048)",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("spec-draft-kvarn-window-chunk must be positive");
+            }
+            params.speculative.draft.kvarn.window_chunk = static_cast<uint32_t>(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI})
+      .set_env("LLAMA_ARG_SPEC_DRAFT_KVARN_WINDOW_CHUNK"));
     add_opt(common_arg(
         {"--spec-draft-override-tensor", "-otd", "--override-tensor-draft"}, "<tensor name pattern>=<buffer type>,...",
         "override tensor buffer type for draft model", [](common_params & params, const std::string & value) {

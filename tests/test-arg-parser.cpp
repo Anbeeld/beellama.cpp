@@ -463,6 +463,7 @@ static void test(void) {
         "binary_name", "-m", "model_file.gguf",
         "--cache-type-k", "kvarn4",
         "--cache-type-v", "kvarn2",
+        "--kvarn-window-chunk", "4096",
     };
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.kvarn.type == LLAMA_KVARN_K4V2_G128);
@@ -472,6 +473,7 @@ static void test(void) {
     assert(params.kvarn.swa_value_bits == 0);
     assert(params.kvarn.sink_tokens == 128);
     assert(params.kvarn.sinkhorn_iters == 16);
+    assert(params.kvarn.window_chunk == 4096);
     assert(params.kvarn.fail_if_unsupported);
     assert(params.cache_kvarn_bits_k == 4);
     assert(params.cache_kvarn_bits_v == 2);
@@ -479,7 +481,12 @@ static void test(void) {
     assert(params.cache_type_v == GGML_TYPE_Q2_0S);
     assert(!params.kv_unified);
     assert(common_context_params_to_llama(params).kvarn.type == LLAMA_KVARN_K4V2_G128);
+    assert(common_context_params_to_llama(params).kvarn.window_chunk == 4096);
     assert(!common_context_params_to_llama(params).kv_unified);
+
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--kvarn-window-chunk", "0"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
     params = common_params();
     argv = {
@@ -614,9 +621,17 @@ static void test(void) {
     }
 
     params = common_params();
-    argv = {"binary_name", "-m", "model_file.gguf", "--spec-type", "draft-simple", "--spec-draft-type-k", "kvarn4", "--spec-draft-type-v", "kvarn2"};
+    assert(params.speculative.draft.kvarn.window_chunk == 2048);
+    argv = {
+        "binary_name", "-m", "model_file.gguf", "--spec-type", "draft-simple",
+        "--spec-draft-type-k", "kvarn4", "--spec-draft-type-v", "kvarn2",
+        "--spec-draft-kvarn-window-chunk", "4096",
+    };
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
     assert(params.speculative.draft.kvarn.type == LLAMA_KVARN_K4V2_G128);
+    assert(params.speculative.draft.kvarn.window_chunk == 4096);
+    assert(params.kvarn.window_chunk == 0);
+    assert(common_base_params_to_speculative(params).kvarn.window_chunk == 4096);
     assert(params.speculative.draft.cache_type_k == GGML_TYPE_Q4_0);
     assert(params.speculative.draft.cache_type_v == GGML_TYPE_Q2_0S);
 
@@ -959,6 +974,96 @@ static void test(void) {
     printf("test-arg-parser: all tests OK\n\n");
 }
 
+static void test_draft_ubatch_configuration_is_independent() {
+    auto parse = [](common_params & params, std::vector<std::string> argv) {
+        std::vector<char *> argv_ptrs;
+        for (std::string & arg : argv) {
+            argv_ptrs.push_back(arg.data());
+        }
+        return common_params_parse((int) argv_ptrs.size(), argv_ptrs.data(), params, LLAMA_EXAMPLE_SPECULATIVE);
+    };
+
+    common_params params;
+    assert(params.speculative.draft.n_ubatch == 0); // automatic default
+    params.n_batch  = 2048;
+    params.n_ubatch = 512;
+
+    common_params draft = common_base_params_to_speculative(params);
+    assert(params.n_batch == 2048);
+    assert(params.n_ubatch == 512);
+    assert(draft.n_batch == 2048);
+    assert(draft.n_ubatch == 128);
+
+    params.n_parallel = 16;
+    params.speculative.draft.n_max = 9;
+    params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK };
+    draft = common_base_params_to_speculative(params);
+    assert(draft.n_ubatch == 160); // enough for every slot's non-causal noise block
+
+    params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
+    draft = common_base_params_to_speculative(params);
+    assert(draft.n_ubatch == 160);
+
+    params.n_parallel = 8;
+    draft = common_base_params_to_speculative(params);
+    assert(draft.n_ubatch == 128);
+
+    params.n_parallel = 16;
+    params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+    draft = common_base_params_to_speculative(params);
+    assert(draft.n_ubatch == 128);
+
+    params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK };
+    assert(parse(params, {
+        "binary_name", "-m", "model.gguf", "-b", "2048", "-ub", "512",
+        "--spec-draft-ubatch-size", "192",
+    }));
+    assert(params.n_batch == 2048);
+    assert(params.n_ubatch == 512);
+    assert(params.speculative.draft.n_ubatch == 192);
+    draft = common_base_params_to_speculative(params);
+    assert(draft.n_batch == 2048);
+    assert(draft.n_ubatch == 192);
+
+    params = common_params();
+    assert(parse(params, { "binary_name", "-m", "model.gguf", "-b", "2048", "-ub", "512", "-ubd", "128" }));
+    params.n_parallel = 16;
+    params.speculative.draft.n_max = 9;
+    params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
+    draft = common_base_params_to_speculative(params);
+    assert(params.n_batch == 2048);
+    assert(params.n_ubatch == 512);
+    assert(draft.n_batch == 2048);
+    assert(draft.n_ubatch == 128);
+
+    for (const char * option : { "--spec-draft-batch-size", "-bd" }) {
+        params = common_params();
+        const std::string error = capture_stderr([&]() {
+            assert(!parse(params, { "binary_name", option, "512" }));
+        });
+        assert(error.find(option) != std::string::npos);
+    }
+
+    for (const char * value : { "0", "-1" }) {
+        params = common_params();
+        const std::string error = capture_stderr([&]() {
+            assert(!parse(params, { "binary_name", "--spec-draft-ubatch-size", value }));
+        });
+        assert(error.find("--spec-draft-ubatch-size") != std::string::npos);
+    }
+
+    set_test_env("LLAMA_ARG_SPEC_DRAFT_UBATCH_SIZE", "96");
+    params = common_params();
+    assert(parse(params, { "binary_name", "-m", "model.gguf", "-b", "2048", "-ub", "512" }));
+    assert(params.n_batch == 2048);
+    assert(params.n_ubatch == 512);
+    assert(params.speculative.draft.n_ubatch == 96);
+    draft = common_base_params_to_speculative(params);
+    assert(draft.n_batch == 2048);
+    assert(draft.n_ubatch == 96);
+    unset_test_env("LLAMA_ARG_SPEC_DRAFT_UBATCH_SIZE");
+}
+
 static void test_draft_cache_configuration_is_independent() {
     common_params defaults;
     assert(defaults.speculative.draft.cache_kvarn_bits_k == 0);
@@ -1070,6 +1175,7 @@ static void test_single_device_draft_does_not_inherit_target_tensor_split() {
 int main(void) {
     try {
         test();
+        test_draft_ubatch_configuration_is_independent();
         test_draft_cache_configuration_is_independent();
         test_single_device_draft_does_not_inherit_target_tensor_split();
     } catch (std::exception & e) {

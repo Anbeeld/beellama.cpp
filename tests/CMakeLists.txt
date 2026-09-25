@@ -138,6 +138,12 @@ if (Python3_Interpreter_FOUND)
     set_property(TEST test-kvarn-eager-workspace-static PROPERTY LABELS cuda)
 
     add_test(
+        NAME test-kvarn-d64-parallel-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-kvarn-d64-parallel-static.py)
+    set_property(TEST test-kvarn-d64-parallel-static PROPERTY LABELS cuda)
+
+    add_test(
         NAME test-kvarn-rollback-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-kvarn-rollback-static.py)
@@ -160,6 +166,12 @@ if (Python3_Interpreter_FOUND)
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-kvarn-port-safety-static.py)
     set_property(TEST test-kvarn-port-safety-static PROPERTY LABELS cuda)
+
+    add_test(
+        NAME test-qwen4exp-qsa-kvarn-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-qwen4exp-qsa-kvarn-static.py)
+    set_property(TEST test-qwen4exp-qsa-kvarn-static PROPERTY LABELS main)
 
     add_test(
         NAME test-kvarn-hip-tail-capability-static
@@ -333,6 +345,8 @@ llama_build(test-save-load-state.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
+    llama_build_and_test(test-kv-tail-input.cpp)
+    target_include_directories(test-kv-tail-input PRIVATE ${PROJECT_SOURCE_DIR}/src)
     llama_build_and_test(test-unicode.cpp)
     llama_build_and_test(test-sampling.cpp)
     llama_build_and_test(test-reasoning-budget.cpp)
@@ -415,6 +429,16 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
     )
     set_tests_properties(test-recurrent-state-rollback PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+
+    llama_test(
+        test-recurrent-state-rollback
+        NAME test-recurrent-state-rollback-lfm2
+        LABEL main
+        ARGS -m "${MODEL_DIR}/lfm2-dense.gguf"
+    )
+    set_tests_properties(test-recurrent-state-rollback-lfm2 PROPERTIES
         FIXTURES_REQUIRED generate-models
     )
 
@@ -539,6 +563,19 @@ if (LLAMA_BUILD_SERVER)
     llama_build_and_test(test-server-prompt-checkpoint.cpp)
     target_include_directories(test-server-prompt-checkpoint PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)
     target_link_libraries(test-server-prompt-checkpoint PRIVATE server-context)
+
+    # input-marking-aware prompt tokenization (prompt_parts) regression tests;
+    # needs a vocab-only GGUF (the qwen2 vocab provides the control special
+    # tokens the tests rely on) and the GPT-OSS chat template
+    llama_build_and_test(
+        test-prompt-parts.cpp
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS
+            ${PROJECT_SOURCE_DIR}/models/ggml-vocab-qwen2.gguf
+            ${PROJECT_SOURCE_DIR}/models/templates/openai-gpt-oss-120b.jinja
+    )
+    target_include_directories(test-prompt-parts PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)
+    target_link_libraries(test-prompt-parts PRIVATE server-context)
 endif()
 # Upstream model-resolution coverage serves repositories through cpp-httplib.
 llama_build_and_test(test-model-resolution.cpp)

@@ -68,22 +68,56 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_combine_kernel(
         dst_meta[output_row] = make_float2(m, denom);
     }
 
-    for (int dim = tid; dim < D; dim += blockDim.x) {
+    if constexpr (D == 64) {
+        // A one-thread-per-dimension reduction leaves three quarters of this
+        // 256-thread block idle while reading the large split buffer. Give each
+        // D64 dimension four contiguous split ranges, then reduce those four
+        // numerators in shared memory. Each 64-thread group still issues
+        // contiguous loads for a split, while all 256 threads remain useful.
+        constexpr int DIM_GROUPS = GGML_CUDA_FATTN_KVARN_DECODE_COMBINE_THREADS / D;
+        const int dim = tid % D;
+        const int group = tid / D;
+        const int splits_per_group = (n_splits + DIM_GROUPS - 1) / DIM_GROUPS;
+        const int split_begin = group * splits_per_group;
+        const int split_end = min(n_splits, split_begin + splits_per_group);
         float out = 0.0f;
         if (denom > 0.0f) {
-            for (int split = 0; split < n_splits; ++split) {
-                // Skipped splits did not write partials; their zero weight also
-                // avoids reading those unwritten values during the reduction.
+            for (int split = split_begin; split < split_end; ++split) {
                 const float weight = split_weights[split];
                 if (weight == 0.0f) {
                     continue;
                 }
-                const size_t base = (((size_t) stream * n_q + q_index) * n_q_heads + q_head) * n_splits + split;
+                const size_t base = (((size_t) stream * n_q + q_index) * n_q_heads + q_head) *
+                    n_splits + split;
                 out += weight * partial[base * D + dim];
             }
-            out /= denom;
         }
-        dst[output_row * D + dim] = out;
+        reduce_sh[tid] = out;
+        __syncthreads();
+        if (group == 0) {
+            for (int g = 1; g < DIM_GROUPS; ++g) {
+                out += reduce_sh[g * D + dim];
+            }
+            dst[output_row * D + dim] = denom > 0.0f ? out / denom : 0.0f;
+        }
+    } else {
+        for (int dim = tid; dim < D; dim += blockDim.x) {
+            float out = 0.0f;
+            if (denom > 0.0f) {
+                for (int split = 0; split < n_splits; ++split) {
+                    // Skipped splits did not write partials; their zero weight also
+                    // avoids reading those unwritten values during the reduction.
+                    const float weight = split_weights[split];
+                    if (weight == 0.0f) {
+                        continue;
+                    }
+                    const size_t base = (((size_t) stream * n_q + q_index) * n_q_heads + q_head) * n_splits + split;
+                    out += weight * partial[base * D + dim];
+                }
+                out /= denom;
+            }
+            dst[output_row * D + dim] = out;
+        }
     }
 }
 

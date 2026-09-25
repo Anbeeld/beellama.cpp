@@ -446,6 +446,33 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     return build_delta_net_chunking(q, k, v, g, b, s, il);
 }
 
+void llm_build_delta_net_base::build_rs_history(
+        llm_graph_input_rs * inp, ggml_tensor * states_all, int64_t state_size, int64_t n_written) {
+    if (!inp->s_history) {
+        return;
+    }
+
+    const int64_t n_seqs = ubatch.n_seqs;
+    const int64_t n_history = inp->s_history->ne[0] / n_seqs;
+    const int64_t mem_size = inp->mctx->get_size();
+    const int64_t head = inp->mctx->get_head();
+    const size_t row_size = ggml_row_size(states_all->type, state_size);
+
+    // Gather before writing any snapshots: source and destination may overlap,
+    // especially on the decode immediately after a partial rollback.
+    ggml_tensor * rows = ggml_reshape_2d(ctx0, states_all, state_size, states_all->ne[1]);
+    ggml_tensor * previous = ggml_get_rows(ctx0, rows, inp->s_history);
+    ggml_build_forward_expand(gf, previous);
+
+    for (int64_t age = 0; age < n_history; ++age) {
+        ggml_tensor * src = ggml_view_2d(ctx0, previous, state_size, n_seqs,
+                previous->nb[1], age*n_seqs*row_size);
+        ggml_tensor * dst = ggml_view_2d(ctx0, states_all, state_size, n_seqs,
+                states_all->nb[1], ((n_written + age)*mem_size + head)*row_size);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+    }
+}
+
 ggml_tensor * llm_build_delta_net_base::build_conv_state(
         llm_graph_input_rs * inp,
         ggml_tensor *        conv_states_all,
@@ -496,12 +523,13 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
     } else {
         // [TAG_RECURRENT_ROLLBACK_SPLITS]
-        // this logic assumes that the last (n_rs_seq + 1) tokens of a sequence in a batch are inside
-        //   the same ubatch, which `split_equal()` guarantees via its n_keep_tail argument
-
+        // Preserve snapshots from previous batches before writing this batch's
+        // suffix. Without this, a short decode leaves older rollback slots stale.
         const int64_t K = (int64_t) cparams.n_rs_seq + 1;
+        const int64_t n_written = std::min<int64_t>(ubatch.n_seq_tokens, K);
+        build_rs_history(inp, conv_states_all, row_count, n_written);
 
-        for (int64_t t = 1; t <= K; ++t) {
+        for (int64_t t = K - n_written + 1; t <= K; ++t) {
             const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
             const int64_t s_slot = K - t;
 
@@ -562,6 +590,8 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     const int64_t D = S_v * S_v * H_v;
     const int64_t K = cparams.n_rs_seq + 1;
+    const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
+    build_rs_history(inp, ssm_states_all, hparams.n_embd_s(), n_written);
 
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
     ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
@@ -584,8 +614,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
 
-    // op writes the last min(n_seq_tokens, K) snapshots; trailing slots are left unwritten
-    const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
+    // op writes the last min(n_seq_tokens, K) snapshots; older slots were carried above
 
     // write the produced snapshots into the recurrent cache (snapshot slot i -> rollback group i)
     ggml_tensor * src = ggml_view_3d(ctx0, gdn_out,

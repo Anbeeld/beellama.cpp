@@ -1,5 +1,7 @@
 #include "llama-kvarn.h"
 
+#include "ggml-backend.h"
+
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -61,11 +63,47 @@ static constexpr std::array<llama_kvarn_type_desc, LLAMA_KVARN_TYPE_COUNT> KVAR_
     LLAMA_KVARN_DESC(8, 8),
 }};
 
+bool llama_kvarn_backend_supports_non_causal_mask(ggml_backend_dev_t dev) {
+    if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return false;
+    }
+    if (ggml_backend_dev_is_meta(dev)) {
+        const size_t count = ggml_backend_meta_device_count(dev);
+        for (size_t i = 0; i < count; ++i) {
+            if (!llama_kvarn_backend_supports_non_causal_mask(
+                        ggml_backend_meta_device_get(dev, i))) {
+                return false;
+            }
+        }
+        return count > 0;
+    }
+    auto * reg = ggml_backend_dev_backend_reg(dev);
+    using capabilities_fn_t = bool (*)(ggml_backend_dev_t, ggml_backend_kvarn_capabilities *);
+    auto * fn = reg ? reinterpret_cast<capabilities_fn_t>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_kvarn_capabilities")) : nullptr;
+    if (!fn) {
+        return false;
+    }
+    ggml_backend_kvarn_capabilities capabilities = {};
+    capabilities.struct_size = sizeof(capabilities);
+    capabilities.abi_version = GGML_BACKEND_KVARN_CAPABILITIES_ABI_VERSION;
+    return fn(dev, &capabilities) && capabilities.struct_size == sizeof(capabilities) &&
+        capabilities.abi_version == GGML_BACKEND_KVARN_CAPABILITIES_ABI_VERSION &&
+        (capabilities.route_families & GGML_BACKEND_KVARN_ROUTE_NON_CAUSAL_MASK) != 0;
+}
+
 bool llama_kvarn_native_attention_allowed(bool causal_attn, llm_arch arch) {
-    // DFlash non-causal block masks are qualified through the materialized
-    // oracle. Keep native record-consuming attention for causal DFlash and
-    // all existing architectures.
+    // The pre-existing causal and other-architecture policy is independent of
+    // the separately qualified non-causal DFlash route.
     return causal_attn || arch != LLM_ARCH_DFLASH;
+}
+
+bool llama_kvarn_native_attention_allowed(const llama_kvarn_native_attention_request & request) {
+    return (request.mask == LLAMA_KVARN_MASK_DFLASH_BLOCK ||
+            request.mask == LLAMA_KVARN_MASK_DFLASH_SWA) &&
+        request.owned_dense_kv && request.native_body_and_tail &&
+        request.backend_non_causal_mask &&
+        (request.head_dim == 128 || request.head_dim == 256 || request.head_dim == 512);
 }
 
 llama_kvarn_attention_plan llama_kvarn_plan_attention(
@@ -73,6 +111,20 @@ llama_kvarn_attention_plan llama_kvarn_plan_attention(
         bool native_original_v,
         uint32_t native_rotated_max_query_tokens,
         uint32_t n_query_tokens) {
+    return llama_kvarn_plan_attention(
+            native_attention,
+            native_original_v,
+            native_rotated_max_query_tokens,
+            n_query_tokens,
+            /*head_dim =*/ 0);
+}
+
+llama_kvarn_attention_plan llama_kvarn_plan_attention(
+        bool native_attention,
+        bool native_original_v,
+        uint32_t native_rotated_max_query_tokens,
+        uint32_t n_query_tokens,
+        int head_dim) {
     if (!native_attention) {
         return { false, GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED };
     }
@@ -80,6 +132,11 @@ llama_kvarn_attention_plan llama_kvarn_plan_attention(
     // A backend that predates the extended capability still supports the
     // established one-row rotated decode contract.
     const uint32_t rotated_limit = std::max(1u, native_rotated_max_query_tokens);
+    // D64 decode stays record-native at every context length. Prompt
+    // processing materializes into the regular tiled FlashAttention route.
+    if (head_dim == 64 && n_query_tokens > rotated_limit) {
+        return { false, GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED };
+    }
     if (n_query_tokens <= rotated_limit) {
         return { true, GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED };
     }
@@ -140,6 +197,7 @@ llama_kvarn_params llama_kvarn_default_params() {
         /*.group               =*/ 128,
         /*.sinkhorn_iters      =*/ 16,
         /*.sink_tokens         =*/ 128,
+        /*.window_chunk        =*/ 0,
         /*.fail_if_unsupported =*/ true,
     };
 }
@@ -612,12 +670,36 @@ llama_kvarn_tile_layout llama_kvarn_make_layout(int head_dim, int group, int key
     return layout;
 }
 
-int llama_kvarn_head_slices(int head_dim) {
-    if (head_dim != 128 && head_dim != 256 && head_dim != 512) {
-        return 0;
-    }
+llama_kvarn_record_layout llama_kvarn_make_record_layout(int record_dim, int bits, bool value) {
+    assert(record_dim == 64 || record_dim == 128);
+    assert(llama_kvarn_valid_bits(bits));
 
-    return head_dim / 128;
+    llama_kvarn_record_layout layout = {};
+    layout.token_group = KVAR_N_GROUP;
+    layout.record_dim = uint32_t(record_dim);
+    layout.rows = value ? KVAR_N_GROUP : uint32_t(record_dim);
+    layout.cols = value ? uint32_t(record_dim) : KVAR_N_GROUP;
+    layout.payload_bytes = llama_kvarn_packed_bytes(int(layout.rows * layout.cols), bits);
+    layout.scale_off = layout.payload_bytes;
+    layout.zp_off = layout.scale_off + size_t(layout.rows) * sizeof(uint16_t);
+    layout.other_off = layout.zp_off + size_t(layout.rows) * sizeof(uint16_t);
+    layout.record_bytes = layout.other_off + size_t(layout.cols) * sizeof(uint16_t);
+    return layout;
+}
+
+bool llama_kvarn_geometry_for(int head_dim, llama_kvarn_geometry & geometry) {
+    switch (head_dim) {
+        case 64:  geometry = { KVAR_N_GROUP,  64,  64, 1 }; return true;
+        case 128: geometry = { KVAR_N_GROUP, 128, 128, 1 }; return true;
+        case 256: geometry = { KVAR_N_GROUP, 128, 256, 2 }; return true;
+        case 512: geometry = { KVAR_N_GROUP, 128, 512, 4 }; return true;
+        default:  geometry = {}; return false;
+    }
+}
+
+int llama_kvarn_head_slices(int head_dim) {
+    llama_kvarn_geometry geometry = {};
+    return llama_kvarn_geometry_for(head_dim, geometry) ? int(geometry.head_slices) : 0;
 }
 
 bool llama_kvarn_head_dim_supported(int head_dim) {
@@ -663,6 +745,26 @@ uint8_t llama_kvarn_unpack_bits_value(const uint8_t * src, int index, int bits) 
     }
 
     return value;
+}
+
+void llama_kvarn_hadamard_64(float * values) {
+    assert(values != nullptr);
+
+    for (int stride = 1; stride < 64; stride *= 2) {
+        for (int base = 0; base < 64; base += 2 * stride) {
+            for (int i = 0; i < stride; ++i) {
+                const float a = values[base + i];
+                const float b = values[base + stride + i];
+                values[base + i] = a + b;
+                values[base + stride + i] = a - b;
+            }
+        }
+    }
+
+    constexpr float INV_SQRT_64 = 0.125f;
+    for (int i = 0; i < 64; ++i) {
+        values[i] *= INV_SQRT_64;
+    }
 }
 
 void llama_kvarn_hadamard_128(float * values) {

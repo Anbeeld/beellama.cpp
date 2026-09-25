@@ -56,6 +56,25 @@ struct llama_kvarn_type_desc {
     int group;
 };
 
+struct llama_kvarn_geometry {
+    uint32_t token_group;
+    uint32_t record_dim;
+    uint32_t head_dim;
+    uint32_t head_slices;
+};
+
+struct llama_kvarn_record_layout {
+    uint32_t token_group;
+    uint32_t record_dim;
+    uint32_t rows;
+    uint32_t cols;
+    size_t payload_bytes;
+    size_t scale_off;
+    size_t zp_off;
+    size_t other_off;
+    size_t record_bytes;
+};
+
 struct llama_kvarn_tile_layout {
     size_t k_payload_off;
     size_t v_payload_off;
@@ -116,6 +135,8 @@ const llama_kvarn_type_desc * llama_kvarn_type_desc_from_name(const char * name)
 const llama_kvarn_type_desc * llama_kvarn_type_desc_from_type(llama_kvarn_type type);
 
 llama_kvarn_tile_layout llama_kvarn_make_layout(int head_dim, int group, int key_bits, int value_bits);
+llama_kvarn_record_layout llama_kvarn_make_record_layout(int record_dim, int bits, bool value);
+bool llama_kvarn_geometry_for(int head_dim, llama_kvarn_geometry & geometry);
 
 int  llama_kvarn_head_slices(int head_dim);
 bool llama_kvarn_head_dim_supported(int head_dim);
@@ -125,13 +146,37 @@ struct llama_kvarn_attention_plan {
     enum ggml_flash_attn_ext_kvarn_domain domain;
 };
 
+bool llama_kvarn_backend_supports_non_causal_mask(ggml_backend_dev_t dev);
 bool llama_kvarn_native_attention_allowed(bool causal_attn, llm_arch arch);
+
+enum llama_kvarn_mask_semantics {
+    LLAMA_KVARN_MASK_UNSUPPORTED,
+    LLAMA_KVARN_MASK_DFLASH_BLOCK,
+    LLAMA_KVARN_MASK_DFLASH_SWA,
+};
+
+struct llama_kvarn_native_attention_request {
+    llama_kvarn_mask_semantics mask;
+    bool owned_dense_kv;
+    bool native_body_and_tail;
+    bool backend_non_causal_mask;
+    int head_dim;
+};
+
+bool llama_kvarn_native_attention_allowed(const llama_kvarn_native_attention_request & request);
 
 llama_kvarn_attention_plan llama_kvarn_plan_attention(
         bool native_attention,
         bool native_original_v,
         uint32_t native_rotated_max_query_tokens,
         uint32_t n_query_tokens);
+
+llama_kvarn_attention_plan llama_kvarn_plan_attention(
+        bool native_attention,
+        bool native_original_v,
+        uint32_t native_rotated_max_query_tokens,
+        uint32_t n_query_tokens,
+        int head_dim);
 
 enum ggml_flash_attn_ext_kvarn_domain llama_kvarn_attention_domain(
         bool native_attention,
@@ -234,6 +279,7 @@ bool llama_kvarn_stream_is_exclusive_for(
     return true;
 }
 
+void llama_kvarn_hadamard_64(float * values);
 void llama_kvarn_hadamard_128(float * values);
 
 void llama_kvarn_quantize_k_tile(

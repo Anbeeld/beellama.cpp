@@ -1,6 +1,6 @@
-# BeeLlama v0.4.6 features
+# BeeLlama v0.4.7 features
 
-BeeLlama v0.4.6 keeps a small fork surface on top of upstream llama.cpp. Use
+BeeLlama v0.4.7 keeps a small fork surface on top of upstream llama.cpp. Use
 this page to choose a feature; use the [argument reference](beellama-args.md)
 for exact names, environment variables, defaults, and validation ranges.
 
@@ -11,7 +11,9 @@ for exact names, environment variables, defaults, and validation ranges.
 KVarN is Huawei's calibration-free, variance-normalized KV-cache quantizer,
 adapted here for llama.cpp. It applies a per-head Hadamard rotation after RoPE,
 normalizes both axes of each 128-token tile, and stores structured 2-, 3-, 4-,
-5-, 6-, or 8-bit records with scale metadata. K and V widths are independent,
+5-, 6-, or 8-bit records with scale metadata. Logical 64-dimensional heads use
+true rectangular K records (64 x 128) and V records (128 x 64); wider heads
+retain the established 128 x 128 sliced-record ABI. K and V widths are independent,
 and supported Qwen 3.6 and Gemma 4 SWA layers can use a separate KVarN pair.
 Non-SWA layers keep the first 128 attention-sink tokens exact. Bee also keeps at
 least the newest 128 tokens exact, unlike the reference implementation's
@@ -67,20 +69,28 @@ as the intended workload. Keep both `-b` and `-ub` identical between baseline
 and candidate runs. Record the model file, command, prompt or corpus, sampling
 settings, GPU, and commit with every result.
 
-CUDA multi-token KVarN prefill materializes transient F16 K/V windows. The
-v0.4.6 default keeps one window through 65,536 active tokens to avoid an
-additional partial-softmax merge. `GGML_KVARN_WINDOW_CHUNK` can select a smaller
-positive token count when concurrent long prompts require less transient
-scratch; the value does not change the context size, retained cache, KVarN bit
-width, or precision-tail length. Smaller windows remain mathematically
-online-softmax equivalent but change floating-point reduction order, so KLD
-comparisons must record this setting.
+CUDA KVarN prefill uses direct records for supported shapes and transient F16
+K/V windows for unsupported shapes. The
+target-context default keeps one window through 65,536 active tokens to avoid an
+additional partial-softmax merge. `--kvarn-window-chunk` and
+`--spec-draft-kvarn-window-chunk` select positive token counts for the target
+and owned draft contexts independently. The draft context defaults to `2048`,
+which keeps its transient F16 workspace bounded for shallow speculative models;
+the target context falls back to `GGML_KVARN_WINDOW_CHUNK`. The value does not
+change the context size, retained cache, KVarN bit width, or precision-tail
+length. Smaller windows remain mathematically online-softmax equivalent but
+change floating-point reduction order, so KLD comparisons must record both
+context settings.
 
 The CUDA specialized split, SWA-vector, and tiled descriptor-native MMA routes
 publish the same optional FP32 `(maximum, denominator)` metadata as upstream
-FlashAttention. Single-token generation uses split/vector decode, while short
-multi-token verification uses tiled MMA to reuse decoded K/V tiles across query
-rows. Q9-Q16 batches with GQA above four use a fused 128-column tile when the
+FlashAttention. For 64-dimensional heads, query widths 1 through 16 are eligible
+for split decode when the device and concrete geometry support it. Geometry
+selection keeps the single-query KV partition so autoregressive generation and
+speculative verification use the same online-softmax partitioning; if no valid
+geometry exists, dispatch retains the portable or materialized fallback. Other
+head dimensions keep their existing split limit of eight rows and generic-MMA
+policy. Q9-Q16 batches with GQA above four use a fused 128-column tile when the
 concrete kernel fits the device's opt-in shared-memory budget and has nonzero
 measured occupancy; all other devices and shapes retain the regular tile
 matrix. An attached precision tail therefore does not force KVarN away from its
@@ -143,9 +153,13 @@ KVarN supports target contexts and owned draft caches for draft-simple, EAGLE3,
 Qwen3.5/Qwen3.6 dense and MoE MTP, standalone Qwen3.8/Qwen4Exp MTP sidecars,
 DFlash1/DFlash2, and non-MLA DSpark. DSV4/MLA DSpark fails closed because its
 latent cache is incompatible with KVarN's dense K/V records. DFlash-family modes
-use one K/V pair for both
-full-attention and SWA sub-caches. Their non-causal block attention uses the
-materialized correctness route while persistent K/V remains compressed. Shared
+use one K/V pair for both full-attention and SWA sub-caches. On capable CUDA
+backends, owned DFlash1/DFlash2 D128/D256/D512 non-causal block attention can
+consume records directly for supported query/domain/tail shapes. Unqualified
+shapes and other backends retain materialized attention; persistent K/V remains
+compressed on either route. Multi-stream SWA (`--parallel 2` or higher without
+unified draft storage) stays materialized because record-native multi-slot
+parity is not qualified. Non-MLA DSpark remains materialized. Shared
 Gemma 4 MTP reads the target cache representation and does not allocate an
 independent draft record store. N-gram modes have no draft model cache and
 reject explicit draft KVarN selections during argument validation.
@@ -154,15 +168,18 @@ GPUs, then falls back to a portable
 direct-record route when those matrix instructions are unavailable or the
 complete body-plus-tail request does not fit a specialized route. The portable
 CUDA route consumes rotated compressed records and attached F16 or BF16 tails
-directly for D128, D256, and D512 heads. Its correctness limit is not the
-specialized decode threshold of 16 queries, so prompt-sized query batches stay
-native instead of creating a full F32 KQ tensor.
+directly for D64, D128, D256, and D512 heads. CUDA D64 decode remains on that
+direct route at every KV length. Query batches above the backend's native
+rotated-query limit transiently materialize the rectangular records and use
+tiled FlashAttention. Persistent KVarN storage remains compressed, and the
+native exact-tail merge avoids a full F32 KQ tensor.
 
 ROCm/HIP selects between record-tiled split decode, eligible descriptor-native
 WMMA/MFMA, and the same portable direct-record kernel. Unsupported AMD matrix
 shapes remain on portable native attention instead of materializing the cache.
-CPU has a backend-native direct-record attention path. Vulkan directly consumes
-KVarN records and exact tails for supported D128, D256, and D512 shapes. Its
+CPU has a backend-native direct-record attention path, including D64. Vulkan directly consumes
+KVarN records and exact tails for supported D128, D256, and D512 shapes; D64
+remains fail-closed there pending rectangular shader qualification. Its
 standard-cache segmented route likewise consumes a quantized body, F16/BF16
 history, and current K/V with one online FP32 softmax. Explicit materialization
 remains a fallback for unsupported placements or shapes. Matrix-capable HIP and
@@ -185,13 +202,20 @@ correctness, memory behavior, or performance on that GPU.
 
 | HIP architecture | Physical wave | Native KVarN route |
 |---|---:|---|
-| RDNA3, RDNA3.5, RDNA4 | 32 | WMMA generic/prefill and occupancy-selected split decode |
+| RDNA3, RDNA3.5 | 32 | WMMA generic/prefill (D256 on fp32-accumulator tiles, qualified on gfx1100) and occupancy-selected split decode |
+| RDNA4 | 32 | WMMA generic/prefill up to D128; D256+ stays on portable direct-record attention until its fp32 tiles qualify |
 | CDNA1-CDNA4 | 64 | MFMA generic/prefill and physical-wave split decode |
 | Older GCN, RDNA1, RDNA2 | device default | Portable direct-record attention |
 
 CDNA fast routing is compiled and selected by capability but remains
 experimental until hardware parity and performance results are published.
 MUSA explicitly remains on the portable route.
+
+On HIP, Bee reports `integrated = false`, backing out the upstream APU
+zero-copy host-buffer path after async-execution corruption was observed
+(PPL 5.9243 -> 8.51+ without `HIP_LAUNCH_BLOCKING`). This changes APU
+tensor placement off host-mapped memory and therefore VRAM headroom; the
+trade-off is unmeasured (no APU hardware available).
 
 Set `GGML_KVARN_DEBUG_ROUTES=1` to log the selected CUDA/HIP route, compute
 capability, rotated/original domain, K/V bit widths, query and KV counts,
@@ -582,6 +606,7 @@ static maximum and selector confidence against the target workload.
 - [`--spec-type draft-dflash`](beellama-args.md#dflash-and-adaptive-draft-depth)
 - [`--spec-draft-model`](beellama-args.md#dflash-and-adaptive-draft-depth)
 - [`--spec-draft-n-max`](beellama-args.md#dflash-and-adaptive-draft-depth)
+- [`--spec-draft-ubatch-size`, `-ubd`](beellama-args.md#dflash-and-adaptive-draft-depth)
 - [`--spec-dm-controller`](beellama-args.md#dflash-and-adaptive-draft-depth)
 - [`--spec-dm-profit-baseline-interval`](beellama-args.md#dflash-and-adaptive-draft-depth)
 
@@ -590,7 +615,10 @@ static maximum and selector confidence against the target workload.
 Compare adaptive and fixed-depth runs with the same prompt, target and draft
 files, cache types, sampling settings, and GPU. Report generated and accepted
 draft tokens as well as wall-clock throughput; output bytes are not a stable
-cross-build oracle for speculative decoding.
+cross-build oracle for speculative decoding. Draft contexts inherit target `-b`,
+while physical `-ubd` sets draft work per batch without changing target `-ub`.
+Smaller draft ubatches can reduce draft graph and workspace memory at the cost
+of prompt catch-up throughput.
 
 ### Known limitations
 

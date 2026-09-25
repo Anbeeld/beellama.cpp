@@ -15,6 +15,7 @@ enum ggml_cuda_fattn_kvarn_head_dim : uint32_t {
     GGML_CUDA_FATTN_KVARN_HEAD_DIM_128 = 1u << 0,
     GGML_CUDA_FATTN_KVARN_HEAD_DIM_256 = 1u << 1,
     GGML_CUDA_FATTN_KVARN_HEAD_DIM_512 = 1u << 2,
+    GGML_CUDA_FATTN_KVARN_HEAD_DIM_64  = 1u << 3,
 };
 
 enum ggml_cuda_fattn_kvarn_route {
@@ -29,6 +30,7 @@ enum ggml_cuda_fattn_kvarn_route {
 enum ggml_cuda_fattn_kvarn_amd_mma_arch {
     GGML_CUDA_FATTN_KVARN_AMD_NONE,
     GGML_CUDA_FATTN_KVARN_AMD_RDNA_WMMA,
+    GGML_CUDA_FATTN_KVARN_AMD_RDNA4_WMMA,
     GGML_CUDA_FATTN_KVARN_AMD_CDNA_MFMA,
 };
 
@@ -60,14 +62,16 @@ inline ggml_cuda_fattn_kvarn_mma_eligibility ggml_cuda_fattn_kvarn_amd_mma_eligi
         return GGML_CUDA_FATTN_KVARN_MMA_INVALID_COLUMNS;
     }
     if (input.head_dim <= 0 ||
-            (input.arch == GGML_CUDA_FATTN_KVARN_AMD_RDNA_WMMA && input.head_dim > 128) ||
+            (input.arch == GGML_CUDA_FATTN_KVARN_AMD_RDNA_WMMA && input.head_dim > 256) ||
+            (input.arch == GGML_CUDA_FATTN_KVARN_AMD_RDNA4_WMMA && input.head_dim > 128) ||
             (input.arch == GGML_CUDA_FATTN_KVARN_AMD_CDNA_MFMA && input.head_dim > 256)) {
         return GGML_CUDA_FATTN_KVARN_MMA_HEAD_DIM_UNSUPPORTED;
     }
     if (input.ncols1 * input.ncols2 < 16) {
         return GGML_CUDA_FATTN_KVARN_MMA_TILE_TOO_SMALL;
     }
-    if (input.arch == GGML_CUDA_FATTN_KVARN_AMD_RDNA_WMMA && input.ncols2 == 1) {
+    if ((input.arch == GGML_CUDA_FATTN_KVARN_AMD_RDNA_WMMA ||
+            input.arch == GGML_CUDA_FATTN_KVARN_AMD_RDNA4_WMMA) && input.ncols2 == 1) {
         return GGML_CUDA_FATTN_KVARN_MMA_RDNA_SINGLE_GQA_COLUMN;
     }
     return GGML_CUDA_FATTN_KVARN_MMA_ELIGIBLE;
@@ -181,6 +185,7 @@ inline ggml_cuda_fattn_kvarn_capabilities ggml_cuda_fattn_kvarn_select_capabilit
     result.rotated_query_max_specialized =
         result.specialized_routes ? GGML_CUDA_FATTN_KVARN_SPECIALIZED_DECODE_MAX_Q : 0u;
     result.supported_head_dims = result.portable_native || result.specialized_routes ?
+        GGML_CUDA_FATTN_KVARN_HEAD_DIM_64  |
         GGML_CUDA_FATTN_KVARN_HEAD_DIM_128 |
         GGML_CUDA_FATTN_KVARN_HEAD_DIM_256 |
         GGML_CUDA_FATTN_KVARN_HEAD_DIM_512 : 0u;
@@ -196,6 +201,7 @@ inline bool ggml_cuda_fattn_kvarn_body_shape_supported(
         return false;
     }
     switch (d_k) {
+        case  64: head_dim = GGML_CUDA_FATTN_KVARN_HEAD_DIM_64;  break;
         case 128: head_dim = GGML_CUDA_FATTN_KVARN_HEAD_DIM_128; break;
         case 256: head_dim = GGML_CUDA_FATTN_KVARN_HEAD_DIM_256; break;
         case 512: head_dim = GGML_CUDA_FATTN_KVARN_HEAD_DIM_512; break;
@@ -216,8 +222,12 @@ struct ggml_cuda_fattn_kvarn_route_input {
     bool vector_eligible;
     bool split_eligible;
     bool prompt_prefill;
-    int  split_max_q;
 };
+
+inline int ggml_cuda_fattn_kvarn_split_max_q(int head_dim) {
+    return head_dim == 64 ? GGML_CUDA_FATTN_KVARN_SPECIALIZED_DECODE_MAX_Q :
+        GGML_CUDA_FATTN_KVARN_SPLIT_DEFAULT_MAX_Q;
+}
 
 // Optional softmax metadata is an output contract, not a route constraint.
 // Eligibility is computed by the shape/domain-specific dispatch helpers.
@@ -229,8 +239,7 @@ inline ggml_cuda_fattn_kvarn_route ggml_cuda_fattn_kvarn_select_route(
     if (input.vector_eligible) {
         return GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_VECTOR;
     }
-    const int split_max_q = input.split_max_q > 0 ? input.split_max_q : 1;
-    if (input.n_q <= split_max_q && input.split_eligible) {
+    if (input.n_q <= ggml_cuda_fattn_kvarn_split_max_q(input.head_dim) && input.split_eligible) {
         return GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_SPLIT;
     }
     return GGML_CUDA_FATTN_KVARN_ROUTE_GENERIC_MMA;

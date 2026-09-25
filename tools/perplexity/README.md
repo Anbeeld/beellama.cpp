@@ -22,6 +22,17 @@ and finally the `--kl-divergence` argument to indicate that the program should c
 This is a measure of how similar the FP16 and the quantized logit distributions are with a value of 0 indicating that the distribution are the same.
 The uncertainty on the mean KL divergence is calculated by assuming the KL divergence per token follows a Gaussian distribution.
 
+KL-divergence baselines and candidates are processed in blocks controlled by
+`--batch-size`; `--ubatch-size` controls how those blocks are split internally.
+The F32 logits output requires `vocabulary size * batch size * 4` bytes of host
+memory. KL-divergence evaluation also keeps a compressed baseline block that
+requires roughly half as much memory. Use matching `--batch-size` and
+`--ubatch-size` settings when generating a baseline and evaluating a candidate.
+
+For example, a model with 248320 vocabulary entries and a batch size of 2048
+uses 1940 MiB for the F32 logits block and about 970 MiB for the compressed
+baseline block.
+
 In addition to the KL divergence the following statistics are calculated with `--kl-divergence`:
 
 * Ratio of mean FP16 PPL and quantized PPL. Uncertainty is estimated on logits, then propagated. The logarithm of this metric is also calculated and printed, it is 0 if the logit distributions are the same.

@@ -2,6 +2,9 @@
 
 #include "fattn-common.cuh"
 #include "fattn-kvarn-dispatch.cuh"
+#if defined(GGML_CUDA_KVARN)
+#include "kvarn.cuh"
+#endif
 
 template<typename T>
 static __global__ void k_flash_attn_ext_tail_pack_arenas(
@@ -447,6 +450,39 @@ static size_t ggml_cuda_tail_pass_alloc_size(ggml_backend_cuda_context & ctx, gg
     return ggml_cuda_flash_attn_ext_get_alloc_size(ctx.device, &pass) + 256;
 }
 
+#if defined(GGML_CUDA_KVARN)
+static void ggml_cuda_tail_clear_tensor_sources(ggml_tensor & tensor) {
+    tensor.op = GGML_OP_NONE;
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        tensor.src[i] = nullptr;
+    }
+    tensor.view_src = nullptr;
+    tensor.view_offs = 0;
+}
+
+static ggml_tensor ggml_cuda_tail_materialize_kvarn_view(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor *         tensor,
+        void *                      data,
+        bool                        emit_rotated) {
+    const ggml_tensor * base = ggml_cuda_fattn_kvarn_view_base(tensor);
+    GGML_ASSERT(base != nullptr);
+
+    ggml_tensor materialize = *base;
+    materialize.op = GGML_OP_KVARN_MATERIALIZE;
+    materialize.data = data;
+    materialize.view_src = nullptr;
+    materialize.view_offs = 0;
+    ggml_set_op_params_i32(&materialize, 4, emit_rotated ? 1 : 0);
+    ggml_cuda_op_kvarn_materialize(ctx, &materialize);
+
+    ggml_tensor result = *tensor;
+    result.data = data;
+    ggml_cuda_tail_clear_tensor_sources(result);
+    return result;
+}
+#endif
+
 static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * q  = dst->src[0];
     const ggml_tensor * kb = dst->src[1];
@@ -697,20 +733,62 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
         body_alloc.alloc(body_alloc_size);
         body_pass.data = body_alloc.get();
     }
-    const uint64_t tail_pack_bytes = kt_alloc.actual_size + vt_alloc.actual_size +
+    uint64_t tail_pack_bytes = kt_alloc.actual_size + vt_alloc.actual_size +
             q_alloc.actual_size + mask_alloc.actual_size + kb_alloc.actual_size +
             vb_alloc.actual_size + body_mask_alloc.actual_size;
     const uint64_t tail_plan_input_bytes = ggml_nbytes(mt) + ggml_nbytes(qo) + ggml_nbytes(rd);
     // mt/qo/rd are scheduler-owned graph tensors and are already included in
     // the reported CUDA compute buffer. Keep their footprint visible as a
     // diagnostic, but do not double-count it as CUDA-pool high water.
-    const uint64_t tail_base_bytes = body_meta_alloc.actual_size + tail_meta_alloc.actual_size +
-            tail_pack_bytes + body_alloc.actual_size;
+    uint64_t body_output_bytes = body_alloc.actual_size;
+    uint64_t tail_base_bytes = body_meta_alloc.actual_size + tail_meta_alloc.actual_size +
+            tail_pack_bytes + body_output_bytes;
+    ggml_cuda_pool_alloc<half> k_materialized_alloc(pool);
+    ggml_cuda_pool_alloc<half> v_materialized_alloc(pool);
+    ggml_cuda_pool_alloc<uint8_t> fallback_body_alloc(pool);
     if (!tail_bodyless) {
         if (ggml_cuda_flash_attn_ext_kvarn_uses_views(&body_pass)) {
             if (!ggml_cuda_flash_attn_ext_kvarn(
                     ctx, &body_pass, GGML_CUDA_FATTN_KVARN_ENTRY_COMPACT_TAIL)) {
-                GGML_ABORT("unsupported structured body in exact-tail attention");
+#if defined(GGML_CUDA_KVARN)
+                const bool mixed_domain = ggml_get_op_params_i32(
+                        &body_pass, GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN) ==
+                    GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V;
+                k_materialized_alloc.alloc(ggml_nelements(kb));
+                v_materialized_alloc.alloc(ggml_nelements(vb));
+                ggml_tensor k_materialized = ggml_cuda_tail_materialize_kvarn_view(
+                        ctx, kb, k_materialized_alloc.get(), true);
+                ggml_tensor v_materialized = ggml_cuda_tail_materialize_kvarn_view(
+                        ctx, vb, v_materialized_alloc.get(), !mixed_domain);
+
+                if (body_packed) {
+                    k_flash_attn_ext_tail_pack_body_rows<<<blocks_for(kb_packed_bytes), threads, 0, ctx.stream()>>>(
+                        (const char *) k_materialized.data, kb_alloc.get(), (const int32_t *) rd->data,
+                        int(kb_row_bytes), int(kb->ne[1]), body_stride, int(kb->ne[2]), n_active,
+                        desc_stride, body_map_offset, k_materialized.nb[1], k_materialized.nb[2], k_materialized.nb[3]);
+                    k_flash_attn_ext_tail_pack_body_rows<<<blocks_for(vb_packed_bytes), threads, 0, ctx.stream()>>>(
+                        (const char *) v_materialized.data, vb_alloc.get(), (const int32_t *) rd->data,
+                        int(vb_row_bytes), int(vb->ne[1]), body_stride, int(vb->ne[2]), n_active,
+                        desc_stride, body_map_offset, v_materialized.nb[1], v_materialized.nb[2], v_materialized.nb[3]);
+                    CUDA_CHECK(cudaGetLastError());
+                    ggml_cuda_tail_clear_tensor_sources(kb_packed);
+                    ggml_cuda_tail_clear_tensor_sources(vb_packed);
+                } else {
+                    body_pass.src[1] = &k_materialized;
+                    body_pass.src[2] = &v_materialized;
+                }
+
+                const size_t fallback_body_alloc_size = ggml_cuda_tail_pass_alloc_size(ctx, body_pass);
+                fallback_body_alloc.alloc(fallback_body_alloc_size);
+                body_pass.data = fallback_body_alloc.get();
+                ggml_cuda_flash_attn_ext_dispatch(ctx, &body_pass);
+                tail_pack_bytes += k_materialized_alloc.actual_size + v_materialized_alloc.actual_size;
+                body_output_bytes += fallback_body_alloc.actual_size;
+                tail_base_bytes = body_meta_alloc.actual_size + tail_meta_alloc.actual_size +
+                    tail_pack_bytes + body_output_bytes;
+#else
+                GGML_ABORT("KVarN exact-tail body reached a CUDA build without KVarN kernels");
+#endif
             }
         } else {
             ggml_cuda_flash_attn_ext_dispatch(ctx, &body_pass);
@@ -756,7 +834,7 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
                 body_meta_alloc.actual_size,
                 tail_meta_alloc.actual_size,
                 tail_pack_bytes,
-                body_alloc.actual_size,
+                body_output_bytes,
                 0,
                 tail_plan_input_bytes,
                 tail_base_bytes);
@@ -792,7 +870,7 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
             body_meta_alloc.actual_size,
             tail_meta_alloc.actual_size,
             tail_pack_bytes,
-            body_alloc.actual_size,
+            body_output_bytes,
             tail_alloc.actual_size,
             tail_plan_input_bytes,
             tail_base_bytes + tail_alloc.actual_size);

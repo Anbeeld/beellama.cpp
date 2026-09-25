@@ -32,6 +32,32 @@ __device__ __forceinline__ nv_bfloat16 kvarn_wht_from_float<nv_bfloat16>(float v
     return __float2bfloat16(value);
 }
 
+template<typename T>
+static __global__ void kvarn_wht_64_kernel(
+        const T * __restrict__ src,
+        T * __restrict__ dst,
+        int64_t n_groups) {
+    const int64_t group = blockIdx.x;
+    if (group >= n_groups) {
+        return;
+    }
+    const int tid = threadIdx.x;
+    __shared__ float buf[64];
+    buf[tid] = kvarn_wht_to_float(src[group * 64 + tid]);
+    __syncthreads();
+    for (int h = 1; h < 64; h *= 2) {
+        if (tid < 32) {
+            const int j = (tid / h) * (2 * h) + (tid % h);
+            const float a = buf[j];
+            const float b = buf[j + h];
+            buf[j] = a + b;
+            buf[j + h] = a - b;
+        }
+        __syncthreads();
+    }
+    dst[group * 64 + tid] = kvarn_wht_from_float<T>(buf[tid] * 0.125f);
+}
+
 template<typename T, int SLICES>
 static __global__ void kvarn_wht_shared_kernel(
         const T * __restrict__ src,
@@ -190,7 +216,7 @@ void ggml_cuda_op_kvarn_wht(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
 
     int head_width;
     memcpy(&head_width, dst->op_params, sizeof(head_width));
-    GGML_ASSERT(head_width == 128 || head_width == 256 || head_width == 512);
+    GGML_ASSERT(head_width == 64 || head_width == 128 || head_width == 256 || head_width == 512);
 
     const int64_t n_elements = ggml_nelements(src0);
     GGML_ASSERT(n_elements % head_width == 0);
@@ -216,6 +242,8 @@ void ggml_cuda_op_kvarn_wht(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
 #define GGML_CUDA_KVARN_WHT_TYPE(T) \
     do { \
         switch (head_width) { \
+            case  64: kvarn_wht_64_kernel<T><<<(int) n_groups, 64, 0, stream>>>( \
+                         (const T *) src0->data, (T *) dst->data, n_groups); break; \
             case 128: GGML_CUDA_KVARN_WHT_LAUNCH(T, 1); break; \
             case 256: GGML_CUDA_KVARN_WHT_LAUNCH(T, 2); break; \
             case 512: GGML_CUDA_KVARN_WHT_LAUNCH(T, 4); break; \

@@ -1,4 +1,4 @@
-# BeeLlama v0.4.6 argument reference
+# BeeLlama v0.4.7 argument reference
 
 This page covers Bee-owned arguments and the upstream arguments whose behavior
 BeeLlama extends. Run `llama-server --help` or `llama-cli --help` for the full
@@ -8,7 +8,9 @@ limits, and measurement guidance.
 ## KVarN cache types and SWA overrides
 
 KVarN values are `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`, `kvarn6`, and
-`kvarn8`. K and V may use different bit widths.
+`kvarn8`. K and V may use different bit widths. Logical 64-dimensional K/V heads are
+supported on the qualified CPU and CUDA routes with rectangular 64 x 128 K and
+128 x 64 V records. D128/D256/D512 retain their existing 128 x 128 record ABI.
 
 CUDA, ROCm/HIP, Vulkan, and CPU consume compressed KVarN records directly in
 native FlashAttention paths. Vulkan requires shader Int64 and
@@ -24,13 +26,18 @@ body-plus-tail route and require a CUDA 12.4 build or release package. CUDA
 | `-ctv TYPE`, `--cache-type-v TYPE` | `LLAMA_ARG_CACHE_TYPE_V` | `f16` | Selects the target V cache with the same values and one-sided promotion rule as `--cache-type-k`. |
 | `-ctkd TYPE`, `--spec-draft-type-k TYPE` | `LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K` | `f16` | Selects the draft K cache. Bee accepts the six KVarN values for draft-simple, EAGLE3, audited owned Qwen MTP, DFlash1/DFlash2, and non-MLA DSpark contexts. A one-sided KVarN selection promotes draft V to the same width with a warning. |
 | `-ctvd TYPE`, `--spec-draft-type-v TYPE` | `LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V` | `f16` | Selects the draft V cache with the same values and one-sided promotion rule. Target and draft cache selections remain independent. |
+| `--kvarn-window-chunk N` | `LLAMA_ARG_KVARN_WINDOW_CHUNK` | `GGML_KVARN_WINDOW_CHUNK` or `65536` | Sets the target context's CUDA KVarN prefill materialization window. |
+| `--spec-draft-kvarn-window-chunk N` | `LLAMA_ARG_SPEC_DRAFT_KVARN_WINDOW_CHUNK` | `2048` | Sets an owned draft context's CUDA KVarN prefill materialization window independently. |
 | `--cache-type-k-swa TYPE` | `LLAMA_ARG_CACHE_TYPE_K_SWA` | Same as `--cache-type-k` | Overrides KVarN K precision for SWA layers. Accepts only the six `kvarnN` values, requires target KVarN, and must be paired with the V override. |
 | `--cache-type-v-swa TYPE` | `LLAMA_ARG_CACHE_TYPE_V_SWA` | Same as `--cache-type-v` | Overrides KVarN V precision for SWA layers. Accepts only the six `kvarnN` values, requires target KVarN, and must be paired with the K override. |
 
 Draft KVarN is runtime-qualified on CUDA for draft-simple, EAGLE3, the owned
 MTP allowlist, DFlash1/DFlash2, and non-MLA DSpark. The CPU reference route is qualified
-for owned MTP. Non-causal DFlash-family models keep KVarN persistent storage but
-use materialized attention; the direct record-consuming route is not enabled.
+for owned MTP. Owned DFlash1/DFlash2 non-causal KVarN blocks use direct records
+on capable CUDA devices for supported D128/D256/D512 shapes; unsupported
+shapes and non-CUDA backends materialize without changing persistent storage.
+Multi-stream SWA draft caches also retain materialized attention. Non-MLA
+DSpark remains on the materialized route.
 DSV4/MLA DSpark is incompatible with KVarN's dense K/V representation and fails
 closed. Shared Gemma 4 MTP and MTP architectures outside the allowlist fail closed. For
 Gemma 4 MTP, select target KVarN with `--cache-type-k/v`; the assistant reads
@@ -39,13 +46,28 @@ remain unqualified until backend runtime tests pass. N-gram modes do not own a
 KV context and reject explicit KVarN `--spec-draft-type-k/v` selections during
 argument validation.
 
-CUDA multi-token KVarN prefill uses transient F16 K/V materialization windows.
-`GGML_KVARN_WINDOW_CHUNK` sets the positive token count per window and defaults
-to `65536`; missing, zero, and negative values use that default, while values
-above the active KV length are capped to that length. A smaller value reduces
-peak transient scratch for concurrent long prompts but adds partial-softmax
-merges and changes floating-point reduction order. It does not alter context or
-persistent KV-cache capacity.
+CUDA KVarN prefill uses direct records on supported shapes and transient F16
+K/V materialization windows on unsupported shapes.
+D64 uses this tiled route when a query batch exceeds the backend's native
+rotated-query limit. Decode remains record-native at every KV length.
+`--kvarn-window-chunk N` and `--spec-draft-kvarn-window-chunk N` independently
+set the positive token count per window for the target and owned draft contexts.
+The draft option is useful for shallow speculative models whose transient F16
+materialization workspace can otherwise outweigh their persistent KVarN cache
+saving. The draft context defaults to `2048`; the target context falls back to
+`GGML_KVARN_WINDOW_CHUNK`, which defaults to `65536`. Missing, zero, and
+negative environment values use that target default. Values above the active KV
+length are capped to that length. A smaller value reduces peak transient scratch
+but adds partial-softmax merges and changes floating-point reduction order. It
+does not alter context or persistent KV-cache capacity.
+
+On HIP/ROCm, KVarN prompt prefill defaults to the F32-accumulator WMMA route
+on arches whose tiles accumulate in fp32 (RDNA3/gfx11); RDNA4 stays on the
+portable route until its fp32 tiles qualify. `GGML_KVARN_AMD_PROMPT_PORTABLE`
+opts a prompt back into portable-native direct-record attention: any nonzero
+value (conventionally `1`) selects portable, while unset, `0`, or
+non-numeric values keep the WMMA default. The check runs before the generic
+probe, so opting in does not pay for a discarded WMMA pass.
 
 ## KV cache precision tail for quantized caches
 
@@ -221,6 +243,7 @@ behavior. The `--spec-dm-*` rows are Bee server additions.
 | `--spec-draft-model FNAME`, `-md FNAME` | `LLAMA_ARG_SPEC_DRAFT_MODEL` | Unused | Loads an upstream-format `dflash` draft GGUF. |
 | `--spec-draft-n-max N` | `LLAMA_ARG_SPEC_DRAFT_N_MAX` | Upstream: `3`; omitted DFlash: `dflash.block_size - 1` | Sets the maximum draft depth. An explicit CLI or env value always wins; upstream clamps values above the drafter's trained limit. A block-16 drafter therefore defaults to 15 only when this setting is omitted. |
 | `--spec-draft-n-min N` | `LLAMA_ARG_SPEC_DRAFT_N_MIN` | `0` | Sets the minimum number of draft tokens used by upstream speculation. |
+| `--spec-draft-ubatch-size N`, `-ubd N` | `LLAMA_ARG_SPEC_DRAFT_UBATCH_SIZE` | `128` or larger for parallel DFlash/DSpark | Overrides the physical batch capacity of a model-backed draft context without changing target `-ub`. A smaller draft ubatch can reduce draft graph and workspace memory, but it can also reduce prompt catch-up throughput. |
 | `--spec-draft-p-min P`, `--draft-p-min P` | `LLAMA_ARG_SPEC_DRAFT_P_MIN` | `0.0` | Stops an individual greedy draft when its probability falls below `P`; this is independent of the profit controller. |
 | `--spec-dm-controller MODE` | `LLAMA_ARG_SPEC_DM_CONTROLLER` | `profit` | For DFlash1, `profit` adapts depth from measured cycle profit and `off` keeps the resolved or explicit maximum static. DFlash2 always uses its fixed trained block limit and selector confidence; other speculative modes are unchanged. |
 | `--spec-dm-profit-min F` | `LLAMA_ARG_SPEC_DM_PROFIT_MIN` | `0.05` | Sets the minimum margin over the no-spec baseline before clearing disable dwell. Range: `0.0` to `0.50`. |
@@ -230,6 +253,14 @@ behavior. The `--spec-dm-*` rows are Bee server additions.
 | `--spec-dm-profit-min-samples N` | `LLAMA_ARG_SPEC_DM_PROFIT_MIN_SAMPLES` | `3` | Sets the samples required before a depth's profit statistics are ready. Range: `1` to `64`. |
 | `--spec-dm-profit-warmup N` | `LLAMA_ARG_SPEC_DM_PROFIT_WARMUP` | `0` | Sets measured samples for each initial positive-depth probe. `0` uses `--spec-dm-profit-min-samples`; range: `0` to `64`. |
 | `--spec-dm-profit-baseline-interval N` | `LLAMA_ARG_SPEC_DM_PROFIT_BASELINE_INTERVAL` | `1024` | Sets active controller cycles between no-spec baseline probes. `0` disables periodic probes; range: `0` to `4096`. |
+
+Model-backed draft contexts inherit target `-b/--batch-size` as their logical
+capacity. Without an explicit `--spec-draft-ubatch-size`, draft physical size
+is 128; for DFlash/DSpark it grows to `max(128, parallel * (n_max + 1))`
+to fit merged noise blocks. An explicit value is not raised automatically.
+Existing context normalization caps it to the inherited logical size, so `-b`
+must also fit a merged block. Target `-ub/--ubatch-size` remains independent.
+N-gram-only modes do not create a draft context.
 
 ## Reasoning loop guard
 
@@ -296,6 +327,14 @@ select the intended target explicitly with `CMAKE_CUDA_ARCHITECTURES` when the
 build host cannot detect it. Pre-Turing support remains runtime-unqualified
 until matching real devices pass the KVarN parity, memory, and model-smoke
 tests.
+
+## CUDA/HIP dequant matvec knobs
+
+| Env var | Default | Behavior |
+|---|---|---|
+| `GGML_CUDA_DQ_MMV` | Arch default (on for RDNA3.5) | `0` forces the K-quant dequant-float matvec off, `1` forces it on. Unset or anything else warns (when set) and keeps the arch default. |
+| `GGML_CUDA_DQ_Q6K` | Arch default (on for RDNA3.5) | Same `0`/`1`/arch-default semantics for the Q6_K dequant-float matvec arm. |
+| `GGML_CUDA_DQ_ROWS` | `1` | Rows per block for the dequant matvec kernels. Only `1`/`2`/`4`/`8` are instantiated; anything else warns and uses `1`. |
 
 ## Migration from earlier versions
 

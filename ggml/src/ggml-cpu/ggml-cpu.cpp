@@ -508,7 +508,7 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                      op->src[9]->type == GGML_TYPE_I32);
                 return kvarn_k && kvarn_v && rotated &&
                     tail_ok &&
-                    (src0->ne[0] == 128 || src0->ne[0] == 256 || src0->ne[0] == 512) &&
+                    (src0->ne[0] == 64 || src0->ne[0] == 128 || src0->ne[0] == 256 || src0->ne[0] == 512) &&
                     src0->ne[0] == src1->ne[0] && src0->ne[0] == src2->ne[0] &&
                     src0->type == GGML_TYPE_F32 &&
                     src1->type == GGML_TYPE_F16 &&
@@ -713,6 +713,37 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
 }
 
 static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_kvarn_capabilities") == 0) {
+        return (void *) +[](ggml_backend_dev_t, ggml_backend_kvarn_capabilities * result) {
+            if (result == nullptr || result->struct_size < sizeof(*result) ||
+                    result->abi_version != GGML_BACKEND_KVARN_CAPABILITIES_ABI_VERSION) {
+                return false;
+            }
+            *result = {
+                /* .struct_size                      = */ sizeof(*result),
+                /* .abi_version                      = */ GGML_BACKEND_KVARN_CAPABILITIES_ABI_VERSION,
+                /* .route_families                   = */ GGML_BACKEND_KVARN_ROUTE_PORTABLE_NATIVE,
+                /* .supported_head_dims              = */ GGML_BACKEND_KVARN_HEAD_DIM_64 |
+                                                          GGML_BACKEND_KVARN_HEAD_DIM_128 |
+                                                          GGML_BACKEND_KVARN_HEAD_DIM_256 |
+                                                          GGML_BACKEND_KVARN_HEAD_DIM_512,
+                /* .store_materialize                = */ 1,
+                /* .portable_direct_body             = */ 1,
+                /* .portable_integrated_tail_f16     = */ 1,
+                /* .portable_integrated_tail_bf16    = */ 1,
+                /* .specialized_generic_mma          = */ 0,
+                /* .specialized_decode_split         = */ 0,
+                /* .specialized_decode_vector        = */ 0,
+                /* .original_v_domain                = */ 0,
+                /* .rotated_query_max_portable       = */ UINT32_MAX,
+                /* .rotated_query_max_specialized    = */ 0,
+                /* .physical_warp_size               = */ 1,
+                /* .reserved                         = */ 0,
+                /* .minimum_dynamic_shared_bytes     = */ 0,
+            };
+            return true;
+        };
+    }
     if (strcmp(name, "ggml_backend_kvarn_ops") == 0) {
         return (void *) +[](ggml_backend_dev_t) { return true; };
     }
@@ -732,7 +763,7 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
                 (tail_k == GGML_TYPE_F16 || tail_k == GGML_TYPE_BF16) &&
                 (tail_v == GGML_TYPE_F16 || tail_v == GGML_TYPE_BF16);
             const bool dims_ok = d_k == d_v &&
-                (d_k == 128 || d_k == 256 || d_k == 512);
+                (d_k == 64 || d_k == 128 || d_k == 256 || d_k == 512);
             return body_ok && tail_ok && dims_ok;
         };
     }
@@ -754,7 +785,7 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
                 (tail_k == GGML_TYPE_F16 || tail_k == GGML_TYPE_BF16) &&
                 (tail_v == GGML_TYPE_F16 || tail_v == GGML_TYPE_BF16);
             const bool dims_ok = d_k == d_v &&
-                (d_k == 128 || d_k == 256 || d_k == 512);
+                (d_k == 64 || d_k == 128 || d_k == 256 || d_k == 512);
             return body_ok && tail_ok && dims_ok;
         };
     }

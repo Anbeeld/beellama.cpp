@@ -35,6 +35,19 @@ static bool decode_one(llama_context * ctx, llama_token tok, llama_pos pos) {
     return ok;
 }
 
+// A short first decode must work when the rollback reserve exceeds the batch.
+// Server warmup exercises this shape before the first speculative request.
+static bool test_short_initial_decode(const common_params & params, llama_model * model) {
+    llama_context * ctx = make_ctx(params, model);
+    if (ctx == nullptr) {
+        return false;
+    }
+    const std::vector<llama_token> tokens = { 1, 2 };
+    const bool ok = decode_tokens(ctx, tokens, 2) && decode_one(ctx, 3, 2);
+    llama_free(ctx);
+    return ok;
+}
+
 // Roll back multiple sequences, then replay them in a single batch whose
 // per-seq token count exceeds n_ubatch: each seq's replay spans several
 // ubatches while its rollback restore is still pending. Compared against a
@@ -100,10 +113,17 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
         ok = ok && llama_decode(ctx_roll, batch) == 0;
         llama_batch_free(batch);
 
-        ok = ok && llama_memory_seq_rm(llama_get_memory(ctx_roll), (llama_seq_id) s, p0, -1);
+        llama_memory_t memory = llama_get_memory(ctx_roll);
+        ok = ok && llama_memory_seq_rm(memory, (llama_seq_id) s, p0, -1);
 
-        // a second partial removal while one is pending must be refused
-        ok = ok && !llama_memory_seq_rm(llama_get_memory(ctx_roll), (llama_seq_id) s, p0 - 1, -1);
+        // A pending recurrent rollback is single-use. Planning must reject a
+        // second partial removal instead of promising a mutation that fails.
+        llama_pos planned_p0 = -1;
+        llama_pos planned_p1 = -1;
+        ok = ok && !llama_memory_can_seq_rm(memory, (llama_seq_id) s, p0 - 1, -1);
+        ok = ok && !llama_memory_seq_rm_plan(
+                memory, (llama_seq_id) s, p0 - 1, -1, &planned_p0, &planned_p1);
+        ok = ok && !llama_memory_seq_rm(memory, (llama_seq_id) s, p0 - 1, -1);
     }
     if (!ok) {
         fprintf(stderr, "%s : multi-seq prefill/rollback failed\n", __func__);
@@ -234,6 +254,11 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
+    if (!test_short_initial_decode(params, model)) {
+        fprintf(stderr, "%s : short initial recurrent decode failed\n", __func__);
+        return 1;
+    }
+
     const llama_vocab * vocab   = llama_model_get_vocab(model);
     const int           n_vocab = llama_vocab_n_tokens(vocab);
 
@@ -292,7 +317,7 @@ int main(int argc, char ** argv) {
     ckpt.load_tgt(ctx_dst, 0, 0);
 
     constexpr float eps = 1e-5f;
-    std::vector<std::vector<float>> logits_src_replay(n_rollback);
+    std::vector<std::vector<float>> logits_full_replay(n_rollback);
     const auto replay_and_compare = [&](const char * mode) {
         for (uint32_t i = 0; i < n_rollback; ++i) {
             const llama_pos pos = rollback_pos + i;
@@ -309,8 +334,15 @@ int main(int argc, char ** argv) {
                 return false;
             }
 
-            logits_src_replay[i].assign(logits_src, logits_src + n_vocab);
+            if (mode[0] == 'f') {
+                logits_full_replay[i].assign(logits_src, logits_src + n_vocab);
+            }
             for (int token = 0; token < n_vocab; ++token) {
+                if (mode[0] != 'f' && std::fabs(logits_src[token] - logits_full_replay[i][token]) > eps) {
+                    fprintf(stderr, "%s : repeated rollback logits mismatch at position %d, token %d (%g != %g)\n",
+                            __func__, pos, token, (double) logits_src[token], (double) logits_full_replay[i][token]);
+                    return false;
+                }
                 if (std::fabs(logits_src[token] - logits_dst[token]) > eps) {
                     fprintf(stderr, "%s : %s logits mismatch at position %d, token %d (%g != %g)\n",
                             __func__, mode, pos, token, (double) logits_src[token], (double) logits_dst[token]);
@@ -380,9 +412,9 @@ int main(int argc, char ** argv) {
         }
 
         for (int token = 0; token < n_vocab; ++token) {
-            if (std::fabs(logits_src_replay[i][token] - logits_dirty[token]) > eps) {
+            if (std::fabs(logits_full_replay[i][token] - logits_dirty[token]) > eps) {
                 fprintf(stderr, "%s : dirty-ctx logits mismatch at position %d, token %d (%g != %g)\n",
-                        __func__, pos, token, (double) logits_src_replay[i][token], (double) logits_dirty[token]);
+                        __func__, pos, token, (double) logits_full_replay[i][token], (double) logits_dirty[token]);
                 return 1;
             }
         }

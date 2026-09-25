@@ -22,7 +22,13 @@ static inline bool ggml_cuda_fattn_kvarn_window_enabled() {
     return env == nullptr || atoi(env) != 0;
 }
 
-static inline int ggml_cuda_fattn_kvarn_window_chunk(const int n_kv) {
+static inline int ggml_cuda_fattn_kvarn_window_chunk(const ggml_tensor * dst, const int n_kv) {
+    const int context_chunk = ggml_get_op_params_i32(
+            dst, GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_WINDOW_CHUNK);
+    if (context_chunk > 0) {
+        return std::min(n_kv, context_chunk);
+    }
+
     const char * env = getenv("GGML_KVARN_WINDOW_CHUNK");
     if (env == nullptr) {
         return std::min(n_kv, GGML_CUDA_FATTN_KVARN_WINDOW_CHUNK);
@@ -347,7 +353,7 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
     const int nbatch_fa = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols, cc);
     const int nthreads = ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols, cc);
     const int nwarps = nthreads / warp_size_host;
-    const int window_chunk = ggml_cuda_fattn_kvarn_window_chunk(plan.n_kv);
+    const int window_chunk = ggml_cuda_fattn_kvarn_window_chunk(dst, plan.n_kv);
 
     if (getenv("GGML_CUDA_FA_ROUTE_DEBUG") != nullptr) {
         fprintf(stderr,

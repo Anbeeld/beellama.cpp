@@ -31,6 +31,7 @@ struct ggml_cuda_fattn_kvarn_desc {
     int head_base;
     int groups_per_stream;
     int record_bytes;
+    int record_dim;
     int stage_groups;
     int tail_groups;
     int bits;
@@ -131,6 +132,7 @@ struct ggml_cuda_fattn_kvarn_plan_side {
     int tail_groups   = 0;
     int groups_per_stream = 0;
     int head_slices   = 1;
+    int record_dim    = 0;
     bool value        = false;
     bool swa          = false;
     bool eager_records = false;
@@ -229,16 +231,26 @@ static inline bool ggml_cuda_fattn_kvarn_unwrap_view(
     side.read_indirect = ggml_get_op_params_i32(cur, 10) != 0;
     const int head_slices_param = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_HEAD_SLICES);
     side.head_slices = head_slices_param > 0 ? head_slices_param : 1;
+    side.record_dim = int(side.stage->ne[0]);
     side.stage_groups = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_STAGE_GROUPS);
     const int tail_groups_param = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_TAIL_GROUPS);
     side.tail_groups = tail_groups_param > 0 ? tail_groups_param : side.stage_groups - 1;
 
     if (!ggml_cuda_fattn_kvarn_valid_bits(side.bits) || side.n_stream <= 0 || side.stage_groups < 2 ||
             side.tail_groups <= 0 || side.tail_groups > side.stage_groups ||
-            !(side.head_slices == 1 || side.head_slices == 2 || side.head_slices == 4)) {
+            !(side.head_slices == 1 || side.head_slices == 2 || side.head_slices == 4) ||
+            !(side.record_dim == 64 || side.record_dim == GGML_CUDA_FATTN_KVARN_DIM) ||
+            (side.record_dim == 64 && side.head_slices != 1)) {
         return false;
     }
     if (side.records->type != GGML_TYPE_I8 || side.stage->type != GGML_TYPE_F16 || side.indices->type != GGML_TYPE_I64) {
+        return false;
+    }
+    const int rows = side.value ? GGML_CUDA_FATTN_KVARN_DIM : side.record_dim;
+    const int cols = side.value ? side.record_dim : GGML_CUDA_FATTN_KVARN_DIM;
+    const size_t record_bytes = size_t(rows * cols * side.bits) / 8 +
+        size_t(2 * rows + cols) * sizeof(half);
+    if (side.records->ne[0] != (int64_t) record_bytes) {
         return false;
     }
     if (side.stage->ne[2] % (GGML_CUDA_FATTN_KVARN_DIM * side.stage_groups) != 0) {
@@ -270,7 +282,8 @@ static inline bool ggml_cuda_fattn_kvarn_view_supported(
     if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16) {
         return false;
     }
-    if (!((Q->ne[0] == 128 && V->ne[0] == 128) ||
+    if (!((Q->ne[0] == 64 && V->ne[0] == 64) ||
+          (Q->ne[0] == 128 && V->ne[0] == 128) ||
           (Q->ne[0] == 256 && V->ne[0] == 256) ||
           (Q->ne[0] == 512 && V->ne[0] == 512))) {
         return false;
@@ -301,7 +314,10 @@ static inline bool ggml_cuda_fattn_kvarn_view_supported(
     plan.n_kv = (int) K->ne[1];
     plan.n_kv_heads = (int) K->ne[2];
     plan.n_stream = (int) K->ne[3];
-    plan.slices = plan.head_dim / GGML_CUDA_FATTN_KVARN_DIM;
+    if (plan.k.record_dim != plan.v.record_dim) {
+        return false;
+    }
+    plan.slices = plan.head_dim / plan.k.record_dim;
     if (plan.k.head_slices != plan.v.head_slices ||
             (plan.k.head_slices != 1 && plan.k.head_slices != plan.slices)) {
         return false;
@@ -309,7 +325,8 @@ static inline bool ggml_cuda_fattn_kvarn_view_supported(
     if (plan.n_stream != plan.k.n_stream || plan.n_stream != plan.v.n_stream) {
         return false;
     }
-    if (plan.k.view->ne[1] != (int64_t) plan.n_kv_heads * plan.slices ||
+    if (plan.k.view->ne[0] != plan.k.record_dim || plan.v.view->ne[0] != plan.v.record_dim ||
+        plan.k.view->ne[1] != (int64_t) plan.n_kv_heads * plan.slices ||
         plan.v.view->ne[1] != (int64_t) plan.n_kv_heads * plan.slices ||
         plan.k.view->ne[2] != plan.n_kv || plan.v.view->ne[2] != plan.n_kv ||
         plan.k.view->ne[3] != plan.n_stream || plan.v.view->ne[3] != plan.n_stream) {

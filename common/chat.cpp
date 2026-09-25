@@ -928,12 +928,92 @@ static void foreach_parameter(const json &                                      
     }
 }
 
+// The prompt parts mirror the rendered prompt string (their concatenation
+// equals the prompt). These helpers edit the parts consistently with the
+// prompt, even when the edited text spans two adjacent parts.
+
+// Erase [pos, pos + len) from the concatenation of parts.
+// Returns false if the range is not fully covered by the parts.
+static bool string_parts_erase_range(std::vector<jinja::string_part> & parts, size_t pos, size_t len) {
+    size_t total = 0;
+    for (const auto & part : parts) {
+        total += part.val.size();
+    }
+    if (pos + len > total) {
+        return false;
+    }
+    size_t off     = 0;
+    size_t to_drop = len;
+    for (auto & part : parts) {
+        const size_t sz = part.val.size();
+        if (off + sz > pos && to_drop > 0) {
+            const size_t skip = pos > off ? pos - off : 0;
+            const size_t drop = std::min(to_drop, sz - skip);
+            part.val.erase(skip, drop);
+            to_drop -= drop;
+        }
+        off += sz;
+    }
+    return to_drop == 0;
+}
+
+// Replace the occurrence of "from" located at global position pos in the
+// concatenation of parts with "to". The occurrence may span two adjacent
+// parts; the replacement text is placed in the part where the occurrence
+// starts, preserving its is_input provenance.
+// Returns false if the parts do not contain "from" at pos (i.e. they no
+// longer mirror the prompt they were derived from).
+static bool string_parts_replace_at(
+        std::vector<jinja::string_part> & parts,
+        size_t                            pos,
+        const std::string &               from,
+        const std::string &               to) {
+    std::string actual;
+    {
+        size_t off = 0;
+        for (const auto & part : parts) {
+            if (actual.size() >= from.size()) {
+                break;
+            }
+            const size_t sz = part.val.size();
+            if (off <= pos && off + sz > pos) {
+                const size_t skip = pos - off;
+                actual += part.val.substr(skip, from.size() - actual.size());
+            }
+            off += sz;
+        }
+    }
+    if (actual != from) {
+        return false;
+    }
+    if (!string_parts_erase_range(parts, pos, from.size())) {
+        return false;
+    }
+    size_t off = 0;
+    for (auto & part : parts) {
+        const size_t sz = part.val.size();
+        if (off == pos) {
+            part.val.insert(0, to);
+            return true;
+        }
+        if (off < pos && pos < off + sz) {
+            part.val.insert(pos - off, to);
+            return true;
+        }
+        off += sz;
+    }
+    // pos is at the very end of the concatenation: append to the last part
+    parts.back().val += to;
+    return true;
+}
+
 static std::string common_chat_template_direct_apply_impl(
     const common_chat_template & tmpl,
     const autoparser::generation_params & inputs,
     const std::optional<json> & messages_override = std::nullopt,
     const std::optional<json> & tools_override = std::nullopt,
-    const std::optional<json> & additional_context = std::nullopt) {
+    const std::optional<json> & additional_context = std::nullopt,
+    std::vector<jinja::string_part> * out_parts = nullptr) {
     jinja::context ctx(tmpl.source());
 
     // messages_override is already built for this template, do not touch its content parts
@@ -979,22 +1059,133 @@ static std::string common_chat_template_direct_apply_impl(
     const jinja::value results = runtime.execute(tmpl.prog);
     auto parts = jinja::runtime::gather_string_parts(results);
 
+    // Preserve the jinja::string parts (with is_input metadata) for the caller
+    if (out_parts) {
+        *out_parts = parts->as_string().parts;
+    }
+
     std::string result = parts->as_string().str();
 
     // TODO: improve this later
     if (inputs.add_bos && string_starts_with(result, tmpl.bos_token())) {
         result = result.substr(tmpl.bos_token().size());
+        // Keep the parts in sync with the prompt (the token may span parts).
+        if (out_parts) {
+            string_parts_erase_range(*out_parts, 0, tmpl.bos_token().size());
+        }
     }
     if (inputs.add_eos && string_ends_with(result, tmpl.eos_token())) {
         result = result.substr(0, result.size() - tmpl.eos_token().size());
+        // Keep the parts in sync with the prompt (the token may span parts).
+        if (out_parts) {
+            size_t total = 0;
+            for (const auto & part : *out_parts) {
+                total += part.val.size();
+            }
+            string_parts_erase_range(*out_parts, total - tmpl.eos_token().size(), tmpl.eos_token().size());
+        }
     }
     return result;
 }
 
 std::string common_chat_template_direct_apply(
     const common_chat_template & tmpl,
-    const autoparser::generation_params & inputs) {
-    return common_chat_template_direct_apply_impl(tmpl, inputs, std::nullopt, std::nullopt, std::nullopt);
+    const autoparser::generation_params & inputs,
+    std::vector<jinja::string_part> * out_parts) {
+    return common_chat_template_direct_apply_impl(tmpl, inputs, std::nullopt, std::nullopt, std::nullopt, out_parts);
+}
+
+bool common_chat_parts_have_special_input(
+    const struct llama_vocab * vocab,
+    const std::vector<jinja::string_part> & parts) {
+    for (const auto & part : parts) {
+        if (!part.is_input || part.val.empty()) {
+            continue;
+        }
+        // Tokenize the input part in isolation with parse_special=true: if any
+        // of the resulting tokens is a control/unknown special token, the
+        // per-part parse_special handling changes the result (those tokens
+        // would be parsed as special in a whole-prompt parse_special=true pass,
+        // but are byte-fallbacked in the per-part parse_special=false pass).
+        //
+        // Note: this mirrors the tokenizer's own rule (see
+        // llama_vocab::impl::tokenizer_st_partition): with parse_special=false,
+        // special tokens with the control or unknown attribute are not parsed.
+        //
+        // The check is done per part, in isolation. A special token that spans
+        // a part boundary would require the template to emit a partial special
+        // token exactly at a user-content boundary, which well-formed chat
+        // templates do not do.
+        const auto tokens = common_tokenize(vocab, part.val, /*add_special=*/false, /*parse_special=*/true);
+        for (const auto tok : tokens) {
+            const auto attr = llama_vocab_get_attr(vocab, tok);
+            if (attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_UNKNOWN)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+std::vector<llama_token> common_tokenize_parts(
+    const struct llama_vocab * vocab,
+    const std::vector<jinja::string_part> & parts,
+    bool add_special) {
+    if (!common_chat_parts_have_special_input(vocab, parts)) {
+        // Fast path: no is_input part contains special-token text, so the
+        // per-part parse_special distinction is moot. Tokenize the
+        // concatenated prompt in a single pass so the token ids are identical
+        // to the legacy whole-prompt tokenization (this preserves normal
+        // tokenizer merges across part boundaries).
+        std::string full;
+        size_t total = 0;
+        for (const auto & part : parts) {
+            total += part.val.size();
+        }
+        full.reserve(total);
+        for (const auto & part : parts) {
+            full += part.val;
+        }
+        return common_tokenize(vocab, full, add_special, /*parse_special=*/true);
+    }
+
+    // Protection path: tokenize each part separately so that user-provided
+    // content (is_input) is never parsed for special tokens, while template
+    // parts keep parse_special=true so legitimate special tokens like
+    // <|im_start|>, <|im_end|>, etc. are properly recognized.
+    //
+    // Merge adjacent parts with the same provenance first: the rendered
+    // parts from the jinja runtime never contain adjacent parts of the same
+    // type (it merges them), but parts appended afterwards (e.g. the
+    // continuation generation prompt) can. Merging keeps normal tokenizer
+    // merges across same-type part boundaries.
+    std::vector<jinja::string_part> merged;
+    merged.reserve(parts.size());
+    for (const auto & part : parts) {
+        if (!merged.empty() && merged.back().is_input == part.is_input) {
+            merged.back().val += part.val;
+        } else {
+            merged.push_back(part);
+        }
+    }
+
+    std::vector<llama_token> result;
+
+    bool first = true;
+    for (const auto & part : merged) {
+        if (part.val.empty()) {
+            continue;
+        }
+
+        // Only add special (BOS) on the very first non-empty part
+        const bool part_add_special = add_special && first;
+        first = false;
+
+        const auto tokens = common_tokenize(vocab, part.val, part_add_special, /*parse_special=*/!part.is_input);
+        result.insert(result.end(), tokens.begin(), tokens.end());
+    }
+
+    return result;
 }
 
 static std::string common_chat_template_generation_prompt_impl(
@@ -1076,7 +1267,7 @@ static common_chat_params common_chat_params_init_ministral_3(const common_chat_
     data.supports_thinking  = true;
     data.thinking_start_tag = "[THINK]";
     data.thinking_end_tags  = {"[/THINK]"};
-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs, /* messages_override = */ adjusted_messages);
+    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs, /* messages_override = */ adjusted_messages, std::nullopt, std::nullopt, &data.prompt_parts);
     data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs, /* messages_override = */ adjusted_messages);
     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
     data.preserved_tokens  = {
@@ -1088,13 +1279,22 @@ static common_chat_params common_chat_params_init_ministral_3(const common_chat_
 
     if (inputs.has_continuation()) {
         const auto & msg = inputs.continue_msg;
+        // Keep the provenance separate: template delimiters vs request-provided
+        // continued content (must not be parsed for special tokens).
+        std::vector<jinja::string_part> gen_parts;
 
         data.generation_prompt = "[THINK]" + msg.reasoning_content;
+        gen_parts.push_back({false, "[THINK]"});
+        gen_parts.push_back({true,  msg.reasoning_content});
         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
             data.generation_prompt += "[/THINK]" + msg.render_content();
+            gen_parts.push_back({false, "[/THINK]"});
+            gen_parts.push_back({true,  msg.render_content()});
         }
 
         data.prompt += data.generation_prompt;
+
+        data.prompt_parts.insert(data.prompt_parts.end(), gen_parts.begin(), gen_parts.end());
     }
 
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
@@ -1165,7 +1365,7 @@ static common_chat_params common_chat_params_init_qwen3_coder(const common_chat_
 
     const std::string GEN_PREFIX = "<|im_start|>assistant\n";
 
-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
+    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs, std::nullopt, std::nullopt, std::nullopt, &data.prompt_parts);
     data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs);
     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
 
@@ -1204,17 +1404,27 @@ static common_chat_params common_chat_params_init_qwen3_coder(const common_chat_
         const auto & msg = inputs.continue_msg;
 
         data.generation_prompt = GEN_PREFIX;
+        std::vector<jinja::string_part> gen_parts;
+        gen_parts.push_back({false, GEN_PREFIX});
         if (supports_reasoning) {
+            // The delimiters are template text; the continued reasoning/content
+            // is request-provided and must not be parsed for special tokens.
+            gen_parts.push_back({false, "<think>\n"});
+            gen_parts.push_back({true,  msg.reasoning_content});
             data.generation_prompt += "<think>\n" + msg.reasoning_content;
             if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+                gen_parts.push_back({false, "\n</think>\n\n"});
                 data.generation_prompt += "\n</think>\n\n";
             }
         }
         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+            gen_parts.push_back({true, msg.render_content()});
             data.generation_prompt += msg.render_content();
         }
 
         data.prompt += data.generation_prompt;
+
+        data.prompt_parts.insert(data.prompt_parts.end(), gen_parts.begin(), gen_parts.end());
     }
 
     std::vector<std::string> tool_call_starts = { "<tool_call>" };
@@ -1355,15 +1565,23 @@ static common_chat_params common_chat_params_init_gpt_oss(const common_chat_temp
         adjusted_messages.push_back(msg);
     }
 
-    auto prompt = common_chat_template_direct_apply_impl(tmpl, inputs, /* messages_override= */ adjusted_messages);
+    auto prompt = common_chat_template_direct_apply_impl(tmpl, inputs, /* messages_override= */ adjusted_messages, std::nullopt, std::nullopt, &data.prompt_parts);
 
     // Check if we need to replace the return token with end token during
     // inference and without generation prompt. For more details see:
     // https://github.com/ggml-org/llama.cpp/issues/15417
+    static constexpr std::string_view return_token = "<|return|>";
+    static constexpr std::string_view end_token    = "<|end|>";
     if (inputs.is_inference && !inputs.add_generation_prompt) {
-        static constexpr std::string_view return_token = "<|return|>";
-        static constexpr std::string_view end_token    = "<|end|>";
         if (size_t pos = prompt.rfind(return_token); pos != std::string::npos) {
+            // Apply the same replacement to the prompt parts so that the
+            // server-side tokenization of prompt_parts sees exactly the same
+            // text as data.prompt (in general, the token may span two
+            // adjacent parts).
+            if (!string_parts_replace_at(data.prompt_parts, pos, std::string(return_token), std::string(end_token))) {
+                LOG_WRN("%s: prompt parts do not mirror the prompt, the return->end replacement was not applied to them\n",
+                        __func__);
+            }
             prompt.replace(pos, return_token.length(), end_token);
         }
     }
@@ -1394,12 +1612,24 @@ static common_chat_params common_chat_params_init_gpt_oss(const common_chat_temp
     if (inputs.has_continuation()) {
         const auto & msg = inputs.continue_msg;
 
+        // Keep the provenance of the continuation separate: the channel
+        // delimiters are template text, while the reasoning/content that
+        // comes from the request must not be parsed for special tokens.
+        std::vector<jinja::string_part> gen_parts = {
+            {false, "<|start|>assistant<|channel|>analysis<|message|>"},
+            {true,  msg.reasoning_content},
+        };
+
         data.generation_prompt = "<|start|>assistant<|channel|>analysis<|message|>" + msg.reasoning_content;
         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+            gen_parts.push_back({false, "<|end|><|start|>assistant<|channel|>final<|message|>"});
+            gen_parts.push_back({true,  msg.render_content()});
             data.generation_prompt += "<|end|><|start|>assistant<|channel|>final<|message|>" + msg.render_content();
         }
 
         data.prompt += data.generation_prompt;
+
+        data.prompt_parts.insert(data.prompt_parts.end(), gen_parts.begin(), gen_parts.end());
     }
 
     auto has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
@@ -1509,7 +1739,7 @@ static common_chat_params common_chat_params_init_gemma4(const common_chat_templ
                                                          const autoparser::generation_params & inputs) {
     common_chat_params data;
 
-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
+    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs, std::nullopt, std::nullopt, std::nullopt, &data.prompt_parts);
     data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs);
 
     if (inputs.add_generation_prompt && string_ends_with(data.prompt, "<turn|>\n")) {
@@ -1518,6 +1748,8 @@ static common_chat_params common_chat_params_init_gemma4(const common_chat_templ
         // from emitting its proper reasoning token sequence.
         data.generation_prompt = "<|turn>model\n";
         data.prompt += data.generation_prompt;
+
+        data.prompt_parts.push_back({false, data.generation_prompt});
     }
 
     data.message_delimiters = {
@@ -1540,14 +1772,25 @@ static common_chat_params common_chat_params_init_gemma4(const common_chat_templ
 
     if (inputs.has_continuation()) {
         const auto & msg = inputs.continue_msg;
+        // Keep the provenance separate: template delimiters vs request-provided
+        // continued content (must not be parsed for special tokens).
+        std::vector<jinja::string_part> gen_parts;
 
-        data.generation_prompt = string_ends_with(data.prompt, "<turn|>\n") ? "<|turn>model\n" : "";
+        const std::string turn_prefix = string_ends_with(data.prompt, "<turn|>\n") ? "<|turn>model\n" : "";
+        data.generation_prompt        = turn_prefix;
+        gen_parts.push_back({false, turn_prefix});
         data.generation_prompt += "<|channel>thought\n" + msg.reasoning_content;
+        gen_parts.push_back({false, "<|channel>thought\n"});
+        gen_parts.push_back({true,  msg.reasoning_content});
         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
             data.generation_prompt += "<channel|>" + msg.render_content();
+            gen_parts.push_back({false, "<channel|>"});
+            gen_parts.push_back({true,  msg.render_content()});
         }
 
         data.prompt += data.generation_prompt;
+
+        data.prompt_parts.insert(data.prompt_parts.end(), gen_parts.begin(), gen_parts.end());
     }
 
     auto has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
@@ -1673,7 +1916,7 @@ static common_chat_params common_chat_params_init_functionary_v3_2(const common_
                                                                    const autoparser::generation_params & inputs) {
     common_chat_params data;
 
-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
+    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs, std::nullopt, std::nullopt, std::nullopt, &data.prompt_parts);
     data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs);
     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
     data.preserved_tokens  = {
@@ -1685,8 +1928,14 @@ static common_chat_params common_chat_params_init_functionary_v3_2(const common_
 
     if (inputs.has_continuation()) {
         const auto & msg = inputs.continue_msg;
+
+        // The header is template text; the continued content is
+        // request-provided and must not be parsed for special tokens.
         data.generation_prompt = "<|start_header_id|>assistant<|end_header_id|>\n\n>>>all\n" + msg.render_content();
         data.prompt += data.generation_prompt;
+
+        data.prompt_parts.push_back({false, "<|start_header_id|>assistant<|end_header_id|>\n\n>>>all\n"});
+        data.prompt_parts.push_back({true,  msg.render_content()});
     }
 
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
@@ -1774,7 +2023,7 @@ static common_chat_params common_chat_params_init_kimi_k2(const common_chat_temp
                                                           const autoparser::generation_params & inputs) {
     common_chat_params data;
 
-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
+    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs, std::nullopt, std::nullopt, std::nullopt, &data.prompt_parts);
     data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs);
     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
     data.supports_thinking = true;
@@ -1807,13 +2056,22 @@ static common_chat_params common_chat_params_init_kimi_k2(const common_chat_temp
 
     if (inputs.has_continuation()) {
         const auto & msg = inputs.continue_msg;
+        // Keep the provenance separate: template delimiters vs request-provided
+        // continued content (must not be parsed for special tokens).
+        std::vector<jinja::string_part> gen_parts;
 
         data.generation_prompt = GEN_PROMPT + THINK_START + msg.reasoning_content;
+        gen_parts.push_back({false, GEN_PROMPT + THINK_START});
+        gen_parts.push_back({true,  msg.reasoning_content});
         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
             data.generation_prompt += THINK_END + msg.render_content();
+            gen_parts.push_back({false, THINK_END});
+            gen_parts.push_back({true,  msg.render_content()});
         }
 
         data.prompt += data.generation_prompt;
+
+        data.prompt_parts.insert(data.prompt_parts.end(), gen_parts.begin(), gen_parts.end());
     }
 
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
@@ -1926,7 +2184,7 @@ static common_chat_params common_chat_params_init_lfm2(const common_chat_templat
         adjusted_messages.push_back(msg);
     }
 
-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs, adjusted_messages);
+    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs, adjusted_messages, std::nullopt, std::nullopt, &data.prompt_parts);
     data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs, adjusted_messages);
     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
     data.supports_thinking = true;
@@ -1948,13 +2206,22 @@ static common_chat_params common_chat_params_init_lfm2(const common_chat_templat
 
     if (inputs.has_continuation()) {
         const auto & msg = inputs.continue_msg;
+        // Keep the provenance separate: template delimiters vs request-provided
+        // continued content (must not be parsed for special tokens).
+        std::vector<jinja::string_part> gen_parts;
 
         data.generation_prompt = GEN_PROMPT + THINK_START + msg.reasoning_content;
+        gen_parts.push_back({false, GEN_PROMPT + THINK_START});
+        gen_parts.push_back({true,  msg.reasoning_content});
         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
             data.generation_prompt += THINK_END + msg.render_content();
+            gen_parts.push_back({false, THINK_END});
+            gen_parts.push_back({true,  msg.render_content()});
         }
 
         data.prompt += data.generation_prompt;
+
+        data.prompt_parts.insert(data.prompt_parts.end(), gen_parts.begin(), gen_parts.end());
     }
 
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
@@ -2017,7 +2284,7 @@ static common_chat_params common_chat_params_init_gigachat_v3(
 
     common_chat_params data;
 
-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
+    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs, std::nullopt, std::nullopt, std::nullopt, &data.prompt_parts);
     data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs);
     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
     data.supports_thinking = false;
@@ -2028,8 +2295,14 @@ static common_chat_params common_chat_params_init_gigachat_v3(
 
     if (inputs.has_continuation()) {
         const auto & msg = inputs.continue_msg;
+
+        // The role header is template text; the continued content is
+        // request-provided and must not be parsed for special tokens.
         data.generation_prompt = "assistant<|role_sep|>\n" + msg.render_content();
         data.prompt += data.generation_prompt;
+
+        data.prompt_parts.push_back({false, "assistant<|role_sep|>\n"});
+        data.prompt_parts.push_back({true,  msg.render_content()});
     }
 
     auto has_tools         = inputs.tools.is_array() && !inputs.tools.empty();
@@ -2196,7 +2469,7 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
     const std::string TC_SEPARATOR = "\n\n";
 
     data.prompt = common_chat_template_direct_apply_impl(
-        tmpl, inputs, adjusted_messages, std::nullopt, additional_context);
+        tmpl, inputs, adjusted_messages, std::nullopt, additional_context, &data.prompt_parts);
     data.generation_prompt = common_chat_template_generation_prompt_impl(
         tmpl, inputs, adjusted_messages, std::nullopt, additional_context);
     data.format             = COMMON_CHAT_FORMAT_PEG_NATIVE;
@@ -2211,20 +2484,31 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
 
     if (inputs.has_continuation()) {
         const auto & msg = inputs.continue_msg;
+        // Keep the provenance separate: template delimiters vs request-provided
+        // continued content (must not be parsed for special tokens).
+        std::vector<jinja::string_part> gen_parts;
 
         if (is_v4 && msg.reasoning_content.empty()) {
             data.generation_prompt = GEN_PROMPT + THINK_END;
+            gen_parts.push_back({false, GEN_PROMPT + THINK_END});
             if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
                 data.generation_prompt += msg.render_content();
+                gen_parts.push_back({true, msg.render_content()});
             }
         } else {
             data.generation_prompt = GEN_PROMPT + THINK_START + msg.reasoning_content;
+            gen_parts.push_back({false, GEN_PROMPT + THINK_START});
+            gen_parts.push_back({true,  msg.reasoning_content});
             if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
                 data.generation_prompt += THINK_END + msg.render_content();
+                gen_parts.push_back({false, THINK_END});
+                gen_parts.push_back({true,  msg.render_content()});
             }
         }
 
         data.prompt += data.generation_prompt;
+
+        data.prompt_parts.insert(data.prompt_parts.end(), gen_parts.begin(), gen_parts.end());
     }
 
     bool require_tools   = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED;
@@ -2386,7 +2670,7 @@ static common_chat_params common_chat_params_init_kimi_k3(const common_chat_temp
                                                           const autoparser::generation_params & inputs) {
     common_chat_params data;
 
-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
+    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs, std::nullopt, std::nullopt, std::nullopt, &data.prompt_parts);
     data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs);
     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
     data.supports_thinking = true;
@@ -2434,13 +2718,22 @@ static common_chat_params common_chat_params_init_kimi_k3(const common_chat_temp
 
     if (inputs.has_continuation()) {
         const auto & msg = inputs.continue_msg;
+        // Keep the provenance separate: template delimiters vs request-provided
+        // continued content (must not be parsed for special tokens).
+        std::vector<jinja::string_part> gen_parts;
 
         data.generation_prompt = MSG_START + THINK_START + msg.reasoning_content;
+        gen_parts.push_back({false, MSG_START + THINK_START});
+        gen_parts.push_back({true,  msg.reasoning_content});
         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
             data.generation_prompt += THINK_END + RESP_START + msg.render_content();
+            gen_parts.push_back({false, THINK_END + RESP_START});
+            gen_parts.push_back({true,  msg.render_content()});
         }
 
         data.prompt += data.generation_prompt;
+
+        data.prompt_parts.insert(data.prompt_parts.end(), gen_parts.begin(), gen_parts.end());
     }
 
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
@@ -2587,7 +2880,7 @@ static common_chat_params common_chat_params_init_cohere2moe(const common_chat_t
     // Stable prefix of the generation prompt that precedes the (forced) <|START_THINKING|> marker.
     const std::string GEN_PREFIX = TURN_START + CHATBOT;
 
-    data.prompt             = common_chat_template_direct_apply_impl(tmpl, inputs);
+    data.prompt             = common_chat_template_direct_apply_impl(tmpl, inputs, std::nullopt, std::nullopt, std::nullopt, &data.prompt_parts);
     data.generation_prompt  = common_chat_template_generation_prompt_impl(tmpl, inputs);
     data.format             = COMMON_CHAT_FORMAT_PEG_NATIVE;
     data.supports_thinking  = true;
@@ -2618,13 +2911,22 @@ static common_chat_params common_chat_params_init_cohere2moe(const common_chat_t
 
     if (inputs.has_continuation()) {
         const auto & msg = inputs.continue_msg;
+        // Keep the provenance separate: template delimiters vs request-provided
+        // continued content (must not be parsed for special tokens).
+        std::vector<jinja::string_part> gen_parts;
 
         data.generation_prompt = GEN_PREFIX + THINK_START + msg.reasoning_content;
+        gen_parts.push_back({false, GEN_PREFIX + THINK_START});
+        gen_parts.push_back({true,  msg.reasoning_content});
         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
             data.generation_prompt += THINK_END + TEXT_START + msg.render_content();
+            gen_parts.push_back({false, THINK_END + TEXT_START});
+            gen_parts.push_back({true,  msg.render_content()});
         }
 
         data.prompt += data.generation_prompt;
+
+        data.prompt_parts.insert(data.prompt_parts.end(), gen_parts.begin(), gen_parts.end());
     }
 
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
@@ -2703,7 +3005,7 @@ static common_chat_params common_chat_params_init_minimax_m3(const common_chat_t
                                                              const autoparser::generation_params & inputs) {
     common_chat_params data;
 
-    data.prompt             = common_chat_template_direct_apply_impl(tmpl, inputs);
+    data.prompt             = common_chat_template_direct_apply_impl(tmpl, inputs, std::nullopt, std::nullopt, std::nullopt, &data.prompt_parts);
     data.generation_prompt  = common_chat_template_generation_prompt_impl(tmpl, inputs);
     data.format             = COMMON_CHAT_FORMAT_PEG_MINIMAX_M3;
     data.supports_thinking  = true;
@@ -2746,13 +3048,22 @@ static common_chat_params common_chat_params_init_minimax_m3(const common_chat_t
 
     if (inputs.has_continuation()) {
         const auto & msg = inputs.continue_msg;
+        // Keep the provenance separate: template delimiters vs request-provided
+        // continued content (must not be parsed for special tokens).
+        std::vector<jinja::string_part> gen_parts;
 
         data.generation_prompt = GEN_PROMPT + THINK_START + msg.reasoning_content;
+        gen_parts.push_back({false, GEN_PROMPT + THINK_START});
+        gen_parts.push_back({true,  msg.reasoning_content});
         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
             data.generation_prompt += THINK_END + msg.render_content();
+            gen_parts.push_back({false, THINK_END});
+            gen_parts.push_back({true,  msg.render_content()});
         }
 
         data.prompt += data.generation_prompt;
+
+        data.prompt_parts.insert(data.prompt_parts.end(), gen_parts.begin(), gen_parts.end());
     }
 
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
@@ -3186,7 +3497,7 @@ static common_chat_params common_chat_params_init_minicpm5(const common_chat_tem
                                                            const autoparser::generation_params & inputs) {
     common_chat_params data;
 
-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
+    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs, std::nullopt, std::nullopt, std::nullopt, &data.prompt_parts);
     data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs);
     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
     data.supports_thinking = true;
@@ -3216,13 +3527,22 @@ static common_chat_params common_chat_params_init_minicpm5(const common_chat_tem
 
     if (inputs.has_continuation()) {
         const auto & msg = inputs.continue_msg;
+        // Keep the provenance separate: template delimiters vs request-provided
+        // continued content (must not be parsed for special tokens).
+        std::vector<jinja::string_part> gen_parts;
 
         data.generation_prompt = "<|im_start|>assistant\n<think>\n" + msg.reasoning_content;
+        gen_parts.push_back({false, "<|im_start|>assistant\n<think>\n"});
+        gen_parts.push_back({true,  msg.reasoning_content});
         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
             data.generation_prompt += "\n</think>\n\n" + msg.render_content();
+            gen_parts.push_back({false, "\n</think>\n\n"});
+            gen_parts.push_back({true,  msg.render_content()});
         }
 
         data.prompt += data.generation_prompt;
+
+        data.prompt_parts.insert(data.prompt_parts.end(), gen_parts.begin(), gen_parts.end());
     }
 
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
@@ -3333,7 +3653,7 @@ static common_chat_params common_chat_params_init_muse_glimmer(const common_chat
                                                                const autoparser::generation_params & inputs) {
     common_chat_params data;
 
-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
+    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs, std::nullopt, std::nullopt, std::nullopt, &data.prompt_parts);
     data.generation_prompt = "<|start|>assistant";
     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
     data.supports_thinking = true;
@@ -3354,13 +3674,22 @@ static common_chat_params common_chat_params_init_muse_glimmer(const common_chat
 
     if (inputs.has_continuation()) {
         const auto & msg = inputs.continue_msg;
+        // Keep the provenance separate: template delimiters vs request-provided
+        // continued content (must not be parsed for special tokens).
+        std::vector<jinja::string_part> gen_parts;
 
         data.generation_prompt = "<|start|>assistant to=self<|message|>" + msg.reasoning_content;
+        gen_parts.push_back({false, "<|start|>assistant to=self<|message|>"});
+        gen_parts.push_back({true,  msg.reasoning_content});
         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
             data.generation_prompt += "<|eom|><|start|>assistant to=user<|message|>" + msg.render_content();
+            gen_parts.push_back({false, "<|eom|><|start|>assistant to=user<|message|>"});
+            gen_parts.push_back({true,  msg.render_content()});
         }
 
         data.prompt += data.generation_prompt;
+
+        data.prompt_parts.insert(data.prompt_parts.end(), gen_parts.begin(), gen_parts.end());
     }
 
     auto extract_reasoning = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
@@ -3700,7 +4029,7 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
         common_chat_params data;
         auto params_copy               = params;
         params_copy.reasoning_format   = COMMON_REASONING_FORMAT_NONE;
-        data.prompt                    = common_chat_template_direct_apply_impl(tmpl, params_copy);
+        data.prompt                    = common_chat_template_direct_apply_impl(tmpl, params_copy, std::nullopt, std::nullopt, std::nullopt, &data.prompt_parts);
         data.generation_prompt         = common_chat_template_generation_prompt_impl(tmpl, params);
         data.format                    = COMMON_CHAT_FORMAT_PEG_NATIVE;
         auto parser                    = build_chat_peg_parser([&data](common_chat_peg_builder &p) {
