@@ -1693,6 +1693,12 @@ private:
         return true;
     }
 
+    bool uses_mtp() const {
+        return spec && std::find(params_base.speculative.types.begin(),
+                params_base.speculative.types.end(),
+                COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+    }
+
     server_slot * get_slot_by_id(int id_slot) {
         // note: allow id_slot to be out of bounds (wrap around)
         id_slot = id_slot % slots.size();
@@ -2707,6 +2713,12 @@ private:
         const int id_task = slot.task->id;
 
         const int64_t n_tokens_checkpoint = slot.prompt.n_tokens() - n_tokens_cur;
+        if (uses_mtp() && std::any_of(slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(),
+                [&](const auto & cur) {
+                    return cur.n_tokens == n_tokens_checkpoint && cur.pos_min == pos_min && cur.pos_max == pos_max;
+                })) {
+            return; // this prefix's state was already captured before its suffix was replayed
+        }
         if (!prompt_reuse_boundary_is_stable(n_tokens_checkpoint)) {
             SLT_TRC(slot,
                     "skipping non-descriptor KVarN checkpoint boundary (n_tokens = %" PRId64 ", alignment = %d)\n",
@@ -3906,7 +3918,10 @@ private:
                                         main_p1 < 0 && (!slot.draft_owns_state || draft_p1 < 0) &&
                                         common_p0 > 0 && common_p0 <= pos_next;
                                 const bool extends_complete_prompt = n_past == slot.prompt.n_tokens();
-                                const bool state_required = !extends_complete_prompt && !use_live_plan;
+                                // MTP's pending target hidden row belongs to the previous
+                                // position, not to the live KV suffix. A native suffix rollback
+                                // cannot rewind it; restore target, draft and MTP state together.
+                                const bool state_required = uses_mtp() || (!extends_complete_prompt && !use_live_plan);
                                 if (server_prompt_reuse_requires_checkpoint_search(
                                             state_required, pos_min, pos_min_thold)) {
                                     // Prefer the memory implementation's native suffix plan before
@@ -3915,7 +3930,7 @@ private:
                                     // return an earlier complete boundary.  Both are safer and
                                     // cheaper than checkpoint restoration when every target/draft
                                     // child has already validated the same positive boundary.
-                                    if (use_live_plan) {
+                                    if (use_live_plan && !uses_mtp()) {
                                         const bool exact_live_plan = common_p0 == pos_next;
                                         pos_next = common_p0;
                                         n_past = slot.prompt.tokens.size_up_to_pos(pos_next);
@@ -3933,7 +3948,7 @@ private:
                                                 // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
                                                 SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
                                                 // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
-                                                if (cur.pos_max > pos_next) {
+                                                if (cur.pos_max > pos_next || (uses_mtp() && cur.n_tokens > n_past)) {
                                                     return false;
                                                 }
                                                 return prompt_reuse_boundary_is_stable(cur.n_tokens) &&
@@ -3977,7 +3992,7 @@ private:
                                 // erase any checkpoints with pos_max > pos_next
                                 for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
                                     const auto & cur = *it;
-                                    if (cur.pos_max > pos_next) {
+                                    if (cur.pos_max > pos_next || (uses_mtp() && cur.n_tokens > n_past)) {
                                         SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {
@@ -4111,7 +4126,7 @@ private:
                     do_checkpoint = do_checkpoint && (
                             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
-                            n_swa > 0);
+                            n_swa > 0 || uses_mtp());
 
                     bool has_mtmd = false;
 
@@ -4207,13 +4222,17 @@ private:
                         // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
                         // create checkpoints that many tokens before the end of the prompt:
                         //  - 4 + n_ubatch
-                        //  - 4
+                        //  - 4 (non-MTP); MTP saves one token before the end so
+                        //    repeated scoring replays the same final batch shape.
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         if (do_checkpoint) {
-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+                            const int checkpoint_offsets[] = {4 + n_ubatch, 4, 1};
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
+                                if ((offset == 1 && !uses_mtp()) || (offset == 4 && uses_mtp())) {
+                                    continue;
+                                }
                                 const int n_last = std::min(n_batch, offset);
                                 const int32_t alignment = prompt_reuse_alignment();
                                 const int64_t checkpoint_boundary = server_prompt_checkpoint_boundary(
