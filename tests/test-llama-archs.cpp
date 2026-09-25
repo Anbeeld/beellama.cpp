@@ -10,6 +10,7 @@
 
 #include "../src/llama-context.h"
 #include "../src/llama-kv-cache-kvarn.h"
+#include "../src/llama-memory-hybrid.h"
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
@@ -69,7 +70,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help] [--test-mtp-ubatch-sync] [--test-mtp-request-reset] [--test-mtp-kvarn-routing]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help] [--test-mtp-ubatch-sync] [--test-mtp-request-reset] [--test-mtp-kvarn-routing] [--test-kvarn-state-restore]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -737,6 +738,126 @@ static int test_mtp_kvarn_routing(const size_t seed) {
     return 0;
 }
 
+// Decodes `tokens` at positions [p0, p0 + n) of one sequence and returns the
+// logits of every token, so a restored prefix is checked across a whole suffix.
+static std::vector<float> kvarn_restore_decode(
+        llama_context * lctx, const std::vector<llama_token> & tokens, llama_pos p0, llama_seq_id seq_id) {
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(lctx)));
+    llama_batch batch = llama_batch_init(int32_t(tokens.size()), 0, 1);
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        common_batch_add(batch, tokens[i], p0 + llama_pos(i), { seq_id }, true);
+    }
+    const int32_t ret = llama_decode(lctx, batch);
+    llama_batch_free(batch);
+    if (ret != 0) {
+        throw std::runtime_error("KVarN restore test decode failed");
+    }
+    std::vector<float> result;
+    result.reserve(tokens.size()*size_t(n_vocab));
+    for (int32_t i = 0; i < int32_t(tokens.size()); ++i) {
+        const float * logits = llama_get_logits_ith(lctx, i);
+        result.insert(result.end(), logits, logits + n_vocab);
+    }
+    return result;
+}
+
+// Regression for the ordinary --cache-ram KVarN restore bug: with one physical
+// stream per sequence (-np > 1, not unified), a SELF_CONTAINED state omitted the
+// F16-only stage rows (the permanent group-0 sink and an unsealed live group).
+// The restore then read whatever the destination stage happened to contain, so
+// it matched only when restored into the slot that produced it and still held
+// that data. A restore after a data-clearing memory clear, into another
+// sequence, or into a slot overwritten by unrelated work must be equivalent.
+static int test_kvarn_state_restore(const size_t seed) {
+    int failures = 0;
+    // LLAMA isolates the KVarN attention cache; QWEN35 adds the recurrent
+    // state of the hybrid architecture used by the failing server test.
+    for (const llm_arch arch : { LLM_ARCH_LLAMA, LLM_ARCH_QWEN35 }) {
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, false);
+        llama_model_params model_params = llama_model_default_params();
+        model_params.progress_callback = silent_model_load_progress;
+        size_t tmp = seed;
+        llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tmp, model_params));
+        if (!model) {
+            throw std::runtime_error("failed to create KVarN restore test model");
+        }
+        const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+
+        // 256 ends on a sealed record boundary (like the 1,792-token server entry);
+        // 300 leaves an unsealed live group that exists only in the F16 stage.
+        for (const uint32_t n_prefix : { 256u, 300u }) {
+            llama_context_params params = llama_context_default_params();
+            params.n_ctx = 1024;
+            params.n_batch = 512;
+            params.n_ubatch = 64;
+            params.n_seq_max = 2;
+            params.kv_unified = false;
+            params.n_threads = 4;
+            params.n_threads_batch = 4;
+            params.offload_kqv = false;
+            params.kvarn = llama_kvarn_params_for_type(LLAMA_KVARN_K4V4_G128);
+            llama_context_ptr ctx(llama_init_from_model(model.get(), params));
+            if (!ctx) {
+                throw std::runtime_error("failed to create KVarN restore test context");
+            }
+            llama_memory_t mem = llama_get_memory(ctx.get());
+            const auto * hybrid = dynamic_cast<const llama_memory_hybrid *>(mem);
+            if (dynamic_cast<const llama_kv_cache_kvarn *>(hybrid ? hybrid->get_mem_attn() : mem) == nullptr) {
+                fprintf(stderr, "%s: KVarN restore test did not construct KVarN storage\n", llm_arch_name(arch));
+                return 1;
+            }
+
+            const auto prefix = get_tokens(n_prefix, n_vocab, seed + 1);
+            const auto suffix = get_tokens(24, n_vocab, seed + 2);
+            const auto unrelated = get_tokens(200, n_vocab, seed + 3);
+            const llama_pos p_suffix = llama_pos(n_prefix);
+            constexpr llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED;
+
+            kvarn_restore_decode(ctx.get(), prefix, 0, 0);
+            std::vector<uint8_t> state(llama_state_seq_get_size_ext(ctx.get(), 0, flags));
+            if (state.empty() ||
+                    llama_state_seq_get_data_ext(ctx.get(), state.data(), state.size(), 0, flags) != state.size()) {
+                throw std::runtime_error("failed to save KVarN sequence state");
+            }
+            // Reference: the live, never-saved state continues with the suffix.
+            const auto reference = kvarn_restore_decode(ctx.get(), suffix, p_suffix, 0);
+
+            const auto check = [&](const char * name, llama_seq_id seq_id) {
+                if (llama_state_seq_set_data_ext(ctx.get(), state.data(), state.size(), seq_id, flags) != state.size()) {
+                    fprintf(stderr, "%s prefix %u %s: KVarN state restore failed\n", llm_arch_name(arch), n_prefix, name);
+                    ++failures;
+                    return;
+                }
+                const auto restored = kvarn_restore_decode(ctx.get(), suffix, p_suffix, seq_id);
+                // The restored state and the executed graph are identical, so the
+                // continuation must be bit-exact. Before the fix a restore into the
+                // overwritten sequence differed only at ~1e-14 on this tiny model.
+                const double err = nmse(reference, restored);
+                const bool ok = reference == restored;
+                fprintf(stderr, "%-6s prefix %u %-34s nmse = %.3e %s\n",
+                        llm_arch_name(arch), n_prefix, name, err, ok ? "OK" : "FAIL");
+                failures += ok ? 0 : 1;
+            };
+
+            // Another sequence has its own, never-written physical stream.
+            check("restore into fresh sequence 1", 1);
+            llama_memory_seq_rm(mem, 1, -1, -1);
+
+            // The original sequence after unrelated work has overwritten its stage.
+            llama_memory_seq_rm(mem, 0, -1, -1);
+            kvarn_restore_decode(ctx.get(), unrelated, 0, 0);
+            llama_memory_seq_rm(mem, 0, -1, -1);
+            check("restore into overwritten sequence 0", 0);
+
+            // The original sequence after all model memory data was zeroed.
+            llama_memory_clear(mem, true);
+            check("restore after hard memory clear", 0);
+        }
+    }
+
+    return failures == 0 ? 0 : 1;
+}
+
 static std::vector<float> get_logits(
         llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false) {
     const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
@@ -1137,6 +1258,7 @@ int main(int argc, char ** argv) {
     bool test_mtp_sync = false;
     bool test_mtp_reset = false;
     bool test_mtp_kvarn = false;
+    bool test_kvarn_restore = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -1191,6 +1313,9 @@ int main(int argc, char ** argv) {
         if (strcmp(argv[i], "--test-mtp-kvarn-routing") == 0) {
             test_mtp_kvarn = true;
         }
+        if (strcmp(argv[i], "--test-kvarn-state-restore") == 0) {
+            test_kvarn_restore = true;
+        }
     }
     printf("%s: using seed %zu\n", __func__, seed);
 
@@ -1206,6 +1331,9 @@ int main(int argc, char ** argv) {
         }
         if (test_mtp_kvarn) {
             return test_mtp_kvarn_routing(seed);
+        }
+        if (test_kvarn_restore) {
+            return test_kvarn_state_restore(seed);
         }
         return test_backends(arch, seed, verbosity);
     } catch (const std::exception & err) {

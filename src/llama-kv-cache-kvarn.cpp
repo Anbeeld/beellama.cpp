@@ -2383,7 +2383,11 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
         // read plan is active; otherwise it uses the parity/window layout, so the
         // state rows must be selected under the same rule.
         const bool explicit_stage = !swa && uses_compact_read_indices();
-        if (explicit_stage) {
+        if (!swa && !explicit_stage) {
+            // The fixed layout has no allocator-owned stage slots, so derive the
+            // F16-only groups (group-0 sink, unsealed live group) from the cells.
+            staged_groups = llama_kvarn_stage_only_groups(source_cells);
+        } else if (explicit_stage) {
             for (const uint32_t cell : source_cells) {
                 if (metadata->allocation_cell_uses_stage(cell)) {
                     staged_groups.push_back(cell/KVAR_N_GROUP);
@@ -2400,7 +2404,7 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
                 stage_groups,
                 tail_groups,
                 swa,
-                explicit_stage ? &staged_groups : nullptr,
+                swa ? nullptr : &staged_groups,
                 explicit_stage ? &metadata->get_allocation_stage_slots() : nullptr);
     }
     if (selective_stage_cells.size() > std::numeric_limits<uint32_t>::max()) {
@@ -2794,7 +2798,9 @@ void llama_kv_cache_kvarn::state_read_sinfo(
         std::vector<uint32_t> staged_groups;
         // mirror the store's stage layout: allocator slots only with compact reads
         const bool explicit_stage = !swa && uses_compact_read_indices();
-        if (explicit_stage) {
+        if (!swa && !explicit_stage) {
+            staged_groups = llama_kvarn_stage_only_groups(destination_cells);
+        } else if (explicit_stage) {
             for (const uint32_t cell : destination_cells) {
                 if (metadata_prepared->allocation_cell_uses_stage(cell)) {
                     staged_groups.push_back(cell/KVAR_N_GROUP);
@@ -2811,7 +2817,7 @@ void llama_kv_cache_kvarn::state_read_sinfo(
                 stage_groups,
                 tail_groups,
                 swa,
-                explicit_stage ? &staged_groups : nullptr,
+                swa ? nullptr : &staged_groups,
                 explicit_stage ? &metadata_prepared->get_allocation_stage_slots() : nullptr);
         for (const auto & cell : desired) {
             desired_stage_rows.emplace(cell.source_cell, cell.stage_row);
