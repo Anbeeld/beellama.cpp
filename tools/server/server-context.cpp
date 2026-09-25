@@ -2848,6 +2848,23 @@ private:
             ckpt_write(ofs, buf.data(), n, n_written);
         }
     }
+    static bool ckpt_read_buf(std::ifstream & ifs, common_prompt_checkpoint_buffer & buf, size_t & n_read) {
+        uint64_t n = 0;
+        // 16 GiB cap, in case the size field itself is corrupted
+        if (!ckpt_read(ifs, &n, sizeof(n), n_read) || n > (1ull << 34)) {
+            return false;
+        }
+        buf.resize(n);
+        return n == 0 || ckpt_read(ifs, buf.data(), n, n_read);
+    }
+
+    static void ckpt_write_buf(std::ofstream & ofs, const common_prompt_checkpoint_buffer & buf, size_t & n_written) {
+        const uint64_t n = buf.size();
+        ckpt_write(ofs, &n, sizeof(n), n_written);
+        if (n > 0) {
+            ckpt_write(ofs, buf.data(), n, n_written);
+        }
+    }
 
     size_t save_slot_checkpoints(const std::string & filepath, const server_slot & slot) const {
         if (slot.prompt.checkpoints.empty()) {
