@@ -482,6 +482,18 @@ std::vector<uint32_t> llama_kvarn_live_stage_groups(
     return live;
 }
 
+std::vector<uint32_t> llama_kvarn_stage_only_groups(const std::vector<uint32_t> & cells) {
+    const std::set<uint32_t> present(cells.begin(), cells.end());
+    std::set<uint32_t> groups;
+    for (const uint32_t cell : present) {
+        const uint32_t group = cell/KVAR_N_GROUP;
+        if (group == 0 || present.count(group*KVAR_N_GROUP + (KVAR_N_GROUP - 1u)) == 0) {
+            groups.insert(group);
+        }
+    }
+    return { groups.begin(), groups.end() };
+}
+
 std::vector<llama_kvarn_state_stage_cell> llama_kvarn_select_state_stage_cells(
         const std::vector<uint32_t> & source_cells,
         uint32_t live_cell_max_p1,
