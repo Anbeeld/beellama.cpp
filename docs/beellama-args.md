@@ -281,6 +281,27 @@ N-gram-only modes do not create a draft context.
 | Chat request JSON `"reasoning_control": true` | — | `false` | Arms a live `/v1/chat/completions` request for external reasoning control. The chat template must expose a reasoning end sequence. |
 | `POST /v1/chat/completions/control` with `{"id":"chatcmpl-...","action":"reasoning_end"}` | — | Disabled per request | Forces the armed completion's reasoning sampler toward its final-answer phase. Unknown or completed ids return a non-success result; `reasoning_end` is the only accepted action. |
 
+## Prompt-cache protection
+
+These options protect frequently reused prompt prefixes, such as a fixed agent
+system prompt, inside the `--cache-ram` prompt cache so unrelated requests do
+not evict them. Protection needs `--cache-ram` and is disabled by default.
+A prefix is protected after it was reused, with different continuations, at
+least `--cache-protect-hits` times; the snapshot is taken at the reused
+boundary and restored when a later request extends it. Requests using
+`--cache-reuse`, LoRA adapters or multimodal input are not considered.
+
+| Argument | Env var | Default | Behavior |
+|---|---|---|---|
+| `--cache-protect-ram MiB` | `LLAMA_ARG_CACHE_PROTECT_RAM` | `0` | RAM budget for protected prefix snapshots, counted within `--cache-ram`. `0` disables protection. |
+| `--cache-protect-min-tokens N` | `LLAMA_ARG_CACHE_PROTECT_MIN_TOKENS` | `8192` | Minimum actually reused prefix length that can become protected. Must be positive. |
+| `--cache-protect-hits N` | `LLAMA_ARG_CACHE_PROTECT_HITS` | `3` | Divergent reuses of the same prefix needed before protection. Continuations of a protected prefix only refresh it. Must be positive. |
+| `--cache-protect-max N` | `LLAMA_ARG_CACHE_PROTECT_MAX` | `4` | Maximum simultaneously protected snapshots. Must be positive. |
+| `--cache-protect-replace-after SECONDS` | `LLAMA_ARG_CACHE_PROTECT_REPLACE_AFTER` | `3600` | Minimum inactivity before a protected snapshot may be replaced by a new candidate; it then becomes an ordinary cache entry. `0` permits immediate LRU replacement. |
+
+`/metrics` reports `prompt_cache_protected_entries`,
+`prompt_cache_protected_bytes` and `prompt_cache_protection_candidates`.
+
 ## Presets
 
 | Argument | Env var | Default | Behavior |
