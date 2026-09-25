@@ -110,7 +110,11 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
 #define VDR_Q1_0_Q8_1_MMQ  4  // Q1_0 has 128 bits (4 ints) per block
 
 #define VDR_Q2_0_Q8_1_MMVQ 1  // Process one 32-element chunk at a time for parallelism
+#define VDR_PQ2_0_Q8_1_MMVQ 1  // one 32-element chunk at a time (same per-chunk codec as Q2_0)
+#define VDR_PTQ1_0_Q8_1_MMVQ 4 // whole 128 block per call: keeps the byte walk uniform across lanes
 #define VDR_Q2_0_Q8_1_MMQ  2  // Q2_0 group 64: 128 bits (4 ints) per block, 2 32-element chunks
+#define VDR_PQ2_0_Q8_1_MMQ  2  // Q2_0 group 128: 4 32-element chunks per block
+#define VDR_PTQ1_0_Q8_1_MMQ  2  // expanded to signed bytes in the MMQ tile loader
 
 #define VDR_Q4_0_Q8_1_MMVQ 2
 #define VDR_Q4_0_Q8_1_MMQ  4
@@ -1057,6 +1061,192 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
     }
 
     // Apply Q2_0's single scale and this chunk's Q8_1 scale
+    const float d8 = __low2float(bq8_1_chunk->ds);
+    return d2 * d8 * sumi;
+}
+
+#if !defined(GGML_USE_HIP)
+template <int ncols_dst>
+static __device__ __forceinline__ void vec_dot_ptq1_0_q8_1_multi(const void * __restrict__ vbq,
+                                                                 const block_q8_1 * __restrict__ bq8_1,
+                                                                 const int &    kbx,
+                                                                 const int &    iqs,
+                                                                 const uint32_t stride_col_y,
+                                                                 float *        result) {
+    const block_ptq1_0 * bq                 = (const block_ptq1_0 *) vbq + kbx;
+    int                  sumi[ncols_dst][4] = {};
+
+    // Widen four bytes to 16-bit lanes so multiply-by-three cannot carry between bytes.
+#    pragma unroll
+    for (int g = 0; g < 4; ++g) {
+        const uint32_t packed = get_int_b4(bq->qs, g);
+        uint32_t       v_lo   = __byte_perm(packed, 0, 0x4140);
+        uint32_t       v_hi   = __byte_perm(packed, 0, 0x4342);
+
+#    pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            const uint32_t w_lo = v_lo * 3;
+            const uint32_t w_hi = v_hi * 3;
+            v_lo                = w_lo & 0x00FF00FF;
+            v_hi                = w_hi & 0x00FF00FF;
+
+            const int q = __vsub4(__byte_perm(w_lo, w_hi, 0x7531), 0x01010101);
+            const int e = t * 16 + 4 * g;
+#    pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                const int u     = get_int_b4(bq8_1[j * stride_col_y + iqs + (e >> 5)].qs, (e & 31) >> 2);
+                sumi[j][e >> 5] = ggml_cuda_dp4a(q, u, sumi[j][e >> 5]);
+            }
+        }
+    }
+
+#    pragma unroll
+    for (int g = 0; g < 2; ++g) {
+        const uint32_t packed = get_int_b4(bq->qs + 16, g);
+        uint32_t       v_lo   = __byte_perm(packed, 0, 0x4140);
+        uint32_t       v_hi   = __byte_perm(packed, 0, 0x4342);
+
+#    pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            const uint32_t w_lo = v_lo * 3;
+            const uint32_t w_hi = v_hi * 3;
+            v_lo                = w_lo & 0x00FF00FF;
+            v_hi                = w_hi & 0x00FF00FF;
+
+            const int q = __vsub4(__byte_perm(w_lo, w_hi, 0x7531), 0x01010101);
+            const int e = 80 + t * 8 + 4 * g;
+#    pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                const int u     = get_int_b4(bq8_1[j * stride_col_y + iqs + (e >> 5)].qs, (e & 31) >> 2);
+                sumi[j][e >> 5] = ggml_cuda_dp4a(q, u, sumi[j][e >> 5]);
+            }
+        }
+    }
+
+    uint32_t v = (uint32_t) bq->qh[0] | ((uint32_t) bq->qh[1] << 16);
+#    pragma unroll
+    for (int t = 0; t < 4; t += 2) {
+        const uint32_t w0 = v * 3;
+        v                 = w0 & 0x00FF00FF;
+        const uint32_t w1 = v * 3;
+        v                 = w1 & 0x00FF00FF;
+
+        const int q = __vsub4(__byte_perm(w0, w1, 0x7531), 0x01010101);
+#    pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            const int u = get_int_b4(bq8_1[j * stride_col_y + iqs + 3].qs, 6 + t / 2);
+            sumi[j][3]  = ggml_cuda_dp4a(q, u, sumi[j][3]);
+        }
+    }
+
+    const float d = (float) bq->d;
+#    pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        float acc = 0.0f;
+#    pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            acc += __low2float(bq8_1[j * stride_col_y + iqs + k].ds) * (float) sumi[j][k];
+        }
+        result[j] = d * acc;
+    }
+}
+#endif
+
+// PTQ1_0 x Q8_1. One call consumes the full 128-weight block.
+static __device__ __forceinline__ float vec_dot_ptq1_0_q8_1(const void * __restrict__ vbq,
+                                                            const block_q8_1 * __restrict__ bq8_1,
+                                                            const int & kbx,
+                                                            const int & iqs) {
+#if defined(GGML_USE_HIP)
+    const block_ptq1_0 * bq      = (const block_ptq1_0 *) vbq + kbx;
+    int                  sumi[4] = { 0, 0, 0, 0 };
+
+#    pragma unroll
+    for (int m = 0; m < 16; ++m) {
+        uint32_t v = bq->qs[m];
+#    pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            const uint32_t w = v * 3;
+            const int      q = (int) (w >> 8) - 1;
+            v                = w & 0xFF;
+            const int e      = t * 16 + m;
+            sumi[e >> 5] += q * (int) bq8_1[iqs + (e >> 5)].qs[e & 31];
+        }
+    }
+
+#    pragma unroll
+    for (int m = 0; m < 8; ++m) {
+        uint32_t v = bq->qs[16 + m];
+#    pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            const uint32_t w = v * 3;
+            const int      q = (int) (w >> 8) - 1;
+            v                = w & 0xFF;
+            const int e      = 80 + t * 8 + m;
+            sumi[e >> 5] += q * (int) bq8_1[iqs + (e >> 5)].qs[e & 31];
+        }
+    }
+
+#    pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        uint32_t v = bq->qh[h];
+#    pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const uint32_t w = v * 3;
+            const int      q = (int) (w >> 8) - 1;
+            v                = w & 0xFF;
+            const int e      = 120 + t * 2 + h;
+            sumi[e >> 5] += q * (int) bq8_1[iqs + (e >> 5)].qs[e & 31];
+        }
+    }
+
+    float acc = 0.0f;
+#    pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        acc += __low2float(bq8_1[iqs + k].ds) * (float) sumi[k];
+    }
+    return (float) bq->d * acc;
+#else
+    float result;
+    vec_dot_ptq1_0_q8_1_multi<1>(vbq, bq8_1, kbx, iqs, 0, &result);
+    return result;
+#endif
+}
+
+static __device__ __forceinline__ float vec_dot_pq2_0_q8_1(const void * __restrict__ vbq,
+                                                           const block_q8_1 * __restrict__ bq8_1,
+                                                           const int & kbx,
+                                                           const int & iqs) {
+    const block_pq2_0 * bq2_0 = (const block_pq2_0 *) vbq + kbx;
+
+    // Q2_0 group 128: 128 elements, ONE scale, processed as four 32-element chunks
+    // (iqs selects the chunk, 0-3). Same per-chunk 2-bit codec as Q2_0.
+    const float     d2 = bq2_0->d;
+    const int16_t * qs = (const int16_t *) bq2_0->qs + iqs * 4;
+
+    const block_q8_1 * bq8_1_chunk = bq8_1 + iqs;
+
+    int sumi = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int q  = qs[j];
+        const int u  = get_int_b4(bq8_1_chunk->qs, j*2+0);
+        const int v  = get_int_b4(bq8_1_chunk->qs, j*2+1);
+
+#if defined(GGML_USE_HIP) && defined(__HIP_DEVICE_COMPILE__)
+        const int qx = q2_0_symbols4_hip((uint32_t) q & 0xFFu);
+        const int qy = q2_0_symbols4_hip(((uint32_t) q >> 8) & 0xFFu);
+#else
+        const int qe = __byte_perm(0x020100FF, 0x020100FF, q >> 0);
+        const int qo = __byte_perm(0x020100FF, 0x020100FF, q >> 2);
+        const int qx = __byte_perm(qe, qo, 0x5140);
+        const int qy = __byte_perm(qe, qo, 0x7362);
+#endif
+
+        sumi = ggml_cuda_dp4a(u, qx, sumi);
+        sumi = ggml_cuda_dp4a(v, qy, sumi);
+    }
+
     const float d8 = __low2float(bq8_1_chunk->ds);
     return d2 * d8 * sumi;
 }
