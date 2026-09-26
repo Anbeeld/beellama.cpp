@@ -82,12 +82,6 @@ if (Python3_Interpreter_FOUND)
     set_property(TEST test-cuda-mmq-low-bit-static PROPERTY LABELS cuda)
 
     add_test(
-        NAME test-fattn-vec-dispatch-generated
-        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/gen-fattn-vec-dispatch.py --check)
-    set_property(TEST test-fattn-vec-dispatch-generated PROPERTY LABELS cuda)
-
-    add_test(
         NAME test-hip-shuffle-compat-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-hip-shuffle-compat-static.py)
@@ -202,7 +196,7 @@ function(llama_build source)
     endif()
 
     add_executable(${TEST_TARGET} ${TEST_SOURCES})
-    target_link_libraries(${TEST_TARGET} PRIVATE llama llama-common)
+    target_link_libraries(${TEST_TARGET} PRIVATE llama llama-common) # TODO: [TAG_TESTS_LLAMA_LINK]
     if (LLAMA_TESTS_INSTALL)
         install(TARGETS ${TEST_TARGET} RUNTIME)
     endif()
@@ -355,13 +349,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-llama-grammar.cpp)
     llama_build_and_test(test-batch-alloc.cpp)
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
-    target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)
     target_link_libraries(test-chat PRIVATE server-context)
-    # TODO: disabled on loongarch64 because the ggml-ci node lacks Python 3.8
-    if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "loongarch64")
-        llama_build_and_test(test-json-schema-to-grammar.cpp   WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
-        target_include_directories(test-json-schema-to-grammar PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
-    endif()
+    llama_build_and_test(test-json-schema-to-grammar.cpp)
 
     if (NOT GGML_BACKEND_DL)
         llama_build(test-quantize-stats.cpp)
@@ -390,7 +380,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
-    llama_build_and_test(test-llama-archs.cpp)
+    llama_build(test-llama-archs.cpp)
     llama_test(
         test-llama-archs
         NAME test-mtp-ubatch-sync
@@ -460,6 +450,15 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-recurrent-state-rollback-dsv4 PROPERTIES
         FIXTURES_REQUIRED generate-models
     )
+    llama_test(
+        test-recurrent-state-rollback
+        NAME test-recurrent-state-rollback-kimi-k3
+        LABEL main
+        ARGS -m "${MODEL_DIR}/kimi-k3-moe.gguf"
+    )
+    set_tests_properties(test-recurrent-state-rollback-kimi-k3 PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
 
     # Test state save/load functionality across all architectures, using the generated dummy models
     llama_test(
@@ -469,11 +468,14 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS --models "${MODEL_DIR}"
     )
     set_tests_properties(test-save-load-state-archs PROPERTIES FIXTURES_REQUIRED generate-models)
+
+    llama_build(test-fusion.cpp)
 endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
 llama_build_and_test(test-jinja.cpp)
 llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)
+llama_build_and_test(test-json-schema.cpp)
 llama_build_and_test(test-chat-auto-parser.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-chat-template.cpp)
 # debug tool for chat template differential analysis (not registered as a test, run it manually)
@@ -504,7 +506,7 @@ add_test(NAME test-download-model COMMAND ${CMAKE_COMMAND}
     -DDEST=${MODEL_DEST}
     -DNAME=${MODEL_NAME}
     -DHASH=${MODEL_HASH}
-    -P ${CMAKE_SOURCE_DIR}/cmake/download-models.cmake
+    -P ${PROJECT_SOURCE_DIR}/cmake/download-models.cmake
 )
 set_tests_properties(test-download-model PROPERTIES FIXTURES_SETUP test-download-model)
 
@@ -586,17 +588,11 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
   llama_build_and_test(test-opt.cpp)
 endif()
-llama_build_and_test(test-backend-ops.cpp)
 llama_build_and_test(test-kv-tail-copy-transaction.cpp)
 target_include_directories(test-kv-tail-copy-transaction PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
-# the tensor API kernels come from a separate metallib - check they produce correct results
-# ref: https://github.com/ggml-org/llama.cpp/issues/27473
-if (GGML_METAL AND NOT GGML_METAL_EMBED_LIBRARY)
-    llama_test(test-backend-ops NAME test-backend-ops-metallib-tensor
-               ARGS test -b MTL0 -o MUL_MAT -p type_a=q6_K)
-    set_tests_properties(test-backend-ops-metallib-tensor PROPERTIES ENVIRONMENT GGML_METAL_TENSOR_ENABLE=1)
-endif()
+# TODO: make this test (and others) not link `libllama` as it is not needed [TAG_TESTS_LLAMA_LINK]
+llama_build(test-backend-ops.cpp)
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
@@ -640,7 +636,7 @@ if (APPLE)
     llama_build(test-rset-release.cpp)
 endif()
 
-if (NOT GGML_BACKEND_DL)
+if (NOT GGML_BACKEND_DL AND GGML_CPU)
     # these tests use the backends directly and cannot be built with dynamic loading
     llama_build_and_test(test-barrier.cpp)
     llama_build_and_test(test-quantize-fns.cpp)

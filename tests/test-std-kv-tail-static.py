@@ -309,8 +309,8 @@ def main() -> None:
         raise AssertionError("server exposes asynchronous target KV updates")
 
     context_source = (ROOT / "src/llama-context.cpp").read_text(encoding="utf-8")
-    context_decode = context_source.split("llama_context::decode(const llama_batch & batch_inp)", 1)[1].split(
-        "llama_context::encode", 1
+    context_decode = context_source.split("llama_context::decode(const llama_batch_ext & batch_inp)", 1)[1].split(
+        "llama_context::build_graph", 1
     )[0]
     if "cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP" not in context_decode or "synchronize();" not in context_decode:
         raise AssertionError("MTP decode exposes asynchronous draft KV updates")
@@ -575,7 +575,8 @@ def main() -> None:
             raise AssertionError(
                 f"Vulkan KVarN materialization live descriptor dispatch lacks {required}"
             )
-    if '"src10", "src11"' not in vulkan:
+    vulkan_debug = (ROOT / "ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp").read_text(encoding="utf-8")
+    if '"src10", "src11"' not in vulkan_debug:
         raise AssertionError("Vulkan graph debugging does not cover the retained 12-source tensor contract")
     if graph.count("if (tail_route == LLAMA_KV_TAIL_ROUTE_NATIVE)") < 2 or graph.count(
             "ggml_concat(ctx0, k_tail, k_tail_current, 2)") < 2:

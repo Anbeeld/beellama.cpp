@@ -3322,6 +3322,12 @@ static void test_native_flash_attention_portable_backend(
     }
 
     for (int head_dim : { 64, 128, 256, 512 }) {
+        // The native graph includes a head-wide WHT. Vulkan does not advertise
+        // D64 WHT; its KVarN D64 body must use the normal materialized fallback.
+        if (backend != reference_backend && head_dim == 64 &&
+                !backend_advertises_kvarn_head_dim(backend, GGML_BACKEND_KVARN_HEAD_DIM_64)) {
+            continue;
+        }
         for (int n_q : { 1, 4, 32 }) {
             if (trace) {
                 std::fprintf(stderr, "native trace: %s D%d nq=%d\n", backend_label, head_dim, n_q);
@@ -3413,23 +3419,25 @@ static void test_native_flash_attention_portable_backend(
         require_close_f32_rmse(actual_d128_gqa2, expected_d128_gqa2, 1e-2f,
                 "D128 GQA2 split-128 KVarN decode differs from materialized reference");
 
-        const std::vector<float> expected = test_native_flash_attention_output(
-                reference_backend, false, false, 64, 4, 3, 22,
-                32, 8, 256, 5, false, nullptr, false, 0, true);
-        const std::vector<float> actual = test_native_flash_attention_output(
-                backend, true, true, 64, 4, 3, 22,
-                32, 8, 256, 5, false, nullptr, false, 0, true);
-        require_close_f32_rmse(actual, expected, 1e-2f,
-                "D64 mixed-domain KVarN prefill differs from materialized reference");
+        if (backend_advertises_kvarn_head_dim(backend, GGML_BACKEND_KVARN_HEAD_DIM_64)) {
+            const std::vector<float> expected = test_native_flash_attention_output(
+                    reference_backend, false, false, 64, 4, 3, 22,
+                    32, 8, 256, 5, false, nullptr, false, 0, true);
+            const std::vector<float> actual = test_native_flash_attention_output(
+                    backend, true, true, 64, 4, 3, 22,
+                    32, 8, 256, 5, false, nullptr, false, 0, true);
+            require_close_f32_rmse(actual, expected, 1e-2f,
+                    "D64 mixed-domain KVarN prefill differs from materialized reference");
 
-        const std::vector<float> expected_tail = test_native_flash_attention_output(
-                reference_backend, false, false, 64, 5, 4, 4,
-                32, 8, 512, 5, false, nullptr, false, 128, true);
-        const std::vector<float> actual_tail = test_native_flash_attention_output(
-                backend, true, true, 64, 5, 4, 4,
-                32, 8, 512, 5, false, nullptr, false, 128, true);
-        require_close_f32_rmse(actual_tail, expected_tail, 1e-2f,
-                "D64 mixed-domain KVarN exact-tail attention differs from materialized reference");
+            const std::vector<float> expected_tail = test_native_flash_attention_output(
+                    reference_backend, false, false, 64, 5, 4, 4,
+                    32, 8, 512, 5, false, nullptr, false, 128, true);
+            const std::vector<float> actual_tail = test_native_flash_attention_output(
+                    backend, true, true, 64, 5, 4, 4,
+                    32, 8, 512, 5, false, nullptr, false, 128, true);
+            require_close_f32_rmse(actual_tail, expected_tail, 1e-2f,
+                    "D64 mixed-domain KVarN exact-tail attention differs from materialized reference");
+        }
     }
 
     if (std::strcmp(backend_label, "GPU") == 0 &&
@@ -3470,6 +3478,10 @@ static void test_native_flash_attention_portable_backend(
     }
 
     for (int head_dim : { 64, 128, 256, 512 }) {
+        if (backend != reference_backend && head_dim == 64 &&
+                !backend_advertises_kvarn_head_dim(backend, GGML_BACKEND_KVARN_HEAD_DIM_64)) {
+            continue;
+        }
         for (int n_q : { 1, 2, 8, 16 }) {
             for (ggml_type exact_type : { GGML_TYPE_F16, GGML_TYPE_BF16 }) {
                 const int current_tokens = std::max(n_q, 4);
@@ -3505,6 +3517,9 @@ static void test_native_flash_attention_cpu() {
 static void test_dflash_non_causal_attention_parity() {
     ggml_backend_t cpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_CPU, true);
     ggml_backend_t gpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
+    const ggml_backend_dev_t gpu_device = gpu_backend ? ggml_backend_get_device(gpu_backend) : nullptr;
+    const char * backend_name = gpu_device ? ggml_backend_dev_name(gpu_device) : nullptr;
+    const bool cuda_native_non_causal = backend_name != nullptr && std::strncmp(backend_name, "CUDA", 4) == 0;
 
     const auto check = [&](ggml_backend_t backend, int head_dim, int bits_k, int bits_v,
                            int n_q, int n_kv, bool exact_tail, bool swa = false,
@@ -3531,7 +3546,9 @@ static void test_dflash_non_causal_attention_parity() {
                 true, 0, 0, holes, visible_from);
         require_close_f32_rmse(actual, expected, 1e-3f,
                 "DFlash non-causal materialized KVarN fallback differs from reference");
-        if (backend != gpu_backend) {
+        if (backend != gpu_backend || !cuda_native_non_causal) {
+            // Vulkan/non-CUDA GPU paths verify the materialized oracle above;
+            // this direct non-causal matrix is qualified only for CUDA.
             return;
         }
         const auto [reset_routes, get_routes] = get_kvarn_route_stats_fns(backend);
@@ -3615,6 +3632,13 @@ static void test_odd_offset_record_decode_gpu() {
         return;
     }
 
+    const ggml_backend_dev_t gpu_device = ggml_backend_get_device(gpu_backend);
+    const char * backend_name = gpu_device ? ggml_backend_dev_name(gpu_device) : nullptr;
+    if (backend_name == nullptr || std::strncmp(backend_name, "CUDA", 4) != 0) {
+        // This regression asserts CUDA's specialized decode-split counter.
+        ggml_backend_free(gpu_backend);
+        return;
+    }
     const auto route_stats_fns = get_kvarn_route_stats_fns(gpu_backend);
     require(route_stats_fns.first != nullptr && route_stats_fns.second != nullptr,
             "odd-offset KVarN decode requires CUDA route telemetry");
@@ -4657,7 +4681,12 @@ static void test_native_flash_attention_tail_materialize_fallback() {
         return;
     }
     const auto [route_stats_reset, route_stats_get] = get_kvarn_route_stats_fns(gpu_backend);
+    const ggml_backend_dev_t gpu_device = ggml_backend_get_device(gpu_backend);
+    const char * backend_name = gpu_device ? ggml_backend_dev_name(gpu_device) : nullptr;
+    // This test forces the CUDA compact-tail materialization route; Vulkan has
+    // neither that test knob nor the CUDA route ABI (its native paths are tested above).
     if (route_stats_reset == nullptr || route_stats_get == nullptr ||
+            backend_name == nullptr || std::strncmp(backend_name, "CUDA", 4) != 0 ||
             !backend_supports_kvarn_flash_attention_shape(gpu_backend, 512)) {
         ggml_backend_free(gpu_backend);
         return;

@@ -118,29 +118,8 @@ if (CUDAToolkit_FOUND)
     file(GLOB   SRCS "template-instances/mmf*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
 
-    macro(ggml_add_fattn_vec_pair OUT_VAR PREFIX K_TYPE V_TYPE)
-        set(_FILE "${PREFIX}/fattn-vec-instance-${K_TYPE}-${V_TYPE}.cu")
-        if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_FILE}")
-            message(FATAL_ERROR "Missing FA vec template instance: ${_FILE}")
-        endif()
-        list(APPEND ${OUT_VAR} "${_FILE}")
-    endmacro()
-
-    set(FA_VEC_PREFIX "template-instances")
-
-    if (GGML_CUDA_FA_ALL_QUANTS)
-        file(GLOB   SRCS "${FA_VEC_PREFIX}/fattn-vec-instance-*.cu")
-        list(APPEND GGML_SOURCES_CUDA ${SRCS})
-        add_compile_definitions(GGML_CUDA_FA_ALL_QUANTS)
-    else()
-        ggml_cuda_get_fattn_vec_default_pairs(GGML_CUDA_FA_DEFAULT_KV_PAIRS)
-        foreach(PAIR ${GGML_CUDA_FA_DEFAULT_KV_PAIRS})
-            string(REPLACE ":" ";" PARTS "${PAIR}")
-            list(GET PARTS 0 K_TYPE)
-            list(GET PARTS 1 V_TYPE)
-            ggml_add_fattn_vec_pair(GGML_SOURCES_CUDA "${FA_VEC_PREFIX}" "${K_TYPE}" "${V_TYPE}")
-        endforeach()
-    endif()
+    ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR} SRCS)
+    list(APPEND GGML_SOURCES_CUDA ${SRCS})
 
     ggml_add_backend_library(ggml-cuda
                              ${GGML_HEADERS_CUDA}

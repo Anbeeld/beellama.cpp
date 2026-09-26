@@ -282,6 +282,13 @@ Consider setting `CUDA_SCALE_LAUNCH_QUEUES=4x`, which increases the CUDA command
 Override default, speed-optimized compute types for cuBLAS matrix multiplications.
 Legal values: `auto`, `f16`, `fp16`, `bf16`, `f32`, `fp32`.
 
+#### GGML_CUDA_MMQ_PREC
+
+Override the activation precision that the model requests for NVFP4 and MXFP4 matrix multiplications.
+Currently supported values: `auto`, `q8`, `q4`.
+
+NVFP4 and MXFP4 layers marked as W4A16 request 8-bit activations, so on Blackwell those layers run through the W4A8 path instead of the native W4A4 path. Set `q4` to keep the native W4A4 path for faster prompt processing at the cost of accuracy, or `q8` to use the W4A8 path for every layer, `auto` uses per-tensor prec metadata (this is the same behavior as when the environment variable is not set).
+
 ### Unified Memory
 
 The environment variable `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` can be used to enable unified memory in Linux. This allows swapping to system RAM instead of crashing when the GPU VRAM is exhausted. In Windows this setting is available in the NVIDIA control panel as `System Memory Fallback`.
@@ -301,6 +308,7 @@ The following compilation options are also available to tweak performance:
 | GGML_CUDA_FORCE_MMQ           | Boolean                | false   | Force the use of custom matrix multiplication kernels for quantized models instead of FP16 cuBLAS even if there is no int8 tensor core implementation available (affects V100, CDNA and RDNA3+). MMQ kernels are enabled by default on GPUs with int8 tensor core support. With MMQ force enabled, speed for large batch sizes will be worse but VRAM consumption will be lower. |
 | GGML_CUDA_FORCE_CUBLAS        | Boolean                | false   | Force the use of FP16 cuBLAS instead of custom matrix multiplication kernels for quantized models. There may be issues with numerical overflows (except for V100, CDNA and RDNA4 which use FP32 compute type by default) and memory use will be higher. Prompt processing may become faster on recent datacenter GPUs (the custom kernels were tuned primarily for RTX 3000/4000).   |
 | GGML_CUDA_FA_ALL_QUANTS       | Boolean                | false   | Compile all 169 ordered CUDA FlashAttention vector pairs for the 13 retained standard cache types, plus all 36 KVarN fast-decode pairs when `GGML_CUDA_KVARN` is enabled. Use this for broad asymmetric-cache experiments. |
+| GGML_CUDA_FA_QUANTS            | `all` or `type_K-type_V` list | empty (Bee balanced matrix) | Compile selected CUDA FlashAttention vector pairs; `all` selects 169 ordered pairs. Empty uses the 50-pair balanced default; `GGML_CUDA_FA_ALL_QUANTS=ON` selects the full matrix. |
 | GGML_CUDA_KVARN               | Boolean                | true    | Compile shared CUDA/HIP KVarN kernels and CUDA native-attention template instances. Disable to omit them from CUDA or HIP builds. |
 
 With no quant-matrix flag, CUDA FlashAttention compiles 50 vector pairs over `f16`, `bf16`, `q8_0`, `q6_1`, `q6_0`, `q5_1`, `q5_0`, `q4_1`, `q4_0`, `q3_1`, `q3_0`, `q2_1`, and the fork's internal q2 fallback type. The 48 quantized pairs are derived from the 15 balanced KVarN bit-pair rules; same-bit pairs retain `_1:_1`, `_1:_0`, and `_0:_0` variants. Homogeneous `f16:f16` and `bf16:bf16` pairs cover KVarN and standard precision tails. Mixed float/quant and mixed F16/BF16 pairs use the normal CUDA FlashAttention fallback instead of a compiled vector case. When enabled, KVarN keeps 15 balanced fast-decode pairs by default and all 36 with `GGML_CUDA_FA_ALL_QUANTS=ON`; every valid KVarN bit pair remains supported through descriptor-native MMA when it is outside the fast matrix. `GGML_CUDA_FA_HALF_QUANTS` has been removed.
@@ -325,11 +333,11 @@ cmake --build build --config Release
 By default, all supported compute capabilities are enabled. To customize this behavior, you can specify the `MUSA_ARCHITECTURES` option in the CMake command:
 
 ```bash
-cmake -B build -DGGML_MUSA=ON -DMUSA_ARCHITECTURES="21"
+cmake -B build -DGGML_MUSA=ON -DMUSA_ARCHITECTURES="31"
 cmake --build build --config Release
 ```
 
-This configuration enables only compute capability `2.1` (MTT S80) during compilation, which can help reduce compilation time.
+This configuration enables only compute capability `3.1` (MTT S5000) during compilation, which can help reduce compilation time.
 
 #### Compilation options
 
@@ -831,7 +839,7 @@ To read documentation for how to build on Android, [click here](./android.md)
 
 ## WebGPU
 
-The WebGPU backend relies on [Dawn](https://dawn.googlesource.com/dawn). Follow the instructions [here](https://dawn.googlesource.com/dawn/+/refs/heads/main/docs/quickstart-cmake.md) to install Dawn locally so that llama.cpp can find it using CMake. The current implementation is up-to-date with Dawn commit `18eb229`.
+The WebGPU backend relies on [Dawn](https://dawn.googlesource.com/dawn). Follow the instructions [here](https://dawn.googlesource.com/dawn/+/refs/heads/main/docs/quickstart-cmake.md) to install Dawn locally so that llama.cpp can find it using CMake. The current implementation is up-to-date with Dawn commit `94c3c9c`.
 
 In the llama.cpp directory, build with CMake:
 

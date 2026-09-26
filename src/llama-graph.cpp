@@ -1922,6 +1922,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    prec_policy      (params.prec_policy),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1949,6 +1950,10 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+
+    if (prec_policy) {
+        prec_policy->apply(res);
+    }
 
     if (w_s) {
         res = ggml_mul(ctx0, res, w_s);
@@ -1981,6 +1986,10 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * ids,
           ggml_tensor * w_s) const {
     ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+
+    if (prec_policy) {
+        prec_policy->apply(res);
+    }
 
     if (w_s) {
         const int64_t n_expert = w_s->ne[0];
@@ -2359,7 +2368,7 @@ ggml_tensor * llm_graph_context::build_ffn(
         cur = build_lora_mm(down, cur);
         if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2) {
             // GLM4, GLM4_MOE, and JAIS2 seem to have numerical issues with half-precision accumulators
-            ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
+            ggml_prec_set_acc(cur, GGML_PREC_F32);
         }
     }
 
@@ -2457,7 +2466,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (probs_in == nullptr) {
         logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
         if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
-            ggml_mul_mat_set_prec(logits, GGML_PREC_F32);
+            ggml_prec_set_acc(logits, GGML_PREC_F32);
         }
         cb(logits, "ffn_moe_logits", il);
     } else {
@@ -2658,7 +2667,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     const float limit = hparams.swiglu_clamp_exp[il];
                     constexpr float eps = 1e-6f;
                     if (limit > eps) {
-                        if (arch == LLM_ARCH_DEEPSEEK4 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0) || arch == LLM_ARCH_HY_V4) {
+                        if (arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_DEEPSEEK4 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0) || arch == LLM_ARCH_HY_V4) {
                             cur = ggml_swiglu_clamp(ctx0, cur, up, limit);
                         } else {
                             up = ggml_clamp(ctx0, up, -limit, limit);
@@ -2735,6 +2744,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+    if (arch == LLM_ARCH_MISTRAL4) {
+        // src1 can exceed F16 range
+        ggml_prec_set_src(experts, GGML_PREC_F32, 1);
+    }
     cb(experts, "ffn_moe_down", il);
 
     if (down_exps_s) {
@@ -2884,6 +2897,7 @@ ggml_tensor * llm_graph_context::build_inp_pos() const {
 
     cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t)n_tokens*hparams.n_pos_per_embd());
     ggml_set_input(cur);
+    cb(cur, "inp_pos", -1);
 
     res->add_input(std::move(inp));
 
@@ -2898,7 +2912,7 @@ ggml_tensor * llm_graph_context::build_inp_attn_scale() const {
     // this need to be 1x1xN for broadcasting
     cur = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, 1, n_tokens);
     ggml_set_input(cur);
-    ggml_set_name(cur, "attn_scale");
+    cb(cur, "inp_attn_scale", -1);
 
     res->add_input(std::move(inp));
 
@@ -2920,6 +2934,7 @@ ggml_tensor * llm_graph_context::build_inp_out_ids() const {
 
     cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_outputs);
     ggml_set_input(cur);
+    ggml_set_name(cur, "out_ids");
 
     res->add_input(std::move(inp));
 
@@ -2933,6 +2948,7 @@ ggml_tensor * llm_graph_context::build_inp_mean() const {
 
     cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_tokens, ubatch.n_seqs_unq);
     ggml_set_input(cur);
+    ggml_set_name(cur, "mean");
 
     res->add_input(std::move(inp));
 
@@ -2946,6 +2962,7 @@ ggml_tensor * llm_graph_context::build_inp_cls() const {
 
     cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_seqs_unq);
     ggml_set_input(cur);
+    ggml_set_name(cur, "cls");
 
     res->add_input(std::move(inp));
 
@@ -2970,6 +2987,7 @@ ggml_tensor * llm_graph_context::build_inp_cross_embd() const {
 
     cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_enc);
     ggml_set_input(cur);
+    ggml_set_name(cur, "cross_embd");
 
     res->add_input(std::move(inp));
 
@@ -2983,6 +3001,7 @@ ggml_tensor * llm_graph_context::build_inp_pos_bucket_enc() const {
 
     cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_tokens, n_tokens);
     ggml_set_input(cur);
+    ggml_set_name(cur, "pos_bucket_enc");
 
     res->add_input(std::move(inp));
 
@@ -3000,6 +3019,7 @@ ggml_tensor * llm_graph_context::build_inp_pos_bucket_dec() const {
 
     cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_tokens);
     ggml_set_input(cur);
+    ggml_set_name(cur, "pos_bucket_dec");
 
     res->add_input(std::move(inp));
 
@@ -3152,7 +3172,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
-        ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
+        ggml_prec_set_acc(cur, GGML_PREC_F32);
 
         if (final_attn_op) {
             *final_attn_op = cur;
@@ -3199,6 +3219,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         // note: this op tends to require high floating point range
         //       while for some models F16 is enough, for others it is not, so we default to F32 here
+        ggml_prec_set_acc(kq, GGML_PREC_F32);
+
         if (arch == LLM_ARCH_GROK) {
             // need to do the following:
             // multiply by attn_output_multiplier
@@ -3350,6 +3372,7 @@ llm_graph_input_attn_no_cache * llm_graph_context::build_attn_inp_no_cache() con
     // note: there is no KV cache, so the number of KV values is equal to the number of tokens in the batch
     inp->self_kq_mask = ggml_new_tensor_4d(ctx0, type_mask, n_tokens, n_tokens, 1, 1);
     ggml_set_input(inp->self_kq_mask);
+    cb(inp->self_kq_mask, "self_kq_mask", -1);
 
     inp->self_kq_mask_cnv = inp->self_kq_mask;
 
@@ -3910,7 +3933,7 @@ ggml_tensor * llm_graph_context::build_attn(
         if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2) {
             // GLM4, GLM4_MOE, and JAIS2 seem to have numerical issues with half-precision accumulators
             cur = build_lora_mm(wo, cur);
-            ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
+            ggml_prec_set_acc(cur, GGML_PREC_F32);
             if (wo_s) {
                 cur = ggml_mul(ctx0, cur, wo_s);
             }
@@ -3997,7 +4020,7 @@ ggml_tensor * llm_graph_context::build_attn(
         if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE) {
             // GLM4 and GLM4_MOE seem to have numerical issues with half-precision accumulators
             cur = build_lora_mm(wo, cur);
-            ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
+            ggml_prec_set_acc(cur, GGML_PREC_F32);
             if (wo_s) {
                 cur = ggml_mul(ctx0, cur, wo_s);
             }
@@ -4769,6 +4792,7 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     inp->s_copy = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
     ggml_set_input(inp->s_copy);
+    ggml_set_name(inp->s_copy, "rs_s_copy");
 
     const int64_t n_history = std::max<int64_t>(0,
             (int64_t) mctx_cur->get_n_rs_seq() + 1 - ubatch.n_seq_tokens);
