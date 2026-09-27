@@ -3958,6 +3958,7 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size, llama_sta
         return nread;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
+        io.discard();
         return 0;
     }
 }

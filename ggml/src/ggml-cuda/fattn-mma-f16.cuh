@@ -2033,8 +2033,8 @@ static __global__ void flash_attn_ext_f16(
 #endif // defined(AMD_WMMA_AVAILABLE)
 
 #if defined(AMD_MFMA_AVAILABLE)
-    // Mirrored by ggml_cuda_fattn_kvarn_amd_mma_eligibility on the host.
-    if (ncols1*ncols2 < 16 || DKQ > 256) {
+    // KVarN's host route policy is stricter on head dimensions; retain upstream's larger-tile MFMA support.
+    if (ncols1*ncols2 < 16 || (DKQ > 256 && ncols1*ncols2 < 64)) {
         NO_DEVICE_CODE;
         return;
     }
