@@ -1003,6 +1003,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                     ggml_backend_meta_get_split_state(tensor->src[i], /*assume_sync =*/ true) :
                     ggml_backend_meta_get_split_state(
                             buf_ctx, stc, tensor->src[i], /*assume_sync =*/ true);
+            // A zero-row logits tensor has no split state. The sampler may pad
+            // it with one dummy row; that row consists entirely of padding and
+            // must be identical on every device.
+            if (tensor->op == GGML_OP_PAD && i == 0 && ggml_nelements(tensor->src[i]) == 0) {
+                src_ss[i] = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+            }
             GGML_ASSERT(src_ss[i].axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
         }
 

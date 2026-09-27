@@ -592,7 +592,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
         // output
         if (std::regex_match(tensor_name, pattern_output_weight)) {
-            if (is_dsv4) {
+            // A qwen4exp MTP sidecar can borrow this projection for its sampler.
+            // Its TOP_K requires full vocabulary logits on each device.
+            if (is_dsv4 || ud->model->arch == LLM_ARCH_QWEN4EXP) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             }
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);

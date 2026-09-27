@@ -551,8 +551,8 @@ static bool mtp_sync_test_decode(llama_model * model, uint32_t n_ubatch) {
         throw std::runtime_error("failed to decode MTP batch");
     }
 
-    // A synchronized multi-ubatch decode accounts its queued prompt tokens
-    // before returning. The intentionally asynchronous single-ubatch path does not.
+    // MTP must finish and account for all queued tokens before returning,
+    // regardless of whether the batch required one or multiple ubatches.
     return llama_perf_context(ctx.get()).n_p_eval >= n_tokens;
 }
 
@@ -572,8 +572,8 @@ static int test_mtp_ubatch_sync(const size_t seed) {
         fprintf(stderr, "MTP ubatches were not synchronized\n");
         return 1;
     }
-    if (mtp_sync_test_decode(model.get(), 4)) {
-        fprintf(stderr, "single MTP ubatch was synchronized\n");
+    if (!mtp_sync_test_decode(model.get(), 4)) {
+        fprintf(stderr, "single MTP ubatch was not synchronized\n");
         return 1;
     }
 
@@ -1162,7 +1162,8 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                         model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER, encode);
                         logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);
                     }
-                    if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llm_arch_supports_sm_tensor(arch)) {
+                    // Keep qwen4exp tensor mode exercised even if its support guard regresses.
+                    if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llm_arch_supports_sm_tensor(arch) || arch == LLM_ARCH_QWEN4EXP) {
                         test_executed = true;
                         model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, dc.devs, dc.split_mode, encode);
                         logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode);
@@ -1310,7 +1311,7 @@ int main(int argc, char ** argv) {
                 usage(argv);
                 return 1;
             }
-} else if (strcmp(argv[i], "--test-mtp-ubatch-sync") == 0) {
+        } else if (strcmp(argv[i], "--test-mtp-ubatch-sync") == 0) {
             test_mtp_sync = true;
         } else if (strcmp(argv[i], "--test-mtp-request-reset") == 0) {
             test_mtp_reset = true;
@@ -1329,13 +1330,19 @@ int main(int argc, char ** argv) {
     LOG_INF("%s: using seed %zu, stdev %f\n", __func__, seed, stdev);
 
     try {
+        if (test_mtp_sync) {
+            return test_mtp_ubatch_sync(seed);
+        }
+        if (test_mtp_reset) {
+            return test_mtp_request_reset(seed);
+        }
+        if (test_mtp_kvarn) {
+            return test_mtp_kvarn_routing(seed);
+        }
         if (!out.empty()) {
             return save_models(arch_filter, seed, stdev, verbosity, out);
         }
-    const char * target_backend = nullptr;
-    bool test_mtp_sync = false;
-    bool test_mtp_reset = false;
-    bool test_mtp_kvarn = false;
+        return test_backends(arch_filter, seed, stdev, verbosity, target_backend);
     } catch (const std::exception & err) {
         fprintf(stderr, "encountered runtime error: %s\n", err.what());
         return -1;
