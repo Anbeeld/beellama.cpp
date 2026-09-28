@@ -1630,6 +1630,18 @@ std::string server_task_result_metrics::to_metrics() {
 
     const std::vector<metric_item> gauges = {
         {
+            "prompt_cache_protected_entries",
+            "Currently protected RAM prefix snapshots",
+            (double) metrics.prompt_cache_protected_entries
+        }, {
+            "prompt_cache_protected_bytes",
+            "Conservatively reserved protected snapshot payload bytes",
+            (double) metrics.prompt_cache_protected_bytes
+        }, {
+            "prompt_cache_protection_candidates",
+            "Tracked automatic prefix protection candidates",
+            (double) metrics.prompt_cache_protection_candidates
+        }, {
             "prompt_tokens_seconds",
             "Average prompt throughput in tokens/s",
             metrics.prompt_bucket.n_per_second()
@@ -1808,13 +1820,102 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-server_prompt_cache_state * server_prompt_cache::admit(server_prompt_cache_state && candidate) {
+size_t server_prompt_cache::protected_count() const {
+    return std::count_if(states.begin(), states.end(), [](const auto & s) { return s.protected_entry; });
+}
+
+size_t server_prompt_cache::protected_size() const {
+    // Conservative reservation: a protected snapshot must fit independently
+    // of ordinary entries sharing its checkpoint storage.
+    size_t bytes = 0;
+    for (const auto & state : states) {
+        if (state.protected_entry) {
+            bytes += state.accounted_size();
+        }
+    }
+    return bytes;
+}
+
+bool server_prompt_cache::observe_reuse(
+        const server_tokens & requested, size_t reused, bool branched, int64_t now_us) {
+    if (!protection_enabled() || requested.has_mtmd || reused == 0 || reused > requested.size()) {
+        return false;
+    }
+
+    bool covered = false;
+    for (auto & state : states) {
+        const size_t n = state.prompt.tokens.size();
+        if (state.protected_entry && n <= reused &&
+                size_t(state.prompt.tokens.get_common_prefix(requested)) >= n) {
+            state.last_used_us = now_us;
+            covered = true;
+        }
+    }
+    if (covered || !branched || reused < protection.min_tokens) {
+        return false;
+    }
+
+    constexpr size_t max_candidate_tokens = 1024 * 1024;
+    if (reused > max_candidate_tokens) {
+        return false;
+    }
+    auto found = protection_candidates.end();
+    size_t candidate_tokens = 0;
+    for (auto it = protection_candidates.begin(); it != protection_candidates.end(); ++it) {
+        candidate_tokens += it->prefix.size();
+        if (it->prefix.size() == reused &&
+                size_t(it->prefix.get_common_prefix(requested)) == reused) {
+            found = it;
+        }
+    }
+    if (found == protection_candidates.end()) {
+        // Allocate before discarding any useful learning metadata.
+        const auto & ids = requested.get_tokens();
+        protection_candidate candidate;
+        candidate.prefix = server_tokens(llama_tokens(ids.begin(), ids.begin() + reused), false);
+        while (!protection_candidates.empty() &&
+                (protection_candidates.size() >= 64 || candidate_tokens + reused > max_candidate_tokens)) {
+            candidate_tokens -= protection_candidates.front().prefix.size();
+            protection_candidates.pop_front();
+        }
+        protection_candidates.push_back(std::move(candidate));
+        found = std::prev(protection_candidates.end());
+    }
+    if (protection.replace_after_us > 0 && now_us - found->last_used_us > protection.replace_after_us) {
+        found->hits = 0;
+    }
+    found->last_used_us = now_us;
+    if (found->hits < protection.min_hits) {
+        ++found->hits;
+    }
+    const bool ready = found->hits >= protection.min_hits;
+    SRV_DBG("cache protection candidate: tokens = %zu, hits = %u/%u\n",
+            reused, found->hits, protection.min_hits);
+    protection_candidates.splice(protection_candidates.end(), protection_candidates, found);
+    return ready;
+}
+
+server_prompt_cache_state * server_prompt_cache::admit(
+        server_prompt_cache_state && candidate, bool protect, int64_t now_us) {
     ++admission_attempts;
+
+    if (protect) {
+        // Only snapshots of an observed, qualified boundary can be protected.
+        const auto found = std::find_if(protection_candidates.begin(), protection_candidates.end(),
+                [&](const auto & c) {
+                    return c.hits >= protection.min_hits && c.prefix.size() == candidate.prompt.tokens.size() &&
+                            size_t(c.prefix.get_common_prefix(candidate.prompt.tokens)) == c.prefix.size();
+                });
+        if (!protection_enabled() || found == protection_candidates.end()) {
+            ++admission_failures;
+            return nullptr;
+        }
+    }
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(candidate.prompt.tokens);
 
-        if (cur_lcp_len == (int) candidate.prompt.tokens.size()) {
+        if (cur_lcp_len == (int) candidate.prompt.tokens.size() && !protect) {
             SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
             ++admission_failures;
             return nullptr;
@@ -1854,6 +1955,60 @@ server_prompt_cache_state * server_prompt_cache::admit(server_prompt_cache_state
         return nullptr;
     }
 
+    // Plan demotions without mutating the cache. Failed admission must retain
+    // both existing protection and ordinary entries.
+    std::vector<server_prompt_cache_state *> demote;
+    size_t reserved = protected_size();
+    size_t count = protected_count();
+    if (protect) {
+        const size_t budget = limit_size > 0 ? std::min(limit_size, protection.max_bytes) : protection.max_bytes;
+        if (standalone_size > budget) {
+            ++admission_failures;
+            return nullptr;
+        }
+        std::vector<server_prompt_cache_state *> idle;
+        for (auto & state : states) {
+            if (state.protected_entry && now_us - state.last_used_us >= protection.replace_after_us) {
+                idle.push_back(&state);
+            }
+        }
+        std::sort(idle.begin(), idle.end(), [](const auto * a, const auto * b) {
+            return a->last_used_us < b->last_used_us;
+        });
+        for (auto * state : idle) {
+            if (count < protection.max_entries && reserved <= budget - standalone_size) {
+                break;
+            }
+            reserved -= state->accounted_size();
+            --count;
+            demote.push_back(state);
+        }
+        if (count >= protection.max_entries || reserved > budget - standalone_size) {
+            ++admission_failures;
+            return nullptr;
+        }
+    }
+    if (limit_size > 0 && reserved > limit_size - standalone_size) {
+        ++admission_failures;
+        return nullptr;
+    }
+    // Token caps are secondary to the byte budget, but never silently exceed
+    // them with non-evictable entries. Use the configured cap conservatively.
+    if (limit_tokens > 0) {
+        size_t reserved_tokens = protect ? candidate.prompt.tokens.size() : 0;
+        for (auto & state : states) {
+            if (state.protected_entry && std::find(demote.begin(), demote.end(), &state) == demote.end()) {
+                reserved_tokens += state.prompt.tokens.size();
+            }
+        }
+        if (reserved_tokens > limit_tokens) {
+            ++admission_failures;
+            return nullptr;
+        }
+    }
+    candidate.protected_entry = protect;
+    candidate.last_used_us = now_us;
+
     // Publish the already-materialized candidate node before touching existing
     // entries.  list node allocation is the last fallible admission step; if it
     // fails, the cache is unchanged.
@@ -1866,6 +2021,15 @@ server_prompt_cache_state * server_prompt_cache::admit(server_prompt_cache_state
     }
     auto admitted = std::prev(states.end());
 
+    for (auto * state : demote) {
+        state->protected_entry = false;
+        SRV_INF("cache protection released: tokens = %zu\n", state->prompt.tokens.size());
+    }
+    if (protect) {
+        SRV_INF("cache protection admitted: tokens = %zu, size = %.3f MiB, protected = %zu\n",
+                admitted->prompt.tokens.size(), standalone_size / (1024.0 * 1024.0), protected_count());
+    }
+
     // remove any cached prompts that are fully contained in the current prompt
     for (auto it = states.begin(); it != states.end();) {
         if (it == admitted) {
@@ -1874,7 +2038,7 @@ server_prompt_cache_state * server_prompt_cache::admit(server_prompt_cache_state
         }
         const int len = it->prompt.tokens.get_common_prefix(admitted->prompt.tokens);
 
-        if (len == (int) it->prompt.tokens.size()) {
+        if (!it->protected_entry && len == (int) it->prompt.tokens.size()) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
             it = states.erase(it);
@@ -1887,10 +2051,13 @@ server_prompt_cache_state * server_prompt_cache::admit(server_prompt_cache_state
         // The candidate is already present and fully materialized. Evict only
         // older entries until unique payload accounting is within budget.
         while (!states.empty() && accounted_size() > limit_size) {
-            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
-                    states.front().accounted_size() / (1024.0 * 1024.0));
-
-            states.pop_front();
+            auto victim = std::find_if(states.begin(), admitted, [](const auto & s) { return !s.protected_entry; });
+            // The preflight reserved enough room for all protected snapshots
+            // plus the candidate, so an older ordinary victim must exist.
+            GGML_ASSERT(victim != admitted);
+            SRV_WRN(" - making room for prompt cache entry, removing oldest ordinary entry (size = %.3f MiB)\n",
+                    victim->accounted_size() / (1024.0 * 1024.0));
+            states.erase(victim);
         }
     }
 
@@ -1900,11 +2067,11 @@ server_prompt_cache_state * server_prompt_cache::admit(server_prompt_cache_state
 
 server_prompt_cache_state * server_prompt_cache::insert(
         const server_prompt & prompt,
-        server_prompt_data && data) {
+        server_prompt_data && data, bool protect, int64_t now_us) {
     server_prompt_cache_state candidate;
     candidate.prompt = prompt.clone();
     candidate.data = std::move(data);
-    return admit(std::move(candidate));
+    return admit(std::move(candidate), protect, now_us);
 }
 
 server_prompt_cache_state * server_prompt_cache::alloc(
@@ -2193,9 +2360,10 @@ bool server_prompt_cache::load(
 void server_prompt_cache::update() {
     if (limit_size > 0) {
         while (!states.empty() && accounted_size() > limit_size) {
-            SRV_WRN(" - cache accounted-payload limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().accounted_size() / (1024.0 * 1024.0));
-
-            states.pop_front();
+            auto victim = std::find_if(states.begin(), states.end(), [](const auto & s) { return !s.protected_entry; });
+            GGML_ASSERT(victim != states.end());
+            SRV_WRN(" - cache accounted-payload limit reached, removing oldest ordinary entry (size = %.3f MiB)\n", victim->accounted_size() / (1024.0 * 1024.0));
+            states.erase(victim);
         }
     }
 
@@ -2207,10 +2375,11 @@ void server_prompt_cache::update() {
 
     if (limit_tokens > 0) {
         while (!states.empty() && n_tokens() > limit_tokens_cur) {
-            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
-                    limit_tokens, limit_tokens_cur, states.front().accounted_size() / (1024.0 * 1024.0));
-
-            states.pop_front();
+            auto victim = std::find_if(states.begin(), states.end(), [](const auto & s) { return !s.protected_entry; });
+            GGML_ASSERT(victim != states.end());
+            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest ordinary entry (size = %.3f MiB)\n",
+                    limit_tokens, limit_tokens_cur, victim->accounted_size() / (1024.0 * 1024.0));
+            states.erase(victim);
         }
     }
 

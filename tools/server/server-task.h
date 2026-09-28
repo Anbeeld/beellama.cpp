@@ -843,6 +843,11 @@ struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
 
+    // Immutable snapshot at a successfully reused boundary, protected from
+    // ordinary eviction. Replacement is controlled by the cache policy.
+    bool protected_entry = false;
+    int64_t last_used_us = 0;
+
     size_t accounted_size() const {
         size_t res = data.size();
 
@@ -855,6 +860,32 @@ struct server_prompt_cache_state {
 };
 
 struct server_prompt_cache {
+    struct protection_policy {
+        size_t max_bytes = 0; // opt-in; part of the existing cache budget
+        size_t min_tokens = 8192;
+        uint32_t min_hits = 3;
+        size_t max_entries = 4;
+        int64_t replace_after_us = 3600LL * 1000000;
+    } protection;
+
+    struct protection_candidate {
+        server_tokens prefix;
+        uint32_t hits = 0;
+        int64_t last_used_us = 0;
+    };
+
+    // Bounded independently of state entries so subsumption does not erase
+    // learning. Text only, at most 64 prefixes / 1M token IDs (4 MiB).
+    std::list<protection_candidate> protection_candidates;
+    bool protection_enabled() const { return protection.max_bytes > 0 && protection.max_entries > 0; }
+    size_t protected_size() const;
+    size_t protected_count() const;
+
+    // Call once after successful suffix rollback, before evaluating new tokens.
+    // Continuations refresh residency; only divergent reuse learns candidates.
+    // true requests a SELF_CONTAINED snapshot of the actual current boundary.
+    bool observe_reuse(const server_tokens & requested, size_t reused, bool branched, int64_t now_us);
+
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
@@ -884,7 +915,8 @@ struct server_prompt_cache {
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
-    server_prompt_cache_state * insert(const server_prompt & prompt, server_prompt_data && data);
+    server_prompt_cache_state * insert(const server_prompt & prompt, server_prompt_data && data,
+            bool protect = false, int64_t now_us = 0);
 
     bool erase(const server_prompt_cache_state * entry);
 
@@ -911,7 +943,8 @@ struct server_prompt_cache {
     void update();
 
 private:
-    server_prompt_cache_state * admit(server_prompt_cache_state && candidate);
+    server_prompt_cache_state * admit(server_prompt_cache_state && candidate,
+            bool protect = false, int64_t now_us = 0);
 };
 
 // used exclusively by router mode
