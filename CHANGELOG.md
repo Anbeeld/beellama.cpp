@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.4.8
+
+- Updated the llama.cpp base through upstream commit `9adc7f420`.
+
 ## v0.4.7
 
 - Added true rectangular KVarN storage and attention for 64-dimensional K/V heads, including 64x128 K records, 128x64 V records, WHT64 transforms, target and owned draft caches, full-context and iSWA routing, and F16/BF16 precision tails. Existing D128, D256, and D512 record layouts and state formats remain compatible, while unsupported backend placements continue to fail closed.

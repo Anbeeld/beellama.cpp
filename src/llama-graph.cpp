@@ -3199,13 +3199,13 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     } else {
         GGML_ASSERT(!tail_read_idxs && "indexed KV tails require native backend attention support");
         ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
-        ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+        ggml_prec_set_acc(kq, GGML_PREC_F32);
         cb(kq, "kq", il);
 
         const int64_t n_kv_body = kq->ne[0];
         if (k_tail) {
             ggml_tensor * kq_tail = ggml_mul_mat(ctx0, k_tail, q_tail_batched);
-            ggml_mul_mat_set_prec(kq_tail, GGML_PREC_F32);
+            ggml_prec_set_acc(kq_tail, GGML_PREC_F32);
             kq_tail = ggml_reshape_4d(ctx0, kq_tail,
                     kq_tail->ne[0], q->ne[2], q->ne[1], q->ne[3]);
             kq_tail = ggml_permute(ctx0, kq_tail, 0, 2, 1, 3);
