@@ -22,7 +22,11 @@ def mark_timed_out() -> int:
 def stop_tree(process: subprocess.Popen[bytes]) -> None:
     if os.name == "nt":
         # cmd / cmake / ninja / compiler children must all exit before cache archiving.
-        subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], check=True)
+        # taskkill can report failure when children exit while it walks the tree.
+        # Wait for the build leader instead of treating that race as a build error.
+        result = subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], check=False)
+        if result.returncode != 0:
+            process.wait(timeout=30)
     else:
         os.killpg(process.pid, signal.SIGTERM)
         try:
