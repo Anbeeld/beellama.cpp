@@ -387,6 +387,9 @@ private:
 
     llm_graph_result * gf_res_prev_active = nullptr;
 
+    // one-time Hadamard transform-coverage check on the first built graph
+    bool hadamard_verified = false;
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 
