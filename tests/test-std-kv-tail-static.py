@@ -299,7 +299,10 @@ def main() -> None:
     decode_failure = server_context.split("if (ret != 0)", 1)[1].split(
         "// retry with half the batch size", 1
     )[0]
-    if "batch_view.seq_id[0]" not in decode_failure or "return true" not in decode_failure:
+    if ("owners.insert(owners.end(), token.seq_ids_extra.begin(), token.seq_ids_extra.end())" not in decode_failure
+            or "for (const llama_seq_id owner : owners)" not in decode_failure
+            or "slot.id != owner" not in decode_failure
+            or "return true" not in decode_failure):
         raise AssertionError("attributable one-token decode failure still cancels unrelated slots")
 
     decode_body = server_context.split("bool decode(int32_t & n_batch", 1)[1].split(

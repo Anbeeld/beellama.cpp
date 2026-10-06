@@ -88,7 +88,7 @@ int llama_batched_bench(int argc, char ** argv) {
 
     const int32_t n_kv_max = llama_n_ctx(ctx);
 
-    llama_batch batch = llama_batch_init(n_kv_max, 0, 1);
+    common_batch batch(ctx);
 
     std::unique_ptr<std::ofstream> logits_out;
     if (!params.batched_bench_logits_out.empty()) {
@@ -96,8 +96,7 @@ int llama_batched_bench(int argc, char ** argv) {
                 params.batched_bench_logits_out, std::ios::binary | std::ios::trunc);
         if (!*logits_out) {
             LOG_ERR("failed to open logits output: %s\n", params.batched_bench_logits_out.c_str());
-            llama_batch_free(batch);
-            llama_free(ctx);
+                        llama_free(ctx);
             llama_model_free(model);
             return 1;
         }
@@ -113,12 +112,12 @@ int llama_batched_bench(int argc, char ** argv) {
     int32_t current_tg = -1;
     int32_t current_pl = -1;
 
-    const auto write_logits = [&](llama_context * decode_ctx, const llama_batch & decoded) {
+    const auto write_logits = [&](llama_context * decode_ctx, const common_batch & decoded, int32_t off, int32_t count) {
         if (!logits_out || current_pl < 0) {
             return;
         }
-        for (int32_t i = 0; i < decoded.n_tokens; ++i) {
-            if (!decoded.logits[i]) {
+        for (int32_t i = 0; i < count; ++i) {
+            if (!decoded.tokens[off + i].output) {
                 continue;
             }
             const float * row = llama_get_logits_ith(decode_ctx, i);
@@ -132,8 +131,8 @@ int llama_batched_bench(int argc, char ** argv) {
                     top = token;
                 }
             }
-            const int32_t seq_id = decoded.n_seq_id[i] > 0 ? decoded.seq_id[i][0] : -1;
-            const int32_t position = decoded.pos[i];
+            const int32_t seq_id = decoded.tokens[off + i].seq_id;
+            const int32_t position = decoded.tokens[off + i].pos[0];
             const int32_t finite_i = finite ? 1 : 0;
             const int32_t vocab_i = n_vocab;
             for (const int32_t value : { current_pp, current_tg, current_pl, seq_id, position, finite_i, top, vocab_i }) {
@@ -149,21 +148,11 @@ int llama_batched_bench(int argc, char ** argv) {
     };
 
     // decode in batches of ctx_params.n_batch tokens
-    auto decode_helper = [&](llama_context * ctx, llama_batch & batch, int32_t n_batch, bool synchronize) {
-        for (int32_t i = 0; i < batch.n_tokens; i += n_batch) {
-            const int32_t n_tokens = std::min(n_batch, batch.n_tokens - i);
+    auto decode_helper = [&](llama_context * ctx, common_batch & batch, int32_t n_batch, bool synchronize) {
+        for (int32_t i = 0; i < batch.size(); i += n_batch) {
+            const int32_t n_tokens = std::min(n_batch, batch.size() - i);
 
-            llama_batch batch_view = {
-                n_tokens,
-                batch.token    + i,
-                nullptr,
-                batch.pos      + i,
-                batch.n_seq_id + i,
-                batch.seq_id   + i,
-                batch.logits   + i,
-            };
-
-            const int ret = llama_decode(ctx, batch_view);
+            const int ret = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get_sub_batch(i, n_tokens));
             if (ret != 0) {
                 LOG_ERR("failed to decode the batch, n_batch = %d, ret = %d\n", n_batch, ret);
                 return false;
@@ -172,7 +161,7 @@ int llama_batched_bench(int argc, char ** argv) {
             if (synchronize || logits_out) {
                 llama_synchronize(ctx);
             }
-            write_logits(ctx, batch_view);
+            write_logits(ctx, batch, i, n_tokens);
         }
 
         return true;
@@ -181,7 +170,7 @@ int llama_batched_bench(int argc, char ** argv) {
     // warm up
     {
         for (int i = 0; i < 16; ++i) {
-            common_batch_add(batch, get_token(0, i), i, { 0 }, false);
+            batch.add(get_token(0, i), i, 0, false);
         }
 
         if (!decode_helper(ctx, batch, ctx_params.n_batch, true)) {
@@ -216,11 +205,11 @@ int llama_batched_bench(int argc, char ** argv) {
                     continue;
                 }
 
-                common_batch_clear(batch);
+                batch.clear();
 
                 const int prompt_sequences = is_pp_shared ? 1 : pl;
                 const auto add_prompt_token = [&](int j, int i) {
-                    common_batch_add(batch, get_token(j, i), i, { j }, i == pp - 1);
+                    batch.add(get_token(j, i), i, j, i == pp - 1);
                 };
                 if (params.batched_bench_batch_layout == "seq-major") {
                     for (int j = 0; j < prompt_sequences; ++j) {
@@ -258,8 +247,8 @@ int llama_batched_bench(int argc, char ** argv) {
 
                     if (!params.kv_unified) {
                         // run one dummy token to apply the memory copy
-                        common_batch_clear(batch);
-                        common_batch_add(batch, get_token(0, pp), pp + 0, { 0 }, true);
+                        batch.clear();
+                        batch.add(get_token(0, pp), pp, 0, true);
                         if (!decode_helper(ctx, batch, ctx_params.n_batch, true)) {
                             LOG_ERR("%s: llama_decode() failed\n", __func__);
                             llama_free(ctx);
@@ -277,9 +266,9 @@ int llama_batched_bench(int argc, char ** argv) {
                     // 0 0 0 ... 1 1 1 ... 2 2 2 ... 3 3 3 ...
                     for (int j = 0; j < pl; ++j) {
                         for (int i = 0; i < tg; ++i) {
-                            common_batch_clear(batch);
+                            batch.clear();
 
-                            common_batch_add(batch, get_token(j, pp + i), pp + i, { j }, true);
+                            batch.add(get_token(j, pp + i), pp + i, j, true);
 
                             if (!decode_helper(ctx, batch, ctx_params.n_batch, true)) {
                                 LOG_ERR("%s: llama_decode() failed\n", __func__);
@@ -293,10 +282,10 @@ int llama_batched_bench(int argc, char ** argv) {
                     // decode pattern:
                     // 0123 0123 0123 ...
                     for (int i = 0; i < tg; ++i) {
-                        common_batch_clear(batch);
+                        batch.clear();
 
                         for (int j = 0; j < pl; ++j) {
-                            common_batch_add(batch, get_token(j, pp + i), pp + i, { j }, true);
+                            batch.add(get_token(j, pp + i), pp + i, j, true);
                         }
 
                         if (!decode_helper(ctx, batch, ctx_params.n_batch, true)) {
@@ -337,7 +326,6 @@ int llama_batched_bench(int argc, char ** argv) {
     LOG("\n");
     llama_perf_context_print(ctx);
 
-    llama_batch_free(batch);
 
     llama_free(ctx);
     llama_model_free(model);

@@ -104,6 +104,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
         bool                    grammar_first = false,
         const common_sampler_accept_callback & on_accept = {});
 
+// as above, but verifies by rejection sampling; draft_q holds the draft's candidates per token
+std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first = false, const common_sampler_accept_callback & on_accept = {});
+
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(
         struct common_sampler * gsmpl,

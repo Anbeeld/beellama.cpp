@@ -1,3 +1,6 @@
+// TODO: merge with test-recurrent-state-rollback.cpp
+// TODO: merge with test-state-restore-fragmented.cpp
+
 #include "arg.h"
 #include "common.h"
 #include "log.h"
@@ -73,26 +76,9 @@ static bool get_current_logits(llama_context * ctx, std::vector<float> & out) {
     return true;
 }
 
-struct llama_batch_ptr {
-    llama_batch batch;
-
-    llama_batch_ptr(int32_t n_tokens, int32_t embd, int32_t n_seq_max)
-        : batch{llama_batch_init(n_tokens, embd, n_seq_max)} {}
-
-    ~llama_batch_ptr() { llama_batch_free(batch); }
-
-    llama_batch_ptr(const llama_batch_ptr &) = delete;
-    llama_batch_ptr & operator=(const llama_batch_ptr &) = delete;
-    llama_batch_ptr(llama_batch_ptr &&) = default;
-    llama_batch_ptr & operator=(llama_batch_ptr &&) = default;
-
-    llama_batch & get() { return batch; }
-    const llama_batch & get() const { return batch; }
-};
-
 static generation_result generate_tokens(llama_context * ctx, llama_sampler * smpl, int & n_past, int32_t n_predict, llama_seq_id seq_id) {
     generation_result result;
-    llama_batch_ptr batch(1, 0, 1);
+    common_batch batch(ctx);
 
     for (int i = 0; i < n_predict; i++) {
         std::vector<float> logits;
@@ -108,10 +94,10 @@ static generation_result generate_tokens(llama_context * ctx, llama_sampler * sm
         result.tokens.push_back(next_token);
         result.logits.push_back(std::move(logits));
 
-        common_batch_clear(batch.get());
-        common_batch_add(batch.get(), next_token, n_past, {seq_id}, true);
+        batch.clear();
+        batch.add(next_token, n_past, seq_id, true);
 
-        if (llama_decode(ctx, batch.get())) {
+        if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
             LOG_ERR("\n%s: failed to evaluate\n", __func__);
             return {};
         }
@@ -129,7 +115,7 @@ static bool generate_tokens_compare(
         return false;
     }
 
-    llama_batch_ptr batch(1, 0, 1);
+    common_batch batch(ctx);
 
     for (int i = 0; i < n_predict; i++) {
         std::vector<float> logits;
@@ -157,10 +143,10 @@ static bool generate_tokens_compare(
             LOG_TRC("%s: sampled token %d differs from expected %d, using expected token\n", __func__, next_token, expected_token);
         }
 
-        common_batch_clear(batch.get());
-        common_batch_add(batch.get(), expected_token, n_past, {seq_id}, true);
+        batch.clear();
+        batch.add(expected_token, n_past, seq_id, true);
 
-        if (llama_decode(ctx, batch.get())) {
+        if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
             LOG_ERR("\n%s: failed to evaluate\n", __func__);
             return false;
         }
@@ -320,12 +306,12 @@ static bool test_cross_ubatch_tail_state(
     }
 
     const llama_token probe = tokens.empty() ? 1 : tokens.back();
-    llama_batch_ptr source_batch(1, 0, 1);
-    llama_batch_ptr destination_batch(1, 0, 1);
-    common_batch_add(source_batch.get(), probe, n_past, {0}, true);
-    common_batch_add(destination_batch.get(), probe, n_past, {0}, true);
-    if (llama_decode(source.get(), source_batch.get()) ||
-            llama_decode(destination.get(), destination_batch.get())) {
+    common_batch source_batch(source.get());
+    common_batch destination_batch(destination.get());
+    source_batch.add(probe, n_past, 0, true);
+    destination_batch.add(probe, n_past, 0, true);
+    if (llama_process(source.get(), LLAMA_PROCESS_TYPE_DECODE, source_batch.get()) ||
+            llama_process(destination.get(), LLAMA_PROCESS_TYPE_DECODE, destination_batch.get())) {
         LOG_ERR("%s: probe decode failed for ubatch %u -> %u\n",
                 __func__, source_ubatch, destination_ubatch);
         return false;
@@ -545,14 +531,14 @@ static bool test_tail_copy_is_immediately_saveable(
     }
 
     const llama_token probe = tokens.empty() ? 1 : tokens.back();
-    llama_batch_ptr source_batch(1, 0, 1);
-    llama_batch_ptr restored_batch(1, 0, 1);
-    llama_batch_ptr guard_batch(1, 0, 1);
-    common_batch_add(source_batch.get(), probe, n_past, {0}, true);
-    common_batch_add(restored_batch.get(), probe, n_past, {1}, true);
-    common_batch_add(guard_batch.get(), probe, n_past, {1}, true);
-    if (llama_decode(source.get(), source_batch.get()) || llama_decode(restored.get(), restored_batch.get()) ||
-            llama_decode(corruption_guard.get(), guard_batch.get())) {
+    common_batch source_batch(source.get());
+    common_batch restored_batch(restored.get());
+    common_batch guard_batch(corruption_guard.get());
+    source_batch.add(probe, n_past, 0, true);
+    restored_batch.add(probe, n_past, 1, true);
+    guard_batch.add(probe, n_past, 1, true);
+    if (llama_process(source.get(), LLAMA_PROCESS_TYPE_DECODE, source_batch.get()) || llama_process(restored.get(), LLAMA_PROCESS_TYPE_DECODE, restored_batch.get()) ||
+            llama_process(corruption_guard.get(), LLAMA_PROCESS_TYPE_DECODE, guard_batch.get())) {
         LOG_ERR("%s: continuation decode failed\n", __func__);
         return false;
     }
@@ -669,11 +655,11 @@ static bool test_kvarn_partial_checkpoint_history(
     int n_past = 0;
     for (size_t offset = 0; offset < prefix.size();) {
         const int32_t count = int32_t(std::min<size_t>(context_params.n_batch, prefix.size() - offset));
-        llama_batch_ptr batch(count, 0, 1);
+        common_batch batch(context.get());
         for (int32_t i = 0; i < count; ++i) {
-            common_batch_add(batch.get(), prefix[offset + i], n_past + i, { 0 }, false);
+            batch.add(prefix[offset + i], n_past + i, 0 , false);
         }
-        if (llama_decode(context.get(), batch.get())) {
+        if (llama_process(context.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
             LOG_ERR("%s: failed to decode wrapped-tail prefix chunk\n", __func__);
             return false;
         }
@@ -694,11 +680,11 @@ static bool test_kvarn_partial_checkpoint_history(
         int device_past = 0;
         for (size_t offset = 0; offset < prefix.size();) {
             const int32_t count = int32_t(std::min<size_t>(device_params.n_batch, prefix.size() - offset));
-            llama_batch_ptr batch(count, 0, 1);
+            common_batch batch(device_context.get());
             for (int32_t i = 0; i < count; ++i) {
-                common_batch_add(batch.get(), prefix[offset + i], device_past + i, { 0 }, false);
+                batch.add(prefix[offset + i], device_past + i, 0 , false);
             }
-            if (llama_decode(device_context.get(), batch.get())) {
+            if (llama_process(device_context.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
                 LOG_ERR("%s: failed to decode wrapped on-device prefix chunk\n", __func__);
                 return false;
             }
@@ -717,9 +703,9 @@ static bool test_kvarn_partial_checkpoint_history(
 
         const llama_token device_probe = tokens.empty() ? llama_token(2) : tokens.front();
         const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
-        llama_batch_ptr source_probe(1, 0, 1);
-        common_batch_add(source_probe.get(), device_probe, device_past, { 0 }, true);
-        if (llama_decode(device_context.get(), source_probe.get())) {
+        common_batch source_probe(device_context.get());
+        source_probe.add(device_probe, device_past, 0 , true);
+        if (llama_process(device_context.get(), LLAMA_PROCESS_TYPE_DECODE, source_probe.get())) {
             LOG_ERR("%s: failed to decode wrapped on-device source probe\n", __func__);
             return false;
         }
@@ -732,9 +718,9 @@ static bool test_kvarn_partial_checkpoint_history(
             LOG_ERR("%s: failed to restore wrapped on-device checkpoint\n", __func__);
             return false;
         }
-        llama_batch_ptr destination_probe(1, 0, 1);
-        common_batch_add(destination_probe.get(), device_probe, device_past, { 1 }, true);
-        if (llama_decode(device_context.get(), destination_probe.get())) {
+        common_batch destination_probe(device_context.get());
+        destination_probe.add(device_probe, device_past, 1 , true);
+        if (llama_process(device_context.get(), LLAMA_PROCESS_TYPE_DECODE, destination_probe.get())) {
             LOG_ERR("%s: failed to decode wrapped on-device destination probe\n", __func__);
             return false;
         }
@@ -779,9 +765,9 @@ static bool test_kvarn_partial_checkpoint_history(
     };
     const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
     const auto decode_probe = [&](llama_token token, int position, std::vector<float> & logits) {
-        llama_batch_ptr batch(1, 0, 1);
-        common_batch_add(batch.get(), token, position, { 0 }, true);
-        if (llama_decode(context.get(), batch.get())) {
+        common_batch batch(context.get());
+        batch.add(token, position, 0 , true);
+        if (llama_process(context.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
             return false;
         }
         const float * values = llama_get_logits_ith(context.get(), -1);
@@ -816,11 +802,11 @@ static bool test_kvarn_partial_checkpoint_history(
         return false;
     }
 
-    llama_batch_ptr extension_batch(3, 0, 1);
+    common_batch extension_batch(context.get());
     for (int i = 0; i < 3; ++i) {
-        common_batch_add(extension_batch.get(), extension, n_past + i, { 0 }, i == 2);
+        extension_batch.add(extension, n_past + i, 0 , i == 2);
     }
-    if (llama_decode(context.get(), extension_batch.get())) {
+    if (llama_process(context.get(), LLAMA_PROCESS_TYPE_DECODE, extension_batch.get())) {
         LOG_ERR("%s: failed to advance from checkpoint A to B\n", __func__);
         return false;
     }
@@ -850,10 +836,10 @@ static bool test_kvarn_partial_checkpoint_history(
         }
     }
 
-    llama_batch_ptr mutation_batch(2, 0, 1);
-    common_batch_add(mutation_batch.get(), extension, checkpoint_b_past, { 0 }, false);
-    common_batch_add(mutation_batch.get(), extension, checkpoint_b_past + 1, { 0 }, true);
-    if (llama_decode(context.get(), mutation_batch.get())) {
+    common_batch mutation_batch(context.get());
+    mutation_batch.add(extension, checkpoint_b_past, 0 , false);
+    mutation_batch.add(extension, checkpoint_b_past + 1, 0 , true);
+    if (llama_process(context.get(), LLAMA_PROCESS_TYPE_DECODE, mutation_batch.get())) {
         LOG_ERR("%s: failed to mutate live checkpoint state\n", __func__);
         return false;
     }
@@ -986,9 +972,9 @@ static bool test_kvarn_partial_checkpoint_history(
             LOG_ERR("%s: mismatched KVarN context accepted the v12 checkpoint\n", __func__);
             return false;
         }
-        llama_batch_ptr mismatch_probe(1, 0, 1);
-        common_batch_add(mismatch_probe.get(), probe_a, 0, { 0 }, true);
-        if (llama_decode(mismatch.get(), mismatch_probe.get())) {
+        common_batch mismatch_probe(mismatch.get());
+        mismatch_probe.add(probe_a, 0, 0 , true);
+        if (llama_process(mismatch.get(), LLAMA_PROCESS_TYPE_DECODE, mismatch_probe.get())) {
             LOG_ERR("%s: rejected v12 checkpoint left its destination unusable\n", __func__);
             return false;
         }
@@ -1077,23 +1063,23 @@ static bool test_kvarn_unified_capacity(
 
     constexpr int32_t borrowed_capacity = 384;
     for (int32_t offset = 0; offset < borrowed_capacity; offset += 128) {
-        llama_batch_ptr batch(128, 0, 1);
+        common_batch batch(context.get());
         for (int32_t i = 0; i < 128; ++i) {
             const llama_token token = tokens.empty() ? llama_token(1) : tokens[(offset + i) % tokens.size()];
-            common_batch_add(batch.get(), token, offset + i, { 0 }, false);
+            batch.add(token, offset + i, 0 , false);
         }
-        if (llama_decode(context.get(), batch.get())) {
+        if (llama_process(context.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
             LOG_ERR("%s: sequence 0 could not borrow unused unified KVarN capacity\n", __func__);
             return false;
         }
     }
 
-    llama_batch_ptr other(128, 0, 1);
+    common_batch other(context.get());
     for (int32_t i = 0; i < 128; ++i) {
         const llama_token token = tokens.empty() ? llama_token(1) : tokens[i % tokens.size()];
-        common_batch_add(other.get(), token, i, { 1 }, false);
+        other.add(token, i, 1 , false);
     }
-    if (llama_decode(context.get(), other.get())) {
+    if (llama_process(context.get(), LLAMA_PROCESS_TYPE_DECODE, other.get())) {
         LOG_ERR("%s: borrowing sequence aliased the remaining unified KVarN capacity\n", __func__);
         return false;
     }
@@ -1125,13 +1111,13 @@ static bool test_kvarn_unified_reuses_freed_groups(
     const auto decode = [&](llama_seq_id seq_id, int32_t pos0, int32_t count) {
         for (int32_t offset = 0; offset < count; offset += 128) {
             const int32_t n_tokens = std::min(128, count - offset);
-            llama_batch_ptr batch(n_tokens, 0, 1);
+            common_batch batch(context.get());
             for (int32_t i = 0; i < n_tokens; ++i) {
                 const int32_t pos = pos0 + offset + i;
                 const llama_token token = tokens.empty() ? llama_token(1) : tokens[pos % tokens.size()];
-                common_batch_add(batch.get(), token, pos, { seq_id }, offset + n_tokens == count && i + 1 == n_tokens);
+                batch.add(token, pos, seq_id , offset + n_tokens == count && i + 1 == n_tokens);
             }
-            if (llama_decode(context.get(), batch.get())) {
+            if (llama_process(context.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
                 return false;
             }
         }
@@ -1260,12 +1246,12 @@ static bool test_seq_rm_isolated(
 
     const size_t n_tokens = tokens.size() < 128 ? tokens.size() : 128;
     for (llama_seq_id seq_id = 0; seq_id < 2; ++seq_id) {
-        llama_batch_ptr batch(n_tokens, 0, 1);
+        common_batch batch(ctx.get());
         for (size_t i = 0; i < n_tokens; ++i) {
-            common_batch_add(batch.get(), tokens[i], i, { seq_id }, i == n_tokens - 1);
+            batch.add(tokens[i], i, seq_id, i == n_tokens - 1);
         }
 
-        if (llama_decode(ctx.get(), batch.get())) {
+        if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
             LOG_ERR("%s: failed to decode prompt for sequence %d\n", __func__, seq_id);
             return false;
         }
@@ -1522,19 +1508,26 @@ static bool test_seq_cp_device(struct llama_model * model, const struct common_p
 // - save again on the host and compare the two blobs byte for byte
 static bool test_seq_cp_scatter(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens, int test_num, bool on_device) {
     auto params_ctx = common_context_params_to_llama(params);
-    params_ctx.n_ctx      = 256;
+    // Unified KVarN needs enough 128-token groups to stage both sequences.
+    params_ctx.n_ctx      = params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED ? 512 : 256;
     params_ctx.n_seq_max  = 2;
     params_ctx.kv_unified = true;
     auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
+    if (!ctx) {
+        LOG_ERR("%s: failed to create scatter-copy context\n", __func__);
+        return false;
+    }
 
     LOGV(LOG_LEVEL_INFO, "\n=== Test %d: seq copy (%s, scatter) ===\n", test_num, on_device ? "device" : "host");
 
-    const uint32_t flags = on_device ? LLAMA_STATE_SEQ_FLAGS_ON_DEVICE : LLAMA_STATE_SEQ_FLAGS_NONE;
+    const uint32_t self_flags = params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED ?
+        LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED : LLAMA_STATE_SEQ_FLAGS_NONE;
+    const uint32_t flags = self_flags | (on_device ? LLAMA_STATE_SEQ_FLAGS_ON_DEVICE : LLAMA_STATE_SEQ_FLAGS_NONE);
 
     auto decode_one = [&](llama_token tok, int pos, llama_seq_id seq) {
-        llama_batch_ptr batch(1, 0, 1);
-        common_batch_add(batch.get(), tok, pos, { seq }, true);
-        return llama_decode(ctx.get(), batch.get()) == 0;
+        common_batch batch(ctx.get());
+        batch.add(tok, pos, seq, true);
+        return llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
     };
 
     // seq 0 cells 0,1,4 interleave the seq 1 cells 2,3,5
@@ -1568,7 +1561,7 @@ static bool test_seq_cp_scatter(struct llama_model * model, const struct common_
 
     // host blob: contains the KV data, used for the byte-for-byte comparison
     std::vector<uint8_t> state_before;
-    if (!get_seq_state(1, LLAMA_STATE_SEQ_FLAGS_NONE, state_before)) {
+    if (!get_seq_state(1, self_flags, state_before)) {
         return false;
     }
 
@@ -1594,7 +1587,7 @@ static bool test_seq_cp_scatter(struct llama_model * model, const struct common_
     LOG_TRC("%s: seq 1 restored via %s, %zu bytes\n", __func__, on_device ? "device" : "host", nset);
 
     std::vector<uint8_t> state_after;
-    if (!get_seq_state(1, LLAMA_STATE_SEQ_FLAGS_NONE, state_after)) {
+    if (!get_seq_state(1, self_flags, state_after)) {
         return false;
     }
 
@@ -1617,7 +1610,8 @@ static bool test_state_roundtrip(struct llama_model * model, const struct common
 
     LOGV(LOG_LEVEL_INFO, "\n=== Test 8: state blob round-trip ===\n");
 
-    if (llama_decode(ctx.get(), llama_batch_get_one(const_cast<llama_token *>(tokens.data()), (int32_t) tokens.size()))) {
+    common_batch batch = common_batch_get_one(ctx.get(), tokens);
+    if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
         LOG_ERR("\n%s: failed to decode prompt\n", __func__);
         return false;
     }
@@ -1670,7 +1664,7 @@ static bool test_state_roundtrip(struct llama_model * model, const struct common
 
 // column headers for the --models table, one per test, in the order they are run
 static const std::vector<const char *> test_names = {
-    "baseline", "seq_rm", "state_load", "cp_h", "cp_d", "cp_h_s", "cp_d_s", "rt", "rf",
+    "baseline", "seq_rm", "state_load", "cp_h", "cp_d", "cp_h_s", "cp_d_s", "rt", "rf", "rot",
 };
 
 // overwrite the tensor data with 0xff bytes (NaN when read as f16/f32), so that the restore fails
@@ -1695,7 +1689,8 @@ static bool corrupt_state(std::vector<uint8_t> & data, bool quantized_v) {
 // a failed restore must leave the sequence empty and must not change the logits of other sequences
 static bool test_state_restore_failure(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens) {
     auto params_ctx = common_context_params_to_llama(params);
-    params_ctx.n_ctx      = 256;
+    // Unified KVarN reserves two 128-token staging groups per sequence.
+    params_ctx.n_ctx      = params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED ? 1024 : 256;
     params_ctx.n_seq_max  = 4;
     params_ctx.kv_unified = true;
 
@@ -1721,12 +1716,12 @@ static bool test_state_restore_failure(struct llama_model * model, const struct 
     }
 
     const auto decode = [&](const llama_tokens & inp, llama_seq_id seq_id, std::vector<float> * logits_out) {
-        llama_batch_ptr batch(inp.size(), 0, 1);
+        common_batch batch(ctx.get());
         for (size_t i = 0; i < inp.size(); ++i) {
-            common_batch_add(batch.get(), inp[i], i, { seq_id }, i == inp.size() - 1);
+            batch.add(inp[i], i, seq_id, i == inp.size() - 1);
         }
 
-        if (llama_decode(ctx.get(), batch.get())) {
+        if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
             LOG_ERR("%s: failed to decode on sequence %d\n", __func__, seq_id);
             return false;
         }
@@ -1838,6 +1833,92 @@ static bool test_state_restore_failure(struct llama_model * model, const struct 
 }
 
 
+// Test 10: state rotation
+// a KV state saved with attention rotation enabled must restore only into a context with the same setting;
+// note: rotation is only active for quantized KV caches with a head size that is a multiple of 64,
+//       for other models the restore into the rotation-disabled context is valid and the test passes vacuously
+static bool test_state_rotation(struct llama_model * model, const struct common_params & params) {
+    LOGV(LOG_LEVEL_INFO, "\n=== Test 10: state rotation ===\n");
+
+    const std::string attn_rot_disable = common_get_env("LLAMA_ATTN_ROT_DISABLE");
+    const auto make_context = [&](ggml_type type_k, ggml_type type_v, bool disable_rotation) {
+        common_set_env("LLAMA_ATTN_ROT_DISABLE", disable_rotation ? "1" : "0");
+        auto params_ctx = common_context_params_to_llama(params);
+        params_ctx.n_ctx    = 32;
+        params_ctx.n_batch  = 1;
+        params_ctx.n_ubatch = 1;
+        params_ctx.type_k   = type_k;
+        params_ctx.type_v   = type_v;
+        params_ctx.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        return llama_context_ptr(llama_init_from_model(model, params_ctx));
+    };
+
+    std::vector<std::pair<ggml_type, ggml_type>> type_pairs;
+    for (const auto & types : { std::pair{GGML_TYPE_Q8_0, GGML_TYPE_Q8_0} }) {
+        if (make_context(types.first, types.second, false)) {
+            type_pairs.push_back(types);
+        }
+    }
+    if (type_pairs.empty()) {
+        LOG_WRN("%s: no supported quantized KV cache type combination - skipping\n", __func__);
+        return true;
+    }
+
+    bool success = true;
+    for (const auto & types : type_pairs) {
+        auto src = make_context(types.first, types.second, false);
+        if (!src) {
+            LOG_ERR("%s: failed to create source context\n", __func__);
+            success = false;
+            break;
+        }
+
+        llama_token token = 0;
+        if (llama_decode(src.get(), llama_batch_get_one(&token, 1))) {
+            LOG_ERR("%s: failed to decode token\n", __func__);
+            success = false;
+            break;
+        }
+
+        const size_t state_size = llama_state_seq_get_size(src.get(), 0);
+        if (state_size == 0) {
+            continue; // no KV state to test
+        }
+
+        std::vector<uint8_t> state(state_size);
+        if (llama_state_seq_get_data(src.get(), state.data(), state.size(), 0) != state.size()) {
+            LOG_ERR("%s: failed to save sequence state\n", __func__);
+            success = false;
+            break;
+        }
+
+        auto matching = make_context(types.first, types.second, false);
+        if (!matching || llama_state_seq_set_data(matching.get(), state.data(), state.size(), 0) != state.size()) {
+            LOG_ERR("%s: failed to restore matching rotation\n", __func__);
+            success = false;
+            break;
+        }
+
+        auto mismatched = make_context(types.first, types.second, true);
+        if (!mismatched) {
+            LOG_ERR("%s: failed to create mismatched rotation context\n", __func__);
+            success = false;
+            break;
+        }
+        if (llama_state_seq_set_data(mismatched.get(), state.data(), state.size(), 0) != 0) {
+            LOG_TRC("%s: state restored into rotation-disabled context, model does not use attention rotation\n", __func__);
+        }
+    }
+    common_set_env("LLAMA_ATTN_ROT_DISABLE", attn_rot_disable);
+
+    if (!success) {
+        return false;
+    }
+
+    LOGV(LOG_LEVEL_INFO, "\nPASS\n");
+    return true;
+}
+
 struct test_suite {
     std::vector<test_status> results;
 
@@ -1848,7 +1929,7 @@ struct test_suite {
     }
 };
 
-// Run the full save/load test suite (tests 1-9) for a single model.
+// Run the full save/load test suite (tests 1-10) for a single model.
 // Returns the per-test results.
 static test_suite run_save_load_tests_for_model(const std::string & model_path, const struct common_params & base_params) {
     test_suite suite;
@@ -1966,6 +2047,9 @@ static test_suite run_save_load_tests_for_model(const std::string & model_path, 
     // Test 9: state restore failure
     suite.results.push_back(test_state_restore_failure(model, params, tokens) ? test_status::PASS : test_status::FAIL);
 
+    // Test 10: state rotation
+    suite.results.push_back(test_state_rotation(model, params) ? test_status::PASS : test_status::FAIL);
+
     return suite;
 }
 
@@ -2027,7 +2111,7 @@ int main(int argc, char ** argv) {
         params.n_predict = 16;
     }
 
-    ggml_backend_load_all();
+    llama_backend_init();
 
     if (!models_dir.empty()) {
         // run the suite over every dummy model in the directory
