@@ -29,6 +29,7 @@
 #include <random>
 #include <utility>
 #include <fstream>
+#include <limits>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -3024,6 +3025,145 @@ private:
         return result.success;
     }
 
+    // Optional SCKP v1 appendix after the llama sequence-state payload. Historical
+    // recurrent/SWA state cannot be reconstructed from the final state alone.
+    static constexpr uint32_t SLOT_CKPT_MAGIC   = 0x504b4353;
+    static constexpr uint32_t SLOT_CKPT_VERSION = 1;
+
+    static bool ckpt_read(std::ifstream & ifs, void * dst, size_t size, size_t & n_read) {
+        if (!ifs.read((char *) dst, size)) {
+            return false;
+        }
+        n_read += size;
+        return true;
+    }
+
+    template<typename Buffer>
+    static bool ckpt_read_buf(std::ifstream & ifs, Buffer & buf, size_t n_avail, size_t & n_read) {
+        uint64_t n = 0;
+        // Validate against the actual remaining bytes before allocating.
+        if (!ckpt_read(ifs, &n, sizeof(n), n_read) || n_read > n_avail || n > n_avail - n_read) {
+            return false;
+        }
+        buf.resize(n);
+        return n == 0 || ckpt_read(ifs, buf.data(), n, n_read);
+    }
+
+    static void ckpt_write(std::ofstream & ofs, const void * src, size_t size, size_t & n_written) {
+        ofs.write((const char *) src, size);
+        n_written += size;
+    }
+
+    template<typename Buffer>
+    static void ckpt_write_buf(std::ofstream & ofs, const Buffer & buf, size_t & n_written) {
+        const uint64_t n = buf.size();
+        ckpt_write(ofs, &n, sizeof(n), n_written);
+        if (n > 0) {
+            ckpt_write(ofs, buf.data(), n, n_written);
+        }
+    }
+
+    bool save_slot_checkpoints(const std::string & filepath, const server_slot & slot, size_t & n_written) const {
+        n_written = 0;
+        if (slot.prompt.checkpoints.empty()) {
+            return true;
+        }
+        if (slot.prompt.checkpoints.size() > std::numeric_limits<uint32_t>::max()) {
+            return false;
+        }
+        std::ofstream ofs(std::filesystem::u8path(filepath), std::ios::binary | std::ios::app);
+        if (!ofs) {
+            SRV_WRN("failed to append context checkpoints to '%s'\n", filepath.c_str());
+            return false;
+        }
+        const uint32_t magic   = SLOT_CKPT_MAGIC;
+        const uint32_t version = SLOT_CKPT_VERSION;
+        const uint32_t count   = (uint32_t) slot.prompt.checkpoints.size();
+        ckpt_write(ofs, &magic,   sizeof(magic),   n_written);
+        ckpt_write(ofs, &version, sizeof(version), n_written);
+        ckpt_write(ofs, &count,   sizeof(count),   n_written);
+        for (const auto & cur : slot.prompt.checkpoints) {
+            ckpt_write(ofs, &cur.n_tokens, sizeof(cur.n_tokens), n_written);
+            ckpt_write(ofs, &cur.pos_min,  sizeof(cur.pos_min),  n_written);
+            ckpt_write(ofs, &cur.pos_max,  sizeof(cur.pos_max),  n_written);
+            ckpt_write_buf(ofs, cur.data_tgt,  n_written);
+            ckpt_write_buf(ofs, cur.data_dft,  n_written);
+            ckpt_write_buf(ofs, cur.data_spec, n_written);
+        }
+        ofs.flush();
+        // close can report a delayed write failure as well.
+        ofs.close();
+        if (!ofs) {
+            SRV_WRN("failed to append context checkpoints to '%s' - the appendix is incomplete\n", filepath.c_str());
+            return false;
+        }
+        SRV_INF("appended %u context checkpoint(s) (%.3f MiB) to '%s'\n",
+                count, (float) n_written / 1024 / 1024, filepath.c_str());
+        return true;
+    }
+
+    // Returns bytes consumed, or zero for an absent/unusable optional appendix.
+    // Parse into a temporary list so a truncated appendix cannot admit a prefix.
+    size_t load_slot_checkpoints(const std::string & filepath, size_t offset, server_slot & slot) const {
+        try {
+            std::ifstream ifs(std::filesystem::u8path(filepath), std::ios::binary | std::ios::ate);
+            const auto end = ifs.tellg();
+            if (!ifs || end < 0 || uint64_t(end) < offset || !ifs.seekg(offset)) {
+                return 0;
+            }
+            const size_t n_avail = size_t(end) - offset;
+            size_t n_read = 0;
+            uint32_t magic   = 0;
+            uint32_t version = 0;
+            uint32_t count   = 0;
+            if (!ckpt_read(ifs, &magic, sizeof(magic), n_read) || magic != SLOT_CKPT_MAGIC) {
+                return 0;
+            }
+            // Each entry needs at least its metadata and three blob lengths.
+            constexpr size_t entry_min = sizeof(int64_t) + 2 * sizeof(llama_pos) + 3 * sizeof(uint64_t);
+            if (!ckpt_read(ifs, &version, sizeof(version), n_read) || version != SLOT_CKPT_VERSION ||
+                !ckpt_read(ifs, &count, sizeof(count), n_read) || n_read > n_avail ||
+                count > (n_avail - n_read) / entry_min) {
+                SRV_WRN("invalid context checkpoint appendix in '%s' - ignored\n", filepath.c_str());
+                return 0;
+            }
+            std::list<common_prompt_checkpoint> checkpoints;
+            const size_t limit = size_t(std::max(0, params_base.n_ctx_checkpoints));
+            for (uint32_t i = 0; i < count; ++i) {
+                common_prompt_checkpoint cur;
+                cur.id_task = -1;
+                if (!ckpt_read(ifs, &cur.n_tokens, sizeof(cur.n_tokens), n_read) ||
+                    !ckpt_read(ifs, &cur.pos_min,  sizeof(cur.pos_min),  n_read) ||
+                    !ckpt_read(ifs, &cur.pos_max,  sizeof(cur.pos_max),  n_read) ||
+                    !ckpt_read_buf(ifs, cur.data_tgt,  n_avail, n_read) ||
+                    !ckpt_read_buf(ifs, cur.data_dft,  n_avail, n_read) ||
+                    !ckpt_read_buf(ifs, cur.data_spec, n_avail, n_read)) {
+                    SRV_WRN("truncated context checkpoint appendix in '%s' - ignored\n", filepath.c_str());
+                    return 0;
+                }
+                if (cur.n_tokens <= 0 || cur.n_tokens > slot.prompt.n_tokens() ||
+                    cur.pos_min < 0 || cur.pos_max < cur.pos_min ||
+                    cur.pos_max >= slot.prompt.tokens.pos_next() || cur.empty()) {
+                    SRV_WRN("invalid context checkpoint metadata in '%s' - ignored\n", filepath.c_str());
+                    return 0;
+                }
+                checkpoints.push_back(std::move(cur));
+                if (checkpoints.size() > limit) {
+                    checkpoints.pop_front();
+                }
+            }
+            // Do not test-load draft state here: that would mutate the live slot.
+            // The existing checkpoint transaction validates target, owned draft,
+            // and speculative state together before committing any component.
+            slot.prompt.checkpoints = std::move(checkpoints);
+            SRV_INF("restored %zu context checkpoint(s) from '%s'\n", slot.prompt.checkpoints.size(), filepath.c_str());
+            return n_read;
+        } catch (const std::exception & err) {
+            SRV_WRN("unable to read context checkpoint appendix in '%s': %s - ignored\n", filepath.c_str(), err.what());
+            return 0;
+        }
+    }
+
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
@@ -3240,6 +3380,12 @@ private:
                         break;
                     }
 
+                    size_t nwrite_ckpt = 0;
+                    if (!save_slot_checkpoints(filepath, *slot, nwrite_ckpt)) {
+                        send_error(task, "Unable to save slot: incomplete context checkpoints", ERROR_TYPE_SERVER);
+                        break;
+                    }
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -3249,7 +3395,7 @@ private:
                     res->filename = filename;
                     res->is_save  = true;
                     res->n_tokens = slot->prompt.tokens.size();
-                    res->n_bytes  = nwrite;
+                    res->n_bytes  = nwrite + nwrite_ckpt;
                     res->t_ms     = t_save_ms;
                     queue_results.send(std::move(res));
                 } break;
@@ -3305,6 +3451,9 @@ private:
                         break;
                     }
 
+                    // nread is the end offset of the llama sequence-state payload.
+                    const size_t nread_ckpt = load_slot_checkpoints(filepath, nread, *slot);
+
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
 
@@ -3314,7 +3463,7 @@ private:
                     res->filename = filename;
                     res->is_save  = false;
                     res->n_tokens = slot->prompt.tokens.size();
-                    res->n_bytes  = nread;
+                    res->n_bytes  = nread + nread_ckpt;
                     res->t_ms     = t_restore_ms;
                     queue_results.send(std::move(res));
                 } break;
