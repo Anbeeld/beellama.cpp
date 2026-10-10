@@ -688,6 +688,37 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1 && src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return src_ss[1];
         }
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_0 &&
+                src_ss[1].n_segments == 1 && src_ss[1].nr[0] == 1) {
+            bool complete_rows = true;
+            for (size_t j = 0; j < n_bufs; j++) {
+                complete_rows = complete_rows && (src_ss[1].ne[j] == 0 || src_ss[1].ne[j] == tensor->src[1]->ne[0]);
+            }
+            if (complete_rows) {
+                // MQA cache rotation: a rank owns the entire feature row, not
+                // a partial dot product. Assign the complete output feature row
+                // to that same rank while leaving empty ranks empty. Retain axis
+                // zero so the following head reshape/cache store stays aligned.
+                return {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};
+            }
+        }
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1 &&
+                src_ss[0].n_segments == 1 && src_ss[1].n_segments == 1 && src_ss[0].nr[0] != 0 && src_ss[1].nr[0] != 0) {
+            bool same_whole_owner = true;
+            for (size_t j = 0; j < n_bufs; j++) {
+                const int64_t left = src_ss[0].ne[j] * src_ss[0].nr[0];
+                const int64_t right = src_ss[1].ne[j] * src_ss[1].nr[0];
+                same_whole_owner = same_whole_owner &&
+                        (left == 0 || left == tensor->src[0]->ne[0]) &&
+                        (right == 0 || right == tensor->src[1]->ne[1]) && ((left == 0) == (right == 0));
+            }
+            if (same_whole_owner) {
+                // The only KV head and its output projection can be represented
+                // on different logical axes after inverse cache rotation. Both
+                // are whole on the same rank, so reduce exactly as a feature split.
+                return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
+            }
+        }
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_0) {
             GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
             return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
@@ -719,9 +750,6 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 }
                 if (src_ss[0].n_segments == 1) {
                     base_ne_in /= src_ss[0].nr[0];
-                    if (src_ss[0].axis == ggml_n_dims(tensor->src[0]) - 1 && src_ss[0].nr[0] == 1) {
-                        return {ggml_backend_meta_split_axis(ggml_n_dims(tensor) - 1), {0}, {1}, 1};
-                    }
                     if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && tensor->ne[0] == tensor->src[0]->ne[0] &&
                             tensor->ne[1] == 1 && src_ss[0].nr[0] == 1) {
                         bool complete_rows = true;
@@ -730,9 +758,25 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                             complete_rows = complete_rows && (ne == 0 || ne == tensor->src[0]->ne[0]);
                         }
                         if (complete_rows) {
-                            // Move a complete dim-0 split to the following singleton dimension.
+                            // Preserve the singleton head axis before ggml_n_dims squeezes it
+                            // during single-token decode (otherwise RMS norm splits a row).
                             return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
                         }
+                    }
+                    if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1 && tensor->ne[1] == 1 && src_ss[0].nr[0] == 1 &&
+                            tensor->ne[0] > tensor->src[0]->ne[0] && tensor->ne[0] % tensor->src[0]->ne[0] == 0) {
+                        bool complete_columns = true;
+                        for (size_t j = 0; j < n_bufs; j++) {
+                            complete_columns = complete_columns && (src_ss[0].ne[j] == 0 || src_ss[0].ne[j] == tensor->src[0]->ne[1]);
+                        }
+                        if (complete_columns) {
+                            // Reassemble whole rotation chunks into the single KV head,
+                            // rather than interpreting ownership as a token-axis split.
+                            return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
+                        }
+                    }
+                    if (src_ss[0].axis == ggml_n_dims(tensor->src[0]) - 1 && src_ss[0].nr[0] == 1) {
+                        return {ggml_backend_meta_split_axis(ggml_n_dims(tensor) - 1), {0}, {1}, 1};
                     }
                 }
                 // Reshape outputs use one segment; split-state propagation merges source segments.
@@ -769,6 +813,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_view = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && tensor->view_offs == 0 && ggml_are_same_shape(tensor, tensor->src[0]) &&
+                std::memcmp(tensor->nb, tensor->src[0]->nb, sizeof(tensor->nb)) == 0) {
+            // A no-op flattened cache-store view must not invent a head axis.
+            return src_ss[0];
+        }
         if (ggml_is_contiguous(tensor) && ggml_is_contiguous(tensor->src[0])) {
             return handle_reshape(src_ss);
         }
@@ -791,6 +840,18 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (!ggml_is_permuted(tensor) && !ggml_is_permuted(tensor->src[0]) && axis >= 0 && axis < GGML_MAX_DIMS-1) {
             for (int dim = 0; dim < GGML_MAX_DIMS-1; dim++) {
                 if (tensor->nb[dim+1] == tensor->src[0]->nb[axis+1]) {
+                    if (dim == 0 && tensor->ne[1] == 1 && src_ss[0].n_segments == 1 && src_ss[0].nr[0] == 1 &&
+                            tensor->nb[2] == tensor->nb[1] && tensor->ne[0] == tensor->src[0]->ne[axis]) {
+                        bool complete_rows = true;
+                        for (size_t j = 0; j < n_bufs; j++) {
+                            complete_rows = complete_rows && (src_ss[0].ne[j] == 0 || src_ss[0].ne[j] == tensor->ne[0]);
+                        }
+                        if (complete_rows) {
+                            // Non-unified MQA cache views add a singleton head between
+                            // the row and context axes. Keep that axis for FlashAttention.
+                            return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
+                        }
+                    }
                     return {ggml_backend_meta_split_axis(dim), {0}, {1}, 1};
                 }
             }
@@ -2501,10 +2562,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             int i_start = 0;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-                if (meta_tensor_is_external_host(node)) {
+                const bool external_host = meta_tensor_is_external_host(node);
+                if (external_host && i + 1 != cgraph->n_nodes) {
                     continue;
                 }
-                const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(node, /*assume_sync =*/ false);
+                // A trailing host cache view is already materialized, but must
+                // still close the final meta subgraph (including its boundary).
+                const ggml_backend_meta_split_state split_state = external_host
+                        ? ggml_backend_meta_split_state{GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1}
+                        : ggml_backend_meta_get_split_state(node, /*assume_sync =*/ false);
                 if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
                     max_tmp_size = std::max(max_tmp_size, ggml_nbytes(node));
                 }
