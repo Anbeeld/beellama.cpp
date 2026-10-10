@@ -693,6 +693,12 @@ add_executable(${TEST_TARGET} test-c.c)
 target_link_libraries(${TEST_TARGET} PRIVATE llama)
 
 if (NOT LLAMA_USE_SYSTEM_GGML)
+    # Check the internal quantization ABI with the C compiler, not only C++/CUDA.
+    add_executable(test-prism-quants test-prism-quants.c)
+    target_include_directories(test-prism-quants PRIVATE ../ggml/src)
+    target_link_libraries(test-prism-quants PRIVATE ggml)
+    llama_test(test-prism-quants)
+
     # Needs non-public ggml-impl.h
     llama_build_and_test(test-gguf.cpp)
 
