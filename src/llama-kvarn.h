@@ -235,6 +235,12 @@ std::vector<uint32_t> llama_kvarn_live_stage_groups(
         uint32_t n_groups,
         uint32_t retained_per_seq);
 
+// Non-SWA groups whose live rows exist only in the F16 stage of a stream with
+// the fixed per-stream stage layout. Eager stores seal a group > 0 into its
+// record when the group's final cell is written; group 0 is the permanent
+// attention sink and is never sealed. `cells` are stream-local cell indices.
+std::vector<uint32_t> llama_kvarn_stage_only_groups(const std::vector<uint32_t> & cells);
+
 std::vector<llama_kvarn_state_stage_cell> llama_kvarn_select_state_stage_cells(
         const std::vector<uint32_t> & source_cells,
         uint32_t live_cell_max_p1,
