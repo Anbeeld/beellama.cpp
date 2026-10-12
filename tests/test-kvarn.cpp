@@ -470,6 +470,12 @@ static void kvarn_per_stream_state_keeps_sink_and_unsealed_stage_rows() {
     }
     require(llama_kvarn_select_state_record_groups(aligned, aligned_rows, 32) == sealed,
             "per-stream KVarN state did not serialize every sealed record");
+    const auto aligned_rollback_rows = llama_kvarn_select_state_stage_cells(
+            aligned, 1792, 3, 2, false);
+    require(aligned_rollback_rows.size() == 384 &&
+            aligned_rollback_rows[128].source_cell == 1536 &&
+            aligned_rollback_rows.back().source_cell == 1791,
+            "per-stream KVarN state lost sealed F16 rows needed for suffix rollback");
 
     std::vector<uint32_t> unaligned = aligned;
     for (uint32_t cell = 1792; cell < 1799; ++cell) {
@@ -485,6 +491,12 @@ static void kvarn_per_stream_state_keeps_sink_and_unsealed_stage_rows() {
             "per-stream KVarN state mapped the unsealed group to the wrong stage slot");
     require(llama_kvarn_select_state_record_groups(unaligned, unaligned_rows, 32) == sealed,
             "per-stream KVarN state serialized a stale unsealed record");
+    const auto unaligned_rollback_rows = llama_kvarn_select_state_stage_cells(
+            unaligned, 1799, 3, 2, false);
+    require(unaligned_rollback_rows.size() == 263 &&
+            unaligned_rollback_rows[128].source_cell == 1664 &&
+            unaligned_rollback_rows.back().source_cell == 1798,
+            "per-stream KVarN state lost the previous or live rollback group");
 }
 
 static void kvarn_compact_read_plan_skips_ownership_holes() {

@@ -2399,15 +2399,11 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
             }
         }
         std::vector<uint32_t> staged_groups;
-        // The store only encodes allocator-assigned stage slots when the compact
-        // read plan is active; otherwise it uses the parity/window layout, so the
-        // state rows must be selected under the same rule.
+        // Compact reads use allocator-owned slots. The fixed layout must also
+        // preserve the previous group's F16 rows: suffix rollback can reopen a
+        // sealed group, and attention/re-sealing then need its exact prefix.
         const bool explicit_stage = !swa && uses_compact_read_indices();
-        if (!swa && !explicit_stage) {
-            // The fixed layout has no allocator-owned stage slots, so derive the
-            // F16-only groups (group-0 sink, unsealed live group) from the cells.
-            staged_groups = llama_kvarn_stage_only_groups(source_cells);
-        } else if (explicit_stage) {
+        if (explicit_stage) {
             for (const uint32_t cell : source_cells) {
                 if (metadata->allocation_cell_uses_stage(cell)) {
                     staged_groups.push_back(cell/KVAR_N_GROUP);
@@ -2424,7 +2420,7 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
                 stage_groups,
                 tail_groups,
                 swa,
-                swa ? nullptr : &staged_groups,
+                explicit_stage ? &staged_groups : nullptr,
                 explicit_stage ? &metadata->get_allocation_stage_slots() : nullptr);
     }
     if (selective_stage_cells.size() > std::numeric_limits<uint32_t>::max()) {
@@ -2439,9 +2435,20 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
 
     std::vector<uint32_t> selective_record_groups;
     if (state_kind == KVAR_N_STATE_RECORDS_SELECTIVE) {
+        const auto source_cells = metadata->state_source_cells(seq_id);
+        auto stage_only_cells = selective_stage_cells;
+        if (!uses_compact_read_indices()) {
+            // Rollback insurance duplicates sealed records in the F16 stage;
+            // only genuinely stage-only groups may exclude their records.
+            const auto stage_only_groups = llama_kvarn_stage_only_groups(source_cells);
+            const uint32_t source_max_p1 = source_cells.empty() ? 0 :
+                    *std::max_element(source_cells.begin(), source_cells.end()) + 1u;
+            stage_only_cells = llama_kvarn_select_state_stage_cells(
+                    source_cells, source_max_p1, stage_groups, tail_groups,
+                    false, &stage_only_groups);
+        }
         selective_record_groups = llama_kvarn_select_state_record_groups(
-                metadata->state_source_cells(seq_id), selective_stage_cells,
-                n_groups_per_stream);
+                source_cells, stage_only_cells, n_groups_per_stream);
     }
     if (selective_record_groups.size() > std::numeric_limits<uint32_t>::max()) {
         throw std::overflow_error("KVarN selective record group count overflows uint32_t");
@@ -2816,11 +2823,10 @@ void llama_kv_cache_kvarn::state_read_sinfo(
             }
         }
         std::vector<uint32_t> staged_groups;
-        // mirror the store's stage layout: allocator slots only with compact reads
+        // Mirror both the allocator-owned compact stage and the fixed layout's
+        // live/previous rollback window, including rows of sealed groups.
         const bool explicit_stage = !swa && uses_compact_read_indices();
-        if (!swa && !explicit_stage) {
-            staged_groups = llama_kvarn_stage_only_groups(destination_cells);
-        } else if (explicit_stage) {
+        if (explicit_stage) {
             for (const uint32_t cell : destination_cells) {
                 if (metadata_prepared->allocation_cell_uses_stage(cell)) {
                     staged_groups.push_back(cell/KVAR_N_GROUP);
@@ -2837,7 +2843,7 @@ void llama_kv_cache_kvarn::state_read_sinfo(
                 stage_groups,
                 tail_groups,
                 swa,
-                swa ? nullptr : &staged_groups,
+                explicit_stage ? &staged_groups : nullptr,
                 explicit_stage ? &metadata_prepared->get_allocation_stage_slots() : nullptr);
         for (const auto & cell : desired) {
             desired_stage_rows.emplace(cell.source_cell, cell.stage_row);

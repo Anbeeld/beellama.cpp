@@ -872,73 +872,94 @@ static int test_kvarn_state_restore(const size_t seed) {
 
         // 256 ends on a sealed record boundary (like the 1,792-token server entry);
         // 300 leaves an unsealed live group that exists only in the F16 stage.
-        for (const uint32_t n_prefix : { 256u, 300u }) {
-            llama_context_params params = llama_context_default_params();
-            params.n_ctx = 1024;
-            params.n_batch = 512;
-            params.n_ubatch = 64;
-            params.n_seq_max = 2;
-            params.kv_unified = false;
-            params.n_threads = 4;
-            params.n_threads_batch = 4;
-            params.offload_kqv = false;
-            params.kvarn = llama_kvarn_params_for_type(LLAMA_KVARN_K4V4_G128);
-            llama_context_ptr ctx(llama_init_from_model(model.get(), params));
-            if (!ctx) {
-                throw std::runtime_error("failed to create KVarN restore test context");
-            }
-            llama_memory_t mem = llama_get_memory(ctx.get());
-            const auto * hybrid = dynamic_cast<const llama_memory_hybrid *>(mem);
-            if (dynamic_cast<const llama_kv_cache_kvarn *>(hybrid ? hybrid->get_mem_attn() : mem) == nullptr) {
-                fprintf(stderr, "%s: KVarN restore test did not construct KVarN storage\n", llm_arch_name(arch));
-                return 1;
-            }
-
-            const auto prefix = get_tokens(n_prefix, n_vocab, seed + 1);
-            const auto suffix = get_tokens(24, n_vocab, seed + 2);
-            const auto unrelated = get_tokens(200, n_vocab, seed + 3);
-            const llama_pos p_suffix = llama_pos(n_prefix);
-            constexpr llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED;
-
-            kvarn_restore_decode(ctx.get(), prefix, 0, 0);
-            std::vector<uint8_t> state(llama_state_seq_get_size_ext(ctx.get(), 0, flags));
-            if (state.empty() ||
-                    llama_state_seq_get_data_ext(ctx.get(), state.data(), state.size(), 0, flags) != state.size()) {
-                throw std::runtime_error("failed to save KVarN sequence state");
-            }
-            // Reference: the live, never-saved state continues with the suffix.
-            const auto reference = kvarn_restore_decode(ctx.get(), suffix, p_suffix, 0);
-
-            const auto check = [&](const char * name, llama_seq_id seq_id) {
-                if (llama_state_seq_set_data_ext(ctx.get(), state.data(), state.size(), seq_id, flags) != state.size()) {
-                    fprintf(stderr, "%s prefix %u %s: KVarN state restore failed\n", llm_arch_name(arch), n_prefix, name);
-                    ++failures;
-                    return;
+        for (const uint32_t n_seq : { 1u, 2u }) {
+            for (const uint32_t n_prefix : { 256u, 300u }) {
+                // Recurrent memory has no suffix rollback snapshots in this fixture.
+                // LLAMA also checks replay within and across the final group boundary.
+                std::set<uint32_t> continuation_positions = { n_prefix };
+                if (arch == LLM_ARCH_LLAMA) {
+                    continuation_positions.insert(n_prefix - 2);
+                    continuation_positions.insert(n_prefix/128*128 - 2);
                 }
-                const auto restored = kvarn_restore_decode(ctx.get(), suffix, p_suffix, seq_id);
-                // The restored state and the executed graph are identical, so the
-                // continuation must be bit-exact. Before the fix a restore into the
-                // overwritten sequence differed only at ~1e-14 on this tiny model.
-                const double err = nmse(reference, restored);
-                const bool ok = reference == restored;
-                fprintf(stderr, "%-6s prefix %u %-34s nmse = %.3e %s\n",
-                        llm_arch_name(arch), n_prefix, name, err, ok ? "OK" : "FAIL");
-                failures += ok ? 0 : 1;
-            };
+                for (const uint32_t n_keep : continuation_positions) {
+                    llama_context_params params = llama_context_default_params();
+                    params.n_ctx = 1024;
+                    params.n_batch = 512;
+                    params.n_ubatch = 64;
+                    params.n_seq_max = n_seq;
+                    params.kv_unified = false;
+                    params.n_threads = 4;
+                    params.n_threads_batch = 4;
+                    params.offload_kqv = false;
+                    params.kvarn = llama_kvarn_params_for_type(LLAMA_KVARN_K4V4_G128);
+                    llama_context_ptr ctx(llama_init_from_model(model.get(), params));
+                    if (!ctx) {
+                        throw std::runtime_error("failed to create KVarN restore test context");
+                    }
+                    llama_memory_t mem = llama_get_memory(ctx.get());
+                    const auto * hybrid = dynamic_cast<const llama_memory_hybrid *>(mem);
+                    if (dynamic_cast<const llama_kv_cache_kvarn *>(hybrid ? hybrid->get_mem_attn() : mem) == nullptr) {
+                        fprintf(stderr, "%s: KVarN restore test did not construct KVarN storage\n", llm_arch_name(arch));
+                        return 1;
+                    }
 
-            // Another sequence has its own, never-written physical stream.
-            check("restore into fresh sequence 1", 1);
-            llama_memory_seq_rm(mem, 1, -1, -1);
+                    const auto prefix = get_tokens(n_prefix, n_vocab, seed + 1);
+                    const auto suffix = get_tokens(24, n_vocab, seed + 2);
+                    const auto unrelated = get_tokens(200, n_vocab, seed + 3);
+                    const llama_pos p_suffix = llama_pos(n_keep);
+                    constexpr llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED;
 
-            // The original sequence after unrelated work has overwritten its stage.
-            llama_memory_seq_rm(mem, 0, -1, -1);
-            kvarn_restore_decode(ctx.get(), unrelated, 0, 0);
-            llama_memory_seq_rm(mem, 0, -1, -1);
-            check("restore into overwritten sequence 0", 0);
+                    kvarn_restore_decode(ctx.get(), prefix, 0, 0);
+                    std::vector<uint8_t> state(llama_state_seq_get_size_ext(ctx.get(), 0, flags));
+                    if (state.empty() ||
+                            llama_state_seq_get_data_ext(ctx.get(), state.data(), state.size(), 0, flags) != state.size()) {
+                        throw std::runtime_error("failed to save KVarN sequence state");
+                    }
+                    // Reference: trim the original live state before continuing. This
+                    // includes reopening a sealed group, whose surviving F16 rows are
+                    // required by both attention and re-sealing after suffix rollback.
+                    if (!llama_memory_seq_rm(mem, 0, p_suffix, -1)) {
+                        throw std::runtime_error("failed to trim live KVarN reference state");
+                    }
+                    const auto reference = kvarn_restore_decode(ctx.get(), suffix, p_suffix, 0);
 
-            // The original sequence after all model memory data was zeroed.
-            llama_memory_clear(mem, true);
-            check("restore after hard memory clear", 0);
+                    const auto check = [&](const char * name, llama_seq_id seq_id) {
+                        if (llama_state_seq_set_data_ext(ctx.get(), state.data(), state.size(), seq_id, flags) != state.size()) {
+                            fprintf(stderr, "%s prefix %u %s: KVarN state restore failed\n", llm_arch_name(arch), n_prefix, name);
+                            ++failures;
+                            return;
+                        }
+                        if (!llama_memory_seq_rm(mem, seq_id, p_suffix, -1)) {
+                            throw std::runtime_error("failed to trim restored KVarN state");
+                        }
+                        const auto restored = kvarn_restore_decode(ctx.get(), suffix, p_suffix, seq_id);
+                        // The restored state and the executed graph are identical, so the
+                        // continuation must be bit-exact. Before the fix a restore into the
+                        // overwritten sequence differed only at ~1e-14 on this tiny model.
+                        const double err = nmse(reference, restored);
+                        const bool ok = reference == restored;
+                        fprintf(stderr, "%-6s streams %u prefix %u keep %u %-34s nmse = %.3e %s\n",
+                                llm_arch_name(arch), n_seq, n_prefix, n_keep, name, err, ok ? "OK" : "FAIL");
+                        failures += ok ? 0 : 1;
+                    };
+
+                    // Another sequence has its own, never-written physical stream.
+                    if (n_seq > 1) {
+                        check("restore into fresh sequence 1", 1);
+                        llama_memory_seq_rm(mem, 1, -1, -1);
+                    }
+
+                    // The original sequence after unrelated work has overwritten its stage.
+                    llama_memory_seq_rm(mem, 0, -1, -1);
+                    kvarn_restore_decode(ctx.get(), unrelated, 0, 0);
+                    llama_memory_seq_rm(mem, 0, -1, -1);
+                    check("restore into overwritten sequence 0", 0);
+
+                    // The original sequence after all model memory data was zeroed.
+                    llama_memory_clear(mem, true);
+                    check("restore after hard memory clear", 0);
+                }
+            }
         }
     }
 
