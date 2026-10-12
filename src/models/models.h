@@ -2541,7 +2541,6 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * k_cur,
                     ggml_tensor * v_cur,
                     ggml_tensor * sel,
-                        int64_t   n_sel,
                           float   kq_scale,
                             int   il);
 

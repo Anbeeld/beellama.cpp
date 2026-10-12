@@ -705,20 +705,18 @@ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 #endif
 
 void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
-    const int qk = QK2_0;
-    const int nb = n / qk;
-
-    assert(n % qk == 0);
+    assert(n % QK2_0 == 0);
     assert(nrc == 1);
     UNUSED(nrc);
     UNUSED(bx);
     UNUSED(by);
     UNUSED(bs);
 
+#if defined(__AVX2__)
+    const int nb = n / QK2_0;
     const block_q2_0 * GGML_RESTRICT x = vx;
     const block_q8_0 * GGML_RESTRICT y = vy;
 
-#if defined(__AVX2__)
     // weight (4*b + j) lives in bits [2j, 2j+1] of byte b: broadcast the 8 bytes to 4 lanes and shift lane j by 2j,
     // which yields order (8*j + b); the q8 block is permuted to the same order, so the dot product is unchanged
     const __m256i shifts = _mm256_set_epi64x(6, 4, 2, 0);
