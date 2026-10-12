@@ -4293,13 +4293,20 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
     const auto * kvarn_ctx = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur);
     const bool use_kvarn = kvarn_ctx != nullptr;
+    // Q still has all streams flattened here; build_attn_mha divides its
+    // token dimension by the mask's stream count. Route by that per-stream
+    // query width, not the batch's total token count (e.g. 30 one-row decodes).
+    const auto * route_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
+    GGML_ASSERT(route_mask->ne[3] > 0 && q_cur->ne[2] % route_mask->ne[3] == 0);
+    const uint32_t query_tokens_per_stream = uint32_t(q_cur->ne[2] / route_mask->ne[3]);
     const bool kvarn_native_attention = llm_kvarn_native_attention_for(
-        kvarn_ctx, arch, cparams.causal_attn, is_swa, il, (int) q_cur->ne[0]);
+        kvarn_ctx, arch, cparams.causal_attn, is_swa, il, (int) q_cur->ne[0]) &&
+        (!is_swa || route_mask->ne[3] == 1 || query_tokens_per_stream == 1);
     const auto kvarn_plan = use_kvarn ? llama_kvarn_plan_attention(
         kvarn_native_attention,
         kvarn_ctx->native_attention_uses_original_v(il),
         kvarn_ctx->native_rotated_max_query_tokens(il),
-        (uint32_t) q_cur->ne[2],
+        query_tokens_per_stream,
         (int) q_cur->ne[0]) : llama_kvarn_attention_plan {
             false, GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO };
     if (use_kvarn && arch == LLM_ARCH_DFLASH && !cparams.causal_attn) {

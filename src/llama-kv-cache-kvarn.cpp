@@ -50,6 +50,25 @@ using backend_kvarn_tail_attention_supported_t = bool (*)(
         ggml_backend_dev_t,
         ggml_type, ggml_type, ggml_type, ggml_type, int64_t, int64_t);
 
+// Multi-stream SWA decode is qualified on CPU and CUDA. Other backends
+// retain materialization until their ring/index addressing is runtime-tested.
+static bool kvarn_backend_supports_multistream_swa(ggml_backend_dev_t dev) {
+    if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return true;
+    }
+    if (ggml_backend_dev_is_meta(dev)) {
+        const size_t count = ggml_backend_meta_device_count(dev);
+        for (size_t i = 0; i < count; ++i) {
+            if (!kvarn_backend_supports_multistream_swa(ggml_backend_meta_device_get(dev, i))) {
+                return false;
+            }
+        }
+        return count > 0;
+    }
+    const auto reg = ggml_backend_dev_backend_reg(dev);
+    return reg != nullptr && std::strcmp(ggml_backend_reg_name(reg), "CUDA") == 0;
+}
+
 bool kvarn_backend_supports_native_tail(
         ggml_backend_dev_t dev, ggml_type exact_type, int64_t d_k, int64_t d_v) {
     if (dev == nullptr) {
@@ -1486,7 +1505,8 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
             (!explicit_bias && kvarn_backend_supports_native_tail(
                 dev, exact_tail_type, head_dim_k, head_dim_v));
         const bool native_attention =
-            llama_kvarn_backend_supports_native_ops(dev) && native_tail && !(swa && n_stream > 1);
+            llama_kvarn_backend_supports_native_ops(dev) && native_tail &&
+            (!swa || n_stream == 1 || kvarn_backend_supports_multistream_swa(dev));
         const bool mixed_tail_native = native_attention &&
             llama_kvarn_backend_mixed_tail_native_preferred(dev);
         const bool native_original_v = native_attention &&

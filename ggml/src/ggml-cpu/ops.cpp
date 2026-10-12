@@ -12708,7 +12708,7 @@ static bool kvarn_cpu_attn_parse_side(const ggml_tensor * tensor, kvarn_cpu_attn
         const int64_t index = kvarn_cpu_read_cell(encoded, side.read_indirect, side.swa, staged);
         const int64_t global_group = index / KVAR_N_GROUP;
         const int64_t position = index % KVAR_N_GROUP;
-        const int64_t stream = side.swa ? side.stream_start : global_group / side.groups_per_stream;
+        const int64_t stream = side.swa ? kvarn_cpu_swa_stream(encoded) : global_group / side.groups_per_stream;
         if (stream < side.stream_start || stream >= side.stream_start + side.n_stream) {
             continue;
         }
@@ -12742,7 +12742,8 @@ static kvarn_cpu_attn_ref kvarn_cpu_attn_resolve(
 
     const int64_t stream = side.stream_start + out_stream;
     const int64_t * indices = (const int64_t *) side.indices->data;
-    const int64_t encoded = (side.swa || side.read_indirect) ? indices[token] : token;
+    const int64_t encoded = side.swa ? indices[stream * side.view->ne[2] + token] :
+        (side.read_indirect ? indices[token] : token);
     if (encoded == -1) {
         return {};
     }

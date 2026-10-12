@@ -1234,7 +1234,7 @@ static std::vector<ggml_fp16_t> test_kvarn_reference_decode(
     require(stream_start >= 0 && n_stream > 0 && stream_start + n_stream <= total_streams,
             "reference decode stream range mismatch");
     if (swa) {
-        require((int) indices.size() >= n_kv, "reference decode SWA indices too short");
+        require((int) indices.size() >= n_kv * n_stream, "reference decode SWA indices too short");
     }
 
     const int groups_per_stream = (int) (records->ne[2] / total_streams);
@@ -1249,6 +1249,7 @@ static std::vector<ggml_fp16_t> test_kvarn_reference_decode(
     ggml_backend_tensor_get(records, record_data.data(), 0, record_data.size());
 
     std::vector<int64_t> live_groups(n_stream, 0);
+    std::vector<int64_t> live_positions(n_stream, -1);
     for (int64_t idx : indices) {
         if (idx < 0) {
             require(swa, "reference decode negative non-SWA index");
@@ -1256,7 +1257,18 @@ static std::vector<ggml_fp16_t> test_kvarn_reference_decode(
         }
         const int64_t group_global = idx / 128;
         if (swa) {
-            live_groups[0] = std::max(live_groups[0], group_global);
+            const int64_t stream = llama_kvarn_decode_swa_stream(idx);
+            if (stream >= stream_start && stream < stream_start + n_stream) {
+                const int64_t cell = llama_kvarn_decode_cell(idx);
+                const int64_t group = cell / 128;
+                const size_t output_stream = size_t(stream - stream_start);
+                if (group > live_groups[output_stream]) {
+                    live_groups[output_stream] = group;
+                    live_positions[output_stream] = cell % 128;
+                } else if (group == live_groups[output_stream]) {
+                    live_positions[output_stream] = std::max(live_positions[output_stream], cell % 128);
+                }
+            }
         } else {
             const int64_t stream = group_global / groups_per_stream;
             if (stream >= stream_start && stream < stream_start + n_stream) {
@@ -1276,9 +1288,14 @@ static std::vector<ggml_fp16_t> test_kvarn_reference_decode(
             ? (live_group >= (tail_groups - 1) ? live_group - (tail_groups - 1) : 0)
             : 0;
         for (int cell = 0; cell < n_kv; ++cell) {
-            const int64_t abs_pos = swa ? indices[cell] : cell;
-            if (abs_pos < 0) {
+            const int64_t read_idx = swa ? indices[size_t(out_stream) * n_kv + cell] : cell;
+            if (read_idx < 0) {
                 continue;
+            }
+            const int64_t abs_pos = swa ? llama_kvarn_decode_cell(read_idx) : cell;
+            if (swa) {
+                require(llama_kvarn_decode_swa_stream(read_idx) == uint32_t(stream),
+                        "reference decode SWA index belongs to another stream");
             }
             const int64_t group = abs_pos / 128;
             const int64_t pos = abs_pos % 128;
@@ -1306,7 +1323,8 @@ static std::vector<ggml_fp16_t> test_kvarn_reference_decode(
                 // Eager stores publish completed groups immediately, even
                 // while their lossless staging slots have not been reused.
                 if (stage->op_params[9] != 0) {
-                    const bool incomplete_live = group == live_group && n_kv % 128 != 0;
+                    const bool incomplete_live = group == live_group &&
+                        (swa ? live_positions[out_stream] < 127 : n_kv % 128 != 0);
                     from_stage = (!swa && group == 0) || incomplete_live;
                     from_record = !from_stage && group <= live_group &&
                         (swa ? live_group - group < groups_per_stream : group < groups_per_stream);
@@ -2188,7 +2206,12 @@ static std::vector<float> test_native_flash_attention_output(
         int            indirect_offset = 0,
         int            window_chunk = 0,
         bool           non_causal_holes = false,
-        int            visible_from = 0) {
+        int            visible_from = 0,
+        int            n_stream = 1,
+        bool           staged_swa_tail = false) {
+    require(n_stream > 0, "native FA: invalid stream count");
+    require(n_stream == 1 || (exact_tail_tokens == 0 && explicit_stage_slot < 0 && indirect_offset == 0),
+            "native FA: multistream fixture does not support exact tails or indirect slots");
     ggml_init_params params = {
         /*.mem_size   =*/ 32 * 1024 * 1024,
         /*.mem_buffer =*/ nullptr,
@@ -2197,7 +2220,6 @@ static std::vector<float> test_native_flash_attention_output(
     ggml_context * ctx = ggml_init(params);
     require(ctx != nullptr, "native FA: failed to initialize ggml context");
 
-    constexpr int n_stream   = 1;
     const int record_dim = head_dim == 64 ? 64 : 128;
     const int slices = head_dim / record_dim;
     const int record_heads = n_kv_heads * slices;
@@ -2392,12 +2414,18 @@ static std::vector<float> test_native_flash_attention_output(
     require(buffer != nullptr, "native FA: failed to allocate tensors");
 
     std::vector<float> q_data((size_t) head_dim * n_q * n_q_heads * n_stream);
-    for (int qh = 0; qh < n_q_heads; ++qh) {
-        for (int iq = 0; iq < n_q; ++iq) {
-            for (int d = 0; d < head_dim; ++d) {
-                q_data[((size_t) qh * n_q + iq) * head_dim + d] =
-                    0.09f * std::sin(float(d) * 0.017f + float(iq) * 0.13f + float(qh) * 0.021f) +
-                    0.07f * std::cos(float(d) * 0.031f - float(iq) * 0.05f + float(qh) * 0.033f);
+    for (int s = 0; s < n_stream; ++s) {
+        for (int qh = 0; qh < n_q_heads; ++qh) {
+            for (int iq = 0; iq < n_q; ++iq) {
+                for (int d = 0; d < head_dim; ++d) {
+                    // Preserve single-stream fixtures; new production-layout cases
+                    // index [D, heads, queries, streams] before the graph permute.
+                    const size_t row = production_query_layout && n_stream > 1 ?
+                        size_t(iq) * n_q_heads + qh : size_t(qh) * n_q + iq;
+                    q_data[(size_t(s) * n_q * n_q_heads + row) * head_dim + d] =
+                        0.09f * std::sin(float(d) * 0.017f + float(iq) * 0.13f + float(qh) * 0.021f + float(s) * 0.19f) +
+                        0.07f * std::cos(float(d) * 0.031f - float(iq) * 0.05f + float(qh) * 0.033f + float(s) * 0.23f);
+                }
             }
         }
     }
@@ -2411,18 +2439,20 @@ static std::vector<float> test_native_flash_attention_output(
     if (const char * outlier_env = std::getenv("GGML_KVARN_TEST_LADDER_OUTLIER")) {
         ladder_outlier = strtof(outlier_env, nullptr);
     }
-    for (int t = 0; t < n_kv; ++t) {
+    for (int st = 0; st < n_kv * n_stream; ++st) {
+        const int t = st % n_kv;
+        const int s = st / n_kv;
         for (int h = 0; h < n_kv_heads; ++h) {
             for (int slice = 0; slice < slices; ++slice) {
                 const int record_head = h * slices + slice;
                 for (int d = 0; d < record_dim; ++d) {
                     const int full_d = slice * record_dim + d;
-                    const size_t off = ((size_t) t * record_heads + record_head) * record_dim + d;
+                    const size_t off = ((size_t) st * record_heads + record_head) * record_dim + d;
                     k_data[off] =
-                        0.80f * std::sin(float(full_d) * 0.011f + float(t) * 0.021f) +
+                        0.80f * std::sin(float(full_d) * 0.011f + float(t) * 0.021f + float(s) * 0.31f) +
                         0.10f * std::cos(float(t) * 0.009f + float(h) * 0.17f);
                     v_data[off] =
-                        0.75f * std::cos(float(full_d) * 0.013f - float(t) * 0.019f) +
+                        0.75f * std::cos(float(full_d) * 0.013f - float(t) * 0.019f + float(s) * 0.37f) +
                         0.08f * std::sin(float(t) * 0.015f + float(h) * 0.23f);
                     if (ladder_outlier != 0.0f && (full_d % 64) == 0) {
                         k_data[off] *= ladder_outlier;
@@ -2438,6 +2468,18 @@ static std::vector<float> test_native_flash_attention_output(
     const int live_group = (n_kv - 1) / 128;
     const bool live_group_incomplete = n_kv % 128 != 0;
     for (int i = 0; i < n_kv * n_stream; ++i) {
+        if (n_stream > 1) {
+            const int s = i / n_kv;
+            const int t = i % n_kv;
+            // Start beyond both record and stage depth, with distinct per-stream
+            // ring ownership. A full window crosses the physical record ring.
+            idx[i] = swa ? llama_kvarn_encode_swa_position(
+                    uint32_t(s), uint32_t(128 * (groups_per_stream + 1 + s % 5) +
+                        (staged_swa_tail ? 17 : 0) + t)) :
+                    int64_t(s * groups_per_stream * 128 + t);
+            read_idx[i] = idx[i];
+            continue;
+        }
         idx[i] = explicit_stage_slot >= 0 ?
             llama_kvarn_encode_store_cell(
                     uint32_t(i), i/128 == 0 ? 0u : uint32_t(explicit_stage_slot)) : i;
@@ -2450,7 +2492,8 @@ static std::vector<float> test_native_flash_attention_output(
     }
 
     std::vector<ggml_fp16_t> mask_data((size_t) n_kv * n_q * n_stream);
-    for (int iq = 0; iq < n_q; ++iq) {
+    for (int siq = 0; siq < n_q * n_stream; ++siq) {
+        const int iq = siq % n_q;
         for (int ikv = 0; ikv < n_kv; ++ikv) {
             // DFlash non-causal blocks can see every live row in their stream;
             // retain a short masked suffix to represent empty/padded cache cells.
@@ -2459,7 +2502,7 @@ static std::vector<float> test_native_flash_attention_output(
             const bool visible = non_causal_mask
                 ? dflash_visible
                 : ikv <= iq + n_kv - n_q;
-            mask_data[(size_t) iq * n_kv + ikv] = ggml_fp32_to_fp16(
+            mask_data[(size_t) siq * n_kv + ikv] = ggml_fp32_to_fp16(
                     !exact_tail_bodyless && visible ? 0.0f : -INFINITY);
         }
     }
@@ -5792,8 +5835,222 @@ static void test_meta_kvarn_zero_head_shard() {
     ggml_backend_free(backend);
 }
 
+// Qualifies SWA record-native attention independently of the cache route gate.
+static void test_multistream_swa_native_attention() {
+    ggml_backend_t cpu = init_test_backend(GGML_BACKEND_DEVICE_TYPE_CPU, true);
+    ggml_backend_t gpu = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
+    const char * name = gpu ? ggml_backend_dev_name(ggml_backend_get_device(gpu)) : nullptr;
+    const bool cuda = name && std::strncmp(name, "CUDA", 4) == 0;
+    for (int n_stream : { 3, 30 }) {
+        for (int head_dim : { 256, 512 }) {
+            for (int n_q : { 1, 32 }) {
+                if (n_stream == 30 && n_q != 1) {
+                    continue;
+                }
+                for (bool staged_tail : { false, true }) {
+                    const int gqa = head_dim == 256 ? 2 : 16;
+                    const auto output = [&](ggml_backend_t backend, bool native) {
+                        return test_native_flash_attention_output(
+                                backend, native, native, head_dim, 4, 4, n_q,
+                                gqa, 1, 512, 3, true, nullptr, false, 0, false,
+                                GGML_TYPE_F16, 0, false, true, -1, true, false,
+                                false, 0, 0, false, 0, n_stream, staged_tail);
+                    };
+                    std::fprintf(stderr, "multistream SWA attention: streams=%d D%d GQA%d queries=%d staged_tail=%d\n",
+                            n_stream, head_dim, gqa, n_q, int(staged_tail));
+                    const std::vector<float> expected = output(cpu, false);
+                    const auto compare_streams = [&](const std::vector<float> & actual, const char * message) {
+                        require(actual.size() == expected.size(), "multistream SWA attention output size mismatch");
+                        const size_t stride = expected.size() / n_stream;
+                        for (int s = 0; s < n_stream; ++s) {
+                            const size_t begin = size_t(s) * stride;
+                            const std::vector<float> actual_stream(actual.begin() + begin, actual.begin() + begin + stride);
+                            const std::vector<float> expected_stream(expected.begin() + begin, expected.begin() + begin + stride);
+                            require_close_f32_rmse(actual_stream, expected_stream, 1e-2f, message);
+                        }
+                    };
+                    compare_streams(output(cpu, true),
+                            "multistream SWA CPU native attention differs from materialized CPU oracle");
+                    if (cuda) {
+                        const auto [reset, get] = get_kvarn_route_stats_fns(gpu);
+                        require(reset && get, "multistream SWA CUDA route telemetry is unavailable");
+                        reset();
+                        const std::vector<float> actual = output(gpu, true);
+                        test_kvarn_route_stats routes = make_test_kvarn_route_stats();
+                        get(&routes);
+                        require(routes.direct_entry > 0 &&
+                                (n_q == 1 ? routes.decode_vector + routes.decode_split + routes.generic_mma :
+                                    routes.prompt_prefill) > 0 &&
+                                routes.materialize_fallback == 0,
+                                "multistream SWA attention did not execute a record-native CUDA route");
+                        compare_streams(actual,
+                                "multistream SWA CUDA native attention differs from materialized CPU oracle");
+                    }
+                }
+            }
+        }
+    }
+    if (!cuda) {
+        std::printf("test-kvarn: multistream SWA CUDA qualification skipped (CUDA backend unavailable)\n");
+    }
+    if (gpu) {
+        ggml_backend_free(gpu);
+    }
+    ggml_backend_free(cpu);
+}
+
+// Snapshot both persisted representations: decode equality alone can miss a
+// bad eager seal or a write into an inactive stream.
+static std::vector<uint8_t> test_headwide_multistream_store_snapshot(
+        ggml_backend_t backend, int head_dim, bool value, bool swa,
+        const std::vector<int> & streams, bool interleaved, bool hinted, bool decode = false) {
+    const int slices = head_dim / 128;
+    const int record_heads = 2 * slices;
+    const int n_stream = *std::max_element(streams.begin(), streams.end()) + 2;
+    const int stage_groups = swa ? 4 : 2;
+    constexpr int groups_per_stream = 4;
+    constexpr int bits = 4;
+    // Below the bulk-workspace threshold: exercise the headwide monolithic
+    // route, including the pos=127 eager-seal boundary and SWA ring reuse.
+    const int tokens_per_stream = decode ? 1 : (swa ? 257 : 130);
+    const int n_tokens = int(streams.size()) * tokens_per_stream;
+    const int record_bytes = int(llama_kvarn_make_record_layout(128, bits, value).record_bytes);
+    ggml_init_params params = { 8 * 1024 * 1024, nullptr, true };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr, "multistream headwide store: context allocation failed");
+    ggml_tensor * current = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, record_heads, n_tokens);
+    ggml_tensor * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
+    ggml_tensor * stage = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, record_heads, 128 * stage_groups * n_stream);
+    ggml_tensor * records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, record_bytes, record_heads, groups_per_stream * n_stream);
+    ggml_tensor * stored = ggml_kvarn_store(ctx, current, indices, stage, records, bits, 16, value, stage_groups);
+    stored->op_params[3] = hinted ? tokens_per_stream : 0;
+    stored->op_params[4] = swa ? 1 : 0;
+    stored->op_params[5] = slices;
+    stored->op_params[9] = 1;
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, stored);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    require(buffer != nullptr, "multistream headwide store: tensor allocation failed");
+    std::vector<float> input(ggml_nelements(current));
+    std::vector<int64_t> idx(n_tokens);
+    std::vector<bool> active(n_stream, false);
+    for (int i = 0; i < n_tokens; ++i) {
+        const int block = interleaved ? i % int(streams.size()) : i / tokens_per_stream;
+        const int t = interleaved ? i / int(streams.size()) : i % tokens_per_stream;
+        const int stream = streams[block];
+        active[stream] = true;
+        const int pos = (decode ? (swa ? 8 * 128 + 127 : 128 + 127) :
+                (swa ? 7 * 128 + 126 : 126)) + t;
+        idx[i] = swa ? llama_kvarn_encode_swa_position(uint32_t(stream), uint32_t(pos)) :
+                int64_t(stream * groups_per_stream * 128 + pos);
+        for (int h = 0; h < record_heads; ++h) {
+            for (int d = 0; d < 128; ++d) {
+                input[(size_t(i) * record_heads + h) * 128 + d] =
+                    std::sin(float(d) * 0.071f + float(h) * 0.13f + float(stream) * 0.31f) +
+                    std::cos(float(i) * 0.037f + float(block) * 0.23f);
+            }
+        }
+    }
+    std::vector<ggml_fp16_t> stage_seed(ggml_nelements(stage), ggml_fp32_to_fp16(0.125f));
+    std::vector<uint8_t> record_seed(ggml_nbytes(records), 0x5a);
+    ggml_backend_tensor_set(current, input.data(), 0, ggml_nbytes(current));
+    ggml_backend_tensor_set(indices, idx.data(), 0, ggml_nbytes(indices));
+    ggml_backend_tensor_set(stage, stage_seed.data(), 0, ggml_nbytes(stage));
+    ggml_backend_tensor_set(records, record_seed.data(), 0, ggml_nbytes(records));
+    require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
+            "multistream headwide store: graph compute failed");
+    ggml_backend_synchronize(backend);
+    const size_t stage_bytes = ggml_nbytes(stage);
+    std::vector<uint8_t> snapshot(stage_bytes + ggml_nbytes(records));
+    ggml_backend_tensor_get(stage, snapshot.data(), 0, stage_bytes);
+    ggml_backend_tensor_get(records, snapshot.data() + stage_bytes, 0, ggml_nbytes(records));
+    const size_t stage_stride = stage_bytes / n_stream;
+    const size_t record_stride = ggml_nbytes(records) / n_stream;
+    const uint8_t * stage_initial = reinterpret_cast<const uint8_t *>(stage_seed.data());
+    for (int stream = 0; stream < n_stream; ++stream) {
+        if (active[stream]) {
+            // Group 1 (non-SWA) or absolute group 8 / ring slot 0 (SWA)
+            // is completely written, and eager sealing must publish it.
+            const size_t sealed = stage_bytes + stream * record_stride +
+                    size_t(swa ? 0 : 1) * record_bytes * record_heads;
+            require(std::any_of(snapshot.begin() + sealed,
+                                snapshot.begin() + sealed + size_t(record_bytes) * record_heads,
+                                [](uint8_t byte) { return byte != 0x5a; }),
+                    "multistream headwide store did not eagerly seal completed group");
+        } else {
+            require(std::memcmp(snapshot.data() + stream * stage_stride,
+                                stage_initial + stream * stage_stride, stage_stride) == 0,
+                    "multistream headwide store modified inactive stage sentinel");
+            require(std::memcmp(snapshot.data() + stage_bytes + stream * record_stride,
+                                record_seed.data() + stream * record_stride, record_stride) == 0,
+                    "multistream headwide store modified inactive record sentinel");
+        }
+    }
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    return snapshot;
+}
+
+static void test_headwide_multistream_store() {
+    ggml_backend_t backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
+    if (!backend) {
+        std::printf("test-kvarn: multistream GPU headwide store skipped (GPU backend unavailable)\n");
+        return;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    const char * name = ggml_backend_dev_name(dev);
+    const bool cuda = name && std::strncmp(name, "CUDA", 4) == 0;
+    auto reset = reinterpret_cast<test_kvarn_store_route_stats_reset_fn>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_kvarn_store_route_stats_reset"));
+    auto get = reinterpret_cast<test_kvarn_store_route_stats_get_fn>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_kvarn_store_route_stats_get"));
+    if (cuda) {
+        require(reset && get, "multistream headwide store route telemetry unavailable");
+    }
+    std::vector<int> thirty(30);
+    std::iota(thirty.begin(), thirty.end(), 0);
+    const std::vector<std::vector<int>> cases = {
+        { 0, 1, 2 }, thirty, { 4, 0, 2 }, { 2, 2, 0 }, { 0, 1, 2 },
+    };
+    for (int head_dim : { 256, 512 }) {
+        for (bool value : { false, true }) {
+            for (bool swa : { false, true }) {
+                for (bool decode : { false, true }) {
+                for (size_t c = 0; c < cases.size(); ++c) {
+                    const bool interleaved = c == cases.size() - 1;
+                    const std::vector<uint8_t> serial = test_headwide_multistream_store_snapshot(
+                            backend, head_dim, value, swa, cases[c], interleaved, false, decode);
+                    if (cuda) {
+                        reset();
+                    }
+                    const std::vector<uint8_t> hinted = test_headwide_multistream_store_snapshot(
+                            backend, head_dim, value, swa, cases[c], interleaved, true, decode);
+                    require(hinted == serial,
+                            "hinted multistream headwide store stage/record bytes differ from serial route");
+                    if (cuda) {
+                        test_kvarn_store_route_stats stats = make_test_kvarn_store_route_stats();
+                        get(&stats);
+                        require(stats.headwide_monolithic > 0 && stats.headwide_workspace == 0,
+                                "multistream headwide store did not exercise monolithic route");
+                    }
+                }
+                }
+            }
+        }
+    }
+    ggml_backend_free(backend);
+}
+
 int main() {
     ggml_backend_load_all();
+
+    if (std::getenv("GGML_KVARN_TEST_MULTISTREAM_ONLY") != nullptr) {
+        test_multistream_swa_native_attention();
+        test_headwide_multistream_store();
+        std::printf("test-kvarn: multistream attention/store matrix OK\n");
+        return 0;
+    }
 
     if (std::getenv("GGML_KVARN_BENCH_RECORD_SEAL") != nullptr) {
         benchmark_record_sealer();
@@ -5851,6 +6108,8 @@ int main() {
         return 0;
     }
 
+    test_multistream_swa_native_attention();
+    test_headwide_multistream_store();
     kvarn_suffix_rollback_capability_contract();
     kvarn_composite_exclusivity_forwards();
     kvarn_composite_removal_plan_forwards();
