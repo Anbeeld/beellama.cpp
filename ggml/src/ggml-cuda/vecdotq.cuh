@@ -1233,9 +1233,12 @@ static __device__ __forceinline__ float vec_dot_pq2_0_q8_1(const void * __restri
         const int u  = get_int_b4(bq8_1_chunk->qs, j*2+0);
         const int v  = get_int_b4(bq8_1_chunk->qs, j*2+1);
 
-#if defined(GGML_USE_HIP) && defined(__HIP_DEVICE_COMPILE__)
-        const int qx = q2_0_symbols4_hip((uint32_t) q & 0xFFu);
-        const int qy = q2_0_symbols4_hip(((uint32_t) q >> 8) & 0xFFu);
+#if defined(GGML_USE_HIP)
+        const uint32_t qx_indices = (q & 0x03) | ((q & 0x0C) << 6) | ((q & 0x30) << 12) | ((q & 0xC0) << 18);
+        const uint32_t qy_bits    = q >> 8;
+        const uint32_t qy_indices = (qy_bits & 0x03) | ((qy_bits & 0x0C) << 6) | ((qy_bits & 0x30) << 12) | ((qy_bits & 0xC0) << 18);
+        const int qx = __builtin_amdgcn_perm(0x020100FF, 0x020100FF, qx_indices);
+        const int qy = __builtin_amdgcn_perm(0x020100FF, 0x020100FF, qy_indices);
 #else
         const int qe = __byte_perm(0x020100FF, 0x020100FF, q >> 0);
         const int qo = __byte_perm(0x020100FF, 0x020100FF, q >> 2);
