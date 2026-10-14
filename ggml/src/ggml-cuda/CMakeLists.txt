@@ -1,5 +1,18 @@
 cmake_minimum_required(VERSION 3.18)  # for CMAKE_CUDA_ARCHITECTURES
 
+# ARM64EC uses the x64 ABI, so it needs the x64 import libraries. The arm64 ones
+# hold native ARM64 symbols and cannot satisfy EC references at link time.
+# FindCUDAToolkit picks the library dir from the host arch, not the target, so
+# anchor its search at lib/x64 here. It derives everything else from CUDA_CUDART.
+string(TOLOWER "${CMAKE_GENERATOR_PLATFORM}" GGML_CUDA_PLATFORM_LWR)
+if (MSVC AND GGML_CUDA_PLATFORM_LWR STREQUAL "arm64ec")
+    find_library(CUDA_CUDART
+        NAMES cudart
+        HINTS ${CUDAToolkit_ROOT} ENV CUDA_PATH
+        PATH_SUFFIXES lib/x64
+    )
+endif()
+
 find_package(CUDAToolkit)
 
 if (CUDAToolkit_FOUND)
@@ -58,14 +71,13 @@ if (CUDAToolkit_FOUND)
 
     enable_language(CUDA)
 
-    # TODO: Remove once CCCL 3.2 has been released and bundled with CUDA Toolkit
-    if (GGML_CUDA_CUB_3DOT2)
+    if (GGML_CUDA_CCCL_VERSION)
         include(FetchContent)
 
         FetchContent_Declare(
             CCCL
             GIT_REPOSITORY https://github.com/nvidia/cccl.git
-            GIT_TAG        v3.2.0
+            GIT_TAG        "${GGML_CUDA_CCCL_VERSION}"
             GIT_SHALLOW    TRUE
         )
 
@@ -118,29 +130,8 @@ if (CUDAToolkit_FOUND)
     file(GLOB   SRCS "template-instances/mmf*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
 
-    macro(ggml_add_fattn_vec_pair OUT_VAR PREFIX K_TYPE V_TYPE)
-        set(_FILE "${PREFIX}/fattn-vec-instance-${K_TYPE}-${V_TYPE}.cu")
-        if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_FILE}")
-            message(FATAL_ERROR "Missing FA vec template instance: ${_FILE}")
-        endif()
-        list(APPEND ${OUT_VAR} "${_FILE}")
-    endmacro()
-
-    set(FA_VEC_PREFIX "template-instances")
-
-    if (GGML_CUDA_FA_ALL_QUANTS)
-        file(GLOB   SRCS "${FA_VEC_PREFIX}/fattn-vec-instance-*.cu")
-        list(APPEND GGML_SOURCES_CUDA ${SRCS})
-        add_compile_definitions(GGML_CUDA_FA_ALL_QUANTS)
-    else()
-        ggml_cuda_get_fattn_vec_default_pairs(GGML_CUDA_FA_DEFAULT_KV_PAIRS)
-        foreach(PAIR ${GGML_CUDA_FA_DEFAULT_KV_PAIRS})
-            string(REPLACE ":" ";" PARTS "${PAIR}")
-            list(GET PARTS 0 K_TYPE)
-            list(GET PARTS 1 V_TYPE)
-            ggml_add_fattn_vec_pair(GGML_SOURCES_CUDA "${FA_VEC_PREFIX}" "${K_TYPE}" "${V_TYPE}")
-        endforeach()
-    endif()
+    ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR} SRCS)
+    list(APPEND GGML_SOURCES_CUDA ${SRCS})
 
     ggml_add_backend_library(ggml-cuda
                              ${GGML_HEADERS_CUDA}
@@ -171,14 +162,15 @@ if (CUDAToolkit_FOUND)
         add_compile_definitions(GGML_CUDA_NO_PEER_COPY)
     endif()
 
+    if (GGML_CUDA_CCCL_VERSION)
+        target_link_libraries(ggml-cuda PRIVATE CCCL::CCCL)
+    endif()
+
     if (GGML_STATIC)
         if (WIN32)
             # As of 12.3.1 CUDA Toolkit for Windows does not offer a static cublas library
             target_link_libraries(ggml-cuda PRIVATE CUDA::cudart_static CUDA::cublas)
         else ()
-            if (GGML_CUDA_CUB_3DOT2)
-                target_link_libraries(ggml-cuda PRIVATE  CCCL::CCCL)
-            endif()
             if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "10.1")
                 target_link_libraries(ggml-cuda PRIVATE  CUDA::cudart_static CUDA::cublas_static CUDA::cublasLt_static)
             else()
@@ -186,9 +178,6 @@ if (CUDAToolkit_FOUND)
             endif()
         endif()
     else()
-        if (GGML_CUDA_CUB_3DOT2)
-            target_link_libraries(ggml-cuda PRIVATE  CCCL::CCCL)
-        endif()
         target_link_libraries(ggml-cuda PRIVATE CUDA::cudart CUDA::cublas)
     endif()
 

@@ -37,6 +37,7 @@ public:
     virtual void on_commit(std::function<void()> callback) = 0;
     virtual void commit() = 0;
     virtual void cancel() = 0;
+    virtual void discard() { cancel(); }
 
     // bytes read so far
     virtual size_t n_bytes() = 0;

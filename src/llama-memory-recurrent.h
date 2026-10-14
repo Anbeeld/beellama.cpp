@@ -130,6 +130,8 @@ private:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
 
     bool resize(uint32_t new_mem_size);
+    // true if no layers - can happen if the layer filter removes all layers
+    bool is_empty() const;
 
     size_t total_size() const;
 
@@ -143,6 +145,7 @@ private:
     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t cell_count, uint32_t restore_head);
 
+    void state_clear(llama_seq_id seq_id, uint32_t cell_head, uint32_t cell_count);
 };
 
 class llama_memory_recurrent_context : public llama_memory_context_i {

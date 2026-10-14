@@ -50,12 +50,12 @@ static __device__ __forceinline__ int64_t ggml_cuda_fattn_kvarn_read_cell(
         const int64_t encoded,
         bool & explicitly_staged,
         int * assigned_slot = nullptr) {
-    GGML_UNUSED(desc);
-    explicitly_staged = encoded < -1;
+    // SWA's high word encodes the stream, not a compact-tail staging slot.
+    explicitly_staged = !desc.swa && encoded < -1;
     const uint64_t payload = uint64_t(encoded < -1 ? -(encoded + 2) : encoded);
     if (assigned_slot != nullptr) {
         const uint32_t packed = uint32_t(payload >> 32u);
-        *assigned_slot = packed == 0 ? -1 : int(packed - 1u);
+        *assigned_slot = desc.swa || packed == 0 ? -1 : int(packed - 1u);
     }
     return int64_t(uint32_t(payload));
 }

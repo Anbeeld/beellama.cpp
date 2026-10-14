@@ -54,59 +54,41 @@ int main(int argc, char ** argv) {
     }
 
     const std::string root = argv[1];
-    const std::string generator = read_file(root + "/scripts/gen-fattn-vec-dispatch.py");
-    const std::string dispatch = read_file(root + "/ggml/src/ggml-cuda/fattn-vec-dispatch.cuh");
     const std::string vec = read_file(root + "/ggml/src/ggml-cuda/fattn-vec.cuh");
     const std::string cmake = read_file(root + "/ggml/CMakeLists.txt");
+    const std::string instances = read_file(root + "/ggml/cmake/common.cmake");
     const std::string fattn = read_file(root + "/ggml/src/ggml-cuda/fattn.cu");
 
-    const std::string all_branch = slice_between(dispatch,
-            "#if defined(GGML_CUDA_FA_ALL_QUANTS)",
-            "#else");
-    const std::string default_branch = slice_between(dispatch,
-            "#else",
-            "#endif");
+    const std::string dispatch = slice_between(fattn,
+            "static fattn_vec_case_t ggml_cuda_get_fattn_vec_case",
+            "static ggml_type ggml_cuda_fattn_canonical_kv_type");
+    ok &= expect(!dispatch.empty() && count_occurrences(dispatch, "FATTN_VEC_CASES_ALL_D(") == 169,
+        "the runtime vector dispatch must enumerate all 169 ordered pairs of the 13 retained types");
+    ok &= expect(dispatch.find("FATTN_VEC_CASES_ALL_D(F16   , F16)") != std::string::npos &&
+                 dispatch.find("FATTN_VEC_CASES_ALL_D(BF16  , BF16)") != std::string::npos,
+        "the full runtime vector dispatch must retain homogeneous F16 and BF16 instances");
+    ok &= expect(dispatch.find("Q2_0S") != std::string::npos && dispatch.find("GGML_TYPE_Q2_0,") == std::string::npos,
+        "the fork low-bit vector type must be Q2_0S, distinct from upstream Q2_0");
+    ok &= expect(cmake.find("list(LENGTH _pairs _pair_count)") != std::string::npos &&
+                 cmake.find("Default CUDA FA vec policy expected 50 pairs") != std::string::npos &&
+                 cmake.find("foreach(PAIR ${GGML_CUDA_KVARN_DEFAULT_PAIRS})") != std::string::npos,
+        "CMake must derive and enforce the 50-pair default policy from KVarN default pairs");
+    ok &= expect(cmake.find("set(_pairs f16:f16 bf16:bf16)") != std::string::npos &&
+                 instances.find("ggml_cuda_get_fattn_vec_default_pairs(DEFAULT_PAIRS)") != std::string::npos &&
+                 instances.find("if (GGML_CUDA_FA_ALL_QUANTS)") != std::string::npos &&
+                 instances.find("foreach (TYPE_V IN LISTS FA_TYPES)") != std::string::npos,
+        "the compiled default and ALL modes must use the validated CMake pair lists");
+    ok &= expect(fattn.find("#if defined(GGML_CUDA_FA_ALL_QUANTS)") != std::string::npos &&
+                 fattn.find("return true;", fattn.find("#if defined(GGML_CUDA_FA_ALL_QUANTS)")) != std::string::npos &&
+                 fattn.find("ggml_cuda_fattn_default_quant_pair(type_K, type_V)") != std::string::npos,
+        "runtime compiled-pair gate must select all pairs in ALL mode and enforce the default quant policy otherwise");
 
-    ok &= expect(generator.find("assert len(TYPES) == 13") != std::string::npos &&
-                 generator.find("assert len(pairs_default) == 50") != std::string::npos &&
-                 generator.find("assert len(pairs_all) == 169") != std::string::npos,
-        "the vector-pair generator must assert the 13-type, 50-default, and 169-ALL policy counts");
-    ok &= expect(generator.find("KVARN_DEFAULT_BIT_PAIRS") != std::string::npos,
-        "the default vector-pair policy must use the KVarN default bit-pair rules");
-    ok &= expect(generator.find("GGML_TYPE_Q2_0S") != std::string::npos,
-        "the surviving fork q2 cache type must be q2_0s, not the upstream q2_0 type");
 
-    ok &= expect(!all_branch.empty() && !default_branch.empty(),
-        "the generated vector dispatch must have distinct ALL and default branches");
-    ok &= expect(count_occurrences(all_branch, "FATTN_VEC_CASES_ALL_D(") == 169,
-        "the ALL vector dispatch must include every ordered pair of the 13 retained types");
-    ok &= expect(count_occurrences(default_branch, "FATTN_VEC_CASES_ALL_D(") == 50,
-        "the default vector dispatch must include exactly 50 pairs");
-    ok &= expect(default_branch.find("FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16, GGML_TYPE_F16)") != std::string::npos &&
-                 default_branch.find("FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)") != std::string::npos,
-        "the default vector dispatch must retain the homogeneous F16 and BF16 tail pairs");
-    ok &= expect(default_branch.find("FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16, GGML_TYPE_Q") == std::string::npos &&
-                 default_branch.find("FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_F16)") == std::string::npos &&
-                 default_branch.find("FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16, GGML_TYPE_BF16)") == std::string::npos &&
-                 default_branch.find("FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_F16)") == std::string::npos,
-        "the default vector dispatch must not retain mixed float/quant or mixed float tail pairs");
-
-    const char * groups[][2] = {
-        { "GGML_TYPE_Q8_0", nullptr },
-        { "GGML_TYPE_Q6_1", "GGML_TYPE_Q6_0" },
-        { "GGML_TYPE_Q5_1", "GGML_TYPE_Q5_0" },
-        { "GGML_TYPE_Q4_1", "GGML_TYPE_Q4_0" },
-        { "GGML_TYPE_Q3_1", "GGML_TYPE_Q3_0" },
-        { "GGML_TYPE_Q2_1", "GGML_TYPE_Q2_0S" },
-    };
     const int group_sizes[] = { 1, 2, 2, 2, 2, 2 };
     const int bit_pairs[][2] = {
-        { 0, 0 }, { 0, 1 }, { 0, 2 },
-        { 1, 1 }, { 1, 2 }, { 1, 3 },
-        { 2, 2 }, { 2, 3 }, { 2, 4 },
-        { 3, 3 }, { 3, 4 }, { 3, 5 },
-        { 4, 4 }, { 4, 5 },
-        { 5, 5 },
+        { 0, 0 }, { 0, 1 }, { 0, 2 }, { 1, 1 }, { 1, 2 }, { 1, 3 },
+        { 2, 2 }, { 2, 3 }, { 2, 4 }, { 3, 3 }, { 3, 4 }, { 3, 5 },
+        { 4, 4 }, { 4, 5 }, { 5, 5 },
     };
     size_t expected_quant_pairs = 0;
     for (const auto & bit_pair : bit_pairs) {
@@ -114,27 +96,36 @@ int main(int argc, char ** argv) {
         const int v_group = bit_pair[1];
         for (int k_variant = 0; k_variant < group_sizes[k_group]; ++k_variant) {
             for (int v_variant = 0; v_variant < group_sizes[v_group]; ++v_variant) {
-                if (k_group == v_group && k_variant > v_variant) {
-                    continue;
-                }
-                const std::string expected = "FATTN_VEC_CASES_ALL_D(" + std::string(groups[k_group][k_variant]) +
-                    ", " + groups[v_group][v_variant] + ")";
-                ok &= expect(default_branch.find(expected) != std::string::npos,
-                    "the default vector dispatch is missing a KVarN-rule quant pair");
+                if (k_group == v_group && k_variant > v_variant) continue;
                 ++expected_quant_pairs;
             }
         }
     }
     ok &= expect(expected_quant_pairs == 48,
         "the KVarN-rule quant matrix must contain exactly 48 pairs");
-    ok &= expect(dispatch.find("GGML_CUDA_FA_HALF_QUANTS") == std::string::npos,
-        "the removed HALF build tier must not survive in vector dispatch");
-
-    ok &= expect(cmake.find("foreach(PAIR ${GGML_CUDA_KVARN_DEFAULT_PAIRS})") != std::string::npos &&
-                 cmake.find("Default CUDA FA vec policy expected 50 pairs") != std::string::npos,
-        "CMake must derive the 50 default vector pairs from the KVarN default pairs");
-    ok &= expect(fattn.find("ggml_cuda_fattn_default_quant_pair") != std::string::npos,
-        "the runtime compiled-pair check must implement the same KVarN-rule quant policy");
+    const std::string pair_list = slice_between(cmake, "set(GGML_CUDA_KVARN_DEFAULT_PAIRS", ")");
+    for (const auto & bit_pair : bit_pairs) {
+        const int k_bits = 8 - (bit_pair[0] == 0 ? 0 : bit_pair[0] + 1);
+        const int v_bits = 8 - (bit_pair[1] == 0 ? 0 : bit_pair[1] + 1);
+        const std::string pair = "k" + std::to_string(k_bits) + "-v" + std::to_string(v_bits);
+        ok &= expect(pair_list.find(pair) != std::string::npos,
+            "CMake default policy is missing a required KVarN bit pair");
+    }
+    const char * group_types[] = {
+        "set(_types_8 q8_0)", "set(_types_6 q6_1 q6_0)",
+        "set(_types_5 q5_1 q5_0)", "set(_types_4 q4_1 q4_0)",
+        "set(_types_3 q3_1 q3_0)", "set(_types_2 q2_1 q2_0s)",
+    };
+    for (const char * types : group_types) {
+        ok &= expect(cmake.find(types) != std::string::npos,
+            "CMake default policy is missing an ordered quant type group");
+    }
+    ok &= expect(cmake.find("K_BITS EQUAL V_BITS AND K_INDEX GREATER V_INDEX") != std::string::npos &&
+                 cmake.find("list(APPEND _pairs \"${K_TYPE}:${V_TYPE}\")") != std::string::npos,
+        "CMake must emit only the selected ordered quant variants");
+    ok &= expect(fattn.find("GGML_CUDA_FA_HALF_QUANTS") == std::string::npos &&
+                 cmake.find("GGML_CUDA_FA_HALF_QUANTS") == std::string::npos,
+        "the removed HALF build tier must not survive in the CUDA FA policy");
 
     ok &= expect(vec.find("static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device()") != std::string::npos,
         "the vector kernel helper section must remain present");

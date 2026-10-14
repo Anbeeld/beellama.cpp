@@ -27,14 +27,15 @@ def main() -> None:
         "const bool mtp_only",
         "LLM_TENSOR_NEXTN_EH_PROJ",
         "LLM_TENSOR_NEXTN_HC_HEAD_NORM",
-        "TENSOR_NOT_REQUIRED | flags",
+        "const int  trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0",
+        "load_block(il, trunk_flags)",
         "layer.nextn.hc_head_norm ? layer.nextn.hc_head_norm : model.hc_head_norm",
         "qwen4exp_shared_model",
         "LLM_GRAPH_TYPE_DECODER_MTP",
         "llama_model_qwen4exp::graph_mtp::graph_mtp",
-        "mctx_hyb != nullptr && mctx_hyb->get_idx() != nullptr",
+        "mctx_idx && hparams.indexer_kpool > 0",
         "(!cparams.embeddings_nextn || cparams.embeddings_nextn_masked)",
-        "if (inp_out_ids && cparams.embeddings_nextn && !cparams.embeddings_nextn_masked)",
+        "if (cparams.embeddings_nextn && !cparams.embeddings_nextn_masked && inp_out_ids)",
     ):
         require(qwen4exp, needle, "Qwen4Exp standalone MTP draft-head support is incomplete")
     require(qwen4exp_h, "struct graph_mtp : public graph", "Qwen4Exp MTP graph declaration is missing")
@@ -50,8 +51,8 @@ def main() -> None:
 
     qwen4exp_converter = (ROOT / "conversion/qwen4exp.py").read_text(encoding="utf-8")
     for needle in (
-        '_MTP_MIXER_PREFIX = "mtp.hyper_connection_mixer."',
-        'f"model.layers.{cls._original_block_count}.{suffix}"',
+        '"hyper_connection_mixer": "nextn_hc_head"',
+        'f"model.layers.{cls._original_block_count}.{cls._MTP_EXTRA[part]}.{rest}"',
     ):
         require(
             qwen4exp_converter,

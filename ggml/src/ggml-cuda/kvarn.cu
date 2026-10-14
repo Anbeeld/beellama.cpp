@@ -1074,7 +1074,8 @@ static __global__ void kvarn_store_kernel_headwide(
         int tail_groups,
         int head_slices,
         bool eager_records,
-        const int * skip_if_workspace_valid) {
+        const int * skip_if_workspace_valid,
+        bool parallel_decode = false) {
     extern __shared__ float shared[];
     const int head0 = blockIdx.x * head_slices;
     if (head0 + head_slices > n_heads) {
@@ -1085,7 +1086,30 @@ static __global__ void kvarn_store_kernel_headwide(
     }
     const int dim = threadIdx.x;
 
-    for (int token = 0; token < n_tokens; ++token) {
+    // One decode token per independent stream can be staged/sealed in parallel.
+    // The host hint describes shape, not ownership: validate actual device
+    // indices before allowing separate blocks to mutate persistent cache state.
+    bool independent = parallel_decode;
+    if (parallel_decode) {
+        for (int i = 0; i < n_tokens && independent; ++i) {
+            const int64_t encoded = indices[i];
+            const int stream_i = swa ? kvarn_swa_stream(encoded) :
+                int(kvarn_index_cell(encoded) / (int64_t(groups_per_stream) * KVAR_N_DIM));
+            independent = stream_i >= 0 && stream_i < n_stream;
+            for (int j = 0; j < i && independent; ++j) {
+                const int64_t previous = indices[j];
+                const int stream_j = swa ? kvarn_swa_stream(previous) :
+                    int(kvarn_index_cell(previous) / (int64_t(groups_per_stream) * KVAR_N_DIM));
+                independent = stream_i != stream_j;
+            }
+        }
+        if (!independent && blockIdx.y != 0) {
+            return;
+        }
+    }
+    const int token_begin = independent ? int(blockIdx.y) : 0;
+    const int token_end = independent ? token_begin + 1 : n_tokens;
+    for (int token = token_begin; token < token_end; ++token) {
         const int64_t encoded_idx = indices[token];
         const int assigned_slot = swa ? -1 : kvarn_index_stage_slot(encoded_idx);
         const int64_t idx = kvarn_index_cell(encoded_idx);
@@ -2547,7 +2571,10 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             KVAR_N_SHARED_BYTES));
 #endif
         auto prof = kvarn_prof_begin(ctx, stream, kvarn_prof_kind::STORE_HI, value, bits, (int) current->ne[2], staged_bytes);
-        kvarn_store_kernel_headwide<<<n_heads / head_slices, KVAR_N_DIM, KVAR_N_SHARED_BYTES, stream>>>(
+        const bool parallel_decode = tokens_per_stream_hint == 1 && n_tokens > 1 &&
+            n_tokens <= n_stream && n_tokens <= 65535;
+        const dim3 blocks(n_heads / head_slices, parallel_decode ? n_tokens : 1, 1);
+        kvarn_store_kernel_headwide<<<blocks, KVAR_N_DIM, KVAR_N_SHARED_BYTES, stream>>>(
             (const float *) current->data,
             (const int64_t *) indices->data,
             (half *) stage->data,
@@ -2565,7 +2592,8 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             tail_groups,
             head_slices,
             eager_records,
-            nullptr);
+            nullptr,
+            parallel_decode);
         kvarn_prof_end(prof, stream);
         return;
     }

@@ -54,9 +54,9 @@ def main() -> None:
     assert "the indexer cache must track the attention cache cell for cell" in qwen4exp, (
         "the QSA graph must keep validating that the indexer mirrors the attention cells"
     )
-    assert "mctx_hyb->get_idx() != nullptr" in qwen4exp, (
-        "QSA sparse selection must stay gated on the index cache; without it the graph uses dense attention"
-    )
+    assert "mctx_idx && hparams.indexer_kpool > 0" in qwen4exp and (
+        "mctx_hyb && mctx_hyb->get_idx() && inp_kpool" in qwen4exp
+    ), "QSA sparse selection must stay gated on the index cache; without it the graph uses dense attention"
 
     base = KV_CACHE_BASE.read_text(encoding="utf-8")
     apply = function_body(base, "void llama_kv_cache::apply_ubatch(")

@@ -308,7 +308,7 @@ static __device__ __forceinline__ int ggml_cuda_fattn_kvarn_live_index_for_threa
             const int64_t encoded = indices[i];
             const uint64_t payload = uint64_t(encoded < -1 ? -(encoded + 2) : encoded);
             const int64_t idx = int64_t(uint32_t(payload));
-            if (idx >= 0) {
+            if (encoded != -1 && (!swa || int(payload >> 32u) == stream)) {
                 live_index = max(live_index, (int) idx);
             }
         }
@@ -361,6 +361,7 @@ static __global__ void ggml_cuda_fattn_kvarn_init_descs_kernel(
         bool v_eager_records,
         bool v_read_indirect,
         int n_stream,
+        int n_kv,
         int n_kv_heads,
         int slices,
         int record_dim,
@@ -399,9 +400,12 @@ static __global__ void ggml_cuda_fattn_kvarn_init_descs_kernel(
 
     for (int h = 0; h < n_kv_heads; ++h) {
         ggml_cuda_fattn_kvarn_desc & k_desc = k_descs[(size_t) out_stream * n_kv_heads + h];
-        k_desc.records = k_records;
+        // SWA loaders address a stream-local ring and read-index window.
+        // Stage addressing still uses the global stream through desc.stream.
+        k_desc.records = k_swa ? k_records +
+            int64_t(k_stream) * k_groups_per_stream * k_n_record_heads * k_record_bytes : k_records;
         k_desc.stage = k_stage;
-        k_desc.indices = k_indices;
+        k_desc.indices = k_swa ? k_indices + int64_t(k_stream) * n_kv : k_indices;
         k_desc.n_record_heads = k_n_record_heads;
         k_desc.live_group = k_partial[0] / GGML_CUDA_FATTN_KVARN_DIM;
         k_desc.live_pos = k_partial[0] % GGML_CUDA_FATTN_KVARN_DIM;
@@ -421,9 +425,10 @@ static __global__ void ggml_cuda_fattn_kvarn_init_descs_kernel(
         k_desc.original_domain = k_original_domain;
 
         ggml_cuda_fattn_kvarn_desc & v_desc = v_descs[(size_t) out_stream * n_kv_heads + h];
-        v_desc.records = v_records;
+        v_desc.records = v_swa ? v_records +
+            int64_t(v_stream) * v_groups_per_stream * v_n_record_heads * v_record_bytes : v_records;
         v_desc.stage = v_stage;
-        v_desc.indices = v_indices;
+        v_desc.indices = v_swa ? v_indices + int64_t(v_stream) * n_kv : v_indices;
         v_desc.n_record_heads = v_n_record_heads;
         v_desc.live_group = v_partial[0] / GGML_CUDA_FATTN_KVARN_DIM;
         v_desc.live_pos = v_partial[0] % GGML_CUDA_FATTN_KVARN_DIM;
@@ -483,6 +488,7 @@ void ggml_cuda_fattn_kvarn_init_descs(
         plan.v.eager_records,
         plan.v.read_indirect,
         plan.n_stream,
+        plan.n_kv,
         plan.n_kv_heads,
         plan.slices,
         plan.k.record_dim,
@@ -491,6 +497,7 @@ void ggml_cuda_fattn_kvarn_init_descs(
         k_original_domain,
         v_original_domain);
     CUDA_CHECK(cudaGetLastError());
+
 }
 
 static inline bool ggml_cuda_fattn_kvarn_fast_decode_pair_enabled(int k_bits, int v_bits) {

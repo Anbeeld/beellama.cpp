@@ -328,6 +328,24 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     quantize &= name.find("indexer.k_proj.weight") == std::string::npos;
     quantize &= name.find("indexer.q_proj.weight") == std::string::npos;
 
+    // glm5-next
+    if (arch == LLM_ARCH_GLM5_NEXT) {
+        quantize &= name.find("hc_")                     == std::string::npos;
+        quantize &= name.find("indexer.attn_q_b")        == std::string::npos;
+        quantize &= name.find("indexer.attn_k")          == std::string::npos;
+        quantize &= name.find("indexer.proj")            == std::string::npos;
+        quantize &= name.find("indexer_compressor_gate") == std::string::npos;
+        quantize &= name.find("indexer_compressor_ape")  == std::string::npos;
+        quantize &= name.find("ssm_f_a.weight")          == std::string::npos;
+        quantize &= name.find("ssm_f_b.weight")          == std::string::npos;
+        quantize &= name.find("ssm_g_a.weight")          == std::string::npos;
+        quantize &= name.find("ssm_g_b.weight")          == std::string::npos;
+        quantize &= name.find("ssm_beta.weight")         == std::string::npos;
+        quantize &= name.find("attn_kv_a_mqa.weight")    == std::string::npos;
+        quantize &= name.find("attn_k_b.weight")         == std::string::npos;
+        quantize &= name.find("attn_v_b.weight")         == std::string::npos;
+    }
+
     // do not quantize RWKV's small yet 2D weights
     quantize &= name.find("time_mix_first.weight") == std::string::npos;
     quantize &= name.find("time_mix_w0.weight") == std::string::npos;
@@ -391,6 +409,8 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             case GGML_TYPE_IQ3_S:   // types on the right: block size 32
             case GGML_TYPE_IQ4_XS:  return_type = GGML_TYPE_IQ4_NL; break;
             case GGML_TYPE_Q2_0:
+            case GGML_TYPE_PTQ1_0:
+            case GGML_TYPE_PQ2_0:
             case GGML_TYPE_Q2_K:
             case GGML_TYPE_Q3_K:
             case GGML_TYPE_TQ1_0:
@@ -451,6 +471,22 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
         return std::make_pair(i_layer, n_layer);
     };
 
+    // by default, for glm5-next, don't let these tensors be quantized below Q8_0
+    if (arch == LLM_ARCH_GLM5_NEXT && (
+        name.find("attn_q_a")      != std::string::npos ||
+        name.find("attn_q_b")      != std::string::npos ||
+        name.find("nextn.eh_proj") != std::string::npos))
+    {
+        switch (new_type) {
+            case GGML_TYPE_F32:
+            case GGML_TYPE_BF16:
+            case GGML_TYPE_F16:
+                break;
+            default:
+                return GGML_TYPE_Q8_0;
+        }
+    }
+
     // for arches that share the same tensor between the token embeddings and the output, we quantize the token embeddings
     // with the quantization of the output tensor
     if (category == tensor_category::OUTPUT || (qs.has_tied_embeddings && category == tensor_category::TOKEN_EMBD)) {
@@ -502,7 +538,7 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
             else if (ftype == LLAMA_FTYPE_MOSTLY_IQ3_XXS) {
                 new_type = GGML_TYPE_IQ3_S;
             }
-            else if (ftype == LLAMA_FTYPE_MOSTLY_TQ1_0 || ftype == LLAMA_FTYPE_MOSTLY_TQ2_0 || ftype == LLAMA_FTYPE_MOSTLY_Q2_0) {
+            else if (ftype == LLAMA_FTYPE_MOSTLY_TQ1_0 || ftype == LLAMA_FTYPE_MOSTLY_TQ2_0 || ftype == LLAMA_FTYPE_MOSTLY_Q2_0 || ftype == LLAMA_FTYPE_MOSTLY_PQ2_0 || ftype == LLAMA_FTYPE_MOSTLY_PTQ1_0) {
                 new_type = GGML_TYPE_Q4_K;
             }
         }
@@ -856,6 +892,8 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_ALL_F32:     return GGML_TYPE_F32;
         case LLAMA_FTYPE_MOSTLY_Q1_0: return GGML_TYPE_Q1_0;
         case LLAMA_FTYPE_MOSTLY_Q2_0: return GGML_TYPE_Q2_0;
+        case LLAMA_FTYPE_MOSTLY_PQ2_0: return GGML_TYPE_PQ2_0;
+        case LLAMA_FTYPE_MOSTLY_PTQ1_0: return GGML_TYPE_PTQ1_0;
 
         case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: return GGML_TYPE_MXFP4;
 

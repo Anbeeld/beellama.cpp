@@ -71,8 +71,10 @@ int main(int argc, char ** argv) {
         "KL divergence must not silently cap the requested batch by logits memory");
     ok &= expect(kl.find("const int n_batch = std::max(1, std::min(n_ctx_i, params.n_batch))") != std::string::npos,
         "KL divergence batch size must honor the requested batch size");
-    ok &= expect(kl.find("llama_batch_init(n_batch, 0, 1)") != std::string::npos,
-        "KL divergence batch allocation must match bounded n_batch");
+    ok &= expect(kl.find("common_batch batch(ctx)") != std::string::npos &&
+                 kl.find("const int batch_size  = std::min(end - batch_start, n_batch)") != std::string::npos &&
+                 kl.find("llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())") != std::string::npos,
+        "KL divergence must bound and decode the context-owned batch");
     ok &= expect(kl.find("std::vector<uint16_t> log_probs_uint16(size_t(n_batch) * nv)") != std::string::npos,
         "KL divergence base-logit buffer must match the decode batch size");
     ok &= expect(kl.find("const int logits_first = std::max(first, pos_start)") != std::string::npos &&

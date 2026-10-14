@@ -36,10 +36,10 @@ def main() -> None:
     )
 
     cmake = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
-    for component, value in (("MAJOR", 0), ("MINOR", 4), ("PATCH", 7)):
+    for component, value in (("MAJOR", 0), ("MINOR", 4), ("PATCH", 8)):
         require(
             f"set(LLAMA_VERSION_{component} {value})" in cmake,
-            f"v0.4.7 release metadata has the wrong {component.lower()} version",
+            f"v0.4.8 release metadata has the wrong {component.lower()} version",
         )
 
     release = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
@@ -153,7 +153,13 @@ def main() -> None:
 
     setup_cuda = (ACTIONS / "windows-setup-cuda/action.yml").read_text(encoding="utf-8")
     require("cuda_arch:" not in setup_cuda, "x64-only CUDA setup must not require cuda_arch")
-    require("13.4" not in setup_cuda, "unused ARM64 CUDA 13.4 setup must not remain")
+    require(
+        "Install Cuda Toolkit 13.4 for x64" in setup_cuda
+        and "cuda_crt/windows-x86_64/cuda_crt-windows-x86_64-13.4" in setup_cuda
+        and "windows-sbsa" not in setup_cuda,
+        "CUDA 13.4 setup must remain x64-only, not restore ARM64 packaging",
+    )
+    require('cuda: "13.4"' not in release, "unused CUDA 13.4 must not enter the release matrix")
 
     removed_imports = (
         ACTIONS / "ccache-buckets/action.yml",
@@ -186,10 +192,10 @@ def main() -> None:
         "every release cache must fall back to the same backend/toolchain key in the parent channel",
     )
     require(
-        release.count("if: ${{ success() || cancelled() }}")
+        release.count("if: ${{ success() && !cancelled() }}")
         == save_count,
-        "every rolling-cache save must run for successful and cancelled builds, "
-        "but skip failed builds so a crash cannot evict healthy entries",
+        "every rolling-cache save must run only after a successful, non-cancelled build "
+        "so failed or interrupted builds cannot evict healthy entries",
     )
     require(
         "always() && needs.release-meta.outputs.preview == 'true'" not in release,
