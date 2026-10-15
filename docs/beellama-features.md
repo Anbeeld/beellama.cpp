@@ -399,7 +399,12 @@ target/draft/speculative components can restore, and the boundary actually
 committed. Live slots and RAM entries are ranked by that safe restorable prefix,
 not lexical similarity alone. KVarN durable checkpoints are eligible only on
 complete descriptor boundaries; standard and recurrent caches retain upstream
-batching and impose no Bee-specific 64-token cadence. `cache_prompt=false`,
+batching and impose no Bee-specific 64-token cadence. With structured chats, the
+KVarN prompt fill loop breaks on the descriptor-group seam preceding each user
+message, replicating the upstream user-message-start checkpoint placement with
+the block size in mind, so mid-prompt anchors stay restorable and bounded by the
+number of user messages; raw prompts without message spans retain the periodic
+anchor cadence. `cache_prompt=false`,
 slot eviction, corrupt or incompatible state, and the absence of one common
 target/draft/speculative plan remain reason-coded misses.
 

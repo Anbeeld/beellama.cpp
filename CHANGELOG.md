@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.4.9
+
+- Improved KVarN server prompt checkpoint placement. Structured-chat prompts now break the fill loop on the descriptor-group seam preceding each user message, replicating the upstream user-message-start checkpoint behavior with the 128-token block size in mind, so mid-prompt checkpoints land on restorable full-descriptor positions and are bounded by the number of user messages instead of prompt length. Follow-up requests sharing a prefix up to a message boundary reprocess at most one group plus the new message. Standard and recurrent caches keep the upstream user-message behavior, raw/unstructured prompts keep the periodic anchor cadence, and the snapped end-of-prompt checkpoints, per-slot FIFO cap, and create-time alignment guard are unchanged.
+
 ## v0.4.8
 
 - Updated the llama.cpp base from `465e49b9c` to `c06f84160` and ggml to 0.26.0. Inherited changes include GLM-5.3-Flash, Maple, HrmText, Ling 3.0 VL, and decision-model support; expanded MTP/DFlash, probabilistic drafting, sparse FlashAttention, multimodal embeddings, `/v1/systemone`, extended batch APIs, imatrix calibration, and backend/server/Web UI fixes. Session/sequence-state formats are now 11/4, the backend API is 3, and RPC is 7.0.0. Legacy mmap/mlock/direct-I/O switches are replaced by `--load-mode`.
