@@ -36,10 +36,10 @@ def main() -> None:
     )
 
     cmake = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
-    for component, value in (("MAJOR", 0), ("MINOR", 4), ("PATCH", 8)):
+    for component, value in (("MAJOR", 0), ("MINOR", 4), ("PATCH", 9)):
         require(
             f"set(LLAMA_VERSION_{component} {value})" in cmake,
-            f"v0.4.8 release metadata has the wrong {component.lower()} version",
+            f"v0.4.9 release metadata has the wrong {component.lower()} version",
         )
 
     release = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
