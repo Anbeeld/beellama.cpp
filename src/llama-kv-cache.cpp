@@ -1317,11 +1317,12 @@ llama_kv_cache::llama_kv_cache(
         n_rot_v = other->n_rot_v;
     } else {
         const char * LLAMA_ATTN_ROT_DISABLE = getenv("LLAMA_ATTN_ROT_DISABLE");
-        const bool attn_rot_disable = disable_attn_rot ||
+        const bool attn_rot_disable = disable_attn_rot || !model.attn_rot ||
                 (LLAMA_ATTN_ROT_DISABLE ? atoi(LLAMA_ATTN_ROT_DISABLE) : false);
         if (attn_rot_disable) {
             LLAMA_LOG_WARN("%s: attention rotation disabled%s\n", __func__,
-                    disable_attn_rot ? " for this context" : " (LLAMA_ATTN_ROT_DISABLE)");
+                    disable_attn_rot ? " for this context" :
+                    !model.attn_rot ? " (llama_model_set_attn_rot)" : " (LLAMA_ATTN_ROT_DISABLE)");
         }
 
         bool attn_rot_k =
@@ -1973,14 +1974,12 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
             llama_batch_allocr & balloc,
             uint32_t n_ubatch,
             bool embd_all) {
-    GGML_UNUSED(embd_all);
-
     do {
         balloc.split_reset();
 
         std::vector<llama_ubatch> ubatches;
         while (true) {
-            auto ubatch = n_stream == 1 ? balloc.split_simple(n_ubatch) : balloc.split_equal(n_ubatch, true, 0);
+            auto ubatch = n_stream == 1 ? balloc.split_simple(n_ubatch) : embd_all ? balloc.split_seq(n_ubatch) : balloc.split_equal(n_ubatch, true, 0);
 
             if (ubatch.n_tokens == 0) {
                 break;
@@ -4196,7 +4195,7 @@ public:
 void llm_graph_input_k_shift::set_input(const llama_ubatch * ubatch) {
     GGML_UNUSED(ubatch);
 
-    if (k_shift) {
+    if (k_shift && k_shift->buffer) {
         kv_self->set_input_k_shift(k_shift);
     }
 
@@ -5358,19 +5357,22 @@ std::vector<std::vector<uint32_t>> llama_kv_cache::state_v2_read_payload_and_ins
 }
 
 bool llama_kv_cache::requires_state_for_partial_restore() const {
-    // Overlay-with-body can reconstruct any surviving prefix by trimming a
-    // suffix; the exact tail is a precision cache, not the only copy.  SWA
-    // windows and bodyless exact tails cannot be recovered that way, so they
-    // still have to ride along in PARTIAL_ONLY snapshots.
-    if (n_swa > 0) {
-        return true;
-    }
-    return has_compact_tail() && !has_kv_body();
+    // A surviving body can recover positions but not exact rows overwritten
+    // by later tokens. Preserve the overlay alongside recurrent state in a
+    // partial checkpoint; its immutable body remains reference-only.
+    return n_swa > 0 || has_tail_overlay();
 }
 
 void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
+        return;
+    }
+
+    // Ordinary dense KV can restore a live prefix by suffix removal. KVarN's
+    // metadata parser and exact-tail frames must retain their own framing.
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) && !tail_metadata_only &&
+            !has_tail_overlay() && !requires_state_for_partial_restore()) {
         return;
     }
 
@@ -5452,6 +5454,11 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
 void llama_kv_cache::state_read_sinfo(
         llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags,
         slot_info_vec_t * sinfos_out, const slot_info_vec_t * sinfos_in) {
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) && !tail_metadata_only &&
+            !has_tail_overlay() && !requires_state_for_partial_restore()) {
+        return;
+    }
+
     // KVarN restores into a private metadata-only clone and commits that clone
     // atomically with its record payload. Keep that internal parser immediate.
     if (tail_metadata_only) {

@@ -1080,7 +1080,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         ggml_backend_meta_split_state split_state;
         switch (tensor->op) {
             case GGML_OP_NONE: {
-                split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+                if (tensor->view_src != nullptr) {
+                    // full-tensor view created with ggml_view_tensor, transparent for the split state
+                    split_state = ggml_backend_meta_get_split_state(buf_ctx, stc, tensor->view_src, assume_sync);
+                } else {
+                    split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+                }
             } break;
             case GGML_OP_DUP: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
@@ -1394,13 +1399,32 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     return ret;
 }
 
+static bool ggml_backend_meta_is_host_view(const struct ggml_tensor * tensor) {
+    // CPU-backed Meta buffers advertise host storage too, but their data is a
+    // proxy address and must still be projected onto the individual shards.
+    return ggml_is_view(tensor) && tensor->view_src->buffer != nullptr &&
+            !ggml_backend_buffer_is_meta(tensor->view_src->buffer) &&
+            ggml_backend_buffer_is_host(tensor->view_src->buffer);
+}
+
+static bool meta_tensor_is_external_host(const ggml_tensor * tensor) {
+    return (tensor->buffer != nullptr && !ggml_backend_buffer_is_meta(tensor->buffer) &&
+            ggml_backend_buffer_is_host(tensor->buffer)) || ggml_backend_meta_is_host_view(tensor);
+}
+
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync) {
     ggml_backend_buffer_t owner_buffer = ggml_backend_meta_tensor_owner_buffer(tensor);
-    GGML_ASSERT(ggml_backend_buffer_is_meta(owner_buffer));
-    ggml_backend_meta_buffer_context * buf_ctx =
-            (ggml_backend_meta_buffer_context *) owner_buffer->context;
-    return ggml_backend_meta_get_split_state(
-            *buf_ctx, buf_ctx->get_simple_tensor_container(tensor), tensor, assume_sync);
+    if (owner_buffer != nullptr) {
+        ggml_backend_meta_buffer_context * buf_ctx =
+                (ggml_backend_meta_buffer_context *) owner_buffer->context;
+        return ggml_backend_meta_get_split_state(
+                *buf_ctx, buf_ctx->get_simple_tensor_container(tensor), tensor, assume_sync);
+    }
+
+    // [TAG_META_HOST_VIEWS]
+    // External host nodes are already materialized and are not split across sub-devices.
+    GGML_ASSERT(meta_tensor_is_external_host(tensor));
+    return {GGML_BACKEND_SPLIT_AXIS_NONE, {0}, {1}, 1};
 }
 
 static void * ggml_backend_meta_buffer_get_base(ggml_backend_buffer_t buffer) {
@@ -2375,16 +2399,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         size_t n_subgraphs  = 0;
         size_t max_tmp_size = 0;
 
-        auto meta_tensor_is_external_host = [](const ggml_tensor * tensor) {
-            if (tensor->buffer != nullptr && !ggml_backend_buffer_is_meta(tensor->buffer) &&
-                    ggml_backend_buffer_is_host(tensor->buffer)) {
-                return true;
-            }
-            return tensor->view_src != nullptr && tensor->view_src->op == GGML_OP_NONE &&
-                    !ggml_backend_buffer_is_meta(tensor->view_src->buffer) &&
-                    ggml_backend_buffer_is_host(tensor->view_src->buffer);
-        };
-
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
 
@@ -2523,7 +2537,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         }
                     }
 
-                    if (next->view_src != nullptr && next->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(next->view_src->buffer)) {
+                    if (meta_tensor_is_external_host(next)) {
                         continue;
                     }
                     if (ggml_backend_meta_get_split_state(next, false).axis != GGML_BACKEND_SPLIT_AXIS_PARTIAL) {

@@ -86,7 +86,10 @@ llama-server -m target.gguf --spec-type draft-dflash \
 Model-backed draft contexts inherit the target logical batch capacity configured
 with `--batch-size` (`-b`). Use `--spec-draft-ubatch-size N` (`-ubd N`) to set an
 independent physical capacity; its environment variable is
-`LLAMA_ARG_SPEC_DRAFT_UBATCH_SIZE`. Without an explicit override, the draft
+`LLAMA_ARG_SPEC_DRAFT_UBATCH_SIZE`. Upstream's `--spec-draft-n-ubatch N`
+(`LLAMA_ARG_SPEC_DRAFT_N_UBATCH`) sets the same capacity for positive values;
+its explicit `0` inherits the target's physical ubatch. Omitting both options
+retains Bee's automatic policy. Without an explicit override, the draft
 ubatch defaults to 128; for DFlash/DSpark it grows to
 `max(128, parallel * (n_max + 1))` to fit all slots' noise blocks in one decode.
 An explicit
@@ -284,6 +287,9 @@ Use exactly one of these options:
 --spec-draft-ubatch-size, -ubd          N
                                         physical maximum batch size for the draft context (default: 128 or larger for parallel DFlash/DSpark)
                                         (env: LLAMA_ARG_SPEC_DRAFT_UBATCH_SIZE)
+--spec-draft-n-ubatch                   N
+                                        same positive draft capacity; explicit 0 inherits the target --ubatch-size
+                                        (env: LLAMA_ARG_SPEC_DRAFT_N_UBATCH)
 --spec-draft-p-split, --draft-p-split   P
                                         speculative decoding split probability (default: 0.10)
                                         (env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT)

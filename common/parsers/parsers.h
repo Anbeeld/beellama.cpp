@@ -17,26 +17,19 @@
 
 using json = common_json;
 
-// iterate over the function tools of an OpenAI-style tools array
-void foreach_function(const json & tools, const std::function<void(const json &)> & fn);
+// iterate over the function tools of an OpenAI-style tools array, passing each tool with its index in the array
+void foreach_function(const json & tools, const std::function<void(size_t, const json &)> & fn);
 
-// iterate over the parameters of a function tool, with the document that owns them
-void foreach_parameter(const json & function, const std::function<void(const common_chat_schema_property &, const common_chat_schema_document_ptr &)> & fn);
+// iterate over the parameters of a function tool, passing each parameter with its index and the document that owns it
+void foreach_parameter(const json & function, const std::function<void(size_t, const common_chat_schema_property &, const common_chat_schema_document_ptr &)> & fn);
 
 // render a template; the override arguments let a parser feed in messages, tools or context it has rewritten
-std::string common_chat_template_direct_apply_impl(
+common_chat_prompt common_chat_template_direct_apply_impl(
     const common_chat_template & tmpl,
     const autoparser::generation_params & inputs,
     const std::optional<json> & messages_override = std::nullopt,
     const std::optional<json> & tools_override = std::nullopt,
-    const std::optional<json> & additional_context = std::nullopt,
-    std::vector<jinja::string_part> * out_parts = nullptr);
-
-bool string_parts_replace_at(
-    std::vector<jinja::string_part> & parts,
-    size_t pos,
-    const std::string & from,
-    const std::string & to);
+    const std::optional<json> & additional_context = std::nullopt);
 
 // the suffix a template appends when add_generation_prompt is set
 std::string common_chat_template_generation_prompt_impl(
@@ -66,6 +59,8 @@ common_chat_params common_chat_params_init_gigachat_v3(const common_chat_templat
 
 common_chat_params common_chat_params_init_gpt_oss(const common_chat_template & tmpl, const autoparser::generation_params & inputs);
 
+common_chat_params common_chat_params_init_k2_horizon(const common_chat_template & tmpl, const autoparser::generation_params & inputs);
+
 common_chat_params common_chat_params_init_kimi_k2(const common_chat_template & tmpl, const autoparser::generation_params & inputs);
 
 common_chat_params common_chat_params_init_kimi_k3(const common_chat_template & tmpl, const autoparser::generation_params & inputs);
@@ -86,3 +81,5 @@ common_chat_params common_chat_params_init_ministral_3(const common_chat_templat
 common_chat_params common_chat_params_init_muse_glimmer(const common_chat_template & tmpl, const autoparser::generation_params & inputs);
 
 common_chat_params common_chat_params_init_qwen3_coder(const common_chat_template & tmpl, const autoparser::generation_params & inputs);
+
+common_chat_params common_chat_params_init_translate_gemma(const common_chat_template & tmpl, const autoparser::generation_params & inputs);

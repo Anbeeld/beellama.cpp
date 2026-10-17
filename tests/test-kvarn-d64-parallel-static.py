@@ -80,8 +80,12 @@ planner = Path("src/llama-kvarn.cpp").read_text(encoding="utf8")
 assert "LLAMA_KVARN_D64_NATIVE_MAX_KV" not in planner, \
     "D64 decode must not fall back to whole-context materialization"
 graph = Path("src/llama-graph.cpp").read_text(encoding="utf8")
-assert graph.count("(uint32_t) q_cur->ne[2],\n        (int) q_cur->ne[0]") == 2, \
-    "full and iSWA planners must receive query-token count, not query-head count"
+assert graph.count("(uint32_t) q_cur->ne[2],\n        (int) q_cur->ne[0]") == 1, \
+    "the full-attention planner must receive query-token count, not query-head count"
+assert "const uint32_t query_tokens_per_stream = uint32_t(q_cur->ne[2] / route_mask->ne[3]);" in graph, \
+    "the iSWA query count must use token rows per stream, not query heads or all streams combined"
+assert graph.count("query_tokens_per_stream,\n        (int) q_cur->ne[0]") == 1, \
+    "the iSWA planner must consume its per-stream query-token count"
 
 meta = Path("ggml/src/ggml-backend-meta.cpp").read_text(encoding="utf8")
 assert "head_width == 64 || head_width == 128" in meta, \

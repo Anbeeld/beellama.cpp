@@ -71,10 +71,10 @@ common_chat_msg make_msg(const std::string & role, const std::string & content) 
     return msg;
 }
 
-std::string concat_parts(const std::vector<jinja::string_part> & parts) {
+std::string concat_parts(const std::vector<common_chat_prompt_part> & parts) {
     std::string res;
     for (const auto & part : parts) {
-        res += part.val;
+        res += part.text;
     }
     return res;
 }
@@ -100,9 +100,11 @@ size_t count_token(const llama_tokens & tokens, llama_token id) {
     return n;
 }
 
-bool has_part(const std::vector<jinja::string_part> & parts, const std::string & val, bool is_input) {
+bool has_part(const std::vector<common_chat_prompt_part> & parts, const std::string & val, bool is_input) {
+    // append() coalesces adjacent same-provenance text. The complete expected
+    // span must still belong to one part with the required provenance.
     return std::any_of(parts.begin(), parts.end(), [&](const auto & part) {
-        return part.val == val && part.is_input == is_input;
+        return part.text.find(val) != std::string::npos && part.is_input == is_input;
     });
 }
 
@@ -128,12 +130,12 @@ void test_user_input_special_token_injection(const test_ctx & c) {
 
     const auto p = common_chat_templates_apply(c.qwen_tmpls.get(), in);
 
-    CHECK(!p.prompt_parts.empty());
-    CHECK(concat_parts(p.prompt_parts) == p.prompt);
-    CHECK(common_chat_parts_have_special_input(c.vocab, p.prompt_parts));
+    CHECK(!p.prompt.parts.empty());
+    CHECK(concat_parts(p.prompt.parts) == p.prompt.str());
+    CHECK(common_chat_parts_have_special_input(c.vocab, p.prompt.parts));
 
-    const auto tok_parts  = common_tokenize_parts(c.vocab, p.prompt_parts, /*add_special=*/true);
-    const auto tok_legacy = common_tokenize(c.vocab, p.prompt, /*add_special=*/true, /*parse_special=*/true);
+    const auto tok_parts  = common_tokenize_parts(c.vocab, p.prompt.parts, /*add_special=*/true);
+    const auto tok_legacy = common_tokenize(c.vocab, p.prompt.str(), /*add_special=*/true, /*parse_special=*/true);
 
     const size_t n_parts  = count_token(tok_parts, c.im_start);
     const size_t n_legacy = count_token(tok_legacy, c.im_start);
@@ -163,12 +165,12 @@ void test_tool_input_special_token_injection(const test_ctx & c) {
 
     const auto p = common_chat_templates_apply(c.qwen_tmpls.get(), in);
 
-    CHECK(!p.prompt_parts.empty());
-    CHECK(concat_parts(p.prompt_parts) == p.prompt);
-    CHECK(common_chat_parts_have_special_input(c.vocab, p.prompt_parts));
+    CHECK(!p.prompt.parts.empty());
+    CHECK(concat_parts(p.prompt.parts) == p.prompt.str());
+    CHECK(common_chat_parts_have_special_input(c.vocab, p.prompt.parts));
 
-    const auto tok_parts  = common_tokenize_parts(c.vocab, p.prompt_parts, /*add_special=*/true);
-    const auto tok_legacy = common_tokenize(c.vocab, p.prompt, /*add_special=*/true, /*parse_special=*/true);
+    const auto tok_parts  = common_tokenize_parts(c.vocab, p.prompt.parts, /*add_special=*/true);
+    const auto tok_legacy = common_tokenize(c.vocab, p.prompt.str(), /*add_special=*/true, /*parse_special=*/true);
 
     const size_t n_parts  = count_token(tok_parts, c.im_start);
     const size_t n_legacy = count_token(tok_legacy, c.im_start);
@@ -188,16 +190,16 @@ void test_normal_prompt_token_ids_unchanged(const test_ctx & c) {
 
     const auto p = common_chat_templates_apply(c.qwen_tmpls.get(), in);
 
-    CHECK(!p.prompt_parts.empty());
-    CHECK(concat_parts(p.prompt_parts) == p.prompt);
-    CHECK(!common_chat_parts_have_special_input(c.vocab, p.prompt_parts));
+    CHECK(!p.prompt.parts.empty());
+    CHECK(concat_parts(p.prompt.parts) == p.prompt.str());
+    CHECK(!common_chat_parts_have_special_input(c.vocab, p.prompt.parts));
 
     // the test must exercise real template/input boundaries
-    CHECK_MSG(p.prompt_parts.size() >= 4, "expected multiple prompt parts, got %zu", p.prompt_parts.size());
+    CHECK_MSG(p.prompt.parts.size() >= 4, "expected multiple prompt parts, got %zu", p.prompt.parts.size());
     bool has_template_part = false;
     bool has_input_part    = false;
-    for (const auto & part : p.prompt_parts) {
-        if (part.val.empty()) {
+    for (const auto & part : p.prompt.parts) {
+        if (part.text.empty()) {
             continue;
         }
         has_template_part = has_template_part || !part.is_input;
@@ -207,8 +209,8 @@ void test_normal_prompt_token_ids_unchanged(const test_ctx & c) {
     CHECK(has_input_part);
 
     // token ids must be identical to the legacy whole-prompt tokenization
-    const auto tok_parts  = common_tokenize_parts(c.vocab, p.prompt_parts, /*add_special=*/true);
-    const auto tok_legacy = common_tokenize(c.vocab, p.prompt, /*add_special=*/true, /*parse_special=*/true);
+    const auto tok_parts  = common_tokenize_parts(c.vocab, p.prompt.parts, /*add_special=*/true);
+    const auto tok_legacy = common_tokenize(c.vocab, p.prompt.str(), /*add_special=*/true, /*parse_special=*/true);
     if (tok_parts != tok_legacy) {
         fprintf(stderr, "  parts : %zu tokens\n  legacy: %zu tokens\n", tok_parts.size(), tok_legacy.size());
         for (size_t i = 0; i < std::min(tok_parts.size(), tok_legacy.size()); i++) {
@@ -224,9 +226,9 @@ void test_normal_prompt_token_ids_unchanged(const test_ctx & c) {
     // Synthetic boundary case: a BPE merge straddles a template/input part
     // boundary ("Hello" = "Hel" + "lo"). Tokenizing the parts separately
     // breaks the merge; the fast path must keep the legacy token ids.
-    const std::vector<jinja::string_part> boundary_parts = {
-        {false, "Hel"},
-        {true,  "lo"},
+    const std::vector<common_chat_prompt_part> boundary_parts = {
+        {"Hel", false},
+        {"lo", true},
     };
     const auto tok_boundary  = common_tokenize_parts(c.vocab, boundary_parts, /*add_special=*/false);
     const auto tok_whole     = common_tokenize(c.vocab, "Hello", /*add_special=*/false, /*parse_special=*/true);
@@ -247,10 +249,10 @@ void test_normal_prompt_token_ids_unchanged(const test_ctx & c) {
     // merged before tokenizing, so normal merges across their boundary are
     // preserved while the is_input part keeps the parse_special=false
     // protection.
-    const std::vector<jinja::string_part> protect_parts = {
-        {false, "Hel"},
-        {false, "lo"},
-        {true,  " and <|im_start|>injected"},
+    const std::vector<common_chat_prompt_part> protect_parts = {
+        {"Hel", false},
+        {"lo", false},
+        {" and <|im_start|>injected", true},
     };
     const auto tok_protect   = common_tokenize_parts(c.vocab, protect_parts, /*add_special=*/false);
     const auto tok_ref_hello = common_tokenize(c.vocab, "Hello", /*add_special=*/false, /*parse_special=*/true);
@@ -277,15 +279,15 @@ void test_continuation_provenance_autoparser(const test_ctx & c) {
 
         const auto p = common_chat_templates_apply(c.qwen_tmpls.get(), in);
 
-        CHECK(concat_parts(p.prompt_parts) == p.prompt);
+        CHECK(concat_parts(p.prompt.parts) == p.prompt.str());
         // request-provided continuation content must be marked as input
-        CHECK_MSG(has_part(p.prompt_parts, last.reasoning_content, true),
+        CHECK_MSG(has_part(p.prompt.parts, last.reasoning_content, true),
                   "reasoning content not marked as input in prompt parts");
-        CHECK_MSG(has_part(p.prompt_parts, last.content, true),
+        CHECK_MSG(has_part(p.prompt.parts, last.content, true),
                   "message content not marked as input in prompt parts");
 
-        const auto tok_parts  = common_tokenize_parts(c.vocab, p.prompt_parts, /*add_special=*/true);
-        const auto tok_legacy = common_tokenize(c.vocab, p.prompt, /*add_special=*/true, /*parse_special=*/true);
+        const auto tok_parts  = common_tokenize_parts(c.vocab, p.prompt.parts, /*add_special=*/true);
+        const auto tok_legacy = common_tokenize(c.vocab, p.prompt.str(), /*add_special=*/true, /*parse_special=*/true);
 
         const size_t n_parts  = count_token(tok_parts, c.im_start);
         const size_t n_legacy = count_token(tok_legacy, c.im_start);
@@ -307,12 +309,12 @@ void test_continuation_provenance_autoparser(const test_ctx & c) {
 
         const auto p = common_chat_templates_apply(c.qwen_tmpls.get(), in);
 
-        CHECK(concat_parts(p.prompt_parts) == p.prompt);
-        CHECK_MSG(has_part(p.prompt_parts, last.reasoning_content, true),
+        CHECK(concat_parts(p.prompt.parts) == p.prompt.str());
+        CHECK_MSG(has_part(p.prompt.parts, last.reasoning_content, true),
                   "reasoning content not marked as input in prompt parts");
 
-        const auto tok_parts  = common_tokenize_parts(c.vocab, p.prompt_parts, /*add_special=*/true);
-        const auto tok_legacy = common_tokenize(c.vocab, p.prompt, /*add_special=*/true, /*parse_special=*/true);
+        const auto tok_parts  = common_tokenize_parts(c.vocab, p.prompt.parts, /*add_special=*/true);
+        const auto tok_legacy = common_tokenize(c.vocab, p.prompt.str(), /*add_special=*/true, /*parse_special=*/true);
 
         const size_t n_parts  = count_token(tok_parts, c.im_start);
         const size_t n_legacy = count_token(tok_legacy, c.im_start);
@@ -332,17 +334,17 @@ void test_gpt_oss_return_replacement(const test_ctx & c) {
 
     const auto p = common_chat_templates_apply(c.gptoss_tmpls.get(), in);
 
-    CHECK(ends_with(p.prompt, "<|end|>"));
-    CHECK(p.prompt.find("<|return|>") == std::string::npos);
+    CHECK(ends_with(p.prompt.str(), "<|end|>"));
+    CHECK(p.prompt.str().find("<|return|>") == std::string::npos);
 
     // the parts must carry the same replacement, so server-side tokenization
     // of prompt_parts sees the same text as data.prompt
-    CHECK(!p.prompt_parts.empty());
-    CHECK(concat_parts(p.prompt_parts) == p.prompt);
-    CHECK(concat_parts(p.prompt_parts).find("<|return|>") == std::string::npos);
-    if (!p.prompt_parts.empty()) {
-        CHECK(ends_with(p.prompt_parts.back().val, "<|end|>"));
-        CHECK(!p.prompt_parts.back().is_input);
+    CHECK(!p.prompt.parts.empty());
+    CHECK(concat_parts(p.prompt.parts) == p.prompt.str());
+    CHECK(concat_parts(p.prompt.parts).find("<|return|>") == std::string::npos);
+    if (!p.prompt.parts.empty()) {
+        CHECK(ends_with(p.prompt.parts.back().text, "<|end|>"));
+        CHECK(!p.prompt.parts.back().is_input);
     }
 }
 
@@ -357,21 +359,21 @@ void test_gpt_oss_continuation_provenance(const test_ctx & c) {
 
     const auto p = common_chat_templates_apply(c.gptoss_tmpls.get(), in);
 
-    CHECK(concat_parts(p.prompt_parts) == p.prompt);
+    CHECK(concat_parts(p.prompt.parts) == p.prompt.str());
 
     // specialized parser path: delimiters are template text, the
     // request-provided reasoning/content is input
-    CHECK_MSG(has_part(p.prompt_parts, "<|start|>assistant<|channel|>analysis<|message|>", false),
+    CHECK_MSG(has_part(p.prompt.parts, "<|start|>assistant<|channel|>analysis<|message|>", false),
               "gpt-oss analysis delimiter not marked as template text");
-    CHECK_MSG(has_part(p.prompt_parts, last.reasoning_content, true),
+    CHECK_MSG(has_part(p.prompt.parts, last.reasoning_content, true),
               "gpt-oss reasoning content not marked as input");
-    CHECK_MSG(has_part(p.prompt_parts, "<|end|><|start|>assistant<|channel|>final<|message|>", false),
+    CHECK_MSG(has_part(p.prompt.parts, "<|end|><|start|>assistant<|channel|>final<|message|>", false),
               "gpt-oss final delimiter not marked as template text");
-    CHECK_MSG(has_part(p.prompt_parts, last.content, true),
+    CHECK_MSG(has_part(p.prompt.parts, last.content, true),
               "gpt-oss message content not marked as input");
 
-    const auto tok_parts  = common_tokenize_parts(c.vocab, p.prompt_parts, /*add_special=*/true);
-    const auto tok_legacy = common_tokenize(c.vocab, p.prompt, /*add_special=*/true, /*parse_special=*/true);
+    const auto tok_parts  = common_tokenize_parts(c.vocab, p.prompt.parts, /*add_special=*/true);
+    const auto tok_legacy = common_tokenize(c.vocab, p.prompt.str(), /*add_special=*/true, /*parse_special=*/true);
 
     const size_t n_parts  = count_token(tok_parts, c.im_start);
     const size_t n_legacy = count_token(tok_legacy, c.im_start);
@@ -393,23 +395,23 @@ void test_qwen3_coder_continuation_provenance(const test_ctx & c) {
 
     const auto p = common_chat_templates_apply(c.qwen3coder_tmpls.get(), in);
 
-    CHECK(concat_parts(p.prompt_parts) == p.prompt);
-    CHECK_MSG(has_part(p.prompt_parts, last.content, true),
+    CHECK(concat_parts(p.prompt.parts) == p.prompt.str());
+    CHECK_MSG(has_part(p.prompt.parts, last.content, true),
               "qwen3-coder continued content not marked as input");
 
     // the generation prompt prefix (im_start/assistant) is the last template
     // part right before the continued content
     bool prefix_before_content = false;
-    for (size_t i = 1; i < p.prompt_parts.size(); i++) {
-        if (p.prompt_parts[i].val == last.content && p.prompt_parts[i].is_input &&
-            p.prompt_parts[i - 1].val == "<|im_start|>assistant\n" && !p.prompt_parts[i - 1].is_input) {
+    for (size_t i = 1; i < p.prompt.parts.size(); i++) {
+        if (p.prompt.parts[i].text == last.content && p.prompt.parts[i].is_input &&
+            ends_with(p.prompt.parts[i - 1].text, "<|im_start|>assistant\n") && !p.prompt.parts[i - 1].is_input) {
             prefix_before_content = true;
         }
     }
     CHECK_MSG(prefix_before_content, "qwen3-coder generation prompt prefix not marked as template text");
 
-    const auto tok_parts  = common_tokenize_parts(c.vocab, p.prompt_parts, /*add_special=*/true);
-    const auto tok_legacy = common_tokenize(c.vocab, p.prompt, /*add_special=*/true, /*parse_special=*/true);
+    const auto tok_parts  = common_tokenize_parts(c.vocab, p.prompt.parts, /*add_special=*/true);
+    const auto tok_legacy = common_tokenize(c.vocab, p.prompt.str(), /*add_special=*/true, /*parse_special=*/true);
     const size_t n_parts  = count_token(tok_parts, c.im_start);
     const size_t n_legacy = count_token(tok_legacy, c.im_start);
     CHECK_MSG(n_parts == n_legacy - 1,
@@ -431,20 +433,20 @@ void test_gemma4_continuation_provenance(const test_ctx & c) {
 
     const auto p = common_chat_templates_apply(c.gemma4_tmpls.get(), in);
 
-    CHECK(concat_parts(p.prompt_parts) == p.prompt);
-    CHECK_MSG(has_part(p.prompt_parts, "<|turn>model\n", false),
+    CHECK(concat_parts(p.prompt.parts) == p.prompt.str());
+    CHECK_MSG(has_part(p.prompt.parts, "<|turn>model\n", false),
               "gemma4 turn prefix not marked as template text");
-    CHECK_MSG(has_part(p.prompt_parts, "<|channel>thought\n", false),
+    CHECK_MSG(has_part(p.prompt.parts, "<|channel>thought\n", false),
               "gemma4 thought delimiter not marked as template text");
-    CHECK_MSG(has_part(p.prompt_parts, last.reasoning_content, true),
+    CHECK_MSG(has_part(p.prompt.parts, last.reasoning_content, true),
               "gemma4 reasoning content not marked as input");
-    CHECK_MSG(has_part(p.prompt_parts, "<channel|>", false),
+    CHECK_MSG(has_part(p.prompt.parts, "<channel|>", false),
               "gemma4 channel terminator not marked as template text");
-    CHECK_MSG(has_part(p.prompt_parts, last.content, true),
+    CHECK_MSG(has_part(p.prompt.parts, last.content, true),
               "gemma4 message content not marked as input");
 
-    const auto tok_parts  = common_tokenize_parts(c.vocab, p.prompt_parts, /*add_special=*/true);
-    const auto tok_legacy = common_tokenize(c.vocab, p.prompt, /*add_special=*/true, /*parse_special=*/true);
+    const auto tok_parts  = common_tokenize_parts(c.vocab, p.prompt.parts, /*add_special=*/true);
+    const auto tok_legacy = common_tokenize(c.vocab, p.prompt.str(), /*add_special=*/true, /*parse_special=*/true);
     const size_t n_parts  = count_token(tok_parts, c.im_start);
     const size_t n_legacy = count_token(tok_legacy, c.im_start);
     CHECK_MSG(n_parts == n_legacy - 2,
@@ -478,16 +480,17 @@ void test_completion_and_count_consistency(const test_ctx & c) {
         {"max_tokens", 5},
     };
     std::vector<raw_buffer> files;
-    const json llama_params = oaicompat_chat_params_parse(body, opt, files);
+    common_chat_session session;
+    const json llama_params = oaicompat_chat_params_parse(c.vocab, body, opt, files, session);
 
     CHECK(llama_params.contains("prompt_parts"));
     CHECK(llama_params.at("prompt_parts").is_array());
     CHECK(!llama_params.at("prompt_parts").empty());
 
     // parse prompt_parts exactly like handle_completions_impl / handle_count_tokens
-    std::vector<jinja::string_part> parts;
+    std::vector<common_chat_prompt_part> parts;
     for (const auto & p : llama_params.at("prompt_parts")) {
-        parts.push_back({p.at("is_input").get<bool>(), p.at("text").get<std::string>()});
+        parts.push_back({p.at("text").get<std::string>(), p.at("is_input").get<bool>()});
     }
 
     const auto init_opt = mtmd_helper_init_opt_default();
@@ -518,11 +521,11 @@ void test_mtmd_part_layout() {
 
     {
         // ordinary layout: marker in its own part
-        const std::vector<jinja::string_part> parts = {
-            {false, "describe "},
-            {true,  marker},
-            {true,  " and <|im_start|>hack "},
-            {false, "the picture"},
+        const std::vector<common_chat_prompt_part> parts = {
+            {"describe ", false},
+            {marker, true},
+            {" and <|im_start|>hack ", true},
+            {"the picture", false},
         };
         std::vector<server_mtmd_seg> segs;
         CHECK(server_build_mtmd_part_layout(marker, parts, /*n_files=*/1, segs));
@@ -540,9 +543,9 @@ void test_mtmd_part_layout() {
     {
         // marker spanning a part boundary (template part ends mid-marker,
         // input part completes it)
-        const std::vector<jinja::string_part> parts = {
-            {false, "A <__media"},
-            {true,  "__> B"},
+        const std::vector<common_chat_prompt_part> parts = {
+            {"A <__media", false},
+            {"__> B", true},
         };
         std::vector<server_mtmd_seg> segs;
         CHECK(server_build_mtmd_part_layout(marker, parts, /*n_files=*/1, segs));
@@ -555,12 +558,12 @@ void test_mtmd_part_layout() {
     }
     {
         // multiple markers, interleaved with input/template text
-        const std::vector<jinja::string_part> parts = {
-            {false, "one "},
-            {true,  marker},
-            {true,  " two "},
-            {false, marker},
-            {false, " three"},
+        const std::vector<common_chat_prompt_part> parts = {
+            {"one ", false},
+            {marker, true},
+            {" two ", true},
+            {marker, false},
+            {" three", false},
         };
         std::vector<server_mtmd_seg> segs;
         CHECK(server_build_mtmd_part_layout(marker, parts, /*n_files=*/2, segs));

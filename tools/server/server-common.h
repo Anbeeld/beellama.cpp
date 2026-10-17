@@ -106,6 +106,20 @@ std::string gen_tool_call_id();
 const char * get_media_marker();
 
 //
+// model output modalities
+//
+
+// output modalities for architecture.output_modalities in GET /models
+std::vector<std::string> server_model_output_modalities(common_decision_type decision_type);
+
+// architecture object of GET /models; shared by the direct server and the router
+json server_model_architecture_json(
+        bool inp_image,
+        bool inp_audio,
+        bool inp_video,
+        const std::vector<std::string> & output_modalities);
+
+//
 // lora utils
 //
 
@@ -304,12 +318,12 @@ struct server_mtmd_seg {
  */
 bool server_build_mtmd_part_layout(
         const std::string & marker,
-        const std::vector<jinja::string_part> & parts,
+        const std::vector<common_chat_prompt_part> & parts,
         size_t n_files,
         std::vector<server_mtmd_seg> & out_segs);
 
 /**
- * Tokenize a provenance-tagged chat prompt (jinja string parts carrying the
+ * Tokenize a provenance-tagged chat prompt (upstream prompt parts carrying the
  * is_input metadata), optionally interleaving the media files at the media
  * marker positions.
  *
@@ -326,7 +340,7 @@ bool server_build_mtmd_part_layout(
 server_tokens server_tokenize_prompt_parts(
                                         const llama_vocab * vocab,
                                         mtmd_context * mctx,
-                                        const std::vector<jinja::string_part> & parts,
+                                        const std::vector<common_chat_prompt_part> & parts,
                                         const std::vector<raw_buffer> & files,
                                         const mtmd_helper_init_opt & init_opt,
                                         bool add_special,
@@ -388,9 +402,11 @@ json oaicompat_completion_params_parse(const json & body);
 
 // used by /chat/completions endpoint
 json oaicompat_chat_params_parse(
+    const llama_vocab * vocab,
     json & body, /* openai api json semantics */
     const server_chat_params & opt,
-    std::vector<raw_buffer> & out_files);
+    std::vector<raw_buffer> & out_files,
+    common_chat_session & out_session);
 
 // used by /embeddings endpoint, content has the same format as a chat message content array
 server_tokens tokenize_oai_content_array(

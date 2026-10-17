@@ -5,7 +5,7 @@ common_chat_params common_chat_params_init_functionary_v3_2(const common_chat_te
                                                                    const autoparser::generation_params & inputs) {
     common_chat_params data;
 
-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs, std::nullopt, std::nullopt, std::nullopt, &data.prompt_parts);
+    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
     data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs);
     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
     data.preserved_tokens  = {
@@ -21,13 +21,11 @@ common_chat_params common_chat_params_init_functionary_v3_2(const common_chat_te
         // The header is template text; the continued content is
         // request-provided and must not be parsed for special tokens.
         data.generation_prompt = "<|start_header_id|>assistant<|end_header_id|>\n\n>>>all\n" + msg.render_content();
-        data.prompt += data.generation_prompt;
-
-        data.prompt_parts.push_back({false, "<|start_header_id|>assistant<|end_header_id|>\n\n>>>all\n"});
-        data.prompt_parts.push_back({true,  msg.render_content()});
+        data.prompt.append("<|start_header_id|>assistant<|end_header_id|>\n\n>>>all\n");
+        data.prompt.append(msg.render_content(), true);
     }
 
-    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+    data.parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
         // Functionary v3.2 format:
         // - Normal content: >>>all\n{content}
         // - Tool calls: >>>function_name\n{json_args}
@@ -48,7 +46,7 @@ common_chat_params common_chat_params_init_functionary_v3_2(const common_chat_te
 
         // Build tool call parsers for each available function
         auto tool_choice = p.choice();
-        foreach_function(inputs.tools, [&](const json & tool) {
+        foreach_function(inputs.tools, [&](size_t tool_index, const json & tool) {
             const auto & function = tool.at("function");
             std::string  name     = function.at("name");
             const auto   schema   = common_chat_tool_parameters(function);
@@ -56,10 +54,10 @@ common_chat_params common_chat_params_init_functionary_v3_2(const common_chat_te
             // Tool format: >>>function_name\n{json_args}
             auto tool_parser = p.tool(
                 p.tool_open(p.tool_name(p.literal(name)) + p.literal("\n")) +
-                p.tool_args(p.schema(p.json(), "tool-" + name + "-schema", schema))
+                p.tool_args(p.schema(p.json(), "tool-" + std::to_string(tool_index) + "-schema", schema))
             );
 
-            tool_choice |= p.rule("tool-" + name, tool_parser);
+            tool_choice |= p.rule("tool-" + std::to_string(tool_index), tool_parser);
         });
 
         auto content_only = content_until_end;
@@ -82,13 +80,11 @@ common_chat_params common_chat_params_init_functionary_v3_2(const common_chat_te
         return generation_prompt + ret;
     });
 
-    data.parser = parser.save();
-
     if (include_grammar) {
         data.grammar_lazy = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
 
         data.grammar = build_grammar([&](const common_grammar_builder & builder) {
-            parser.build_grammar(builder, data.grammar_lazy);
+            data.parser.build_grammar(builder, data.grammar_lazy);
         });
 
         // Grammar trigger for when the model starts outputting a tool call

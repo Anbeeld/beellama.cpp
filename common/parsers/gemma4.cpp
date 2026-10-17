@@ -152,16 +152,15 @@ common_chat_params common_chat_params_init_gemma4(const common_chat_template &  
                                                          const autoparser::generation_params & inputs) {
     common_chat_params data;
 
-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs, std::nullopt, std::nullopt, std::nullopt, &data.prompt_parts);
+    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
     data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs);
 
-    if (inputs.add_generation_prompt && string_ends_with(data.prompt, "<turn|>\n")) {
+    if (inputs.add_generation_prompt && string_ends_with(data.prompt.str(), "<turn|>\n")) {
         // This may happen if the model generates content + tool_call, the
         // template does not add the model's next turn and confuses the model
         // from emitting its proper reasoning token sequence.
         data.generation_prompt = "<|turn>model\n";
-        data.prompt += data.generation_prompt;
-        data.prompt_parts.push_back({false, data.generation_prompt});
+        data.prompt.append(data.generation_prompt);
     }
 
     data.message_delimiters = {
@@ -186,23 +185,23 @@ common_chat_params common_chat_params_init_gemma4(const common_chat_template &  
         const auto & msg = inputs.continue_msg;
         // Keep the provenance separate: template delimiters vs request-provided
         // continued content (must not be parsed for special tokens).
-        std::vector<jinja::string_part> gen_parts;
+        std::vector<common_chat_prompt_part> gen_parts;
 
-        const std::string turn_prefix = string_ends_with(data.prompt, "<turn|>\n") ? "<|turn>model\n" : "";
+        const std::string turn_prefix = string_ends_with(data.prompt.str(), "<turn|>\n") ? "<|turn>model\n" : "";
         data.generation_prompt        = turn_prefix;
-        gen_parts.push_back({false, turn_prefix});
+        gen_parts.push_back({turn_prefix, false});
         data.generation_prompt += "<|channel>thought\n" + msg.reasoning_content;
-        gen_parts.push_back({false, "<|channel>thought\n"});
-        gen_parts.push_back({true,  msg.reasoning_content});
+        gen_parts.push_back({"<|channel>thought\n", false});
+        gen_parts.push_back({msg.reasoning_content, true});
         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
             data.generation_prompt += "<channel|>" + msg.render_content();
-            gen_parts.push_back({false, "<channel|>"});
-            gen_parts.push_back({true,  msg.render_content()});
+            gen_parts.push_back({"<channel|>", false});
+            gen_parts.push_back({msg.render_content(), true});
         }
 
-        data.prompt += data.generation_prompt;
-
-        data.prompt_parts.insert(data.prompt_parts.end(), gen_parts.begin(), gen_parts.end());
+        for (const auto & part : gen_parts) {
+            data.prompt.append(part.text, part.is_input);
+        }
     }
 
     auto has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
@@ -210,7 +209,7 @@ common_chat_params common_chat_params_init_gemma4(const common_chat_template &  
     auto include_grammar     = has_response_format || (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE);
     auto extract_reasoning   = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
 
-    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+    data.parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
         auto start = p.rule("start", p.optional(p.literal("<|turn>model\n")));
 
         if (extract_reasoning) {
@@ -266,13 +265,13 @@ common_chat_params common_chat_params_init_gemma4(const common_chat_template &  
 
             auto tool_choice = p.choice();
 
-            foreach_function(inputs.tools, [&](const json & tool) {
+            foreach_function(inputs.tools, [&](size_t tool_index, const json & tool) {
                 const auto & function = tool.at("function");
                 std::string  name     = function.at("name");
                 // TODO @aldehir : need to extend json-schema-to-grammar to produce more than JSON rules
                 // const auto & params   = function.at("parameters");
 
-                tool_choice |= p.rule("tool-" + name, p.tool(p.sequence({
+                tool_choice |= p.rule("tool-" + std::to_string(tool_index), p.tool(p.sequence({
                     p.tool_open(p.tool_name(p.literal(name)) + p.peek(p.literal("{"))),
                     p.tool_args(p.ref("gemma4-dict")),
                 })));
@@ -302,12 +301,10 @@ common_chat_params common_chat_params_init_gemma4(const common_chat_template &  
         return start + p.one_or_more(message);
     });
 
-    data.parser = parser.save();
-
     if (include_grammar) {
         data.grammar_lazy = !(has_response_format || (has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED));
         data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
-            parser.build_grammar(builder, data.grammar_lazy);
+            data.parser.build_grammar(builder, data.grammar_lazy);
         });
 
         data.grammar_triggers = {

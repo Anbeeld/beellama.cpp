@@ -1933,7 +1933,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         }
         // The tile_Q buffer is reused for the next k00 iteration, so all warps must sync here
         // before its data is overwritten. With np > 1 only some warps read back, but they all write.
-        if (np > 1 || k00 + nbatch_combine < DV/2) {
+        if (np > 1 || nbatch_combine != DKQ/2 || k00 + nbatch_combine < DV/2) {
             __syncthreads();
         }
     }

@@ -192,7 +192,8 @@ bool llama_memory_recurrent::can_seq_rm(llama_seq_id seq_id, llama_pos p0, llama
         // A recurrent snapshot rollback is consumed by the next graph input.
         // Until then, a second partial rollback cannot be represented and
         // must be rejected during planning, before mutation starts.
-        return rs_idx[seq_id] == 0 && rollback >= 1 && rollback <= llama_pos(n_rs_seq);
+        return cell.seq_id.size() <= 1 &&
+               (is_empty() || (rs_idx[seq_id] == 0 && rollback >= 1 && rollback <= llama_pos(n_rs_seq)));
     }
     return true;
 }
@@ -235,6 +236,10 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
 
             // partial rollback via per-token snapshot index (bounded by n_rs_seq)
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
+                // a cell shared by several sequences cannot move back for only one of them
+                if (cell.seq_id.size() > 1) {
+                    return false;
+                }
                 // the filter kept no layer (e.g. an MTP draft context), so only the position moves back
                 if (is_empty()) {
                     cell.pos = p0 - 1;
