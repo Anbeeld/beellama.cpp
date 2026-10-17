@@ -466,7 +466,8 @@ extern "C" {
     // descriptor-native domain contract.
     enum ggml_flash_attn_ext_op_param {
         GGML_FLASH_ATTN_EXT_OP_PARAM_PREC         = 3,
-        GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN = 4,
+        // Slot 4 is the generic sparse-FA n_kv_max hint, including after KVarN materialization.
+        GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN = 9,
         GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_BODYLESS = 5,
         GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_HISTORY_SLOTS = 6,
         GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_WINDOW_CHUNK = 7,
