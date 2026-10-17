@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.4.9
+
+- Updated the llama.cpp base from `c06f84160` to `fd55cb98f`. Inherited changes include multi-GPU MoE caching, LiLiCorr speculative decoding, chat-session APIs, new model support, and backend, server, conversion, and Web UI updates.
+
 ## v0.4.8
 
 - Updated the llama.cpp base from `465e49b9c` to `c06f84160` and ggml to 0.26.0. Inherited changes include GLM-5.3-Flash, Maple, HrmText, Ling 3.0 VL, and decision-model support; expanded MTP/DFlash, probabilistic drafting, sparse FlashAttention, multimodal embeddings, `/v1/systemone`, extended batch APIs, imatrix calibration, and backend/server/Web UI fixes. Session/sequence-state formats are now 11/4, the backend API is 3, and RPC is 7.0.0. Legacy mmap/mlock/direct-I/O switches are replaced by `--load-mode`.
