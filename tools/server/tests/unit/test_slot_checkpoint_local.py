@@ -210,6 +210,63 @@ def _appendix(data: bytes) -> tuple[int, list[tuple[int, list[tuple[int, int, in
     return offset, entries
 
 
+@pytest.mark.parametrize("model,spec", [("none", "none"), ("mtp", "mtp")], indirect=["model"], ids=["target", "mtp"])
+@pytest.mark.parametrize("cache", ["f16", "kvarn4"])
+@pytest.mark.parametrize("min_step", [0, 8192], ids=["all-users", "spaced-users"])
+def test_chat_user_seam_checkpoints(model: Path, spec: str, cache: str, min_step: int, tmp_path: Path):
+    directory = tmp_path / "chat-slots"
+    server = _server(model, cache, directory, "user-seams", spec)
+    server.n_slots = 1
+    server.n_ctx = 4096
+    server.jinja = True
+    server.chat_template = "chatml"
+    server.checkpoint_min_step = min_step
+    server.start(timeout_seconds=600)
+    try:
+        # Keep every user boundary far from the snapped end anchors and off the
+        # descriptor grid. Span coordinates come from the actual rendered tokens.
+        messages = [{"role": "system", "content": "System context. " * 70}]
+        for turn in range(3):
+            messages.append({"role": "user", "content": f"Question {turn}. " + "alpha beta gamma. " * 65})
+            if turn < 2:
+                messages.append({"role": "assistant", "content": "Previous answer. " * 50})
+        rendered = server.make_request("POST", "/apply-template", data={"messages": messages})
+        assert rendered.status_code == 200, rendered.body
+        prompt = _tokenize(server, rendered.body["prompt"], special=True)
+        delimiter = _tokenize(server, "<|im_start|>user\n", special=False)
+        starts = [i for i in range(len(prompt)) if prompt[i:i + len(delimiter)] == delimiter]
+        assert len(starts) == 3, starts
+        assert all(pos > 128 and pos % 128 != 0 for pos in starts), starts
+        assert len(prompt) - starts[-1] > 256, (len(prompt), starts)
+        response = server.make_request("POST", "/v1/chat/completions", data={
+            "messages": messages, "max_tokens": 1, "temperature": 0.0,
+            "seed": 12345, "id_slot": 0, "cache_prompt": True,
+        })
+        assert response.status_code == 200, response.body
+        _slot(server, 0, "save", "chat.bin")
+        data = (directory / "chat.bin").read_bytes()
+        _, entries = _appendix(data)
+        boundaries = [struct.unpack_from("=q", data, offset)[0] for offset, _ in entries]
+        alignment = 128 if cache == "kvarn4" else 1
+        seams = [pos // alignment * alignment for pos in starts]
+        expected = seams if min_step == 0 else [seams[0], seams[-1]]
+        # Tail anchors are beyond the last user start; inspect only semantic anchors.
+        actual = [pos for pos in boundaries if pos <= starts[-1]]
+        assert actual == expected, (actual, expected, boundaries, starts)
+        assert all(pos % alignment == 0 for pos in boundaries), boundaries
+
+        suffix = _tokenize(server, "A different historical question. What is seven plus eight?\nAnswer:", special=False)
+        branch = prompt[:starts[1]] + suffix
+        reused = _complete(server, branch, 0)
+        assert reused["timings"]["cache_source"] == "checkpoint", reused
+        expected_reuse = seams[1] if min_step == 0 else seams[0]
+        assert reused["timings"]["cache_n"] == expected_reuse, reused
+        cold = _complete(server, branch, 0, cache=False)
+        _assert_reuse(reused, cold)
+    finally:
+        server.stop()
+
+
 @pytest.mark.parametrize("cache", ["f16", "kvarn4"])
 def test_checkpoint_appendix_damage_falls_back(model: Path, cache: str, tmp_path: Path):
     directory = tmp_path / "slots"

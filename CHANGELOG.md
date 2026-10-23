@@ -2,6 +2,7 @@
 
 ## v0.4.9
 
+- Moved structured KVarN mid-prompt checkpoints to the nonzero descriptor-group boundary at or before each user-message start (PR #186). Retained seam anchors sit less than one group before their user boundary; checkpoint spacing and per-slot FIFO limits still apply, so this is not a bound on total follow-up replay.
 - Updated the llama.cpp base from `c06f84160` to `fd55cb98f`. Inherited changes include multi-GPU MoE caching, LiLiCorr speculative decoding, chat-session APIs, new model support, and backend, server, conversion, and Web UI updates.
 
 ## v0.4.8

@@ -172,6 +172,22 @@ static std::vector<llama_token> server_sample_and_accept_synth(
     return result;
 }
 
+// true if a user message span starts in [lo, hi). Spans are sorted by pos and
+// lo/hi are token indices, so they compare directly with span.pos. Used to place
+// KVarN checkpoints on the group seam preceding a user message.
+static bool server_prompt_spans_has_user_start_in(const common_chat_msg_spans & spans, int32_t lo, int32_t hi) {
+    for (const auto & span : spans.spans) {
+        const int32_t pos = (int32_t) span.pos;
+        if (pos >= hi) {
+            break;
+        }
+        if (span.role == COMMON_CHAT_ROLE_USER && pos >= lo) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
     SLOT_STATE_IDLE,
@@ -4539,6 +4555,7 @@ private:
 
                     bool do_checkpoint = params_base.n_ctx_checkpoints > 0;
                     const int32_t checkpoint_min_step = params_base.checkpoint_min_step;
+                    const int32_t reuse_alignment = prompt_reuse_alignment();
                     const auto & spans = slot.task->params.message_spans;
                     // Structured chats already checkpoint user boundaries. Add
                     // periodic anchors only for raw/unstructured prompts, where
@@ -4657,7 +4674,9 @@ private:
                         slot.prompt.tokens.push_back(cur_tok);
 
                         // break at the last user message, or at user messages at least min step past the last checkpoint
-                        if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
+                        // (standard/recurring caches); KVarN breaks at the group seam just before a user
+                        // message instead, so the checkpoint boundary is a restorable full-descriptor position
+                        if (do_checkpoint && reuse_alignment == 1 && spans.is_user_start(slot.prompt.n_tokens())) {
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
@@ -4672,6 +4691,22 @@ private:
                         if (do_checkpoint && checkpoint_interval > 0 &&
                                 slot.prompt.n_tokens() % checkpoint_interval == 0) {
                             break;
+                        }
+
+                        // KVarN: break on the group seam that precedes a user message starting within the
+                        // next group, so the following checkpoint boundary sits no more than one group
+                        // before the message boundary and is a restorable full-descriptor position
+                        if (do_checkpoint && reuse_alignment > 1 &&
+                                slot.prompt.n_tokens() >= reuse_alignment &&
+                                slot.prompt.n_tokens() % reuse_alignment == 0) {
+                            const auto pos = slot.prompt.n_tokens();
+                            const bool user_ahead = server_prompt_spans_has_user_start_in(spans, pos, pos + reuse_alignment);
+                            const bool last_user_ahead = last_user_pos >= pos && last_user_pos < pos + reuse_alignment;
+
+                            if (user_ahead && (last_user_ahead || slot.prompt.checkpoints.empty() ||
+                                               pos > slot.prompt.checkpoints.back().n_tokens + checkpoint_min_step)) {
+                                break;
+                            }
                         }
 
                         // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
@@ -4710,7 +4745,15 @@ private:
 
                     const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
 
-                    const bool is_user_start = spans.is_user_start(n_tokens_start);
+                    const bool is_user_start = reuse_alignment == 1 && spans.is_user_start(n_tokens_start);
+                    // KVarN: this batch round starts at a group seam with a user message in the following
+                    // group, so a checkpoint here sits just before that message boundary
+                    const bool is_user_seam = reuse_alignment > 1 &&
+                            n_tokens_start >= reuse_alignment &&
+                            n_tokens_start % reuse_alignment == 0 &&
+                            server_prompt_spans_has_user_start_in(spans, n_tokens_start, n_tokens_start + reuse_alignment);
+                    const bool is_last_user_seam = is_user_seam &&
+                            last_user_pos >= n_tokens_start && last_user_pos < n_tokens_start + reuse_alignment;
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
                     const bool is_periodic_checkpoint = checkpoint_interval > 0 &&
                             n_tokens_start > 0 && n_tokens_start % checkpoint_interval == 0;
@@ -4729,8 +4772,9 @@ private:
                         slot.init_sampler();
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
-                        // message or we are near the end of the prompt
-                        if (!is_user_start && !is_periodic_checkpoint && !near_prompt_end) {
+                        // message (standard caches), a group seam just before a user message (KVarN),
+                        // a periodic anchor, or we are near the end of the prompt
+                        if (!is_user_start && !is_user_seam && !is_periodic_checkpoint && !near_prompt_end) {
                             do_checkpoint = false;
                         }
                     }
@@ -4749,9 +4793,10 @@ private:
                     do_checkpoint = do_checkpoint && n_tokens_cur > 0;
 
                     // no need to create checkpoints that are too close together, unless it's the last user message
+                    // or the KVarN seam just before it
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
-                            is_last_user_message || near_prompt_end ||
+                            is_last_user_message || near_prompt_end || is_last_user_seam ||
                             n_tokens_start >= slot.prompt.checkpoints.back().n_tokens + checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 

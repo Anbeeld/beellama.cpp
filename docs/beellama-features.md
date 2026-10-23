@@ -403,6 +403,15 @@ batching and impose no Bee-specific 64-token cadence. `cache_prompt=false`,
 slot eviction, corrupt or incompatible state, and the absence of one common
 target/draft/speculative plan remain reason-coded misses.
 
+For structured KVarN prompts, mid-prompt checkpoints move to
+`floor(user_start / group) * group`, provided that boundary is nonzero.
+These seam anchors obey `--checkpoint-min-step` and the per-slot FIFO
+checkpoint cap; the last user seam is exempt from the spacing requirement.
+A retained seam anchor is less than one descriptor group before its user
+boundary, but this does not guarantee a one-group limit on total follow-up
+replay. Standard/recurrent cache scheduling, raw/unstructured periodic anchors,
+snapped end anchors, and the checkpoint alignment guard remain unchanged.
+
 RAM entries are immutable and repeatably restorable. Admission serializes a
 self-contained target/draft/speculative candidate before publishing it and
 clears an idle unified slot only after admission succeeds. Restore prepares and
