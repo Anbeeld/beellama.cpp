@@ -15,6 +15,7 @@
 
 bool llama_model_saver_supports_arch(llm_arch arch) {
     switch (arch) {
+        case LLM_ARCH_SENSENOVA_U1:
         case LLM_ARCH_GEMMA3N:
         case LLM_ARCH_BITNET:
         case LLM_ARCH_T5:
@@ -279,6 +280,7 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,            hparams.n_embd_head_v_full);
     add_kv(LLM_KV_ATTENTION_LAYERNORM_EPS,           hparams.f_norm_eps);
     add_kv(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
+    add_kv(LLM_KV_POST_NORM_EPS,                     hparams.f_post_norm_eps);
     add_kv(LLM_KV_ATTENTION_GROUPNORM_EPS,           hparams.f_norm_group_eps);
     add_kv(LLM_KV_ATTENTION_GROUPNORM_GROUPS,        hparams.n_norm_groups);
     add_kv(LLM_KV_ATTENTION_VALUE_EXPERT_COUNT,      hparams.n_value_expert);
@@ -422,6 +424,7 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_TOKENIZER_ADD_SEP,                 vocab.get_add_sep());
     add_kv(LLM_KV_TOKENIZER_ADD_PREFIX,              vocab.get_add_space_prefix());
     add_kv(LLM_KV_TOKENIZER_REMOVE_EXTRA_WS,         vocab.get_remove_extra_whitespaces());
+    add_kv(LLM_KV_TOKENIZER_CLEAN_SPACES,            vocab.get_clean_spaces());
     add_kv(LLM_KV_TOKENIZER_PRECOMPILED_CHARSMAP,    vocab.get_precompiled_charsmap());
     // add_kv(LLM_KV_TOKENIZER_HF_JSON,                 ???);
     // add_kv(LLM_KV_TOKENIZER_RWKV,                    ???);

@@ -522,6 +522,14 @@ preparation and compute failures distinctly. A failed destination may be
 evicted as cleanup, but state save, the next decode, sequence reuse, and server
 handoff cannot observe it as a completed copy.
 
+Disk slot saves include checkpoint metadata and the live owned-draft and
+speculative continuation state. Restore prepares target, owned draft, and
+speculative state before publishing any component. A malformed draft appendix
+rejects the restore without publishing the target. Shared draft KV is never
+serialized or restored independently. A legacy target-only file used with an
+owned draft requires full prompt reevaluation rather than reusing a mismatched
+draft epoch.
+
 ### Backend routes
 
 CUDA, CPU, and Vulkan KVarN routes are hardware verified. The portable

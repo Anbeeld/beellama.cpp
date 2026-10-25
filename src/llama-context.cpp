@@ -377,6 +377,11 @@ static bool kv_tail_device_has_native_attention(ggml_backend_dev_t dev) {
                    reg, "ggml_backend_kvarn_tail_attention_supported") != nullptr;
 }
 
+static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
+    /*.op               =*/ LLM_FUSED_OP_TOP_K_MASK,
+    /*.name             =*/ "fused top-k mask",
+    /*.n_tokens_per_seq =*/ 1,
+};
 
 llama_context::llama_context(
         const llama_model & model,
@@ -737,6 +742,10 @@ llama_context::llama_context(
     cparams.fused_dsv4_hc_comb = true;
     cparams.fused_dsv4_hc_post = true;
     cparams.auto_fhc           = true;
+
+    // only the indexer models build this mask, skip the probe for the others
+    cparams.fused_top_k_mask = true;
+    cparams.auto_ftkm        = hparams.indexer_top_k > 0;
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
@@ -1130,6 +1139,12 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         resolve(llm_fused_op_dsv4_hc_comb_probe, cparams.fused_dsv4_hc_comb);
         resolve(llm_fused_op_dsv4_hc_post_probe, cparams.fused_dsv4_hc_post);
         cparams.auto_fhc = false;
+    }
+
+    if (cparams.auto_ftkm) {
+        LLAMA_LOG_INFO("%s: resolving fused top-k mask support:\n", func);
+        resolve(llm_fused_op_top_k_mask_probe, cparams.fused_top_k_mask);
+        cparams.auto_ftkm = false;
     }
 }
 
@@ -4165,6 +4180,7 @@ private:
 };
 
 struct llama_state_seq_restore_plan {
+    std::unique_ptr<llama_file> file;
     std::unique_ptr<llama_io_read_i> io;
     size_t bytes = 0;
 };
@@ -4345,6 +4361,44 @@ llama_state_seq_restore_plan * llama_context::state_seq_prepare_data(
         return plan.release();
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error preparing state: %s\n", __func__, err.what());
+        return nullptr;
+    }
+}
+
+llama_state_seq_restore_plan * llama_context::state_seq_prepare_file(
+        llama_seq_id seq_id, const char * filepath, llama_token * tokens_out,
+        size_t n_token_capacity, size_t * n_token_count_out, size_t * n_bytes_out) {
+    if (!filepath || !tokens_out || !n_token_count_out || !n_bytes_out ||
+            seq_id < 0 || uint32_t(seq_id) >= cparams.n_seq_max ||
+            (memory && !memory->state_seq_can_restore(seq_id, 0))) {
+        return nullptr;
+    }
+    try {
+        auto plan = std::make_unique<llama_state_seq_restore_plan>();
+        plan->file = std::make_unique<llama_file>(filepath, "rb");
+        auto & file = *plan->file;
+        const uint32_t magic = file.read_u32();
+        const uint32_t version = file.read_u32();
+        if (magic != LLAMA_STATE_SEQ_MAGIC || version != LLAMA_STATE_SEQ_VERSION) {
+            throw std::runtime_error("unknown sequence state file version");
+        }
+        const uint32_t count = file.read_u32();
+        if (count > n_token_capacity || count > (file.size() - file.tell()) / sizeof(llama_token)) {
+            throw std::runtime_error("sequence state token count exceeds capacity or file size");
+        }
+        std::vector<llama_token> tokens(count);
+        file.read_raw(tokens.data(), sizeof(llama_token) * count);
+        plan->io = std::make_unique<llama_io_read_file>(&file);
+        if (!state_seq_read_data(*plan->io, seq_id, 0)) {
+            throw std::runtime_error("unable to prepare sequence state file");
+        }
+        plan->bytes = file.tell();
+        std::copy(tokens.begin(), tokens.end(), tokens_out);
+        *n_token_count_out = count;
+        *n_bytes_out = plan->bytes;
+        return plan.release();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error preparing state file: %s\n", __func__, err.what());
         return nullptr;
     }
 }
@@ -5647,6 +5701,18 @@ llama_state_seq_restore_plan * llama_state_seq_prepare_data_ext(
 
     ctx->synchronize();
     return ctx->state_seq_prepare_data(seq_id, src, size, flags);
+}
+
+llama_state_seq_restore_plan * llama_state_seq_prepare_file(
+        llama_context * ctx, const char * filepath, llama_seq_id seq_id,
+        llama_token * tokens_out, size_t n_token_capacity,
+        size_t * n_token_count_out, size_t * n_bytes_out) {
+    if (!ctx) {
+        return nullptr;
+    }
+    ctx->synchronize();
+    return ctx->state_seq_prepare_file(
+            seq_id, filepath, tokens_out, n_token_capacity, n_token_count_out, n_bytes_out);
 }
 
 size_t llama_state_seq_restore_plan_commit(llama_state_seq_restore_plan * plan) {

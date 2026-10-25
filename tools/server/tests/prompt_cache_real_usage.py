@@ -434,6 +434,7 @@ def run_phase(args: argparse.Namespace, server: Server, oracle: bool, records: l
             "cache_reason": str(timings.get("cache_reason", "unknown")),
             "ttft_ms": result.ttft_ms,
             "total_latency_ms": result.latency_ms,
+            "timings": timings,
             "output_tokens": len(output_token_ids),
             "output_token_ids": output_token_ids,
             "output_token_ids_source": "native_return_tokens",

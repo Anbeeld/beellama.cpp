@@ -1161,6 +1161,18 @@ extern "C" {
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
 
+    // Prepare the target payload of a sequence-state file without publishing it.
+    // Tokens and n_bytes_out (the end offset of the target payload, before any
+    // optional appendix) are returned only on success. The plan owns its file.
+    LLAMA_API struct llama_state_seq_restore_plan * llama_state_seq_prepare_file(
+            struct llama_context * ctx,
+                      const char * filepath,
+                    llama_seq_id   dest_seq_id,
+                     llama_token * tokens_out,
+                          size_t   n_token_capacity,
+                          size_t * n_token_count_out,
+                          size_t * n_bytes_out);
+
     // Returns the committed byte count, or zero for an invalid/consumed plan.
     LLAMA_API size_t llama_state_seq_restore_plan_commit(
             struct llama_state_seq_restore_plan * plan);

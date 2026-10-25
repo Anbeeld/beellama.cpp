@@ -58,33 +58,74 @@ struct tensor_data_params {
     float  stdev;
 };
 
+// fills the values of one tensor, the name carries whatever the property needs
+typedef void (*tensor_filler)(std::vector<float> & dst, const char * name, const tensor_data_params & params);
+
+// a normal draw keyed on a name, so that tensors which share a draw ask for the same key
+static void fill_normal(std::vector<float> & dst, const char * key, const tensor_data_params & params) {
+    std::mt19937 gen(params.seed ^ std::hash<std::string>{}(key));
+    std::normal_distribution<float> dis(0.0f, params.stdev);
+    for (float & v : dst) {
+        v = dis(gen);
+    }
+}
+
+// Mamba A must be negative (state decay)
+static void fill_ssm_a(std::vector<float> & dst, const char * name, const tensor_data_params & params) {
+    fill_normal(dst, name, params);
+    for (float & v : dst) {
+        v = -fabsf(v);
+    }
+}
+
+// a norm preserving residual gate holds alpha^2 + beta^2 == 1, and the conversion resolves both from one raw weight
+// the alpha and the beta of a block share that weight, so the key drops the suffix and keeps the block
+static void fill_resid_gate(std::vector<float> & dst, const char * name, const tensor_data_params & params) {
+    const char * suffix = strstr(name, "_resid_");
+    const bool is_beta = strstr(suffix, "_resid_beta") != nullptr;
+    fill_normal(dst, std::string(name, suffix - name).c_str(), params);
+    for (float & v : dst) {
+        const float beta = 1.0f / (1.0f + expf(-v));
+        v = is_beta ? beta : sqrtf(1.0f - beta*beta);
+    }
+}
+
+// a random router bias can tie within the noise between the backends, a ramp keeps the top-k selection the same
+static void fill_exp_probs_b(std::vector<float> & dst, const char *, const tensor_data_params &) {
+    for (size_t i = 0; i < dst.size(); i++) {
+        dst[i] = 2.0f*i;
+    }
+}
+
+// a tensor whose values hold a property of their own, matched on a substring of its name, first match wins
+static const struct { const char * match; tensor_filler fill; } TENSOR_FILLERS[] = {
+    { "ssm_a",       fill_ssm_a       },
+    { "_resid_",     fill_resid_gate  },
+    { "exp_probs_b", fill_exp_probs_b },
+};
+
 static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
     const tensor_data_params & params = *(const tensor_data_params *) userdata;
-    size_t seed = params.seed;
-    std::hash<std::string> hasher;
-    seed ^= hasher(tensor->name);
-    std::mt19937 gen(seed);
-    std::normal_distribution<float> dis(0.0f, params.stdev);
 
-    // TODO: refactor per-tensor initialization logic in a cleaner way
-
-    // note: Mamba A must be negative (state decay)
-    const bool is_ssm_a = strstr(tensor->name, "ssm_a") != nullptr;
-    const int64_t ne = ggml_nelements(tensor);
-    if (tensor->type == GGML_TYPE_F32) {
-        std::vector<float> tmp(ne);
-        for (int64_t i = 0; i < ne; i++) {
-            float val = dis(gen);
-            tmp[i] = is_ssm_a ? -fabsf(val) : val;
+    tensor_filler fill = fill_normal;
+    for (const auto & filler : TENSOR_FILLERS) {
+        if (strstr(tensor->name, filler.match) != nullptr) {
+            fill = filler.fill;
+            break;
         }
+    }
+
+    std::vector<float> tmp(ggml_nelements(tensor));
+    fill(tmp, tensor->name, params);
+
+    if (tensor->type == GGML_TYPE_F32) {
         ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
     } else if (tensor->type == GGML_TYPE_F16) {
-        std::vector<ggml_fp16_t> tmp(ne);
-        for (int64_t i = 0; i < ne; i++) {
-            float val = dis(gen);
-            tmp[i] = ggml_fp32_to_fp16(is_ssm_a ? -fabsf(val) : val);
+        std::vector<ggml_fp16_t> tmp16(tmp.size());
+        for (size_t i = 0; i < tmp.size(); i++) {
+            tmp16[i] = ggml_fp32_to_fp16(tmp[i]);
         }
-        ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
+        ggml_backend_tensor_set(tensor, tmp16.data(), 0, ggml_nbytes(tensor));
     } else {
         GGML_ABORT("fatal error");
     }
@@ -103,6 +144,7 @@ static void usage(char ** argv) {
     LOG("      --test-mtp-request-reset Run the Bee MTP request reset regression\n");
     LOG("      --test-mtp-kvarn-routing Run the Bee MTP KVarN routing regression\n");
     LOG("      --test-kvarn-state-restore Run the Bee KVarN self-contained state restore regression\n");
+    LOG("      --test-qsa-exact-tail Run the QSA body/exact mask regression\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -194,8 +236,14 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
     uint32_t n_head_kv = n_head;
     if (arch == LLM_ARCH_QWEN3) {
         n_head_kv = 1; // MQA coverage
-    } else if (arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_AFMOE || arch == LLM_ARCH_MAION_CODER) {
+    } else if (arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_MUSE_SPARK || arch == LLM_ARCH_AFMOE || arch == LLM_ARCH_MAION_CODER ||
+            arch == LLM_ARCH_KOLIBRI1) {
         n_head_kv = 2; // GQA coverage
+    }
+    if (arch == LLM_ARCH_BEAM) {
+        n_head    = 4;
+        n_head_kv = 2;
+        n_layer   = 4;
     }
     const uint32_t n_embd_head = n_embd / n_head;
 
@@ -294,6 +342,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         // partial rotary: n_rot must not exceed the indexer key length (64)
         ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(64));
     }
+    if (arch == LLM_ARCH_SENSENOVA_U1) {
+        ms.add_kv(LLM_KV_ROPE_FREQ_BASE_SPATIAL, 10000.0f);
+    }
     ms.add_kv(LLM_KV_ATTENTION_CLAMP_KQV,              1.0f);
     ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_EPS,          1e-5f);
     ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,      1e-5f);
@@ -306,6 +357,13 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
 
     if (arch == LLM_ARCH_MAION_CODER) {
         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, std::vector<uint32_t>{1, 1, 0, 0});
+    } else if (arch == LLM_ARCH_BEAM) {
+        std::vector<uint32_t> pattern;
+        pattern.reserve(n_layer);
+        for (uint32_t il = 0; il < n_layer; il++) {
+            pattern.push_back(il % 2);
+        }
+        ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, pattern);
     } else if (arch == LLM_ARCH_GEMMA4) {
         ms.add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER,      n_embd/2);
         ms.add_kv(LLM_KV_ATTENTION_SHARED_KV_LAYERS,      uint32_t(0));
@@ -315,16 +373,32 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         // SWA pattern: every 5th layer is full attention (matches E2B layer_types)
         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, uint32_t(5));
     } else if (arch == LLM_ARCH_COHERE2MOE || arch == LLM_ARCH_MIMO2 || arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_SPARK2_5 ||
-            arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_GRANITE_SWA || arch == LLM_ARCH_DOTS3NOTE ||
-            arch == LLM_ARCH_MAPLE) {
+            arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_MUSE_SPARK || arch == LLM_ARCH_GRANITE_SWA || arch == LLM_ARCH_DOTS3NOTE ||
+            arch == LLM_ARCH_KOLIBRI1 || arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_FLINT) {
         std::vector<uint32_t> pattern;
         pattern.reserve(n_layer);
         for (uint32_t il = 0; il < n_layer; il++) {
             pattern.push_back(il % 2);
         }
         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, pattern);
+        if (arch == LLM_ARCH_FLINT) {
+            ms.add_kv(LLM_KV_ATTENTION_ROPE_PATTERN, pattern);
+        }
     } else {
         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, uint32_t(2));
+    }
+
+    if (arch == LLM_ARCH_MUSE_SPARK) {
+        ms.add_kv(LLM_KV_POST_NORM_EPS,           1e-5f);
+        ms.add_kv(LLM_KV_ROPE_FREQ_BASE_SWA,      10000.0f);
+        ms.add_kv(LLM_KV_FINAL_LOGIT_SOFTCAPPING, 30.0f);
+        ms.add_kv(LLM_KV_MOE_LATENT_SIZE,         n_embd/2);
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,    1.0f);
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,     true);
+    }
+
+    if (arch == LLM_ARCH_KOLIBRI1) {
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM, false);
     }
 
     // MSA requires one indexer head per GQA (KV) head, unlike the DSA archs where the
@@ -451,18 +525,41 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_EXPERT_COUNT,               uint32_t(host_experts_test(arch) ? 64 : 2));
         ms.add_kv(LLM_KV_EXPERT_USED_COUNT,          uint32_t(2));
         ms.add_kv(LLM_KV_EXPERT_SHARED_COUNT,        uint32_t(1));
-        ms.add_kv(LLM_KV_EXPERT_GATING_FUNC,         arch == LLM_ARCH_DEEPSEEK4 ? uint32_t(4) : uint32_t(2)); // sqrtsoftplus : sigmoid
+
+        uint32_t gating_func = 2;
+        switch (arch) {
+            case LLM_ARCH_MELLUM:
+                gating_func = 1;
+                break;
+            case LLM_ARCH_DEEPSEEK4:
+                gating_func = 4;
+                break;
+            default:
+                break;
+        }
+
+        ms.add_kv(LLM_KV_EXPERT_GATING_FUNC,         gating_func); // sigmoid : softmax : sqrtsoftplus
         ms.add_kv(LLM_KV_EXPERT_GROUP_SCALE,         1.0f);
         ms.add_kv(LLM_KV_EXPERTS_PER_GROUP,          uint32_t(1));
+        if (arch == LLM_ARCH_FLINT) {
+            ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM, true);
+        }
         if (arch == LLM_ARCH_K2_HORIZON) {
             ms.add_kv(LLM_KV_ATTENTION_VALUE_EXPERT_COUNT,      uint32_t(2));
             ms.add_kv(LLM_KV_ATTENTION_VALUE_EXPERT_USED_COUNT, uint32_t(2));
         }
     }
 
+    if (arch == LLM_ARCH_BEAM) {
+        ms.add_kv(LLM_KV_EXPERT_COUNT,            uint32_t(8));
+        ms.add_kv(LLM_KV_EXPERT_GROUP_COUNT,      uint32_t(4));
+        ms.add_kv(LLM_KV_EXPERT_GROUP_USED_COUNT, uint32_t(2));
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,    2.5f);
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,     true);
+    }
+
     if (arch == LLM_ARCH_MAION_CODER) {
         ms.add_kv(LLM_KV_MOE_LATENT_SIZE, n_embd / 2);
-        ms.add_kv(LLM_KV_EXPERT_COUNT, uint32_t(4));
         ms.add_kv(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, std::vector<uint32_t>{n_ff, n_ff / 2, n_ff, n_ff});
     }
 
@@ -1011,6 +1108,55 @@ static std::vector<float> kvarn_restore_decode(
     return result;
 }
 
+// QSA can elide the ordinary mask, but exact-tail planning still needs it.
+static int test_qsa_exact_tail(const size_t seed) {
+    auto gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    tensor_data_params data = { seed, 0.1f };
+    auto mp = llama_model_default_params();
+    ggml_backend_dev_t devices[] = { ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), nullptr };
+    mp.devices = devices;
+    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &data, mp));
+    if (!model) {
+        throw std::runtime_error("failed to create sparse QSA tail fixture");
+    }
+    const auto tokens = get_tokens(32, 128, seed + 1);
+    std::vector<float> reference;
+    for (bool tail : { false, true }) {
+        auto cp = llama_context_default_params();
+        cp.n_ctx = 512;
+        cp.n_batch = cp.n_ubatch = 32;
+        cp.n_threads = cp.n_threads_batch = 2;
+        cp.offload_kqv = false;
+        cp.type_k = cp.type_v = tail ? GGML_TYPE_Q4_0 : GGML_TYPE_Q8_0;
+        cp.kv_tail_tokens = 64;
+        cp.kv_tail_type = GGML_TYPE_F16;
+        llama_context_ptr ctx(llama_init_from_model(model.get(), cp));
+        if (!ctx) {
+            throw std::runtime_error("failed to create sparse QSA tail context");
+        }
+        kvarn_restore_decode(ctx.get(), tokens, 0, 0);
+        auto logits = kvarn_restore_decode(ctx.get(), get_tokens(16, 128, seed + 2), 32, 0);
+        if (!tail) {
+            reference = std::move(logits);
+        } else {
+            // Both overlays cover every visible row with identical rotations.
+            // The masked body's quantization must not change exact-tail logits.
+            float max_error = 0.0f;
+            for (size_t i = 0; i < logits.size(); ++i) {
+                max_error = std::max(max_error, std::abs(logits[i] - reference[i]));
+                if (!std::isfinite(logits[i])) {
+                    throw std::runtime_error("sparse QSA exact-tail logits are not finite");
+                }
+            }
+            std::fprintf(stderr, "QSA exact-tail max error=%g NMSE=%g\n", max_error, nmse(reference, logits));
+            if (max_error > 1.0e-6f) {
+                throw std::runtime_error("sparse QSA exact-tail logits depend on masked body precision");
+            }
+        }
+    }
+    return 0;
+}
+
 // Regression for the ordinary --cache-ram KVarN restore bug: with one physical
 // stream per sequence (-np > 1, not unified), a SELF_CONTAINED state omitted the
 // F16-only stage rows (the permanent group-0 sink and an unsealed live group).
@@ -1292,6 +1438,7 @@ static bool check_causal_attn_toggle(
 
 static bool moe_mandatory(const llm_arch arch) {
     switch (arch) {
+        case LLM_ARCH_FLINT:
         case LLM_ARCH_LLAMA4:
         case LLM_ARCH_MAION_CODER:
         case LLM_ARCH_COHERE2MOE:
@@ -1319,6 +1466,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_BAILINGMOE3:
         case LLM_ARCH_DOTS1:
         case LLM_ARCH_AFMOE:
+        case LLM_ARCH_BEAM:
         case LLM_ARCH_ERNIE4_5:
         case LLM_ARCH_ERNIE4_5_MOE:
         case LLM_ARCH_HUNYUAN_MOE:
@@ -1343,6 +1491,8 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_MELLUM:
         case LLM_ARCH_LAGUNA:
         case LLM_ARCH_MAPLE:
+        case LLM_ARCH_MUSE_SPARK:
+        case LLM_ARCH_KOLIBRI1:
             return true;
         default:
             return false;
@@ -1480,6 +1630,18 @@ static int save_models(const std::string & arch_filter, const size_t seed, const
     return 0;
 }
 
+// the CPU and the GPU of an Apple SoC carry the same description, the name tells them apart (CPU, MTL0)
+static std::string get_device_label(ggml_backend_dev_t dev) {
+    const char * desc = ggml_backend_dev_description(dev);
+    const char * name = ggml_backend_dev_name(dev);
+
+    if (strcmp(desc, name) == 0) {
+        return desc;
+    }
+
+    return std::string(desc) + " (" + name + ")";
+}
+
 static int test_backends(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity, const char * target_backend) {
     struct user_data_t {
         struct {
@@ -1532,7 +1694,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 if (target_backend != nullptr && strcmp(target_backend, ggml_backend_dev_name(dev)) != 0) {
                     continue;
                 }
-                dev_configs.emplace_back(std::vector<ggml_backend_dev_t>{dev}, ggml_backend_dev_description(dev), LLAMA_SPLIT_MODE_LAYER);
+                dev_configs.emplace_back(std::vector<ggml_backend_dev_t>{dev}, get_device_label(dev), LLAMA_SPLIT_MODE_LAYER);
                 max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
 
                 // cpu-based devices cannot be used in tensor split mode
@@ -1774,6 +1936,7 @@ int main(int argc, char ** argv) {
     bool test_mtp_reset = false;
     bool test_mtp_kvarn = false;
     bool test_kvarn_restore = false;
+    bool test_qsa_tail = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -1851,6 +2014,8 @@ int main(int argc, char ** argv) {
             test_mtp_kvarn = true;
         } else if (strcmp(argv[i], "--test-kvarn-state-restore") == 0) {
             test_kvarn_restore = true;
+        } else if (strcmp(argv[i], "--test-qsa-exact-tail") == 0) {
+            test_qsa_tail = true;
         } else {
             LOG_ERR("%s: unknown argument: %s\n", __func__, argv[i]);
             usage(argv);
@@ -1881,6 +2046,9 @@ int main(int argc, char ** argv) {
         }
         if (test_kvarn_restore) {
             return test_kvarn_state_restore(seed);
+        }
+        if (test_qsa_tail) {
+            return test_qsa_exact_tail(seed);
         }
         return test_backends(arch_filter, seed, stdev, verbosity, target_backend);
     } catch (const std::exception & err) {
