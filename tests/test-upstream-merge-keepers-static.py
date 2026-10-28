@@ -24,21 +24,36 @@ def main() -> None:
     qwen4exp_h = (ROOT / "src/models/models.h").read_text(encoding="utf-8")
     for needle in (
         "LLM_KV_NEXTN_PREDICT_LAYERS",
-        "const bool mtp_only",
+        "const auto nf = nextn_flags(ml, LLM_TENSOR_HC_ATTN_NORM);",
         "LLM_TENSOR_NEXTN_EH_PROJ",
         "LLM_TENSOR_NEXTN_HC_HEAD_NORM",
-        "const int  trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0",
+        "const int trunk_flags = nf.trunk;",
         "load_block(il, trunk_flags)",
         "layer.nextn.hc_head_norm ? layer.nextn.hc_head_norm : model.hc_head_norm",
         "qwen4exp_shared_model",
         "LLM_GRAPH_TYPE_DECODER_MTP",
         "llama_model_qwen4exp::graph_mtp::graph_mtp",
         "mctx_idx && hparams.indexer_kpool > 0",
-        "(!cparams.embeddings_nextn || cparams.embeddings_nextn_masked)",
-        "if (cparams.embeddings_nextn && !cparams.embeddings_nextn_masked && inp_out_ids)",
+        "crop_before_nextn(inp_out_ids)",
+        "crop_after_nextn(inp_out_ids)",
     ):
         require(qwen4exp, needle, "Qwen4Exp standalone MTP draft-head support is incomplete")
     require(qwen4exp_h, "struct graph_mtp : public graph", "Qwen4Exp MTP graph declaration is missing")
+    # Upstream centralized the same admission/cropping rules. The loader helper
+    # is also exercised by test-nextn-flags with trunk/sidecar/skip fixtures.
+    model = (ROOT / "src/llama-model.cpp").read_text(encoding="utf-8")
+    for needle in (
+        'ml.get_weight(tn(trunk_probe, "weight", 0).str().c_str()) == nullptr',
+        'ml.get_weight(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", hparams.n_layer()).str().c_str()) == nullptr',
+        "trunk = TENSOR_NOT_REQUIRED;",
+        "mtp |= TENSOR_SKIP;",
+    ):
+        require(model, needle, "shared NextN admission must preserve standalone sidecar loading")
+    graph_h = (ROOT / "src/llama-graph.h").read_text(encoding="utf-8")
+    require(graph_h, "return inp_out_ids != nullptr && (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked);",
+            "NextN crop-before must preserve all requested hidden rows")
+    require(graph_h, "return inp_out_ids != nullptr && cparams.embeddings_nextn && !cparams.embeddings_nextn_masked;",
+            "NextN crop-after must keep the unmasked hidden-state extraction")
 
     hybrid_idx = (ROOT / "src/llama-memory-hybrid-idx.cpp").read_text(encoding="utf-8")
     constructors = hybrid_idx.split("llama_memory_hybrid_idx::llama_memory_hybrid_idx(")[1:]

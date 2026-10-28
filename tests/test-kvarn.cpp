@@ -2369,7 +2369,7 @@ static std::vector<float> test_native_flash_attention_output(
     ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, mask, 1.0f / std::sqrt(float(head_dim)), 0.0f, 0.0f);
     ggml_flash_attn_ext_add_sinks(out, sinks);
     out->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_WINDOW_CHUNK] = window_chunk;
-    if (native_view) {
+    if (native_view || materialized_graph) {
         out->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN] =
             rotate_graph ? (original_value_domain ?
                 GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V :
@@ -4768,6 +4768,103 @@ static void test_native_flash_attention_portable_original_v() {
     ggml_backend_free(gpu_backend);
 }
 
+static void test_flash_attn_op_param_layout() {
+    ggml_init_params params = { 1024 * 1024, nullptr, true };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr, "FA params: failed to initialize context");
+    ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, 4, 8, 1);
+    ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 256, 4096, 1, 1);
+    ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 256, 4096, 1, 1);
+    ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, nullptr, 0.0625f, 0.0f, 0.0f);
+
+    for (int slot : { GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN,
+                      GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_BODYLESS,
+                      GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_HISTORY_SLOTS,
+                      GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_WINDOW_CHUNK,
+                      GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_NON_CAUSAL_MASK }) {
+        require(slot > 4 && size_t(slot) < sizeof(out->op_params) / sizeof(out->op_params[0]),
+                "KVarN FA parameter overlaps generic FA parameters or exceeds storage");
+    }
+    // Match build_attn_mha followed by llm_flash_attn_ext_set_kvarn_domain.
+    for (int n_kv_max : { 0, 256 }) {
+        ggml_flash_attn_ext_set_n_kv_max(out, n_kv_max);
+        out->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN] =
+                GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V;
+        require(out->op_params[4] == n_kv_max,
+                "KVarN domain clobbered the sparse FA hint");
+        ggml_flash_attn_ext_set_n_kv_max(out, n_kv_max);
+        require(out->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN] ==
+                    GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V,
+                "sparse FA hint clobbered the KVarN domain");
+    }
+    ggml_free(ctx);
+    std::printf("test-kvarn: FlashAttention parameter layout OK\n");
+}
+
+// Materialized K/V must produce identical regular FA output with or without
+// the KVarN domain annotation. Long contexts expose accidental sparse dispatch.
+static void test_flash_attn_kvarn_domain_isolated_gpu(int n_kv) {
+    ggml_backend_t backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
+    if (backend == nullptr) {
+        std::printf("test-kvarn: FA domain isolation skipped (GPU unavailable)\n");
+        return;
+    }
+    ggml_init_params params = { 4 * 1024 * 1024, nullptr, true };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr, "FA domain: failed to initialize context");
+    ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, 4, 8, 1);
+    ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 256, n_kv, 1, 1);
+    ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 256, n_kv, 1, 1);
+    ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, 4, 1, 1);
+    ggml_tensor * plain = ggml_flash_attn_ext(ctx, q, k, v, mask, 0.0625f, 0.0f, 0.0f);
+    ggml_tensor * tagged = ggml_flash_attn_ext(ctx, q, k, v, mask, 0.0625f, 0.0f, 0.0f);
+    ggml_flash_attn_ext_set_prec(plain, GGML_PREC_F32);
+    ggml_flash_attn_ext_set_prec(tagged, GGML_PREC_F32);
+    ggml_flash_attn_ext_set_n_kv_max(tagged, 0);
+    tagged->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN] =
+            GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V;
+    if (!ggml_backend_supports_op(backend, plain) || !ggml_backend_supports_op(backend, tagged)) {
+        std::printf("test-kvarn: FA domain isolation skipped (shape unsupported)\n");
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return;
+    }
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, plain);
+    ggml_build_forward_expand(graph, tagged);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    require(buffer != nullptr, "FA domain: failed to allocate tensors");
+    std::vector<float> q_data(ggml_nelements(q));
+    std::vector<ggml_fp16_t> k_data(ggml_nelements(k));
+    std::vector<ggml_fp16_t> v_data(ggml_nelements(v));
+    std::vector<ggml_fp16_t> mask_data(ggml_nelements(mask), ggml_fp32_to_fp16(0.0f));
+    for (size_t i = 0; i < q_data.size(); ++i) {
+        q_data[i] = std::sin(float(i % 997) * 0.013f);
+    }
+    for (size_t i = 0; i < k_data.size(); ++i) {
+        k_data[i] = ggml_fp32_to_fp16(std::cos(float(i % 991) * 0.017f));
+        v_data[i] = ggml_fp32_to_fp16(std::sin(float(i % 983) * 0.019f));
+    }
+    ggml_backend_tensor_set(q, q_data.data(), 0, ggml_nbytes(q));
+    ggml_backend_tensor_set(k, k_data.data(), 0, ggml_nbytes(k));
+    ggml_backend_tensor_set(v, v_data.data(), 0, ggml_nbytes(v));
+    ggml_backend_tensor_set(mask, mask_data.data(), 0, ggml_nbytes(mask));
+    require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
+            "FA domain: graph compute failed");
+    std::vector<float> expected(ggml_nelements(plain));
+    std::vector<float> actual(ggml_nelements(tagged));
+    ggml_backend_tensor_get(plain, expected.data(), 0, ggml_nbytes(plain));
+    ggml_backend_tensor_get(tagged, actual.data(), 0, ggml_nbytes(tagged));
+    for (size_t i = 0; i < expected.size(); ++i) {
+        require(std::isfinite(expected[i]) && std::isfinite(actual[i]) && actual[i] == expected[i],
+                "KVarN domain changed regular FlashAttention output");
+    }
+    std::printf("test-kvarn: FA domain isolation n_kv=%d OK\n", n_kv);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+}
+
 // Unsupported compact-tail KVarN body routes must degrade to the existing
 // materialized attention path instead of aborting the process. The force knob
 // makes this otherwise hardware/geometry-dependent boundary deterministic.
@@ -4790,25 +4887,33 @@ static void test_native_flash_attention_tail_materialize_fallback() {
 
     ggml_backend_t cpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_CPU, true);
     scoped_test_env force_materialize("GGML_KVARN_TEST_FORCE_MATERIALIZE_FATTN", "1");
-    for (bool original_value_domain : { false, true }) {
-        const std::vector<float> expected = test_native_flash_attention_output(
-                cpu_backend, false, false, 512, 6, 6, 4,
-                16, 2, 512, 3, false, nullptr, false, 128, original_value_domain,
-                GGML_TYPE_F16, 0, false, true, -1, true);
-        route_stats_reset();
-        const std::vector<float> actual = test_native_flash_attention_output(
-                gpu_backend, true, true, 512, 6, 6, 4,
-                16, 2, 512, 3, false, nullptr, false, 128, original_value_domain,
-                GGML_TYPE_F16, 0, false, true, -1, true);
-        test_kvarn_route_stats stats = make_test_kvarn_route_stats();
-        route_stats_get(&stats);
+    for (int n_kv : { 512, 4096, 16384 }) {
+        for (bool original_value_domain : { false, true }) {
+            const std::vector<float> expected = test_native_flash_attention_output(
+                    cpu_backend, false, false, 512, 6, 6, 4,
+                    16, 2, n_kv, 3, false, nullptr, false, 128, original_value_domain,
+                    GGML_TYPE_F16, 0, false, true, -1, true);
+            route_stats_reset();
+            const std::vector<float> actual = test_native_flash_attention_output(
+                    gpu_backend, true, true, 512, 6, 6, 4,
+                    16, 2, n_kv, 3, false, nullptr, false, 128, original_value_domain,
+                    GGML_TYPE_F16, 0, false, true, -1, true);
+            test_kvarn_route_stats stats = make_test_kvarn_route_stats();
+            route_stats_get(&stats);
 
-        require_close_f32_rmse(actual, expected, 1e-2f,
-                "materialized compact-tail KVarN fallback differs from CPU reference");
-        require(stats.compact_tail_entry > 0 && stats.materialize_fallback > 0,
-                "unsupported compact-tail KVarN body did not use materialization fallback");
+            require_close_f32_rmse(actual, expected, 1e-2f,
+                    "materialized compact-tail KVarN fallback differs from CPU reference");
+            require(stats.compact_tail_entry > 0 && stats.materialize_fallback > 0,
+                    "unsupported compact-tail KVarN body did not use materialization fallback");
+            const std::vector<float> materialized = test_native_flash_attention_output(
+                    gpu_backend, false, true, 512, 6, 6, 4,
+                    16, 2, n_kv, 3, false, nullptr, false, 128, original_value_domain,
+                    GGML_TYPE_F16, 0, false, true, -1, true, false, true);
+            require_close_f32_rmse(materialized, expected, 1e-2f,
+                    "graph-materialized KVarN attention differs from CPU reference");
+        }
     }
-    std::printf("test-kvarn: compact-tail materialization fallback OK\n");
+    std::printf("test-kvarn: compact-tail materialization fallback and graph materialization OK\n");
     std::fflush(stdout);
     ggml_backend_free(cpu_backend);
     ggml_backend_free(gpu_backend);
@@ -6097,6 +6202,18 @@ static void test_headwide_multistream_store() {
 
 int main() {
     ggml_backend_load_all();
+
+    if (std::getenv("GGML_KVARN_TEST_FA_PARAMS_ONLY") != nullptr) {
+        test_flash_attn_kvarn_domain_isolated_gpu(4096);
+        test_flash_attn_kvarn_domain_isolated_gpu(16384);
+        test_flash_attn_op_param_layout();
+        test_native_flash_attention_tail_materialize_fallback();
+        return 0;
+    }
+
+    test_flash_attn_op_param_layout();
+    test_flash_attn_kvarn_domain_isolated_gpu(4096);
+    test_flash_attn_kvarn_domain_isolated_gpu(16384);
 
     if (std::getenv("GGML_KVARN_TEST_MULTISTREAM_ONLY") != nullptr) {
         test_multistream_swa_native_attention();

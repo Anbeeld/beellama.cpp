@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.4.9
+
+- Updated the llama.cpp base from `c06f84160` to `d327bf1f0` and ggml to 0.27.0. Inherited changes include Flint loading/conversion and Jinja hexadecimal escapes, Kolibri-1, SenseNova U1, Nemotron embedding/vision updates, Granite Switch and H2O-Lightning decision models, Soprano TTS and Voxtral realtime audio; multi-GPU MoE caching, LiLiCorr and probabilistic DFlash2 drafting, speculative logprobs, live draft state in disk slot saves, chat-session APIs, server TTS/realtime transcription, and backend, conversion, and Web UI updates. Bee's RPC protocol is now 9.0.0 because the upstream `TOP_K_MASK` insertion shifts fork operation numbers; matching Bee RPC builds are required.
+- Moved structured KVarN mid-prompt checkpoints to the nonzero descriptor-group boundary at or before each user-message start (PR #186). Retained seam anchors sit less than one group before their user boundary; checkpoint spacing and per-slot FIFO limits still apply, so this is not a bound on total follow-up replay.
+- Extended Bee's transactional slot restore to disk files, preparing target, owned draft, speculative continuation, and prompt/checkpoint metadata before publication. Malformed or incompatible appendices leave the live slot unchanged, shared draft KV is never restored independently, and legacy target-only files with an owned draft require full prompt reevaluation. Added `llama_state_seq_prepare_file` for file-backed restore preparation.
+- Fixed historical prompt-cache selection and accounting. MTP checkpoints stay within the restored continuation boundary, RAM candidates without a usable checkpoint must fit recurrent rollback limits, and cached/planned token counts and cumulative cache metrics follow the actual committed boundary after descriptor-aligned rollback. Ordinary body-backed historical truncation and explicit reduced-tail coverage remain unchanged.
+- Fixed Qwen4Exp QSA precision-tail masking. Sparse selection now applies to both cache-body and exact-tail attention, while the ordinary mask remains available when needed for tail planning. Added a numerical graph regression.
+
 ## v0.4.8
 
 - Updated the llama.cpp base from `465e49b9c` to `c06f84160` and ggml to 0.26.0. Inherited changes include GLM-5.3-Flash, Maple, HrmText, Ling 3.0 VL, and decision-model support; expanded MTP/DFlash, probabilistic drafting, sparse FlashAttention, multimodal embeddings, `/v1/systemone`, extended batch APIs, imatrix calibration, and backend/server/Web UI fixes. Session/sequence-state formats are now 11/4, the backend API is 3, and RPC is 7.0.0. Legacy mmap/mlock/direct-I/O switches are replaced by `--load-mode`.

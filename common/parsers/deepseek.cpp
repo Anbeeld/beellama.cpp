@@ -111,7 +111,7 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
     };
 
     data.prompt = common_chat_template_direct_apply_impl(
-        tmpl, inputs, adjusted_messages, std::nullopt, additional_context, &data.prompt_parts);
+        tmpl, inputs, adjusted_messages, std::nullopt, additional_context);
     data.generation_prompt = common_chat_template_generation_prompt_impl(
         tmpl, inputs, adjusted_messages, std::nullopt, additional_context);
     data.format             = COMMON_CHAT_FORMAT_PEG_NATIVE;
@@ -128,48 +128,48 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
         const auto & msg = inputs.continue_msg;
         // Keep the provenance separate: template delimiters vs request-provided
         // continued content (must not be parsed for special tokens).
-        std::vector<jinja::string_part> gen_parts;
+        std::vector<common_chat_prompt_part> gen_parts;
 
         if (is_v4 && msg.reasoning_content.empty()) {
             data.generation_prompt = GEN_PROMPT + THINK_END;
-            gen_parts.push_back({false, GEN_PROMPT + THINK_END});
+            gen_parts.push_back({GEN_PROMPT + THINK_END, false});
             if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
                 data.generation_prompt += msg.render_content();
-                gen_parts.push_back({true, msg.render_content()});
+                gen_parts.push_back({msg.render_content(), true});
             }
         } else {
             data.generation_prompt = GEN_PROMPT + THINK_START + msg.reasoning_content;
-            gen_parts.push_back({false, GEN_PROMPT + THINK_START});
-            gen_parts.push_back({true,  msg.reasoning_content});
+            gen_parts.push_back({GEN_PROMPT + THINK_START, false});
+            gen_parts.push_back({msg.reasoning_content, true});
             if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
                 data.generation_prompt += THINK_END + msg.render_content();
-                gen_parts.push_back({false, THINK_END});
-                gen_parts.push_back({true,  msg.render_content()});
+                gen_parts.push_back({THINK_END, false});
+                gen_parts.push_back({msg.render_content(), true});
             }
         }
 
-        data.prompt += data.generation_prompt;
-
-        data.prompt_parts.insert(data.prompt_parts.end(), gen_parts.begin(), gen_parts.end());
+        for (const auto & part : gen_parts) {
+            data.prompt.append(part.text, part.is_input);
+        }
     }
 
     bool require_tools   = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED;
     bool has_tool_calls = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
 
-    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+    data.parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
         auto generation_prompt = p.literal(GEN_PROMPT);
         auto end               = p.end();
 
         // build tool call section first since we might need it in reasoning
         auto tool_choice = p.choice();
         if (has_tool_calls) {
-            foreach_function(inputs.tools, [&](const json & tool) {
+            foreach_function(inputs.tools, [&](size_t tool_index, const json & tool) {
                 const auto & function = tool.at("function");
                 std::string  name     = function.at("name");
 
                 std::vector<common_peg_parser> required_parsers;
                 std::vector<common_peg_parser> optional_parsers;
-                foreach_parameter(function, [&](const common_chat_schema_property & param, const common_chat_schema_document_ptr & doc) {
+                foreach_parameter(function, [&](size_t param_index, const common_chat_schema_property & param, const common_chat_schema_document_ptr & doc) {
                     bool is_string = param.schema->may_be_string();
 
                     auto arg = p.tool_arg(
@@ -177,11 +177,11 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
                                         p.literal("\" string=\"" + std::string(is_string ? "true" : "false") + "\">")) +
                         (is_string ?
                              p.tool_arg_string_value(p.until(PARAM_END)) :
-                             p.tool_arg_json_value(p.schema(p.json(), "tool-" + name + "-arg-" + param.name + "-schema",
+                             p.tool_arg_json_value(p.schema(p.json(), "tool-" + std::to_string(tool_index) + "-arg-" + std::to_string(param_index) + "-schema",
                                                             doc, *param.schema))) +
                         p.tool_arg_close(p.literal(PARAM_END)));
 
-                    auto named_arg = p.rule("tool-" + name + "-arg-" + param.name, arg);
+                    auto named_arg = p.rule("tool-" + std::to_string(tool_index) + "-arg-" + std::to_string(param_index), arg);
                     if (param.required) {
                         required_parsers.push_back(named_arg);
                     } else {
@@ -210,7 +210,7 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
                                                                    p.tool_name(p.literal(name)) + p.literal("\">\n")) +
                                                        invoke_body + p.space() + p.tool_close(p.literal(INVOKE_END)));
 
-                tool_choice |= p.rule("tool-" + name, func_parser);
+                tool_choice |= p.rule("tool-" + std::to_string(tool_index), func_parser);
             });
         }
 
@@ -267,12 +267,10 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
             generation_prompt + reasoning + content_before_tools + tool_calls + end;
     });
 
-    data.parser = parser.save();
-
     if (include_grammar) {
         data.grammar_lazy = has_tools && !require_tools;
         data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
-            parser.build_grammar(builder, data.grammar_lazy);
+            data.parser.build_grammar(builder, data.grammar_lazy);
         });
 
         data.grammar_triggers = {

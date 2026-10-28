@@ -405,14 +405,13 @@ static void test_example_native(testing & t) {
 
         auto parser = build_parser(tc);
         common_chat_parser_params parser_params;
-        parser_params.reasoning_format = tc.reasoning_format;
-        parser_params.generation_prompt = tc.generation_prompt;
+        parser_params.generation_prompt = common_chat_input(tc.generation_prompt);
 
         common_chat_msg prev;
         common_chat_msg accumulated;
         for (size_t i = 1; i <= tc.input.size(); ++i) {
             const bool is_partial = i < tc.input.size();
-            common_chat_msg msg = common_chat_peg_parse(parser, tc.input.substr(0, i), is_partial, parser_params);
+            common_chat_msg msg = common_chat_peg_parse(parser, common_chat_input(tc.input.substr(0, i)), is_partial, parser_params);
 
             std::vector<common_chat_msg_diff> diffs;
             try {

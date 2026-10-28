@@ -7,7 +7,7 @@ common_chat_params common_chat_params_init_minicpm5(const common_chat_template &
                                                            const autoparser::generation_params & inputs) {
     common_chat_params data;
 
-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs, std::nullopt, std::nullopt, std::nullopt, &data.prompt_parts);
+    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
     data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs);
     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
     data.supports_thinking = true;
@@ -39,23 +39,23 @@ common_chat_params common_chat_params_init_minicpm5(const common_chat_template &
         const auto & msg = inputs.continue_msg;
         // Keep the provenance separate: template delimiters vs request-provided
         // continued content (must not be parsed for special tokens).
-        std::vector<jinja::string_part> gen_parts;
+        std::vector<common_chat_prompt_part> gen_parts;
 
         data.generation_prompt = "<|im_start|>assistant\n<think>\n" + msg.reasoning_content;
-        gen_parts.push_back({false, "<|im_start|>assistant\n<think>\n"});
-        gen_parts.push_back({true,  msg.reasoning_content});
+        gen_parts.push_back({"<|im_start|>assistant\n<think>\n", false});
+        gen_parts.push_back({msg.reasoning_content, true});
         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
             data.generation_prompt += "\n</think>\n\n" + msg.render_content();
-            gen_parts.push_back({false, "\n</think>\n\n"});
-            gen_parts.push_back({true,  msg.render_content()});
+            gen_parts.push_back({"\n</think>\n\n", false});
+            gen_parts.push_back({msg.render_content(), true});
         }
 
-        data.prompt += data.generation_prompt;
-
-        data.prompt_parts.insert(data.prompt_parts.end(), gen_parts.begin(), gen_parts.end());
+        for (const auto & part : gen_parts) {
+            data.prompt.append(part.text, part.is_input);
+        }
     }
 
-    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+    data.parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
         auto generation_prompt = p.literal("<|im_start|>assistant\n");
 
         auto reasoning = p.eps();
@@ -77,18 +77,18 @@ common_chat_params common_chat_params_init_minicpm5(const common_chat_template &
             });
 
             auto tool_choice = p.choice();
-            foreach_function(inputs.tools, [&](const json & tool) {
+            foreach_function(inputs.tools, [&](size_t tool_index, const json & tool) {
                 const auto &      function = tool.at("function");
                 const std::string name     = function.at("name");
 
                 std::vector<common_peg_parser> arg_rules;
-                foreach_parameter(function, [&](const common_chat_schema_property & prop, const common_chat_schema_document_ptr & doc) {
+                foreach_parameter(function, [&](size_t param_index, const common_chat_schema_property & prop, const common_chat_schema_document_ptr & doc) {
                     auto value_parser = p.eps();
                     if (prop.schema->may_be_string()) {
                         value_parser = string_value;
                     } else {
                         value_parser = p.tool_arg_json_value(
-                                p.schema(p.json(), "tool-" + name + "-arg-" + prop.name + "-schema", doc, *prop.schema)
+                                p.schema(p.json(), "tool-" + std::to_string(tool_index) + "-arg-" + std::to_string(param_index) + "-schema", doc, *prop.schema)
                             ) + p.tool_arg_close(p.literal("</param>"));
                     }
 
@@ -108,7 +108,7 @@ common_chat_params common_chat_params_init_minicpm5(const common_chat_template &
                     << p.tool_args(args)
                     << p.tool_close(p.literal("</function>")));
 
-                tool_choice |= p.rule("tool-" + name, tool_parser);
+                tool_choice |= p.rule("tool-" + std::to_string(tool_index), tool_parser);
             });
 
             auto max_calls  = inputs.parallel_tool_calls ? -1 : 1;
@@ -122,12 +122,10 @@ common_chat_params common_chat_params_init_minicpm5(const common_chat_template &
         return generation_prompt + reasoning + p.content(p.rest()) + p.end();
     });
 
-    data.parser = parser.save();
-
     if (include_grammar) {
         data.grammar_lazy = !(has_response_format || (has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED));
         data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
-            parser.build_grammar(builder, data.grammar_lazy);
+            data.parser.build_grammar(builder, data.grammar_lazy);
         });
 
         data.grammar_triggers = {

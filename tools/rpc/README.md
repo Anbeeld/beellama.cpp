@@ -4,6 +4,12 @@
 > This example and the RPC backend are currently in a proof-of-concept development stage. As such, the functionality is fragile and
 > insecure. **Never run the RPC server on an open network or in a sensitive environment!**
 
+Bee clients and servers must use compatible Bee RPC builds. This integration
+uses protocol **9.0.0** because upstream's new `TOP_K_MASK` operation shifts
+Bee's KVarN operation numbers. Protocol-8 peers, including pre-merge Bee and
+upstream builds, are rejected during the handshake rather than reinterpreting
+operations. Upgrade both ends together.
+
 The `ggml-rpc-server` allows exposing `ggml` devices on a remote host.
 The RPC backend communicates with one or several instances of `ggml-rpc-server` and offloads computations to them.
 This can be used for distributed LLM inference with `llama.cpp` in the following way:
@@ -58,7 +64,7 @@ ggml_cuda_init: GGML_CUDA_FORCE_MMQ:    no
 ggml_cuda_init: GGML_CUDA_FORCE_CUBLAS: no
 ggml_cuda_init: found 1 CUDA devices:
   Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes
-Starting RPC server v3.0.0
+Starting RPC server v9.0.0
   endpoint       : 127.0.0.1:50052
   local cache    : n/a
 Devices:
@@ -113,8 +119,25 @@ $ GGML_RPC_NO_RDMA=1 bin/ggml-rpc-server
 
 ### Troubleshooting
 
-Use the `GGML_RPC_DEBUG` environment variable to enable debug messages from `ggml-rpc-server`:
+The `GGML_RPC_DEBUG` environment variable controls the verbosity of the logs emitted by the RPC backend.
+It can be set on the server, on the client (e.g. `llama-cli`), or both. Larger values produce more detailed output:
+
+- unset / `0` - disabled (only warnings and errors are printed)
+- `1` - high-level events: connections, handshake, buffer allocations, graph computes, cache evictions
+- `2` - per-command trace: every RPC message sent/received, tensor transfers, cache hits/misses
+- `3` - fine detail: per-command timings, graph node dumps, transport byte counts
+
+Non-numeric values are treated as `1`.
+
 ```bash
 $ GGML_RPC_DEBUG=1 bin/ggml-rpc-server
+```
+
+> [!NOTE]
+> The debug levels are emitted as `ggml` debug records, which `llama.cpp` applications drop unless the
+> global verbosity threshold is raised. On the client, pass `-lv 5` together with `GGML_RPC_DEBUG`:
+
+```bash
+$ GGML_RPC_DEBUG=2 bin/llama-cli -hf ggml-org/gemma-3-1b-it-GGUF -ngl 99 --rpc 192.168.88.10:50052 -lv 5
 ```
 

@@ -20,6 +20,14 @@ static void speculative_rollback_checkpoint_boundary() {
     assert( server_prompt_reuse_requires_checkpoint_search(false, 512, 512));
     assert( server_prompt_reuse_requires_checkpoint_search(true, 0, 528));
 
+    // A checkpoint may still match the request but extend beyond the restored
+    // MTP continuation state. Ordinary checkpoints only need the shared prefix.
+    assert(!server_prompt_checkpoint_must_prune(false, 100, 101, 100, 120, 100));
+    assert( server_prompt_checkpoint_must_prune(true,  100, 101, 100, 120, 100));
+    assert(!server_prompt_checkpoint_must_prune(true,   99, 100, 100, 120, 100));
+    assert( server_prompt_checkpoint_must_prune(false,  99, 100, 100,  99, 100));
+    assert( server_prompt_checkpoint_must_prune(false, 101, 102, 100, 120, 100));
+
     assert(server_prompt_reuse_alignment(0) == 1);
     assert(server_prompt_reuse_alignment(128) == 128);
     assert(server_prompt_reuse_alignment(192) == 192);
@@ -207,6 +215,40 @@ static void prompt_cache_ranks_safe_restorable_prefix_before_lexical_lcp() {
     assert(cache.load(current, requested, 0, 128, io));
     assert(restored);
     assert(current.tokens.size() == 2);
+}
+
+static void prompt_cache_respects_native_rollback_limit() {
+    for (const uint32_t limit : {0u, 1u, UINT32_MAX}) {
+        for (const bool checkpoint : {false, true}) {
+            server_prompt_cache cache(1, 0);
+            server_prompt_cache_state saved;
+            saved.prompt = make_prompt({1, 2, 3, 4, 5});
+            saved.data.main = {0x2a};
+            if (checkpoint) {
+                common_prompt_checkpoint anchor;
+                anchor.n_tokens = 1;
+                anchor.pos_min = 0;
+                anchor.pos_max = 0;
+                saved.prompt.checkpoints.push_back(std::move(anchor));
+            }
+            cache.states.push_back(std::move(saved));
+            server_prompt current;
+            server_tokens requested(llama_tokens {1, 2, 9}, false);
+            int target_state = 0;
+            server_prompt_cache_state_io io {
+                false, false,
+                [&](const uint8_t *, size_t, const uint8_t *, size_t, const uint8_t *, size_t) {
+                    target_state = 42;
+                    return true;
+                },
+            };
+            assert(cache.load(current, requested, 0, 1, io, nullptr, limit));
+            const bool useful = checkpoint || limit == UINT32_MAX;
+            assert(target_state == (useful ? 42 : 0));
+            assert(cache.restore_attempts == (useful ? 1u : 0u));
+            assert(current.tokens.size() == (useful ? 5u : 0u));
+        }
+    }
 }
 
 static void prompt_cache_does_not_restore_just_admitted_live_state() {
@@ -481,6 +523,7 @@ static void prompt_cache_snapshot_restore_evict_stress() {
 
 int main() {
     prompt_cache_ranks_safe_restorable_prefix_before_lexical_lcp();
+    prompt_cache_respects_native_rollback_limit();
     prompt_cache_load_target_success_draft_failure_is_atomic();
     prompt_cache_does_not_restore_just_admitted_live_state();
     restore_transaction_validation_failures_are_atomic();

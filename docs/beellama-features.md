@@ -403,6 +403,15 @@ batching and impose no Bee-specific 64-token cadence. `cache_prompt=false`,
 slot eviction, corrupt or incompatible state, and the absence of one common
 target/draft/speculative plan remain reason-coded misses.
 
+For structured KVarN prompts, mid-prompt checkpoints move to
+`floor(user_start / group) * group`, provided that boundary is nonzero.
+These seam anchors obey `--checkpoint-min-step` and the per-slot FIFO
+checkpoint cap; the last user seam is exempt from the spacing requirement.
+A retained seam anchor is less than one descriptor group before its user
+boundary, but this does not guarantee a one-group limit on total follow-up
+replay. Standard/recurrent cache scheduling, raw/unstructured periodic anchors,
+snapped end anchors, and the checkpoint alignment guard remain unchanged.
+
 RAM entries are immutable and repeatably restorable. Admission serializes a
 self-contained target/draft/speculative candidate before publishing it and
 clears an idle unified slot only after admission succeeds. Restore prepares and
@@ -512,6 +521,14 @@ destination usable. Deferred standard-tail copy reports allocation/transfer
 preparation and compute failures distinctly. A failed destination may be
 evicted as cleanup, but state save, the next decode, sequence reuse, and server
 handoff cannot observe it as a completed copy.
+
+Disk slot saves include checkpoint metadata and the live owned-draft and
+speculative continuation state. Restore prepares target, owned draft, and
+speculative state before publishing any component. A malformed draft appendix
+rejects the restore without publishing the target. Shared draft KV is never
+serialized or restored independently. A legacy target-only file used with an
+owned draft requires full prompt reevaluation rather than reusing a mismatched
+draft epoch.
 
 ### Backend routes
 
