@@ -1379,7 +1379,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     exact_tail_type_requested(tail_type_requested),
     exact_tail_type(tail_type_requested),
     metadata(std::make_unique<llama_kv_cache>(
-        model,
+        model, model.no_alloc(),
         hparams,
         GGML_TYPE_F16,
         GGML_TYPE_F16,
@@ -1388,7 +1388,6 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         unified,
         kv_size,
         n_seq_max,
-        n_pad,
         n_swa,
         swa_type,
         nullptr,
@@ -1628,7 +1627,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     size_t total_bytes = 0;
     for (auto & [buft, ctx] : ctx_map) {
         ggml_backend_buffer_t buf;
-        if (hparams.no_alloc) {
+        if (model.no_alloc()) {
             buf = ggml_backend_buft_alloc_buffer(buft, 0);
             for (auto * tensor = ggml_get_first_tensor(ctx.get()); tensor != nullptr; tensor = ggml_get_next_tensor(ctx.get(), tensor)) {
                 tensor->buffer = buf;
@@ -1790,7 +1789,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
 
         for (auto & [buft, ctx] : tail_ctx_map) {
             ggml_backend_buffer_t buf;
-            if (hparams.no_alloc) {
+            if (model.no_alloc()) {
                 buf = ggml_backend_buft_alloc_buffer(buft, 0);
                 for (auto * tensor = ggml_get_first_tensor(ctx.get()); tensor != nullptr; tensor = ggml_get_next_tensor(ctx.get(), tensor)) {
                     tensor->buffer = buf;
@@ -1831,7 +1830,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
 
 std::unique_ptr<llama_kv_cache> llama_kv_cache_kvarn::make_metadata_cache() const {
     auto result = std::make_unique<llama_kv_cache>(
-            model,
+            model, model.no_alloc(),
             hparams,
             GGML_TYPE_F16,
             GGML_TYPE_F16,
@@ -1840,7 +1839,6 @@ std::unique_ptr<llama_kv_cache> llama_kv_cache_kvarn::make_metadata_cache() cons
             n_stream == 1,
             kv_size,
             n_seq_max,
-            metadata_n_pad,
             metadata_n_swa,
             metadata_swa_type,
             nullptr,
@@ -2088,7 +2086,7 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_kvarn::memory_breakd
     std::map<ggml_backend_buffer_type_t, size_t> result;
     for (const auto & [ctx, buf] : ctxs_bufs) {
         auto * buft = ggml_backend_buffer_get_type(buf.get());
-        result[buft] += hparams.no_alloc
+        result[buft] += model.no_alloc()
             ? ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft)
             : ggml_backend_buffer_get_size(buf.get());
     }
@@ -3037,7 +3035,7 @@ ggml_tensor * llama_kv_cache_kvarn::get_materialization_source(int32_t il, bool 
 std::unique_ptr<llama_kv_cache> llama_kv_cache_kvarn::make_shared_metadata_cache(
         const llama_model & model_view) const {
     return std::make_unique<llama_kv_cache>(
-            model_view,
+            model_view, model_view.no_alloc(),
             model_view.hparams,
             GGML_TYPE_F16,
             GGML_TYPE_F16,
@@ -3046,7 +3044,6 @@ std::unique_ptr<llama_kv_cache> llama_kv_cache_kvarn::make_shared_metadata_cache
             n_stream == 1,
             kv_size,
             n_seq_max,
-            metadata_n_pad,
             metadata_n_swa,
             metadata_swa_type,
             metadata.get(),

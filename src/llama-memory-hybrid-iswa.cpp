@@ -11,6 +11,7 @@
 
 llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         const llama_model & model,
+                      bool   no_alloc,
                             /* attn */
                 ggml_type   type_k,
                 ggml_type   type_v,
@@ -19,7 +20,6 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
                  uint32_t   kv_size,
                  uint32_t   n_batch,
                  uint32_t   n_ubatch,
-                 uint32_t   n_pad,
                             /* recurrent */
                 ggml_type   type_r,
                 ggml_type   type_s,
@@ -43,6 +43,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
     hparams(model.hparams),
     mem_attn(new llama_kv_cache_iswa(
         model,
+        no_alloc,
         type_k,
         type_v,
         v_trans,
@@ -53,7 +54,6 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         n_seq_max,
         n_batch,
         n_ubatch,
-        n_pad,
         nullptr,
         filter_attn == nullptr ?
             [&](int32_t il) { return !hparams.is_recr(il); }
@@ -71,6 +71,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
     )),
     mem_recr(new llama_memory_recurrent(
         model,
+        no_alloc,
         type_r,
         type_s,
         offload,

@@ -381,6 +381,8 @@ extern "C" {
     GGML_API void        ggml_fp32_to_bf16_row_ref(const float *, ggml_bf16_t *, int64_t);
     GGML_API void        ggml_fp32_to_bf16_row(const float *, ggml_bf16_t *, int64_t);
 
+    typedef struct { uint8_t bits; } ggml_fp8_e4m3_t;
+
     struct ggml_object;
     struct ggml_context;
     struct ggml_cgraph;
@@ -439,9 +441,10 @@ extern "C" {
         GGML_TYPE_Q2_0S   = 47,
         GGML_TYPE_Q2_1    = 48,
         // Prism-private formats from PrismML's fork, kept at their upstream-fork ids so
-        // Bonsai 2 files load unchanged. type_traits is sized to COUNT, 49..141 stay unused.
+        // Bonsai 2 files load unchanged. type_traits is sized to COUNT, 50..141 stay unused.
         GGML_TYPE_PQ2_0   = 142, // ternary, group 128 (upstream Q2_0 is group 64)
         GGML_TYPE_PTQ1_0  = 143, // ternary, group 128, trits packed base-3, five per byte
+        GGML_TYPE_F8_E4M3 = 49, // upstream GGUF id 43 is mapped at the file boundary
         GGML_TYPE_COUNT   = 144,
     };
 
@@ -519,6 +522,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
         GGML_FTYPE_MOSTLY_PQ2_0   = 128, // except 1d tensors (Prism-private group-128 Q2_0)
         GGML_FTYPE_MOSTLY_PTQ1_0  = 129, // except 1d tensors (Prism-private group-128 ternary)
+        GGML_FTYPE_MOSTLY_F8_E4M3 = 29, // except 1d tensors
     };
 
     // available tensor operations:

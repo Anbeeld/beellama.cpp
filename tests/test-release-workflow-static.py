@@ -36,11 +36,19 @@ def main() -> None:
     )
 
     cmake = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
-    for component, value in (("MAJOR", 0), ("MINOR", 4), ("PATCH", 9)):
+    for component, value in (("MAJOR", 0), ("MINOR", 4), ("PATCH", 10)):
         require(
             f"set(LLAMA_VERSION_{component} {value})" in cmake,
-            f"v0.4.9 release metadata has the wrong {component.lower()} version",
+            f"v0.4.10 release metadata has the wrong {component.lower()} version",
         )
+
+    require(
+        'option(LLAMA_BUILD_IS_DEV "llama: dev build" OFF)' in cmake,
+        "v0.4.10 must default to non-development build metadata",
+    )
+    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    require(changelog.startswith("# Changelog\n\n## v0.4.10\n"),
+            "the current release must lead the changelog")
 
     release = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
     preview_dispatch = (WORKFLOWS / "release-preview-dispatch.yml").read_text(encoding="utf-8")

@@ -70,6 +70,7 @@ class GGMLQuants:
             "mxfp4",
             "nvfp4",
             "q1_0", "q2_0",
+            "f8_e4m3",
             "iq2_xxs", "iq2_xs", "iq2_s", "iq3_xxs", "iq3_s", "iq1_s", "iq1_m",
             "iq4_nl", "iq4_xs",
         ):
@@ -105,12 +106,15 @@ class GGMLQuants:
 
     def quantize(self, data: np.ndarray, qtype: GGMLQuantizationType) -> np.ndarray:
         result = np.zeros(gguf.quant_shape_to_byte_shape(data.shape, qtype), dtype=np.uint8, order="C")
-        if self.libggml.ggml_quantize_requires_imatrix(qtype.value):
+        # GGUF's FP8 wire ID 43 is bridged to Bee's internal enum 49;
+        # Bee retains internal 43 for its existing Q6_0 cache ABI.
+        c_type = 49 if qtype == GGMLQuantizationType.F8_E4M3 else qtype.value
+        if self.libggml.ggml_quantize_requires_imatrix(c_type):
             # TODO: is a column-wise sum of squares appropriate?
             qw = np.sum((data * data).reshape((-1, data.shape[-1])), axis=0).ctypes.data_as(c_float_p)
         else:
             qw = ctypes.cast(0, c_float_p)
-        result_size = self.libggml.ggml_quantize_chunk(qtype.value, data.ctypes.data_as(c_float_p), result.ctypes.data_as(ctypes.c_void_p), 0, prod(data.shape[:-1]), data.shape[-1], qw)
+        result_size = self.libggml.ggml_quantize_chunk(c_type, data.ctypes.data_as(c_float_p), result.ctypes.data_as(ctypes.c_void_p), 0, prod(data.shape[:-1]), data.shape[-1], qw)
         assert result.size == result_size
         return result
 
@@ -180,6 +184,19 @@ def do_test(libggml_path: Path, quick: bool = False, user_type: GGMLQuantization
             continue
 
         logger.info(f"Testing {qtype.name}")
+
+        if qtype == GGMLQuantizationType.F8_E4M3:
+            encodings = np.arange(256, dtype=np.uint8)
+            pydq = gguf.dequantize(encodings, qtype)
+            ggdq = ggml_quants.dequantize(encodings, qtype)
+            assert pydq.dtype == np.float32
+            nan_mask = (encodings & 0x7F) == 0x7F
+            # Both 0x7F and 0xFF are NaNs; check classification, not FP32 NaN sign or payload.
+            np.testing.assert_array_equal(np.isnan(pydq), nan_mask)
+            np.testing.assert_array_equal(np.isnan(ggdq), nan_mask)
+            # Compare finite values by bits to also check signed zeros.
+            np.testing.assert_array_equal(pydq[~nan_mask].view(np.uint32), ggdq[~nan_mask].view(np.uint32))
+            logger.info("All 256 FP8 E4M3 encodings match C")
 
         rc = r.copy(order="C")
 

@@ -269,16 +269,18 @@ def main() -> None:
     if "case LLM_ARCH_DFLASH:" in null_memory_arches:
         raise AssertionError("DFlash requires its own KV cache; routing it to null memory crashes graph reservation")
     mtp_hybrid_qwen = create_memory.split("const bool mtp_on_hybrid_qwen", 1)[1].split(";", 1)[0]
-    require(
-        mtp_hybrid_qwen,
-        "arch == LLM_ARCH_QWEN4EXP",
-        "Qwen4Exp MTP must use a plain attention cache rather than the target hybrid cache",
-    )
-    require(
-        create_memory,
-        "params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_QWEN4EXP",
-        "only the Qwen4Exp MTP cache may opt out of quantized-cache activation rotation",
-    )
+    if "arch == LLM_ARCH_QWEN4EXP" in mtp_hybrid_qwen:
+        raise AssertionError("Qwen4Exp MTP requires its owned hybrid/QSA indexer, not a plain dense cache")
+    require(create_memory, "arch == LLM_ARCH_QWEN4EXP && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP",
+            "Qwen4Exp MTP must select only its draft attention/indexer layer")
+    require(qwen4exp, 'qwen4exp_shared_model(cparams, model, "token_embd")',
+            "shared Qwen4Exp MTP must borrow the target embedding")
+    require(qwen4exp, 'qwen4exp_shared_model(cparams, model, "output")',
+            "shared Qwen4Exp MTP must borrow the target output projection")
+    arch_tests = (ROOT / "tests/test-llama-archs.cpp").read_text(encoding="utf-8")
+    for needle in ("draft->tok_embd = nullptr;", "draft->output = nullptr;",
+                   "dynamic_cast<llama_memory_hybrid_idx *>"):
+        require(arch_tests, needle, "shared MTP reservation needs a missing-global-tensor regression")
 
     dflash = (ROOT / "src/models/dflash.cpp").read_text(encoding="utf-8")
     if dflash.count("Kcur = llama_mul_mat_hadamard(ctx0, Kcur") != 2:

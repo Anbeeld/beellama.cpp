@@ -20,6 +20,29 @@
 #define GGUF_MAX_STRING_LENGTH  (1024*1024*1024)
 #define GGUF_MAX_ARRAY_ELEMENTS (1024*1024*1024)
 
+// GGUF wire IDs are not always Bee's internal ABI/cache-state type IDs.
+// Upstream FP8 owns wire 43; Bee's cache-only Q6_0 keeps internal enum 43
+// and uses private wire 144 for GGUF roundtrips. Old ambiguous Q6_0 weight
+// files using wire 43 are not an advertised format and cannot be detected
+// safely. Private PQ2_0/PTQ1_0 wire IDs 142/143 remain unchanged.
+static ggml_type gguf_type_from_wire(int32_t type) {
+    switch (type) {
+        case 43:  return GGML_TYPE_F8_E4M3;
+        case 144: return GGML_TYPE_Q6_0;
+        // Internal FP8 ID 49 is not a GGUF wire ID.
+        case GGML_TYPE_F8_E4M3: return GGML_TYPE_COUNT;
+        default: return static_cast<ggml_type>(type);
+    }
+}
+
+static int32_t gguf_type_to_wire(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_F8_E4M3: return 43;
+        case GGML_TYPE_Q6_0:   return 144;
+        default: return static_cast<int32_t>(type);
+    }
+}
+
 #ifdef _WIN32
 #    define gguf_ftell _ftelli64
 #    define gguf_fseek _fseeki64
@@ -724,7 +747,9 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
 
         // tensor type
         {
-            ok = ok && gr.read(info.t.type);
+            int32_t wire_type = -1;
+            ok = ok && gr.read(wire_type);
+            info.t.type = gguf_type_from_wire(wire_type);
 
             // check that tensor type is within defined range
             if (info.t.type < 0 || info.t.type >= GGML_TYPE_COUNT) {
@@ -1568,7 +1593,7 @@ struct gguf_writer_base {
         for (uint32_t j = 0; j < n_dims; ++j) {
             write(info.t.ne[j]);
         }
-        write(info.t.type);
+        write(gguf_type_to_wire(info.t.type));
         write(info.offset);
     }
 

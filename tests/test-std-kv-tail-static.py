@@ -144,14 +144,21 @@ def main() -> None:
 
     common_source = (ROOT / "common/common.cpp").read_text(encoding="utf-8")
     fit_callsite = common_source.split(
-        "if (params.fit_params) {", 1
-    )[1].split("llama_model * model = llama_model_load_from_file", 1)[0]
+        "void common_fit_apply(", 1
+    )[1].split("common_init_result::common_init_result", 1)[0]
     if "common_fit_params(" not in fit_callsite:
-        raise AssertionError("common init no longer invokes upstream parameter fitting")
+        raise AssertionError("common fit adapter no longer invokes upstream parameter fitting")
+    init_fit = common_source.split("common_init_result::common_init_result", 1)[1].split(
+        "llama_model * model = llama_model_load_from_file", 1
+    )[0]
+    if "common_fit_apply(params, mparams, cparams);" not in init_fit or \
+            "catch (const common_params_fit_unsafe_extra_exception & e)" not in init_fit:
+        raise AssertionError("common init must invoke the fit adapter and abort unsafe extra-context fitting")
     if "fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS" in fit_callsite or \
             "failed to fit parameters with exact Bee validation" in fit_callsite:
         raise AssertionError("common init hard-fails an advisory upstream fit conflict")
-    if "fit_status == COMMON_PARAMS_FIT_STATUS_UNSAFE_EXTRA" not in fit_callsite:
+    if "fit_status == COMMON_PARAMS_FIT_STATUS_UNSAFE_EXTRA" not in fit_callsite or \
+            "throw common_params_fit_unsafe_extra_exception(" not in fit_callsite:
         raise AssertionError("unsafe KVarN extra-context measurements do not fail closed")
 
     server_tests = (ROOT / "tests/test-server-prompt-checkpoint.cpp").read_text(encoding="utf-8")
@@ -338,7 +345,7 @@ def main() -> None:
     if "model.split_mode()" in constructor:
         raise AssertionError("standard overlay placement still uses CLI split mode instead of realized body storage")
     standard_order = [
-        constructor.find("ggml_backend_alloc_ctx_tensors_from_buft"),
+        constructor.find('ctxs_bufs.emplace(std::move(ctx), buft, "kv cache")'),
         constructor.find("validate_meta_body(layer, owner_k"),
         constructor.find("finalize_tail_overlay_metadata()"),
         constructor.find('ggml_format_name(layer.k_tail, "cache_k_tail_l%d"'),

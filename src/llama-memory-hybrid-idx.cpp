@@ -1,9 +1,5 @@
 #include "llama-memory-hybrid-idx.h"
 
-#include <algorithm>
-#include <cmath>
-#include <type_traits>
-
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
@@ -15,6 +11,7 @@
 #include <cmath>
 #include <iterator>
 #include <stdexcept>
+#include <type_traits>
 
 //
 // llama_memory_hybrid_idx
@@ -22,12 +19,12 @@
 
 llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         const llama_model & model,
+                     bool   no_alloc,
                             /* attn */
                 ggml_type   type_k,
                 ggml_type   type_v,
                      bool   v_trans,
                  uint32_t   kv_size,
-                 uint32_t   n_pad,
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
                             /* recurrent */
@@ -50,7 +47,8 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
                  uint32_t   tail_rollback_tokens) :
     llama_memory_hybrid(
         model,
-        type_k, type_v, v_trans, kv_size, n_pad, n_swa, swa_type,
+        no_alloc,
+        type_k, type_v, v_trans, kv_size, n_swa, swa_type,
         type_r, type_s, rs_size,
         n_seq_max, n_rs_seq, offload, unified,
         filter_attn, filter_recr, n_ubatch,
@@ -74,8 +72,8 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
 
         return new llama_kv_cache(
-            model, hparams_idx, type_k, type_v, v_trans, offload, unified,
-            kv_size, n_seq_max, n_pad, n_swa, swa_type,
+            model, no_alloc, hparams_idx, type_k, type_v, v_trans, offload, unified,
+            kv_size, n_seq_max, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, 0, 0, GGML_TYPE_F16,
             UINT32_MAX, false, 0, 0, "idx_");
     }()) {}
@@ -88,7 +86,6 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
                 ggml_type   idx_type_v,
                      bool   idx_v_trans,
                  uint32_t   kv_size,
-                 uint32_t   n_pad,
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
                  uint32_t   n_seq_max,
@@ -100,15 +97,18 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     hparams_idx(model.hparams),
     mem_idx(filter_idx == nullptr ? nullptr : [&] {
         std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), 1);
-        hparams_idx.n_embd_head_k_full = model.hparams.indexer_head_size;
+        hparams_idx.n_embd_head_k_full = model.hparams.indexer_head_size *
+                (model.hparams.indexer_kpool > 0 ? model.hparams.indexer_kpool_row : 1);
         // Raw indexer keys are rotated only after pooling, including owned KVarN contexts.
         hparams_idx.rope_type = LLAMA_ROPE_TYPE_NONE;
+        hparams_idx.n_embd_head_k_mla_impl = model.hparams.indexer_head_size;
+        hparams_idx.n_embd_head_v_mla_impl = model.hparams.indexer_head_size;
 
         LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
 
         return new llama_kv_cache(
-            model, hparams_idx, idx_type_k, idx_type_v, idx_v_trans, offload, unified,
-            kv_size, n_seq_max, n_pad, n_swa, swa_type,
+            model, model.no_alloc(), hparams_idx, idx_type_k, idx_type_v, idx_v_trans, offload, unified,
+            kv_size, n_seq_max, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, n_ubatch, 0, GGML_TYPE_F16,
             UINT32_MAX, false, 0, 0, "idx_");
     }()) {}

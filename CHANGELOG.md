@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.4.10
+
+- Updated the llama.cpp base from `d327bf1f0` to `3c809f443` and ggml to 0.28.0. Inherited changes include DeepSeek V4.1, LiquidAI LFM3 and d1 text/audio/vision models, Limite 1B, Mistral Large 4, and OCP FP8 E4M3 weights; batched backend tensor transfers, no-allocation memory measurement, realtime conversation support, model memory scheduling, and backend, conversion, server, and Web UI updates.
+- Integrated FP8 GGUF support without renumbering Bee's standard low-bit cache types or changing their state IDs. Upstream FP8 wire ID 43 maps to Bee's internal FP8 type, while Q6_0 GGUF roundtrips use private wire ID 144; Prism PQ2_0/PTQ1_0 IDs remain unchanged. Added independent external-file, writer-ID, ABI, and roundtrip regressions.
+- Adapted KVarN and precision-tail allocation, accounting, and exact fitting to upstream's model-owned no-allocation mode. Batched host state transfers retain explicit prepare/commit behavior, cancellation, staged clear/write ordering, and atomic metadata publication.
+- Fixed Qwen4Exp QSA mask layout for multiple KV streams and preserved pooled-indexer shapes alongside KVarN and exact tails. Shared MTP sidecars now connect target embedding/output borrowing to the draft graph and retain owned hybrid/indexer memory; dense legacy heads avoid uploading unused indexer inputs. Added synthetic missing-weight and QSA/dense-head decode regressions, with standard and KVarN draft-cache replay checks.
+- Fixed Qwen4Exp MTP conversion of `model.mtp`-prefixed HyperConnection mixer tensors, matching the shared Qwen remapper's accepted prefixes while preserving standalone-head tensor names and PLE filtering.
+
 ## v0.4.9
 
 - Updated the llama.cpp base from `c06f84160` to `d327bf1f0` and ggml to 0.27.0. Inherited changes include Flint loading/conversion and Jinja hexadecimal escapes, Kolibri-1, SenseNova U1, Nemotron embedding/vision updates, Granite Switch and H2O-Lightning decision models, Soprano TTS and Voxtral realtime audio; multi-GPU MoE caching, LiLiCorr and probabilistic DFlash2 drafting, speculative logprobs, live draft state in disk slot saves, chat-session APIs, server TTS/realtime transcription, and backend, conversion, and Web UI updates. Bee's RPC protocol is now 9.0.0 because the upstream `TOP_K_MASK` insertion shifts fork operation numbers; matching Bee RPC builds are required.

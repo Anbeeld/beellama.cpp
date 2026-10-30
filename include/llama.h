@@ -161,6 +161,7 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_PQ2_0         = 141, // except 1d tensors (Prism group-128 Q2_0)
         LLAMA_FTYPE_MOSTLY_PQ2_0_LEGACY  = 142, // pre-rename value for the same format, still found in published ggufs
         LLAMA_FTYPE_MOSTLY_PTQ1_0        = 143, // except 1d tensors (Prism group-128 ternary, 1.75 bpw)
+        LLAMA_FTYPE_MOSTLY_F8_E4M3       = 42, // except 1d tensors
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
@@ -1790,6 +1791,10 @@ extern "C" {
                                float   penalty_repeat,   // must be > 0.0, 1.0 = disabled
                                float   penalty_freq,     // must be finite, 0.0 = disabled
                                float   penalty_present); // must be finite, 0.0 = disabled
+
+    /// maximum number of distinct DRY sequence breakers, duplicates not counted
+    /// processing each breaker scans the entire vocabulary, so the init cost is O(num_breakers x n_vocab)
+    #define LLAMA_DRY_MAX_SEQ_BREAKERS 64
 
     ///  @details DRY sampler, designed by p-e-w, as described in: https://github.com/oobabooga/text-generation-webui/pull/5677, porting Koboldcpp implementation authored by pi6am: https://github.com/LostRuins/koboldcpp/pull/982
     LLAMA_API struct llama_sampler * llama_sampler_init_dry(
