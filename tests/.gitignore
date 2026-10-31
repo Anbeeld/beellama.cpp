@@ -7,3 +7,4 @@
 ggml-common.h
 **/*.swp
 !peg-parser
+!sinq-reference/

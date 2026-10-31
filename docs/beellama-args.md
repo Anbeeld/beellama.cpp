@@ -1,9 +1,51 @@
-# BeeLlama v0.4.7 argument reference
+# BeeLlama v0.5.0 argument reference
 
 This page covers Bee-owned arguments and the upstream arguments whose behavior
 BeeLlama extends. Run `llama-server --help` or `llama-cli --help` for the full
 upstream surface. See [BeeLlama features](beellama-features.md) for use cases,
 limits, and measurement guidance.
+
+## SINQ-derived standard Q_K preconditioning
+
+`llama-quantize` can condition selected Qwen3.5 input columns before the
+unchanged standard Q3_K/Q4_K encoder. Companion vectors require BeeLlama at
+inference. These are not portable, ordinary scale-free Q_K models, despite
+using standard weight types.
+
+| Option | Default | Behavior |
+|---|---|---|
+| `--sinq-precondition none\|sidecar\|identity` | `none` | `sidecar` computes column scales; `identity` writes all-one controls. Only standard Q3_K/Q4_K weights within the supported mask receive companions. |
+| `--sinq-strip-width 64\|128` | `64` | Full-height normalization-strip width, separate from native 256-element Q_K superblocks. |
+| `--sinq-iterations 4\|8\|16` | `16` | Best-intermediate float32 normalization steps. |
+| `--sinq-gate on\|off` | `on` | Whole-matrix kurtosis greater than 5 uses exact identity scales when enabled. This follows the reference gate recipe, not a claim that it is the best quality setting. |
+| `--sinq-coverage` | Off | Restricts ordinary controls to the same supported Qwen3.5 primary-trunk FFN/attention/GDN mask. Conditioning itself always uses this mask. |
+| `--tensor-type tensor_name=ggml_type` | Unused | Existing repeatable selector can retain floats or mix standard quantization types. |
+| `--tensor-type-file FILE` | Unused | Reads the existing selectors from a file. |
+| `--pure` | Off | Disables conventional K-quant mixture heuristics for controlled comparisons. |
+| `--keep-split` | Off | Keeps input shards and each scale vector with its base matrix. |
+
+SINQ options accept either `--option=value` or `--option value`.
+
+```sh
+llama-quantize --pure --sinq-precondition=sidecar --sinq-gate=off   source-bf16.gguf model.beellama-qk-sinq.gguf Q3_K
+llama-quantize --pure source-bf16.gguf ordinary-control.gguf Q3_K
+```
+
+Sources must be F32/F16/BF16. The text-only 9B conditioning policy selects 248
+projection matrices. Embedding and output matrices are ordinarily quantized,
+not conditioned; norms, convolution filters and architectural state retain
+their required types. To verify pure coverage, inspect every final tensor:
+`--pure` disables mixture heuristics but shape fallbacks may still apply.
+Use explicit `--output-tensor-type` and `--token-embedding-type` overrides
+where required. `--sinq-coverage` restricts quantization to the projection mask
+only when explicitly requested.
+
+Admitted placements are CPU and single-GPU CUDA, including partial layer
+offload. Hadamard, row/tensor splitting and conditioning an already transformed
+source fail closed. See the [companion contract](../../beellama.doc/docs/explanation/sinq-format.md)
+for manifest/version checks, LoRA input separation and third-party loader
+warnings. Conditioning is experimental and disabled by default; measured
+quality gains depend on format and metric.
 
 ## KVarN cache types and SWA overrides
 
@@ -312,8 +354,18 @@ configuration example.
 |---|---|---|---|
 | `--save-all-logits FNAME`, `--kl-divergence-base FNAME` | — | Unused | Without `--kl-divergence`, writes the base run's compressed log probabilities to `FNAME`. |
 | `--kl-divergence` | — | Off | Compares the current run with the file supplied by `--kl-divergence-base` and returns a nonzero exit code on read or evaluation failure. |
+| `--ppl-full` | N/A | Off | Scores all N-1 next-token targets, including remainder and context-boundary targets. Requires `-f` and a logits file; incompatible with `--chunks`, `--ppl-stride`, and task scoring. |
+| `--kld-token-output FILE` | N/A | Unused | Writes ordered per-token TSV for `--ppl-full`: input index, context position, target token, KLD, base/candidate NLL, and top-1 agreement. Reference-writing runs mark unavailable comparison fields `NA`. |
 
 Use the same corpus, context, logical batch, and physical ubatch for both KLD legs.
+Full-corpus mode tokenizes once with special tokens, resets state every context,
+and uses no overlap or per-context BOS replacement. Its compact reference
+retains the full vocabulary log-probability range and uses a separate format
+from legacy KLD files. With a BF16 baseline, the comparison direction is
+`KL(P_BF16 || P_candidate)` over the full vocabulary. Run a matched BF16
+self-comparison to measure the compact-reference floor; the reference is not
+lossless. Header validation checks context, vocabulary, and tokens, not all
+runtime settings, so keep tokenizer/model settings matched as well.
 
 ## CUDA FlashAttention build policy
 

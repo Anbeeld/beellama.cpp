@@ -534,6 +534,12 @@ extern "C" {
         size_t size;
     };
 
+    enum llama_sinq_precondition {
+        LLAMA_SINQ_NONE = 0,
+        LLAMA_SINQ_SIDECAR = 1,
+        LLAMA_SINQ_IDENTITY = 2, // instrumentation control, ordinary encoding with all-one companions
+    };
+
     // model quantization parameters
     typedef struct llama_model_quantize_params {
         int32_t nthread;                                            // number of threads to use for quantizing, if <=0 will use std::thread::hardware_concurrency()
@@ -551,6 +557,11 @@ extern "C" {
         const struct llama_model_tensor_override * tt_overrides;    // pointer to tensor overrides
         const int32_t * prune_layers;                               // pointer to layer indices to prune
         size_t max_buf_size;                                        // max bytes of tensor rows kept in memory at once, 0 = default (8 GiB)
+        enum llama_sinq_precondition sinq_precondition;              // optional BeeLlama channel-scale extension; standard weight encoding
+        int32_t sinq_strip_width;                                   // normalization strip width, not the native quantizer block size
+        int32_t sinq_iterations;                                    // 4, 8 or 16 normalization steps
+        bool sinq_gate;                                             // whole-matrix kurtosis > 5 uses identity
+        bool sinq_coverage;                                         // restrict ordinary controls to the same Qwen35 primary-trunk mask
     } llama_model_quantize_params;
 
     typedef struct llama_logit_bias {

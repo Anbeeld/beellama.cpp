@@ -133,6 +133,12 @@ static void usage(const char * executable) {
     printf("  --leave-output-tensor\n");
     printf("                                      leave output.weight un(re)quantized\n");
     printf("                                      increases model size but may also increase quality, especially when requantizing\n");
+    printf("  --sinq-precondition none|sidecar|identity\n");
+    printf("                                      offline conditioning with standard Q3_K/Q4_K blocks; companions require BeeLlama\n");
+    printf("  --sinq-strip-width 64|128             normalization strip, not the native Q_K block size\n");
+    printf("  --sinq-iterations 4|8|16              best-intermediate normalization steps (default 16)\n");
+    printf("  --sinq-gate on|off                    kurtosis > 5 uses exact identity (default on)\n");
+    printf("  --sinq-coverage                       same eligible Qwen35 projection mask for ordinary controls\n");
     printf("  --pure\n");
     printf("                                      disable k-quant mixtures and quantize all tensors to the same type\n");
     printf("  --imatrix file_name\n");
@@ -395,6 +401,19 @@ static bool parse_layer_prune(const char * data, std::vector<int> & prune_layers
 int llama_quantize(int argc, char ** argv);
 
 int llama_quantize(int argc, char ** argv) {
+    // Accept both --sinq-option=value and --sinq-option value without changing
+    // the legacy positional/native-format parser.
+    std::vector<std::string> normalized;
+    for (int i = 0; i < argc; ++i) {
+        const std::string arg(argv[i]);
+        const auto eq = arg.find('=');
+        if (arg.rfind("--sinq-",0) == 0 && eq != std::string::npos) {
+            normalized.push_back(arg.substr(0,eq)); normalized.push_back(arg.substr(eq+1));
+        } else { normalized.push_back(arg); }
+    }
+    std::vector<char *> arguments;
+    for (auto & arg : normalized) { arguments.push_back(arg.data()); }
+    argc = int(arguments.size()); argv = arguments.data();
     std::setlocale(LC_NUMERIC, "C");
     if (argc < 3) {
         usage(argv[0]);
@@ -450,6 +469,27 @@ int llama_quantize(int argc, char ** argv) {
             params.dry_run = true;
         } else if (strcmp(argv[arg_idx], "--allow-requantize") == 0) {
             params.allow_requantize = true;
+        } else if (strcmp(argv[arg_idx], "--sinq-precondition") == 0) {
+            if (++arg_idx >= argc) { usage(argv[0]); }
+            const std::string mode(argv[arg_idx]);
+            if (mode == "none") { params.sinq_precondition = LLAMA_SINQ_NONE; }
+            else if (mode == "sidecar") { params.sinq_precondition = LLAMA_SINQ_SIDECAR; }
+            else if (mode == "identity") { params.sinq_precondition = LLAMA_SINQ_IDENTITY; }
+            else { usage(argv[0]); }
+        } else if (strcmp(argv[arg_idx], "--sinq-strip-width") == 0 || strcmp(argv[arg_idx], "--sinq-iterations") == 0) {
+            const bool strip = strcmp(argv[arg_idx],"--sinq-strip-width") == 0;
+            if (++arg_idx >= argc) { usage(argv[0]); }
+            char * end = nullptr;
+            const long value = std::strtol(argv[arg_idx],&end,10);
+            if (!end || *end || (strip ? (value != 64 && value != 128) : (value != 4 && value != 8 && value != 16))) { usage(argv[0]); }
+            if (strip) { params.sinq_strip_width = int32_t(value); } else { params.sinq_iterations = int32_t(value); }
+        } else if (strcmp(argv[arg_idx], "--sinq-gate") == 0) {
+            if (++arg_idx >= argc) { usage(argv[0]); }
+            if (strcmp(argv[arg_idx],"on") == 0) { params.sinq_gate = true; }
+            else if (strcmp(argv[arg_idx],"off") == 0) { params.sinq_gate = false; }
+            else { usage(argv[0]); }
+        } else if (strcmp(argv[arg_idx], "--sinq-coverage") == 0) {
+            params.sinq_coverage = true;
         } else if (strcmp(argv[arg_idx], "--pure") == 0) {
             params.pure = true;
         } else if (strcmp(argv[arg_idx], "--imatrix") == 0) {

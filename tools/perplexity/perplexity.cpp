@@ -14,6 +14,10 @@
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <future>
+#include <filesystem>
+#include <iomanip>
+#include <limits>
 #include <mutex>
 #include <random>
 #include <sstream>
@@ -149,12 +153,96 @@ static void process_logits(
     }
 }
 
+// Full-reference numeric helpers have external linkage for deterministic no-model tests.
+double perplexity_full_encode(int n_vocab, const float * logits, uint16_t * encoded, int target);
+std::array<double, 4> perplexity_full_compare(int n_vocab, const float * logits, const uint16_t * encoded, int target);
+
+double perplexity_full_encode(int n_vocab, const float * logits, uint16_t * encoded, int target) {
+    const auto bounds = std::minmax_element(logits, logits + n_vocab);
+    const double minimum = *bounds.first;
+    const double maximum = *bounds.second;
+    double sum = 0;
+    for (int i = 0; i < n_vocab; ++i) {
+        sum += std::exp(double(logits[i]) - maximum);
+    }
+    const double log_sum = std::log(sum);
+    const float metadata[] = {float((maximum - minimum) / 65535.0), float(minimum - maximum - log_sum)};
+    std::memcpy(encoded, metadata, sizeof(metadata));
+    for (int i = 0; i < n_vocab; ++i) {
+        const double code = maximum == minimum ? 0 :
+            std::round((double(logits[i]) - minimum) * 65535.0 / (maximum - minimum));
+        encoded[i + 4] = uint16_t(std::max(0.0, std::min(65535.0, code)));
+    }
+    // The even-vocabulary padding word is part of the existing compact row layout.
+    if (n_vocab % 2) {
+        encoded[n_vocab + 4] = 0;
+    }
+    return maximum - double(logits[target]) + log_sum;
+}
+
+std::array<double, 4> perplexity_full_compare(int n_vocab, const float * logits, const uint16_t * encoded, int target) {
+    float metadata[2];
+    std::memcpy(metadata, encoded, sizeof(metadata));
+    const double scale = metadata[0];
+    encoded += 4;
+    const int candidate_top = int(std::max_element(logits, logits + n_vocab) - logits);
+    const int base_top = scale == 0 ? 0 : int(std::max_element(encoded, encoded + n_vocab) - encoded);
+    const double maximum = logits[candidate_top];
+    // Normalize the reconstructed reference too: quantization changes its total probability mass.
+    const double base_max = scale * encoded[base_top];
+    double candidate_sum = 0;
+    double base_sum = 0;
+    for (int i = 0; i < n_vocab; ++i) {
+        candidate_sum += std::exp(double(logits[i]) - maximum);
+        base_sum += std::exp(scale * encoded[i] - base_max);
+    }
+    const double candidate_log_sum = std::log(candidate_sum);
+    const double base_log_sum = std::log(base_sum);
+    double kld = 0;
+    for (int i = 0; i < n_vocab; ++i) {
+        const double log_p = scale * encoded[i] - base_max - base_log_sum;
+        const double log_q = double(logits[i]) - maximum - candidate_log_sum;
+        kld += std::exp(log_p) * (log_p - log_q);
+    }
+    // The stored minimum cancels during normalization and is validated by the caller.
+    return {{kld, base_max - scale * encoded[target] + base_log_sum,
+        maximum - double(logits[target]) + candidate_log_sum, candidate_top == base_top ? 1.0 : 0.0}};
+}
+
+bool perplexity_full_compare_batch(int n_vocab, const float * logits, const uint16_t * encoded,
+                                  const int * targets, int count, int threads, std::array<double,4> * metrics) {
+    if (n_vocab <= 0 || count <= 0 || threads <= 0 || !logits || !encoded || !targets || !metrics) { return false; }
+    const size_t row_words = 2*((size_t(n_vocab)+1)/2)+4;
+    std::atomic<int> next{0};
+    std::atomic<bool> valid{true};
+    auto compute = [&]() {
+        for (int row = next++; row < count; row = next++) {
+            const float * values = logits+size_t(row)*n_vocab;
+            bool finite = targets[row] >= 0 && targets[row] < n_vocab;
+            for (int j = 0; j < n_vocab; ++j) { finite = std::isfinite(values[j]) && finite; }
+            if (!finite) { valid = false; continue; }
+            metrics[row] = perplexity_full_compare(n_vocab,values,encoded+size_t(row)*row_words,targets[row]);
+        }
+    };
+    std::vector<std::thread> pool;
+    try {
+        for (int i = 1; i < std::min(threads,count); ++i) { pool.emplace_back(compute); }
+        compute();
+    } catch (...) {
+        for (auto & worker : pool) { worker.join(); }
+        throw;
+    }
+    for (auto & worker : pool) { worker.join(); }
+    return valid.load();
+}
+
 static bool process_logits(std::ostream& out, int n_vocab, const float * logits, const int * tokens, int n_token,
-        std::vector<std::thread> & workers, std::vector<uint16_t> & log_probs, double & nll, double & nll2) {
+        std::vector<std::thread> & workers, std::vector<uint16_t> & log_probs, double & nll, double & nll2,
+        double * full_nll = nullptr) {
     std::mutex mutex;
     const int nv = 2*((n_vocab + 1)/2) + 4;
     int counter = 0;
-    auto compute = [&mutex, &counter, &log_probs, &nll, &nll2, n_vocab, logits, tokens, n_token, nv] () {
+    auto compute = [&mutex, &counter, &log_probs, &nll, &nll2, n_vocab, logits, tokens, n_token, nv, full_nll] () {
         double local_nll  = 0;
         double local_nll2 = 0;
         while (true) {
@@ -165,7 +253,12 @@ static bool process_logits(std::ostream& out, int n_vocab, const float * logits,
                 break;
             }
             lock.unlock();
-            const double v = log_softmax(n_vocab, logits + size_t(i)*n_vocab, log_probs.data() + (size_t)i*nv, tokens[i+1]);
+            const double v = full_nll
+                ? perplexity_full_encode(n_vocab, logits + size_t(i)*n_vocab, log_probs.data() + (size_t)i*nv, tokens[i+1])
+                : log_softmax(n_vocab, logits + size_t(i)*n_vocab, log_probs.data() + (size_t)i*nv, tokens[i+1]);
+            if (full_nll) {
+                full_nll[i] = v;
+            }
             local_nll += v;
             local_nll2 += v*v;
         }
@@ -2019,6 +2112,282 @@ static bool kl_divergence(llama_context * ctx, const common_params & params) {
     return true;
 }
 
+// Full-corpus reference protocol (native-endian fixed-width scalars, like legacy logits):
+// magic[8] = "_logitF1", uint32 context, uint32 vocabulary, uint64 token_count,
+// token_count llama_token values, then token_count-1 compact rows. Each row is
+// float scale, float min_log_probability, uint16 codes[vocabulary], padded to an
+// even number of codes. Unlike legacy rows, the entire logit range is retained.
+// Tokenization is common_tokenize(..., add_special=true) once for the whole file.
+// Input i predicts token i+1, including across context boundaries. State resets
+// before inputs 0, context, 2*context, ...; positions restart at zero, no overlap
+// and no per-context BOS substitution. Candidate and reference must use identical
+// model/tokenizer settings, context, batch and microbatch flags. The header checks
+// context/vocabulary/tokens, not model runtime settings. Compact rows approximate
+// reference probabilities; measure their floor with a same-model BF16 comparison.
+bool perplexity_full_same_file(const std::string & a, const std::string & b) {
+    if (a.empty() || b.empty()) { return false; }
+#ifdef _WIN32
+    // NUL is a device, not a filesystem path; MSVC rejects canonicalizing it.
+    // Keep regular-file alias checks intact, including hard links.
+    const bool a_null = _stricmp(a.c_str(), "NUL") == 0;
+    const bool b_null = _stricmp(b.c_str(), "NUL") == 0;
+    if (a_null || b_null) { return a_null && b_null; }
+#endif
+    return std::filesystem::weakly_canonical(a) == std::filesystem::weakly_canonical(b) ||
+        (std::filesystem::exists(a) && std::filesystem::exists(b) && std::filesystem::equivalent(a, b));
+}
+
+static bool perplexity_full(llama_context * ctx, const common_params & params) {
+    auto fail = [](const char * message) {
+        LOG_ERR("ppl-full: %s\n", message);
+        return false;
+    };
+    const auto * vocab = llama_model_get_vocab(llama_get_model(ctx));
+    const uint32_t n_ctx = uint32_t(params.n_ctx);
+    const uint32_t n_vocab = uint32_t(llama_vocab_n_tokens(vocab));
+    const auto tokens = common_tokenize(ctx, params.prompt, true);
+    const uint64_t token_count = tokens.size();
+    if (token_count < 2 || n_vocab == 0 || llama_n_ctx(ctx) < n_ctx) {
+        return fail("need at least two tokens, a nonempty vocabulary and the requested context");
+    }
+    for (auto token : tokens) {
+        if (token < 0 || uint32_t(token) >= n_vocab) {
+            return fail("input contains a token outside the model vocabulary");
+        }
+    }
+    // A token-output path must never overwrite its corpus or reference (including aliases).
+    const auto same_file = perplexity_full_same_file;
+    try {
+        if (same_file(params.logits_file, params.prompt_file) ||
+            same_file(params.kld_token_output, params.prompt_file) ||
+            same_file(params.kld_token_output, params.logits_file)) {
+            return fail("corpus, reference and token-output paths must be distinct");
+        }
+    } catch (const std::filesystem::filesystem_error & error) {
+        LOG_ERR("ppl-full: cannot validate output paths: %s\n", error.what());
+        return false;
+    }
+    const size_t row_words = 2 * ((size_t(n_vocab) + 1) / 2) + 4;
+    const uint64_t row_bytes = row_words * sizeof(uint16_t);
+    const uint64_t max_file = uint64_t(std::numeric_limits<std::streamoff>::max());
+    if (token_count > (max_file - 24 + row_bytes) / (sizeof(llama_token) + row_bytes)) {
+        return fail("reference size exceeds stream limits");
+    }
+    const uint64_t expected_size = 24 + token_count * sizeof(llama_token) + (token_count - 1) * row_bytes;
+    std::ifstream reference;
+    std::ofstream baseline;
+    if (params.kl_divergence) {
+        reference.open(params.logits_file, std::ios::binary);
+        char magic[8] = {};
+        uint32_t stored_ctx = 0, stored_vocab = 0;
+        uint64_t stored_count = 0;
+        reference.read(magic, sizeof(magic));
+        reference.read(reinterpret_cast<char *>(&stored_ctx), sizeof(stored_ctx));
+        reference.read(reinterpret_cast<char *>(&stored_vocab), sizeof(stored_vocab));
+        reference.read(reinterpret_cast<char *>(&stored_count), sizeof(stored_count));
+        if (!reference || std::memcmp(magic, "_logitF1", 8) || stored_ctx != n_ctx ||
+                stored_vocab != n_vocab || stored_count != token_count) {
+            return fail("invalid reference header or mismatched context, vocabulary or token count");
+        }
+        const auto tokens_begin = reference.tellg();
+        reference.seekg(0, std::ios::end);
+        if (!reference || reference.tellg() != std::streamoff(expected_size)) {
+            return fail("truncated reference or trailing reference data");
+        }
+        reference.seekg(tokens_begin);
+        for (uint64_t i = 0; i < token_count; ++i) {
+            llama_token stored_token = LLAMA_TOKEN_NULL;
+            reference.read(reinterpret_cast<char *>(&stored_token), sizeof(stored_token));
+            if (!reference || stored_token != tokens[size_t(i)]) {
+                LOG_ERR("ppl-full: reference token mismatch or read failure at input %llu\n", (unsigned long long) i);
+                return false;
+            }
+        }
+    } else {
+        baseline.open(params.logits_file, std::ios::binary | std::ios::trunc);
+        baseline.write("_logitF1", 8);
+        baseline.write(reinterpret_cast<const char *>(&n_ctx), sizeof(n_ctx));
+        baseline.write(reinterpret_cast<const char *>(&n_vocab), sizeof(n_vocab));
+        baseline.write(reinterpret_cast<const char *>(&token_count), sizeof(token_count));
+        // Bound individual stream writes, including for very large token arrays.
+        for (size_t i = 0; i < tokens.size(); ) {
+            const size_t count = std::min<size_t>(tokens.size() - i, 1 << 18);
+            baseline.write(reinterpret_cast<const char *>(tokens.data() + i), count * sizeof(llama_token));
+            if (!baseline) {
+                return fail("cannot write reference header or tokens");
+            }
+            i += count;
+        }
+    }
+    std::ofstream output;
+    if (!params.kld_token_output.empty()) {
+        output.open(params.kld_token_output, std::ios::trunc);
+        output << "input_index\tcontext_position\ttarget_token\tkld\tbase_nll\tcandidate_nll\ttop1_agree\n";
+        output << std::setprecision(17);
+        if (!output) {
+            return fail("cannot open or write token output");
+        }
+    }
+    const int n_batch = std::max(1, std::min({int(n_ctx), params.n_batch,
+        int(llama_n_batch(ctx)), ppl_max_logits_rows(int(n_vocab), params)}));
+    std::vector<uint16_t> encoded(size_t(n_batch) * row_words);
+    std::vector<double> batch_nll(n_batch);
+    std::vector<std::array<double, 4>> batch_metrics(n_batch);
+    std::vector<double> kld_values;
+    if (params.kl_divergence) {
+        kld_values.reserve(size_t(token_count - 1));
+    }
+    std::vector<std::thread> workers(std::max(1u, std::thread::hardware_concurrency()) - 1);
+    common_batch batch(ctx);
+    double candidate_nll = 0, base_nll = 0, nll2 = 0, sum_kld = 0;
+    uint64_t same_top = 0;
+    int64_t decode_us = 0, validation_us = 0, reference_us = 0, scoring_us = 0, output_us = 0;
+    // One owned previous batch lets CPU probability work overlap the next GPU
+    // decode. Never retain llama_get_logits storage across another decode.
+    std::vector<float> scoring_logits(params.kl_divergence ? size_t(n_batch)*n_vocab : 0);
+    std::vector<uint16_t> scoring_encoded(params.kl_divergence ? encoded.size() : 0);
+    std::future<bool> scoring_job;
+    auto finish_batch = [&](size_t first, int position, int count) {
+        const int64_t start = ggml_time_us();
+        if (params.kl_divergence) {
+            if (!perplexity_full_compare_batch(int(n_vocab),scoring_logits.data(),scoring_encoded.data(),
+                    tokens.data()+first+1,count,int(workers.size()+1),batch_metrics.data())) {
+                return fail("nonfinite candidate logits");
+            }
+            scoring_us += ggml_time_us()-start;
+        }
+        const int64_t output_start = ggml_time_us();
+        // A single scoring job owns reductions and ordered output. The main
+        // thread joins it before recycling buffers or reading final totals.
+        for (int i = 0; i < count; ++i) {
+            const auto & metrics = batch_metrics[i];
+            if (params.kl_divergence) {
+                sum_kld += metrics[0];
+                base_nll += metrics[1];
+                candidate_nll += metrics[2];
+                same_top += uint64_t(metrics[3]);
+                kld_values.push_back(metrics[0]);
+            }
+            if (output.is_open()) {
+                output << first+i << '\t' << position+i << '\t' << tokens[first+i+1] << '\t';
+                if (params.kl_divergence) {
+                    output << metrics[0] << '\t' << metrics[1] << '\t' << metrics[2] << '\t' << int(metrics[3]);
+                } else {
+                    output << "NA\t" << batch_nll[i] << "\tNA\tNA";
+                }
+                output << '\n';
+            }
+        }
+        if (output.is_open() && !output) { return fail("token output write failed"); }
+        output_us += ggml_time_us()-output_start;
+        return true;
+    };
+    LOG_INF("ppl-full: %llu tokens, %llu predictions, context=%u batch=%d microbatch=%u; "
+        "state resets every context, no overlap or BOS replacement\n",
+        (unsigned long long) token_count, (unsigned long long) (token_count - 1),
+        n_ctx, n_batch, llama_n_ubatch(ctx));
+    for (size_t first = 0; first < tokens.size() - 1; ) {
+        const int position = int(first % n_ctx);
+        if (position == 0) {
+            llama_memory_clear(llama_get_memory(ctx), true);
+        }
+        const int count = int(std::min({size_t(n_batch), size_t(n_ctx - position), tokens.size() - 1 - first}));
+        batch.clear();
+        for (int i = 0; i < count; ++i) {
+            batch.add(tokens[first + i], position + i, 0, true);
+        }
+        std::future<std::pair<bool,int64_t>> reference_read;
+        if (params.kl_divergence) {
+            // One bounded row batch only. Its read overlaps GPU inference, not
+            // another read or numerical reduction; stream ordering is unchanged.
+            reference_read = std::async(std::launch::async,[&reference,&encoded,count,row_bytes]() {
+                const int64_t start = ggml_time_us();
+                reference.read(reinterpret_cast<char *>(encoded.data()),count*row_bytes);
+                return std::make_pair(bool(reference),ggml_time_us()-start);
+            });
+        }
+        int64_t stage_start = ggml_time_us();
+        if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
+            return fail("decode failed");
+        }
+        const float * logits = llama_get_logits(ctx);
+        if (!logits) {
+            return fail("decode returned no logits");
+        }
+        decode_us += ggml_time_us() - stage_start;
+        stage_start = ggml_time_us();
+        if (!params.kl_divergence) {
+            for (size_t i = 0; i < size_t(count)*n_vocab; ++i) {
+                if (!std::isfinite(logits[i])) { return fail("nonfinite candidate logits"); }
+            }
+        }
+        validation_us += ggml_time_us() - stage_start;
+        stage_start = ggml_time_us();
+        if (params.kl_divergence) {
+            const auto read_result = reference_read.get();
+            reference_us += read_result.second;
+            if (!read_result.first) { return fail("reference row read failed"); }
+            for (int i = 0; i < count; ++i) {
+                float metadata[2];
+                std::memcpy(metadata, encoded.data() + size_t(i) * row_words, sizeof(metadata));
+                if (!std::isfinite(metadata[0]) || !std::isfinite(metadata[1]) || metadata[0] < 0) {
+                    return fail("invalid reference row metadata");
+                }
+            }
+            if (scoring_job.valid() && !scoring_job.get()) { return false; }
+            std::copy_n(logits,size_t(count)*n_vocab,scoring_logits.data());
+            encoded.swap(scoring_encoded);
+            scoring_job = std::async(std::launch::async,finish_batch,first,position,count);
+        } else {
+            if (!process_logits(baseline, int(n_vocab), logits, tokens.data() + first, count,
+                    workers, encoded, candidate_nll, nll2, batch_nll.data())) { return false; }
+            scoring_us += ggml_time_us()-stage_start;
+            if (!finish_batch(first,position,count)) { return false; }
+        }
+        first += count;
+    }
+    if (scoring_job.valid() && !scoring_job.get()) { return false; }
+    LOG_INF("ppl-full timing: decode_and_logits_ms=%.3f validation_ms=%.3f reference_read_ms=%.3f "
+            "probability_scoring_ms=%.3f token_output_ms=%.3f scoring_threads=%zu "
+            "reference_io_overlapped=%d scoring_includes_parallel_validation=%d previous_batch_scoring_overlapped=%d\n",
+        decode_us/1000.0,validation_us/1000.0,reference_us/1000.0,scoring_us/1000.0,output_us/1000.0,workers.size()+1,
+        int(params.kl_divergence),int(params.kl_divergence),int(params.kl_divergence));
+    if (baseline.is_open()) {
+        baseline.flush();
+        baseline.close();
+        if (!baseline) {
+            return fail("reference flush/close failed");
+        }
+    }
+    if (output.is_open()) {
+        output.flush();
+        output.close();
+        if (!output) {
+            return fail("token output flush/close failed");
+        }
+    }
+    if (params.kl_divergence && (reference.peek() != std::char_traits<char>::eof() || reference.bad())) {
+        return fail("trailing reference data or read failure");
+    }
+    const double count = double(token_count - 1);
+    LOG("Full-corpus %s PPL: %.9g (%llu predictions)\n", params.kl_divergence ? "candidate" : "base",
+        std::exp(candidate_nll / count), (unsigned long long) (token_count - 1));
+    if (params.kl_divergence) {
+        // Sorting a copy leaves all position-aligned observations in corpus order.
+        auto sorted = kld_values;
+        std::sort(sorted.begin(), sorted.end());
+        auto percentile = [&](double fraction) {
+            const double index = fraction * (sorted.size() - 1);
+            const size_t low = size_t(index);
+            return sorted[low] + (index - low) * (sorted[std::min(low + 1, sorted.size() - 1)] - sorted[low]);
+        };
+        LOG("Full-corpus base PPL: %.9g; top1 agreement: %.9g\n", std::exp(base_nll / count), same_top / count);
+        LOG("Full-vocabulary KL(ref||candidate): mean=%.12g median=%.12g P95=%.12g P99=%.12g P99.9=%.12g max=%.12g\n",
+            sum_kld / count, percentile(0.5), percentile(0.95), percentile(0.99), percentile(0.999), sorted.back());
+    }
+    return true;
+}
+
 // satisfies -Wmissing-declarations
 int llama_perplexity(int argc, char ** argv);
 
@@ -2042,7 +2411,18 @@ int llama_perplexity(int argc, char ** argv) {
         return 1;
     }
 
-    if (params.hellaswag || params.winogrande || params.multiple_choice) {
+    if ((!params.kld_token_output.empty() && !params.ppl_full) ||
+        (params.ppl_full && (params.ppl_subset_option || params.n_chunks != -1 || params.ppl_stride != 0 ||
+            params.logits_file.empty() || params.prompt_file.empty() || params.hellaswag ||
+            params.winogrande || params.multiple_choice))) {
+        LOG_ERR("--ppl-full requires -f and --save-all-logits/--kl-divergence-base; "
+            "--chunks, --ppl-stride and task scoring are incompatible; --kld-token-output requires --ppl-full\n");
+        return 1;
+    }
+
+    if (params.ppl_full) {
+        params.n_parallel = 1;
+    } else if (params.hellaswag || params.winogrande || params.multiple_choice) {
         params.n_parallel = std::max(4, params.n_parallel);
         params.kv_unified = true;
     } else { // Perplexity & KL divergence
@@ -2074,6 +2454,14 @@ int llama_perplexity(int argc, char ** argv) {
     if (ctx == nullptr) {
         LOG_ERR("%s: failed to create context\n", __func__);
         return 1;
+    }
+
+    if (params.ppl_full) {
+        const bool success = perplexity_full(ctx, params);
+        llama_perf_context_print(ctx);
+        common_memory_breakdown_print(ctx);
+        llama_backend_free();
+        return success ? 0 : 1;
     }
 
     const int n_ctx_train = llama_model_n_ctx_train(model);

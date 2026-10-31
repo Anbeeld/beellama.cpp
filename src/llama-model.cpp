@@ -41,6 +41,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <unordered_set>
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
@@ -1638,6 +1639,114 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
 
+    struct sinq_family {
+        llm_tensor kind;
+        ggml_tensor * llama_layer::* member;
+    };
+    const sinq_family sinq_families[] = {
+        { LLM_TENSOR_ATTN_Q,    &llama_layer::wq },
+        { LLM_TENSOR_ATTN_K,    &llama_layer::wk },
+        { LLM_TENSOR_ATTN_V,    &llama_layer::wv },
+        { LLM_TENSOR_ATTN_QKV,  &llama_layer::wqkv },
+        { LLM_TENSOR_ATTN_GATE, &llama_layer::wqkv_gate },
+        { LLM_TENSOR_ATTN_OUT,  &llama_layer::wo },
+        { LLM_TENSOR_SSM_BETA,  &llama_layer::ssm_beta },
+        { LLM_TENSOR_SSM_ALPHA, &llama_layer::ssm_alpha },
+        { LLM_TENSOR_SSM_OUT,   &llama_layer::ssm_out },
+        { LLM_TENSOR_FFN_GATE,  &llama_layer::ffn_gate },
+        { LLM_TENSOR_FFN_UP,    &llama_layer::ffn_up },
+        { LLM_TENSOR_FFN_DOWN,  &llama_layer::ffn_down },
+    };
+    const std::string sinq_suffix = ".sinq_scale2";
+    const int64_t sinq_version_key = gguf_find_key(ml.metadata, "beellama.qk_sinq.version");
+    const int64_t sinq_manifest_key = gguf_find_key(ml.metadata, "beellama.qk_sinq.tensors");
+    if (sinq_version_key >= 0 &&
+        (gguf_get_kv_type(ml.metadata, sinq_version_key) != GGUF_TYPE_UINT32 ||
+         gguf_get_val_u32(ml.metadata, sinq_version_key) != 1)) {
+        throw std::runtime_error("QK SINQ requires uint32 beellama.qk_sinq.version=1");
+    }
+    if (sinq_version_key >= 0) {
+        const int64_t width_key = gguf_find_key(ml.metadata,"beellama.qk_sinq.strip_width");
+        const int64_t steps_key = gguf_find_key(ml.metadata,"beellama.qk_sinq.iterations");
+        const int64_t algorithm_key = gguf_find_key(ml.metadata,"beellama.qk_sinq.algorithm");
+        if (width_key < 0 || steps_key < 0 || algorithm_key < 0 ||
+            gguf_get_kv_type(ml.metadata,width_key) != GGUF_TYPE_UINT32 ||
+            gguf_get_kv_type(ml.metadata,steps_key) != GGUF_TYPE_UINT32 ||
+            gguf_get_kv_type(ml.metadata,algorithm_key) != GGUF_TYPE_STRING) {
+            throw std::runtime_error("QK SINQ requires typed qk_sinq algorithm, strip_width and iterations metadata");
+        }
+        const uint32_t width = gguf_get_val_u32(ml.metadata,width_key);
+        const uint32_t steps = gguf_get_val_u32(ml.metadata,steps_key);
+        const std::string algorithm = gguf_get_val_str(ml.metadata,algorithm_key);
+        if ((width != 64 && width != 128) || (steps != 4 && steps != 8 && steps != 16) ||
+            (algorithm != "identity" && algorithm != "sinkhorn_log")) {
+            throw std::runtime_error("QK SINQ unsupported qk_sinq normalization recipe");
+        }
+    }
+    std::unordered_set<std::string> sinq_allowed;
+    if (arch == LLM_ARCH_QWEN35) {
+        const auto tn = LLM_TN(arch);
+        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+            for (const auto & family : sinq_families) {
+                sinq_allowed.insert(tn(family.kind, "weight", il).str());
+            }
+        }
+    }
+    std::unordered_set<std::string> sinq_declared;
+    if (sinq_manifest_key >= 0 || sinq_version_key >= 0) {
+        if (sinq_version_key < 0 || sinq_manifest_key < 0 ||
+            gguf_get_kv_type(ml.metadata,sinq_manifest_key) != GGUF_TYPE_ARRAY ||
+            gguf_get_arr_type(ml.metadata,sinq_manifest_key) != GGUF_TYPE_STRING ||
+            gguf_get_arr_n(ml.metadata,sinq_manifest_key) == 0) {
+            throw std::runtime_error("QK SINQ requires beellama.qk_sinq.version=1 and a nonempty beellama.qk_sinq.tensors string array");
+        }
+        if (ml.files.empty()) { throw std::runtime_error("QK SINQ companions require file-backed GGUF loading for shard validation"); }
+        for (size_t i = 0; i < gguf_get_arr_n(ml.metadata,sinq_manifest_key); ++i) {
+            const std::string name = gguf_get_arr_str(ml.metadata,sinq_manifest_key,i);
+            if (!sinq_declared.insert(name).second) { throw std::runtime_error("QK SINQ duplicate transformed tensor in manifest"); }
+            if (arch != LLM_ARCH_QWEN35 || !sinq_allowed.count(name)) {
+                throw std::runtime_error(format("QK SINQ unsupported tensor '%s': primary-trunk qwen35 projections only",name.c_str()));
+            }
+            const auto base = ml.weights_map.find(name);
+            if (base == ml.weights_map.end() ||
+                (base->second.tensor->type != GGML_TYPE_Q3_K && base->second.tensor->type != GGML_TYPE_Q4_K)) {
+                throw std::runtime_error(format("QK SINQ companion association '%s' requires a standard Q3_K/Q4_K base weight",name.c_str()));
+            }
+            const auto & weight = base->second;
+            if (ggml_n_dims(weight.tensor) != 2 || !ggml_is_contiguous(weight.tensor) ||
+                weight.tensor->ne[0] % ggml_blck_size(weight.tensor->type)) {
+                throw std::runtime_error("QK SINQ weight must be a contiguous block-aligned matrix");
+            }
+            const auto scale = ml.weights_map.find(name+sinq_suffix);
+            if (scale == ml.weights_map.end()) {
+                throw std::runtime_error(format("QK SINQ weight '%s' requires FP16 companion",name.c_str()));
+            }
+            const auto * t = scale->second.tensor;
+            if (scale->second.idx != weight.idx || t->type != GGML_TYPE_F16 ||
+                t->ne[0] != weight.tensor->ne[0] || t->ne[1] != 1 || t->ne[2] != 1 || t->ne[3] != 1 || !ggml_is_contiguous(t)) {
+                throw std::runtime_error(format("QK SINQ companion '%s' must be contiguous FP16 shape {K} in the same GGUF shard as its base",scale->first.c_str()));
+            }
+        }
+    }
+    for (const auto & entry : ml.weights_map) {
+        const auto & name = entry.first;
+        if (name.size() >= sinq_suffix.size() && name.compare(name.size()-sinq_suffix.size(),sinq_suffix.size(),sinq_suffix) == 0 &&
+            !sinq_declared.count(name.substr(0,name.size()-sinq_suffix.size()))) {
+            throw std::runtime_error(format("QK SINQ orphan companion '%s': requires declared beellama.qk_sinq association",name.c_str()));
+        }
+    }
+    const size_t n_sinq_weights = sinq_declared.size();
+    if (n_sinq_weights) {
+        if (split_mode == LLAMA_SPLIT_MODE_ROW || split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+            throw std::runtime_error("QK SINQ does not support row/tensor split modes; use --split-mode none with CUDA0 or CPU placement");
+        }
+        for (int64_t i = 0; i < gguf_get_n_kv(ml.metadata); ++i) {
+            if (std::string(gguf_get_key(ml.metadata, i)).find("prism.hadamard.") == 0) {
+                throw std::runtime_error("SINQ cannot be combined with Hadamard metadata; use an unrotated SINQ model");
+            }
+        }
+    }
+
     if (ml.use_mmap && params.load_mode == LLAMA_LOAD_MODE_AUTO) {
         for (const auto & dev : devices) {
             ggml_backend_dev_props props;
@@ -1759,6 +1868,25 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
         // call the per-model loading function
         load_arch_tensors(ml);
+
+        if (n_sinq_weights) {
+            for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+                for (const auto & family : sinq_families) {
+                    ggml_tensor * base = layers[il].*(family.member);
+                    if (!base || !sinq_declared.count(base->name)) {
+                        continue;
+                    }
+                    ggml_tensor * scale = create_tensor(
+                        tn(family.kind, "weight.sinq_scale2", il), { base->ne[0] }, 0);
+                    if (!sinq_scales.emplace(base, scale).second) {
+                        throw std::runtime_error(format("SINQ duplicate companion association for '%s'", base->name));
+                    }
+                }
+            }
+            if (sinq_scales.size() != n_sinq_weights) {
+                throw std::runtime_error("SINQ base weight was skipped or not associated with a companion; primary-trunk loading is required");
+            }
+        }
 
         // generic pass: load optional per-tensor/per-expert ".scale" tensors (e.g. NVFP4 scale2)
         // this avoids having to add scale loading to every architecture
@@ -1929,10 +2057,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             (output_s || output_in_s)) {
         throw std::runtime_error("output scales require a separate output weight");
     }
-    // populate tensors_by_name
-    for (auto & [_, ctx_ptr] : ml.ctx_map) {
+    // populate tensors_by_name and preserve placement before mmap tensors get buffers.
+    std::unordered_map<const ggml_tensor *,ggml_backend_buffer_type_t> tensor_bufts;
+    for (auto & [ctx_key, ctx_ptr] : ml.ctx_map) {
         for (auto * cur = ggml_get_first_tensor(ctx_ptr.get()); cur != NULL; cur = ggml_get_next_tensor(ctx_ptr.get(), cur)) {
             tensors_by_name.emplace_back(ggml_get_name(cur), cur);
+            tensor_bufts.emplace(cur,ctx_key.buft);
         }
     }
 
@@ -2061,6 +2191,94 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         const int max_offloadable_layers       = n_layer_all + 1;
 
         LLAMA_LOG_INFO("%s: offloaded %d/%d layers to GPU\n", __func__, std::min(n_gpu_layers, max_offloadable_layers), max_backend_supported_layers);
+    }
+
+    // Source companions stay F16 on disk. Cache their exact F32 promotion once,
+    // not through hundreds of CPY kernels on every decode step. Group buffers
+    // by placement and share equal vectors; all-one diagonals are exact no-ops.
+    struct sinq_cache_group {
+        ggml_context_ptr ctx;
+        std::map<std::vector<ggml_fp16_t>,ggml_tensor *> tensors;
+        std::vector<std::pair<ggml_tensor *,std::vector<float>>> values;
+    };
+    std::map<ggml_backend_buffer_type_t,sinq_cache_group> sinq_cache;
+    size_t sinq_identity_count = 0;
+    auto sinq_placement = [&](ggml_backend_buffer_type_t buft) -> std::string {
+        auto * device = ggml_backend_buft_get_device(buft);
+        if (!device) {
+            for (const auto & candidate : pimpl->cpu_buft_list) {
+                if (candidate.second == buft) { device = candidate.first; break; }
+            }
+        }
+        if (!device) { throw std::runtime_error("QK SINQ cannot resolve a tensor buffer placement"); }
+        return ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU ? "CPU" : ggml_backend_dev_name(device);
+    };
+    for (auto it = sinq_scales.begin(); it != sinq_scales.end();) {
+        ggml_tensor * scale = it->second;
+        if (sinq_placement(tensor_bufts.at(it->first)) != sinq_placement(tensor_bufts.at(scale))) {
+            throw std::runtime_error(format("QK SINQ scale placement must match base weight '%s'; use matching tensor placement overrides",it->first->name));
+        }
+        const auto & serialized = ml.weights_map.at(scale->name);
+        std::vector<ggml_fp16_t> values(ggml_nelements(scale));
+        // File-backed association/shard bounds were validated above. This read
+        // also works for no-allocation fit probes before backend data loading.
+        const auto & file = ml.files.at(serialized.idx);
+        file->seek(serialized.offs,SEEK_SET);
+        file->read_raw(values.data(),values.size()*sizeof(ggml_fp16_t));
+        std::vector<float> promoted(values.size());
+        bool identity = true;
+        for (size_t j = 0; j < values.size(); ++j) {
+            const float value = ggml_fp16_to_fp32(values[j]);
+            if (!std::isfinite(value) || value <= 0.f) {
+                throw std::runtime_error(format("SINQ companion '%s' has non-finite or non-positive scale at index %zu",scale->name,j));
+            }
+            promoted[j] = value;
+            identity = identity && value == 1.f;
+        }
+        if (identity) {
+            ++sinq_identity_count;
+            it = sinq_scales.erase(it);
+            continue;
+        }
+        const auto buft = tensor_bufts.at(scale);
+        auto & group = sinq_cache[buft];
+        if (!group.ctx) {
+            group.ctx.reset(ggml_init({ggml_tensor_overhead()*(n_sinq_weights+1),nullptr,true}));
+            if (!group.ctx) { throw std::runtime_error("cannot allocate QK SINQ runtime scale context"); }
+        }
+        auto found = group.tensors.find(values);
+        if (found == group.tensors.end()) {
+            auto * cached = ggml_new_tensor_1d(group.ctx.get(),GGML_TYPE_F32,scale->ne[0]);
+            ggml_format_name(cached,"%s.runtime_f32",scale->name);
+            group.values.emplace_back(cached,std::move(promoted));
+            found = group.tensors.emplace(std::move(values),cached).first;
+        }
+        it->second = found->second;
+        ++it;
+    }
+    for (auto & entry : sinq_cache) {
+        auto & group = entry.second;
+        ggml_backend_buffer_ptr buffer;
+        if (ml.no_alloc) {
+            buffer.reset(ggml_backend_buft_alloc_buffer(entry.first,0));
+            for (auto & value : group.values) { value.first->buffer = buffer.get(); }
+        } else {
+            buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(group.ctx.get(),entry.first));
+        }
+        if (!buffer) { throw std::runtime_error("cannot allocate QK SINQ runtime scale buffer"); }
+        ggml_backend_buffer_set_usage(buffer.get(),GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        if (!ml.no_alloc) {
+            for (const auto & value : group.values) {
+                ggml_backend_tensor_set(value.first,value.second.data(),0,value.second.size()*sizeof(float));
+            }
+        }
+        std::vector<ggml_backend_buffer_ptr> buffers;
+        buffers.emplace_back(std::move(buffer));
+        pimpl->ctxs_bufs.emplace_back(std::move(group.ctx),std::move(buffers));
+    }
+    if (n_sinq_weights) {
+        LLAMA_LOG_INFO("%s: QK SINQ cached F32 vectors for %zu weights, elided %zu exact identity diagonals\n",
+            __func__,sinq_scales.size(),sinq_identity_count);
     }
 
     // print memory requirements per buffer type

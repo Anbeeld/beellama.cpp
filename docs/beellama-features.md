@@ -1,8 +1,45 @@
-# BeeLlama v0.4.7 features
+# BeeLlama v0.5.0 features
 
-BeeLlama v0.4.7 keeps a small fork surface on top of upstream llama.cpp. Use
+BeeLlama v0.5.0 keeps a small fork surface on top of upstream llama.cpp. Use
 this page to choose a feature; use the [argument reference](beellama-args.md)
 for exact names, environment variables, defaults, and validation ranges.
+
+## SINQ-derived Q_K weight preconditioning
+
+The quantizer can apply SINQ-derived column scales before the standard
+Q3_K/Q4_K encoders. Inference multiplies base-layer activations by the stored
+FP16 channel vector and uses the existing Q_K CPU/CUDA kernels.
+
+Conditioning is opt-in through `--sinq-precondition=sidecar`; normal quantization
+is unchanged. `identity` supplies all-one companions for an exact output and
+same-byte-budget control. Normalization-strip widths 64/128 do not alter Q_K
+superblocks. Iteration counts 4/8/16 and a threshold-5 identity gate are explicit.
+
+Conditioning covers Qwen3.5 primary-trunk FFN, attention and Gated DeltaNet
+projections. The text-only 9B model has 248 such matrices. Embedding and output
+matrices remain eligible for ordinary quantization but receive no conditioning
+companion. Norms, convolution filters and architectural state retain their
+required types. `--pure` and explicit tensor selectors allow uniform Q3_K or
+Q4_K coverage; `--sinq-coverage` separately restricts quantization to the
+projection mask when a partial-coverage control is wanted.
+
+LoRA reads original inputs, not conditioned inputs. NVFP4 scalar input scales
+are separate. Windows CPU, single-GPU CUDA and partial layer offload have been
+tested, including independently masked physical GPUs. Split-file companions
+stay with their base matrices. Row/tensor splitting and Hadamard combinations
+fail closed; non-CUDA backends and true multi-GPU splitting are not qualified.
+
+**These sidecar GGUFs require BeeLlama.** A third-party loader may recognize the
+Q_K weights but ignore their companions, producing incorrect output. See the
+[argument reference](beellama-args.md#sinq-derived-standard-q_k-preconditioning)
+and [companion contract](../../beellama.doc/docs/explanation/sinq-format.md).
+
+Full-coverage measurements found lower KL and perplexity for conditioned Q3_K.
+Conditioned Q4_K lowered KL but increased perplexity. Conditioning remains
+experimental and disabled by default; it is not an unconditional quality win
+or a portable scale-free export. Keep inference speed trials separate from
+synchronized `--kv-memory` accounting. Detailed measurements are maintained in
+[beellama.doc](../../beellama.doc/docs/records/benchmarks/sinq-v050/docs/qk-sinq-v050-pure-practical-report.md).
 
 ## KVarN target KV cache
 
@@ -730,6 +767,8 @@ model, corpus, context, and batching constant.
 - [`--save-all-logits`](beellama-args.md#kld-measurement)
 - [`--kl-divergence`](beellama-args.md#kld-measurement)
 - [`--kl-divergence-base`](beellama-args.md#kld-measurement)
+- [`--ppl-full`](beellama-args.md#kld-measurement)
+- [`--kld-token-output`](beellama-args.md#kld-measurement)
 - Upstream `-c`, `-b`, and `-ub`
 
 ### Measurement and validation
@@ -739,6 +778,14 @@ the same evaluation tokens, logical batch, and physical ubatch. Treat a nonzero
 process exit as a failed measurement rather than a score.
 
 ### Known limitations
+
+`--ppl-full` scores all N-1 next-token targets from the tokenized corpus,
+including the remainder and targets across context boundaries. State resets
+every context, with no overlap or per-context BOS replacement. With a BF16
+reference it measures full-vocabulary `KL(P_BF16 || P_candidate)` and can write
+ordered per-token TSV using `--kld-token-output`. The compact reference
+approximates probabilities, so measure a matched BF16 self-comparison floor
+before interpreting small differences.
 
 The base file is tied to its vocabulary, evaluation tokens, and context size.
 It is a measurement artifact, not a portable model format.

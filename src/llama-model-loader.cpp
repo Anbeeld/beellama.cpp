@@ -1011,7 +1011,13 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
         case GGML_OP_MUL:
             {
                 ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, w->ne[0], w->ne[1], w->ne[2], w->ne[3]);
-                op_tensor = ggml_mul(ctx, a, w);
+                ggml_tensor * b = w;
+                const std::string name = ggml_get_name(w);
+                const std::string suffix = ".sinq_scale2";
+                if (name.size() >= suffix.size() && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0) {
+                    b = ggml_cast(ctx, w, GGML_TYPE_F32);
+                }
+                op_tensor = ggml_mul(ctx, a, b);
             } break;
         case GGML_OP_DIV:
             {
@@ -1219,7 +1225,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         // tensors with "bias" suffix are always used with GGML_OP_ADD or GGML_OP_ADD_ID;
         // embedded-adapter ".lora_a"/".lora_b" tensors are always used with GGML_OP_MUL_MAT_ID
         ggml_op op;
-        if (tn.suffix != nullptr && strcmp(tn.suffix, "bias") == 0) {
+        const bool sinq_scale = tn.suffix != nullptr && strcmp(tn.suffix, "weight.sinq_scale2") == 0;
+        if (sinq_scale) {
+            op = GGML_OP_MUL;
+        } else if (tn.suffix != nullptr && strcmp(tn.suffix, "bias") == 0) {
             op = info.op == GGML_OP_MUL_MAT_ID ? GGML_OP_ADD_ID : GGML_OP_ADD;
         } else if (hparams.router_layer >= 0 && tn.suffix != nullptr &&
                 (strcmp(tn.suffix, "lora_a") == 0 || strcmp(tn.suffix, "lora_b") == 0)) {
@@ -1290,10 +1299,40 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
+        auto check_sinq_device = [&](ggml_backend_dev_t dev) {
+            if (!dev || (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU &&
+                         strcmp(ggml_backend_dev_name(dev), "CUDA0") != 0)) {
+                throw std::runtime_error(format(
+                    "SINQ tensor '%s' requires CUDA0 or explicit CPU placement; backend '%s' is unsupported (multi-GPU is not validated)",
+                    tn.str().c_str(), dev ? ggml_backend_dev_name(dev) : "unknown"));
+            }
+        };
         if (!buft) {
+            if (sinq_scale) {
+                check_sinq_device(buft_list->front().first);
+            }
             buft = select_weight_buft(hparams, t_meta, op, buft_list);
             if (!buft) {
                 throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
+            }
+        }
+
+        // Auxiliary vectors must not enter CPU weight-repack buffers.
+        if (sinq_scale) {
+            auto * dev = ggml_backend_buft_get_device(buft);
+            // The built-in CPU buffer and some CPU extra buffers deliberately
+            // have a null device. Resolve only buffers registered in the CPU list.
+            if (!dev) {
+                for (const auto & candidate : *buft_list_cpu) {
+                    if (candidate.second == buft && ggml_backend_dev_type(candidate.first) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                        dev = candidate.first;
+                        break;
+                    }
+                }
+            }
+            check_sinq_device(dev);
+            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                buft = ggml_backend_dev_buffer_type(dev);
             }
         }
 

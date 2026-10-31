@@ -2037,6 +2037,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("max number of chunks to process (default: %d, -1 = all)", params.n_chunks),
         [](common_params & params, int value) {
             params.n_chunks = value;
+            params.ppl_subset_option = true;
         }
     ).set_examples({LLAMA_EXAMPLE_IMATRIX, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_RETRIEVAL}));
     add_opt(common_arg({ "-fa", "--flash-attn" }, "[on|off|auto]",
@@ -2851,10 +2852,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
+        {"--ppl-full"},
+        "score all next-token predictions, resetting state every context (requires a logits file; no chunks or stride)",
+        [](common_params & params) {
+            params.ppl_full = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_PERPLEXITY}));
+    add_opt(common_arg(
+        {"--kld-token-output"}, "FILE",
+        "write ordered per-token TSV for --ppl-full",
+        [](common_params & params, const std::string & value) {
+            params.kld_token_output = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_PERPLEXITY}));
+    add_opt(common_arg(
         {"--ppl-stride"}, "N",
         string_format("stride for perplexity calculation (default: %d)", params.ppl_stride),
         [](common_params & params, int value) {
             params.ppl_stride = value;
+            params.ppl_subset_option = true;
         }
     ).set_examples({LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(

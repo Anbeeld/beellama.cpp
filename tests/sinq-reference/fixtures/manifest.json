@@ -1,0 +1,1731 @@
+{
+  "format_version": 1,
+  "oracle_revision": "42ca83edf8fe1afc48c40fca6acc973c5d2bb59f",
+  "source_sha256": {
+    "sinkhorn.py": "25423fbc588157432392f6b256f49715bebefce6f4c7824b8503dea99a65552a",
+    "dual_shift.py": "8f1518777b826971fe2595df662f9614a423993c35e4548b24adf26f69c6c551",
+    "optimize.py": "7879b8aff65ac721429fd3af6483444d9e2dbaa061a81d8d79b8c0ad6e2b3aa0",
+    "quantizer.py": "6eed9b75a9847076950cf2d9fa749b58f325e22524e82597f7058a432a94075e"
+  },
+  "environment": {
+    "torch": "2.6.0+cu124",
+    "numpy": "1.26.4",
+    "cuda_runtime": "12.4",
+    "device": "NVIDIA GeForce RTX 3090",
+    "CUDA_VISIBLE_DEVICES": "0"
+  },
+  "config": {
+    "bits": [
+      3,
+      4
+    ],
+    "groups": [
+      64,
+      128
+    ],
+    "seed": 20260519,
+    "input": "CUDA0 float16, then float32 for pre-cast oracle call",
+    "gate": "pinned optimize.kurtosis on whole half-rounded matrix, variance clamp 1e-6, non-Fisher, > 5 => rtn",
+    "normalization": "pinned sinkhorn_log(matrix, 16), unchanged defaults",
+    "post_cast": "S,Z,T: half().float(); Q unchanged",
+    "tile_adjustment": "forbidden"
+  },
+  "model_gap": null,
+  "fixtures": [
+    {
+      "name": "ordinary_g64_b3_default",
+      "shape": [
+        8,
+        64
+      ],
+      "group": 64,
+      "bits": 3,
+      "gate": "default",
+      "whole_matrix_kurtosis": 3.251873731613159,
+      "default_gate_fallback": false,
+      "fallback": false,
+      "method": "sinq",
+      "pre_fp16": {
+        "file": "ordinary_g64_b3_default.pre.bin",
+        "sha256": "3e034ab3c3748977d8c5a61b25cad7ec5c5872e26b80077d7e15005fef4b9148",
+        "bytes": 4444
+      },
+      "serialized_fp16": {
+        "file": "ordinary_g64_b3_default.bin",
+        "sha256": "96d8abc3323cf51cff3edb09bcf06cee8ba1899879ed81c89e37c8117557f301",
+        "bytes": 4444
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 0.14111328125,
+        "rmse": 0.05477043613791466,
+        "mean_abs": 0.04590504243969917
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 0.14111328125,
+        "rmse": 0.05476808175444603,
+        "mean_abs": 0.04590403288602829
+      },
+      "model_source": null
+    },
+    {
+      "name": "ordinary_g64_b4_default",
+      "shape": [
+        8,
+        64
+      ],
+      "group": 64,
+      "bits": 4,
+      "gate": "default",
+      "whole_matrix_kurtosis": 3.251873731613159,
+      "default_gate_fallback": false,
+      "fallback": false,
+      "method": "sinq",
+      "pre_fp16": {
+        "file": "ordinary_g64_b4_default.pre.bin",
+        "sha256": "a323ba04223265d6e62da9c28dc530da5b9529f44df7dabbf38f486b714bf7f3",
+        "bytes": 4444
+      },
+      "serialized_fp16": {
+        "file": "ordinary_g64_b4_default.bin",
+        "sha256": "1d100dadd4ff45b55d3f2473e5d68d09594e94605446ab327fb6b5c12f6288a9",
+        "bytes": 4444
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 0.06822457909584045,
+        "rmse": 0.025551866739988327,
+        "mean_abs": 0.02115626260638237
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 0.06818205118179321,
+        "rmse": 0.025545945391058922,
+        "mean_abs": 0.0211498886346817
+      },
+      "model_source": null
+    },
+    {
+      "name": "constant_g64_b3_default",
+      "shape": [
+        5,
+        64
+      ],
+      "group": 64,
+      "bits": 3,
+      "gate": "default",
+      "whole_matrix_kurtosis": 0.0,
+      "default_gate_fallback": false,
+      "fallback": false,
+      "method": "sinq",
+      "pre_fp16": {
+        "file": "constant_g64_b3_default.pre.bin",
+        "sha256": "e5bb947b1303e8a1f7b5b73edad7e4290d5039079cb3f215a39111482951ff20",
+        "bytes": 2884
+      },
+      "serialized_fp16": {
+        "file": "constant_g64_b3_default.bin",
+        "sha256": "32e239efdcfa72fcfa618b82aab9af6bd314f27530d8f8ff81970a7ccadf9a6d",
+        "bytes": 2884
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 4.857778549194336e-06,
+        "rmse": 4.857778549194336e-06,
+        "mean_abs": 4.857778549194336e-06
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 3.246217966079712e-05,
+        "rmse": 3.246217966079712e-05,
+        "mean_abs": 3.246217966079712e-05
+      },
+      "model_source": null
+    },
+    {
+      "name": "constant_g64_b4_default",
+      "shape": [
+        5,
+        64
+      ],
+      "group": 64,
+      "bits": 4,
+      "gate": "default",
+      "whole_matrix_kurtosis": 0.0,
+      "default_gate_fallback": false,
+      "fallback": false,
+      "method": "sinq",
+      "pre_fp16": {
+        "file": "constant_g64_b4_default.pre.bin",
+        "sha256": "1b6b175b99ca7b7b3f7473a5407335bc11cf9f8b1aaf8d1bf614f8b68d9c2d10",
+        "bytes": 2884
+      },
+      "serialized_fp16": {
+        "file": "constant_g64_b4_default.bin",
+        "sha256": "325f9de76435b57930e75aa255bced8cec84d9ebce8931679c2b9ada37d58c33",
+        "bytes": 2884
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 1.6093254089355469e-06,
+        "rmse": 1.6093254089355469e-06,
+        "mean_abs": 1.6093254089355469e-06
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 0.00013206899166107178,
+        "rmse": 0.00013206899166107178,
+        "mean_abs": 0.00013206899166107178
+      },
+      "model_source": null
+    },
+    {
+      "name": "near_zero_g64_b3_default",
+      "shape": [
+        5,
+        64
+      ],
+      "group": 64,
+      "bits": 3,
+      "gate": "default",
+      "whole_matrix_kurtosis": 3.927717955320986e-07,
+      "default_gate_fallback": false,
+      "fallback": false,
+      "method": "sinq",
+      "pre_fp16": {
+        "file": "near_zero_g64_b3_default.pre.bin",
+        "sha256": "b3060c2d216116f5742f16c4870c8d1234cc275b8931ab6ebe6c4b541515a9ee",
+        "bytes": 2884
+      },
+      "serialized_fp16": {
+        "file": "near_zero_g64_b3_default.bin",
+        "sha256": "b929d201a9af9595047c7a1e582b3f5fb2ebb6bd6c89c23bc5f61844c6407c13",
+        "bytes": 2884
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 7.133156941563357e-06,
+        "rmse": 4.155070655542659e-06,
+        "mean_abs": 3.563515292626107e-06
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 7.152557373046875e-06,
+        "rmse": 4.161802735325182e-06,
+        "mean_abs": 3.569759428501129e-06
+      },
+      "model_source": null
+    },
+    {
+      "name": "near_zero_g64_b4_default",
+      "shape": [
+        5,
+        64
+      ],
+      "group": 64,
+      "bits": 4,
+      "gate": "default",
+      "whole_matrix_kurtosis": 3.927717955320986e-07,
+      "default_gate_fallback": false,
+      "fallback": false,
+      "method": "sinq",
+      "pre_fp16": {
+        "file": "near_zero_g64_b4_default.pre.bin",
+        "sha256": "25ba1bc6624218a41d11b7aa68469540a0136e329f11fdd58f501aae2c5514b1",
+        "bytes": 2884
+      },
+      "serialized_fp16": {
+        "file": "near_zero_g64_b4_default.bin",
+        "sha256": "98647eda94f19c3d1b7d7b4821ea90e8441012047b65349f1e72985851109977",
+        "bytes": 2884
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 3.3288065424130764e-06,
+        "rmse": 1.822339527279837e-06,
+        "mean_abs": 1.5788700693519786e-06
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 3.337860107421875e-06,
+        "rmse": 1.8250273114972515e-06,
+        "mean_abs": 1.580454409122467e-06
+      },
+      "model_source": null
+    },
+    {
+      "name": "asymmetric_g64_b3_default",
+      "shape": [
+        7,
+        64
+      ],
+      "group": 64,
+      "bits": 3,
+      "gate": "default",
+      "whole_matrix_kurtosis": 2.0731563568115234,
+      "default_gate_fallback": false,
+      "fallback": false,
+      "method": "sinq",
+      "pre_fp16": {
+        "file": "asymmetric_g64_b3_default.pre.bin",
+        "sha256": "0bdc8e52d1e209b78f3925fdd1ae61d8ff97b4aa44f60deb136f03289bef1052",
+        "bytes": 3924
+      },
+      "serialized_fp16": {
+        "file": "asymmetric_g64_b3_default.bin",
+        "sha256": "44f6b2585b95350c6277ae91fb553448d2125fae122433406da6e87b4488c2ac",
+        "bytes": 3924
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 0.06816297769546509,
+        "rmse": 0.030283866450190544,
+        "mean_abs": 0.025403784587979317
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 0.06843793392181396,
+        "rmse": 0.03028661385178566,
+        "mean_abs": 0.02540779672563076
+      },
+      "model_source": null
+    },
+    {
+      "name": "asymmetric_g64_b4_default",
+      "shape": [
+        7,
+        64
+      ],
+      "group": 64,
+      "bits": 4,
+      "gate": "default",
+      "whole_matrix_kurtosis": 2.0731563568115234,
+      "default_gate_fallback": false,
+      "fallback": false,
+      "method": "sinq",
+      "pre_fp16": {
+        "file": "asymmetric_g64_b4_default.pre.bin",
+        "sha256": "fa281daf960734698ae2bec8531562cdfa2d1774354731cede8ce306ca104689",
+        "bytes": 3924
+      },
+      "serialized_fp16": {
+        "file": "asymmetric_g64_b4_default.bin",
+        "sha256": "59ee5cd7767b36225955e13576713e22b37b38d6e6fc08512cb4fed4e940764c",
+        "bytes": 3924
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 0.03728377819061279,
+        "rmse": 0.014164989814162254,
+        "mean_abs": 0.0117448465898633
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 0.03729248046875,
+        "rmse": 0.014174488373100758,
+        "mean_abs": 0.011754619888961315
+      },
+      "model_source": null
+    },
+    {
+      "name": "outlier_g64_b3_default",
+      "shape": [
+        5,
+        128
+      ],
+      "group": 64,
+      "bits": 3,
+      "gate": "default",
+      "whole_matrix_kurtosis": 433.92694091796875,
+      "default_gate_fallback": true,
+      "fallback": true,
+      "method": "rtn",
+      "pre_fp16": {
+        "file": "outlier_g64_b3_default.pre.bin",
+        "sha256": "939c7158c010e82f2a552861fc84d399b84d89d1e9a0a3efbb6d68c77c7dd568",
+        "bytes": 5740
+      },
+      "serialized_fp16": {
+        "file": "outlier_g64_b3_default.bin",
+        "sha256": "1d27bc420f8286bb56b6a563346ded3ca6efdb7ee4c4b4f64ad9950e043ff90d",
+        "bytes": 5740
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 0.0767822265625,
+        "rmse": 0.014095370657742023,
+        "mean_abs": 0.00852949544787407
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 0.0767822265625,
+        "rmse": 0.014009755104780197,
+        "mean_abs": 0.008509795181453228
+      },
+      "model_source": null
+    },
+    {
+      "name": "outlier_g64_b3_ungated",
+      "shape": [
+        5,
+        128
+      ],
+      "group": 64,
+      "bits": 3,
+      "gate": "ungated",
+      "whole_matrix_kurtosis": 433.92694091796875,
+      "default_gate_fallback": true,
+      "fallback": false,
+      "method": "sinq",
+      "pre_fp16": {
+        "file": "outlier_g64_b3_ungated.pre.bin",
+        "sha256": "d90433819b704bb395aac53b7f8fa551d8b8e8da5acf49ffdda2bbfc06278dec",
+        "bytes": 5740
+      },
+      "serialized_fp16": {
+        "file": "outlier_g64_b3_ungated.bin",
+        "sha256": "c8cca6d1cf9016440df2f4150d16bd214beb1580ca0b70523c9ecd7defe91aaf",
+        "bytes": 5740
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 1.7454109191894531,
+        "rmse": 0.07687699794769287,
+        "mean_abs": 0.010293714702129364
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 1.7374420166015625,
+        "rmse": 0.07669639587402344,
+        "mean_abs": 0.010290436446666718
+      },
+      "model_source": null
+    },
+    {
+      "name": "outlier_g64_b4_default",
+      "shape": [
+        5,
+        128
+      ],
+      "group": 64,
+      "bits": 4,
+      "gate": "default",
+      "whole_matrix_kurtosis": 433.92694091796875,
+      "default_gate_fallback": true,
+      "fallback": true,
+      "method": "rtn",
+      "pre_fp16": {
+        "file": "outlier_g64_b4_default.pre.bin",
+        "sha256": "ef790715640e33b93c2071f1cec5820eb56863d5746fe5117fbfab1f0213425a",
+        "bytes": 5740
+      },
+      "serialized_fp16": {
+        "file": "outlier_g64_b4_default.bin",
+        "sha256": "c76fa952f5dbbd9438186a86d0d5c55cc7cb57ecc238537b62343734199b7496",
+        "bytes": 5740
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 0.0767822265625,
+        "rmse": 0.013356061652302742,
+        "mean_abs": 0.006434259004890919
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 0.0767822265625,
+        "rmse": 0.013371442444622517,
+        "mean_abs": 0.006436727941036224
+      },
+      "model_source": null
+    },
+    {
+      "name": "outlier_g64_b4_ungated",
+      "shape": [
+        5,
+        128
+      ],
+      "group": 64,
+      "bits": 4,
+      "gate": "ungated",
+      "whole_matrix_kurtosis": 433.92694091796875,
+      "default_gate_fallback": true,
+      "fallback": false,
+      "method": "sinq",
+      "pre_fp16": {
+        "file": "outlier_g64_b4_ungated.pre.bin",
+        "sha256": "8a3055473385999f8771d2cf6c74122a02e9bb0f6c3a9e8dedef39b8d4fdfd75",
+        "bytes": 5740
+      },
+      "serialized_fp16": {
+        "file": "outlier_g64_b4_ungated.bin",
+        "sha256": "fce49f4b5739b4ad993a4d4f24b74140a729a6f0cb1922d23bd11e8168461453",
+        "bytes": 5740
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 0.4470834732055664,
+        "rmse": 0.023479314520955086,
+        "mean_abs": 0.004103700630366802
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 0.45059871673583984,
+        "rmse": 0.023557649925351143,
+        "mean_abs": 0.004107690881937742
+      },
+      "model_source": null
+    },
+    {
+      "name": "non_power_rows_g64_b3_default",
+      "shape": [
+        3,
+        64
+      ],
+      "group": 64,
+      "bits": 3,
+      "gate": "default",
+      "whole_matrix_kurtosis": 3.112680673599243,
+      "default_gate_fallback": false,
+      "fallback": false,
+      "method": "sinq",
+      "pre_fp16": {
+        "file": "non_power_rows_g64_b3_default.pre.bin",
+        "sha256": "6c547a373de68d584d1c166ec24c2420da97d59c00a2e04e9666df38785b3a14",
+        "bytes": 1844
+      },
+      "serialized_fp16": {
+        "file": "non_power_rows_g64_b3_default.bin",
+        "sha256": "3bedada93bd222db23194c52d1c7134f70837629fcc5b51a195c5e6e347f55e5",
+        "bytes": 1844
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 0.17917421460151672,
+        "rmse": 0.05634831637144089,
+        "mean_abs": 0.04495520517230034
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 0.17919468879699707,
+        "rmse": 0.05634218454360962,
+        "mean_abs": 0.044947050511837006
+      },
+      "model_source": null
+    },
+    {
+      "name": "non_power_rows_g64_b4_default",
+      "shape": [
+        3,
+        64
+      ],
+      "group": 64,
+      "bits": 4,
+      "gate": "default",
+      "whole_matrix_kurtosis": 3.112680673599243,
+      "default_gate_fallback": false,
+      "fallback": false,
+      "method": "sinq",
+      "pre_fp16": {
+        "file": "non_power_rows_g64_b4_default.pre.bin",
+        "sha256": "a414af22f32b03ffb30076f15f5548a3fe5860f58080359ff97efe2fcc6316a1",
+        "bytes": 1844
+      },
+      "serialized_fp16": {
+        "file": "non_power_rows_g64_b4_default.bin",
+        "sha256": "441272289ccb911df44061d25f10977995c63ab0e2d4f5b280723211d4961572",
+        "bytes": 1844
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 0.07825571298599243,
+        "rmse": 0.02590886503458023,
+        "mean_abs": 0.02027757279574871
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 0.07842445373535156,
+        "rmse": 0.02591441385447979,
+        "mean_abs": 0.020279893651604652
+      },
+      "model_source": null
+    },
+    {
+      "name": "multi_group_g64_b3_default",
+      "shape": [
+        7,
+        192
+      ],
+      "group": 64,
+      "bits": 3,
+      "gate": "default",
+      "whole_matrix_kurtosis": 8.748223304748535,
+      "default_gate_fallback": true,
+      "fallback": true,
+      "method": "rtn",
+      "pre_fp16": {
+        "file": "multi_group_g64_b3_default.pre.bin",
+        "sha256": "610bf008d3d720ab7fe511c9086ff9d0b99b52209ebbeeeec9741ffbac861281",
+        "bytes": 11716
+      },
+      "serialized_fp16": {
+        "file": "multi_group_g64_b3_default.bin",
+        "sha256": "ecd5f981e55c4ac7670f5faec81f8e40cbaf22841db8ead7775a6d4656cad692",
+        "bytes": 11716
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 0.3705357313156128,
+        "rmse": 0.09170249104499817,
+        "mean_abs": 0.06541065871715546
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 0.3701171875,
+        "rmse": 0.09169269353151321,
+        "mean_abs": 0.06540445238351822
+      },
+      "model_source": null
+    },
+    {
+      "name": "multi_group_g64_b3_ungated",
+      "shape": [
+        7,
+        192
+      ],
+      "group": 64,
+      "bits": 3,
+      "gate": "ungated",
+      "whole_matrix_kurtosis": 8.748223304748535,
+      "default_gate_fallback": true,
+      "fallback": false,
+      "method": "sinq",
+      "pre_fp16": {
+        "file": "multi_group_g64_b3_ungated.pre.bin",
+        "sha256": "8f565a9eed8dfced9aeb7c10b7e02cd180898f8709ae62892dad876ac1456541",
+        "bytes": 11716
+      },
+      "serialized_fp16": {
+        "file": "multi_group_g64_b3_ungated.bin",
+        "sha256": "4403855377fe29db579739cf3538a331ac2a4beb477e53335005c5cc5779e9d3",
+        "bytes": 11716
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 0.4836459159851074,
+        "rmse": 0.0857381522655487,
+        "mean_abs": 0.05956259369850159
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 0.4844341278076172,
+        "rmse": 0.08572432398796082,
+        "mean_abs": 0.05955434963107109
+      },
+      "model_source": null
+    },
+    {
+      "name": "multi_group_g64_b4_default",
+      "shape": [
+        7,
+        192
+      ],
+      "group": 64,
+      "bits": 4,
+      "gate": "default",
+      "whole_matrix_kurtosis": 8.748223304748535,
+      "default_gate_fallback": true,
+      "fallback": true,
+      "method": "rtn",
+      "pre_fp16": {
+        "file": "multi_group_g64_b4_default.pre.bin",
+        "sha256": "c785e2b1a0cc339dd34b681c8becd8314cdfae22ba53a931fba021266270e893",
+        "bytes": 11716
+      },
+      "serialized_fp16": {
+        "file": "multi_group_g64_b4_default.bin",
+        "sha256": "821fe2696001fcdbb60eb8d94b19837c612fd98e5d00b36af2029709e2b503c1",
+        "bytes": 11716
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 0.17304682731628418,
+        "rmse": 0.04078850522637367,
+        "mean_abs": 0.02931707538664341
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 0.1728515625,
+        "rmse": 0.04079081490635872,
+        "mean_abs": 0.029316304251551628
+      },
+      "model_source": null
+    },
+    {
+      "name": "multi_group_g64_b4_ungated",
+      "shape": [
+        7,
+        192
+      ],
+      "group": 64,
+      "bits": 4,
+      "gate": "ungated",
+      "whole_matrix_kurtosis": 8.748223304748535,
+      "default_gate_fallback": true,
+      "fallback": false,
+      "method": "sinq",
+      "pre_fp16": {
+        "file": "multi_group_g64_b4_ungated.pre.bin",
+        "sha256": "edd2a651e81cb380e19820ef550cde77740e5f390608cb5134bb12ae021f5741",
+        "bytes": 11716
+      },
+      "serialized_fp16": {
+        "file": "multi_group_g64_b4_ungated.bin",
+        "sha256": "0ee48e2bde69938b059fd0d6feb2a73e3129b985305c90363ee876b420a708a7",
+        "bytes": 11716
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 0.24669933319091797,
+        "rmse": 0.04013863578438759,
+        "mean_abs": 0.027466649189591408
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 0.24621963500976562,
+        "rmse": 0.04013274237513542,
+        "mean_abs": 0.027464881539344788
+      },
+      "model_source": null
+    },
+    {
+      "name": "qwen35_self_attn_q_proj_g64_b3_default",
+      "shape": [
+        7,
+        256
+      ],
+      "group": 64,
+      "bits": 3,
+      "gate": "default",
+      "whole_matrix_kurtosis": 3.392771005630493,
+      "default_gate_fallback": false,
+      "fallback": false,
+      "method": "sinq",
+      "pre_fp16": {
+        "file": "qwen35_self_attn_q_proj_g64_b3_default.pre.bin",
+        "sha256": "bbaa4526adb8fbedd84e19fe5e4cfbfe3fbeb798bf6870ca1279cb98de94bfc3",
+        "bytes": 15612
+      },
+      "serialized_fp16": {
+        "file": "qwen35_self_attn_q_proj_g64_b3_default.bin",
+        "sha256": "be5da7763acebc51c37418dba6b071c7a935b565bdfefa1fa4a489af09a5a913",
+        "bytes": 15612
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 0.012097187340259552,
+        "rmse": 0.0032166645396500826,
+        "mean_abs": 0.002594500547274947
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 0.012100502848625183,
+        "rmse": 0.003216540440917015,
+        "mean_abs": 0.002594429301097989
+      },
+      "model_source": {
+        "tensor": "mtp.layers.0.self_attn.q_proj.weight",
+        "shard": "model.safetensors-00003-of-00004.safetensors",
+        "slice": [
+          0,
+          7,
+          0,
+          256
+        ],
+        "source_shape": [
+          8192,
+          4096
+        ],
+        "slice_fp32_sha256": "e5ccea2f42d85a5e6db87c1de0c42caccf9dcaa2b9828b49b58b953bda6685da"
+      }
+    },
+    {
+      "name": "qwen35_self_attn_q_proj_g64_b4_default",
+      "shape": [
+        7,
+        256
+      ],
+      "group": 64,
+      "bits": 4,
+      "gate": "default",
+      "whole_matrix_kurtosis": 3.392771005630493,
+      "default_gate_fallback": false,
+      "fallback": false,
+      "method": "sinq",
+      "pre_fp16": {
+        "file": "qwen35_self_attn_q_proj_g64_b4_default.pre.bin",
+        "sha256": "8846948146bd7f51941790e86492d468476bc5df82563cec8d6caa4095a69516",
+        "bytes": 15612
+      },
+      "serialized_fp16": {
+        "file": "qwen35_self_attn_q_proj_g64_b4_default.bin",
+        "sha256": "71751d2d56490f93d4c66f44502a575c932dace2568d9721c62a86caedd06ad2",
+        "bytes": 15612
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 0.005513477139174938,
+        "rmse": 0.001502609346061945,
+        "mean_abs": 0.0012228167615830898
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 0.005514279007911682,
+        "rmse": 0.001502907951362431,
+        "mean_abs": 0.0012230451684445143
+      },
+      "model_source": {
+        "tensor": "mtp.layers.0.self_attn.q_proj.weight",
+        "shard": "model.safetensors-00003-of-00004.safetensors",
+        "slice": [
+          0,
+          7,
+          0,
+          256
+        ],
+        "source_shape": [
+          8192,
+          4096
+        ],
+        "slice_fp32_sha256": "e5ccea2f42d85a5e6db87c1de0c42caccf9dcaa2b9828b49b58b953bda6685da"
+      }
+    },
+    {
+      "name": "qwen35_mlp_down_proj_g64_b3_default",
+      "shape": [
+        7,
+        256
+      ],
+      "group": 64,
+      "bits": 3,
+      "gate": "default",
+      "whole_matrix_kurtosis": 4.524226188659668,
+      "default_gate_fallback": false,
+      "fallback": false,
+      "method": "sinq",
+      "pre_fp16": {
+        "file": "qwen35_mlp_down_proj_g64_b3_default.pre.bin",
+        "sha256": "cfeae9fa55db36ca15189e2aeb0b300eb535260374693c1907fdeb4856f555e7",
+        "bytes": 15612
+      },
+      "serialized_fp16": {
+        "file": "qwen35_mlp_down_proj_g64_b3_default.bin",
+        "sha256": "f06312a6a6bc7a179d4fe92c9685bd9fa0b7ecf7a7781c683d759a798ba555d8",
+        "bytes": 15612
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 0.01287841796875,
+        "rmse": 0.002355995588004589,
+        "mean_abs": 0.001835943665355444
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 0.01287841796875,
+        "rmse": 0.002356230979785323,
+        "mean_abs": 0.0018361100228503346
+      },
+      "model_source": {
+        "tensor": "mtp.layers.0.mlp.down_proj.weight",
+        "shard": "model.safetensors-00002-of-00004.safetensors",
+        "slice": [
+          0,
+          7,
+          0,
+          256
+        ],
+        "source_shape": [
+          4096,
+          12288
+        ],
+        "slice_fp32_sha256": "043058c00e5608f4ec6ab8c4f08f2ef85580969d92bcf87e0b67747717013a3c"
+      }
+    },
+    {
+      "name": "qwen35_mlp_down_proj_g64_b4_default",
+      "shape": [
+        7,
+        256
+      ],
+      "group": 64,
+      "bits": 4,
+      "gate": "default",
+      "whole_matrix_kurtosis": 4.524226188659668,
+      "default_gate_fallback": false,
+      "fallback": false,
+      "method": "sinq",
+      "pre_fp16": {
+        "file": "qwen35_mlp_down_proj_g64_b4_default.pre.bin",
+        "sha256": "00eb79cb77086b738047944b15df6101899dc549f00c878be78281719e66a891",
+        "bytes": 15612
+      },
+      "serialized_fp16": {
+        "file": "qwen35_mlp_down_proj_g64_b4_default.bin",
+        "sha256": "c69283c6c595f17c40849e893f1ebadf62003d5e6e0d4c0142f74a27d6532cd9",
+        "bytes": 15612
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 0.005008993670344353,
+        "rmse": 0.001088914810679853,
+        "mean_abs": 0.0008575787651352584
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 0.005009405314922333,
+        "rmse": 0.0010889555560424924,
+        "mean_abs": 0.0008576393593102694
+      },
+      "model_source": {
+        "tensor": "mtp.layers.0.mlp.down_proj.weight",
+        "shard": "model.safetensors-00002-of-00004.safetensors",
+        "slice": [
+          0,
+          7,
+          0,
+          256
+        ],
+        "source_shape": [
+          4096,
+          12288
+        ],
+        "slice_fp32_sha256": "043058c00e5608f4ec6ab8c4f08f2ef85580969d92bcf87e0b67747717013a3c"
+      }
+    },
+    {
+      "name": "ordinary_g128_b3_default",
+      "shape": [
+        8,
+        128
+      ],
+      "group": 128,
+      "bits": 3,
+      "gate": "default",
+      "whole_matrix_kurtosis": 3.0735371112823486,
+      "default_gate_fallback": false,
+      "fallback": false,
+      "method": "sinq",
+      "pre_fp16": {
+        "file": "ordinary_g128_b3_default.pre.bin",
+        "sha256": "0b2ecfaecf47c66da363665a4f6789886200f6446cd5fbf9c109be7eab5c4dc5",
+        "bytes": 8796
+      },
+      "serialized_fp16": {
+        "file": "ordinary_g128_b3_default.bin",
+        "sha256": "9e1df415591ae5967fd0b49c94a79e6bd52b4f586610dc2459dd08b219a23e0b",
+        "bytes": 8796
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 0.170911967754364,
+        "rmse": 0.05694934353232384,
+        "mean_abs": 0.046712134033441544
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 0.17096614837646484,
+        "rmse": 0.056959763169288635,
+        "mean_abs": 0.04671744257211685
+      },
+      "model_source": null
+    },
+    {
+      "name": "ordinary_g128_b4_default",
+      "shape": [
+        8,
+        128
+      ],
+      "group": 128,
+      "bits": 4,
+      "gate": "default",
+      "whole_matrix_kurtosis": 3.0735371112823486,
+      "default_gate_fallback": false,
+      "fallback": false,
+      "method": "sinq",
+      "pre_fp16": {
+        "file": "ordinary_g128_b4_default.pre.bin",
+        "sha256": "b2aca29cb807b1543fcdfd923ee52b9e29336d0d41839912d8e66f2fbbaaf1fb",
+        "bytes": 8796
+      },
+      "serialized_fp16": {
+        "file": "ordinary_g128_b4_default.bin",
+        "sha256": "5b56afbf1c9b4b73f3c348ced6842ddc878754fc391f58b2b04a9c5414d54e12",
+        "bytes": 8796
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 0.07791531085968018,
+        "rmse": 0.02789192646741867,
+        "mean_abs": 0.023327279835939407
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 0.07780879735946655,
+        "rmse": 0.02789105288684368,
+        "mean_abs": 0.023326953873038292
+      },
+      "model_source": null
+    },
+    {
+      "name": "constant_g128_b3_default",
+      "shape": [
+        5,
+        128
+      ],
+      "group": 128,
+      "bits": 3,
+      "gate": "default",
+      "whole_matrix_kurtosis": 0.0,
+      "default_gate_fallback": false,
+      "fallback": false,
+      "method": "sinq",
+      "pre_fp16": {
+        "file": "constant_g128_b3_default.pre.bin",
+        "sha256": "6d7aca6060acf1e0115f5a92be6e98173415eaa09e4582b12dd6740a07e1e2e1",
+        "bytes": 5700
+      },
+      "serialized_fp16": {
+        "file": "constant_g128_b3_default.bin",
+        "sha256": "a8622f328cd690eb16bb439b41eaeb14553c381a42c2f00d5c661e6d583d7f89",
+        "bytes": 5700
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 4.857778549194336e-06,
+        "rmse": 4.857778549194336e-06,
+        "mean_abs": 4.857778549194336e-06
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 3.246217966079712e-05,
+        "rmse": 3.246217966079712e-05,
+        "mean_abs": 3.246217966079712e-05
+      },
+      "model_source": null
+    },
+    {
+      "name": "constant_g128_b4_default",
+      "shape": [
+        5,
+        128
+      ],
+      "group": 128,
+      "bits": 4,
+      "gate": "default",
+      "whole_matrix_kurtosis": 0.0,
+      "default_gate_fallback": false,
+      "fallback": false,
+      "method": "sinq",
+      "pre_fp16": {
+        "file": "constant_g128_b4_default.pre.bin",
+        "sha256": "470b2cba6ebf9881a2d4d29006da39af40dbac5021ef1ee24e12d37c3fa7db65",
+        "bytes": 5700
+      },
+      "serialized_fp16": {
+        "file": "constant_g128_b4_default.bin",
+        "sha256": "a7f12a12067bd4a4d84d2b063458e8821dae6b59091a3a7c26ce512d367921aa",
+        "bytes": 5700
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 1.6093254089355469e-06,
+        "rmse": 1.6093254089355469e-06,
+        "mean_abs": 1.6093254089355469e-06
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 0.00013206899166107178,
+        "rmse": 0.00013206899166107178,
+        "mean_abs": 0.00013206899166107178
+      },
+      "model_source": null
+    },
+    {
+      "name": "near_zero_g128_b3_default",
+      "shape": [
+        5,
+        128
+      ],
+      "group": 128,
+      "bits": 3,
+      "gate": "default",
+      "whole_matrix_kurtosis": 4.3175165842512797e-07,
+      "default_gate_fallback": false,
+      "fallback": false,
+      "method": "sinq",
+      "pre_fp16": {
+        "file": "near_zero_g128_b3_default.pre.bin",
+        "sha256": "afc3394b9ab63dec9cdc41f4e3bcf67d99d60d221e45323dd1c5ec9c22081180",
+        "bytes": 5700
+      },
+      "serialized_fp16": {
+        "file": "near_zero_g128_b3_default.bin",
+        "sha256": "414bc6b85e6f13ac76a822dde577033063d360c6719fa507a3d6e2e1b4b67ad4",
+        "bytes": 5700
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 7.68899917602539e-06,
+        "rmse": 4.147577783442102e-06,
+        "mean_abs": 3.5977843708678847e-06
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 7.68899917602539e-06,
+        "rmse": 4.1434677768847905e-06,
+        "mean_abs": 3.594468580558896e-06
+      },
+      "model_source": null
+    },
+    {
+      "name": "near_zero_g128_b4_default",
+      "shape": [
+        5,
+        128
+      ],
+      "group": 128,
+      "bits": 4,
+      "gate": "default",
+      "whole_matrix_kurtosis": 4.3175165842512797e-07,
+      "default_gate_fallback": false,
+      "fallback": false,
+      "method": "sinq",
+      "pre_fp16": {
+        "file": "near_zero_g128_b4_default.pre.bin",
+        "sha256": "375d69aad41a12fc754a31bf935da1c2781f471987f78229e10fb3618939655f",
+        "bytes": 5700
+      },
+      "serialized_fp16": {
+        "file": "near_zero_g128_b4_default.bin",
+        "sha256": "bec11e7cfb0a657e95a607366a65854e392c18d0ab573b7e57d61418355ff623",
+        "bytes": 5700
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 3.6279361665947363e-06,
+        "rmse": 1.987188397833961e-06,
+        "mean_abs": 1.7283206261708983e-06
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 3.628781996667385e-06,
+        "rmse": 1.9907627120119287e-06,
+        "mean_abs": 1.7313808484686888e-06
+      },
+      "model_source": null
+    },
+    {
+      "name": "asymmetric_g128_b3_default",
+      "shape": [
+        7,
+        128
+      ],
+      "group": 128,
+      "bits": 3,
+      "gate": "default",
+      "whole_matrix_kurtosis": 2.573169708251953,
+      "default_gate_fallback": false,
+      "fallback": false,
+      "method": "sinq",
+      "pre_fp16": {
+        "file": "asymmetric_g128_b3_default.pre.bin",
+        "sha256": "e73514187f850ba1f0b424c0578e2cadc57723bcd8f9fdad4190054b9722fb08",
+        "bytes": 7764
+      },
+      "serialized_fp16": {
+        "file": "asymmetric_g128_b3_default.bin",
+        "sha256": "26a682d97b64069d1c28cf4fae7510052282eebe677a3bd1383eb7419456fd67",
+        "bytes": 7764
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 0.0896875262260437,
+        "rmse": 0.031041136011481285,
+        "mean_abs": 0.02608506754040718
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 0.08977127075195312,
+        "rmse": 0.03104391135275364,
+        "mean_abs": 0.026088690385222435
+      },
+      "model_source": null
+    },
+    {
+      "name": "asymmetric_g128_b4_default",
+      "shape": [
+        7,
+        128
+      ],
+      "group": 128,
+      "bits": 4,
+      "gate": "default",
+      "whole_matrix_kurtosis": 2.573169708251953,
+      "default_gate_fallback": false,
+      "fallback": false,
+      "method": "sinq",
+      "pre_fp16": {
+        "file": "asymmetric_g128_b4_default.pre.bin",
+        "sha256": "97dee2ffbb36f8de8ac2461f0d3b79249008968706ddb4f3d088f18f082890a9",
+        "bytes": 7764
+      },
+      "serialized_fp16": {
+        "file": "asymmetric_g128_b4_default.bin",
+        "sha256": "180da59a9e006e45911c034c5a14bd3dd7b8193fed212c892a50dce2b42342b2",
+        "bytes": 7764
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 0.039990901947021484,
+        "rmse": 0.014449037611484528,
+        "mean_abs": 0.011997225694358349
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 0.039875030517578125,
+        "rmse": 0.014451468363404274,
+        "mean_abs": 0.01199901569634676
+      },
+      "model_source": null
+    },
+    {
+      "name": "outlier_g128_b3_default",
+      "shape": [
+        5,
+        256
+      ],
+      "group": 128,
+      "bits": 3,
+      "gate": "default",
+      "whole_matrix_kurtosis": 867.8225708007812,
+      "default_gate_fallback": true,
+      "fallback": true,
+      "method": "rtn",
+      "pre_fp16": {
+        "file": "outlier_g128_b3_default.pre.bin",
+        "sha256": "a1cb356b23718298031367262da3117f8f1dec263cddaae1c7b73d459fcdbd9b",
+        "bytes": 11372
+      },
+      "serialized_fp16": {
+        "file": "outlier_g128_b3_default.bin",
+        "sha256": "c887607f5065c98365603f8285c5ffc060978324e6792830c2053cc9184d59d4",
+        "bytes": 11372
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 0.09210205078125,
+        "rmse": 0.014874625019729137,
+        "mean_abs": 0.009067736566066742
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 0.09375,
+        "rmse": 0.014895785599946976,
+        "mean_abs": 0.009071451611816883
+      },
+      "model_source": null
+    },
+    {
+      "name": "outlier_g128_b3_ungated",
+      "shape": [
+        5,
+        256
+      ],
+      "group": 128,
+      "bits": 3,
+      "gate": "ungated",
+      "whole_matrix_kurtosis": 867.8225708007812,
+      "default_gate_fallback": true,
+      "fallback": false,
+      "method": "sinq",
+      "pre_fp16": {
+        "file": "outlier_g128_b3_ungated.pre.bin",
+        "sha256": "506408c688a39aeb3ad8830c24a15dce33814bffd921fc4f62c75e6bfd2b5890",
+        "bytes": 11372
+      },
+      "serialized_fp16": {
+        "file": "outlier_g128_b3_ungated.bin",
+        "sha256": "3fa315e641d98b3aa2c915b0e806996c64803ef9dabd74039585500ac93b5e77",
+        "bytes": 11372
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 1.341827392578125,
+        "rmse": 0.04188898950815201,
+        "mean_abs": 0.007763853762298822
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 1.3387870788574219,
+        "rmse": 0.04186920449137688,
+        "mean_abs": 0.007766443770378828
+      },
+      "model_source": null
+    },
+    {
+      "name": "outlier_g128_b4_default",
+      "shape": [
+        5,
+        256
+      ],
+      "group": 128,
+      "bits": 4,
+      "gate": "default",
+      "whole_matrix_kurtosis": 867.8225708007812,
+      "default_gate_fallback": true,
+      "fallback": true,
+      "method": "rtn",
+      "pre_fp16": {
+        "file": "outlier_g128_b4_default.pre.bin",
+        "sha256": "8ef450fb0c99b48a9081ce69c8869457d25e1c127652cb553ec6dbf4a85fee59",
+        "bytes": 11372
+      },
+      "serialized_fp16": {
+        "file": "outlier_g128_b4_default.bin",
+        "sha256": "4d12306572062e771337522be6445d4bab0d19e051a3462c710ea7924023d9d0",
+        "bytes": 11372
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 0.09210205078125,
+        "rmse": 0.014054507948458195,
+        "mean_abs": 0.006888565607368946
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 0.09210205078125,
+        "rmse": 0.014092221856117249,
+        "mean_abs": 0.006895244121551514
+      },
+      "model_source": null
+    },
+    {
+      "name": "outlier_g128_b4_ungated",
+      "shape": [
+        5,
+        256
+      ],
+      "group": 128,
+      "bits": 4,
+      "gate": "ungated",
+      "whole_matrix_kurtosis": 867.8225708007812,
+      "default_gate_fallback": true,
+      "fallback": false,
+      "method": "sinq",
+      "pre_fp16": {
+        "file": "outlier_g128_b4_ungated.pre.bin",
+        "sha256": "541f388928f440320bc61f352b365e92ffb74bff001ccd3549489a7893fdbce1",
+        "bytes": 11372
+      },
+      "serialized_fp16": {
+        "file": "outlier_g128_b4_ungated.bin",
+        "sha256": "e914dc179c4849041308f99c3ede712657524c12e464b68efdf5007a24db6072",
+        "bytes": 11372
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 0.92059326171875,
+        "rmse": 0.027163241058588028,
+        "mean_abs": 0.004162805620580912
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 0.92578125,
+        "rmse": 0.027284400537610054,
+        "mean_abs": 0.004164830781519413
+      },
+      "model_source": null
+    },
+    {
+      "name": "non_power_rows_g128_b3_default",
+      "shape": [
+        3,
+        128
+      ],
+      "group": 128,
+      "bits": 3,
+      "gate": "default",
+      "whole_matrix_kurtosis": 3.0532066822052,
+      "default_gate_fallback": false,
+      "fallback": false,
+      "method": "sinq",
+      "pre_fp16": {
+        "file": "non_power_rows_g128_b3_default.pre.bin",
+        "sha256": "d148b6a0c48ad597c5a1dd0a5ee486077574cf11d5095e200042608714135de2",
+        "bytes": 3636
+      },
+      "serialized_fp16": {
+        "file": "non_power_rows_g128_b3_default.bin",
+        "sha256": "e34710eae01a698d916660456a55b0955c43ba710e25690ac74b451a6f77a0a8",
+        "bytes": 3636
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 0.2158203125,
+        "rmse": 0.061195794492959976,
+        "mean_abs": 0.049461524933576584
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 0.2158203125,
+        "rmse": 0.061199355870485306,
+        "mean_abs": 0.04946570098400116
+      },
+      "model_source": null
+    },
+    {
+      "name": "non_power_rows_g128_b4_default",
+      "shape": [
+        3,
+        128
+      ],
+      "group": 128,
+      "bits": 4,
+      "gate": "default",
+      "whole_matrix_kurtosis": 3.0532066822052,
+      "default_gate_fallback": false,
+      "fallback": false,
+      "method": "sinq",
+      "pre_fp16": {
+        "file": "non_power_rows_g128_b4_default.pre.bin",
+        "sha256": "4803958f27dfbb2b76a22b7a02f2c00407c8857a4d596d5f8267a5f555a6bdfd",
+        "bytes": 3636
+      },
+      "serialized_fp16": {
+        "file": "non_power_rows_g128_b4_default.bin",
+        "sha256": "251bd06d9ee51ffc3309ffcc0326fb4d7bac9f7c7f7249e5dcdee70ac4bf7a2a",
+        "bytes": 3636
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 0.10679838061332703,
+        "rmse": 0.02857213467359543,
+        "mean_abs": 0.022918999195098877
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 0.106719970703125,
+        "rmse": 0.02857799455523491,
+        "mean_abs": 0.02292327582836151
+      },
+      "model_source": null
+    },
+    {
+      "name": "multi_group_g128_b3_default",
+      "shape": [
+        7,
+        384
+      ],
+      "group": 128,
+      "bits": 3,
+      "gate": "default",
+      "whole_matrix_kurtosis": 8.767374038696289,
+      "default_gate_fallback": true,
+      "fallback": true,
+      "method": "rtn",
+      "pre_fp16": {
+        "file": "multi_group_g128_b3_default.pre.bin",
+        "sha256": "24309310c2c82a73d72a250b74a7e72ebde8d0878fb54e2601aea548f2b858fe",
+        "bytes": 23236
+      },
+      "serialized_fp16": {
+        "file": "multi_group_g128_b3_default.bin",
+        "sha256": "57d7b5b098df1c2496646c73e857dbddc37204fbceb0876a3d51f0bfbb46e951",
+        "bytes": 23236
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 0.44287109375,
+        "rmse": 0.09759056568145752,
+        "mean_abs": 0.07002946734428406
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 0.44287109375,
+        "rmse": 0.09759785979986191,
+        "mean_abs": 0.07003381103277206
+      },
+      "model_source": null
+    },
+    {
+      "name": "multi_group_g128_b3_ungated",
+      "shape": [
+        7,
+        384
+      ],
+      "group": 128,
+      "bits": 3,
+      "gate": "ungated",
+      "whole_matrix_kurtosis": 8.767374038696289,
+      "default_gate_fallback": true,
+      "fallback": false,
+      "method": "sinq",
+      "pre_fp16": {
+        "file": "multi_group_g128_b3_ungated.pre.bin",
+        "sha256": "609519d3fb77e98f71333455279453e714497cb33a4403a1684e752625495472",
+        "bytes": 23236
+      },
+      "serialized_fp16": {
+        "file": "multi_group_g128_b3_ungated.bin",
+        "sha256": "fa6132a31efcd9b929bf54e77a70c48c330ec07d926a7dd1c7c9848f7253d0df",
+        "bytes": 23236
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 0.449951171875,
+        "rmse": 0.09293056279420853,
+        "mean_abs": 0.06412215530872345
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 0.449951171875,
+        "rmse": 0.0929267629981041,
+        "mean_abs": 0.06411848962306976
+      },
+      "model_source": null
+    },
+    {
+      "name": "multi_group_g128_b4_default",
+      "shape": [
+        7,
+        384
+      ],
+      "group": 128,
+      "bits": 4,
+      "gate": "default",
+      "whole_matrix_kurtosis": 8.767374038696289,
+      "default_gate_fallback": true,
+      "fallback": true,
+      "method": "rtn",
+      "pre_fp16": {
+        "file": "multi_group_g128_b4_default.pre.bin",
+        "sha256": "d55f9fe1cef114280b7ba7e09620a80b23e4a36386762563e48c247ac22be7ef",
+        "bytes": 23236
+      },
+      "serialized_fp16": {
+        "file": "multi_group_g128_b4_default.bin",
+        "sha256": "f8be0eb93f8984e2e76a346fe7c0753f70af1fd86b6495892607d688f08a11f5",
+        "bytes": 23236
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 0.2045574188232422,
+        "rmse": 0.048589225858449936,
+        "mean_abs": 0.03465430065989494
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 0.2041015625,
+        "rmse": 0.04858420789241791,
+        "mean_abs": 0.034651778638362885
+      },
+      "model_source": null
+    },
+    {
+      "name": "multi_group_g128_b4_ungated",
+      "shape": [
+        7,
+        384
+      ],
+      "group": 128,
+      "bits": 4,
+      "gate": "ungated",
+      "whole_matrix_kurtosis": 8.767374038696289,
+      "default_gate_fallback": true,
+      "fallback": false,
+      "method": "sinq",
+      "pre_fp16": {
+        "file": "multi_group_g128_b4_ungated.pre.bin",
+        "sha256": "aac72769e5f874cefe2a45b86fbccaeb912766a78215677b47a311ff0e763bca",
+        "bytes": 23236
+      },
+      "serialized_fp16": {
+        "file": "multi_group_g128_b4_ungated.bin",
+        "sha256": "fad13a85a8dfd11d3b3c97051754a1e468f3c73c8b3be4fb3deb1f404366db1d",
+        "bytes": 23236
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 0.22014039754867554,
+        "rmse": 0.0439491868019104,
+        "mean_abs": 0.0306251160800457
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 0.2202467918395996,
+        "rmse": 0.04394886642694473,
+        "mean_abs": 0.030623935163021088
+      },
+      "model_source": null
+    },
+    {
+      "name": "qwen35_self_attn_q_proj_g128_b3_default",
+      "shape": [
+        7,
+        256
+      ],
+      "group": 128,
+      "bits": 3,
+      "gate": "default",
+      "whole_matrix_kurtosis": 3.392771005630493,
+      "default_gate_fallback": false,
+      "fallback": false,
+      "method": "sinq",
+      "pre_fp16": {
+        "file": "qwen35_self_attn_q_proj_g128_b3_default.pre.bin",
+        "sha256": "cf6faad7d23d5cb71028207a3d65c2d757f64a082f62136d4c97cde7d554e150",
+        "bytes": 15500
+      },
+      "serialized_fp16": {
+        "file": "qwen35_self_attn_q_proj_g128_b3_default.bin",
+        "sha256": "200c362c4b4aa786511303e6e02cf50ae242136d5e026ac3515f795e97a148fa",
+        "bytes": 15500
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 0.012661084532737732,
+        "rmse": 0.0034669586457312107,
+        "mean_abs": 0.0027892333455383778
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 0.012682706117630005,
+        "rmse": 0.003466947702690959,
+        "mean_abs": 0.0027891898062080145
+      },
+      "model_source": {
+        "tensor": "mtp.layers.0.self_attn.q_proj.weight",
+        "shard": "model.safetensors-00003-of-00004.safetensors",
+        "slice": [
+          0,
+          7,
+          0,
+          256
+        ],
+        "source_shape": [
+          8192,
+          4096
+        ],
+        "slice_fp32_sha256": "e5ccea2f42d85a5e6db87c1de0c42caccf9dcaa2b9828b49b58b953bda6685da"
+      }
+    },
+    {
+      "name": "qwen35_self_attn_q_proj_g128_b4_default",
+      "shape": [
+        7,
+        256
+      ],
+      "group": 128,
+      "bits": 4,
+      "gate": "default",
+      "whole_matrix_kurtosis": 3.392771005630493,
+      "default_gate_fallback": false,
+      "fallback": false,
+      "method": "sinq",
+      "pre_fp16": {
+        "file": "qwen35_self_attn_q_proj_g128_b4_default.pre.bin",
+        "sha256": "0e0c08c449aa7db0aa3103ea2dad298ae5559d73acee531752eeb4ff0322fda9",
+        "bytes": 15500
+      },
+      "serialized_fp16": {
+        "file": "qwen35_self_attn_q_proj_g128_b4_default.bin",
+        "sha256": "6e1c7588b48c4b982530ee896214f3ec4b59077228063f9be4af583a9169862e",
+        "bytes": 15500
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 0.007116997614502907,
+        "rmse": 0.0016491888090968132,
+        "mean_abs": 0.0013450316619127989
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 0.007120348513126373,
+        "rmse": 0.001649291254580021,
+        "mean_abs": 0.0013451395789161325
+      },
+      "model_source": {
+        "tensor": "mtp.layers.0.self_attn.q_proj.weight",
+        "shard": "model.safetensors-00003-of-00004.safetensors",
+        "slice": [
+          0,
+          7,
+          0,
+          256
+        ],
+        "source_shape": [
+          8192,
+          4096
+        ],
+        "slice_fp32_sha256": "e5ccea2f42d85a5e6db87c1de0c42caccf9dcaa2b9828b49b58b953bda6685da"
+      }
+    },
+    {
+      "name": "qwen35_mlp_down_proj_g128_b3_default",
+      "shape": [
+        7,
+        256
+      ],
+      "group": 128,
+      "bits": 3,
+      "gate": "default",
+      "whole_matrix_kurtosis": 4.524226188659668,
+      "default_gate_fallback": false,
+      "fallback": false,
+      "method": "sinq",
+      "pre_fp16": {
+        "file": "qwen35_mlp_down_proj_g128_b3_default.pre.bin",
+        "sha256": "9b6604bcd38c329d2fc50c1ef44df7aec70ef52dc4519d91e21f12bdaec20b12",
+        "bytes": 15500
+      },
+      "serialized_fp16": {
+        "file": "qwen35_mlp_down_proj_g128_b3_default.bin",
+        "sha256": "d8a03250cd25d873bd568448f84bd3dd2ad95678c370ea174f83cd163237b274",
+        "bytes": 15500
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 0.01287841796875,
+        "rmse": 0.002660545753315091,
+        "mean_abs": 0.002070289570838213
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 0.01287841796875,
+        "rmse": 0.002660508966073394,
+        "mean_abs": 0.002070207381621003
+      },
+      "model_source": {
+        "tensor": "mtp.layers.0.mlp.down_proj.weight",
+        "shard": "model.safetensors-00002-of-00004.safetensors",
+        "slice": [
+          0,
+          7,
+          0,
+          256
+        ],
+        "source_shape": [
+          4096,
+          12288
+        ],
+        "slice_fp32_sha256": "043058c00e5608f4ec6ab8c4f08f2ef85580969d92bcf87e0b67747717013a3c"
+      }
+    },
+    {
+      "name": "qwen35_mlp_down_proj_g128_b4_default",
+      "shape": [
+        7,
+        256
+      ],
+      "group": 128,
+      "bits": 4,
+      "gate": "default",
+      "whole_matrix_kurtosis": 4.524226188659668,
+      "default_gate_fallback": false,
+      "fallback": false,
+      "method": "sinq",
+      "pre_fp16": {
+        "file": "qwen35_mlp_down_proj_g128_b4_default.pre.bin",
+        "sha256": "ec2c9a84866935dda9b09ecdc81e976c6e4f67ae72959665354f174882f552d8",
+        "bytes": 15500
+      },
+      "serialized_fp16": {
+        "file": "qwen35_mlp_down_proj_g128_b4_default.bin",
+        "sha256": "e360ff2239b229debfb8c5404ba602c69b78c8a6fd1c23cc252eb29c92ddbc04",
+        "bytes": 15500
+      },
+      "expected_errors_pre_fp16": {
+        "max_abs": 0.00559007003903389,
+        "rmse": 0.0012145828222855926,
+        "mean_abs": 0.0009585779043845832
+      },
+      "expected_errors_serialized_fp16": {
+        "max_abs": 0.005601942539215088,
+        "rmse": 0.0012144349748268723,
+        "mean_abs": 0.000958516844548285
+      },
+      "model_source": {
+        "tensor": "mtp.layers.0.mlp.down_proj.weight",
+        "shard": "model.safetensors-00002-of-00004.safetensors",
+        "slice": [
+          0,
+          7,
+          0,
+          256
+        ],
+        "source_shape": [
+          4096,
+          12288
+        ],
+        "slice_fp32_sha256": "043058c00e5608f4ec6ab8c4f08f2ef85580969d92bcf87e0b67747717013a3c"
+      }
+    }
+  ],
+  "invalid_shapes": [
+    {
+      "shape": [
+        3,
+        65
+      ],
+      "group": 64,
+      "bits": [
+        3,
+        4
+      ],
+      "expected": "fail",
+      "policy_error": "require N >= 2, G in {64,128}, and K divisible by G; no tile adjustment",
+      "oracle_error": "block must divide W (W=65, block=8)"
+    },
+    {
+      "shape": [
+        3,
+        129
+      ],
+      "group": 128,
+      "bits": [
+        3,
+        4
+      ],
+      "expected": "fail",
+      "policy_error": "require N >= 2, G in {64,128}, and K divisible by G; no tile adjustment",
+      "oracle_error": "block must divide W (W=129, block=8)"
+    },
+    {
+      "shape": [
+        3,
+        96
+      ],
+      "group": 64,
+      "bits": [
+        3,
+        4
+      ],
+      "expected": "fail",
+      "oracle_policy_difference": "upstream would silently change tile to 32; strict boundary rejects before oracle"
+    }
+  ]
+}

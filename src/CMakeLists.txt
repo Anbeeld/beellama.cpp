@@ -49,6 +49,13 @@ set(LLAMA_CORE_SOURCES
     unicode.cpp
 )
 
+# Object linkage keeps the offline optimizer inside installed libllama archives,
+# rather than introducing an uninstalled private static-library dependency.
+add_library(llama-sinq-optimizer OBJECT llama-sinq.cpp)
+set_target_properties(llama-sinq-optimizer PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_compile_features(llama-sinq-optimizer PRIVATE cxx_std_17)
+target_link_libraries(llama-sinq-optimizer PUBLIC ggml)
+
 add_library(llama
             ../include/llama.h
             ${LLAMA_CORE_SOURCES}
@@ -74,7 +81,7 @@ target_include_directories(llama PRIVATE . ${CMAKE_CURRENT_BINARY_DIR})
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
-target_link_libraries(llama PUBLIC ggml)
+target_link_libraries(llama PUBLIC ggml PRIVATE llama-sinq-optimizer)
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)

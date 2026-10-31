@@ -107,11 +107,19 @@ Key binaries are `llama-server`, `llama-cli`, `llama-bench`, and
   attention shaders.
 - `tools/server/server-adaptive-dm.h` - profit adaptive draft-max controller.
 - `tools/server/server-loop-guard.cpp` / `.h` - reasoning loop detection.
+- `src/llama-sinq.cpp` / `.h` - offline SINQ-derived column preconditioning.
+  Weight encoding and inference use unchanged standard Q3_K/Q4_K paths.
+- `src/llama-quant.cpp`, `src/llama-model.cpp`, and `src/llama-graph.cpp` -
+  Qwen3.5 eligibility, versioned channel companions, and base-only activation
+  scaling with original LoRA inputs. Sidecar GGUFs require BeeLlama despite
+  their standard weight type IDs.
 ### Key Docs
 
 - `docs/beellama-features.md` - fork feature and compatibility matrix.
 - `docs/beellama-args.md` - Bee arguments, aliases, and removals.
 - `docs/preset.md` - INI preset format.
+- `../beellama.doc/docs/explanation/sinq-format.md` - standard-Q_K conditioning
+  contract, companion manifest, CPU/CUDA limits and portability warning.
 
 ### Invariants
 
@@ -161,6 +169,15 @@ build/bin/llama-server -m target.gguf \
 
 KLD comparisons use matching `-b` and `-ub` values for the baseline and
 candidate. Record both values with every result.
+
+Q_K conditioning regressions live in `tests/test-qk-sinq-numeric.cpp`,
+`test-qk-sinq-model.cpp`, `test-qk-sinq-graph.cpp`, and
+`test-qk-sinq-backend.cpp`; registration is in `tests/CMakeLists.txt`.
+`gguf-py/tests/test_qk_sinq.py` checks standard payload/companion inspection.
+`tests/test-perplexity-full.cpp` covers the full-corpus reference and comparison
+math used by `tools/perplexity/perplexity.cpp`. `--ppl-full` scores all N-1
+corpus targets; matched BF16 self-comparisons measure its compact-reference
+floor before candidate KLD is interpreted.
 
 ## Git Conventions
 

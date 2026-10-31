@@ -898,6 +898,7 @@ struct llm_graph_params {
     const llama_prec_policy * prec_policy = nullptr;
 
     const llama_hadamard * hdmd = nullptr;
+    const std::unordered_map<const ggml_tensor *, ggml_tensor *> * sinq_scales = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1156,6 +1157,9 @@ struct llm_graph_context {
     const llama_prec_policy * prec_policy;
 
     const llama_hadamard * hdmd;
+    const std::unordered_map<const ggml_tensor *, ggml_tensor *> * sinq_scales;
+    // Per-build cache only: never retain activation graph pointers across builds.
+    mutable std::unordered_map<const ggml_tensor *, std::unordered_map<const ggml_tensor *, ggml_tensor *>> sinq_inputs;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

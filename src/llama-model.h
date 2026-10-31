@@ -744,6 +744,9 @@ struct llama_model {
 
     llama_hadamard hdmd;
 
+    // SINQ scale2 belongs to the base weight, not to any LoRA delta.
+    std::unordered_map<const ggml_tensor *, ggml_tensor *> sinq_scales;
+
     // see llama_model_set_attn_rot
     bool attn_rot = true;
 

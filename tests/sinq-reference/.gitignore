@@ -1,0 +1,7 @@
+*
+!.gitignore
+!generate.py
+!QWEN-MODEL-LICENSE
+!fixtures/
+!fixtures/*.bin
+!fixtures/manifest.json

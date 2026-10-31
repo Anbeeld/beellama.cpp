@@ -99,6 +99,9 @@
 # Python
 
 /.venv
+/.pytest_cache/
+*.pyc
+*.pyo
 __pycache__/
 */poetry.lock
 poetry.toml

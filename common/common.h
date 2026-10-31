@@ -610,6 +610,9 @@ struct common_params {
     int32_t control_vector_layer_end   = -1; // layer range for control vector
     bool    offline                    = false;
 
+    bool    ppl_full        = false; // score every next-token prediction, with non-overlapping contexts
+    bool    ppl_subset_option = false; // --chunks or --ppl-stride was explicitly supplied
+    std::string kld_token_output; // optional full-corpus per-token TSV
     int32_t ppl_stride      = 0;     // stride for perplexity calculations. If left at 0, the pre-existing approach will be used.
     int32_t ppl_output_type = 0;     // = 0 -> ppl output is as usual, = 1 -> ppl output is num_tokens, ppl, one per line
                                      //                                       (which is more convenient to use for plotting)

@@ -4,8 +4,8 @@ include(CheckIncludeFileCXX)
 
 ### llama.cpp version
 set(LLAMA_VERSION_MAJOR 0)
-set(LLAMA_VERSION_MINOR 4)
-set(LLAMA_VERSION_PATCH 10)
+set(LLAMA_VERSION_MINOR 5)
+set(LLAMA_VERSION_PATCH 0)
 set(LLAMA_VERSION_BASE "${LLAMA_VERSION_MAJOR}.${LLAMA_VERSION_MINOR}.${LLAMA_VERSION_PATCH}")
 
 # whether this is a development/nightly build
@@ -213,6 +213,9 @@ llama_option_depr(WARNING     LLAMA_CURL)
 
 include("cmake/license.cmake")
 license_add_file("llama.cpp" "LICENSE")
+license_add_file("SINQ reference and native normalization port" "licenses/LICENSE-SINQ")
+install(FILES "licenses/LICENSE-SINQ" "licenses/NOTICE-SINQ"
+    DESTINATION "share/licenses/beellama.cpp" COMPONENT Licenses)
 
 #
 # compile options

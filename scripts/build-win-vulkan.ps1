@@ -219,6 +219,10 @@ if (Test-Path $licensePath) {
     $stageCount++
 }
 
+Copy-Item -LiteralPath (Join-Path $repoRoot "licenses/LICENSE-SINQ") -Destination $pkgDir -Force
+Copy-Item -LiteralPath (Join-Path $repoRoot "licenses/NOTICE-SINQ") -Destination $pkgDir -Force
+$stageCount += 2
+
 Write-Host "[OK] Staged $stageCount built files"
 Write-Host "`n========================================"
 Write-Host "Done. Package folder: $pkgDir"

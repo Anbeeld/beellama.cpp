@@ -3,6 +3,8 @@
 #include "llama-model-loader.h"
 #include "llama-ext.h"
 #include "llama.h"
+#include "llama-sinq.h"
+#include "llama-version.h"
 
 #include <algorithm>
 #include <cmath>
@@ -222,6 +224,7 @@ struct tensor_metadata {
     std::string     remapped_imatrix_name;
     bool            allows_quantization;
     bool            requires_imatrix;
+    bool            sinq_preconditioned = false;
 };
 
 //
@@ -298,6 +301,14 @@ static void llama_tensor_dequantize_impl(
 //
 // do we allow this tensor to be quantized?
 //
+
+static bool sinq_tensor_eligible(const ggml_tensor * tensor, const llama_model & model) {
+    if (model.arch != LLM_ARCH_QWEN35 || ggml_n_dims(tensor) != 2 || tensor->ne[1] < 2) { return false; }
+    static const std::regex pattern("^blk\\.([0-9]+)\\.(attn_q|attn_k|attn_v|attn_qkv|attn_gate|attn_output|ssm_beta|ssm_alpha|ssm_out|ffn_gate|ffn_up|ffn_down)\\.weight$");
+    std::cmatch match;
+    return std::regex_match(tensor->name, match, pattern) &&
+        std::stoul(match[1].str()) < model.hparams.n_layer();
+}
 
 static bool tensor_allows_quantization(const llama_model_quantize_params * params, llm_arch arch, const ggml_tensor * tensor) {
     // trivial checks first -- no string ops needed
@@ -763,6 +774,11 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
 
 // outer wrapper: determine the ggml_type that this tensor should be quantized to
 static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_model_quantize_params * params, const ggml_tensor * tensor, ggml_type default_type, const tensor_metadata & tm) {
+    // Conditioning eligibility is independent of ordinary quantization coverage.
+    // Only the explicit historical-control option preserves excluded source types.
+    if (params->sinq_coverage && !sinq_tensor_eligible(tensor, qs.model)) {
+        return tensor->type;
+    }
     if (!tensor_allows_quantization(params, qs.model.arch, tensor)) {
         return tensor->type;
     }
@@ -996,6 +1012,14 @@ static void init_quantize_state_counters(quantize_state_impl & qs, std::vector<t
 
 static void llama_model_quantize_impl(const std::string & fname_inp, const std::string & fname_out, const llama_model_quantize_params * params) {
     llama_ftype ftype = params->ftype;
+    const bool sinq_enabled = params->sinq_precondition != LLAMA_SINQ_NONE;
+    if (sinq_enabled && (params->sinq_precondition != LLAMA_SINQ_SIDECAR && params->sinq_precondition != LLAMA_SINQ_IDENTITY)) {
+        throw std::runtime_error("invalid SINQ precondition mode");
+    }
+    if (sinq_enabled && ((params->sinq_strip_width != 64 && params->sinq_strip_width != 128) ||
+        (params->sinq_iterations != 4 && params->sinq_iterations != 8 && params->sinq_iterations != 16) || params->only_copy)) {
+        throw std::runtime_error("QK SINQ requires strip width 64/128, iterations 4/8/16 and actual quantization");
+    }
 
     int nthread = params->nthread;
 
@@ -1019,8 +1043,19 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     const llama_model_kv_override * kv_overrides = params->kv_overrides;
     std::vector<std::string> splits = {};
     llama_model_loader ml(/*metadata*/ nullptr, /*set_tensor_data*/ nullptr, /*set_tensor_data_ud*/ nullptr,
-        fname_inp, splits, /*file*/ nullptr, /*load_mode*/ load_mode, /*check_tensors*/ true, /*no_alloc*/ false, /*load_mtp*/ true, kv_overrides, nullptr);
+        fname_inp, splits, /*file*/ nullptr, /*load_mode*/ sinq_enabled ? LLAMA_LOAD_MODE_MMAP : load_mode, /*check_tensors*/ true, /*no_alloc*/ false, /*load_mtp*/ true, kv_overrides, nullptr);
     ml.init_mappings(false); // no prefetching
+    if (gguf_find_key(ml.metadata, "beellama.qk_sinq.version") >= 0) {
+        throw std::runtime_error("SINQ source copy/requantization requires the original floating model, not a transformed artifact");
+    }
+    if (sinq_enabled) {
+        for (int64_t i = 0; i < gguf_get_n_kv(ml.metadata); ++i) {
+            if (std::string(gguf_get_key(ml.metadata,i)).find("prism.hadamard.") == 0) {
+                throw std::runtime_error("QK SINQ cannot be combined with Hadamard metadata");
+            }
+        }
+        LLAMA_LOG_WARN("QK SINQ companions REQUIRE BeeLlama, standard GGUF engines can silently produce wrong output. Use a .beellama-qk-sinq.gguf filename.\n");
+    }
 
     auto mparams = llama_model_default_params();
     std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, mparams));
@@ -1151,6 +1186,14 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     std::vector<gguf_context_ptr> ctx_outs(n_split);
     ctx_outs[0] = std::move(ctx_out);
 
+    ggml_context_ptr sinq_ctx;
+    if (sinq_enabled) {
+        sinq_ctx.reset(ggml_init({ggml_tensor_overhead()*(tensors.size()+1),nullptr,true}));
+        if (!sinq_ctx) { throw std::runtime_error("cannot allocate QK SINQ companion metadata"); }
+    }
+    std::vector<ggml_tensor *> sinq_aux(tensors.size(),nullptr);
+    std::vector<std::string> sinq_names;
+
     // flag for --dry-run
     bool will_require_imatrix = false;
 
@@ -1176,6 +1219,19 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             metadata[i].target_type = tensor->type;
         }
 
+        metadata[i].sinq_preconditioned = sinq_enabled && sinq_tensor_eligible(tensor,*model) &&
+            (metadata[i].target_type == GGML_TYPE_Q3_K || metadata[i].target_type == GGML_TYPE_Q4_K);
+        if (metadata[i].sinq_preconditioned) {
+            if (tensor->type != GGML_TYPE_F32 && tensor->type != GGML_TYPE_F16 && tensor->type != GGML_TYPE_BF16) {
+                throw std::runtime_error("QK SINQ preconditioning requires original F32/F16/BF16 matrices");
+            }
+            if (tensor->ne[0] % params->sinq_strip_width) { throw std::runtime_error("QK SINQ input dimension is not strip aligned"); }
+            auto * aux = ggml_new_tensor_1d(sinq_ctx.get(),GGML_TYPE_F16,tensor->ne[0]);
+            ggml_set_name(aux,(metadata[i].name+".sinq_scale2").c_str());
+            gguf_add_tensor(ctx_outs[i_split].get(),aux);
+            sinq_aux[i] = aux;
+            sinq_names.push_back(metadata[i].name);
+        }
         metadata[i].requires_imatrix = tensor_requires_imatrix(tensor->name, metadata[i].target_type, ftype);
 
         if (params->imatrix) {
@@ -1195,12 +1251,28 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         }
     }
 
+    if (sinq_enabled) {
+        if (sinq_names.empty()) { throw std::runtime_error("QK SINQ found no eligible primary-trunk qwen35 Q3_K/Q4_K weights"); }
+        std::vector<const char *> names;
+        for (const auto & name : sinq_names) { names.push_back(name.c_str()); }
+        for (auto & out : ctx_outs) {
+            gguf_set_val_u32(out.get(),"beellama.qk_sinq.version",1);
+            gguf_set_arr_str(out.get(),"beellama.qk_sinq.tensors",names.data(),names.size());
+            gguf_set_val_str(out.get(),"beellama.qk_sinq.algorithm",params->sinq_precondition == LLAMA_SINQ_IDENTITY ? "identity" : "sinkhorn_log");
+            gguf_set_val_u32(out.get(),"beellama.qk_sinq.strip_width",params->sinq_strip_width);
+            gguf_set_val_u32(out.get(),"beellama.qk_sinq.iterations",params->sinq_iterations);
+            gguf_set_val_bool(out.get(),"beellama.qk_sinq.kurtosis_gate",params->sinq_gate);
+            gguf_set_val_str(out.get(),"beellama.qk_sinq.producer",LLAMA_COMMIT);
+            gguf_set_val_str(out.get(),"beellama.qk_sinq.numerics","fp16-source-statistics;fp32-best-preupdate;serialized-f16-diagonal;original-W/t;imatrix*t^2");
+        }
+    }
+
     // Set split info if needed
     if (n_split > 1) {
         for (size_t i = 0; i < ctx_outs.size(); ++i) {
             gguf_set_val_u16(ctx_outs[i].get(), ml.llm_kv(LLM_KV_SPLIT_NO).c_str(), i);
             gguf_set_val_u16(ctx_outs[i].get(), ml.llm_kv(LLM_KV_SPLIT_COUNT).c_str(), n_split);
-            gguf_set_val_i32(ctx_outs[i].get(), ml.llm_kv(LLM_KV_SPLIT_TENSORS_COUNT).c_str(), (int32_t)tensors.size());
+            gguf_set_val_i32(ctx_outs[i].get(), ml.llm_kv(LLM_KV_SPLIT_TENSORS_COUNT).c_str(), (int32_t)(tensors.size()+sinq_names.size()));
         }
     }
 
@@ -1288,6 +1360,21 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         bool quantize = cur_type != new_type;
 
         size_t new_size;
+        std::vector<ggml_fp16_t> sinq_values;
+        if (tm.sinq_preconditioned && !params->dry_run) {
+            llama_sinq_options options;
+            options.strip_width = params->sinq_strip_width;
+            options.iterations = params->sinq_iterations;
+            options.gate = params->sinq_gate;
+            options.identity = params->sinq_precondition == LLAMA_SINQ_IDENTITY;
+            llama_sinq_statistics stats;
+            if (!llama_sinq_compute_scales(load_range(0,tensor_size),cur_type,tensor->ne[1],tensor->ne[0],
+                                           options,nthread,sinq_values,stats)) {
+                throw std::runtime_error(format("QK SINQ statistics failed for '%s'",tensor->name));
+            }
+            LLAMA_LOG_INFO("QK SINQ tensor=%s kurtosis=%.9g mode=%s t_min=%.9g t_max=%.9g aux_bytes=%zu; ",
+                tensor->name,stats.kurtosis,stats.identity ? "identity" : "normalized",stats.min_scale,stats.max_scale,sinq_values.size()*sizeof(ggml_fp16_t));
+        }
 
         if (params->dry_run) {
             // the --dry-run option calculates the final quantization size without quantizing
@@ -1367,8 +1454,23 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 const size_t row_size_src = ggml_row_size(tensor->type, n_per_row);
                 const size_t row_size_dst = ggml_row_size(new_type,     n_per_row);
 
-                // process the rows in slabs, so that the buffers stay below max_buf_size
-                const size_t bytes_per_row = row_size_src + row_size_dst + (tensor->type == GGML_TYPE_F32 ? 0 : n_per_row*sizeof(float));
+                std::vector<float> sinq_imatrix;
+                if (tm.sinq_preconditioned && imatrix) {
+                    sinq_imatrix.resize(n_per_row);
+                    for (int64_t j = 0; j < n_per_row; ++j) {
+                        const float t = ggml_fp16_to_fp32(sinq_values[j]);
+                        sinq_imatrix[j] = imatrix[j]*t*t;
+                        if (!std::isfinite(sinq_imatrix[j]) || sinq_imatrix[j] < 0) {
+                            throw std::runtime_error("QK SINQ transformed imatrix must be finite and nonnegative");
+                        }
+                    }
+                    imatrix = sinq_imatrix.data();
+                }
+                std::vector<float> sinq_preconditioned;
+                // The extra W/t slab is included in the configured memory budget.
+                const size_t bytes_per_row = row_size_src + row_size_dst +
+                    (tensor->type == GGML_TYPE_F32 ? 0 : n_per_row*sizeof(float)) +
+                    (tm.sinq_preconditioned ? n_per_row*sizeof(float) : 0);
                 const int64_t nrows_slab = std::max<int64_t>(1, std::min<int64_t>(nrows_total, max_buf_size/bytes_per_row));
 
                 static const int64_t min_chunk_size = 32 * 512;
@@ -1393,6 +1495,13 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                         f32_data = (const float *) f32_conv_buf.data();
                     }
 
+                    if (tm.sinq_preconditioned) {
+                        sinq_preconditioned.resize(nelements_cur);
+                        for (int64_t j = 0; j < nelements_cur; ++j) {
+                            sinq_preconditioned[j] = f32_data[j]/ggml_fp16_to_fp32(sinq_values[j%n_per_row]);
+                        }
+                        f32_data = sinq_preconditioned.data();
+                    }
                     if (work.size() < nrows_cur*row_size_dst) {
                         work.resize(nrows_cur*row_size_dst);
                     }
@@ -1416,6 +1525,13 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
             // tensor data is already written, add the padding
             zeros(fout, GGML_PAD(new_size, align) - new_size);
+
+            if (sinq_aux[i]) {
+                const size_t aux_bytes = sinq_values.size()*sizeof(ggml_fp16_t);
+                fout.write(reinterpret_cast<const char *>(sinq_values.data()),aux_bytes);
+                zeros(fout,GGML_PAD(aux_bytes,align)-aux_bytes);
+                total_size_new += aux_bytes;
+            }
 
             // unmap the tensor to free memory
             if (ml.use_mmap) { ml.unmap_weight(weight); }
@@ -1462,7 +1578,12 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.kv_overrides                =*/ nullptr,
         /*.tensor_type                 =*/ nullptr,
         /*.prune_layers                =*/ nullptr,
-        /*.max_buf_size                =*/ LLAMA_QUANT_MAX_BUF_SIZE
+        /*.max_buf_size                =*/ LLAMA_QUANT_MAX_BUF_SIZE,
+        /*.sinq_precondition            =*/ LLAMA_SINQ_NONE,
+        /*.sinq_strip_width             =*/ 64,
+        /*.sinq_iterations              =*/ 16,
+        /*.sinq_gate                    =*/ true,
+        /*.sinq_coverage                =*/ false
     };
 
     return result;

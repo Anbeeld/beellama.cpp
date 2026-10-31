@@ -2017,6 +2017,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     moe_cache        (params.moe_cache),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
+    sinq_scales      (params.sinq_scales),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -2090,6 +2091,19 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w_s) const {
     // a Hadamard-folded weight reads the transformed input; a LoRA delta lives in the primal basis and reads `cur`
     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
+    if (sinq_scales) {
+        const auto it = sinq_scales->find(w);
+        if (it != sinq_scales->end()) {
+            auto & scaled = sinq_inputs[cur_mm][it->second];
+            if (!scaled) {
+                // Loaded models cache F32 once; metadata-only callers may still
+                // supply serialized F16. ggml_cast always adds a copy node.
+                ggml_tensor * scale = it->second->type == GGML_TYPE_F32 ? it->second : ggml_cast(ctx0,it->second,GGML_TYPE_F32);
+                scaled = ggml_mul(ctx0,cur_mm,scale);
+            }
+            cur_mm = scaled;
+        }
+    }
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur_mm);
 
     if (prec_policy) {
