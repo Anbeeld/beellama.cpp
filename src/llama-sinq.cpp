@@ -84,7 +84,7 @@ float imbalance(const std::vector<float> & rows, const std::vector<float> & cols
 } // namespace
 
 bool llama_sinq_balance_tile(const float * weights, int64_t n, int g, int iterations,
-                            float * columns, float * row_factors) {
+                            float * columns, float * row_factors, llama_sinq_tile_statistics * statistics) {
     if (!weights || !columns || !row_factors || !valid_shape(n,g,g) || !valid_iterations(iterations)) { return false; }
     for (int64_t i = 0; i < n*g; ++i) { if (!std::isfinite(weights[i])) { return false; } }
     try {
@@ -97,6 +97,8 @@ bool llama_sinq_balance_tile(const float * weights, int64_t n, int g, int iterat
         for (float x : cols) { target = std::min(target,clamp(x,1.e-3f,1.e3f)); }
         target += 1.e-6f;
         float best = imbalance(rows,cols); bool stopped = false;
+        llama_sinq_tile_statistics diagnostic;
+        diagnostic.initial_imbalance = best;
         // Candidates are recorded before each update, including k=0. The last
         // update is never a candidate, matching pinned sinkhorn_log(matrix,16).
         for (int it = 0; it < iterations; ++it) {
@@ -107,12 +109,24 @@ bool llama_sinq_balance_tile(const float * weights, int64_t n, int g, int iterat
             }
             std_axes(cur,n,g,rows,cols);
             const float ib = imbalance(rows,cols);
-            if (ib <= best) { best = ib; br = mr; bc = mc; }
+            if (ib <= best) { best = ib; br = mr; bc = mc; diagnostic.chosen_iteration = it; }
             if (ib > best) { stopped = true; }
             if (!stopped) {
                 for (int64_t i = 0; i < n; ++i) { lr[i] = clamp(lr[i]+std::log(clamp(clamp(rows[i],1.e-3f,1.e3f)/target,.7f,2.f)),-.3f,10.f); }
                 for (int j = 0; j < g; ++j) { lc[j] = clamp(lc[j]+std::log(clamp(clamp(cols[j],1.e-3f,1.e3f)/target,.7f,2.f)),-.3f,10.f); }
             }
+        }
+        if (statistics) {
+            diagnostic.best_imbalance = best;
+            // The terminal update is observable but remains an unscored state.
+            for (int64_t i = 0; i < n; ++i) { mr[i] = std::exp(lr[i]); }
+            for (int j = 0; j < g; ++j) { mc[j] = std::exp(lc[j]); }
+            for (int64_t i = 0; i < n; ++i) {
+                for (int j = 0; j < g; ++j) { cur[i*g+j] = weights[i*g+j]/mc[j]/mr[i]; }
+            }
+            std_axes(cur,n,g,rows,cols);
+            diagnostic.terminal_imbalance = imbalance(rows,cols);
+            *statistics = diagnostic;
         }
         std::copy(bc.begin(),bc.end(),columns); std::copy(br.begin(),br.end(),row_factors);
         return true;
@@ -124,30 +138,42 @@ bool llama_sinq_compute_scales(const void * source, ggml_type source_type,
                               int threads, std::vector<ggml_fp16_t> & scales,
                               llama_sinq_statistics & statistics) {
     if (!source || !valid_shape(n,k,options.strip_width) || !valid_iterations(options.iterations) || threads <= 0 ||
+        !std::isfinite(options.strength) || options.strength < 0.f || options.strength > 1.f ||
         (source_type != GGML_TYPE_F32 && source_type != GGML_TYPE_F16 && source_type != GGML_TYPE_BF16)) { return false; }
     // Whole-matrix, half-rounded, non-Fisher kurtosis. Scan even explicit
     // identity input so neither it nor the gate can bypass finite validation.
     const int64_t count = n*k;
-    double mean = 0, m2 = 0, m4 = 0;
+    double mean = 0, m2 = 0, m4 = 0, mean_error = 0, m2_error = 0, m4_error = 0;
+    auto accumulate = [](double value, double & sum, double & error) {
+        const double corrected = value-error;
+        const double next = sum+corrected;
+        error = (next-sum)-corrected;
+        sum = next;
+    };
     for (int64_t i = 0; i < count; ++i) {
         const float x = source_at(source,source_type,i);
         if (!std::isfinite(x)) { return false; }
-        mean += x;
+        accumulate(x,mean,mean_error);
     }
     mean /= count;
     for (int64_t i = 0; i < count; ++i) {
         const double d = source_at(source,source_type,i)-mean, d2 = d*d;
-        m2 += d2; m4 += d2*d2;
+        accumulate(d2,m2,m2_error); accumulate(d2*d2,m4,m4_error);
     }
-    const double variance = std::max(m2/count,1.e-6);
     llama_sinq_statistics result;
-    result.kurtosis = float((m4/count)/(variance*variance));
-    result.identity = options.identity || (options.gate && result.kurtosis > 5.f);
+    // Zero variance has no defined kurtosis. Report zero and do not gate it;
+    // retain the legacy normalizer when gate is off or the matrix is constant.
+    result.degenerate = m2 == 0;
+    result.kurtosis = result.degenerate ? 0 : (m4/double(count))/std::pow(m2/double(count),2);
+    if (!std::isfinite(result.kurtosis)) { return false; }
+    result.gated = options.gate && result.kurtosis > 5.;
+    result.identity = options.identity || options.strength == 0.f || result.gated;
     try {
         std::vector<ggml_fp16_t> output(size_t(k),ggml_fp32_to_fp16(1.f));
         if (!result.identity) {
             const int g = options.strip_width;
             const int64_t groups = k/g;
+            result.strips.resize(size_t(groups));
             std::atomic<int64_t> next{0}; std::atomic<bool> ok{true};
             auto work = [&]() {
                 try {
@@ -156,9 +182,11 @@ bool llama_sinq_compute_scales(const void * source, ggml_type source_type,
                         for (int64_t i = 0; i < n; ++i) {
                             for (int j = 0; j < g; ++j) { tile[i*g+j] = source_at(source,source_type,i*k+group*g+j); }
                         }
-                        if (!llama_sinq_balance_tile(tile.data(),n,g,options.iterations,t.data(),r.data())) { ok = false; break; }
+                        if (!llama_sinq_balance_tile(tile.data(),n,g,options.iterations,t.data(),r.data(),&result.strips[size_t(group)])) { ok = false; break; }
                         for (int j = 0; j < g; ++j) {
-                            const ggml_fp16_t h = ggml_fp32_to_fp16(t[j]);
+                            // Preserve the exact legacy rounding path at strength1.
+                            const float value = options.strength == 1.f ? t[j] : std::exp(options.strength*std::log(t[j]));
+                            const ggml_fp16_t h = ggml_fp32_to_fp16(value);
                             const float f = ggml_fp16_to_fp32(h);
                             if (!(f > 0) || !std::isfinite(f)) { ok = false; break; }
                             output[group*g+j] = h;
@@ -184,7 +212,13 @@ bool llama_sinq_compute_scales(const void * source, ggml_type source_type,
             const float f = ggml_fp16_to_fp32(h);
             result.min_scale = std::min(result.min_scale,f); result.max_scale = std::max(result.max_scale,f);
         }
-        scales.swap(output); statistics = result;
+        std::vector<float> ordered; ordered.reserve(output.size());
+        for (ggml_fp16_t h : output) { ordered.push_back(ggml_fp16_to_fp32(h)); }
+        std::sort(ordered.begin(),ordered.end());
+        result.median_scale = ordered.size()%2 ? ordered[ordered.size()/2] :
+            (ordered[ordered.size()/2-1]+ordered[ordered.size()/2])*.5f;
+        for (const auto & strip : result.strips) { result.selected_identity_count += strip.chosen_iteration == 0; }
+        scales.swap(output); statistics = std::move(result);
         return true;
     } catch (const std::exception &) { return false; }
 }

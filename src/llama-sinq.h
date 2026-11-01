@@ -26,19 +26,33 @@ struct llama_sinq_options {
     int iterations = 16;
     bool gate = true;
     bool identity = false;
+    float strength = 1.f;
+};
+
+struct llama_sinq_tile_statistics {
+    int chosen_iteration = 0;
+    float initial_imbalance = 0;
+    float best_imbalance = 0;
+    float terminal_imbalance = 0;
 };
 
 struct llama_sinq_statistics {
-    float kurtosis = 0;
+    double kurtosis = 0;
     bool identity = false;
+    bool gated = false;
+    bool degenerate = false;
     float min_scale = 1;
     float max_scale = 1;
+    float median_scale = 1;
+    size_t selected_identity_count = 0;
+    std::vector<llama_sinq_tile_statistics> strips;
 };
 
 // Input to this primitive is already FP16-rounded FP32, row-major [N,G].
 // Returns the best-iterate column and row factors, before any Q_K encoding.
 bool llama_sinq_balance_tile(const float * weights, int64_t rows, int width,
-                            int iterations, float * columns, float * row_factors);
+                            int iterations, float * columns, float * row_factors,
+                            llama_sinq_tile_statistics * statistics = nullptr);
 
 // Full-height strips, bounded per-worker workspace. F16-round t BEFORE W/t:
 // serialized t and runtime compensation must be the identical diagonal matrix.

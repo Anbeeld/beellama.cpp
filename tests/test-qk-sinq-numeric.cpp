@@ -22,7 +22,7 @@ static float clip(float x, float a, float b) { return std::max(a,std::min(b,x));
 // in near-zero uniform rescaling can reverse the best-iterate comparison.
 // Locked binaries expose T, but do not contain row factors.
 static void reference(const std::vector<float> & w, int n, int g, int iterations,
-                      std::vector<float> & bc, std::vector<float> & br) {
+                      std::vector<float> & bc, std::vector<float> & br, llama_sinq_tile_statistics * diagnostic = nullptr) {
     std::vector<float> lr(n,0), lc(g,0), rs(n), cs(g), cur(w.size());
     br.assign(n,1); bc.assign(g,1);
     struct accumulator { float avg=0, sum=0, size=0; };
@@ -75,10 +75,12 @@ static void reference(const std::vector<float> & w, int n, int g, int iterations
     for (float x:rs) { target=std::min(target,clip(x,1.e-3f,1.e3f)); }
     for (float x:cs) { target=std::min(target,clip(x,1.e-3f,1.e3f)); }
     target+=1.e-6f; float best=imbalance(); bool stopped=false;
+    if (diagnostic) { diagnostic->initial_imbalance=best; }
     for (int it=0; it<iterations; ++it) {
         for (int i=0; i<n; ++i) { for (int j=0; j<g; ++j) { cur[i*g+j]=w[i*g+j]/std::exp(lc[j])/std::exp(lr[i]); } }
         axes(); float ib=imbalance();
         if (ib<=best) {
+            if (diagnostic) { diagnostic->chosen_iteration=it; }
             best=ib;
             for (int i=0; i<n; ++i) { br[i]=std::exp(lr[i]); }
             for (int j=0; j<g; ++j) { bc[j]=std::exp(lc[j]); }
@@ -88,6 +90,11 @@ static void reference(const std::vector<float> & w, int n, int g, int iterations
             for (int i=0; i<n; ++i) { lr[i]=clip(lr[i]+std::log(clip(clip(rs[i],1.e-3f,1.e3f)/target,.7f,2.f)),-.3f,10.f); }
             for (int j=0; j<g; ++j) { lc[j]=clip(lc[j]+std::log(clip(clip(cs[j],1.e-3f,1.e3f)/target,.7f,2.f)),-.3f,10.f); }
         }
+    }
+    if (diagnostic) {
+        diagnostic->best_imbalance=best;
+        for (int i=0;i<n;++i) { for (int j=0;j<g;++j) { cur[i*g+j]=w[i*g+j]/std::exp(lc[j])/std::exp(lr[i]); } }
+        axes();diagnostic->terminal_imbalance=imbalance();
     }
 }
 struct fixture {
@@ -125,8 +132,9 @@ static void fixtures(int argc, char ** argv) {
         double mean=0,m2=0,m4=0;
         for(float x:a.w) { mean+=x; } mean/=a.w.size();
         for(float x:a.w) { double d=x-mean,d2=d*d; m2+=d2; m4+=d2*d2; }
-        double variance=std::max(m2/a.w.size(),1.e-6);
-        CHECK(close(stats.kurtosis,float(m4/a.w.size()/(variance*variance))));
+        const double variance=m2/a.w.size();
+        const double expected_kurtosis=m2==0 ? 0 : (m4/a.w.size())/(variance*variance);
+        CHECK(std::abs(stats.kurtosis-expected_kurtosis)<=1.e-10*std::max(1.,expected_kurtosis));
         float lo=std::numeric_limits<float>::infinity(), hi=0;
         for (int j=0; j<k; ++j) {
             float actual=ggml_fp16_to_fp32(t[j]); CHECK(actual>0 && std::isfinite(actual));
@@ -298,8 +306,88 @@ static void row_shapes() {
     } }
     std::puts("row shapes: 2/33/128/257, full-height strips, both column reduction branches");
 }
+static void gate_scale_invariance() {
+    constexpr int n=4,k=128;
+    // Dyadic values keep the FP16 source convention exact at every magnitude.
+    for (auto type:{GGML_TYPE_F32,GGML_TYPE_F16,GGML_TYPE_BF16}) {
+        double first=-1;
+        for (float magnitude:{1.f,.0625f,.00390625f,.000244140625f}) {
+            std::vector<float> w(n*k,0.f);w[17]=magnitude;
+            std::vector<ggml_fp16_t> h(n*k);std::vector<ggml_bf16_t> b(n*k);
+            for (int i=0;i<n*k;++i) { h[i]=ggml_fp32_to_fp16(w[i]);b[i]=ggml_fp32_to_bf16(w[i]); }
+            const void * input=type==GGML_TYPE_F32 ? static_cast<void *>(w.data()) :
+                type==GGML_TYPE_F16 ? static_cast<void *>(h.data()) : static_cast<void *>(b.data());
+            long double mean=0,m2=0,m4=0;
+            for(float x:w)mean+=x;mean/=w.size();
+            for(float x:w) { const long double d=x-mean; m2+=d*d;m4+=d*d*d*d; }
+            const double expected=double(w.size()*m4/(m2*m2));
+            llama_sinq_options o;o.gate=true;
+            llama_sinq_statistics s;std::vector<ggml_fp16_t> t;
+            CHECK(llama_sinq_compute_scales(input,type,n,k,o,1,t,s));
+            CHECK(std::abs(s.kurtosis-expected)<=1.e-6*expected);
+            CHECK(s.identity && s.kurtosis>5);
+            if(first>=0)CHECK(std::abs(s.kurtosis-first)<=1.e-6*first);
+            first=s.kurtosis;
+        }
+    }
+    std::puts("gate scale invariance: dyadic F32/F16/BF16 and independent central moments passed");
+}
+
+static void strength_and_diagnostics() {
+    constexpr int n=33,k=256;
+    std::vector<float> w(n*k);
+    for (int i=0;i<n*k;++i) { w[i]=half(float(std::sin(i*.73)*(1+(i%23)*.2))); }
+    for (int width:{64,128}) { for (int iterations:{4,16}) {
+        llama_sinq_options o;o.gate=false;o.strip_width=width;o.iterations=iterations;
+        std::vector<ggml_fp16_t> legacy,actual,identity;
+        llama_sinq_statistics ls,s;
+        CHECK(llama_sinq_compute_scales(w.data(),GGML_TYPE_F32,n,k,o,1,legacy,ls));
+        o.identity=true;CHECK(llama_sinq_compute_scales(w.data(),GGML_TYPE_F32,n,k,o,1,identity,s));o.identity=false;
+        for(float alpha:{0.f,.5f,.75f,1.f}) {
+            o.strength=alpha;
+            CHECK(llama_sinq_compute_scales(w.data(),GGML_TYPE_F32,n,k,o,4,actual,s));
+            if(alpha==0) { CHECK(actual==identity && s.identity && s.strips.empty());continue; }
+            if(alpha==1)CHECK(actual==legacy);
+            CHECK(s.strips.size()==size_t(k/width));
+            size_t selected_identity=0;
+            for(int group=0;group<k/width;++group) {
+                std::vector<float> tile(n*width),ec,er;
+                for(int i=0;i<n;++i)for(int j=0;j<width;++j)tile[i*width+j]=w[i*k+group*width+j];
+                llama_sinq_tile_statistics expected;
+                reference(tile,n,width,iterations,ec,er,&expected);
+                const auto & d=s.strips[group];
+                CHECK(d.chosen_iteration==expected.chosen_iteration);
+                CHECK(d.chosen_iteration>=0 && d.chosen_iteration<iterations);
+                CHECK(close(d.initial_imbalance,expected.initial_imbalance));
+                CHECK(close(d.best_imbalance,expected.best_imbalance));
+                CHECK(close(d.terminal_imbalance,expected.terminal_imbalance));
+                CHECK(d.best_imbalance<=d.initial_imbalance);
+                selected_identity+=d.chosen_iteration==0;
+                for(int j=0;j<width;++j) {
+                    const float value=alpha==1 ? ec[j] : std::exp(alpha*std::log(ec[j]));
+                    CHECK(actual[group*width+j]==ggml_fp32_to_fp16(value));
+                    const double t=ggml_fp16_to_fp32(actual[group*width+j]);
+                    const double x=.375,I=1.25,W=w[group*width+j];
+                    CHECK(std::abs((W/t)*(x*t)-W*x)<=1.e-12*(1+std::abs(W*x)));
+                    CHECK(std::abs((x*t)*(x*t)*I-x*x*(t*t*I))<=1.e-12);
+                }
+            }
+            CHECK(s.selected_identity_count==selected_identity);
+        }
+        for(float alpha:{-.01f,1.01f,std::numeric_limits<float>::quiet_NaN(),std::numeric_limits<float>::infinity()}) {
+            o.strength=alpha;CHECK(!llama_sinq_compute_scales(w.data(),GGML_TYPE_F32,n,k,o,1,actual,s));
+        }
+    } }
+    std::fill(w.begin(),w.end(),.125f);
+    llama_sinq_options o;llama_sinq_statistics s;std::vector<ggml_fp16_t> t;
+    CHECK(llama_sinq_compute_scales(w.data(),GGML_TYPE_F32,n,k,o,1,t,s));CHECK(s.degenerate && !s.gated && s.kurtosis==0);
+    std::fill(w.begin(),w.end(),0.f);
+    CHECK(llama_sinq_compute_scales(w.data(),GGML_TYPE_F32,n,k,o,1,t,s));CHECK(s.degenerate && !s.gated);
+    std::puts("strength/diagnostics: independent preupdate oracle, serialized compensation and degenerate policy passed");
+}
+
 int main(int argc,char ** argv) {
     // Initialize conversion tables on platforms that use them.
     ggml_context * ctx=ggml_init({1024,nullptr,true}); CHECK(ctx); ggml_free(ctx);
-    fixtures(argc,argv); invalid(); synthetic(); row_shapes(); std::puts("test-qk-sinq-numeric: PASS");
+    gate_scale_invariance(); strength_and_diagnostics(); fixtures(argc,argv); invalid(); synthetic(); row_shapes(); std::puts("test-qk-sinq-numeric: PASS");
 }
