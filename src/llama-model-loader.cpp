@@ -4,6 +4,7 @@
 #include "ggml.h"
 #include "gguf.h"
 #include "llama-hparams.h"
+#include "llama-sinq.h"
 #include "llama.h"
 
 #include <algorithm>
@@ -560,6 +561,14 @@ llama_model_loader::llama_model_loader(
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
         : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
+    auto validate_sinq_metadata = [](const gguf_context * metadata) {
+        for (int64_t i = 0; i < gguf_get_n_kv(metadata); ++i) {
+            const std::string key = gguf_get_key(metadata,i);
+            if (key.find("beellama.qk_sinq.") == 0 && !llama_sinq_supported_metadata_key(key)) {
+                throw std::runtime_error("unsupported SINQ metadata: " + key);
+            }
+        }
+    };
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
         trace = atoi(getenv("LLAMA_TRACE"));
@@ -567,7 +576,11 @@ llama_model_loader::llama_model_loader(
 
     if (param_overrides_p != nullptr) {
         for (const struct llama_model_kv_override * p = param_overrides_p; p->key[0] != 0; p++) {
-            kv_overrides.insert({std::string(p->key), *p});
+            const std::string key = p->key;
+            if (key.find("beellama.qk_sinq.") == 0 && !llama_sinq_supported_metadata_key(key)) {
+                throw std::runtime_error("unsupported SINQ metadata: " + key);
+            }
+            kv_overrides.insert({key, *p});
         }
     }
 
@@ -663,6 +676,7 @@ llama_model_loader::llama_model_loader(
 
                 files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
                 contexts.emplace_back(ctx);
+                validate_sinq_metadata(ctx_gguf.get());
 
                 // Save tensors data offset info of the shard.
                 for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
@@ -731,6 +745,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
     }
 
+    validate_sinq_metadata(metadata);
     n_kv      = gguf_get_n_kv(metadata);
     n_tensors = weights_map.size();
 

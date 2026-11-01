@@ -1343,7 +1343,6 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             gguf_set_val_str(out.get(),"beellama.qk_sinq.algorithm",params->sinq_precondition == LLAMA_SINQ_IDENTITY ? "identity" : "sinkhorn_log");
             gguf_set_val_u32(out.get(),"beellama.qk_sinq.strip_width",params->sinq_strip_width);
             gguf_set_val_u32(out.get(),"beellama.qk_sinq.iterations",params->sinq_iterations);
-            gguf_set_val_bool(out.get(),"beellama.qk_sinq.kurtosis_gate",params->sinq_gate);
             gguf_set_val_str(out.get(),"beellama.qk_sinq.producer",LLAMA_COMMIT);
             gguf_set_val_str(out.get(),"beellama.qk_sinq.numerics","fp16-source-statistics;fp32-best-preupdate;serialized-f16-diagonal;original-W/t;imatrix*t^2");
         }
@@ -1452,10 +1451,9 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 {"shape", {tensor->ne[0], tensor->ne[1]}}, {"parameters", ggml_nelements(tensor)},
                 {"included", tm.sinq_preconditioned}, {"reason", reason},
                 {"strip_width", params->sinq_strip_width}, {"iterations", params->sinq_iterations},
-                {"gate", params->sinq_gate}, {"strength", params->sinq_strength},
+                {"strength", params->sinq_strength},
                 {"mode", !sinq_enabled ? "none" : params->sinq_precondition == LLAMA_SINQ_IDENTITY ? "identity" : "sidecar"},
-                {"statistics_status", "not_computed"}, {"gated", nullptr}, {"kurtosis", nullptr},
-                {"degenerate", nullptr}, {"identity", nullptr}, {"strips", nullptr}, {"chosen_iteration_distribution", nullptr},
+                {"statistics_status", "not_computed"}, {"identity", nullptr}, {"strips", nullptr}, {"chosen_iteration_distribution", nullptr},
                 {"scale_min", nullptr}, {"scale_median", nullptr}, {"scale_max", nullptr},
                 {"scales_sha256", nullptr}, {"selected_identity_count", nullptr},
                 {"companion_bytes", 0}, {"imatrix_present", false}, {"imatrix_transformed", false}});
@@ -1470,7 +1468,6 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             llama_sinq_options options;
             options.strip_width = params->sinq_strip_width;
             options.iterations = params->sinq_iterations;
-            options.gate = params->sinq_gate;
             options.identity = params->sinq_precondition == LLAMA_SINQ_IDENTITY;
             options.strength = params->sinq_strength;
             llama_sinq_statistics stats;
@@ -1480,9 +1477,6 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             }
             if (diagnostic) {
                 (*diagnostic)["statistics_status"] = "computed";
-                (*diagnostic)["gated"] = stats.gated;
-                (*diagnostic)["kurtosis"] = stats.kurtosis;
-                (*diagnostic)["degenerate"] = stats.degenerate;
                 (*diagnostic)["identity"] = stats.identity;
                 (*diagnostic)["scale_min"] = stats.min_scale;
                 (*diagnostic)["scale_median"] = stats.median_scale;
@@ -1501,8 +1495,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 }
                 (*diagnostic)["chosen_iteration_distribution"] = histogram;
             }
-            LLAMA_LOG_INFO("QK SINQ tensor=%s kurtosis=%.9g mode=%s t_min=%.9g t_max=%.9g aux_bytes=%zu; ",
-                tensor->name,stats.kurtosis,stats.identity ? "identity" : "normalized",stats.min_scale,stats.max_scale,sinq_values.size()*sizeof(ggml_fp16_t));
+            LLAMA_LOG_INFO("QK SINQ tensor=%s mode=%s t_min=%.9g t_max=%.9g aux_bytes=%zu; ",
+                tensor->name,stats.identity ? "identity" : "normalized",stats.min_scale,stats.max_scale,sinq_values.size()*sizeof(ggml_fp16_t));
         }
 
         if (params->dry_run) {
@@ -1748,7 +1742,6 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.sinq_precondition            =*/ LLAMA_SINQ_NONE,
         /*.sinq_strip_width             =*/ 64,
         /*.sinq_iterations              =*/ 16,
-        /*.sinq_gate                    =*/ true,
         /*.sinq_coverage                =*/ false,
         /*.sinq_strength                =*/ 1.f,
         /*.sinq_tensor_list             =*/ nullptr,

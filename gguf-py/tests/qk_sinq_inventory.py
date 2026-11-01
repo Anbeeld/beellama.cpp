@@ -16,6 +16,16 @@ ROLES = {'attn_gate', 'attn_k', 'attn_output', 'attn_q', 'attn_qkv', 'attn_v',
          'ffn_down', 'ffn_gate', 'ffn_up', 'ssm_alpha', 'ssm_beta', 'ssm_out'}
 
 
+SINQ_FIELDS = {'beellama.qk_sinq.' + name for name in
+               ('version', 'tensors', 'algorithm', 'strip_width', 'iterations', 'producer', 'numerics')}
+
+
+def validate_sinq_metadata(reader, path):
+    for key in reader.fields:
+        if key.startswith('beellama.qk_sinq.') and key not in SINQ_FIELDS:
+            raise ValueError(f'{path}: unsupported SINQ metadata {key}')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', required=True, type=Path)
@@ -25,6 +35,7 @@ def main():
     parser.add_argument("--generic", action="store_true", help="Validate small graph fixtures without the pinned 427/248 Qwen policy")
     args = parser.parse_args()
     source = GGUFReader(args.source)
+    validate_sinq_metadata(source, args.source)
     original = {t.name: t for t in source.tensors}
     eligible = set()
     for name in original:
@@ -38,6 +49,7 @@ def main():
     results = []
     for path in args.models:
         reader = GGUFReader(path)
+        validate_sinq_metadata(reader, path)
         tensors = {t.name: t for t in reader.tensors}
         if len(tensors) != len(reader.tensors):
             raise ValueError(f'{path}: duplicate names')

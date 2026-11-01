@@ -140,34 +140,13 @@ bool llama_sinq_compute_scales(const void * source, ggml_type source_type,
     if (!source || !valid_shape(n,k,options.strip_width) || !valid_iterations(options.iterations) || threads <= 0 ||
         !std::isfinite(options.strength) || options.strength < 0.f || options.strength > 1.f ||
         (source_type != GGML_TYPE_F32 && source_type != GGML_TYPE_F16 && source_type != GGML_TYPE_BF16)) { return false; }
-    // Whole-matrix, half-rounded, non-Fisher kurtosis. Scan even explicit
-    // identity input so neither it nor the gate can bypass finite validation.
-    const int64_t count = n*k;
-    double mean = 0, m2 = 0, m4 = 0, mean_error = 0, m2_error = 0, m4_error = 0;
-    auto accumulate = [](double value, double & sum, double & error) {
-        const double corrected = value-error;
-        const double next = sum+corrected;
-        error = (next-sum)-corrected;
-        sum = next;
-    };
-    for (int64_t i = 0; i < count; ++i) {
-        const float x = source_at(source,source_type,i);
-        if (!std::isfinite(x)) { return false; }
-        accumulate(x,mean,mean_error);
-    }
-    mean /= count;
-    for (int64_t i = 0; i < count; ++i) {
-        const double d = source_at(source,source_type,i)-mean, d2 = d*d;
-        accumulate(d2,m2,m2_error); accumulate(d2*d2,m4,m4_error);
+    // Explicit identity must not bypass finite validation of the same
+    // FP16-rounded source convention used by normalization.
+    for (int64_t i = 0; i < n*k; ++i) {
+        if (!std::isfinite(source_at(source,source_type,i))) { return false; }
     }
     llama_sinq_statistics result;
-    // Zero variance has no defined kurtosis. Report zero and do not gate it;
-    // retain the legacy normalizer when gate is off or the matrix is constant.
-    result.degenerate = m2 == 0;
-    result.kurtosis = result.degenerate ? 0 : (m4/double(count))/std::pow(m2/double(count),2);
-    if (!std::isfinite(result.kurtosis)) { return false; }
-    result.gated = options.gate && result.kurtosis > 5.;
-    result.identity = options.identity || options.strength == 0.f || result.gated;
+    result.identity = options.identity || options.strength == 0.f;
     try {
         std::vector<ggml_fp16_t> output(size_t(k),ggml_fp32_to_fp16(1.f));
         if (!result.identity) {

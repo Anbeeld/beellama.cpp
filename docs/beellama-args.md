@@ -17,7 +17,6 @@ using standard weight types.
 | `--sinq-precondition none\|sidecar\|identity` | `none` | `sidecar` computes column scales; `identity` writes all-one controls. Only standard Q3_K/Q4_K weights within the supported mask receive companions. |
 | `--sinq-strip-width 64\|128` | `64` | Full-height normalization-strip width, separate from native 256-element Q_K superblocks. |
 | `--sinq-iterations 4\|8\|16` | `16` | Best-intermediate float32 normalization steps. |
-| `--sinq-gate on\|off` | `on` | Whole-matrix kurtosis greater than 5 uses exact identity scales when enabled. This follows the reference gate recipe, not a claim that it is the best quality setting. |
 | `--sinq-coverage` | Off | Restricts ordinary controls to the same supported Qwen3.5 primary-trunk FFN/attention/GDN mask. Conditioning itself always uses this mask. |
 | `--tensor-type tensor_name=ggml_type` | Unused | Existing repeatable selector can retain floats or mix standard quantization types. |
 | `--tensor-type-file FILE` | Unused | Reads the existing selectors from a file. |
@@ -27,7 +26,7 @@ using standard weight types.
 SINQ options accept either `--option=value` or `--option value`.
 
 ```sh
-llama-quantize --pure --sinq-precondition=sidecar --sinq-gate=off   source-bf16.gguf model.beellama-qk-sinq.gguf Q3_K
+llama-quantize --pure --sinq-precondition=sidecar source-bf16.gguf model.beellama-qk-sinq.gguf Q3_K
 llama-quantize --pure source-bf16.gguf ordinary-control.gguf Q3_K
 ```
 

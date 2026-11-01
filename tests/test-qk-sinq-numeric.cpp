@@ -98,13 +98,13 @@ static void reference(const std::vector<float> & w, int n, int g, int iterations
     }
 }
 struct fixture {
-    uint32_t h[7];
+    uint32_t h[6];
     std::vector<float> w,t;
 };
 static fixture read_fixture(const std::string & path) {
     std::ifstream f(path,std::ios::binary); CHECK(f.good()); fixture a;
     f.read(reinterpret_cast<char *>(a.h),sizeof(a.h));
-    CHECK(a.h[0]==0x514e4953 && a.h[1]==1 && a.h[2]>=2 && a.h[3]%a.h[4]==0);
+    CHECK(a.h[0]==0x514e4953 && a.h[1]==2 && a.h[2]>=2 && a.h[3]%a.h[4]==0);
     const size_t nk=size_t(a.h[2])*a.h[3], groups=nk/a.h[4];
     a.w.resize(nk); a.t.resize(a.h[3]);
     f.read(reinterpret_cast<char *>(a.w.data()),nk*sizeof(float));
@@ -121,25 +121,16 @@ static void fixtures(int argc, char ** argv) {
         CHECK(a.w==post.w && std::memcmp(a.h,post.h,sizeof(a.h))==0);
         const int n=a.h[2], k=a.h[3], g=a.h[4];
         llama_sinq_options opt; opt.strip_width=g;
-        // Ungated binaries explicitly bypass the whole-matrix gate.
-        opt.gate=path.find("_ungated")==std::string::npos;
         std::vector<ggml_fp16_t> t, parallel; llama_sinq_statistics stats, ps;
         CHECK(llama_sinq_compute_scales(a.w.data(),GGML_TYPE_F32,n,k,opt,1,t,stats));
         CHECK(llama_sinq_compute_scales(a.w.data(),GGML_TYPE_F32,n,k,opt,4,parallel,ps));
-        CHECK(t==parallel && stats.identity==ps.identity && stats.kurtosis==ps.kurtosis);
-        CHECK(stats.identity==(a.h[6]!=0));
-        CHECK(std::isfinite(stats.kurtosis));
-        double mean=0,m2=0,m4=0;
-        for(float x:a.w) { mean+=x; } mean/=a.w.size();
-        for(float x:a.w) { double d=x-mean,d2=d*d; m2+=d2; m4+=d2*d2; }
-        const double variance=m2/a.w.size();
-        const double expected_kurtosis=m2==0 ? 0 : (m4/a.w.size())/(variance*variance);
-        CHECK(std::abs(stats.kurtosis-expected_kurtosis)<=1.e-10*std::max(1.,expected_kurtosis));
+        CHECK(t==parallel && !stats.identity && !ps.identity);
+        CHECK(stats.strips.size()==size_t(k/g));
         float lo=std::numeric_limits<float>::infinity(), hi=0;
         for (int j=0; j<k; ++j) {
             float actual=ggml_fp16_to_fp32(t[j]); CHECK(actual>0 && std::isfinite(actual));
-            if (a.h[6]) { CHECK(actual==1 && a.t[j]==1 && post.t[j]==1); }
-            else { CHECK(t[j] == ggml_fp32_to_fp16(post.t[j])); CHECK(ggml_fp32_to_fp16(a.t[j]) == ggml_fp32_to_fp16(post.t[j])); }
+            CHECK(t[j] == ggml_fp32_to_fp16(post.t[j]));
+            CHECK(ggml_fp32_to_fp16(a.t[j]) == ggml_fp32_to_fp16(post.t[j]));
             lo=std::min(lo,actual); hi=std::max(hi,actual);
         }
         CHECK(stats.min_scale==lo && stats.max_scale==hi);
@@ -207,7 +198,7 @@ static void synthetic() {
         }
         const void * input=type==GGML_TYPE_F32?static_cast<const void *>(w.data()):type==GGML_TYPE_F16?static_cast<const void *>(h.data()):static_cast<const void *>(b.data());
         for (int width:{64,128}) { for (int it:{4,8,16}) {
-            llama_sinq_options o; o.strip_width=width; o.iterations=it; o.gate=false;
+            llama_sinq_options o; o.strip_width=width; o.iterations=it;
             llama_sinq_statistics s,rs; std::vector<ggml_fp16_t> t,t4,rt;
             CHECK(llama_sinq_compute_scales(input,type,n,k,o,1,t,s));
             CHECK(llama_sinq_compute_scales(input,type,n,k,o,4,t4,rs)); CHECK(t==t4);
@@ -273,13 +264,19 @@ static void synthetic() {
     for(int width:{64,128}) {
         llama_sinq_options o; o.strip_width=width; llama_sinq_statistics s; std::vector<ggml_fp16_t> t;
         std::fill(w.begin(),w.end(),.125f);
-        CHECK(llama_sinq_compute_scales(w.data(),GGML_TYPE_F32,n,k,o,4,t,s)); CHECK(s.kurtosis==0 && !s.identity);
+        CHECK(llama_sinq_compute_scales(w.data(),GGML_TYPE_F32,n,k,o,4,t,s)); CHECK(!s.identity);
         std::vector<float> constant(n*width,.125f),ec,er;
         reference(constant,n,width,16,ec,er);
         for(int j=0;j<k;++j) { CHECK(t[j]==ggml_fp32_to_fp16(ec[j%width])); }
         w[k+width+3]=30;
-        CHECK(llama_sinq_compute_scales(w.data(),GGML_TYPE_F32,n,k,o,4,t,s)); CHECK(s.identity && s.kurtosis>5);
-        for(auto v:t) { CHECK(ggml_fp16_to_fp32(v)==1); }
+        CHECK(llama_sinq_compute_scales(w.data(),GGML_TYPE_F32,n,k,o,4,t,s));
+        CHECK(!s.identity && s.strips.size()==size_t(k/width));
+        for (int start=0; start<k; start+=width) {
+            std::vector<float> tile(n*width),columns,rows;
+            for (int i=0;i<n;++i) { for (int j=0;j<width;++j) { tile[i*width+j]=w[i*k+start+j]; } }
+            reference(tile,n,width,16,columns,rows);
+            for (int j=0;j<width;++j) { CHECK(t[start+j]==ggml_fp32_to_fp16(columns[j])); }
+        }
     }
     std::puts("synthetic: source F32/F16/BF16, widths 64/128, iterations 4/8/16, threads 1/4, native Q3_K/Q4_K, exact serialized compensation");
 }
@@ -296,49 +293,22 @@ static void row_shapes() {
             reference(tile,n,g,it,ec,er);
             for(int j=0;j<g;++j) { CHECK(close(columns[j],ec[j])); }
             for(int i=0;i<n;++i) { CHECK(close(rows[i],er[i])); }
-            llama_sinq_options o; o.strip_width=g; o.iterations=it; o.gate=false;
+            llama_sinq_options o; o.strip_width=g; o.iterations=it;
             llama_sinq_statistics s1,s4; std::vector<ggml_fp16_t> t1,t4;
             CHECK(llama_sinq_compute_scales(w.data(),GGML_TYPE_F32,n,k,o,1,t1,s1));
             CHECK(llama_sinq_compute_scales(w.data(),GGML_TYPE_F32,n,k,o,4,t4,s4));
-            CHECK(t1==t4 && s1.kurtosis==s4.kurtosis);
+            CHECK(t1==t4 && s1.identity==s4.identity);
             for(int j=0;j<g;++j) { CHECK(t1[j]==ggml_fp32_to_fp16(columns[j])); }
         }
     } }
     std::puts("row shapes: 2/33/128/257, full-height strips, both column reduction branches");
 }
-static void gate_scale_invariance() {
-    constexpr int n=4,k=128;
-    // Dyadic values keep the FP16 source convention exact at every magnitude.
-    for (auto type:{GGML_TYPE_F32,GGML_TYPE_F16,GGML_TYPE_BF16}) {
-        double first=-1;
-        for (float magnitude:{1.f,.0625f,.00390625f,.000244140625f}) {
-            std::vector<float> w(n*k,0.f);w[17]=magnitude;
-            std::vector<ggml_fp16_t> h(n*k);std::vector<ggml_bf16_t> b(n*k);
-            for (int i=0;i<n*k;++i) { h[i]=ggml_fp32_to_fp16(w[i]);b[i]=ggml_fp32_to_bf16(w[i]); }
-            const void * input=type==GGML_TYPE_F32 ? static_cast<void *>(w.data()) :
-                type==GGML_TYPE_F16 ? static_cast<void *>(h.data()) : static_cast<void *>(b.data());
-            long double mean=0,m2=0,m4=0;
-            for(float x:w)mean+=x;mean/=w.size();
-            for(float x:w) { const long double d=x-mean; m2+=d*d;m4+=d*d*d*d; }
-            const double expected=double(w.size()*m4/(m2*m2));
-            llama_sinq_options o;o.gate=true;
-            llama_sinq_statistics s;std::vector<ggml_fp16_t> t;
-            CHECK(llama_sinq_compute_scales(input,type,n,k,o,1,t,s));
-            CHECK(std::abs(s.kurtosis-expected)<=1.e-6*expected);
-            CHECK(s.identity && s.kurtosis>5);
-            if(first>=0)CHECK(std::abs(s.kurtosis-first)<=1.e-6*first);
-            first=s.kurtosis;
-        }
-    }
-    std::puts("gate scale invariance: dyadic F32/F16/BF16 and independent central moments passed");
-}
-
 static void strength_and_diagnostics() {
     constexpr int n=33,k=256;
     std::vector<float> w(n*k);
     for (int i=0;i<n*k;++i) { w[i]=half(float(std::sin(i*.73)*(1+(i%23)*.2))); }
     for (int width:{64,128}) { for (int iterations:{4,16}) {
-        llama_sinq_options o;o.gate=false;o.strip_width=width;o.iterations=iterations;
+        llama_sinq_options o;o.strip_width=width;o.iterations=iterations;
         std::vector<ggml_fp16_t> legacy,actual,identity;
         llama_sinq_statistics ls,s;
         CHECK(llama_sinq_compute_scales(w.data(),GGML_TYPE_F32,n,k,o,1,legacy,ls));
@@ -380,14 +350,14 @@ static void strength_and_diagnostics() {
     } }
     std::fill(w.begin(),w.end(),.125f);
     llama_sinq_options o;llama_sinq_statistics s;std::vector<ggml_fp16_t> t;
-    CHECK(llama_sinq_compute_scales(w.data(),GGML_TYPE_F32,n,k,o,1,t,s));CHECK(s.degenerate && !s.gated && s.kurtosis==0);
+    CHECK(llama_sinq_compute_scales(w.data(),GGML_TYPE_F32,n,k,o,1,t,s));CHECK(!s.identity && s.strips.size()==size_t(k/o.strip_width));
     std::fill(w.begin(),w.end(),0.f);
-    CHECK(llama_sinq_compute_scales(w.data(),GGML_TYPE_F32,n,k,o,1,t,s));CHECK(s.degenerate && !s.gated);
-    std::puts("strength/diagnostics: independent preupdate oracle, serialized compensation and degenerate policy passed");
+    CHECK(llama_sinq_compute_scales(w.data(),GGML_TYPE_F32,n,k,o,1,t,s));CHECK(!s.identity && s.strips.size()==size_t(k/o.strip_width));
+    std::puts("strength/diagnostics: independent preupdate oracle, serialized compensation and constant normalization passed");
 }
 
 int main(int argc,char ** argv) {
     // Initialize conversion tables on platforms that use them.
     ggml_context * ctx=ggml_init({1024,nullptr,true}); CHECK(ctx); ggml_free(ctx);
-    gate_scale_invariance(); strength_and_diagnostics(); fixtures(argc,argv); invalid(); synthetic(); row_shapes(); std::puts("test-qk-sinq-numeric: PASS");
+    strength_and_diagnostics(); fixtures(argc,argv); invalid(); synthetic(); row_shapes(); std::puts("test-qk-sinq-numeric: PASS");
 }

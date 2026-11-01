@@ -16,7 +16,7 @@ from gguf.quants import dequantize
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def write(path, kind=None, scales=None, manifest=True, version=1):
+def write(path, kind=None, scales=None, manifest=True, version=1, metadata=None):
     w = GGUFWriter(path, 'qwen35')
     name = 'blk.0.ffn_up.weight'
     if kind is None:
@@ -34,6 +34,13 @@ def write(path, kind=None, scales=None, manifest=True, version=1):
         w.add_uint32('beellama.qk_sinq.version', version)
         if manifest:
             w.add_array('beellama.qk_sinq.tensors', [name])
+    for key, value in (metadata or {}).items():
+        if isinstance(value, bool):
+            w.add_bool(key, value)
+        elif isinstance(value, int):
+            w.add_uint32(key, value)
+        else:
+            w.add_string(key, value)
     w.write_header_to_file()
     w.write_kv_data_to_file()
     w.write_tensors_to_file()
@@ -60,6 +67,42 @@ class TestQKSidecar(unittest.TestCase):
                 self.assertEqual(record['auxiliary_bytes'], 512)
                 self.assertEqual(record['tensor_inventory'][0]['dtype'], kind.name)
                 self.assertEqual(record['tensor_inventory'][0]['companion']['min'], 1)
+
+    def test_supported_sinq_metadata(self):
+        metadata = {'beellama.qk_sinq.algorithm': 'normalization',
+                    'beellama.qk_sinq.strip_width': 64,
+                    'beellama.qk_sinq.iterations': 16,
+                    'beellama.qk_sinq.producer': 'test',
+                    'beellama.qk_sinq.numerics': 'test'}
+        with tempfile.TemporaryDirectory() as directory:
+            d = Path(directory)
+            write(d/'source.gguf', metadata=metadata)
+            write(d/'model.gguf', GGMLQuantizationType.Q3_K, np.ones(256), metadata=metadata)
+            result = self.inspect(d/'source.gguf', d/'model.gguf', d/'out.json')
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_unsupported_sinq_metadata(self):
+        cases = [('beellama.qk_sinq.kurtosis_gate', True),
+                 ('beellama.qk_sinq.kurtosis_gate', False),
+                 ('beellama.qk_sinq.kurtosis_gate', 'false'),
+                 ('beellama.qk_sinq.future_control', True)]
+        with tempfile.TemporaryDirectory() as directory:
+            d = Path(directory)
+            for target in ['source', 'model']:
+                for transformed in [False, True]:
+                    for key, value in cases:
+                        with self.subTest(target=target, transformed=transformed,
+                                          key=key, value=value):
+                            for name in ['source', 'model']:
+                                kind = GGMLQuantizationType.Q3_K if transformed else None
+                                scales = np.ones(256) if kind is not None else None
+                                metadata = {key: value} if name == target else None
+                                write(d/f'{name}.gguf', kind, scales, metadata=metadata)
+                            result = self.inspect(d/'source.gguf', d/'model.gguf', d/'out.json')
+                            self.assertNotEqual(result.returncode, 0, result.stdout)
+                            self.assertIn('unsupported SINQ metadata', result.stderr)
+                            self.assertIn(key, result.stderr)
+                            self.assertIn(str(d/f'{target}.gguf'), result.stderr)
 
     def test_bad_association_and_values(self):
         with tempfile.TemporaryDirectory() as directory:

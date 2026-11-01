@@ -3,6 +3,7 @@
 #include "ggml.h"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 // Native codecs audited for column-conditioned matmul and channel importance.
@@ -20,11 +21,21 @@ inline bool llama_sinq_supported_type(ggml_type type) {
     }
 }
 
-// Offline statistics only. Weight storage and matmul remain ordinary GGML types.
+// A closed metadata namespace rejects unsupported transforms rather than
+// silently loading a model with semantics this runtime does not implement.
+inline bool llama_sinq_supported_metadata_key(const std::string & key) {
+    for (const char * supported : {"beellama.qk_sinq.version", "beellama.qk_sinq.tensors",
+            "beellama.qk_sinq.algorithm", "beellama.qk_sinq.strip_width", "beellama.qk_sinq.iterations",
+            "beellama.qk_sinq.producer", "beellama.qk_sinq.numerics"}) {
+        if (key == supported) { return true; }
+    }
+    return false;
+}
+
+// Offline normalization only. Weight storage and matmul remain ordinary GGML types.
 struct llama_sinq_options {
     int strip_width = 64;
     int iterations = 16;
-    bool gate = true;
     bool identity = false;
     float strength = 1.f;
 };
@@ -37,10 +48,7 @@ struct llama_sinq_tile_statistics {
 };
 
 struct llama_sinq_statistics {
-    double kurtosis = 0;
     bool identity = false;
-    bool gated = false;
-    bool degenerate = false;
     float min_scale = 1;
     float max_scale = 1;
     float median_scale = 1;

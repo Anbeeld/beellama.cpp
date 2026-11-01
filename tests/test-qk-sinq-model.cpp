@@ -44,12 +44,12 @@ static void make_model(const std::string & path, const std::string & mode, bool 
     gguf_set_val_u32(file,"tokenizer.ggml.unknown_token_id",0);
     gguf_set_val_u32(file,"tokenizer.ggml.bos_token_id",1);
     gguf_set_val_u32(file,"tokenizer.ggml.eos_token_id",2);
-    const bool sinq = mode != "source" && mode != "orphan";
+    const bool sinq = mode != "source" && mode != "metadata_only" && mode != "orphan";
     if ((sinq || mode == "orphan") && mode != "missing_version") {
         if (mode == "version_dtype") { gguf_set_val_str(file,"beellama.qk_sinq.version","1"); }
         else { gguf_set_val_u32(file,"beellama.qk_sinq.version",mode == "version_value" ? 2 : 1); }
     }
-    if (mode != "source") {
+    if (mode != "source" && mode != "metadata_only") {
         gguf_set_val_str(file,"beellama.qk_sinq.algorithm","sinkhorn_log");
         gguf_set_val_u32(file,"beellama.qk_sinq.strip_width",mode == "bad_width" ? 32 : 64);
         gguf_set_val_u32(file,"beellama.qk_sinq.iterations",mode == "bad_iterations" ? 3 : 16);
@@ -59,6 +59,12 @@ static void make_model(const std::string & path, const std::string & mode, bool 
             gguf_set_arr_str(file,"beellama.qk_sinq.tensors",targets,mode == "duplicate_manifest" ? 2 : 1);
         }
     }
+    if (mode == "legacy_enabled" || mode == "legacy_disabled") {
+        gguf_set_val_bool(file,"beellama.qk_sinq.kurtosis_gate",mode == "legacy_enabled");
+    }
+    if (mode == "metadata_only") { gguf_set_val_bool(file,"beellama.qk_sinq.kurtosis_gate",false); }
+    if (mode == "legacy_mistyped") { gguf_set_val_str(file,"beellama.qk_sinq.kurtosis_gate","off"); }
+    if (mode == "unknown_metadata") { gguf_set_val_bool(file,"beellama.qk_sinq.unknown_control",false); }
     if (mode == "hadamard") { gguf_set_val_bool(file,"prism.hadamard.test",true); }
     std::vector<std::vector<uint8_t>> payloads;
     auto add = [&](const char * name, int k, int n, bool norm = false) {
@@ -98,7 +104,7 @@ static llama_model * load(const std::string & path, llama_split_mode split = LLA
     auto p = llama_model_default_params(); p.n_gpu_layers = 0; p.split_mode = split; p.check_tensors = check_tensors;
     logs.clear(); return llama_model_load_from_file(path.c_str(),p);
 }
-static std::string split_source(const std::string & source, const std::filesystem::path & dir, bool misplace_scale = false) {
+static std::string split_source(const std::string & source, const std::filesystem::path & dir, bool misplace_scale = false, bool unsupported_metadata = false) {
     ggml_context * data = nullptr;
     gguf_init_params init = {false,&data};
     auto * input = gguf_init_from_file(source.c_str(),init);
@@ -110,12 +116,13 @@ static std::string split_source(const std::string & source, const std::filesyste
         gguf_set_val_u16(output,"split.no",uint16_t(part));
         gguf_set_val_u16(output,"split.count",uint16_t(parts));
         gguf_set_val_i32(output,"split.tensors.count",count);
+        if (unsupported_metadata && part == 1) { gguf_set_val_bool(output,"beellama.qk_sinq.kurtosis_gate",false); }
         for (int i = 0; i < count; ++i) {
             const char * name = gguf_get_tensor_name(input,i);
             const int destination = misplace_scale && std::strstr(name,".sinq_scale2") ? 0 : i/4;
             if (destination == part) { gguf_add_tensor(output,ggml_get_tensor(data,name)); }
         }
-        char filename[80]; std::snprintf(filename,sizeof(filename),"%s-%05d-of-%05d.gguf",misplace_scale ? "misplaced-source" : "split-source",part+1,parts);
+        char filename[80]; std::snprintf(filename,sizeof(filename),"%s-%05d-of-%05d.gguf",unsupported_metadata ? "unsupported-source" : misplace_scale ? "misplaced-source" : "split-source",part+1,parts);
         const auto path = (dir/filename).string();
         check(gguf_write_to_file(output,path.c_str(),false),"split fixture write");
         if (part == 0) { first = path; }
@@ -137,7 +144,7 @@ static void full_coverage_pairs(const std::string & source, const std::filesyste
         const auto identity = stock+".identity.gguf";
         const auto treatment = stock+".conditioned.gguf";
         for (auto mode : {LLAMA_SINQ_IDENTITY,LLAMA_SINQ_SIDECAR}) {
-            p.sinq_precondition = mode; p.sinq_gate = false;
+            p.sinq_precondition = mode;
             const auto & path = mode==LLAMA_SINQ_IDENTITY ? identity : treatment;
             check(llama_model_quantize(source.c_str(),path.c_str(),&p)==0,"full pure sidecar quantization");
             ggml_context * data = nullptr;
@@ -202,7 +209,7 @@ static void native_codec_pairs(const std::string & source, const std::filesystem
         auto p=llama_model_quantize_default_params();p.ftype=codec.first;p.pure=true;p.nthread=2;
         const llama_model_tensor_override overrides[]={{".*",codec.second},{nullptr,GGML_TYPE_COUNT}};
         p.tt_overrides=overrides;
-        p.output_tensor_type=codec.second;p.token_embedding_type=codec.second;p.imatrix=entries.data();p.sinq_gate=false;
+        p.output_tensor_type=codec.second;p.token_embedding_type=codec.second;p.imatrix=entries.data();
         const auto stock=(dir/("codec-"+std::to_string(codec.second)+"-stock.gguf")).string();
         check(llama_model_quantize(source.c_str(),stock.c_str(),&p)==0,"native codec stock production");
         ggml_context * stock_data=nullptr;auto * stock_meta=gguf_init_from_file(stock.c_str(),{false,&stock_data});
@@ -289,7 +296,7 @@ static void settings_controls(const std::string & source, const std::filesystem:
         out.close(); check(bool(out),"tensor-list fixture write"); return path;
     };
     const auto ffn_path=write_list("ffn.txt",ffn), attention_path=write_list("attention.txt",attention), all_path=write_list("all.txt",all);
-    auto p=llama_model_quantize_default_params(); p.ftype=LLAMA_FTYPE_MOSTLY_Q3_K_M; p.pure=true; p.nthread=2; p.sinq_gate=false;
+    auto p=llama_model_quantize_default_params(); p.ftype=LLAMA_FTYPE_MOSTLY_Q3_K_M; p.pure=true; p.nthread=2;
     check(p.sinq_strength==1.f && !p.sinq_tensor_list && !p.sinq_diagnostics_json,"new API defaults");
     const auto stock=(dir/"settings-stock.gguf").string();
     const auto stock_json=(dir/"settings-stock.json").string(); p.sinq_diagnostics_json=stock_json.c_str();
@@ -417,7 +424,7 @@ int main(int argc, char ** argv) try {
     for (auto format : formats) {
         const auto output = (dir/("quantized-"+std::to_string(format)+".gguf")).string();
         auto p = llama_model_quantize_default_params(); p.ftype = format; p.pure = true; p.nthread = 2;
-        p.sinq_precondition = LLAMA_SINQ_SIDECAR; p.sinq_strip_width = 64; p.sinq_iterations = 16; p.sinq_gate = false;
+        p.sinq_precondition = LLAMA_SINQ_SIDECAR; p.sinq_strip_width = 64; p.sinq_iterations = 16;
         check(llama_model_quantize(source.c_str(),output.c_str(),&p) == 0,"standard QK model precondition/quantize");
         auto * metadata = gguf_init_from_file(output.c_str(),{true,nullptr});
         check(metadata != nullptr,"read quantized metadata");
@@ -524,6 +531,9 @@ int main(int argc, char ** argv) try {
         {"missing_scale","companion"},{"orphan","companion"},{"scale_shape","FP16"},{"scale_dtype","FP16"},
         {"scale_nan","non-finite or non-positive"},{"scale_zero","non-finite or non-positive"},{"scale_negative","non-finite or non-positive"},
         {"unsupported","unsupported tensor"},{"hadamard","Hadamard"},
+        {"legacy_enabled","unsupported SINQ metadata"},{"legacy_disabled","unsupported SINQ metadata"},
+        {"legacy_mistyped","unsupported SINQ metadata"},{"unknown_metadata","unsupported SINQ metadata"},
+        {"metadata_only","unsupported SINQ metadata"},
     };
     for (const auto & entry : bad) {
         const auto path = (dir/(std::string(entry.first)+".gguf")).string(); make_model(path,entry.first);
@@ -532,12 +542,35 @@ int main(int argc, char ** argv) try {
         check(!model && logs.find(entry.second) != std::string::npos,"malformed fixture accepted or wrong error");
         std::printf("malformed %s rejected OK\n",entry.first);
     }
+    // Unknown transform metadata must not leak through stock COPY or quantization.
+    for (bool copy : {false,true}) {
+        auto p=llama_model_quantize_default_params(); p.only_copy=copy;
+        check(llama_model_quantize((dir/"metadata_only.gguf").string().c_str(),
+            (dir/"metadata-rejected.gguf").string().c_str(),&p)!=0,"unsupported metadata accepted without version");
+    }
     // Required companion validation also runs without the optional general
     // tensor checker, which catches NaN earlier when it is enabled above.
     auto * nan_without_check = load((dir/"scale_nan.gguf").string(),LLAMA_SPLIT_MODE_NONE,false);
     if (nan_without_check) { llama_model_free(nan_without_check); }
     check(!nan_without_check && logs.find("non-finite or non-positive") != std::string::npos,"NaN side scale must fail without optional tensor checks");
     const auto valid = (dir/"valid.gguf").string(); make_model(valid,"valid");
+    const auto unsupported_split = split_source(valid,dir,false,true);
+    auto * unsupported_model = load(unsupported_split);
+    if (unsupported_model) { llama_model_free(unsupported_model); }
+    check(!unsupported_model && logs.find("unsupported SINQ metadata") != std::string::npos,"unsupported metadata accepted in secondary shard");
+    auto reject_copy=llama_model_quantize_default_params(); reject_copy.only_copy=true;
+    check(llama_model_quantize(unsupported_split.c_str(),(dir/"rejected-split.gguf").string().c_str(),&reject_copy)!=0,
+          "COPY accepted unsupported metadata from secondary shard");
+    llama_model_kv_override obsolete_override[2] = {};
+    std::strcpy(obsolete_override[0].key,"beellama.qk_sinq.kurtosis_gate");
+    obsolete_override[0].tag=LLAMA_KV_OVERRIDE_TYPE_BOOL; obsolete_override[0].val_bool=false;
+    auto override_source=llama_model_default_params(); override_source.n_gpu_layers=0; override_source.kv_overrides=obsolete_override;
+    auto * overridden=llama_model_load_from_file(source.c_str(),override_source);
+    if (overridden) { llama_model_free(overridden); }
+    check(!overridden,"unsupported metadata override accepted by loader");
+    reject_copy.kv_overrides=obsolete_override;
+    check(llama_model_quantize(source.c_str(),(dir/"rejected-override.gguf").string().c_str(),&reject_copy)!=0,
+          "COPY accepted unsupported metadata override");
     const auto misplaced = split_source(valid,dir,true);
     auto * misplaced_model = load(misplaced);
     if (misplaced_model) { llama_model_free(misplaced_model); }

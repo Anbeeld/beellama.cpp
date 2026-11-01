@@ -28,7 +28,6 @@ static void run_case(ggml_backend_t backend, const char * name, ggml_type type,
     }
     llama_sinq_options options;
     options.strip_width = width;
-    options.gate = false;
     options.identity = identity;
     llama_sinq_statistics statistics;
     std::vector<ggml_fp16_t> scales;

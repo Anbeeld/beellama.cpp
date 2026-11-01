@@ -126,7 +126,7 @@ static void usage(const char * executable) {
     printf("       [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--tensor-type] [--tensor-type-file]\n");
     printf("       [--prune-layers] [--keep-split] [--override-kv] [--dry-run] [--max-buffer-size]\n");
     printf("       [--sinq-precondition none|sidecar|identity] [--sinq-strip-width 64|128] [--sinq-iterations 4|8|16]\n");
-    printf("       [--sinq-gate on|off] [--sinq-strength FLOAT] [--sinq-tensor-list PATH] [--sinq-diagnostics-json PATH] [--sinq-coverage]\n");
+    printf("       [--sinq-strength FLOAT] [--sinq-tensor-list PATH] [--sinq-diagnostics-json PATH] [--sinq-coverage]\n");
     printf("       model-f32.gguf [model-quant.gguf] type [nthreads]\n\n");
     printf("  --allow-requantize\n");
     printf("                                      allow requantizing tensors that have already been quantized\n");
@@ -143,7 +143,6 @@ static void usage(const char * executable) {
     printf("                                      no embedding/output transform, codec fallback or copy mode\n");
     printf("  --sinq-strip-width 64|128             default 64; selected input dimensions must be strip aligned\n");
     printf("  --sinq-iterations 4|8|16              best-intermediate normalization steps (default 16)\n");
-    printf("  --sinq-gate on|off                    kurtosis > 5 uses exact identity (default on)\n");
     printf("  --sinq-strength FLOAT                 default 1.0; finite [0,1], nondefault requires sidecar\n");
     printf("                                      0 is identity; 1 preserves legacy rounding; serialized F16 scales are authoritative\n");
     printf("  --sinq-tensor-list PATH               default absent (all eligible); UTF-8 exact base names, one per line\n");
@@ -512,11 +511,6 @@ int llama_quantize(int argc, char ** argv) {
         } else if (strcmp(argv[arg_idx], "--sinq-diagnostics-json") == 0) {
             if (++arg_idx >= argc || !*argv[arg_idx]) { usage(argv[0]); }
             params.sinq_diagnostics_json = argv[arg_idx];
-        } else if (strcmp(argv[arg_idx], "--sinq-gate") == 0) {
-            if (++arg_idx >= argc) { usage(argv[0]); }
-            if (strcmp(argv[arg_idx],"on") == 0) { params.sinq_gate = true; }
-            else if (strcmp(argv[arg_idx],"off") == 0) { params.sinq_gate = false; }
-            else { usage(argv[0]); }
         } else if (strcmp(argv[arg_idx], "--sinq-coverage") == 0) {
             params.sinq_coverage = true;
         } else if (strcmp(argv[arg_idx], "--pure") == 0) {
