@@ -5,6 +5,21 @@
 #include <cstdint>
 #include <vector>
 
+// Native codecs audited for column-conditioned matmul and channel importance.
+// This changes neither their block layouts nor their encoder algorithms.
+inline bool llama_sinq_supported_type(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q3_K: case GGML_TYPE_Q4_K:
+        case GGML_TYPE_IQ1_S: case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_XS: case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1: case GGML_TYPE_Q6_K: case GGML_TYPE_Q8_0:
+            return true;
+        default: return false;
+    }
+}
+
 // Offline statistics only. Weight storage and matmul remain ordinary GGML types.
 struct llama_sinq_options {
     int strip_width = 64;

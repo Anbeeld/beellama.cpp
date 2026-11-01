@@ -7,6 +7,7 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
+#include "llama-sinq.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-placement.h"
@@ -1709,8 +1710,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             const auto base = ml.weights_map.find(name);
             if (base == ml.weights_map.end() ||
-                (base->second.tensor->type != GGML_TYPE_Q3_K && base->second.tensor->type != GGML_TYPE_Q4_K)) {
-                throw std::runtime_error(format("QK SINQ companion association '%s' requires a standard Q3_K/Q4_K base weight",name.c_str()));
+                !llama_sinq_supported_type(base->second.tensor->type)) {
+                throw std::runtime_error(format("QK SINQ companion association '%s' requires an audited native weight codec",name.c_str()));
             }
             const auto & weight = base->second;
             if (ggml_n_dims(weight.tensor) != 2 || !ggml_is_contiguous(weight.tensor) ||

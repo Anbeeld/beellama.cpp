@@ -134,7 +134,7 @@ static void usage(const char * executable) {
     printf("                                      leave output.weight un(re)quantized\n");
     printf("                                      increases model size but may also increase quality, especially when requantizing\n");
     printf("  --sinq-precondition none|sidecar|identity\n");
-    printf("                                      offline conditioning with standard Q3_K/Q4_K blocks; companions require BeeLlama\n");
+    printf("                                      offline conditioning with audited native IQ/Q codecs; companions require BeeLlama\n");
     printf("  --sinq-strip-width 64|128             normalization strip, not the native Q_K block size\n");
     printf("  --sinq-iterations 4|8|16              best-intermediate normalization steps (default 16)\n");
     printf("  --sinq-gate on|off                    kurtosis > 5 uses exact identity (default on)\n");

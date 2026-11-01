@@ -1884,7 +1884,8 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                           const ggml_tensor * ffn_up_bias = nullptr,
                                           const ggml_tensor * ffn_gate_bias = nullptr,
                                           const ggml_tensor * ffn_up_scale = nullptr,
-                                          const ggml_tensor * ffn_gate_scale = nullptr) {
+                                          const ggml_tensor * ffn_gate_scale = nullptr,
+                                          bool separate_inputs = false) {
     const bool has_bias = ffn_up_bias != nullptr || ffn_gate_bias != nullptr;
     const bool has_scale = ffn_up_scale != nullptr || ffn_gate_scale != nullptr;
 
@@ -1951,7 +1952,7 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
         return false;
     }
 
-    if (ffn_up->src[1] != ffn_gate->src[1]) {
+    if (!separate_inputs && ffn_up->src[1] != ffn_gate->src[1]) {
         return false;
     }
 
@@ -4036,6 +4037,87 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // Distinct channel scales prevent the ordinary gate/up fusion from sharing
+    // its Q8 input. Quantize both scaled vectors in one launch, then use the
+    // existing fused dot/GLU kernel with separate activation records.
+    const int scaled_glu_outputs[] = { i + 4 };
+    if (node->op == GGML_OP_MUL &&
+            ggml_can_fuse_subgraph(cgraph, i,
+                { GGML_OP_MUL, GGML_OP_MUL_MAT, GGML_OP_MUL, GGML_OP_MUL_MAT, GGML_OP_GLU }, { i + 4 }) &&
+            ggml_cuda_check_fusion_memory_ranges(cgraph, i, 5, scaled_glu_outputs, 1)) {
+        ggml_tensor * first = cgraph->nodes[i + 1];
+        ggml_tensor * second = cgraph->nodes[i + 3];
+        ggml_tensor * glu = cgraph->nodes[i + 4];
+        const ggml_tensor * up = glu->src[1];
+        const ggml_tensor * gate = glu->src[0];
+        if (((up == first && gate == second) || (up == second && gate == first)) &&
+                first->src[1] == node && second->src[1] == cgraph->nodes[i + 2] &&
+                ggml_cuda_should_fuse_mul_mat(up, gate, glu, nullptr, nullptr, nullptr, nullptr, true) &&
+                ggml_cuda_should_fuse_mul_mat_vec_q(up) && ggml_cuda_should_fuse_mul_mat_vec_q(gate) &&
+                (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU_OAI ||
+                 (ggml_get_op_params_f32(glu, 2) == 1.702f && ggml_get_op_params_f32(glu, 3) == 7.0f))) {
+            const ggml_tensor * a = up->src[1];
+            const ggml_tensor * b = gate->src[1];
+            const ggml_tensor * x = a->src[0];
+            const ggml_tensor * sa = a->src[1];
+            const ggml_tensor * sb = b->src[1];
+            const ggml_type type = up->src[0]->type;
+            const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+            const bool preserve_dq = ggml_cuda_dq_mmv_enabled(GGML_CUDA_CC_IS_RDNA3_5(cc)) &&
+                (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K);
+            if (!preserve_dq && x == b->src[0] && x->type == GGML_TYPE_F32 &&
+                    ggml_is_contiguous(x) && ggml_nrows(x) == 1 &&
+                    sa->type == GGML_TYPE_F32 && sb->type == GGML_TYPE_F32 &&
+                    ggml_is_contiguous(sa) && ggml_is_contiguous(sb) &&
+                    ggml_nelements(sa) == x->ne[0] && ggml_nelements(sb) == x->ne[0] &&
+                    ggml_get_op_params_i32(up, 1) == GGML_HINT_NONE &&
+                    ggml_get_op_params_i32(gate, 1) == GGML_HINT_NONE) {
+                ggml_cuda_mm_fusion_args_host fusion{};
+                fusion.gate = gate->src[0];
+                fusion.gate_input_scale = sb;
+                fusion.glu_op = ggml_get_glu_op(glu);
+                fusion.glu_limit = ggml_get_op_params_f32(glu, 3);
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, up->src[0], x, nullptr, glu, &fusion, sa);
+                return 4;
+            }
+        }
+    }
+
+    // Channel scaling followed by a quantized matmul can be applied while
+    // encoding activations. The subgraph check protects shared/observable MUL
+    // results and allocation lifetimes; all other shapes keep the ordinary path.
+    const int scaled_mm_outputs[] = { i + 1 };
+    if (node->op == GGML_OP_MUL &&
+            ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL, GGML_OP_MUL_MAT }, { i + 1 }) &&
+            ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, scaled_mm_outputs, 1)) {
+        ggml_tensor * mm = cgraph->nodes[i + 1];
+        const ggml_tensor * x = node->src[0];
+        const ggml_tensor * scale = node->src[1];
+        const ggml_tensor * w = mm->src[0];
+        const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+        const bool bad_padding = ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+            ggml_nbytes(w) != ggml_backend_buffer_get_alloc_size(w->buffer, w) && w->view_src;
+        const bool preserve_dq = x->ne[1] == 1 &&
+            ggml_cuda_dq_mmv_enabled(GGML_CUDA_CC_IS_RDNA3_5(cc)) &&
+            (w->type == GGML_TYPE_Q4_K || w->type == GGML_TYPE_Q5_K || w->type == GGML_TYPE_Q6_K);
+        if (!preserve_dq && mm->src[1] == node && x->type == GGML_TYPE_F32 && scale->type == GGML_TYPE_F32 &&
+                mm->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && ggml_is_contiguous(scale) &&
+                scale->ne[0] == x->ne[0] && ggml_nelements(scale) == x->ne[0] &&
+                ggml_is_quantized(w->type) && !bad_padding &&
+                w->type != GGML_TYPE_NVFP4 && w->type != GGML_TYPE_MXFP4 &&
+                ggml_get_op_params_i32(mm, 1) == GGML_HINT_NONE) {
+            if (ggml_cuda_should_use_mmvq(w->type, cc, x->ne[1])) {
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, w, x, nullptr, mm, nullptr, scale);
+                return 1;
+            }
+            if (ggml_cuda_should_use_mmq(w->type, cc, x->ne[1], 0) &&
+                    ggml_cuda_is_aligned(x, 16) && ggml_cuda_is_aligned(scale, 16)) {
+                ggml_cuda_mul_mat_q(*cuda_ctx, w, x, nullptr, mm, nullptr, scale);
+                return 1;
+            }
+        }
+    }
 
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&

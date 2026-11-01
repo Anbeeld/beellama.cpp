@@ -2,6 +2,7 @@
 #include "ggml.h"
 #include "gguf.h"
 #include "ggml-backend.h"
+#include "../src/llama-sinq.h"
 
 
 #include <algorithm>
@@ -174,6 +175,103 @@ static void full_coverage_pairs(const std::string & source, const std::filesyste
     }
 }
 
+static void native_codec_pairs(const std::string & source, const std::filesystem::path & dir) {
+    const std::pair<llama_ftype,ggml_type> codecs[] = {
+        {LLAMA_FTYPE_MOSTLY_IQ4_XS,GGML_TYPE_IQ4_XS}, {LLAMA_FTYPE_MOSTLY_IQ1_S,GGML_TYPE_IQ1_S},
+        {LLAMA_FTYPE_MOSTLY_IQ1_M,GGML_TYPE_IQ1_M}, {LLAMA_FTYPE_MOSTLY_IQ2_XXS,GGML_TYPE_IQ2_XXS},
+        {LLAMA_FTYPE_MOSTLY_IQ2_XS,GGML_TYPE_IQ2_XS}, {LLAMA_FTYPE_MOSTLY_IQ2_S,GGML_TYPE_IQ2_S},
+        {LLAMA_FTYPE_MOSTLY_IQ3_XXS,GGML_TYPE_IQ3_XXS}, {LLAMA_FTYPE_MOSTLY_IQ3_S,GGML_TYPE_IQ3_S},
+        {LLAMA_FTYPE_MOSTLY_IQ4_NL,GGML_TYPE_IQ4_NL}, {LLAMA_FTYPE_MOSTLY_Q5_0,GGML_TYPE_Q5_0},
+        {LLAMA_FTYPE_MOSTLY_Q5_1,GGML_TYPE_Q5_1}, {LLAMA_FTYPE_MOSTLY_Q6_K,GGML_TYPE_Q6_K},
+        {LLAMA_FTYPE_MOSTLY_Q8_0,GGML_TYPE_Q8_0},
+    };
+    const char * names[] = {"token_embd.weight","output.weight","blk.0.attn_q.weight","blk.0.attn_k.weight",
+        "blk.0.attn_v.weight","blk.0.attn_output.weight","blk.0.ffn_gate.weight","blk.0.ffn_up.weight","blk.0.ffn_down.weight"};
+    ggml_context * original_data=nullptr;auto * original_meta=gguf_init_from_file(source.c_str(),{false,&original_data});
+    check(original_meta && original_data,"native codec original data read");
+    std::vector<std::vector<float>> importance(9);
+    std::vector<llama_model_imatrix_data> entries;
+    for (int i=0;i<9;++i) {
+        importance[i].resize(i==8 ? 512 : 256);
+        for (size_t j=0;j<importance[i].size();++j) { importance[i][j]=1.f+.01f*float(j%13); }
+        entries.push_back({names[i],importance[i].data(),importance[i].size()});
+    }
+    entries.push_back({nullptr,nullptr,0});
+    for (const auto & codec : codecs) {
+        auto p=llama_model_quantize_default_params();p.ftype=codec.first;p.pure=true;p.nthread=2;
+        const llama_model_tensor_override overrides[]={{".*",codec.second},{nullptr,GGML_TYPE_COUNT}};
+        p.tt_overrides=overrides;
+        p.output_tensor_type=codec.second;p.token_embedding_type=codec.second;p.imatrix=entries.data();p.sinq_gate=false;
+        const auto stock=(dir/("codec-"+std::to_string(codec.second)+"-stock.gguf")).string();
+        check(llama_model_quantize(source.c_str(),stock.c_str(),&p)==0,"native codec stock production");
+        ggml_context * stock_data=nullptr;auto * stock_meta=gguf_init_from_file(stock.c_str(),{false,&stock_data});
+        check(stock_meta && stock_data,"native codec stock read");
+        std::string identity,treatment;
+        for (auto mode : {LLAMA_SINQ_IDENTITY,LLAMA_SINQ_SIDECAR}) {
+            p.sinq_precondition=mode;
+            const auto path=stock+(mode==LLAMA_SINQ_IDENTITY ? ".identity.gguf" : ".sinq.gguf");
+            if(mode==LLAMA_SINQ_IDENTITY)identity=path;else treatment=path;
+            if(llama_model_quantize(source.c_str(),path.c_str(),&p)!=0) {
+                std::fprintf(stderr,"native codec companion failed: %s\n",ggml_type_name(codec.second));
+                check(false,"native codec identity/treatment producer unsupported");
+            }
+            ggml_context * data=nullptr;auto * meta=gguf_init_from_file(path.c_str(),{false,&data});
+            check(meta && data,"native codec companion read");int scales=0;
+            for(int64_t i=0;i<gguf_get_n_tensors(stock_meta);++i) {
+                const char * name=gguf_get_tensor_name(stock_meta,i);auto * a=ggml_get_tensor(stock_data,name);auto * b=ggml_get_tensor(data,name);
+                check(a && b && a->type==b->type,"native codec changed base type map");
+                const bool matrix=a->ne[1]>1;const bool conditioned=matrix && std::strncmp(name,"blk.",4)==0;
+                if(matrix && a->type!=codec.second) {
+                    std::fprintf(stderr,"native codec requested=%s tensor=%s actual=%s\n",ggml_type_name(codec.second),name,ggml_type_name(a->type));
+                    check(false,"native codec type promotion");
+                }
+                const bool companion=gguf_find_tensor(meta,(std::string(name)+".sinq_scale2").c_str())>=0;
+                check(companion==conditioned,"native codec projection association mismatch");scales+=companion;
+                if(mode==LLAMA_SINQ_IDENTITY || !conditioned)check(ggml_nbytes(a)==ggml_nbytes(b) && std::memcmp(a->data,b->data,ggml_nbytes(a))==0,"native codec identity/unconditioned payload changed");
+                if(mode==LLAMA_SINQ_SIDECAR && conditioned) {
+                    auto * original=ggml_get_tensor(original_data,name);
+                    auto * diagonal=ggml_get_tensor(data,(std::string(name)+".sinq_scale2").c_str());
+                    check(original && original->type==GGML_TYPE_F32 && diagonal,"native codec independent input source");
+                    const int64_t k=original->ne[0],n=original->ne[1];size_t index=0;
+                    while(index<9 && std::strcmp(names[index],name)!=0)++index;
+                    check(index<9,"native codec independent importance mapping");
+                    const auto * t=static_cast<const ggml_fp16_t *>(diagonal->data);
+                    const auto * w=static_cast<const float *>(original->data);
+                    std::vector<float> divided(size_t(k*n)),transformed(size_t(k),0.f);
+                    for(int64_t j=0;j<k;++j) {
+                        const float factor=ggml_fp16_to_fp32(t[j]);
+                        transformed[j]=importance[index][j]*factor*factor;
+                        for(int64_t i=0;i<n;++i)divided[size_t(i*k+j)]=w[i*k+j]/factor;
+                    }
+                    std::vector<uint8_t> expected(ggml_nbytes(b));
+                    check(ggml_quantize_chunk(codec.second,divided.data(),expected.data(),0,n,k,transformed.data())==expected.size(),"independent native encoder size");
+                    check(std::memcmp(expected.data(),b->data,expected.size())==0,"producer differs from native codec on original W/t and transformed t^2 I");
+                }
+            }
+            check(scales==7,"native codec missing projection scales");gguf_free(meta);ggml_free(data);
+            auto * model=load(path);check(model!=nullptr,"native codec companion loader unsupported");llama_model_free(model);
+        }
+        check(std::filesystem::file_size(identity)==std::filesystem::file_size(treatment),"native codec identity/treatment byte budget differs");
+        gguf_free(stock_meta);ggml_free(stock_data);
+        if(codec.second==GGML_TYPE_IQ2_XS) {
+            // A lookup has no linear activation-channel moment. Its required
+            // native weighting adapter must equal explicit uniform weights.
+            std::vector<float> uniform(256,1.f);
+            auto explicit_entries=entries;explicit_entries[0].data=uniform.data();
+            p.sinq_precondition=LLAMA_SINQ_NONE;p.imatrix=explicit_entries.data();
+            const auto expected=stock+".lookup-uniform.gguf";
+            const auto observed=stock+".lookup-no-linear-moment.gguf";
+            check(llama_model_quantize(source.c_str(),expected.c_str(),&p)==0,"explicit lookup weights");
+            p.imatrix=entries.data()+1;
+            check(llama_model_quantize(source.c_str(),observed.c_str(),&p)==0,"native lookup requires codec-neutral uniform importance fallback");
+            std::ifstream a(expected,std::ios::binary),b(observed,std::ios::binary);
+            const std::vector<char> first((std::istreambuf_iterator<char>(a)),{}),second((std::istreambuf_iterator<char>(b)),{});
+            check(first==second,"lookup importance fallback differs from explicit uniform native encoding");
+        }
+    }
+    gguf_free(original_meta);ggml_free(original_data);
+}
+
 int main(int argc, char ** argv) try {
     if (argc == 3 && std::strcmp(argv[1],"--load-only") == 0) {
         llama_log_set(logger,nullptr); llama_backend_init();
@@ -212,6 +310,7 @@ int main(int argc, char ** argv) try {
         std::printf("standard QK quantize/reload/slab identity format=%d OK\n",format);
     }
     full_coverage_pairs(source,dir);
+    native_codec_pairs(source,dir);
     // Conditioning must preserve the existing S/M/L allocator, including
     // conventional types that do not receive a channel companion.
     for (auto format : {LLAMA_FTYPE_MOSTLY_Q3_K_S,LLAMA_FTYPE_MOSTLY_Q3_K_M,
@@ -238,9 +337,9 @@ int main(int argc, char ** argv) try {
             const int64_t j = gguf_find_tensor(conditioned,name);
             check(j>=0 && gguf_get_tensor_type(base,i)==gguf_get_tensor_type(conditioned,j),"conditioning changed mixed preset type allocation");
             const auto type = gguf_get_tensor_type(base,i);
-            const bool eligible = std::strncmp(name,"blk.",4)==0 && (type==GGML_TYPE_Q3_K || type==GGML_TYPE_Q4_K);
+            const bool eligible = std::strncmp(name,"blk.",4)==0 && (type==GGML_TYPE_Q3_K || type==GGML_TYPE_Q4_K || type==GGML_TYPE_Q6_K);
             const bool has_scale = gguf_find_tensor(conditioned,(std::string(name)+".sinq_scale2").c_str())>=0;
-            check(has_scale==eligible,"mixed preset companion coverage does not match native Q3/Q4 allocation");
+            check(has_scale==eligible,"mixed preset companion coverage does not match audited Q3/Q4/Q6 allocation");
             if (!eligible) {
                 auto * a = ggml_get_tensor(base_data,name);
                 auto * b = ggml_get_tensor(conditioned_data,name);

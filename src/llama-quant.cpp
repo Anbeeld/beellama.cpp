@@ -1220,7 +1220,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         }
 
         metadata[i].sinq_preconditioned = sinq_enabled && sinq_tensor_eligible(tensor,*model) &&
-            (metadata[i].target_type == GGML_TYPE_Q3_K || metadata[i].target_type == GGML_TYPE_Q4_K);
+            llama_sinq_supported_type(metadata[i].target_type);
         if (metadata[i].sinq_preconditioned) {
             if (tensor->type != GGML_TYPE_F32 && tensor->type != GGML_TYPE_F16 && tensor->type != GGML_TYPE_BF16) {
                 throw std::runtime_error("QK SINQ preconditioning requires original F32/F16/BF16 matrices");
@@ -1252,7 +1252,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     }
 
     if (sinq_enabled) {
-        if (sinq_names.empty()) { throw std::runtime_error("QK SINQ found no eligible primary-trunk qwen35 Q3_K/Q4_K weights"); }
+        if (sinq_names.empty()) { throw std::runtime_error("QK SINQ found no eligible primary-trunk qwen35 native-codec weights"); }
         std::vector<const char *> names;
         for (const auto & name : sinq_names) { names.push_back(name.c_str()); }
         for (auto & out : ctx_outs) {
@@ -1431,6 +1431,15 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                             }
                         }
                     }
+                }
+                std::vector<float> lookup_importance;
+                if (!imatrix && tensor_name_match_token_embd(tensor->name) && ggml_quantize_requires_imatrix(new_type)) {
+                    // Lookup has no linear input-channel activation moments.
+                    // Equal channel weights implement ordinary reconstruction
+                    // error using the unchanged importance-aware native codec.
+                    lookup_importance.assign(size_t(tensor->ne[0])*tensor->ne[2]*tensor->ne[3],1.f);
+                    imatrix=lookup_importance.data();
+                    LLAMA_LOG_INFO("using uniform channel importance for embedding lookup (not calibrated linear moments); ");
                 }
                 if (!imatrix && tm.requires_imatrix) {
                     LLAMA_LOG_ERROR("\n\n============================================================\n");

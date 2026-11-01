@@ -50,11 +50,13 @@ static __device__ __forceinline__ float nvfp4_native_scale_error(
 #endif // CUDART_VERSION >= 12080
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
 
+template <bool scaled = false, bool paired = false>
 __launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
 static __global__ void quantize_q8_1(
         const float * x_ptr, void * vy_ptr,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t ne0, const uint32_t ne1, const uint3 ne2) {
+        const int64_t ne0, const uint32_t ne1, const uint3 ne2, const float * scale,
+        const float * gate_scale = nullptr) {
     ggml_cuda_pdl_lc();
     const float * GGML_CUDA_RESTRICT x  = x_ptr;
     void        * GGML_CUDA_RESTRICT vy = vy_ptr;
@@ -81,7 +83,13 @@ static __global__ void quantize_q8_1(
     const int64_t iqs = i_cont % QK8_1; // quant index
 
     ggml_cuda_pdl_sync();
-    const float xi = i0 < ne00 ? x[i03*s03 + i02*s02 + i01*s01 + i00] : 0.0f;
+    float xi = i0 < ne00 ? x[i03*s03 + i02*s02 + i01*s01 + i00] : 0.0f;
+    if constexpr (scaled) {
+        // Round the product independently, just like the materialized MUL.
+        const float * t = scale;
+        if constexpr (paired) { if (i3 != 0) { t = gate_scale; } }
+        if (i0 < ne00) { xi = __fmul_rn(xi, t[i0]); }
+    }
     float amax = fabsf(xi);
     float sum = xi;
 
@@ -453,11 +461,12 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
 }
 
 // scatter: grid over tokens, quantize once, write to all the token's compact rows
-template <mmq_q8_1_ds_layout ds_layout, bool scatter>
+template <mmq_q8_1_ds_layout ds_layout, bool scatter, bool scaled = false>
 static __global__ void quantize_mmq_q8_1(
         const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t ne0, const int ne1, const int ne2, const int n_expert_used) {
+        const int64_t ne0, const int ne1, const int ne2, const int n_expert_used,
+        const float * scale = nullptr) {
 
     constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
     constexpr int vals_per_sum   = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
@@ -488,7 +497,16 @@ static __global__ void quantize_mmq_q8_1(
     const int64_t iqs     = i0 % QK8_1_MMQ; // quant index in block
 
     // Load 4 floats per thread and calculate max. abs. value between them:
-    const float4 xi = i0 < ne00 ? x4[(base_idx + i00)/4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 xi = i0 < ne00 ? x4[(base_idx + i00)/4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if constexpr (scaled) {
+        if (i0 < ne00) {
+            const float4 t = ((const float4 *) scale)[i0/4];
+            xi.x = __fmul_rn(xi.x, t.x);
+            xi.y = __fmul_rn(xi.y, t.y);
+            xi.z = __fmul_rn(xi.z, t.z);
+            xi.w = __fmul_rn(xi.w, t.w);
+        }
+    }
     float amax = fabsf(xi.x);
     amax = fmaxf(amax, fabsf(xi.y));
     amax = fmaxf(amax, fabsf(xi.z));
@@ -567,7 +585,7 @@ void quantize_row_q8_1_cuda(
     const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
-    ggml_cuda_kernel_launch(quantize_q8_1, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+    ggml_cuda_kernel_launch(quantize_q8_1<false>, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv, (const float *) nullptr, (const float *) nullptr);
     GGML_UNUSED(type_src0);
 }
 
@@ -597,6 +615,53 @@ void quantize_mmq_q8_1_cuda(
             break;
         default:
             GGML_ABORT("fatal error");
+    }
+}
+
+void quantize_row_q8_1_scaled_cuda(
+        const float * x, const float * scale, void * vy, const ggml_type type_src0,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    GGML_ASSERT(ne0 % QK8_1 == 0);
+    const dim3 grid((ne0 + CUDA_QUANTIZE_BLOCK_SIZE - 1)/CUDA_QUANTIZE_BLOCK_SIZE, ne1, ne2*ne3);
+    const ggml_cuda_kernel_launch_params params(grid, dim3(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1), 0, stream);
+    ggml_cuda_kernel_launch(quantize_q8_1<true>, params, x, vy, ne00, s01, s02, s03, ne0, ne1,
+                           init_fastdiv_values(ne2), scale, (const float *) nullptr);
+    GGML_UNUSED(type_src0);
+}
+
+void quantize_row_q8_1_pair_cuda(
+        const float * x, const float * scale, const float * gate_scale, void * vy,
+        const int64_t ne00, const int64_t ne0, cudaStream_t stream) {
+    GGML_ASSERT(ne0 % QK8_1 == 0);
+    const dim3 grid((ne0 + CUDA_QUANTIZE_BLOCK_SIZE - 1)/CUDA_QUANTIZE_BLOCK_SIZE, 1, 2);
+    const ggml_cuda_kernel_launch_params params(grid, dim3(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1), 0, stream);
+    ggml_cuda_kernel_launch(quantize_q8_1<true, true>, params, x, vy, ne00,
+                           int64_t(0), int64_t(0), int64_t(0), ne0, uint32_t(1),
+                           init_fastdiv_values(1), scale, gate_scale);
+}
+
+void quantize_mmq_q8_1_scaled_cuda(
+        const float * x, const float * scale, void * vy, const ggml_type type_src0,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    GGML_ASSERT(ne00 % 4 == 0 && ne0 % QK8_1_MMQ == 0);
+    const dim3 grid(ne1, (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1)/(4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ), ne2*ne3);
+    const dim3 block(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+    switch (mmq_get_q8_1_ds_layout(type_src0)) {
+        case MMQ_Q8_1_DS_LAYOUT_D4:
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false, true><<<grid, block, 0, stream>>>(
+                x, nullptr, vy, ne00, s01, s02, s03, ne0, ne1, ne2, 0, scale);
+            break;
+        case MMQ_Q8_1_DS_LAYOUT_DS4:
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, false, true><<<grid, block, 0, stream>>>(
+                x, nullptr, vy, ne00, s01, s02, s03, ne0, ne1, ne2, 0, scale);
+            break;
+        case MMQ_Q8_1_DS_LAYOUT_D2S6:
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6, false, true><<<grid, block, 0, stream>>>(
+                x, nullptr, vy, ne00, s01, s02, s03, ne0, ne1, ne2, 0, scale);
+            break;
+        default: GGML_ABORT("unsupported scaled Q8 layout");
     }
 }
 
