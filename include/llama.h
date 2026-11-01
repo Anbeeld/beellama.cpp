@@ -561,7 +561,10 @@ extern "C" {
         int32_t sinq_strip_width;                                   // normalization strip width, not the native quantizer block size
         int32_t sinq_iterations;                                    // 4, 8 or 16 normalization steps
         bool sinq_gate;                                             // whole-matrix kurtosis > 5 uses identity
-        bool sinq_coverage;                                         // restrict ordinary controls to the same Qwen35 primary-trunk mask
+        bool sinq_coverage;                                         // historical reproduction only: preserves noneligible source types
+        float sinq_strength;                                       // [0,1], default 1; requires conditioning when nondefault
+        const char * sinq_tensor_list;                              // optional UTF-8 exact-name allowlist path; requires conditioning
+        const char * sinq_diagnostics_json;                         // optional external diagnostics path, also valid for stock
     } llama_model_quantize_params;
 
     typedef struct llama_logit_bias {

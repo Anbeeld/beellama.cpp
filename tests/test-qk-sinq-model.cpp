@@ -3,6 +3,7 @@
 #include "gguf.h"
 #include "ggml-backend.h"
 #include "../src/llama-sinq.h"
+#include "../vendor/nlohmann/json.hpp"
 
 
 #include <algorithm>
@@ -19,7 +20,7 @@
 static void check(bool ok, const char * message) { if (!ok) { throw std::runtime_error(message); } }
 static std::string logs;
 static void logger(ggml_log_level, const char * text, void *) { logs += text; }
-static void make_model(const std::string & path, const std::string & mode) {
+static void make_model(const std::string & path, const std::string & mode, bool incompatible_shape = false) {
     ggml_context * ctx = ggml_init({64*ggml_tensor_overhead(),nullptr,true});
     gguf_context * file = gguf_init_empty();
     gguf_set_val_str(file,"general.architecture","qwen35");
@@ -89,7 +90,7 @@ static void make_model(const std::string & path, const std::string & mode) {
     add("blk.0.attn_norm.weight",256,1,true); add("blk.0.post_attention_norm.weight",256,1,true);
     add("blk.0.attn_q.weight",256,512); add("blk.0.attn_k.weight",256,128); add("blk.0.attn_v.weight",256,128); add("blk.0.attn_output.weight",256,256);
     add("blk.0.attn_q_norm.weight",128,1,true); add("blk.0.attn_k_norm.weight",128,1,true);
-    add("blk.0.ffn_gate.weight",256,512); add("blk.0.ffn_up.weight",256,512); add("blk.0.ffn_down.weight",512,256);
+    add("blk.0.ffn_gate.weight",256,512); add("blk.0.ffn_up.weight",incompatible_shape ? 96 : 256,512); add("blk.0.ffn_down.weight",512,256);
     check(gguf_write_to_file(file,path.c_str(),false),"fixture write");
     gguf_free(file); ggml_free(ctx);
 }
@@ -272,6 +273,133 @@ static void native_codec_pairs(const std::string & source, const std::filesystem
     gguf_free(original_meta);ggml_free(original_data);
 }
 
+static std::vector<char> file_bytes(const std::string & path) {
+    std::ifstream file(path,std::ios::binary);
+    check(bool(file),"open output for byte comparison");
+    return std::vector<char>((std::istreambuf_iterator<char>(file)),{});
+}
+
+static void settings_controls(const std::string & source, const std::filesystem::path & dir) {
+    const std::vector<std::string> ffn = {"blk.0.ffn_down.weight","blk.0.ffn_gate.weight","blk.0.ffn_up.weight"};
+    const std::vector<std::string> attention = {"blk.0.attn_k.weight","blk.0.attn_output.weight","blk.0.attn_q.weight","blk.0.attn_v.weight"};
+    auto all = ffn; all.insert(all.end(),attention.begin(),attention.end());
+    auto write_list = [&](const std::string & name, const std::vector<std::string> & names) {
+        const auto path=(dir/name).string(); std::ofstream out(path,std::ios::binary);
+        for (const auto & tensor : names) { out << tensor << '\n'; }
+        out.close(); check(bool(out),"tensor-list fixture write"); return path;
+    };
+    const auto ffn_path=write_list("ffn.txt",ffn), attention_path=write_list("attention.txt",attention), all_path=write_list("all.txt",all);
+    auto p=llama_model_quantize_default_params(); p.ftype=LLAMA_FTYPE_MOSTLY_Q3_K_M; p.pure=true; p.nthread=2; p.sinq_gate=false;
+    check(p.sinq_strength==1.f && !p.sinq_tensor_list && !p.sinq_diagnostics_json,"new API defaults");
+    const auto stock=(dir/"settings-stock.gguf").string();
+    const auto stock_json=(dir/"settings-stock.json").string(); p.sinq_diagnostics_json=stock_json.c_str();
+    check(llama_model_quantize(source.c_str(),stock.c_str(),&p)==0,"stock diagnostics quantization");
+    check(!file_bytes(stock_json).empty(),"stock diagnostics missing"); p.sinq_diagnostics_json=nullptr;
+    const auto stock_plain=stock+".plain.gguf";
+    check(llama_model_quantize(source.c_str(),stock_plain.c_str(),&p)==0 && file_bytes(stock)==file_bytes(stock_plain),"diagnostics changed stock GGUF");
+    ggml_context * stock_data=nullptr; auto * stock_meta=gguf_init_from_file(stock.c_str(),{false,&stock_data});
+    check(stock_meta && stock_data,"settings stock read");
+    check(gguf_find_key(stock_meta,"beellama.qk_sinq.version")<0,"stock gained SINQ metadata");
+    p.sinq_precondition=LLAMA_SINQ_SIDECAR;
+    const auto legacy=(dir/"settings-legacy.gguf").string();
+    check(llama_model_quantize(source.c_str(),legacy.c_str(),&p)==0,"legacy defaults production");
+    const auto explicit_full=legacy+".full.gguf"; p.sinq_tensor_list=all_path.c_str(); p.sinq_strength=1.f;
+    check(llama_model_quantize(source.c_str(),explicit_full.c_str(),&p)==0,"explicit full mask strength one");
+    check(file_bytes(legacy)==file_bytes(explicit_full),"full exact mask strength one changed legacy bytes");
+    for (int partition=0;partition<2;++partition) {
+        const auto & names=partition==0 ? ffn : attention;
+        p.sinq_tensor_list=partition==0 ? ffn_path.c_str() : attention_path.c_str();
+        const auto output=(dir/("settings-mask-"+std::to_string(partition)+".gguf")).string();
+        const auto report=output+".json"; p.sinq_diagnostics_json=report.c_str();
+        check(llama_model_quantize(source.c_str(),output.c_str(),&p)==0,"exact-name mask quantization");
+        const auto first_report=file_bytes(report);
+        const auto diagnostic=nlohmann::json::parse(first_report.begin(),first_report.end());
+        check(diagnostic.at("totals").at("eligible_tensors")==7 && diagnostic.at("totals").at("included_tensors")==names.size(),"diagnostic mask totals");
+        check(diagnostic.at("tensor_list_sha256").get<std::string>().size()==64,"normalized mask digest missing");
+        std::string previous;
+        for (const auto & record : diagnostic.at("tensors")) {
+            const auto name=record.at("name").get<std::string>();
+            check(previous.empty() || previous<name,"diagnostics not sorted by exact name"); previous=name;
+            const bool selected=std::find(names.begin(),names.end(),name)!=names.end();
+            check(record.at("included")==selected && record.at("qtype")==ggml_type_name(GGML_TYPE_Q3_K),"diagnostics selection or actual codec");
+            if (selected) {
+                check(record.at("statistics_status")=="computed" && record.at("strips").is_array() &&
+                      record.at("scales_sha256").get<std::string>().size()==64 && record.at("companion_bytes").get<size_t>()>0,"included diagnostics incomplete");
+            } else {
+                check(record.at("reason")=="not_in_tensor_list" && record.at("statistics_status")=="not_computed" &&
+                      record.at("strips").is_null() && record.at("scales_sha256").is_null() && record.at("companion_bytes")==0,"excluded diagnostics invented statistics");
+            }
+        }
+        auto reversed=names; std::reverse(reversed.begin(),reversed.end());
+        const auto reversed_path=write_list("reversed-mask.txt",reversed); p.sinq_tensor_list=reversed_path.c_str();
+        check(llama_model_quantize(source.c_str(),output.c_str(),&p)==0 && first_report==file_bytes(report),"diagnostics not deterministic");
+        ggml_context * data=nullptr; auto * meta=gguf_init_from_file(output.c_str(),{false,&data});
+        check(meta && data,"mask output read"); int companions=0;
+        for (int64_t i=0;i<gguf_get_n_tensors(stock_meta);++i) {
+            const char * name=gguf_get_tensor_name(stock_meta,i);
+            auto * a=ggml_get_tensor(stock_data,name); auto * b=ggml_get_tensor(data,name);
+            check(a && b && a->type==b->type,"mask changed stock allocation");
+            const bool selected=std::find(names.begin(),names.end(),name)!=names.end();
+            const bool has_scale=gguf_find_tensor(meta,(std::string(name)+".sinq_scale2").c_str())>=0;
+            check(has_scale==selected,"mask selection not exact"); companions+=has_scale;
+            if (!selected) { check(ggml_nbytes(a)==ggml_nbytes(b) && std::memcmp(a->data,b->data,ggml_nbytes(a))==0,"mask excluded payload differs from stock"); }
+        }
+        check(companions==int(names.size()),"mask complement companion count");
+        gguf_free(meta); ggml_free(data);
+    }
+    p.sinq_tensor_list=nullptr; p.sinq_diagnostics_json=nullptr; p.sinq_strength=0.f;
+    const auto zero=legacy+".zero.gguf", identity=legacy+".identity.gguf";
+    check(llama_model_quantize(source.c_str(),zero.c_str(),&p)==0,"strength zero production");
+    p.sinq_precondition=LLAMA_SINQ_IDENTITY; p.sinq_strength=1.f;
+    check(llama_model_quantize(source.c_str(),identity.c_str(),&p)==0,"legacy identity production");
+    ggml_context * zero_data=nullptr, * identity_data=nullptr;
+    auto * zero_meta=gguf_init_from_file(zero.c_str(),{false,&zero_data});
+    auto * identity_meta=gguf_init_from_file(identity.c_str(),{false,&identity_data});
+    check(zero_meta && identity_meta && zero_data && identity_data,"identity output read");
+    for (int64_t i=0;i<gguf_get_n_tensors(zero_meta);++i) {
+        const char * name=gguf_get_tensor_name(zero_meta,i);
+        auto * a=ggml_get_tensor(zero_data,name); auto * b=ggml_get_tensor(identity_data,name);
+        check(a && b && a->type==b->type && ggml_nbytes(a)==ggml_nbytes(b) && std::memcmp(a->data,b->data,ggml_nbytes(a))==0,"strength zero differs from identity payload");
+        if (auto * stock_tensor=ggml_get_tensor(stock_data,name)) {
+            check(ggml_nbytes(a)==ggml_nbytes(stock_tensor) && std::memcmp(a->data,stock_tensor->data,ggml_nbytes(a))==0,"strength zero differs from stock payload");
+        }
+    }
+    gguf_free(zero_meta); gguf_free(identity_meta); ggml_free(zero_data); ggml_free(identity_data);
+    gguf_free(stock_meta); ggml_free(stock_data);
+    p.sinq_precondition=LLAMA_SINQ_SIDECAR;
+    const auto rejected=(dir/"settings-rejected.gguf").string();
+    auto reject=[&](const char * message) { check(llama_model_quantize(source.c_str(),rejected.c_str(),&p)!=0,message); };
+    for (float value : {-1.f,1.01f,NAN,INFINITY}) { p.sinq_strength=value; reject("bad API strength accepted"); }
+    p.sinq_strength=1.f;
+    const std::vector<std::vector<std::string>> invalid_lists={ {}, {""}, {ffn[0],ffn[0]}, {"blk.99.ffn_up.weight"},
+        {"output.weight"}, {"token_embd.weight"}, {"blk.0.attn_norm.weight"}, {"blk.*.ffn_up.weight"}, {" blk.0.ffn_up.weight"}, {"\xff"} };
+    for (size_t i=0;i<invalid_lists.size();++i) {
+        const auto path=write_list("bad-mask-"+std::to_string(i)+".txt",invalid_lists[i]); p.sinq_tensor_list=path.c_str(); reject("bad mask accepted");
+    }
+    const auto missing=(dir/"nonexistent-mask.txt").string(); p.sinq_tensor_list=missing.c_str(); reject("missing mask accepted");
+    p.sinq_tensor_list=ffn_path.c_str();
+    const llama_model_tensor_override unsupported[]={{".*",GGML_TYPE_F32},{nullptr,GGML_TYPE_COUNT}};
+    p.tt_overrides=unsupported; reject("explicit unsupported codec accepted"); p.tt_overrides=nullptr;
+    p.sinq_coverage=true; reject("mask with historical allocation accepted"); p.sinq_coverage=false;
+    p.sinq_precondition=LLAMA_SINQ_NONE; reject("mask without conditioning accepted");
+    p.sinq_tensor_list=nullptr; p.sinq_strength=.5f; reject("strength without conditioning accepted");
+    p.sinq_precondition=LLAMA_SINQ_IDENTITY; reject("nondefault identity strength accepted");
+    p.sinq_precondition=LLAMA_SINQ_SIDECAR; p.sinq_strength=1.f;
+    p.sinq_strip_width=32; reject("bad strip width accepted"); p.sinq_strip_width=64;
+    p.sinq_iterations=3; reject("bad iterations accepted"); p.sinq_iterations=16;
+    p.only_copy=true; reject("conditioning copy accepted"); p.only_copy=false;
+    const auto bad_report=(dir/"missing-report-directory"/"report.json").string();
+    p.sinq_diagnostics_json=bad_report.c_str(); reject("diagnostics write error ignored");
+    p.sinq_diagnostics_json=source.c_str(); reject("diagnostics overwrite of source accepted");
+    p.sinq_diagnostics_json=stock_json.c_str(); p.dry_run=true; reject("dry-run diagnostics accepted");
+    p.dry_run=false; p.sinq_diagnostics_json=nullptr;
+    const auto malformed=(dir/"settings-incompatible-shape.gguf").string(); make_model(malformed,"source",true);
+    const auto up_only=write_list("up-only.txt",{"blk.0.ffn_up.weight"}); p.sinq_tensor_list=up_only.c_str();
+    check(llama_model_quantize(malformed.c_str(),rejected.c_str(),&p)!=0,"explicit selection silently changed codec for incompatible shape");
+    p.ftype=LLAMA_FTYPE_MOSTLY_Q8_0;
+    check(llama_model_quantize(malformed.c_str(),rejected.c_str(),&p)!=0,"explicit strip-incompatible shape accepted");
+}
+
 int main(int argc, char ** argv) try {
     if (argc == 3 && std::strcmp(argv[1],"--load-only") == 0) {
         llama_log_set(logger,nullptr); llama_backend_init();
@@ -309,6 +437,7 @@ int main(int argc, char ** argv) try {
         check(full_bytes == slab_bytes,"slab boundaries changed normalization, native encoding or GGUF bytes");
         std::printf("standard QK quantize/reload/slab identity format=%d OK\n",format);
     }
+    settings_controls(source,dir);
     full_coverage_pairs(source,dir);
     native_codec_pairs(source,dir);
     // Conditioning must preserve the existing S/M/L allocator, including
@@ -318,8 +447,8 @@ int main(int argc, char ** argv) try {
         const auto standard = (dir/("preset-standard-"+std::to_string(format)+".gguf")).string();
         const auto normalized = (dir/("preset-normalized-"+std::to_string(format)+".gguf")).string();
         auto p = llama_model_quantize_default_params(); p.ftype = format; p.nthread = 2;
-        // The production sidecar mode always preserves excluded source tensors;
-        // the ordinary control must use that same coverage, not quantize heads.
+        // Historical reproduction only: this option changes stock allocation
+        // by preserving noneligible source tensors. It is not a SINQ-only mask.
         p.sinq_coverage = true;
         check(!p.pure,"mixed preset unexpectedly defaults to pure");
         check(llama_model_quantize(source.c_str(),standard.c_str(),&p)==0,"ordinary mixed preset quantize");

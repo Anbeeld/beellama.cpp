@@ -5,6 +5,10 @@
 #include "llama.h"
 #include "llama-sinq.h"
 #include "llama-version.h"
+#include "../vendor/nlohmann/json.hpp"
+extern "C" {
+#include "../vendor/hash/sha256/sha256.h"
+}
 
 #include <algorithm>
 #include <cmath>
@@ -13,6 +17,8 @@
 #include <fstream>
 #include <mutex>
 #include <regex>
+#include <set>
+#include <filesystem>
 #include <thread>
 #include <unordered_map>
 
@@ -1010,12 +1016,74 @@ static void init_quantize_state_counters(quantize_state_impl & qs, std::vector<t
 // main quantization driver
 //
 
+static std::string sinq_digest(const void * data, size_t size) {
+    unsigned char digest[SHA256_DIGEST_SIZE];
+    sha256_hash(digest, static_cast<const unsigned char *>(data), size);
+    static const char hex[] = "0123456789abcdef";
+    std::string result;
+    for (unsigned char byte : digest) { result += hex[byte >> 4]; result += hex[byte & 15]; }
+    return result;
+}
+
+static std::set<std::string> sinq_read_mask(const char * path) {
+    std::ifstream input(std::filesystem::u8path(path), std::ios::binary);
+    if (!input) { throw std::runtime_error("cannot open SINQ tensor list"); }
+    std::set<std::string> names;
+    std::string name;
+    while (std::getline(input, name)) {
+        if (!name.empty() && name.back() == '\r') { name.pop_back(); }
+        // Eligible base names are ASCII, a strict subset of UTF-8. No trimming,
+        // comments, regexes, BOM or empty entries are interpreted as names.
+        if (name.empty() || name.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.") != std::string::npos) {
+            throw std::runtime_error("malformed SINQ tensor-list entry");
+        }
+        if (!names.insert(name).second) { throw std::runtime_error("duplicate SINQ tensor-list entry: " + name); }
+    }
+    if (input.bad() || names.empty()) { throw std::runtime_error("empty or unreadable SINQ tensor list"); }
+    return names;
+}
+
 static void llama_model_quantize_impl(const std::string & fname_inp, const std::string & fname_out, const llama_model_quantize_params * params) {
     llama_ftype ftype = params->ftype;
+    const bool diagnostics = params->sinq_diagnostics_json != nullptr;
     const bool sinq_enabled = params->sinq_precondition != LLAMA_SINQ_NONE;
     if (sinq_enabled && (params->sinq_precondition != LLAMA_SINQ_SIDECAR && params->sinq_precondition != LLAMA_SINQ_IDENTITY)) {
         throw std::runtime_error("invalid SINQ precondition mode");
     }
+    if (!std::isfinite(params->sinq_strength) || params->sinq_strength < 0.f || params->sinq_strength > 1.f) {
+        throw std::runtime_error("SINQ strength must be finite and in [0,1]");
+    }
+    if (!sinq_enabled && (params->sinq_tensor_list || params->sinq_strength != 1.f)) {
+        throw std::runtime_error("SINQ tensor list and nondefault strength require conditioning");
+    }
+    if (params->sinq_tensor_list && params->sinq_coverage) {
+        throw std::runtime_error("SINQ tensor list cannot use historical coverage");
+    }
+    if (params->sinq_precondition == LLAMA_SINQ_IDENTITY && params->sinq_strength != 1.f) {
+        throw std::runtime_error("test-only SINQ identity cannot use nondefault strength; use sidecar strength 0");
+    }
+    if (diagnostics && (params->dry_run || params->only_copy || !*params->sinq_diagnostics_json)) {
+        throw std::runtime_error("SINQ diagnostics require actual quantization and a nonempty external path");
+    }
+    if (diagnostics) {
+        const auto path = std::filesystem::weakly_canonical(std::filesystem::u8path(params->sinq_diagnostics_json));
+        auto aliases = [&](const std::string & other) {
+            const auto target = std::filesystem::u8path(other);
+            return path == std::filesystem::weakly_canonical(target) ||
+                (std::filesystem::exists(path) && std::filesystem::exists(target) && std::filesystem::equivalent(path, target));
+        };
+        if (aliases(fname_inp) || aliases(fname_out) || (params->sinq_tensor_list && aliases(params->sinq_tensor_list))) {
+            throw std::runtime_error("SINQ diagnostics must not overwrite model or tensor-list files");
+        }
+    }
+    const auto sinq_mask = params->sinq_tensor_list ? sinq_read_mask(params->sinq_tensor_list) : std::set<std::string>{};
+    auto unmatched_sinq = sinq_mask;
+    nlohmann::json sinq_report = {{"schema_version", 1}, {"tensors", nlohmann::json::array()}};
+    if (params->sinq_tensor_list) {
+        std::string normalized;
+        for (const auto & name : sinq_mask) { normalized += name + "\n"; }
+        sinq_report["tensor_list_sha256"] = sinq_digest(normalized.data(), normalized.size());
+    } else { sinq_report["tensor_list_sha256"] = nullptr; }
     if (sinq_enabled && ((params->sinq_strip_width != 64 && params->sinq_strip_width != 128) ||
         (params->sinq_iterations != 4 && params->sinq_iterations != 8 && params->sinq_iterations != 16) || params->only_copy)) {
         throw std::runtime_error("QK SINQ requires strip width 64/128, iterations 4/8/16 and actual quantization");
@@ -1213,14 +1281,27 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
         metadata[i].allows_quantization = tensor_allows_quantization(params, model->arch, tensor);
 
+        const int prior_fallbacks = qs.n_fallback;
         if (metadata[i].allows_quantization) {
             metadata[i].target_type = llama_tensor_get_type(qs, params, tensor, default_type, metadata[i]);
         } else {
             metadata[i].target_type = tensor->type;
         }
 
-        metadata[i].sinq_preconditioned = sinq_enabled && sinq_tensor_eligible(tensor,*model) &&
-            llama_sinq_supported_type(metadata[i].target_type);
+        const bool requested = sinq_mask.count(tensor->name) != 0;
+        const bool eligible = sinq_tensor_eligible(tensor,*model);
+        const bool supported = llama_sinq_supported_type(metadata[i].target_type);
+        if (sinq_enabled && eligible && (!params->sinq_tensor_list || requested) && qs.n_fallback != prior_fallbacks) {
+            throw std::runtime_error(format("SINQ selected tensor requires codec fallback: %s", tensor->name));
+        }
+        if (requested) {
+            unmatched_sinq.erase(tensor->name);
+            if (!eligible || !supported) {
+                throw std::runtime_error(format("SINQ explicitly selected ineligible tensor or unsupported codec: %s (%s)", tensor->name, ggml_type_name(metadata[i].target_type)));
+            }
+        }
+        metadata[i].sinq_preconditioned = sinq_enabled && eligible && supported &&
+            (!params->sinq_tensor_list || requested);
         if (metadata[i].sinq_preconditioned) {
             if (tensor->type != GGML_TYPE_F32 && tensor->type != GGML_TYPE_F16 && tensor->type != GGML_TYPE_BF16) {
                 throw std::runtime_error("QK SINQ preconditioning requires original F32/F16/BF16 matrices");
@@ -1251,6 +1332,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         }
     }
 
+    if (!unmatched_sinq.empty()) { throw std::runtime_error("SINQ tensor-list name not found: " + *unmatched_sinq.begin()); }
     if (sinq_enabled) {
         if (sinq_names.empty()) { throw std::runtime_error("QK SINQ found no eligible primary-trunk qwen35 native-codec weights"); }
         std::vector<const char *> names;
@@ -1361,16 +1443,63 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
         size_t new_size;
         std::vector<ggml_fp16_t> sinq_values;
+        nlohmann::json * diagnostic = nullptr;
+        if (diagnostics && sinq_tensor_eligible(tensor, *model)) {
+            const char * reason = tm.sinq_preconditioned ? "included" : !sinq_enabled ? "stock" :
+                !llama_sinq_supported_type(new_type) ? "unsupported_codec" : "not_in_tensor_list";
+            sinq_report["tensors"].push_back({
+                {"name", tensor->name}, {"qtype", ggml_type_name(new_type)},
+                {"shape", {tensor->ne[0], tensor->ne[1]}}, {"parameters", ggml_nelements(tensor)},
+                {"included", tm.sinq_preconditioned}, {"reason", reason},
+                {"strip_width", params->sinq_strip_width}, {"iterations", params->sinq_iterations},
+                {"gate", params->sinq_gate}, {"strength", params->sinq_strength},
+                {"mode", !sinq_enabled ? "none" : params->sinq_precondition == LLAMA_SINQ_IDENTITY ? "identity" : "sidecar"},
+                {"statistics_status", "not_computed"}, {"gated", nullptr}, {"kurtosis", nullptr},
+                {"degenerate", nullptr}, {"identity", nullptr}, {"strips", nullptr}, {"chosen_iteration_distribution", nullptr},
+                {"scale_min", nullptr}, {"scale_median", nullptr}, {"scale_max", nullptr},
+                {"scales_sha256", nullptr}, {"selected_identity_count", nullptr},
+                {"companion_bytes", 0}, {"imatrix_present", false}, {"imatrix_transformed", false}});
+            diagnostic = &sinq_report["tensors"].back();
+            if (imatrix_data) {
+                const auto entry = imatrix_data->find(tm.remapped_imatrix_name);
+                (*diagnostic)["imatrix_present"] = entry != imatrix_data->end() &&
+                    entry->second.size() == size_t(tensor->ne[0]*tensor->ne[2]*tensor->ne[3]);
+            }
+        }
         if (tm.sinq_preconditioned && !params->dry_run) {
             llama_sinq_options options;
             options.strip_width = params->sinq_strip_width;
             options.iterations = params->sinq_iterations;
             options.gate = params->sinq_gate;
             options.identity = params->sinq_precondition == LLAMA_SINQ_IDENTITY;
+            options.strength = params->sinq_strength;
             llama_sinq_statistics stats;
             if (!llama_sinq_compute_scales(load_range(0,tensor_size),cur_type,tensor->ne[1],tensor->ne[0],
                                            options,nthread,sinq_values,stats)) {
                 throw std::runtime_error(format("QK SINQ statistics failed for '%s'",tensor->name));
+            }
+            if (diagnostic) {
+                (*diagnostic)["statistics_status"] = "computed";
+                (*diagnostic)["gated"] = stats.gated;
+                (*diagnostic)["kurtosis"] = stats.kurtosis;
+                (*diagnostic)["degenerate"] = stats.degenerate;
+                (*diagnostic)["identity"] = stats.identity;
+                (*diagnostic)["scale_min"] = stats.min_scale;
+                (*diagnostic)["scale_median"] = stats.median_scale;
+                (*diagnostic)["scale_max"] = stats.max_scale;
+                (*diagnostic)["selected_identity_count"] = stats.selected_identity_count;
+                (*diagnostic)["companion_bytes"] = sinq_values.size()*sizeof(ggml_fp16_t);
+                (*diagnostic)["scales_sha256"] = sinq_digest(sinq_values.data(), sinq_values.size()*sizeof(ggml_fp16_t));
+                (*diagnostic)["strips"] = nlohmann::json::array();
+                nlohmann::json histogram = nlohmann::json::object();
+                for (const auto & strip : stats.strips) {
+                    (*diagnostic)["strips"].push_back({{"chosen_iteration", strip.chosen_iteration},
+                        {"initial_imbalance", strip.initial_imbalance}, {"best_imbalance", strip.best_imbalance},
+                        {"terminal_imbalance", strip.terminal_imbalance}});
+                    const auto key = std::to_string(strip.chosen_iteration);
+                    histogram[key] = histogram.value(key, size_t(0)) + 1;
+                }
+                (*diagnostic)["chosen_iteration_distribution"] = histogram;
             }
             LLAMA_LOG_INFO("QK SINQ tensor=%s kurtosis=%.9g mode=%s t_min=%.9g t_max=%.9g aux_bytes=%zu; ",
                 tensor->name,stats.kurtosis,stats.identity ? "identity" : "normalized",stats.min_scale,stats.max_scale,sinq_values.size()*sizeof(ggml_fp16_t));
@@ -1474,6 +1603,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                         }
                     }
                     imatrix = sinq_imatrix.data();
+                    if (diagnostic) { (*diagnostic)["imatrix_transformed"] = true; }
                 }
                 std::vector<float> sinq_preconditioned;
                 // The extra W/t slab is included in the configured memory budget.
@@ -1552,6 +1682,33 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         close_ofstream();
     }
 
+    if (diagnostics) {
+        auto & records = sinq_report["tensors"];
+        std::sort(records.begin(), records.end(), [](const nlohmann::json & a, const nlohmann::json & b) {
+            return a.at("name").get<std::string>() < b.at("name").get<std::string>();
+        });
+        size_t included = 0, parameters = 0, included_parameters = 0, companion_bytes = 0;
+        nlohmann::json reasons = nlohmann::json::object();
+        for (const auto & record : records) {
+            parameters += record.at("parameters").get<size_t>();
+            if (record.at("included").get<bool>()) {
+                ++included; included_parameters += record.at("parameters").get<size_t>();
+            }
+            companion_bytes += record.at("companion_bytes").get<size_t>();
+            const auto reason = record.at("reason").get<std::string>();
+            reasons[reason] = reasons.value(reason, size_t(0)) + 1;
+        }
+        sinq_report["totals"] = {{"model_tensors", tensors.size()}, {"model_parameters", ml.n_elements},
+            {"eligible_tensors", records.size()}, {"eligible_parameters", parameters},
+            {"included_tensors", included}, {"included_parameters", included_parameters},
+            {"companion_bytes", companion_bytes}, {"reason_counts", reasons},
+            {"source_payload_bytes", total_size_org}, {"output_payload_bytes", total_size_new}};
+        std::ofstream output(std::filesystem::u8path(params->sinq_diagnostics_json), std::ios::binary);
+        output.exceptions(std::ios::failbit | std::ios::badbit);
+        output << sinq_report.dump(2) << '\n';
+        output.close();
+    }
+
     LLAMA_LOG_INFO("%s: model size  = %8.2f MiB (%.2f BPW)\n", __func__, total_size_org/1024.0/1024.0, total_size_org*8.0/ml.n_elements);
     LLAMA_LOG_INFO("%s: quant size  = %8.2f MiB (%.2f BPW)\n", __func__, total_size_new/1024.0/1024.0, total_size_new*8.0/ml.n_elements);
 
@@ -1592,7 +1749,10 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.sinq_strip_width             =*/ 64,
         /*.sinq_iterations              =*/ 16,
         /*.sinq_gate                    =*/ true,
-        /*.sinq_coverage                =*/ false
+        /*.sinq_coverage                =*/ false,
+        /*.sinq_strength                =*/ 1.f,
+        /*.sinq_tensor_list             =*/ nullptr,
+        /*.sinq_diagnostics_json        =*/ nullptr
     };
 
     return result;
