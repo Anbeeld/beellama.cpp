@@ -11,6 +11,7 @@
 #include <fstream>
 
 bool perplexity_full_compare_batch(int, const float *, const uint16_t *, const int *, int, int, std::array<double,4> *);
+bool perplexity_full_nll_batch(int, const float *, const int *, int, int, double *);
 bool perplexity_full_same_file(const std::string &, const std::string &);
 
 double perplexity_full_encode(int n_vocab, const float * logits, uint16_t * encoded, int target);
@@ -60,6 +61,54 @@ int main() {
     require(std::abs(result[1] - (20 + std::log(z_ref))) < 1e-5, "no reference clipping at 16");
     result = perplexity_full_compare(3, reference, encoded.data(), 2);
     require(std::abs(result[0]) < 1e-9, "normalized compact-reference self KL floor");
+
+    // Null-output full PPL must retain the exact double-precision NLL without
+    // encoding discarded reference rows, and validate every vocabulary entry.
+    std::vector<float> nll_logits = {0, -17, -20, 50, 33, 30};
+    const int nll_targets[] = {2, 1};
+    double nll_values[2];
+    for (int threads : {1, 2, 8}) {
+        require(perplexity_full_nll_batch(3, nll_logits.data(), nll_targets, 2, threads, nll_values),
+                "parallel full NLL rejected finite rows");
+        for (int row = 0; row < 2; ++row) {
+            require(nll_values[row] == perplexity_full_encode(3, nll_logits.data()+row*3, encoded.data(), nll_targets[row]),
+                    "null-output NLL differs from original full reference arithmetic");
+        }
+        for (float bad : {std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity()}) {
+            nll_logits[3] = bad; // Not the target: validation must cover the vocabulary.
+            require(!perplexity_full_nll_batch(3, nll_logits.data(), nll_targets, 2, threads, nll_values),
+                    "nonfinite nontarget bypassed full NLL validation");
+        }
+        nll_logits[3] = 50;
+    }
+    const int invalid_targets[] = {2, 3};
+    require(!perplexity_full_nll_batch(3, nll_logits.data(), invalid_targets, 2, 2, nll_values), "invalid full NLL target accepted");
+    require(!perplexity_full_nll_batch(0, nll_logits.data(), nll_targets, 2, 2, nll_values), "empty vocabulary accepted");
+
+    {
+        const int rows = 257, width = 19;
+        std::vector<float> values(rows*width);
+        std::vector<int> targets(rows);
+        std::vector<double> actual(rows), expected(rows);
+        std::vector<uint16_t> scratch(2*((width+1)/2)+4);
+        for (int row = 0; row < rows; ++row) {
+            targets[row] = (row*7)%width;
+            for (int col = 0; col < width; ++col) { values[row*width+col] = float((row*37+col*13)%1000-500)*.125f; }
+            expected[row] = perplexity_full_encode(width, values.data()+row*width, scratch.data(), targets[row]);
+        }
+        for (int threads : {1, 4, 32}) {
+            require(perplexity_full_nll_batch(width, values.data(), targets.data(), rows, threads, actual.data()),
+                    "multirow full NLL failed");
+            require(actual == expected, "parallel NLL row ordering or scalar parity changed");
+        }
+        for (int index : {0, width+3, rows*width-1}) {
+            const float saved = values[index];
+            values[index] = std::numeric_limits<float>::quiet_NaN();
+            require(!perplexity_full_nll_batch(width, values.data(), targets.data(), rows, 32, actual.data()),
+                    "full NLL missed nonfinite first/middle/trailing row");
+            values[index] = saved;
+        }
+    }
 
     const float shifted[] = {50, 33, 30};
     result = perplexity_full_compare(3, shifted, encoded.data(), 2);

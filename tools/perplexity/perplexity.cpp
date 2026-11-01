@@ -236,6 +236,41 @@ bool perplexity_full_compare_batch(int n_vocab, const float * logits, const uint
     return valid.load();
 }
 
+bool perplexity_full_nll_batch(int n_vocab, const float * logits, const int * targets,
+                              int count, int threads, double * nll) {
+    if (n_vocab <= 0 || count <= 0 || threads <= 0 || !logits || !targets || !nll) { return false; }
+    std::atomic<int> next{0};
+    std::atomic<bool> valid{true};
+    auto compute = [&]() {
+        for (int row = next++; row < count; row = next++) {
+            const float * values = logits + size_t(row)*n_vocab;
+            if (targets[row] < 0 || targets[row] >= n_vocab) { valid = false; continue; }
+            double maximum = -std::numeric_limits<double>::infinity();
+            bool finite = true;
+            for (int j = 0; j < n_vocab; ++j) {
+                if (!std::isfinite(values[j])) { finite = false; break; }
+                maximum = std::max(maximum, double(values[j]));
+            }
+            if (!finite) { valid = false; continue; }
+            // Match full-reference encode's double arithmetic and vocabulary
+            // reduction order, without encoding rows destined for a null sink.
+            double sum = 0;
+            for (int j = 0; j < n_vocab; ++j) { sum += std::exp(double(values[j]) - maximum); }
+            nll[row] = maximum - double(values[targets[row]]) + std::log(sum);
+        }
+    };
+    std::vector<std::thread> pool;
+    try {
+        for (int i = 1; i < std::min(threads, count); ++i) { pool.emplace_back(compute); }
+        compute();
+    } catch (...) {
+        for (auto & worker : pool) { worker.join(); }
+        throw;
+    }
+    for (auto & worker : pool) { worker.join(); }
+    return valid.load();
+}
+
 static bool process_logits(std::ostream& out, int n_vocab, const float * logits, const int * tokens, int n_token,
         std::vector<std::thread> & workers, std::vector<uint16_t> & log_probs, double & nll, double & nll2,
         double * full_nll = nullptr) {
@@ -2230,7 +2265,13 @@ static bool perplexity_full(llama_context * ctx, const common_params & params) {
     }
     const int n_batch = std::max(1, std::min({int(n_ctx), params.n_batch,
         int(llama_n_batch(ctx)), ppl_max_logits_rows(int(n_vocab), params)}));
-    std::vector<uint16_t> encoded(size_t(n_batch) * row_words);
+#ifdef _WIN32
+    const bool discard_reference = !params.kl_divergence && _stricmp(params.logits_file.c_str(), "NUL") == 0;
+#else
+    const bool discard_reference = !params.kl_divergence && params.logits_file == "/dev/null";
+#endif
+    const bool pipeline_scoring = params.kl_divergence || discard_reference;
+    std::vector<uint16_t> encoded(discard_reference ? 0 : size_t(n_batch) * row_words);
     std::vector<double> batch_nll(n_batch);
     std::vector<std::array<double, 4>> batch_metrics(n_batch);
     std::vector<double> kld_values;
@@ -2244,7 +2285,7 @@ static bool perplexity_full(llama_context * ctx, const common_params & params) {
     int64_t decode_us = 0, validation_us = 0, reference_us = 0, scoring_us = 0, output_us = 0;
     // One owned previous batch lets CPU probability work overlap the next GPU
     // decode. Never retain llama_get_logits storage across another decode.
-    std::vector<float> scoring_logits(params.kl_divergence ? size_t(n_batch)*n_vocab : 0);
+    std::vector<float> scoring_logits(pipeline_scoring ? size_t(n_batch)*n_vocab : 0);
     std::vector<uint16_t> scoring_encoded(params.kl_divergence ? encoded.size() : 0);
     std::future<bool> scoring_job;
     auto finish_batch = [&](size_t first, int position, int count) {
@@ -2253,6 +2294,16 @@ static bool perplexity_full(llama_context * ctx, const common_params & params) {
             if (!perplexity_full_compare_batch(int(n_vocab),scoring_logits.data(),scoring_encoded.data(),
                     tokens.data()+first+1,count,int(workers.size()+1),batch_metrics.data())) {
                 return fail("nonfinite candidate logits");
+            }
+            scoring_us += ggml_time_us()-start;
+        } else if (discard_reference) {
+            if (!perplexity_full_nll_batch(int(n_vocab), scoring_logits.data(), tokens.data()+first+1,
+                    count, int(workers.size()+1), batch_nll.data())) {
+                return fail("nonfinite candidate logits or invalid target");
+            }
+            for (int i = 0; i < count; ++i) {
+                candidate_nll += batch_nll[i];
+                nll2 += batch_nll[i]*batch_nll[i];
             }
             scoring_us += ggml_time_us()-start;
         }
@@ -2316,7 +2367,7 @@ static bool perplexity_full(llama_context * ctx, const common_params & params) {
         }
         decode_us += ggml_time_us() - stage_start;
         stage_start = ggml_time_us();
-        if (!params.kl_divergence) {
+        if (!pipeline_scoring) {
             for (size_t i = 0; i < size_t(count)*n_vocab; ++i) {
                 if (!std::isfinite(logits[i])) { return fail("nonfinite candidate logits"); }
             }
@@ -2338,6 +2389,10 @@ static bool perplexity_full(llama_context * ctx, const common_params & params) {
             std::copy_n(logits,size_t(count)*n_vocab,scoring_logits.data());
             encoded.swap(scoring_encoded);
             scoring_job = std::async(std::launch::async,finish_batch,first,position,count);
+        } else if (discard_reference) {
+            if (scoring_job.valid() && !scoring_job.get()) { return false; }
+            std::copy_n(logits, size_t(count)*n_vocab, scoring_logits.data());
+            scoring_job = std::async(std::launch::async,finish_batch,first,position,count);
         } else {
             if (!process_logits(baseline, int(n_vocab), logits, tokens.data() + first, count,
                     workers, encoded, candidate_nll, nll2, batch_nll.data())) { return false; }
@@ -2351,7 +2406,7 @@ static bool perplexity_full(llama_context * ctx, const common_params & params) {
             "probability_scoring_ms=%.3f token_output_ms=%.3f scoring_threads=%zu "
             "reference_io_overlapped=%d scoring_includes_parallel_validation=%d previous_batch_scoring_overlapped=%d\n",
         decode_us/1000.0,validation_us/1000.0,reference_us/1000.0,scoring_us/1000.0,output_us/1000.0,workers.size()+1,
-        int(params.kl_divergence),int(params.kl_divergence),int(params.kl_divergence));
+        int(params.kl_divergence),int(pipeline_scoring),int(pipeline_scoring));
     if (baseline.is_open()) {
         baseline.flush();
         baseline.close();
