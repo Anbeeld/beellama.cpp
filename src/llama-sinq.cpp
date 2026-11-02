@@ -12,8 +12,9 @@
 
 namespace {
 bool valid_iterations(int iterations) { return iterations == 4 || iterations == 8 || iterations == 16; }
+constexpr uint64_t workspace_limit = 128ull*1024*1024;
 bool valid_shape(int64_t rows, int64_t columns, int width) {
-    return rows >= 2 && (width == 64 || width == 128) && columns > 0 && columns % width == 0 &&
+    return rows >= 2 && llama_sinq_valid_strip_width(width) && columns > 0 && columns % width == 0 &&
            uint64_t(rows) <= std::numeric_limits<size_t>::max()/sizeof(float)/uint64_t(columns);
 }
 float clamp(float x, float lo, float hi) { return std::min(hi,std::max(lo,x)); }
@@ -83,9 +84,22 @@ float imbalance(const std::vector<float> & rows, const std::vector<float> & cols
 }
 } // namespace
 
+bool llama_sinq_workspace_size(int64_t rows, int width, size_t & bytes) {
+    if (!valid_shape(rows,width,width)) { return false; }
+    // Includes caller input tile, balance_tile's current tile, all row/column
+    // vectors and Welford scratch. Divide before multiplying to avoid overflow.
+    const uint64_t fixed = uint64_t(width)*32+8192;
+    const uint64_t per_row = uint64_t(width)*8+24;
+    if (uint64_t(rows) > (workspace_limit-fixed)/per_row) { return false; }
+    bytes = size_t(uint64_t(rows)*per_row+fixed);
+    return true;
+}
+
 bool llama_sinq_balance_tile(const float * weights, int64_t n, int g, int iterations,
                             float * columns, float * row_factors, llama_sinq_tile_statistics * statistics) {
-    if (!weights || !columns || !row_factors || !valid_shape(n,g,g) || !valid_iterations(iterations)) { return false; }
+    size_t workspace;
+    if (!weights || !columns || !row_factors || !valid_shape(n,g,g) || !valid_iterations(iterations) ||
+        !llama_sinq_workspace_size(n,g,workspace)) { return false; }
     for (int64_t i = 0; i < n*g; ++i) { if (!std::isfinite(weights[i])) { return false; } }
     try {
         std::vector<float> cur(weights,weights+n*g), rows(n), cols(g), lr(n,0), lc(g,0), br(n,1), bc(g,1), mr(n), mc(g);
@@ -140,6 +154,8 @@ bool llama_sinq_compute_scales(const void * source, ggml_type source_type,
     if (!source || !valid_shape(n,k,options.strip_width) || !valid_iterations(options.iterations) || threads <= 0 ||
         !std::isfinite(options.strength) || options.strength < 0.f || options.strength > 1.f ||
         (source_type != GGML_TYPE_F32 && source_type != GGML_TYPE_F16 && source_type != GGML_TYPE_BF16)) { return false; }
+    size_t workspace = 0;
+    if (!(options.identity || options.strength == 0.f) && !llama_sinq_workspace_size(n,options.strip_width,workspace)) { return false; }
     // Explicit identity must not bypass finite validation of the same
     // FP16-rounded source convention used by normalization.
     for (int64_t i = 0; i < n*k; ++i) {
@@ -173,12 +189,10 @@ bool llama_sinq_compute_scales(const void * source, ggml_type source_type,
                     }
                 } catch (const std::exception &) { ok = false; }
             };
-            // Conservative bound includes input/current tiles, all row/column
-            // vectors and reduction scratch. A single full-height strip is the
-            // minimum workspace, even if that strip itself exceeds 128 MiB.
-            const uint64_t workspace = uint64_t(n)*(uint64_t(g)*8+24)+uint64_t(g)*32+8192;
+            // A full-height strip is indivisible. Its checked workspace fits
+            // the hard limit; cap workers so their aggregate fits too.
             const int workers = int(std::min<int64_t>(groups,std::min<int64_t>(threads,
-                std::max<uint64_t>(1,(128ull*1024*1024)/workspace))));
+                workspace_limit/workspace)));
             std::vector<std::thread> pool;
             try { for (int i = 1; i < workers; ++i) { pool.emplace_back(work); } }
             catch (const std::exception &) { ok = false; }

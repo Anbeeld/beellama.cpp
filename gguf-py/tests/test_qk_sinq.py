@@ -16,17 +16,17 @@ from gguf.quants import dequantize
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def write(path, kind=None, scales=None, manifest=True, version=1, metadata=None):
+def write(path, kind=None, scales=None, manifest=True, version=1, metadata=None, columns=256):
     w = GGUFWriter(path, 'qwen35')
     name = 'blk.0.ffn_up.weight'
     if kind is None:
-        w.add_tensor(name, np.zeros((2, 256), dtype=np.float32))
+        w.add_tensor(name, np.zeros((2, columns), dtype=np.float32))
     else:
         block = 110 if kind == GGMLQuantizationType.Q3_K else 144
-        packed = np.zeros((2, block), dtype=np.uint8)
+        packed = np.zeros((2, block * (columns // 256)), dtype=np.uint8)
         # Independent reader/official decoder sees an ordinary 256-weight block.
         decoded = dequantize(packed, kind)
-        assert decoded.shape == (2, 256) and np.all(decoded == 0)
+        assert decoded.shape == (2, columns) and np.all(decoded == 0)
         w.add_tensor(name, packed, raw_dtype=kind)
     if scales is not None:
         w.add_tensor(name + '.sinq_scale2', np.asarray(scales, dtype=np.float16))
@@ -67,6 +67,24 @@ class TestQKSidecar(unittest.TestCase):
                 self.assertEqual(record['auxiliary_bytes'], 512)
                 self.assertEqual(record['tensor_inventory'][0]['dtype'], kind.name)
                 self.assertEqual(record['tensor_inventory'][0]['companion']['min'], 1)
+
+    def test_strip_width_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            d = Path(directory)
+            write(d / 'source.gguf', columns=512)
+            for width in (32, 64, 128, 256, 512):
+                write(d / 'model.gguf', GGMLQuantizationType.Q3_K, np.ones(512),
+                      metadata={'beellama.qk_sinq.strip_width': width}, columns=512)
+                result = self.inspect(d / 'source.gguf', d / 'model.gguf', d / 'out.json')
+                self.assertEqual(result.returncode, 0, result.stderr)
+            for width in (0, 48, 1024, '64', True):
+                write(d / 'model.gguf', GGMLQuantizationType.Q3_K, np.ones(512),
+                      metadata={'beellama.qk_sinq.strip_width': width}, columns=512)
+                self.assertNotEqual(self.inspect(d / 'source.gguf', d / 'model.gguf', d / 'out.json').returncode, 0)
+            write(d / 'source.gguf')
+            write(d / 'model.gguf', GGMLQuantizationType.Q3_K, np.ones(256),
+                  metadata={'beellama.qk_sinq.strip_width': 512})
+            self.assertNotEqual(self.inspect(d / 'source.gguf', d / 'model.gguf', d / 'out.json').returncode, 0)
 
     def test_supported_sinq_metadata(self):
         metadata = {'beellama.qk_sinq.algorithm': 'normalization',

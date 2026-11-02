@@ -20,7 +20,7 @@
 static void check(bool ok, const char * message) { if (!ok) { throw std::runtime_error(message); } }
 static std::string logs;
 static void logger(ggml_log_level, const char * text, void *) { logs += text; }
-static void make_model(const std::string & path, const std::string & mode, bool incompatible_shape = false) {
+static void make_model(const std::string & path, const std::string & mode, bool incompatible_shape = false, int strip_width = 64) {
     ggml_context * ctx = ggml_init({64*ggml_tensor_overhead(),nullptr,true});
     gguf_context * file = gguf_init_empty();
     gguf_set_val_str(file,"general.architecture","qwen35");
@@ -45,16 +45,17 @@ static void make_model(const std::string & path, const std::string & mode, bool 
     gguf_set_val_u32(file,"tokenizer.ggml.bos_token_id",1);
     gguf_set_val_u32(file,"tokenizer.ggml.eos_token_id",2);
     const bool sinq = mode != "source" && mode != "metadata_only" && mode != "orphan";
+    const char * selected_tensor = mode == "unsupported" ? "output.weight" :
+        strip_width == 512 ? "blk.0.ffn_down.weight" : "blk.0.ffn_up.weight";
     if ((sinq || mode == "orphan") && mode != "missing_version") {
         if (mode == "version_dtype") { gguf_set_val_str(file,"beellama.qk_sinq.version","1"); }
         else { gguf_set_val_u32(file,"beellama.qk_sinq.version",mode == "version_value" ? 2 : 1); }
     }
     if (mode != "source" && mode != "metadata_only") {
         gguf_set_val_str(file,"beellama.qk_sinq.algorithm","sinkhorn_log");
-        gguf_set_val_u32(file,"beellama.qk_sinq.strip_width",mode == "bad_width" ? 32 : 64);
+        gguf_set_val_u32(file,"beellama.qk_sinq.strip_width",mode == "bad_width" ? 16 : mode == "strip_misaligned" ? 512 : strip_width);
         gguf_set_val_u32(file,"beellama.qk_sinq.iterations",mode == "bad_iterations" ? 3 : 16);
-        const char * target = mode == "unsupported" ? "output.weight" : "blk.0.ffn_up.weight";
-        const char * targets[] = {target,target};
+        const char * targets[] = {selected_tensor,selected_tensor};
         if (mode != "missing_manifest") {
             gguf_set_arr_str(file,"beellama.qk_sinq.tensors",targets,mode == "duplicate_manifest" ? 2 : 1);
         }
@@ -68,7 +69,7 @@ static void make_model(const std::string & path, const std::string & mode, bool 
     if (mode == "hadamard") { gguf_set_val_bool(file,"prism.hadamard.test",true); }
     std::vector<std::vector<uint8_t>> payloads;
     auto add = [&](const char * name, int k, int n, bool norm = false) {
-        const bool selected = (mode == "unsupported" ? std::strcmp(name,"output.weight") == 0 : std::strcmp(name,"blk.0.ffn_up.weight") == 0);
+        const bool selected = std::strcmp(name,selected_tensor) == 0;
         const ggml_type type = sinq && selected ? GGML_TYPE_Q3_K : GGML_TYPE_F32;
         ggml_tensor * w = n == 1 ? ggml_new_tensor_1d(ctx,type,k) : ggml_new_tensor_2d(ctx,type,k,n);
         ggml_set_name(w,name);
@@ -392,7 +393,8 @@ static void settings_controls(const std::string & source, const std::filesystem:
     p.sinq_tensor_list=nullptr; p.sinq_strength=.5f; reject("strength without conditioning accepted");
     p.sinq_precondition=LLAMA_SINQ_IDENTITY; reject("nondefault identity strength accepted");
     p.sinq_precondition=LLAMA_SINQ_SIDECAR; p.sinq_strength=1.f;
-    p.sinq_strip_width=32; reject("bad strip width accepted"); p.sinq_strip_width=64;
+    for(int width:{-1,0,16,48,96,1024}) { p.sinq_strip_width=width; reject("bad strip width accepted"); }
+    p.sinq_strip_width=64;
     p.sinq_iterations=3; reject("bad iterations accepted"); p.sinq_iterations=16;
     p.only_copy=true; reject("conditioning copy accepted"); p.only_copy=false;
     const auto bad_report=(dir/"missing-report-directory"/"report.json").string();
@@ -405,6 +407,53 @@ static void settings_controls(const std::string & source, const std::filesystem:
     check(llama_model_quantize(malformed.c_str(),rejected.c_str(),&p)!=0,"explicit selection silently changed codec for incompatible shape");
     p.ftype=LLAMA_FTYPE_MOSTLY_Q8_0;
     check(llama_model_quantize(malformed.c_str(),rejected.c_str(),&p)!=0,"explicit strip-incompatible shape accepted");
+}
+
+static void width_roundtrips(const std::string & source, const std::filesystem::path & dir) {
+    const auto mask=(dir/"width-down-only.txt").string();
+    { std::ofstream out(mask); out << "blk.0.ffn_down.weight\n"; check(out.good(),"width mask write"); }
+    for(int width:{32,64,128,256,512}) {
+        const auto manual=(dir/("width-manual-"+std::to_string(width)+".gguf")).string();
+        make_model(manual,"valid",false,width);
+        auto * direct=load(manual); check(direct!=nullptr,"valid width metadata rejected"); llama_model_free(direct);
+        for(auto format:{LLAMA_FTYPE_MOSTLY_Q3_K_M,LLAMA_FTYPE_MOSTLY_Q4_K_M}) {
+            auto p=llama_model_quantize_default_params(); p.ftype=format; p.pure=true; p.nthread=1;
+            p.sinq_precondition=LLAMA_SINQ_SIDECAR; p.sinq_strip_width=width;
+            // Only FFN down has K=512 in this fixture. Explicitly selecting it
+            // preserves the requested width rather than shrinking other strips.
+            p.sinq_tensor_list=mask.c_str();
+            const auto output=(dir/("width-"+std::to_string(width)+"-"+std::to_string(format)+".gguf")).string();
+            check(llama_model_quantize(source.c_str(),output.c_str(),&p)==0,"width quantization");
+            ggml_context * data=nullptr;
+            auto * metadata=gguf_init_from_file(output.c_str(),{false,&data});
+            check(metadata && data,"width output read");
+            check(gguf_get_val_u32(metadata,gguf_find_key(metadata,"beellama.qk_sinq.strip_width"))==uint32_t(width),"requested width changed");
+            auto * scale=ggml_get_tensor(data,"blk.0.ffn_down.weight.sinq_scale2");
+            check(scale && scale->type==GGML_TYPE_F16 && scale->ne[0]==512 && ggml_nbytes(scale)==1024,"width changed sidecar layout");
+            for(int i=0;i<512;++i) {
+                const float value=ggml_fp16_to_fp32(static_cast<const ggml_fp16_t *>(scale->data)[i]);
+                check(std::isfinite(value) && value>0,"width scale not finite positive");
+            }
+            check(gguf_get_arr_n(metadata,gguf_find_key(metadata,"beellama.qk_sinq.tensors"))==1,"width selection expanded");
+            check(gguf_get_tensor_type(metadata,gguf_find_tensor(metadata,"blk.0.ffn_down.weight"))==
+                (format==LLAMA_FTYPE_MOSTLY_Q3_K_M?GGML_TYPE_Q3_K:GGML_TYPE_Q4_K),"width changed native weight codec");
+            check(gguf_find_tensor(metadata,"blk.0.ffn_up.weight.sinq_scale2")<0,"width added an unselected companion");
+            gguf_free(metadata); ggml_free(data);
+            auto * model=load(output); check(model!=nullptr,"width quantized model reload"); llama_model_free(model);
+            p.nthread=4; p.max_buf_size=4096;
+            const auto parallel=output+".parallel.gguf";
+            check(llama_model_quantize(source.c_str(),parallel.c_str(),&p)==0,"parallel width quantization");
+            std::ifstream one(output,std::ios::binary),four(parallel,std::ios::binary);
+            const std::vector<char> a((std::istreambuf_iterator<char>(one)),{}),b((std::istreambuf_iterator<char>(four)),{});
+            check(one.good() && four.good() && a==b,"width threads/slabs changed GGUF bytes");
+            if(width==512) {
+                p.sinq_tensor_list=nullptr;
+                const auto rejected=output+".misaligned.gguf";
+                check(llama_model_quantize(source.c_str(),rejected.c_str(),&p)!=0,"width512 silently shrank a K256 strip");
+            }
+        }
+    }
+    std::puts("widths 32/64/128/256/512: explicit FFN-down quantize/reload, F16 sidecars and thread/slab bytes");
 }
 
 int main(int argc, char ** argv) try {
@@ -444,6 +493,7 @@ int main(int argc, char ** argv) try {
         check(full_bytes == slab_bytes,"slab boundaries changed normalization, native encoding or GGUF bytes");
         std::printf("standard QK quantize/reload/slab identity format=%d OK\n",format);
     }
+    width_roundtrips(source,dir);
     settings_controls(source,dir);
     full_coverage_pairs(source,dir);
     native_codec_pairs(source,dir);
@@ -528,6 +578,7 @@ int main(int argc, char ** argv) try {
         {"missing_version","qk_sinq"},{"version_dtype","qk_sinq"},{"version_value","qk_sinq"},
         {"missing_manifest","qk_sinq"},{"duplicate_manifest","duplicate"},
         {"bad_width","normalization recipe"},{"bad_iterations","normalization recipe"},
+        {"strip_misaligned","strip-aligned"},
         {"missing_scale","companion"},{"orphan","companion"},{"scale_shape","FP16"},{"scale_dtype","FP16"},
         {"scale_nan","non-finite or non-positive"},{"scale_zero","non-finite or non-positive"},{"scale_negative","non-finite or non-positive"},
         {"unsupported","unsupported tensor"},{"hadamard","Hadamard"},

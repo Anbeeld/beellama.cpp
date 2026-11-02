@@ -558,7 +558,7 @@ extern "C" {
         const int32_t * prune_layers;                               // pointer to layer indices to prune
         size_t max_buf_size;                                        // max bytes of tensor rows kept in memory at once, 0 = default (8 GiB)
         enum llama_sinq_precondition sinq_precondition;              // optional BeeLlama channel-scale extension; standard weight encoding
-        int32_t sinq_strip_width;                                   // normalization strip width, not the native quantizer block size
+        int32_t sinq_strip_width;                                   // 32/64/128/256/512 input columns, default 64; not the native codec block size
         int32_t sinq_iterations;                                    // 4, 8 or 16 normalization steps
         bool sinq_coverage;                                         // historical reproduction only: preserves noneligible source types
         float sinq_strength;                                       // [0,1], default 1; requires conditioning when nondefault

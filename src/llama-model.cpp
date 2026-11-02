@@ -1679,7 +1679,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         const uint32_t width = gguf_get_val_u32(ml.metadata,width_key);
         const uint32_t steps = gguf_get_val_u32(ml.metadata,steps_key);
         const std::string algorithm = gguf_get_val_str(ml.metadata,algorithm_key);
-        if ((width != 64 && width != 128) || (steps != 4 && steps != 8 && steps != 16) ||
+        if (!llama_sinq_valid_strip_width(width) || (steps != 4 && steps != 8 && steps != 16) ||
             (algorithm != "identity" && algorithm != "sinkhorn_log")) {
             throw std::runtime_error("QK SINQ unsupported qk_sinq normalization recipe");
         }
@@ -1715,8 +1715,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             const auto & weight = base->second;
             if (ggml_n_dims(weight.tensor) != 2 || !ggml_is_contiguous(weight.tensor) ||
-                weight.tensor->ne[0] % ggml_blck_size(weight.tensor->type)) {
-                throw std::runtime_error("QK SINQ weight must be a contiguous block-aligned matrix");
+                weight.tensor->ne[0] % ggml_blck_size(weight.tensor->type) ||
+                weight.tensor->ne[0] % gguf_get_val_u32(ml.metadata,gguf_find_key(ml.metadata,"beellama.qk_sinq.strip_width"))) {
+                throw std::runtime_error("QK SINQ weight must be a contiguous block-aligned matrix with strip-aligned input columns");
             }
             const auto scale = ml.weights_map.find(name+sinq_suffix);
             if (scale == ml.weights_map.end()) {

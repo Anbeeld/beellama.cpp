@@ -24,6 +24,9 @@ def validate_sinq_metadata(reader, path):
     for key in reader.fields:
         if key.startswith('beellama.qk_sinq.') and key not in SINQ_FIELDS:
             raise ValueError(f'{path}: unsupported SINQ metadata {key}')
+    width = reader.fields.get('beellama.qk_sinq.strip_width')
+    if width is not None and (width.types != [GGUFValueType.UINT32] or width.contents() not in (32, 64, 128, 256, 512)):
+        raise ValueError(f'{path}: unsupported SINQ strip width')
 
 
 def main():
@@ -87,6 +90,9 @@ def main():
                 unquantized_bytes += tensor.n_bytes
             side_summary = None
             if name in declared:
+                width = reader.fields.get('beellama.qk_sinq.strip_width')
+                if width is not None and int(tensor.shape[0]) % int(width.contents()):
+                    raise ValueError(f'{path}: input dimension is not strip aligned')
                 if kind not in ('Q3_K','Q4_K'):
                     raise ValueError(f'{path}: transformed base is not ordinary Q3_K/Q4_K')
                 side_name = name + '.sinq_scale2'

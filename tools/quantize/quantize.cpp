@@ -125,7 +125,7 @@ static void usage(const char * executable) {
     printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--include-weights]\n", executable);
     printf("       [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--tensor-type] [--tensor-type-file]\n");
     printf("       [--prune-layers] [--keep-split] [--override-kv] [--dry-run] [--max-buffer-size]\n");
-    printf("       [--sinq-precondition none|sidecar|identity] [--sinq-strip-width 64|128] [--sinq-iterations 4|8|16]\n");
+    printf("       [--sinq-precondition none|sidecar|identity] [--sinq-strip-width 32|64|128|256|512] [--sinq-iterations 4|8|16]\n");
     printf("       [--sinq-strength FLOAT] [--sinq-tensor-list PATH] [--sinq-diagnostics-json PATH] [--sinq-coverage]\n");
     printf("       model-f32.gguf [model-quant.gguf] type [nthreads]\n\n");
     printf("  --allow-requantize\n");
@@ -141,7 +141,7 @@ static void usage(const char * executable) {
     printf("                                      native IQ1_S/M, IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_NL/XS,\n");
     printf("                                      Q3_K/Q4_K/Q6_K, Q5_0/1 and Q8_0 only\n");
     printf("                                      no embedding/output transform, codec fallback or copy mode\n");
-    printf("  --sinq-strip-width 64|128             default 64; selected input dimensions must be strip aligned\n");
+    printf("  --sinq-strip-width 32|64|128|256|512  default 64; full-height input-column strips, dimensions must be aligned\n");
     printf("  --sinq-iterations 4|8|16              best-intermediate normalization steps (default 16)\n");
     printf("  --sinq-strength FLOAT                 default 1.0; finite [0,1], nondefault requires sidecar\n");
     printf("                                      0 is identity; 1 preserves legacy rounding; serialized F16 scales are authoritative\n");
@@ -496,7 +496,7 @@ int llama_quantize(int argc, char ** argv) {
             if (++arg_idx >= argc) { usage(argv[0]); }
             char * end = nullptr;
             const long value = std::strtol(argv[arg_idx],&end,10);
-            if (!end || *end || (strip ? (value != 64 && value != 128) : (value != 4 && value != 8 && value != 16))) { usage(argv[0]); }
+            if (!end || *end || (strip ? (value != 32 && value != 64 && value != 128 && value != 256 && value != 512) : (value != 4 && value != 8 && value != 16))) { usage(argv[0]); }
             if (strip) { params.sinq_strip_width = int32_t(value); } else { params.sinq_iterations = int32_t(value); }
         } else if (strcmp(argv[arg_idx], "--sinq-strength") == 0) {
             if (++arg_idx >= argc) { usage(argv[0]); }

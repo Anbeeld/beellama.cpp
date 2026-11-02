@@ -1084,9 +1084,9 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         for (const auto & name : sinq_mask) { normalized += name + "\n"; }
         sinq_report["tensor_list_sha256"] = sinq_digest(normalized.data(), normalized.size());
     } else { sinq_report["tensor_list_sha256"] = nullptr; }
-    if (sinq_enabled && ((params->sinq_strip_width != 64 && params->sinq_strip_width != 128) ||
+    if (sinq_enabled && (!llama_sinq_valid_strip_width(params->sinq_strip_width) ||
         (params->sinq_iterations != 4 && params->sinq_iterations != 8 && params->sinq_iterations != 16) || params->only_copy)) {
-        throw std::runtime_error("QK SINQ requires strip width 64/128, iterations 4/8/16 and actual quantization");
+        throw std::runtime_error("QK SINQ requires strip width 32/64/128/256/512, iterations 4/8/16 and actual quantization");
     }
 
     int nthread = params->nthread;
@@ -1307,6 +1307,11 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 throw std::runtime_error("QK SINQ preconditioning requires original F32/F16/BF16 matrices");
             }
             if (tensor->ne[0] % params->sinq_strip_width) { throw std::runtime_error("QK SINQ input dimension is not strip aligned"); }
+            size_t sinq_workspace;
+            if (params->sinq_precondition != LLAMA_SINQ_IDENTITY && params->sinq_strength != 0.f &&
+                !llama_sinq_workspace_size(tensor->ne[1],params->sinq_strip_width,sinq_workspace)) {
+                throw std::runtime_error(format("QK SINQ full-height strip for '%s' exceeds the 128 MiB worker workspace limit or has an invalid shape",tensor->name));
+            }
             auto * aux = ggml_new_tensor_1d(sinq_ctx.get(),GGML_TYPE_F16,tensor->ne[0]);
             ggml_set_name(aux,(metadata[i].name+".sinq_scale2").c_str());
             gguf_add_tensor(ctx_outs[i_split].get(),aux);
