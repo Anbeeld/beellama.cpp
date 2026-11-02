@@ -150,7 +150,7 @@ bool llama_sinq_balance_tile(const float * weights, int64_t n, int g, int iterat
 bool llama_sinq_compute_scales(const void * source, ggml_type source_type,
                               int64_t n, int64_t k, const llama_sinq_options & options,
                               int threads, std::vector<ggml_fp16_t> & scales,
-                              llama_sinq_statistics & statistics) {
+                              llama_sinq_statistics & statistics, std::vector<float> * unrounded) {
     if (!source || !valid_shape(n,k,options.strip_width) || !valid_iterations(options.iterations) || threads <= 0 ||
         !std::isfinite(options.strength) || options.strength < 0.f || options.strength > 1.f ||
         (source_type != GGML_TYPE_F32 && source_type != GGML_TYPE_F16 && source_type != GGML_TYPE_BF16)) { return false; }
@@ -165,6 +165,7 @@ bool llama_sinq_compute_scales(const void * source, ggml_type source_type,
     result.identity = options.identity || options.strength == 0.f;
     try {
         std::vector<ggml_fp16_t> output(size_t(k),ggml_fp32_to_fp16(1.f));
+        std::vector<float> raw_output(unrounded ? size_t(k) : 0,1.f);
         if (!result.identity) {
             const int g = options.strip_width;
             const int64_t groups = k/g;
@@ -185,6 +186,7 @@ bool llama_sinq_compute_scales(const void * source, ggml_type source_type,
                             const float f = ggml_fp16_to_fp32(h);
                             if (!(f > 0) || !std::isfinite(f)) { ok = false; break; }
                             output[group*g+j] = h;
+                            if (unrounded) { raw_output[group*g+j] = value; }
                         }
                     }
                 } catch (const std::exception &) { ok = false; }
@@ -211,6 +213,7 @@ bool llama_sinq_compute_scales(const void * source, ggml_type source_type,
         result.median_scale = ordered.size()%2 ? ordered[ordered.size()/2] :
             (ordered[ordered.size()/2-1]+ordered[ordered.size()/2])*.5f;
         for (const auto & strip : result.strips) { result.selected_identity_count += strip.chosen_iteration == 0; }
+        if (unrounded) { unrounded->swap(raw_output); }
         scales.swap(output); statistics = std::move(result);
         return true;
     } catch (const std::exception &) { return false; }

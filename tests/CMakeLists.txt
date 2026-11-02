@@ -840,6 +840,17 @@ if (NOT QK_SINQ_FIXTURE_COUNT EQUAL 36)
 endif()
 add_test(NAME test-qk-sinq-numeric COMMAND test-qk-sinq-numeric ${QK_SINQ_FIXTURES})
 
+add_executable(test-sinq-activation test-sinq-activation.cpp)
+target_compile_features(test-sinq-activation PRIVATE cxx_std_17)
+target_link_libraries(test-sinq-activation PRIVATE llama-sinq-optimizer)
+add_test(NAME test-sinq-activation COMMAND test-sinq-activation)
+
+add_executable(test-sinq-calibration test-sinq-calibration.cpp)
+target_include_directories(test-sinq-calibration PRIVATE ../src)
+target_compile_features(test-sinq-calibration PRIVATE cxx_std_17)
+target_link_libraries(test-sinq-calibration PRIVATE llama-sinq-optimizer)
+add_test(NAME test-sinq-calibration COMMAND test-sinq-calibration)
+
 add_executable(test-qk-sinq-model test-qk-sinq-model.cpp)
 target_compile_features(test-qk-sinq-model PRIVATE cxx_std_17)
 target_link_libraries(test-qk-sinq-model PRIVATE llama ggml)
@@ -861,6 +872,16 @@ if (GGML_CUDA)
 endif()
 
 if (Python3_Interpreter_FOUND)
+    if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS)
+        set_tests_properties(test-qk-sinq-model PROPERTIES FIXTURES_SETUP sinq-synthetic-source)
+        add_test(NAME test-sinq-calibration-e2e COMMAND ${Python3_EXECUTABLE}
+            ${PROJECT_SOURCE_DIR}/tests/test-sinq-calibration-e2e.py
+            --source ${CMAKE_CURRENT_BINARY_DIR}/qk-sinq-model-fixtures/source.gguf
+            --quantize $<TARGET_FILE:llama-quantize>)
+        set_tests_properties(test-sinq-calibration-e2e PROPERTIES FIXTURES_REQUIRED sinq-synthetic-source SKIP_RETURN_CODE 77)
+    endif()
+    add_test(NAME test-sinq-exporter COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-sinq-exporter.py)
+    set_tests_properties(test-sinq-exporter PROPERTIES WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     add_test(NAME test-qk-sinq-python-storage
         COMMAND ${Python3_EXECUTABLE} -m unittest discover -s ${PROJECT_SOURCE_DIR}/gguf-py/tests -p test_qk_sinq.py)
     set_tests_properties(test-qk-sinq-python-storage PROPERTIES WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})

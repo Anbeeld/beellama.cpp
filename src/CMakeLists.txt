@@ -43,7 +43,6 @@ set(LLAMA_CORE_SOURCES
     llama-model-saver.cpp
     llama-model.cpp
     llama-quant.cpp
-    ../vendor/hash/sha256/sha256.c
     llama-sampler.cpp
     llama-vocab.cpp
     unicode-data.cpp
@@ -52,9 +51,11 @@ set(LLAMA_CORE_SOURCES
 
 # Object linkage keeps the offline optimizer inside installed libllama archives,
 # rather than introducing an uninstalled private static-library dependency.
-add_library(llama-sinq-optimizer OBJECT llama-sinq.cpp)
+add_library(llama-sinq-optimizer OBJECT llama-sinq.cpp llama-sinq-calibration.cpp llama-sinq-activation.cpp
+    ../vendor/hash/sha256/sha256.c)
 set_target_properties(llama-sinq-optimizer PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_features(llama-sinq-optimizer PRIVATE cxx_std_17)
+target_include_directories(llama-sinq-optimizer PRIVATE ../vendor/hash)
 target_link_libraries(llama-sinq-optimizer PUBLIC ggml)
 
 add_library(llama

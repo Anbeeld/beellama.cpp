@@ -564,6 +564,7 @@ extern "C" {
         float sinq_strength;                                       // [0,1], default 1; requires conditioning when nondefault
         const char * sinq_tensor_list;                              // optional UTF-8 exact-name allowlist path; requires conditioning
         const char * sinq_diagnostics_json;                         // optional external diagnostics path, also valid for stock
+        const char * sinq_calibration;                              // optional offline real-activation manifest; sidecar only
     } llama_model_quantize_params;
 
     typedef struct llama_logit_bias {

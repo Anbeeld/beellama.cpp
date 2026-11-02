@@ -4,6 +4,8 @@
 #include "llama-ext.h"
 #include "llama.h"
 #include "llama-sinq.h"
+#include "llama-sinq-calibration.h"
+#include "llama-sinq-activation.h"
 #include "llama-version.h"
 #include "../vendor/nlohmann/json.hpp"
 extern "C" {
@@ -1047,6 +1049,26 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     llama_ftype ftype = params->ftype;
     const bool diagnostics = params->sinq_diagnostics_json != nullptr;
     const bool sinq_enabled = params->sinq_precondition != LLAMA_SINQ_NONE;
+    const bool calibrated = params->sinq_calibration != nullptr;
+    if (calibrated && (!*params->sinq_calibration || params->sinq_precondition != LLAMA_SINQ_SIDECAR || params->only_copy)) {
+        throw std::runtime_error("A-SINQ calibration requires sidecar conditioning and a nonempty activation manifest");
+    }
+    if (calibrated) {
+        if (params->prune_layers && params->prune_layers[0] != -1) {
+            throw std::runtime_error("A-SINQ calibration cannot prune/remap the reference graph");
+        }
+        // The CLI adds these producer-only fields when loading an imatrix.
+        // They do not change the reference model's graph or activation sites.
+        const std::set<std::string> provenance_keys = {"quantize.imatrix.file","quantize.imatrix.dataset",
+            "quantize.imatrix.entries_count","quantize.imatrix.chunks_count"};
+        if (params->kv_overrides) {
+            for (const auto * item=params->kv_overrides;item->key[0];++item) {
+                if (!provenance_keys.count(item->key)) {
+                    throw std::runtime_error("A-SINQ calibration cannot override reference graph metadata");
+                }
+            }
+        }
+    }
     if (sinq_enabled && (params->sinq_precondition != LLAMA_SINQ_SIDECAR && params->sinq_precondition != LLAMA_SINQ_IDENTITY)) {
         throw std::runtime_error("invalid SINQ precondition mode");
     }
@@ -1113,6 +1135,15 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     llama_model_loader ml(/*metadata*/ nullptr, /*set_tensor_data*/ nullptr, /*set_tensor_data_ud*/ nullptr,
         fname_inp, splits, /*file*/ nullptr, /*load_mode*/ sinq_enabled ? LLAMA_LOAD_MODE_MMAP : load_mode, /*check_tensors*/ true, /*no_alloc*/ false, /*load_mtp*/ true, kv_overrides, nullptr);
     ml.init_mappings(false); // no prefetching
+    std::unique_ptr<llama_sinq_activation_manifest> activation_manifest;
+    if (calibrated) {
+        if (ml.files.size() != 1) { throw std::runtime_error("A-SINQ activation source identity requires one original GGUF file"); }
+        activation_manifest.reset(new llama_sinq_activation_manifest(llama_sinq_load_activations(params->sinq_calibration,fname_inp)));
+        sinq_report["calibration"] = {{"method","native-gguf-a-sinq-l1"},
+            {"source_sha256",activation_manifest->source_sha256}, {"source_revision",activation_manifest->source_revision},
+            {"manifest_sha256",activation_manifest->manifest_sha256}, {"fixed_strength",params->sinq_strength}};
+        LLAMA_LOG_WARN("A-SINQ is an offline native-codec adaptation. End-to-end quality is unmeasured; calibration L1 is not KLD/PPL.\n");
+    }
     if (gguf_find_key(ml.metadata, "beellama.qk_sinq.version") >= 0) {
         throw std::runtime_error("SINQ source copy/requantization requires the original floating model, not a transformed artifact");
     }
@@ -1124,6 +1155,23 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         }
         LLAMA_LOG_WARN("QK SINQ companions REQUIRE BeeLlama, standard GGUF engines can silently produce wrong output. Use a .beellama-qk-sinq.gguf filename.\n");
     }
+
+    const auto calibration_output_safe = [&](const std::string & output) {
+        if (!activation_manifest) { return; }
+        auto manifest_path = std::filesystem::u8path(params->sinq_calibration);
+        if (std::filesystem::is_directory(manifest_path)) { manifest_path /= "activations.json"; }
+        std::vector<std::filesystem::path> inputs = {std::filesystem::u8path(fname_inp),manifest_path};
+        if (params->sinq_tensor_list) { inputs.push_back(std::filesystem::u8path(params->sinq_tensor_list)); }
+        for (const auto & item:activation_manifest->tensors) { inputs.push_back(std::filesystem::u8path(item.second.data_file)); }
+        const auto target = std::filesystem::weakly_canonical(std::filesystem::u8path(output));
+        for (const auto & input:inputs) {
+            if (target == std::filesystem::canonical(input) ||
+                (std::filesystem::exists(target) && std::filesystem::equivalent(target,input))) {
+                throw std::runtime_error("A-SINQ output must not overwrite source, manifest, tensor list or activation samples");
+            }
+        }
+    };
+    if (diagnostics) { calibration_output_safe(params->sinq_diagnostics_json); }
 
     auto mparams = llama_model_default_params();
     std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, mparams));
@@ -1338,6 +1386,23 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     }
 
     if (!unmatched_sinq.empty()) { throw std::runtime_error("SINQ tensor-list name not found: " + *unmatched_sinq.begin()); }
+    if (activation_manifest) {
+        std::set<std::string> found;
+        for (size_t index=0;index<metadata.size();++index) {
+            const auto & item = metadata[index];
+            const auto * tensor = tensors[index]->tensor;
+            const auto entry = activation_manifest->tensors.find(item.name);
+            if (entry != activation_manifest->tensors.end()) {
+                if (!sinq_tensor_eligible(tensor,*model) || entry->second.input_dim != tensor->ne[0] || entry->second.output_dim != tensor->ne[1]) {
+                    throw std::runtime_error("A-SINQ manifest tensor eligibility/shape mismatch: " + item.name);
+                }
+                found.insert(item.name);
+            } else if (item.sinq_preconditioned) {
+                throw std::runtime_error("A-SINQ missing actual activation samples for selected tensor: " + item.name);
+            }
+        }
+        if (found.size() != activation_manifest->tensors.size()) { throw std::runtime_error("A-SINQ manifest contains a tensor absent from the original model"); }
+    }
     if (sinq_enabled) {
         if (sinq_names.empty()) { throw std::runtime_error("QK SINQ found no eligible primary-trunk qwen35 native-codec weights"); }
         std::vector<const char *> names;
@@ -1396,6 +1461,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             fname = std::string(split_path.data());
         }
 
+        calibration_output_safe(fname);
         fout = std::ofstream(fname, std::ios::binary);
         fout.exceptions(std::ofstream::failbit); // fail fast on write errors
         const size_t meta_size = gguf_get_meta_size(ctx_outs[cur_split].get());
@@ -1447,6 +1513,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
         size_t new_size;
         std::vector<ggml_fp16_t> sinq_values;
+        std::vector<float> calibration_raw;
         nlohmann::json * diagnostic = nullptr;
         if (diagnostics && sinq_tensor_eligible(tensor, *model)) {
             const char * reason = tm.sinq_preconditioned ? "included" : !sinq_enabled ? "stock" :
@@ -1477,7 +1544,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             options.strength = params->sinq_strength;
             llama_sinq_statistics stats;
             if (!llama_sinq_compute_scales(load_range(0,tensor_size),cur_type,tensor->ne[1],tensor->ne[0],
-                                           options,nthread,sinq_values,stats)) {
+                                           options,nthread,sinq_values,stats,calibrated ? &calibration_raw : nullptr)) {
                 throw std::runtime_error(format("QK SINQ statistics failed for '%s'",tensor->name));
             }
             if (diagnostic) {
@@ -1591,6 +1658,47 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 const size_t row_size_src = ggml_row_size(tensor->type, n_per_row);
                 const size_t row_size_dst = ggml_row_size(new_type,     n_per_row);
 
+                static const int64_t min_chunk_size = 32 * 512;
+                const int64_t chunk_size = (n_per_row >= min_chunk_size ? n_per_row : n_per_row * ((min_chunk_size + n_per_row - 1)/n_per_row));
+                if (calibrated && tm.sinq_preconditioned) {
+                    const auto & entry = activation_manifest->tensors.at(tm.name);
+                    const size_t calibration_budget = std::min<size_t>(max_buf_size,64ull*1024*1024);
+                    // Reject oversized inputs before materializing the sample matrix.
+                    if (uint64_t(entry.count)*uint64_t(entry.input_dim)*sizeof(float) > calibration_budget) {
+                        throw std::runtime_error("A-SINQ activation samples exceed the row/sample workspace budget");
+                    }
+                    const auto samples = llama_sinq_load_activation_samples(entry);
+                    const auto start = ggml_time_us();
+                    const auto read = [&](int64_t first,int64_t rows,float * output) {
+                        const void * src = load_range(size_t(first)*row_size_src,size_t(rows)*row_size_src);
+                        if (cur_type == GGML_TYPE_F32) { std::memcpy(output,src,size_t(rows)*n_per_row*sizeof(float)); }
+                        else { llama_tensor_dequantize_impl(cur_type,src,output,workers,size_t(rows)*n_per_row,nthread); }
+                    };
+                    const auto encode = [&](const float * input,void * output,int64_t first,int64_t rows,const float * importance) {
+                        const int64_t chunks = (rows*n_per_row+chunk_size-1)/chunk_size;
+                        const int use = int(std::max<int64_t>(1,std::min<int64_t>(nthread,chunks)));
+                        return llama_tensor_quantize_impl(new_type,input,output,chunk_size,first,rows,nrows_per_expert,n_per_row,importance,workers,use);
+                    };
+                    const auto result = llama_sinq_calibrate_native(new_type,nrows_total,n_per_row,calibration_raw,sinq_values,
+                        samples,entry.count,imatrix,calibration_budget,read,encode);
+                    sinq_values = result.scales;
+                    const double milliseconds = double(ggml_time_us()-start)/1000.;
+                    if (diagnostic) {
+                        (*diagnostic)["calibration"] = {{"sample_count",entry.count},{"input_dim",n_per_row},{"output_dim",nrows_total},
+                            {"activation_sha256",entry.sha256},{"site",entry.site},{"reference_module",entry.reference_module},
+                            {"codec",ggml_type_name(new_type)},{"uncalibrated_l1",result.baseline_loss},{"selected_l1",result.selected_loss},
+                            {"selected_awq_alpha",result.alpha_index<0 ? nlohmann::json(nullptr) : nlohmann::json(double(result.alpha_index)/20.)},
+                            {"candidate_l1",result.candidate_losses},{"workspace_bytes",result.workspace_bytes}};
+                        std::vector<float> ordered;for (auto h:sinq_values) { ordered.push_back(ggml_fp16_to_fp32(h)); }
+                        std::sort(ordered.begin(),ordered.end());
+                        (*diagnostic)["scale_min"] = ordered.front();(*diagnostic)["scale_max"] = ordered.back();
+                        (*diagnostic)["scale_median"] = ordered.size()%2 ? ordered[ordered.size()/2] : (ordered[ordered.size()/2-1]+ordered[ordered.size()/2])*.5f;
+                        (*diagnostic)["scales_sha256"] = sinq_digest(sinq_values.data(),sinq_values.size()*sizeof(ggml_fp16_t));
+                    }
+                    LLAMA_LOG_INFO("A-SINQ tensor=%s codec=%s N=%" PRId64 " K=%" PRId64 " samples=%d alpha=%g L1=%.9g baseline=%.9g workspace=%zu time_ms=%.3f; ",
+                        tensor->name,ggml_type_name(new_type),nrows_total,n_per_row,entry.count,result.alpha_index<0 ? -1. : double(result.alpha_index)/20.,
+                        result.selected_loss,result.baseline_loss,result.workspace_bytes,milliseconds);
+                }
                 std::vector<float> sinq_imatrix;
                 if (tm.sinq_preconditioned && imatrix) {
                     sinq_imatrix.resize(n_per_row);
@@ -1610,9 +1718,6 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     (tensor->type == GGML_TYPE_F32 ? 0 : n_per_row*sizeof(float)) +
                     (tm.sinq_preconditioned ? n_per_row*sizeof(float) : 0);
                 const int64_t nrows_slab = std::max<int64_t>(1, std::min<int64_t>(nrows_total, max_buf_size/bytes_per_row));
-
-                static const int64_t min_chunk_size = 32 * 512;
-                const int64_t chunk_size = (n_per_row >= min_chunk_size ? n_per_row : n_per_row * ((min_chunk_size + n_per_row - 1)/n_per_row));
 
                 // process rows across all experts in one pass to keep all threads busy
                 new_size = 0;
@@ -1750,7 +1855,8 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.sinq_coverage                =*/ false,
         /*.sinq_strength                =*/ 1.f,
         /*.sinq_tensor_list             =*/ nullptr,
-        /*.sinq_diagnostics_json        =*/ nullptr
+        /*.sinq_diagnostics_json        =*/ nullptr,
+        /*.sinq_calibration             =*/ nullptr
     };
 
     return result;

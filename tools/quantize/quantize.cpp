@@ -144,7 +144,10 @@ static void usage(const char * executable) {
     printf("  --sinq-strip-width 32|64|128|256|512  default 64; full-height input-column strips, dimensions must be aligned\n");
     printf("  --sinq-iterations 4|8|16              best-intermediate normalization steps (default 16)\n");
     printf("  --sinq-strength FLOAT                 default 1.0; finite [0,1], nondefault requires sidecar\n");
-    printf("                                      0 is identity; 1 preserves legacy rounding; serialized F16 scales are authoritative\n");
+    printf("                                      0 disables Sinkhorn (A-SINQ may still apply AWQ); 1 preserves ordinary rounding; F16 scales authoritative\n");
+    printf("  --sinq-calibration PATH              opt-in offline real-activation manifest/directory; requires sidecar\n");
+    printf("                                      A-SINQ adapted to native GGUF codecs, not paper RTN; fixed-strength 20-alpha L1 search\n");
+    printf("                                      no measured end-to-end quality guarantee; missing selected samples are errors\n");
     printf("  --sinq-tensor-list PATH               default absent (all eligible); UTF-8 exact base names, one per line\n");
     printf("                                      requires conditioning; no duplicates, blank lines, regex or unsupported selections\n");
     printf("                                      excludes only conditioning, never changes stock allocation/payloads\n");
@@ -508,6 +511,9 @@ int llama_quantize(int argc, char ** argv) {
         } else if (strcmp(argv[arg_idx], "--sinq-tensor-list") == 0) {
             if (++arg_idx >= argc || !*argv[arg_idx]) { usage(argv[0]); }
             params.sinq_tensor_list = argv[arg_idx];
+        } else if (strcmp(argv[arg_idx], "--sinq-calibration") == 0) {
+            if (++arg_idx >= argc || !*argv[arg_idx]) { usage(argv[0]); }
+            params.sinq_calibration = argv[arg_idx];
         } else if (strcmp(argv[arg_idx], "--sinq-diagnostics-json") == 0) {
             if (++arg_idx >= argc || !*argv[arg_idx]) { usage(argv[0]); }
             params.sinq_diagnostics_json = argv[arg_idx];

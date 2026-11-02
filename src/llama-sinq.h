@@ -75,8 +75,10 @@ bool llama_sinq_balance_tile(const float * weights, int64_t rows, int width,
 // shapes requiring more than that for one strip, without changing the width.
 // F16-round t BEFORE W/t:
 // serialized t and runtime compensation must be the identical diagonal matrix.
+// Optional unrounded strength-powered factors are for offline AWQ correction only.
 bool llama_sinq_compute_scales(const void * source, ggml_type source_type,
                               int64_t rows, int64_t columns,
                               const llama_sinq_options & options, int threads,
                               std::vector<ggml_fp16_t> & scales,
-                              llama_sinq_statistics & statistics);
+                              llama_sinq_statistics & statistics,
+                              std::vector<float> * unrounded = nullptr);
