@@ -845,6 +845,21 @@ target_compile_features(test-sinq-activation PRIVATE cxx_std_17)
 target_link_libraries(test-sinq-activation PRIVATE llama-sinq-optimizer)
 add_test(NAME test-sinq-activation COMMAND test-sinq-activation)
 
+# Offline HF/native parity uses a tiny locally initialized Qwen3.5, never a downloaded model.
+if (GGML_CPU)
+    llama_build(test-sinq-activation-parity.cpp LINK llama ggml ggml-cpu)
+    if (Python3_Interpreter_FOUND)
+        add_test(NAME test-sinq-activation-parity COMMAND ${Python3_EXECUTABLE}
+            ${PROJECT_SOURCE_DIR}/tests/test-sinq-activation-parity.py
+            --runner $<TARGET_FILE:test-sinq-activation-parity>
+            --output ${CMAKE_CURRENT_BINARY_DIR}/sinq-activation-parity
+            --storage-smoke)
+        set_tests_properties(test-sinq-activation-parity PROPERTIES
+            SKIP_RETURN_CODE 77 LABELS "python behavior cpu"
+            ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1;HF_HUB_OFFLINE=1;TRANSFORMERS_OFFLINE=1")
+    endif()
+endif()
+
 add_executable(test-sinq-calibration test-sinq-calibration.cpp)
 target_include_directories(test-sinq-calibration PRIVATE ../src)
 target_compile_features(test-sinq-calibration PRIVATE cxx_std_17)
