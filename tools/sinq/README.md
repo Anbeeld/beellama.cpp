@@ -31,8 +31,16 @@ use a new output directory after diagnosing the failure.
 Supported sites are FFN gate/up/down, full-attention Q/K/V/output, and linear
 attention QKV/Z/a/b/output. Actual module paths start with
 `model.language_model.layers`. Fused, missing, or non-Linear sites are rejected.
-Each selected module's checkpoint weights must exactly match the original
-floating GGUF after the converter's audited permutations. Linear-attention V rows,
+Before capture, every text-model parameter is mapped and compared against the
+original floating GGUF, including embeddings, both normalization stages,
+unselected projections, SSM state/conv parameters and the output head. The
+check applies converter normalization/exponential/head-layout transforms and
+compares at the GGUF storage precision. Missing, extra or mismatched text
+tensors fail even when the selected projection matches. Tied output aliases
+are checked explicitly. Vision parameters are outside this text-only forward.
+Graph-defining configuration is checked as well; unsupported activation/RoPE
+variants fail rather than being guessed. Verification runs on CPU in bounded
+row chunks before moving the model to the requested device. Linear-attention V rows,
 Z rows, a/b rows, and output columns are permuted as appropriate. Only
 linear-attention output activations need the grouped-to-tiled V-head permutation.
 BF16 GGUF bytes are decoded as 16-bit words, not numerical byte values.
@@ -44,13 +52,19 @@ maximum 256. PCG64 is seeded by the first 128 bits of
 Sampling does not depend on hook traversal order. A binary file cannot exceed
 256 MiB. Hooks process one selected row at a time on the host; they do not retain
 all forward activations. Model memory and the current prefill's temporary tensors
-still depend on the checkpoint, context, dtype, and device. Weight validation
-materializes one selected matrix and its converted comparison at a time.
+still depend on the checkpoint, context, dtype, and device. Complete identity verification uses at most 64 MiB of conservative row-buffer
+workspace, excluding the loaded reference model, source mappings and small
+permutation indices; it does not expand a complete embedding matrix to F32.
 
 The manifest records corpus and little-endian uint32 token-stream SHA256 hashes,
 checkpoint config/safetensors hashes, actual module names/classes, dtype, device,
 context, token count, and sampling details. Raw text is not printed or included in
-the manifest. Calibration activation files can themselves contain sensitive data;
+the manifest. The provenance also records `reference_identity`: its
+`qwen35-full-text-storage-v1` contract, verified tensor count/digest, checked
+configuration fields, alias handling and storage-precision policy. Source,
+corpus and checkpoint hashes are rechecked before the manifest is published.
+Older captures do not gain this verification retroactively; re-export them
+before relying on the stronger identity contract. Calibration activation files can themselves contain sensitive data;
 keep them local and exclude them from version control.
 
 ## Small CPU test

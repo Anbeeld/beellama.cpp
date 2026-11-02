@@ -86,15 +86,27 @@ For `ssm_out`, captured input channels must undergo the same permutation as
 GGUF input columns: reshape the head axis as
 `[key_heads,value_heads/key_heads,value_head_dim]`, swap its first two axes,
 then flatten. QKV's V rows, Z rows and alpha/beta rows receive corresponding
-weight-output permutations; their input channels are unchanged. The exporter
-verifies selected checkpoint weights against GGUF weights after these exact
-converter transformations. It correctly decodes packed BF16 GGUF storage.
+weight-output permutations; their input channels are unchanged. The exporter verifies the entire text-model parameter set against GGUF,
+not only selected projections. This includes embeddings, regular norm `1+w`,
+negative exponentiation of `A_log`, convolution squeezing, SSM head reordering
+and the output head (or its verified tied alias). Comparisons are exact after
+converter transformations and rounding to each GGUF tensor's storage dtype.
+Large matrices, including embeddings, are compared in bounded row chunks;
+packed BF16 words are sliced before conversion. Graph-defining configuration
+is also checked, and unsupported activation/RoPE variants fail explicitly.
 
 Mapping was traced through `conversion/qwen.py`, `conversion/base.py`, GGUF
 tensor mappings, `src/models/qwen35.cpp` and installed Transformers 5.6.2
 `modeling_qwen3_5.py`. Structural correspondence is not a claim of bitwise HF
 versus native activation equality. The exporter records graph/module identity,
 checkpoint file hashes, corpus/token identity, dtype and chunking policy.
+Provenance includes `reference_identity.contract` equal to
+`qwen35-full-text-storage-v1`, verified tensor count/digest, configuration fields,
+output alias handling and precision policy. The GGUF, corpus and checkpoint
+hashes are checked again before writing the manifest. Existing captures lack
+this stronger attestation; re-export rather than relabel them. This remains
+producer-only provenance within format v1, not a new required runtime field.
+
 Hadamard-transformed, already conditioned/quantized sources, fused/missing
 reference modules and other architectures are rejected rather than guessed.
 MTP and vision projections are outside the supported primary-trunk set.

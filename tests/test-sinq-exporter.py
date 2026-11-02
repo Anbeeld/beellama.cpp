@@ -114,13 +114,20 @@ class CaptureTests(unittest.TestCase):
         class Language(torch.nn.Module):
             def __init__(self):
                 super().__init__()
+                self.embed_tokens = torch.nn.Embedding(10, 4).half()
+                with torch.no_grad():
+                    self.embed_tokens.weight.copy_(torch.arange(10).unsqueeze(1).expand(-1, 4))
                 block = torch.nn.Module()
                 block.mlp = torch.nn.Module()
                 block.mlp.up_proj = torch.nn.Linear(4, 3, bias=False).half()
                 self.layers = torch.nn.ModuleList([block])
 
             def forward(self, input_ids, **kwargs):
-                x = input_ids.to(torch.float16).unsqueeze(-1).expand(-1, -1, 4)
+                changed_file = getattr(self, 'changed_file', None)
+                if changed_file is not None:
+                    changed_file.write_text('{"changed":true}', encoding='utf-8')
+                    self.changed_file = None
+                x = self.embed_tokens(input_ids)
                 return self.layers[0].mlp.up_proj(x)
         root = torch.nn.Module()
         root.model = torch.nn.Module()
@@ -131,6 +138,7 @@ class CaptureTests(unittest.TestCase):
         (checkpoint / 'config.json').write_text('{}', encoding='utf-8')
         source = self.root / 'source.gguf'
         writer = GGUFWriter(str(source), 'qwen35')
+        writer.add_tensor('token_embd.weight', root.model.language_model.embed_tokens.weight.detach().float().numpy())
         writer.add_tensor('blk.0.ffn_up.weight', root.model.language_model.layers[0].mlp.up_proj.weight.detach().float().numpy())
         writer.write_header_to_file()
         writer.write_kv_data_to_file()
@@ -140,7 +148,7 @@ class CaptureTests(unittest.TestCase):
         selection.write_text('blk.0.ffn_up.weight\n', encoding='utf-8')
         tokens = self.root / 'tokens.json'
         tokens.write_text('[1,2,3,4,5]', encoding='utf-8')
-        config = types.SimpleNamespace(model_type='qwen3_5', text_config=types.SimpleNamespace(vocab_size=10, pad_token_id=0), to_json_string=lambda: '{}')
+        config = types.SimpleNamespace(model_type='qwen3_5', text_config=types.SimpleNamespace(vocab_size=10, pad_token_id=0, num_hidden_layers=1), to_json_string=lambda: '{}')
         fake = types.ModuleType('transformers')
         fake.AutoConfig = types.SimpleNamespace(from_pretrained=lambda *a, **kw: config)
         fake.AutoTokenizer = types.SimpleNamespace(from_pretrained=lambda *a, **kw: types.SimpleNamespace(pad_token_id=0))
@@ -157,6 +165,22 @@ class CaptureTests(unittest.TestCase):
                 exporter.export(args)
             self.assertFalse(Path(args.output).exists())
             tokens.write_text('[1,2,3,4,5]', encoding='utf-8')
+            args.output = str(self.root / 'changed-checkpoint')
+            root.model.language_model.changed_file = checkpoint / 'config.json'
+            with self.assertRaisesRegex(ValueError, 'checkpoint files changed during export'):
+                exporter.export(args)
+            self.assertFalse((Path(args.output) / 'activations.json').exists())
+            (checkpoint / 'config.json').write_text('{}', encoding='utf-8')
+            args.output = str(self.root / 'upstream-mismatch')
+            original_projection = root.model.language_model.layers[0].mlp.up_proj.weight.detach().clone()
+            with torch.no_grad():
+                root.model.language_model.embed_tokens.weight[1, 0].add_(1)
+            with self.assertRaisesRegex(ValueError, 'token_embd.weight'):
+                exporter.export(args)
+            self.assertFalse(Path(args.output).exists())
+            self.assertTrue(torch.equal(original_projection, root.model.language_model.layers[0].mlp.up_proj.weight))
+            with torch.no_grad():
+                root.model.language_model.embed_tokens.weight[1, 0].sub_(1)
             args.output = str(self.root / 'weight-mismatch')
             with torch.no_grad():
                 root.model.language_model.layers[0].mlp.up_proj.weight.add_(1)

@@ -67,26 +67,214 @@ def converter_weight(weight, role, config):
     return reorder_v(weight, 0, kh, vh, 1 if role in ('ssm_alpha', 'ssm_beta') else vd)
 
 
-def floating_tensor(tensor):
+def floating_tensor(tensor, rows=None):
     import numpy as np
-    k, n = map(int, tensor.shape)
-    if tensor.n_elements != k * n:
+    shape = tuple(map(int, tensor.shape))[::-1]
+    count = int(np.prod(shape))
+    if tensor.n_elements != count:
         raise ValueError('GGUF element count mismatch')
     kind = tensor.tensor_type.name
     raw = np.asarray(tensor.data)
     if kind == 'BF16':
-        # GGUFReader exposes BF16 as packed bytes, not numerical uint8 values.
-        words = raw.reshape(-1).view('<u2')
-        if words.size != k * n:
-            raise ValueError('packed BF16 size mismatch')
-        values = (words.astype(np.uint32) << 16).view(np.float32)
-    elif kind in ('F16', 'F32'):
-        values = raw.reshape(-1).astype(np.float32)
-    else:
+        # Slice packed words before converting, including huge embeddings.
+        raw = raw.reshape(-1).view('<u2')
+    elif kind not in ('F16', 'F32'):
         raise ValueError('source must be original floating GGUF')
-    if values.size != k * n or not np.isfinite(values).all():
+    if raw.size != count:
+        raise ValueError('packed floating tensor size mismatch')
+    raw = raw.reshape(shape)
+    if rows is not None:
+        raw = raw[rows]
+    values = (raw.astype(np.uint32) << 16).view(np.float32) if kind == 'BF16' else raw.astype(np.float32)
+    if not np.isfinite(values).all():
         raise ValueError('invalid GGUF weights')
-    return values.reshape(n, k)
+    return values
+
+
+def verify_reference_config(reader, config):
+    """Check graph-defining metadata as well as parameter identity."""
+    import numpy as np
+    verified = []
+
+    def check(suffix, expected, default=None):
+        key = 'qwen35.' + suffix
+        field = reader.fields.get(key)
+        if field is not None or default is not None:
+            actual = np.asarray(field.contents() if field is not None else default)
+            target = np.float32(expected) if actual.dtype.kind == 'f' else expected
+            if not np.all(actual == target):
+                raise ValueError('reference configuration mismatch: ' + key)
+            verified.append(key)
+
+    for suffix, attr in (
+        ('block_count', 'num_hidden_layers'), ('embedding_length', 'hidden_size'),
+        ('context_length', 'max_position_embeddings'),
+        ('feed_forward_length', 'intermediate_size'), ('attention.head_count', 'num_attention_heads'),
+        ('attention.head_count_kv', 'num_key_value_heads'), ('attention.key_length', 'head_dim'),
+        ('attention.value_length', 'head_dim'), ('attention.layer_norm_rms_epsilon', 'rms_norm_eps'),
+        ('ssm.conv_kernel', 'linear_conv_kernel_dim'), ('ssm.state_size', 'linear_key_head_dim'),
+        ('ssm.group_count', 'linear_num_key_heads'), ('ssm.time_step_rank', 'linear_num_value_heads'),
+    ):
+        if 'qwen35.' + suffix in reader.fields:
+            check(suffix, getattr(config, attr))
+    if hasattr(config, 'linear_value_head_dim'):
+        if config.linear_value_head_dim != config.linear_key_head_dim:
+            raise ValueError('reference unequal SSM key/value dimensions unsupported')
+        check('ssm.inner_size', config.linear_value_head_dim * config.linear_num_value_heads)
+    if getattr(config, 'hidden_act', 'silu') != 'silu':
+        raise ValueError('reference non-SiLU activation unsupported')
+    rope = getattr(config, 'rope_parameters', None)
+    if rope:
+        if rope.get('rope_type', 'default') != 'default' or not rope.get('mrope_interleaved', True):
+            raise ValueError('reference nondefault RoPE configuration unsupported')
+        check('rope.freq_base', rope.get('rope_theta', 10000.0), default=10000.0)
+        native_head = reader.fields.get('qwen35.attention.key_length')
+        native_head = int(native_head.contents()) if native_head else config.hidden_size // config.num_attention_heads
+        check('attention.key_length', config.head_dim, default=native_head)
+        check('attention.value_length', config.head_dim, default=config.hidden_size // config.num_attention_heads)
+        check('rope.dimension_count', int(config.head_dim * rope.get('partial_rotary_factor', 0.25)), default=native_head)
+        scaling = reader.fields.get('qwen35.rope.scaling.type')
+        if scaling is not None and scaling.contents() not in ('none', 'linear'):
+            raise ValueError('reference nondefault source RoPE scaling type unsupported')
+        order = reader.fields.get('qwen35.rope.section_order')
+        if order is not None and order.contents() != 'tyxz':
+            raise ValueError('reference source MRoPE section order unsupported')
+        for suffix in ('rope.scaling.factor', 'rope.scale_linear'):
+            field = reader.fields.get('qwen35.' + suffix)
+            if field is not None and float(field.contents()) not in (0.0, 1.0):
+                raise ValueError('reference nondefault source RoPE scaling unsupported')
+        for suffix in ('rope.scaling.attn_factor', 'rope.scaling.alpha'):
+            if 'qwen35.' + suffix in reader.fields:
+                raise ValueError('reference custom source RoPE parameters unsupported')
+        sections = list(rope.get('mrope_section', [11, 11, 10]))
+        sections += [0] * (4 - len(sections))
+        check('rope.dimension_sections', sections)
+    layer_types = getattr(config, 'layer_types', None)
+    if layer_types:
+        if any(kind not in ('linear_attention', 'full_attention') for kind in layer_types):
+            raise ValueError('reference layer types unsupported')
+        expected = [kind == 'linear_attention' for kind in layer_types]
+        field = reader.fields.get('qwen35.attention.recurrent_layers')
+        if field is not None:
+            actual = list(field.contents())
+        else:
+            interval = reader.fields.get('qwen35.full_attention_interval')
+            interval = int(interval.contents()) if interval else 4
+            if interval <= 0:
+                raise ValueError('invalid source full attention interval')
+            actual = [(i + 1) % interval != 0 for i in range(config.num_hidden_layers)]
+        if actual != expected:
+            raise ValueError('reference configuration mismatch: recurrent layers')
+        verified.append('qwen35.attention.recurrent_layers')
+    return verified
+
+
+def verify_reference_identity(model, config, tensors, workspace_limit=64 * 1024 * 1024):
+    """Check the complete text network with bounded row buffers, before capture."""
+    import numpy as np
+    import torch
+    from gguf import MODEL_ARCH, get_tensor_name_map
+    mapper = get_tensor_name_map(MODEL_ARCH.QWEN35, config.num_hidden_layers)
+    verified, aliases = {}, []
+    parameters = model.state_dict()
+    embedding = parameters.get('model.language_model.embed_tokens.weight')
+    for name, parameter in parameters.items():
+        if not (name.startswith('model.language_model.') or name == 'lm_head.weight'):
+            continue  # Vision is not executed by the text calibration forward.
+        if not parameter.is_floating_point():
+            raise ValueError('nonfloating reference parameter: ' + name)
+        canonical = name.replace('language_model.', '')
+        if name.endswith('.dt_bias'):
+            canonical = canonical.rpartition('.dt_bias')[0] + '.dt_proj.bias'
+        mapped = mapper.get_name(canonical, try_suffixes=('.weight', '.bias'))
+        if mapped is None:
+            raise ValueError('unmapped reference text parameter: ' + name)
+        if mapped == 'output.weight' and mapped not in tensors and getattr(config, 'tie_word_embeddings', False):
+            if embedding is None or not torch.equal(parameter.detach().cpu(), embedding.detach().cpu()):
+                raise ValueError('reference output is not tied to token embeddings')
+            aliases.append(name)
+            continue
+        if mapped not in tensors:
+            raise ValueError('missing source tensor: ' + mapped)
+        kind = tensors[mapped].tensor_type.name
+        if kind not in ('F16', 'BF16', 'F32'):
+            raise ValueError('nonfloating source tensor: ' + mapped)
+        storage = {'F16': torch.float16, 'BF16': torch.bfloat16, 'F32': torch.float32}[kind]
+        value = parameter.detach()  # Export verifies on CPU before moving the model.
+        matrix = value.ndim == 2 and 'conv1d' not in name
+        reference_shape = tuple(value.squeeze().shape) if 'conv1d' in name else tuple(value.shape)
+        if reference_shape != tuple(map(int, tensors[mapped].shape))[::-1]:
+            raise ValueError('checkpoint/GGUF shape mismatch: ' + mapped)
+        row_order = column_order = None
+        reorder = ('linear_attn.' in name
+                   and getattr(config, 'linear_num_key_heads', 0) != getattr(config, 'linear_num_value_heads', 0))
+        if reorder and matrix:
+            kh, vh = config.linear_num_key_heads, config.linear_num_value_heads
+            role = PATTERN.fullmatch(mapped)[2]
+            if role == 'ssm_out':
+                column_order = reorder_v(np.arange(value.shape[1]), 0, kh, vh, config.linear_value_head_dim)
+            elif role == 'attn_qkv':
+                qk = 2 * kh * config.linear_key_head_dim
+                row_order = np.concatenate((np.arange(qk), qk + reorder_v(np.arange(value.shape[0] - qk), 0, kh, vh, config.linear_value_head_dim)))
+            else:
+                dim = 1 if role in ('ssm_alpha', 'ssm_beta') else config.linear_value_head_dim
+                row_order = reorder_v(np.arange(value.shape[0]), 0, kh, vh, dim)
+        columns = value.shape[1] if matrix else value.numel()
+        # Conservative allowance for original/cast/indexed and decoded row arrays.
+        row_bytes = int(columns) * 32
+        if workspace_limit < row_bytes:
+            raise ValueError('reference identity workspace cannot fit one row: ' + mapped)
+        rows = value.shape[0] if matrix else 1
+        slab = min(rows, workspace_limit // row_bytes)
+        digest = hashlib.sha256()
+        for first in range(0, rows, slab):
+            stop = min(rows, first + slab)
+            if matrix:
+                block = value[first:stop] if row_order is None else value[torch.from_numpy(row_order[first:stop])]
+                if column_order is not None:
+                    block = block[:, torch.from_numpy(column_order)]
+                expected = floating_tensor(tensors[mapped], slice(first, stop))
+            else:
+                block = value
+                expected = floating_tensor(tensors[mapped])
+            block = block.cpu()
+            if not torch.isfinite(block).all().item():
+                raise ValueError('nonfinite reference parameter: ' + name)
+            # Mirror prepare_tensors promotion before converter arithmetic.
+            if block.dtype not in (torch.float16, torch.float32):
+                block = block.float()
+            if not matrix:
+                if name.endswith('.A_log'):
+                    block = -torch.exp(block)
+                elif 'conv1d' in name:
+                    block = block.squeeze()
+                elif name.endswith('norm.weight') and not name.endswith('linear_attn.norm.weight'):
+                    block = block + 1
+                actual = block.float().numpy()
+                if reorder:
+                    kh, vh = config.linear_num_key_heads, config.linear_num_value_heads
+                    if name.endswith(('.A_log', '.dt_bias')):
+                        actual = reorder_v(actual, 0, kh, vh, 1)
+                    elif 'conv1d' in name:
+                        qk = 2 * kh * config.linear_key_head_dim
+                        actual = np.concatenate((actual[:qk], reorder_v(actual[qk:], 0, kh, vh, config.linear_value_head_dim)))
+                block = torch.from_numpy(np.ascontiguousarray(actual))
+            actual = block.to(storage).float().numpy()
+            if actual.shape != expected.shape or not np.array_equal(actual.view(np.uint32), expected.view(np.uint32)):
+                raise ValueError('checkpoint/GGUF weight mismatch: ' + mapped + ' (' + name + ')')
+            digest.update(actual.astype('<f4', copy=False).tobytes())
+        if mapped in verified:
+            raise ValueError('duplicate reference mapping: ' + mapped)
+        verified[mapped] = digest.hexdigest()
+    extra = set(tensors) - set(verified)
+    if extra:
+        raise ValueError('unverified source tensors: ' + ', '.join(sorted(extra)))
+    if not verified:
+        raise ValueError('no reference text weights verified')
+    digest = hashlib.sha256(json.dumps(verified, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    return dict(contract='qwen35-full-text-storage-v1', verified_tensor_count=len(verified),
+                verified_tensors_sha256=digest, tied_output_aliases=aliases, workspace_limit_bytes=workspace_limit,
+                precision_policy='converter transforms followed by exact GGUF storage-rounded float comparison')
 
 
 class ReservoirCapture:
@@ -167,6 +355,7 @@ def export(args):
     text_config = config.text_config
     if getattr(text_config, 'quantization_config', None):
         raise ValueError('prequantized text model unsupported')
+    source_digest = sha256(source)
     reader = GGUFReader(str(source))
     if any(k.startswith('beellama.qk_sinq.') or k.startswith('beellama.sinq.') or 'hadamard' in k.lower() for k in reader.fields):
         raise ValueError('transformed GGUF unsupported')
@@ -176,6 +365,8 @@ def export(args):
     if arch is None or arch.contents() != 'qwen35':
         raise ValueError('source GGUF architecture must be qwen35')
     tensors = {t.name: t for t in reader.tensors}
+    if len(tensors) != len(reader.tensors):
+        raise ValueError('duplicate source tensor names')
     names = [s.strip() for s in Path(args.tensor_list).read_text(encoding='utf-8').splitlines() if s.strip()]
     if not names or len(names) != len(set(names)):
         raise ValueError('tensor list must be nonempty and unique')
@@ -184,6 +375,7 @@ def export(args):
         if name not in tensors or len(tensors[name].shape) != 2:
             raise ValueError('missing selected original tensor: ' + name)
     corpus = Path(args.text or args.tokens)
+    corpus_digest = sha256(corpus)
     tokenizer = AutoTokenizer.from_pretrained(str(checkpoint), local_files_only=True, trust_remote_code=False)
     if args.tokens:
         tokens = json.loads(corpus.read_text(encoding='utf-8'))
@@ -202,24 +394,23 @@ def export(args):
     revision = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
     torch.manual_seed(args.seed)
     torch.use_deterministic_algorithms(True)
-    if torch.cuda.is_available():
+    if str(args.device).startswith('cuda') and torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = False
     dtype = torch.bfloat16 if args.dtype == 'bf16' else torch.float16
-    model = Qwen3_5ForConditionalGeneration.from_pretrained(str(checkpoint), local_files_only=True, trust_remote_code=False, torch_dtype=dtype).to(args.device).eval()
+    model = Qwen3_5ForConditionalGeneration.from_pretrained(str(checkpoint), local_files_only=True, trust_remote_code=False, torch_dtype=dtype).eval()
+    verified_config = verify_reference_config(reader, text_config)
+    reference_identity = verify_reference_identity(model, text_config, tensors)
+    reference_identity['verified_config_fields'] = verified_config
+    model.to(args.device)
     modules = dict(model.named_modules())
     graph_identity = {name: type(module).__module__ + '.' + type(module).__qualname__ for name, module in modules.items()}
     graph_hash = hashlib.sha256(json.dumps(graph_identity, sort_keys=True).encode()).hexdigest()
-    # Validate every selected module before creating output files.
+    # Complete streamed identity is already verified; only capture-site
+    # availability/type remains to check, without expanding weights again.
     for name in names:
-        path, _, role = module_for(name)
-        module = modules.get(path)
-        if type(module) is not torch.nn.Linear:
+        path, _, _ = module_for(name)
+        if type(modules.get(path)) is not torch.nn.Linear:
             raise ValueError('missing or fused reference module: ' + path)
-        weight = module.weight.detach().to(device='cpu', dtype=torch.float32).numpy()
-        actual = converter_weight(weight, role, text_config)
-        expected = floating_tensor(tensors[name])
-        if actual.shape != expected.shape or not np.array_equal(actual, expected):
-            raise ValueError('checkpoint/GGUF weight mismatch: ' + name)
     output.mkdir(parents=True, exist_ok=False)
     captures, records = [], []
     try:
@@ -242,9 +433,13 @@ def export(args):
             if capture.seen != len(tokens):
                 raise ValueError('capture count differs from valid prefill tokens')
             record['sha256'] = sha256(capture.path)
-        manifest = dict(schema_version=1, architecture='qwen3_5', source_sha256=sha256(source), source_revision=revision,
-                        sampling=dict(contract='valid-token-prefill-reservoir-v1', seed=args.seed, max_rows=args.rows, corpus_sha256=sha256(corpus), token_sha256=token_hash), tensors=records,
-                        provenance=dict(graph_sha256=graph_hash, transformers_version=getattr(transformers, '__version__', 'synthetic-fixture'), reference_implementation_sha256=sha256(inspect.getfile(type(model.model.language_model))), checkpoint_files=identity, config_sha256=hashlib.sha256(config.to_json_string().encode()).hexdigest(), model_class=type(model).__name__, module_classes={r['reference_module']: type(modules[r['reference_module']]).__name__ for r in records}, torch_version=torch.__version__, dtype=args.dtype, device=args.device, context=args.context, token_count=len(tokens), preprocessing='explicit token JSON or local tokenizer; no padding, no cache, fresh prefill chunks', rng='PCG64: SHA256(uint32-LE seed || UTF8 exact tensor name), first 128 bits little-endian; Algorithm R'))
+        if sha256(source) != source_digest or sha256(corpus) != corpus_digest:
+            raise ValueError('source GGUF or calibration corpus changed during export')
+        if any(sha256(path) != identity[path.relative_to(checkpoint).as_posix()] for path in checkpoint_files):
+            raise ValueError('reference checkpoint files changed during export')
+        manifest = dict(schema_version=1, architecture='qwen3_5', source_sha256=source_digest, source_revision=revision,
+                        sampling=dict(contract='valid-token-prefill-reservoir-v1', seed=args.seed, max_rows=args.rows, corpus_sha256=corpus_digest, token_sha256=token_hash), tensors=records,
+                        provenance=dict(reference_identity=reference_identity, graph_sha256=graph_hash, transformers_version=getattr(transformers, '__version__', 'synthetic-fixture'), reference_implementation_sha256=sha256(inspect.getfile(type(model.model.language_model))), checkpoint_files=identity, config_sha256=hashlib.sha256(config.to_json_string().encode()).hexdigest(), model_class=type(model).__name__, module_classes={r['reference_module']: type(modules[r['reference_module']]).__name__ for r in records}, torch_version=torch.__version__, dtype=args.dtype, device=args.device, context=args.context, token_count=len(tokens), preprocessing='explicit token JSON or local tokenizer; no padding, no cache, fresh prefill chunks', rng='PCG64: SHA256(uint32-LE seed || UTF8 exact tensor name), first 128 bits little-endian; Algorithm R'))
         with (output / 'activations.json').open('x', encoding='utf-8') as f:
             json.dump(manifest, f, indent=2, allow_nan=False)
             f.write('\n')

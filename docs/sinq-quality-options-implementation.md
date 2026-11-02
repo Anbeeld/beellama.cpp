@@ -1,5 +1,9 @@
 # SINQ quality options implementation
 
+Audit follow-up: [complete reference identity and CPU numerical validation](sinq-audit-followup.md).
+The original capture and GPU timing evidence below is historical and was not
+relabelled as verification of the follow-up. No GPU tests were needed for that update.
+
 ## Source and scope
 
 Implemented against clean local `09e81f3fa4480d9ee1628af963ed0240f6c5e122`,

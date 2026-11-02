@@ -887,6 +887,10 @@ if (GGML_CUDA)
 endif()
 
 if (Python3_Interpreter_FOUND)
+    add_test(NAME test-sinq-reference-identity COMMAND ${Python3_EXECUTABLE}
+        ${PROJECT_SOURCE_DIR}/tests/test-sinq-reference-identity.py)
+    set_tests_properties(test-sinq-reference-identity PROPERTIES SKIP_RETURN_CODE 77
+        LABELS "python behavior cpu" ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1;HF_HUB_OFFLINE=1;TRANSFORMERS_OFFLINE=1")
     if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS)
         set_tests_properties(test-qk-sinq-model PROPERTIES FIXTURES_SETUP sinq-synthetic-source)
         add_test(NAME test-sinq-calibration-e2e COMMAND ${Python3_EXECUTABLE}
