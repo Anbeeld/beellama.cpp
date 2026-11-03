@@ -4934,7 +4934,19 @@ private:
                                 // MTP's pending target hidden row belongs to the previous
                                 // position, not to the live KV suffix. A native suffix rollback
                                 // cannot rewind it; restore target, draft and MTP state together.
-                                const bool state_required = uses_mtp() || (!extends_complete_prompt && !use_live_plan);
+                                // A prompt that extends the complete cached sequence needs no rollback:
+                                // the live state ends where the prompt continues, a pending recurrent
+                                // rollback is replayed by the next batch, so keep it instead of restoring
+                                // (agentic follow-ups with resent reasoning). LLAMA_CKPT_KEEP_LIVE=0 restores.
+                                static const bool keep_live_enabled = [] {
+                                    const char * env = getenv("LLAMA_CKPT_KEEP_LIVE");
+                                    return env == nullptr || atoi(env) != 0;
+                                }();
+                                const bool keep_live = keep_live_enabled && uses_mtp() && extends_complete_prompt && has_new_tokens;
+                                if (keep_live) {
+                                    SLT_INF(slot, "keeping live state, prompt extends the cached sequence (n_past = %d)\n", n_past);
+                                }
+                                const bool state_required = (uses_mtp() && !keep_live) || (!extends_complete_prompt && !use_live_plan);
                                 if (server_prompt_reuse_requires_checkpoint_search(
                                             state_required, pos_min, pos_min_thold)) {
                                     // Prefer the memory implementation's native suffix plan before
