@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "operation": "score",
+  "threads": 24,
+  "budgets": {
+    "workspace_bytes": 134217728,
+    "max_candidates": 8,
+    "max_output_bytes": 67108864,
+    "max_files": 128,
+    "max_tensors": 1,
+    "max_tokens": 32,
+    "max_probes": 32,
+    "max_evaluations": 8
+  },
+  "method": "fisher_vjp_mc",
+  "objective": "fisher_quadratic",
+  "families": ["ordinary"],
+  "device": "cpu",
+  "context": "reference_inputs",
+  "checkpoint": "fixtures/checkpoint",
+  "candidate_manifest": "fixtures/generated/run-manifest.json",
+  "capture_manifest": "fixtures/blocks.json",
+  "native_bridge": "build-sinq/bin/llama-sinq-native",
+  "probes": 2,
+  "seed": 617,
+  "output_directory": "fixtures/fisher-scores"
+}

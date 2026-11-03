@@ -49,7 +49,7 @@ int main() try {
         check(std::abs(independent-result.selected_loss)<1.e-12,"selected actual native reconstruction score");
         const auto again=llama_sinq_calibrate_native(codec,n,k,raw,ordinary,x,samples,importance.data(),32*1024,read,encode);
         check(again.scales==result.scales && again.alpha_index==result.alpha_index && again.selected_loss==result.selected_loss,"workspace-independent deterministic calibration");
-        for (int threads : {1,4,32}) {
+        for (int threads : {1,4,16,24,32}) {
             const auto parallel=llama_sinq_calibrate_native(codec,n,k,raw,ordinary,x,samples,importance.data(),1024*1024,read,encode,threads);
             check(parallel.candidate_losses==result.candidate_losses && parallel.baseline_loss==result.baseline_loss &&
                   parallel.selected_loss==result.selected_loss && parallel.alpha_index==result.alpha_index && parallel.scales==result.scales,

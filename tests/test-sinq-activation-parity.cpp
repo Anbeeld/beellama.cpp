@@ -96,7 +96,7 @@ int main(int argc, char ** argv) {
         auto cp = llama_context_default_params();
         cp.n_ctx = 64;
         cp.n_batch = cp.n_ubatch = 32;
-        cp.n_threads = cp.n_threads_batch = 1;
+        cp.n_threads = cp.n_threads_batch = 24;
         cp.offload_kqv = cp.op_offload = false;
         cp.type_k = cp.type_v = GGML_TYPE_F32;
         cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;

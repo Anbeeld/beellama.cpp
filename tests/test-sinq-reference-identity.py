@@ -106,6 +106,17 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(result['verified_tensor_count'], len(tensors))
         self.assertGreater(result['verified_tensor_count'], 20)
 
+    def test_strict_execution_rejects_storage_rounded_only_norm(self):
+        from gguf import GGMLQuantizationType
+        from gguf.quants import quantize
+        expected=(self.model.model.language_model.norm.weight+1).detach().numpy()
+        self.tensors['output_norm.weight']=types.SimpleNamespace(tensor_type=GGMLQuantizationType.BF16,
+            shape=self.np.array([4]),n_elements=4,data=quantize(expected,GGMLQuantizationType.BF16))
+        # Legacy exporter comparison still intentionally applies storage rounding.
+        self.assertEqual(self.verify()['verified_tensor_count'],5)
+        with self.assertRaisesRegex(ValueError,'execution storage'):
+            exporter.verify_reference_identity(self.model,self.config,self.tensors,require_exact_execution_storage=True)
+
     def test_unselected_embedding_mismatch(self):
         selected = self.model.model.language_model.layers[0].mlp.up_proj.weight.detach().clone()
         with self.torch.no_grad():

@@ -164,7 +164,9 @@ def main():
                 assert diagnostics == other_diagnostics, (codec, threads, 'nondeterministic numerical diagnostics')
             if args.baseline:
                 baseline_file, baseline_diag = d / f'{codec}-baseline.gguf', d / f'{codec}-baseline.json'
-                run(args.baseline, baseline_file, calibration=d, threads=4, diagnostic=baseline_diag,
+                # Compare full diagnostics at the same thread count: workspace
+                # accounting intentionally includes one error buffer per worker.
+                run(args.baseline, baseline_file, calibration=d, threads=1, diagnostic=baseline_diag,
                     codec=codec, imatrix=imatrix_path)
                 baseline_t = {t.name: t for t in read(baseline_file).tensors}
                 assert ta.keys() == baseline_t.keys(), codec
@@ -185,6 +187,21 @@ def main():
             run(args.quantize, protected, calibration=d, success=False)
             assert exporter.sha256(protected) == before, 'input was clobbered'
         if args.baseline:
+            # Unconfigured stock CLI behavior, including its normal allocation
+            # heuristics, must preserve every tensor payload and type too.
+            for codec in codecs:
+                paths=[]
+                for label,binary in [('old',args.baseline),('new',args.quantize)]:
+                    path=d / f'stock-{label}-{codec}.gguf'
+                    result=subprocess.run([str(binary),str(source),str(path),codec,'24'],capture_output=True,timeout=120)
+                    assert result.returncode==0, (codec,'stock baseline command failed')
+                    paths.append(path)
+                old,new=(read(path) for path in paths)
+                assert not any(key.startswith('beellama.qk_sinq.') for key in new.fields)
+                old_t,new_t=({t.name:t for t in reader.tensors} for reader in (old,new))
+                assert old_t.keys()==new_t.keys()
+                assert all(t.tensor_type==new_t[name].tensor_type and np.array_equal(t.data,new_t[name].data)
+                           for name,t in old_t.items()), (codec,'unconfigured stock path changed bytes')
             for width in (64,128):
                 for strength in (1,.5):
                     old, new = d /f'old-{width}-{strength}.gguf', d /f'ordinary-{width}-{strength}.gguf'

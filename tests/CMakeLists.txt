@@ -391,7 +391,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)
     target_link_libraries(test-chat PRIVATE server-context)
     llama_build_and_test(test-server-component.cpp  LABEL behavior)
-    target_include_directories(test-server-component PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_include_directories(test-server-component PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)
     target_link_libraries(test-server-component PRIVATE server-context)
     llama_build_and_test(test-json-schema-to-grammar.cpp  LABEL behavior)
 
@@ -904,4 +904,35 @@ if (Python3_Interpreter_FOUND)
     add_test(NAME test-qk-sinq-python-storage
         COMMAND ${Python3_EXECUTABLE} -m unittest discover -s ${PROJECT_SOURCE_DIR}/gguf-py/tests -p test_qk_sinq.py)
     set_tests_properties(test-qk-sinq-python-storage PROPERTIES WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+endif()
+
+add_executable(test-sinq-awq-methods test-sinq-awq-methods.cpp)
+target_include_directories(test-sinq-awq-methods PRIVATE ../src)
+target_compile_features(test-sinq-awq-methods PRIVATE cxx_std_17)
+target_link_libraries(test-sinq-awq-methods PRIVATE llama-sinq-optimizer)
+add_test(NAME test-sinq-awq-methods COMMAND test-sinq-awq-methods)
+add_executable(test-sinq-search test-sinq-search.cpp)
+target_include_directories(test-sinq-search PRIVATE ../src)
+target_compile_features(test-sinq-search PRIVATE cxx_std_17)
+target_link_libraries(test-sinq-search PRIVATE llama-sinq-optimizer)
+add_test(NAME test-sinq-search COMMAND test-sinq-search)
+add_executable(test-sinq-research-config test-sinq-research-config.cpp ../src/sinq/sinq-research-config.cpp)
+target_include_directories(test-sinq-research-config PRIVATE ../src)
+target_compile_features(test-sinq-research-config PRIVATE cxx_std_17)
+target_link_libraries(test-sinq-research-config PRIVATE llama-sinq-optimizer)
+add_test(NAME test-sinq-research-config COMMAND test-sinq-research-config)
+if (Python3_Interpreter_FOUND)
+    foreach(research_test blockwise fisher research-config candidate-cache hybrid groupwise-kl)
+        add_test(NAME test-sinq-research-${research_test} COMMAND ${Python3_EXECUTABLE}
+            ${PROJECT_SOURCE_DIR}/tests/test-sinq-${research_test}.py)
+        set_tests_properties(test-sinq-research-${research_test} PROPERTIES
+            SKIP_RETURN_CODE 77
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+            ENVIRONMENT "OMP_NUM_THREADS=24;MKL_NUM_THREADS=24;HF_HUB_OFFLINE=1;TRANSFORMERS_OFFLINE=1;CUDA_VISIBLE_DEVICES=0")
+    endforeach()
+endif()
+
+if (Python3_Interpreter_FOUND AND LLAMA_BUILD_TOOLS AND LLAMA_BUILD_SINQ_RESEARCH)
+    set_tests_properties(test-sinq-research-hybrid test-sinq-research-groupwise-kl PROPERTIES
+        ENVIRONMENT "OMP_NUM_THREADS=24;MKL_NUM_THREADS=24;HF_HUB_OFFLINE=1;TRANSFORMERS_OFFLINE=1;CUDA_VISIBLE_DEVICES=0;SINQ_NATIVE_BIN=$<TARGET_FILE_DIR:llama-quantize>")
 endif()

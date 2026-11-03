@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "operation": "generate",
+  "threads": 24,
+  "budgets": {
+    "workspace_bytes": 134217728,
+    "max_candidates": 8,
+    "max_output_bytes": 67108864,
+    "max_files": 128,
+    "max_tensors": 1,
+    "max_tokens": 32,
+    "max_probes": 32,
+    "max_evaluations": 8
+  },
+  "source_gguf": "fixtures/source.gguf",
+  "activation_manifest": "fixtures/train/activations.json",
+  "tensor_list": ["blk.0.ffn_up.weight"],
+  "native_quantizer": {
+    "recipe": {"blk.0.ffn_up.weight": "q5_0"},
+    "sinq_strip_width": 64,
+    "sinq_iterations": 16,
+    "sinq_strength": 0.75
+  },
+  "generators": ["ordinary", "awq_weight_activation", "awq_activation_only"],
+  "alphas": [0.5],
+  "correction_strengths": [0.5, 1.0],
+  "search": {
+    "strategy": "small_grid",
+    "local_objective": "output_l1",
+    "selection_policy": "in_sample",
+    "max_shortlist": 1,
+    "refine_step": 0.1,
+    "tolerance": 0.0
+  },
+  "native_bridge": "build-sinq/bin/llama-sinq-native",
+  "output_directory": "fixtures/generated"
+}

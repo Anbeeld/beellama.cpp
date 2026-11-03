@@ -169,7 +169,8 @@ def verify_reference_config(reader, config):
     return verified
 
 
-def verify_reference_identity(model, config, tensors, workspace_limit=64 * 1024 * 1024):
+def verify_reference_identity(model, config, tensors, workspace_limit=64 * 1024 * 1024,
+                              require_exact_execution_storage=False):
     """Check the complete text network with bounded row buffers, before capture."""
     import numpy as np
     import torch
@@ -259,6 +260,8 @@ def verify_reference_identity(model, config, tensors, workspace_limit=64 * 1024 
                         qk = 2 * kh * config.linear_key_head_dim
                         actual = np.concatenate((actual[:qk], reorder_v(actual[qk:], 0, kh, vh, config.linear_value_head_dim)))
                 block = torch.from_numpy(np.ascontiguousarray(actual))
+            if require_exact_execution_storage and not torch.equal(block.float(), block.to(storage).float()):
+                raise ValueError('reference execution storage mismatch: ' + mapped + ' (' + name + ')')
             actual = block.to(storage).float().numpy()
             if actual.shape != expected.shape or not np.array_equal(actual.view(np.uint32), expected.view(np.uint32)):
                 raise ValueError('checkpoint/GGUF weight mismatch: ' + mapped + ' (' + name + ')')
@@ -274,7 +277,8 @@ def verify_reference_identity(model, config, tensors, workspace_limit=64 * 1024 
     digest = hashlib.sha256(json.dumps(verified, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
     return dict(contract='qwen35-full-text-storage-v1', verified_tensor_count=len(verified),
                 verified_tensors_sha256=digest, tied_output_aliases=aliases, workspace_limit_bytes=workspace_limit,
-                precision_policy='converter transforms followed by exact GGUF storage-rounded float comparison')
+                precision_policy=('converter transforms require exact execution storage before comparison' if require_exact_execution_storage
+                                  else 'converter transforms followed by exact GGUF storage-rounded float comparison'))
 
 
 class ReservoirCapture:

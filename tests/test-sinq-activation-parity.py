@@ -32,7 +32,7 @@ def fixture(directory, dtype_name, key_heads=2, value_heads=4):
     from transformers import Qwen3_5TextConfig, Qwen3_5TextModel
     from conversion.qwen import Qwen3_5TextModel as Converter
 
-    torch.set_num_threads(1)
+    torch.set_num_threads(24)
     torch.manual_seed(41721)
     config = Qwen3_5TextConfig(
         vocab_size=32, hidden_size=256, intermediate_size=512,
