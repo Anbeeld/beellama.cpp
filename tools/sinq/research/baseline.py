@@ -79,13 +79,14 @@ def _run(command, output, *, timeout, max_output_bytes, threads):
 
 def lock_baseline(source, baseline, recipe, output, *, quantizer, native_validate,
                   imatrix=None, workspace_bytes=64<<20, max_output_bytes=1<<34,
-                  threads=24, timeout=3600):
+                  threads=None, timeout=3600):
     """Reencode once, compare every payload, then publish an immutable v1 JSON lock."""
     source,baseline,output,quantizer=map(lambda p:Path(p).resolve(),(source,baseline,output,quantizer))
     imatrix=Path(imatrix).resolve() if imatrix is not None else None
     reject_alias(output,[source,baseline,quantizer]+([imatrix] if imatrix else []))
     if output.exists(): raise ValueError('baseline manifest already exists')
     if not callable(native_validate): raise ValueError('native loader validation is required')
+    threads=(os.cpu_count() or 1) if threads is None else threads
     if (type(threads)!=int or not 1<=threads<=1024 or type(timeout) not in (int,float) or not math.isfinite(timeout) or timeout<=0
             or type(workspace_bytes)!=int or workspace_bytes<1<<20 or type(max_output_bytes)!=int or max_output_bytes<=0):
         raise ValueError('invalid baseline resource bounds')

@@ -37,6 +37,13 @@ class Bridge(unittest.TestCase):
                     result=request(BINARY,cfg,work)
                     self.assertEqual(len(result['candidates']),6)
                     self.assertEqual(result['encode_count'],4)
+                    serial=work/'serial';serial.mkdir()
+                    reference=request(BINARY,{**cfg,'threads':1,'output':str(serial/'out')},serial)
+                    self.assertEqual(result['selected'],reference['selected'])
+                    self.assertEqual(result['candidates'],reference['candidates'])
+                    for item in result['candidates']:
+                        for key in ('payload','scales'):
+                            self.assertEqual(file_sha256(work/'out'/item[key]),file_sha256(serial/'out'/item[key]))
                     baseline=result['candidates'][0]
                     for item in result['candidates']:
                         packed=work/'out'/item['payload']; scales=work/'out'/item['scales']

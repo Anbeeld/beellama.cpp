@@ -336,9 +336,14 @@ class ReservoirCapture:
 
 
 def export(args):
+    threads=getattr(args, 'threads', None)
+    threads=(os.cpu_count() or 1) if threads is None else threads
+    if type(threads) is not int or not 1<=threads<=1024:
+        raise ValueError('threads must be an integer in 1..1024')
     os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
     import numpy as np
     import torch
+    torch.set_num_threads(threads)
     from gguf import GGUFReader
     import transformers
     from transformers import AutoConfig, AutoTokenizer, Qwen3_5ForConditionalGeneration
@@ -443,7 +448,7 @@ def export(args):
             raise ValueError('reference checkpoint files changed during export')
         manifest = dict(schema_version=1, architecture='qwen3_5', source_sha256=source_digest, source_revision=revision,
                         sampling=dict(contract='valid-token-prefill-reservoir-v1', seed=args.seed, max_rows=args.rows, corpus_sha256=corpus_digest, token_sha256=token_hash), tensors=records,
-                        provenance=dict(reference_identity=reference_identity, graph_sha256=graph_hash, transformers_version=getattr(transformers, '__version__', 'synthetic-fixture'), reference_implementation_sha256=sha256(inspect.getfile(type(model.model.language_model))), checkpoint_files=identity, config_sha256=hashlib.sha256(config.to_json_string().encode()).hexdigest(), model_class=type(model).__name__, module_classes={r['reference_module']: type(modules[r['reference_module']]).__name__ for r in records}, torch_version=torch.__version__, dtype=args.dtype, device=args.device, context=args.context, token_count=len(tokens), preprocessing='explicit token JSON or local tokenizer; no padding, no cache, fresh prefill chunks', rng='PCG64: SHA256(uint32-LE seed || UTF8 exact tensor name), first 128 bits little-endian; Algorithm R'))
+                        provenance=dict(reference_identity=reference_identity, graph_sha256=graph_hash, transformers_version=getattr(transformers, '__version__', 'synthetic-fixture'), reference_implementation_sha256=sha256(inspect.getfile(type(model.model.language_model))), checkpoint_files=identity, config_sha256=hashlib.sha256(config.to_json_string().encode()).hexdigest(), model_class=type(model).__name__, module_classes={r['reference_module']: type(modules[r['reference_module']]).__name__ for r in records}, torch_version=torch.__version__, cpu_threads=torch.get_num_threads(), dtype=args.dtype, device=args.device, context=args.context, token_count=len(tokens), preprocessing='explicit token JSON or local tokenizer; no padding, no cache, fresh prefill chunks', rng='PCG64: SHA256(uint32-LE seed || UTF8 exact tensor name), first 128 bits little-endian; Algorithm R'))
         with (output / 'activations.json').open('x', encoding='utf-8') as f:
             json.dump(manifest, f, indent=2, allow_nan=False)
             f.write('\n')
@@ -470,6 +475,7 @@ def main():
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--context', type=int, default=512)
     p.add_argument('--max-tokens', type=int, default=4096)
+    p.add_argument('--threads', type=int, default=os.cpu_count() or 1, help='CPU threads (default: all logical CPUs)')
     export(p.parse_args())
 
 

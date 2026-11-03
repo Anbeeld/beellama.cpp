@@ -1,8 +1,11 @@
 #pragma once
 #include "../llama-sinq-calibration.h"
 #include "sinq-types.h"
+#include <algorithm>
+#include <thread>
 namespace sinq {
 struct search_options {
+    int threads=int(std::max(1u, std::thread::hardware_concurrency()));
     std::vector<candidate_spec> candidates;
     local_objective objective=local_objective::output_l1;
     bool held_out=false;

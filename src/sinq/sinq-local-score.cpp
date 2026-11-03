@@ -1,5 +1,6 @@
 #include "sinq-local-score.h"
 #include "sinq-numeric.h"
+#include "sinq-parallel.h"
 #include <cmath>
 namespace sinq {
 double row_loss(const float * w,const float * dq,const ggml_fp16_t * u,int64_t k,const float * x,int samples,std::vector<double> & error) {
@@ -26,6 +27,20 @@ double output_l1(const float * w,const float * dq,const ggml_fp16_t * u,int64_t 
 }
 
 namespace sinq {
+void output_scores(const float * w, const float * dq, const ggml_fp16_t * u, int64_t n, int64_t k,
+        const float * x, int samples, local_objective objective, double * losses, int threads) {
+    require(w && dq && u && x && losses && n>0 && k>0 && samples>0, "research invalid score dimensions");
+    require(objective==local_objective::output_l1 || objective==local_objective::output_mse, "research invalid local objective");
+    parallel_for(n, threads, [&](int64_t begin, int64_t end) {
+        std::vector<double> error(objective==local_objective::output_l1 ? size_t(k) : 0);
+        for (int64_t row=begin; row<end; ++row) {
+            losses[row] = objective==local_objective::output_l1
+                ? row_loss(w+row*k, dq+row*k, u, k, x, samples, error)
+                : output_score(w+row*k, dq+row*k, u, 1, k, x, samples, objective);
+        }
+    });
+}
+
 double output_score(const float * w,const float * dq,const ggml_fp16_t * u,int64_t n,int64_t k,
         const float * x,int samples,local_objective objective) {
     if(objective==local_objective::output_l1) return output_l1(w,dq,u,n,k,x,samples);

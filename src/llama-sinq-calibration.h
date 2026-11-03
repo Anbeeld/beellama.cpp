@@ -2,6 +2,8 @@
 
 #include "llama-sinq.h"
 #include <functional>
+#include <algorithm>
+#include <thread>
 
 // Readers expose original row-major [output,input] weights in bounded slabs.
 // The encoder callback is the producer's ordinary native quantization path.
@@ -28,4 +30,5 @@ llama_sinq_calibration_result llama_sinq_calibrate_native(
     const std::vector<float> & raw_sinq, const std::vector<ggml_fp16_t> & ordinary,
     const std::vector<float> & activations, int samples, const float * importance,
     size_t workspace_limit, const llama_sinq_weight_reader & read,
-    const llama_sinq_native_encoder & encode, int nthread = 1);
+    const llama_sinq_native_encoder & encode,
+    int nthread = int(std::max(1u, std::thread::hardware_concurrency())));

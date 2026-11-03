@@ -55,12 +55,13 @@ def _run(config):
         yield run,store,source
 
 
-def _validator(binary):
+def _validator(binary, *, threads=None):
     if not binary or not Path(binary).is_file():
         raise ValueError('a local native_loader (llama-sinq-model) is required')
+    threads=native_codec._thread_count(threads)
     def validate(path):
         result=subprocess.run([str(Path(binary).resolve()),'--load-only',str(Path(path).resolve())],
-            env={**os.environ,'OMP_NUM_THREADS':'24','MKL_NUM_THREADS':'24','CUDA_VISIBLE_DEVICES':'0'},
+            env={**os.environ,'OMP_NUM_THREADS':str(threads),'MKL_NUM_THREADS':str(threads),'CUDA_VISIBLE_DEVICES':'0'},
             capture_output=True,timeout=120)
         if result.returncode:
             raise RuntimeError('native loader rejected hybrid; exit '+str(result.returncode))
@@ -90,7 +91,7 @@ def _stock_baseline(config,run,source):
 def lock_baseline_config(config):
     from .baseline import lock_baseline
     return lock_baseline(config['source_gguf'],config['stock_gguf'],config['recipe'],config['output_manifest'],
-        quantizer=config['quantizer'],native_validate=_validator(config['native_loader']),
+        quantizer=config['quantizer'],native_validate=_validator(config['native_loader'],threads=config['threads']),
         imatrix=config.get('imatrix_path'),workspace_bytes=config['budgets']['workspace_bytes'],
         max_output_bytes=config['budgets']['max_output_bytes'],threads=config['threads'],timeout=config['timeout'])
 
@@ -114,7 +115,7 @@ def _assemble(config,run,store,source):
     baseline,locked=_stock_baseline(config,run,source)
     return dict(status='PASS',source_sha256=run['source_sha256'],stock_baseline_sha256=locked['baseline_sha256'] if locked else None,
         output_sha256=assemble(source,config['output_gguf'],store,config['assignment'],stock_baseline=baseline,
-        native_validate=_validator(config.get('native_loader')),max_output_bytes=config['budgets']['max_output_bytes']))
+        native_validate=_validator(config.get('native_loader'),threads=config['threads']),max_output_bytes=config['budgets']['max_output_bytes']))
 
 
 def _new_output(config,inputs):
@@ -169,10 +170,10 @@ def _score(config,run,store,source):
     if not config.get('native_bridge'):raise ValueError('native_bridge is required for actual candidate decoding/scoring')
     capture=_json(config['capture_manifest']);records=[]
     if method=='local':
-        validated=native_codec.validate_activations(config['native_bridge'],config['capture_manifest'],source)
+        validated=native_codec.validate_activations(config['native_bridge'],config['capture_manifest'],source,threads=config['threads'])
         validation=None
         if config['selection_policy']=='held_out':
-            validation=native_codec.validate_activations(config['native_bridge'],config['validation_manifest'],source)
+            validation=native_codec.validate_activations(config['native_bridge'],config['validation_manifest'],source,threads=config['threads'])
             validate_pairing(_json(config['pairing_manifest']),capture,_json(config['validation_manifest']))
         reader=gguf.GGUFReader(source)
         try:
@@ -184,7 +185,7 @@ def _score(config,run,store,source):
                     c=candidate_for(run,store,name,key)
                     if c.provenance['generator']['family'] not in config['families']:continue
                     score=native_codec.rescore(config['native_bridge'],c,tensors[name],a,validation=v,
-                        objective=config['objective'],workspace_bytes=b['workspace_bytes'])
+                        objective=config['objective'],workspace_bytes=b['workspace_bytes'],threads=config['threads'])
                     records.append({**score,'candidate_id':key,'tensor':name,'method':'local','objective':config['objective'],
                         'capture_sha256':file_digest(config['capture_manifest'])})
         finally:reader.data._mmap.close()
@@ -208,7 +209,7 @@ def _score(config,run,store,source):
         upstream=graph_assignment(run,store,capture.get('baseline',{}),before_layer=min(layers))
         requested=observations(run,store,config,layers)
         adapter=_advanced_reference(config['checkpoint'],source,b['workspace_bytes'],config['threads'])
-        baseline={name:native_codec.decode(config['native_bridge'],candidate,workspace_bytes=b['workspace_bytes'])
+        baseline={name:native_codec.decode(config['native_bridge'],candidate,workspace_bytes=b['workspace_bytes'],threads=config['threads'])
                   for name,candidate in upstream.items()}
         for layer in layers:
             locked=capture_block(adapter,tokens,layer,context=config['context'],baseline=baseline,
@@ -218,7 +219,7 @@ def _score(config,run,store,source):
                 if index!=layer:continue
                 if sum(c.provenance['shape'][0]*c.provenance['shape'][1]*32 for c in candidates.values())>b['workspace_bytes']:
                     raise ValueError('joint candidate decode/swap workspace budget exceeded')
-                effective={name:native_codec.decode(config['native_bridge'],c,workspace_bytes=b['workspace_bytes']) for name,c in candidates.items()}
+                effective={name:native_codec.decode(config['native_bridge'],c,workspace_bytes=b['workspace_bytes'],threads=config['threads']) for name,c in candidates.items()}
                 if probes is None:
                     score=score_block(adapter,locked,effective);value=score[config['objective']]
                 else:
@@ -269,8 +270,8 @@ def _select(config,run,store,source,*,resume=None):
     if b['max_evaluations']+8>b['max_files']:raise ValueError('selector file budget cannot hold score/checkpoint closure')
     if source.stat().st_size*2>b['max_output_bytes']:raise ValueError('selector disk budget cannot hold a bounded hybrid evaluation')
     stock,locked=_stock_baseline(config,run,source)
-    evaluator=NativeKLEvaluator(e['executable'],context=e['context'],batch=e['batch'],microbatch=e['microbatch'],max_tokens=e['max_tokens'],timeout=e['timeout'])
-    validator=_validator(e['native_loader'])
+    evaluator=NativeKLEvaluator(e['executable'],context=e['context'],batch=e['batch'],microbatch=e['microbatch'],max_tokens=e['max_tokens'],timeout=e['timeout'],threads=config['threads'])
+    validator=_validator(e['native_loader'],threads=config['threads'])
     for name,key in config['baseline'].items():candidate_for(run,store,name,key)
     groups=[];seen=set()
     if set(e['alternatives'])!=set(config['groups']):raise ValueError('group alternatives mismatch')

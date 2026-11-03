@@ -1,6 +1,7 @@
 """Strict research configuration and split-provenance contracts (no native dependencies)."""
 import copy
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -29,7 +30,7 @@ class ConfigTests(unittest.TestCase):
         c = config(); original = copy.deepcopy(c)
         r = validate_config(c)
         self.assertEqual(c, original)
-        self.assertEqual(r['threads'], 24)
+        self.assertEqual(r['threads'], os.cpu_count() or 1)
         self.assertEqual(len(r['resolved_candidates']), 4)
         self.assertEqual(r['resolved_candidates'][0]['family'], 'ordinary')
         self.assertEqual(len({x['stable_id'] for x in r['resolved_candidates']}), 4)

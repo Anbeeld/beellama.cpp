@@ -28,7 +28,7 @@ bridge_request parse_bridge_request(const nlohmann::json & j) {
     r.weights=j.value("weights","");r.activations=j.value("activations","");r.validation=j.value("validation","");
     r.importance=j.value("importance","");r.payload=j.value("payload","");r.scales=j.value("scales","");
     r.first_row=j.value("first_row",int64_t(0));r.samples=j.value("samples",0);r.validation_samples=j.value("validation_samples",0);
-    r.threads=j.value("threads",24);r.workspace=j.value("workspace_bytes",size_t(64*1024*1024));r.max_output_bytes=j.value("max_output_bytes",size_t(64*1024*1024));
+    r.threads=j.value("threads",r.threads);r.workspace=j.value("workspace_bytes",size_t(64*1024*1024));r.max_output_bytes=j.value("max_output_bytes",size_t(64*1024*1024));
     require(r.rows>=2 && r.columns>0 && r.columns<=1048576 && uint64_t(r.rows)<=SIZE_MAX/uint64_t(r.columns)/4 &&
         r.threads>0 && r.threads<=1024 && r.workspace>=4096 && r.workspace<=size_t(1024)*1024*1024 && r.max_output_bytes>0,"research bridge invalid dimensions/budgets");
     require(llama_sinq_supported_type(r.codec) && r.columns%ggml_blck_size(r.codec)==0,"research bridge unsupported codec/shape");
@@ -39,6 +39,7 @@ bridge_request parse_bridge_request(const nlohmann::json & j) {
         r.normalization.strength>=0 && r.normalization.strength<=1,"research invalid Sinkhorn configuration");
     const auto objective=j.value("objective",std::string("output_l1"));
     require(objective=="output_l1" || objective=="output_mse","research unsupported objective");
+    r.search.threads=r.threads;
     r.search.objective=objective=="output_l1"?local_objective::output_l1:local_objective::output_mse;
     r.search.held_out=j.value("held_out",false);r.search.tolerance=j.value("tolerance",0.);
     r.search.max_candidates=j.value("max_candidates",size_t(128));r.search.max_shortlist=j.value("max_shortlist",size_t(0));r.search.refine_step=j.value("refine_step",.05);

@@ -26,6 +26,21 @@ and headerless little-endian float32 files. Existing directories or files are
 never overwritten. Failed exports can leave partial files, but no final manifest;
 use a new output directory after diagnosing the failure.
 
+## CPU threads
+
+CPU thread defaults use all logical CPUs. Set exporter `--threads N` or the
+research config's `threads` field to override that count. The same explicit
+count reaches native generation, decoding, local rescoring, KL evaluation and
+PyTorch blockwise/Fisher execution; subprocess OpenMP/MKL limits match it.
+Generation and cached rescoring parallelize independent output rows for both
+L1 and MSE, then reduce losses in their original order. Small tensors and
+workspace limits can reduce the number of active workers. A full thread count
+does not guarantee full CPU utilization during file I/O or serial work.
+
+Thread counts are part of evaluator and resumable-run identities. References
+and resumed runs must use their recorded settings; changing the default does
+not make old locks or cached results compatible automatically.
+
 ## Capture and validation
 
 Supported sites are FFN gate/up/down, full-attention Q/K/V/output, and linear

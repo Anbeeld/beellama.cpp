@@ -65,20 +65,23 @@ class NativeKLEvaluator:
     Native _logitF1 stores the established compressed full-vocabulary reference
     log-probabilities, NOT target-only NLL. The binary digest binds that encoding.
     """
-    def __init__(self, executable, *, context=32, batch=24, microbatch=24, max_tokens=32, timeout=120):
+    def __init__(self, executable, *, context=32, batch=24, microbatch=24, max_tokens=32, timeout=120, threads=None):
         self.executable=Path(executable).resolve()
+        threads=(os.cpu_count() or 1) if threads is None else threads
+        if type(threads) is not int or not 1<=threads<=1024:
+            raise ValueError('threads must be an integer in 1..1024')
         if min(context,batch,microbatch,max_tokens,timeout)<=0:
             raise ValueError('invalid native evaluator budgets')
         self.context=context; self.batch=batch; self.microbatch=microbatch
-        self.max_tokens=max_tokens; self.timeout=timeout
-        self.policy={'context':context,'batch':batch,'microbatch':microbatch,'threads':24,'device':'cpu','reset':'every-context-no-overlap','format':'_logitF1','binary_sha256':file_digest(self.executable)}
+        self.max_tokens=max_tokens; self.timeout=timeout; self.threads=threads
+        self.policy={'context':context,'batch':batch,'microbatch':microbatch,'threads':threads,'device':'cpu','reset':'every-context-no-overlap','format':'_logitF1','binary_sha256':file_digest(self.executable)}
 
     def _run(self,model,corpus,reference,token_output,generate=False):
-        args=[str(self.executable),'-m',str(Path(model).resolve()),'-f',str(Path(corpus).resolve()),'--ppl-full','-c',str(self.context),'-b',str(self.batch),'-ub',str(self.microbatch),'-t','24','-tb','24','-ngl','0','--kld-token-output',str(token_output), '--save-all-logits' if generate else '--kl-divergence-base',str(reference)]
+        args=[str(self.executable),'-m',str(Path(model).resolve()),'-f',str(Path(corpus).resolve()),'--ppl-full','-c',str(self.context),'-b',str(self.batch),'-ub',str(self.microbatch),'-t',str(self.threads),'-tb',str(self.threads),'-ngl','0','--kld-token-output',str(token_output), '--save-all-logits' if generate else '--kl-divergence-base',str(reference)]
         if not generate:
             args.append('--kl-divergence')
         env={k:v for k,v in os.environ.items() if not k.startswith('LLAMA_ARG_')}
-        env.update(OMP_NUM_THREADS='24',MKL_NUM_THREADS='24',CUDA_VISIBLE_DEVICES='')
+        env.update(OMP_NUM_THREADS=str(self.threads),MKL_NUM_THREADS=str(self.threads),CUDA_VISIBLE_DEVICES='')
         result=subprocess.run(args,env=env,capture_output=True,timeout=self.timeout,check=False)
         if result.returncode:
             # Avoid copying arbitrary model/corpus data from tool logs to artifacts.

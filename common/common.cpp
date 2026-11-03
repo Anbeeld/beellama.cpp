@@ -203,102 +203,13 @@ int32_t common_cpu_get_num_physical_cores() {
     return n_threads > 0 ? (n_threads <= 4 ? n_threads : n_threads / 2) : 4;
 }
 
-#if defined(__x86_64__) && defined(__linux__) && !defined(__ANDROID__)
-#include <pthread.h>
-
-static void cpuid(unsigned leaf, unsigned subleaf,
-                  unsigned *eax, unsigned *ebx, unsigned *ecx, unsigned *edx) {
-    __asm__("movq\t%%rbx,%%rsi\n\t"
-            "cpuid\n\t"
-            "xchgq\t%%rbx,%%rsi"
-            : "=a"(*eax), "=S"(*ebx), "=c"(*ecx), "=d"(*edx)
-            : "0"(leaf), "2"(subleaf));
-}
-
-static int pin_cpu(int cpu) {
-    cpu_set_t mask;
-    CPU_ZERO(&mask);
-    CPU_SET(cpu, &mask);
-    return pthread_setaffinity_np(pthread_self(), sizeof(mask), &mask);
-}
-
-static bool is_hybrid_cpu(void) {
-    unsigned eax, ebx, ecx, edx;
-    cpuid(7, 0, &eax, &ebx, &ecx, &edx);
-    return !!(edx & (1u << 15));
-}
-
-static bool is_running_on_efficiency_core(void) {
-    unsigned eax, ebx, ecx, edx;
-    cpuid(0x1a, 0, &eax, &ebx, &ecx, &edx);
-    int intel_atom = 0x20;
-    int core_type = (eax & 0xff000000u) >> 24;
-    return core_type == intel_atom;
-}
-
-static int cpu_count_math_cpus(int n_cpu) {
-    int result = 0;
-    for (int cpu = 0; cpu < n_cpu; ++cpu) {
-        if (pin_cpu(cpu)) {
-            return -1;
-        }
-        if (is_running_on_efficiency_core()) {
-            continue; // efficiency cores harm lockstep threading
-        }
-        ++cpu; // hyperthreading isn't useful for linear algebra
-        ++result;
-    }
-    return result;
-}
-
-#endif // __x86_64__ && __linux__
-
 /**
- * Returns number of CPUs on system that are useful for math.
+ * Returns all logical CPU threads for CPU work by default. Explicit user
+ * thread counts remain authoritative at the option parsing boundary.
  */
 int32_t common_cpu_get_num_math() {
-#if defined(__x86_64__) && defined(__linux__) && !defined(__ANDROID__)
-    int n_cpu = sysconf(_SC_NPROCESSORS_ONLN);
-    if (n_cpu < 1) {
-        return common_cpu_get_num_physical_cores();
-    }
-    if (is_hybrid_cpu()) {
-        cpu_set_t affinity;
-        if (!pthread_getaffinity_np(pthread_self(), sizeof(affinity), &affinity)) {
-            int result = cpu_count_math_cpus(n_cpu);
-            pthread_setaffinity_np(pthread_self(), sizeof(affinity), &affinity);
-            if (result > 0) {
-                return result;
-            }
-        }
-    }
-#elif defined(__riscv) && defined(__linux__)
-    std::ifstream cpuinfo("/proc/cpuinfo");
-    std::string line;
-    int32_t n_a100 = 0;
-    while (std::getline(cpuinfo, line)) {
-        std::istringstream fields(line);
-        std::string key;
-        std::string separator;
-        uint64_t marchid;
-        if (fields >> key >> separator >> std::hex >> marchid &&
-            key == "marchid" && separator == ":" && marchid == UINT64_C(0x8000000041000002)) {
-            ++n_a100;
-        }
-    }
-    if (n_a100 > 0) {
-        return n_a100;
-    }
-#elif defined(__powerpc64__) || defined(__powerpc__)
-    int32_t smt_factor = 1;
-    int phy_cpus = common_cpu_get_num_physical_cores();
-    int logical_cpus = sysconf(_SC_NPROCESSORS_ONLN);
-    if (phy_cpus > 0 && logical_cpus > phy_cpus) {
-        smt_factor = logical_cpus / phy_cpus;
-    }
-    return phy_cpus * std::min(smt_factor, 2);
-#endif
-    return common_cpu_get_num_physical_cores();
+    const unsigned int threads = std::thread::hardware_concurrency();
+    return threads > 0 ? static_cast<int32_t>(threads) : 1;
 }
 
 // Helper for setting process priority

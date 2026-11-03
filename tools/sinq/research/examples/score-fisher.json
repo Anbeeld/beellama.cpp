@@ -1,7 +1,6 @@
 {
   "schema_version": 1,
   "operation": "score",
-  "threads": 24,
   "budgets": {
     "workspace_bytes": 134217728,
     "max_candidates": 8,

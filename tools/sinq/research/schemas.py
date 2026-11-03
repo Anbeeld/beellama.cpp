@@ -9,6 +9,7 @@ import copy
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 
 FAMILIES = ('ordinary', 'awq_weight_activation', 'awq_activation_only')
@@ -167,7 +168,9 @@ def validate_config(config):
     c = copy.deepcopy(config)
     if type(c['schema_version']) is not int or c['schema_version'] != 1:
         raise ValueError('schema_version must be 1')
-    _integer(c.setdefault('threads', 24), 'threads')
+    _integer(c.setdefault('threads', os.cpu_count() or 1), 'threads')
+    if c['threads'] > 1024:
+        raise ValueError('threads must not exceed 1024')
     _fields(c['budgets'], BUDGET_FIELDS, label='budgets')
     for key, value in c['budgets'].items():
         _integer(value, key)

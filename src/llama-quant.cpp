@@ -1045,7 +1045,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     int nthread = params->nthread;
 
     if (nthread <= 0) {
-        nthread = std::thread::hardware_concurrency();
+        nthread = int(std::max(1u, std::thread::hardware_concurrency()));
     }
 
     ggml_type default_type = llama_ftype_get_default_type(ftype);

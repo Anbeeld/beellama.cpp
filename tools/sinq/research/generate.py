@@ -33,7 +33,7 @@ def source_identity():
 def _manifest(config, key):
     path=Path(config[key])
     value=json.loads(path.read_text(encoding='utf-8'))
-    validated=native_codec.validate_activations(config['native_bridge'],path,config['source_gguf'])
+    validated=native_codec.validate_activations(config['native_bridge'],path,config['source_gguf'],threads=config['threads'])
     if validated['source_sha256']!=native_codec.file_sha256(config['source_gguf']):
         raise ValueError('activation/source identity changed')
     return value,validated

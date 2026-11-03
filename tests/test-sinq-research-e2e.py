@@ -211,7 +211,7 @@ def main():
         # Genuine eight-token native full-vocabulary KL wiring and bounded
         # coordinate selection on this tiny graph only (never a quality study).
         corpus=d/'selection.txt';corpus.write_text('abcdefg',encoding='utf-8')
-        evaluator=NativeKLEvaluator(binaries/('llama-perplexity'+suffix),context=32,batch=24,microbatch=24,max_tokens=32)
+        evaluator=NativeKLEvaluator(binaries/('llama-perplexity'+suffix),context=32,batch=24,microbatch=24,max_tokens=32,threads=common['threads'])
         reference=d/'reference.bin';evaluator.create_reference(source,corpus,reference,expected_tokens=[1,3,4,5,6,7,8,9])
         write(d/'selection-stream.json',dict(schema_version=1,split='selection',corpus_sha256=file_sha256(corpus),reference_sha256=file_sha256(reference)))
         groups={f'g{i}':[name] for i,name in enumerate(names)}

@@ -3,6 +3,7 @@
 #include "sinq/sinq-native-codec.h"
 #include "sinq/sinq-numeric.h"
 #include "sinq/sinq-local-score.h"
+#include "sinq/sinq-parallel.h"
 #include "llama-sinq-activation.h"
 #include <filesystem>
 #include <fstream>
@@ -53,8 +54,17 @@ int main(int argc,char**argv) try {
         std::vector<ggml_fp16_t>u(size_t(r.columns),ggml_fp32_to_fp16(1));
         if(!r.scales.empty()){auto b=load(r.scales,u.size()*2,r.workspace);std::memcpy(u.data(),b.data(),b.size());}
         std::vector<float>out(cells);
-        for(int64_t row=0;row<r.rows;++row)ggml_get_type_traits(r.codec)->to_float(packed.data()+row*row_bytes,out.data()+row*r.columns,r.columns);
-        for(size_t i=0;i<cells;++i){const float scale=ggml_fp16_to_fp32(u[i%r.columns]);sinq::require(scale>0 && std::isfinite(scale),"research invalid F16 scale");out[i]*=scale;sinq::require(std::isfinite(out[i]),"research nonfinite reconstruction");}
+        sinq::parallel_for(r.rows,r.threads,[&](int64_t begin,int64_t end){
+            for(int64_t row=begin;row<end;++row) {
+                ggml_get_type_traits(r.codec)->to_float(packed.data()+row*row_bytes,out.data()+row*r.columns,r.columns);
+                for(int64_t column=0;column<r.columns;++column) {
+                    const size_t i=size_t(row)*r.columns+column;
+                    const float scale=ggml_fp16_to_fp32(u[size_t(column)]);
+                    sinq::require(scale>0 && std::isfinite(scale),"research invalid F16 scale");
+                    out[i]*=scale;sinq::require(std::isfinite(out[i]),"research nonfinite reconstruction");
+                }
+            }
+        });
         write(r.output,out.data(),out.size()*4);std::cout<<"{\"status\":\"PASS\",\"operation\":\"decode\"}\n";return 0;
     }
     const size_t source_bytes=ggml_row_size(r.source_type,r.columns)*size_t(r.rows);
@@ -89,22 +99,35 @@ int main(int argc,char**argv) try {
         }
     }
     if(r.operation=="score") {
-        const size_t per=row_bytes+size_t(r.columns)*4;
-        const size_t resident=source_bytes+w.size()*4+(x.size()+validation.size())*4+size_t(r.columns)*32;
+        const size_t per=row_bytes+size_t(r.columns)*4+2*sizeof(double);
+        const size_t base_resident=source_bytes+w.size()*4+(x.size()+validation.size())*4+size_t(r.columns)*32;
+        const size_t scratch=size_t(r.columns)*sizeof(double);
+        sinq::require(r.workspace>base_resident && r.workspace-base_resident>=per+scratch,"research rescore workspace exhausted");
+        const int scoring_threads=int(std::min<size_t>(size_t(std::min<int64_t>(r.threads,r.rows)),
+            (r.workspace-base_resident-per)/scratch));
+        const size_t resident=base_resident+size_t(scoring_threads)*scratch;
         sinq::require(r.workspace>resident && r.workspace-resident>=per,"research rescore workspace exhausted");
         sinq::require(fs::file_size(r.payload)==packed_size,"research score payload size mismatch");
         const int64_t slab=std::min<int64_t>(r.rows,(r.workspace-resident)/per);
         std::vector<uint8_t>packed(size_t(slab)*row_bytes);std::vector<float>dq(size_t(slab)*r.columns);
+        std::vector<double>train_rows(size_t(slab),0.),validation_rows(size_t(slab),0.);
         std::vector<ggml_fp16_t>u(size_t(r.columns),ggml_fp32_to_fp16(1));
         if(!r.scales.empty()){auto b=load(r.scales,u.size()*2,r.workspace);std::memcpy(u.data(),b.data(),b.size());}
         std::ifstream f(r.payload,std::ios::binary);sinq::sum train,val;
         for(int64_t first=0;first<r.rows;first+=slab) {
             const auto rows=std::min(slab,r.rows-first);const auto count=size_t(rows)*row_bytes;
             f.read((char*)packed.data(),count);sinq::require(bool(f)&&ggml_validate_row_data(r.codec,packed.data(),count),"research score invalid native payload");
+            sinq::parallel_for(rows,scoring_threads,[&](int64_t begin,int64_t end){
+                for(int64_t row=begin;row<end;++row)
+                    ggml_get_type_traits(r.codec)->to_float(packed.data()+row*row_bytes,dq.data()+row*r.columns,r.columns);
+            });
+            sinq::output_scores(w.data()+first*r.columns,dq.data(),u.data(),rows,r.columns,x.data(),r.samples,
+                r.search.objective,train_rows.data(),scoring_threads);
+            if(r.search.held_out)sinq::output_scores(w.data()+first*r.columns,dq.data(),u.data(),rows,r.columns,
+                validation.data(),r.validation_samples,r.search.objective,validation_rows.data(),scoring_threads);
             for(int64_t row=0;row<rows;++row) {
-                ggml_get_type_traits(r.codec)->to_float(packed.data()+row*row_bytes,dq.data()+row*r.columns,r.columns);
-                train.add(sinq::output_score(w.data()+(first+row)*r.columns,dq.data()+row*r.columns,u.data(),1,r.columns,x.data(),r.samples,r.search.objective));
-                if(r.search.held_out)val.add(sinq::output_score(w.data()+(first+row)*r.columns,dq.data()+row*r.columns,u.data(),1,r.columns,validation.data(),r.validation_samples,r.search.objective));
+                train.add(train_rows[size_t(row)]);
+                if(r.search.held_out)val.add(validation_rows[size_t(row)]);
             }
         }
         const auto text=json({{"schema_version",1},{"objective",r.search.objective==sinq::local_objective::output_l1?"output_l1":"output_mse"},{"train_score",train.value/double(r.rows)},{"validation_score",r.search.held_out?json(val.value/double(r.rows)):json(nullptr)},{"encode_count",0}}).dump(2)+"\n";

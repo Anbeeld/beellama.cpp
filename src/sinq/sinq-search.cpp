@@ -2,6 +2,7 @@
 #include "sinq-awq.h"
 #include "sinq-local-score.h"
 #include "sinq-numeric.h"
+#include "sinq-parallel.h"
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -20,13 +21,15 @@ llama_sinq_calibration_result legacy_search(ggml_type codec,int64_t n,int64_t k,
         if (importance)require(importance[j]>=0 && std::isfinite(importance[j]),"A-SINQ invalid importance");
     }
     require(importance || !ggml_quantize_requires_imatrix(codec),"A-SINQ native codec requires the final quantizer's imatrix");
-    const int scoring_threads=int(std::min<int64_t>(n,nthread));
     const size_t row_bytes=ggml_row_size(codec,k),fixed=size_t(k)*(64+size_t(samples)*4)+4096;
+    const size_t per_row=size_t(k)*12+row_bytes+sizeof(double);
+    require(limit>fixed && limit-fixed>=per_row,"A-SINQ workspace limit cannot fit one native row");
+    const int scoring_threads=int(std::min<size_t>(size_t(std::min<int64_t>(n,nthread)),
+        1+(limit-fixed-per_row)/(size_t(k)*sizeof(double))));
     // Each scorer owns its reconstruction errors. Include them in the workspace
     // budget before choosing a slab, rather than multiplying the bounded slab.
     require(size_t(scoring_threads-1)<=(std::numeric_limits<size_t>::max()-fixed)/sizeof(double)/size_t(k),"A-SINQ thread workspace overflow");
     const size_t threaded_fixed=fixed+size_t(scoring_threads-1)*size_t(k)*sizeof(double);
-    const size_t per_row=size_t(k)*12+row_bytes+sizeof(double);
     require(limit>threaded_fixed && limit-threaded_fixed>=per_row,"A-SINQ workspace limit cannot fit one native row");
     const int64_t slab=std::min<int64_t>(n,(limit-threaded_fixed)/per_row);
     const size_t cells=size_t(slab)*k;
@@ -111,6 +114,7 @@ search_result research_search(ggml_type codec,int64_t n,int64_t k,const std::vec
         samples>0 && samples<=256 && read && encode && emit,"research invalid codec/shape/readers");
     require(uint64_t(k)<=SIZE_MAX/1024 && uint64_t(n)<=SIZE_MAX/uint64_t(k)/4 &&
         raw.size()==size_t(k) && x.size()==size_t(k)*samples,"research activation cardinality/shape overflow");
+    require(options.threads>0,"research invalid thread count");
     require(options.objective==local_objective::output_l1 || options.objective==local_objective::output_mse,"research invalid objective");
     require(std::isfinite(options.tolerance) && options.tolerance>=0 && options.max_candidates>0 && options.max_candidates<=1024 &&
         options.max_shortlist<=options.max_candidates && std::isfinite(options.refine_step) && options.refine_step>0 && options.refine_step<=1,"research invalid search budget/policy");
@@ -124,12 +128,18 @@ search_result research_search(ggml_type codec,int64_t n,int64_t k,const std::vec
     }
     require(importance || !ggml_quantize_requires_imatrix(codec),"research codec requires imatrix");
     // Include every retained F16 hypothesis and its metadata, not only slabs.
-    const size_t fixed=size_t(k)*(96+size_t(samples+validation_samples)*4+options.max_candidates*2)+options.max_candidates*256+4096;
-    const size_t row_bytes=ggml_row_size(codec,k),per_row=size_t(k)*12+row_bytes;
+    const size_t base_fixed=size_t(k)*(96+size_t(samples+validation_samples)*4+options.max_candidates*2)+options.max_candidates*256+4096;
+    const size_t row_bytes=ggml_row_size(codec,k),per_row=size_t(k)*12+row_bytes+2*sizeof(double);
+    const size_t scratch=size_t(k)*sizeof(double);
+    require(limit>base_fixed && limit-base_fixed>=per_row+scratch,"research workspace cannot fit one row");
+    const int scoring_threads=int(std::min<size_t>(size_t(std::min<int64_t>(n,options.threads)),
+        (limit-base_fixed-per_row)/scratch));
+    const size_t fixed=base_fixed+size_t(scoring_threads)*scratch;
     require(limit>fixed && limit-fixed>=per_row,"research workspace cannot fit one row");
     const int64_t slab=std::min<int64_t>(n,(limit-fixed)/per_row);
     std::vector<float>w(size_t(slab)*k),pre(w.size()),dq(w.size()),im(importance?size_t(k):0);
     std::vector<uint8_t>packed(size_t(slab)*row_bytes);
+    std::vector<double>train_rows(size_t(slab),0.),validation_rows(size_t(slab),0.);
     std::vector<double>mx(size_t(k),0),mw(size_t(k),0);
     std::vector<sum>sums(size_t(k),sum{});
     for(int64_t j=0;j<k;++j){sum v;for(int t=0;t<samples;++t)v.add(std::abs(double(x[size_t(t)*k+j])));mx[j]=v.value/samples;}
@@ -166,13 +176,21 @@ search_result research_search(ggml_type codec,int64_t n,int64_t k,const std::vec
             sum train,val;
             for(int64_t first=0;first<n;first+=slab) {
                 const auto rows=std::min(slab,n-first);read(first,rows,w.data());
-                for(int64_t i=0;i<rows*k;++i)pre[i]=w[i]/ggml_fp16_to_fp32(r.scales[i%k]);
+                parallel_for(rows, scoring_threads, [&](int64_t begin, int64_t end) {
+                    for(int64_t i=begin*k;i<end*k;++i)pre[i]=w[i]/ggml_fp16_to_fp32(r.scales[i%k]);
+                });
                 const size_t bytes=encode(pre.data(),packed.data(),first,rows,importance?im.data():nullptr);
                 require(bytes==size_t(rows)*row_bytes && ggml_validate_row_data(codec,packed.data(),bytes),"research invalid native packed bytes");
+                parallel_for(rows, scoring_threads, [&](int64_t begin, int64_t end) {
+                    for(int64_t row=begin;row<end;++row)
+                        ggml_get_type_traits(codec)->to_float(packed.data()+row*row_bytes,dq.data()+row*k,k);
+                });
+                output_scores(w.data(),dq.data(),r.scales.data(),rows,k,x.data(),samples,options.objective,train_rows.data(),scoring_threads);
+                if(options.held_out)output_scores(w.data(),dq.data(),r.scales.data(),rows,k,validation.data(),validation_samples,options.objective,validation_rows.data(),scoring_threads);
+                // Preserve scalar row-order Kahan reductions across threads/slabs.
                 for(int64_t row=0;row<rows;++row) {
-                    ggml_get_type_traits(codec)->to_float(packed.data()+row*row_bytes,dq.data()+row*k,k);
-                    train.add(output_score(w.data()+row*k,dq.data()+row*k,r.scales.data(),1,k,x.data(),samples,options.objective));
-                    if(options.held_out)val.add(output_score(w.data()+row*k,dq.data()+row*k,r.scales.data(),1,k,validation.data(),validation_samples,options.objective));
+                    train.add(train_rows[size_t(row)]);
+                    if(options.held_out)val.add(validation_rows[size_t(row)]);
                 }
                 emit(index,r.scales,first,rows,packed.data(),bytes);
             }

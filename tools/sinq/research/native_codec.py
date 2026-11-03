@@ -21,8 +21,16 @@ def file_sha256(path):
     return h.hexdigest()
 
 
-def _run(binary, args, timeout=300):
-    env = {**os.environ, 'OMP_NUM_THREADS': '24', 'MKL_NUM_THREADS': '24',
+def _thread_count(threads=None):
+    value = (os.cpu_count() or 1) if threads is None else threads
+    if type(value) is not int or not 1 <= value <= 1024:
+        raise ValueError('threads must be an integer in 1..1024')
+    return value
+
+
+def _run(binary, args, timeout=300, *, threads=None):
+    threads = _thread_count(threads)
+    env = {**os.environ, 'OMP_NUM_THREADS': str(threads), 'MKL_NUM_THREADS': str(threads),
            'HF_HUB_OFFLINE': '1', 'TRANSFORMERS_OFFLINE': '1', 'CUDA_VISIBLE_DEVICES': '0'}
     result = subprocess.run([str(Path(binary).resolve()), *map(str, args)], env=env,
                             capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout)
@@ -33,15 +41,18 @@ def _run(binary, args, timeout=300):
 
 def request(binary, config, directory, *, timeout=300):
     """Private temp request; filesystem outputs are managed by the native bridge."""
+    config = dict(config)
+    threads = _thread_count(config.get('threads'))
+    config['threads'] = threads
     path = Path(directory) / 'request.json'
     with path.open('x', encoding='utf-8') as stream:
         json.dump(config, stream, sort_keys=True, allow_nan=False)
-    return _run(binary, [path], timeout)
+    return _run(binary, [path], timeout, threads=threads)
 
 
-def validate_activations(binary, manifest, source):
+def validate_activations(binary, manifest, source, *, threads=None):
     """Reuse the *unchanged* strict v1 C++ loader, including hash/path policy."""
-    return _run(binary, ['--validate-activations', Path(manifest).resolve(), Path(source).resolve()])
+    return _run(binary, ['--validate-activations', Path(manifest).resolve(), Path(source).resolve()], threads=threads)
 
 
 def copy_tensor_bytes(tensor, destination, *, max_bytes):
@@ -55,7 +66,7 @@ def copy_tensor_bytes(tensor, destination, *, max_bytes):
             stream.write(raw[offset:offset + 1024 * 1024])
 
 
-def decode(binary, candidate, *, first_row=0, rows=None, workspace_bytes=64 << 20):
+def decode(binary, candidate, *, first_row=0, rows=None, workspace_bytes=64 << 20, threads=None):
     """Decode a validated Candidate's indivisible native payload/scale pair.
 
     Caller must obtain Candidate through CandidateStore.get(). Output contains
@@ -78,7 +89,8 @@ def decode(binary, candidate, *, first_row=0, rows=None, workspace_bytes=64 << 2
         config = dict(schema_version=1, operation='decode', codec=candidate.provenance['qtype'].lower(),
                       rows=native_rows, columns=shape[1], first_row=native_first,
                       payload=str(candidate.payload.resolve()), output=str(output),
-                      workspace_bytes=workspace_bytes, max_output_bytes=workspace_bytes)
+                      workspace_bytes=workspace_bytes, max_output_bytes=workspace_bytes,
+                      threads=_thread_count(threads))
         if candidate.scales is not None:
             config['scales'] = str(candidate.scales.resolve())
         request(binary, config, d)
@@ -87,7 +99,7 @@ def decode(binary, candidate, *, first_row=0, rows=None, workspace_bytes=64 << 2
 
 
 def rescore(binary, candidate, source_tensor, activation, *, objective='output_l1',
-            validation=None, workspace_bytes=64 << 20):
+            validation=None, workspace_bytes=64 << 20, threads=None):
     """Rescore immutable bytes without any native re-encoding (encode_count=0)."""
     if objective not in ('output_l1', 'output_mse'):
         raise ValueError('unsupported local objective')
@@ -104,7 +116,7 @@ def rescore(binary, candidate, source_tensor, activation, *, objective='output_l
                       weights=str(weights), payload=str(candidate.payload.resolve()),
                       activations=str(Path(activation['data_file']).resolve()), samples=activation['count'],
                       objective=objective, workspace_bytes=workspace_bytes, max_output_bytes=workspace_bytes,
-                      output=str(Path(d) / 'score.json'))
+                      output=str(Path(d) / 'score.json'), threads=_thread_count(threads))
         if candidate.scales is not None:
             config['scales'] = str(candidate.scales.resolve())
         if validation is not None:
