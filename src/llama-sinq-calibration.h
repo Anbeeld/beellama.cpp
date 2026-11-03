@@ -28,4 +28,4 @@ llama_sinq_calibration_result llama_sinq_calibrate_native(
     const std::vector<float> & raw_sinq, const std::vector<ggml_fp16_t> & ordinary,
     const std::vector<float> & activations, int samples, const float * importance,
     size_t workspace_limit, const llama_sinq_weight_reader & read,
-    const llama_sinq_native_encoder & encode);
+    const llama_sinq_native_encoder & encode, int nthread = 1);

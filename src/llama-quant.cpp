@@ -1680,7 +1680,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                         return llama_tensor_quantize_impl(new_type,input,output,chunk_size,first,rows,nrows_per_expert,n_per_row,importance,workers,use);
                     };
                     const auto result = llama_sinq_calibrate_native(new_type,nrows_total,n_per_row,calibration_raw,sinq_values,
-                        samples,entry.count,imatrix,calibration_budget,read,encode);
+                        samples,entry.count,imatrix,calibration_budget,read,encode,nthread);
                     sinq_values = result.scales;
                     const double milliseconds = double(ggml_time_us()-start)/1000.;
                     if (diagnostic) {

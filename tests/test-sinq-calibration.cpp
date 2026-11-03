@@ -20,7 +20,7 @@ int main() try {
     for (ggml_type codec : {GGML_TYPE_IQ1_S,GGML_TYPE_IQ1_M,GGML_TYPE_IQ2_XXS,GGML_TYPE_IQ2_XS,GGML_TYPE_IQ2_S,
          GGML_TYPE_IQ3_XXS,GGML_TYPE_IQ3_S,GGML_TYPE_IQ4_NL,GGML_TYPE_IQ4_XS,GGML_TYPE_Q3_K,GGML_TYPE_Q4_K,
          GGML_TYPE_Q5_0,GGML_TYPE_Q5_1,GGML_TYPE_Q6_K,GGML_TYPE_Q8_0}) {
-        constexpr int n=3,k=256,samples=4;
+        constexpr int n=37,k=256,samples=8;
         std::vector<float> w(n*k),x(samples*k),importance(k),raw(k);
         std::vector<ggml_fp16_t> ordinary(k);
         for (int j=0;j<k;++j) { raw[j]=.75f+float(j%11)*.07f;ordinary[j]=ggml_fp32_to_fp16(raw[j]);importance[j]=1.f+float(j%7)*.2f; }
@@ -49,6 +49,12 @@ int main() try {
         check(std::abs(independent-result.selected_loss)<1.e-12,"selected actual native reconstruction score");
         const auto again=llama_sinq_calibrate_native(codec,n,k,raw,ordinary,x,samples,importance.data(),32*1024,read,encode);
         check(again.scales==result.scales && again.alpha_index==result.alpha_index && again.selected_loss==result.selected_loss,"workspace-independent deterministic calibration");
+        for (int threads : {1,4,32}) {
+            const auto parallel=llama_sinq_calibrate_native(codec,n,k,raw,ordinary,x,samples,importance.data(),1024*1024,read,encode,threads);
+            check(parallel.candidate_losses==result.candidate_losses && parallel.baseline_loss==result.baseline_loss &&
+                  parallel.selected_loss==result.selected_loss && parallel.alpha_index==result.alpha_index && parallel.scales==result.scales,
+                  "thread count changed candidate losses or selected F16 scales");
+        }
         std::printf("native calibration %s parity PASS\n",ggml_type_name(codec));
     }
     {
@@ -64,6 +70,10 @@ int main() try {
         try { llama_sinq_calibrate_native(GGML_TYPE_Q3_K,n,k,raw,ordinary,x,2,nullptr,64,read,encode); }
         catch(const std::exception &) { budget_rejected=true; }
         check(budget_rejected,"insufficient calibration workspace accepted");
+        bool threads_rejected=false;
+        try { llama_sinq_calibrate_native(GGML_TYPE_Q3_K,n,k,raw,ordinary,x,2,nullptr,64*1024,read,encode,0); }
+        catch(const std::exception &) { threads_rejected=true; }
+        check(threads_rejected,"nonpositive calibration thread count accepted");
         const auto tie=run();
         check(tie.alpha_index==-1 && tie.selected_loss==0 && tie.scales==ordinary,"identity native control/tie must retain uncalibrated candidate");
         const auto reject=[&](const char * message) { bool failed=false;try { run(); } catch(const std::exception &) { failed=true; }check(failed,message); };

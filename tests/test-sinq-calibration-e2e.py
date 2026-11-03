@@ -113,7 +113,7 @@ def main():
             return reader
         codecs = ('Q3_K', 'IQ3_S', 'IQ4_XS', 'Q5_0', 'Q6_K')
         for codec in codecs:
-            for threads in (1, 4):
+            for threads in (1, 4, 32):
                 run(args.quantize, d / f'{codec}-{threads}.gguf', calibration=d, threads=threads,
                     diagnostic=d / f'{codec}-{threads}.json', codec=codec, imatrix=imatrix_path)
             a, b = (read(d / f'{codec}-{t}.gguf') for t in (1, 4))
@@ -146,7 +146,31 @@ def main():
             assert np.isfinite(actual) and np.isclose(actual, cal['selected_l1'], rtol=1e-10, atol=1e-12), (codec, actual, cal)
             assert cal['selected_l1'] <= cal['uncalibrated_l1'], (codec, cal)
             assert np.ptp(cal['candidate_l1']) > 1e-10, (codec, 'activation-aware candidates did not affect output loss')
-            assert diagnostics == json.loads((d / f'{codec}-4.json').read_text()), (codec, 'nondeterministic diagnostics')
+            for threads in (4, 32):
+                other = read(d / f'{codec}-{threads}.gguf')
+                other_t = {t.name: t for t in other.tensors}
+                assert ta.keys() == other_t.keys(), codec
+                assert all(np.array_equal(t.data, other_t[key].data) and t.tensor_type == other_t[key].tensor_type
+                           for key, t in ta.items()), (codec, threads, 'thread-dependent weights/scales')
+                other_diagnostics = json.loads((d / f'{codec}-{threads}.json').read_text())
+                # Scratch ownership changes the reported workspace, not any loss,
+                # candidate, scale, encoding, or other diagnostic value.
+                for reference_item, other_item in zip(diagnostics['tensors'], other_diagnostics['tensors']):
+                    if 'calibration' in reference_item:
+                        reference_workspace = reference_item['calibration']['workspace_bytes']
+                        other_workspace = other_item['calibration'].pop('workspace_bytes')
+                        assert reference_workspace <= other_workspace <= 64 * 1024 * 1024
+                        other_item['calibration']['workspace_bytes'] = reference_workspace
+                assert diagnostics == other_diagnostics, (codec, threads, 'nondeterministic numerical diagnostics')
+            if args.baseline:
+                baseline_file, baseline_diag = d / f'{codec}-baseline.gguf', d / f'{codec}-baseline.json'
+                run(args.baseline, baseline_file, calibration=d, threads=4, diagnostic=baseline_diag,
+                    codec=codec, imatrix=imatrix_path)
+                baseline_t = {t.name: t for t in read(baseline_file).tensors}
+                assert ta.keys() == baseline_t.keys(), codec
+                assert all(np.array_equal(t.data, baseline_t[key].data) and t.tensor_type == baseline_t[key].tensor_type
+                           for key, t in ta.items()), (codec, 'frozen A-SINQ baseline payload changed')
+                assert diagnostics == json.loads(baseline_diag.read_text()), (codec, 'serial baseline diagnostics changed')
         for key, value in [('input_dim', k +1), ('name','blk.0.ffn_down.weight')]:
             bad = json.loads(json.dumps(manifest))
             bad['tensors'][0][key] = value
