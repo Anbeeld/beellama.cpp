@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
 
 ROOT=Path(__file__).resolve().parents[3]
 sys.path.insert(0,str(ROOT/'gguf-py'))
@@ -23,10 +24,15 @@ def _json(path):
     return json.loads(Path(path).read_text(encoding='utf-8'))
 
 
+@contextmanager
 def _run(config):
     path=Path(config['candidate_manifest']).resolve();run=_json(path)
     if run.get('schema_version')!=1 or run.get('checksum')!=digest({k:v for k,v in run.items() if k!='checksum'}):
         raise ValueError('candidate run manifest schema/checksum mismatch')
+    if 'generation_identity_sha256' in run:
+        identity=_json(path.parent/'run-identity.json')
+        if identity.get('kind')!='sinq-generation-run' or identity.get('checksum')!=run['generation_identity_sha256'] or identity['checksum']!=digest({k:v for k,v in identity.items() if k!='checksum'}):
+            raise ValueError('candidate generation identity closure mismatch')
     source=(path.parent/run['source_gguf']).resolve()
     if file_digest(source)!=run['source_sha256']:
         raise ValueError('candidate source GGUF checksum mismatch')
@@ -34,18 +40,19 @@ def _run(config):
     if cache!=path.parent/'cache':
         raise ValueError('candidate cache must be the run-owned cache directory')
     b=config['budgets'];store=CandidateStore(cache,max_bytes=b['max_output_bytes'],max_files=b['max_files'])
-    ids=[];requested_scores=0
-    for name,record in sorted(run['tensors'].items()):
-        for key in [record['stock'],*[r['candidate_id'] for r in record['candidates']]]:
-            candidate=candidate_for(run,store,name,key)
-            if candidate.provenance['generator']['family'] in config.get('families',[]):requested_scores+=1
-            ids.append(key)
-    if len(run['tensors'])>b['max_tensors'] or len(ids)>b['max_candidates']*b['max_tensors']:
-        raise ValueError('candidate manifest count budget exceeded')
-    if 'assignments' in config:requested_scores=len(config['assignments'])
-    if config['operation']=='score' and requested_scores>b['max_evaluations']:
-        raise ValueError('requested candidate scoring work budget exceeded')
-    return run,store,source
+    with store.verified_session():
+        ids=[];requested_scores=0
+        for name,record in sorted(run['tensors'].items()):
+            for key in [record['stock'],*[r['candidate_id'] for r in record['candidates']]]:
+                candidate=candidate_for(run,store,name,key)
+                if candidate.provenance['generator']['family'] in config.get('families',[]):requested_scores+=1
+                ids.append(key)
+        if len(run['tensors'])>b['max_tensors'] or len(ids)>b['max_candidates']*b['max_tensors']:
+            raise ValueError('candidate manifest count budget exceeded')
+        if 'assignments' in config:requested_scores=len(config['assignments'])
+        if config['operation']=='score' and requested_scores>b['max_evaluations']:
+            raise ValueError('requested candidate scoring work budget exceeded')
+        yield run,store,source
 
 
 def _validator(binary):
@@ -88,9 +95,19 @@ def lock_baseline_config(config):
         max_output_bytes=config['budgets']['max_output_bytes'],threads=config['threads'],timeout=config['timeout'])
 
 
+def lock_corpora_config(config):
+    from .corpora import lock_corpora
+    b=config['budgets']
+    return lock_corpora(config['token_sources'],config['partitions'],config['output_manifest'],
+        max_tokens=b['max_tokens'],max_output_bytes=b['max_output_bytes'],max_files=b['max_files'])
+
+
 def assemble_config(config):
+    with _run(config) as inputs:return _assemble(config,*inputs)
+
+
+def _assemble(config,run,store,source):
     from .hybrid import assemble
-    run,store,source=_run(config)
     if file_digest(config['source_gguf'])!=run['source_sha256']:
         raise ValueError('assembly source mismatch')
     for name,key in config['assignment'].items():candidate_for(run,store,name,key)
@@ -140,8 +157,12 @@ def _advanced_reference(checkpoint,source,budget,threads):
 
 
 def score_config(config):
+    with _run(config) as inputs:return _score(config,*inputs)
+
+
+def _score(config,run,store,source):
     import gguf
-    run,store,source=_run(config);method=config['method'];b=config['budgets']
+    method=config['method'];b=config['budgets']
     if method!='local' and (config.get('selection_policy','in_sample')!='in_sample' or any(k in config for k in ('validation_manifest','pairing_manifest'))):
         raise ValueError('advanced held_out capture provenance is not supported')
     _stock_baseline(config,run,source)
@@ -216,11 +237,15 @@ def score_config(config):
 
 
 def select_config(config,*,resume=None):
+    with _run(config) as inputs:return _select(config,*inputs,resume=resume)
+
+
+def _select(config,run,store,source,*,resume=None):
     from .selector import State,Group,coordinate_descent
     from .hybrid import assemble
     from .kl import NativeKLEvaluator
     from .run_state import selection_identity,open_selection,selection_lock
-    run,store,source=_run(config);b=config['budgets']
+    b=config['budgets']
     if file_digest(config['source_gguf'])!=run['source_sha256']:
         raise ValueError('selection source does not match candidate provenance')
     selection=_json(config['selection_manifest']);e=_json(config['evaluator'])
@@ -230,6 +255,15 @@ def select_config(config,*,resume=None):
         raise ValueError('selection stream/reference provenance mismatch (final-test prohibited)')
     if selection.get('schema_version')!=1 or _json(str(e['reference'])+'.json').get('source_sha256')!=run['source_sha256']:
         raise ValueError('selection reference is not bound to the candidate source')
+    from .corpora import load_corpora,bind_corpora
+    from .kl import _header
+    if 'corpus_partitions_manifest' not in config or 'corpus_bindings' not in run:
+        raise ValueError('selection requires corpus_partitions_manifest and token-bound candidate generation provenance')
+    partitions=load_corpora(config['corpus_partitions_manifest'])
+    corpus_identity=bind_corpora(partitions,run['corpus_bindings'],_header(e['reference'],e['max_tokens'])['tokens'])
+    recorded=run.get('corpus_partitions')
+    if recorded and (recorded['file_sha256']!=file_digest(config['corpus_partitions_manifest']) or recorded['identity']!=corpus_identity):
+        raise ValueError('selection corpus partitions differ from generation lock')
     if set(config['baseline'])!=set(run['tensors']):raise ValueError('baseline must assign the complete run tensor allocation')
     if e['max_tokens']>b['max_tokens']:raise ValueError('KL token budget exceeded')
     if b['max_evaluations']+8>b['max_files']:raise ValueError('selector file budget cannot hold score/checkpoint closure')
@@ -285,7 +319,7 @@ def select_config(config,*,resume=None):
             else:os.link(path,best)
         summary=dict(schema_version=1,status='PASS',run_identity_sha256=identity['checksum'],
             source_sha256=run['source_sha256'],stock_baseline_sha256=locked['baseline_sha256'] if locked else None,
-            best_gguf_sha256=best_hash,assignment=dict(result.state.assignment),selection_kld=result.score,
+            corpus_partitions=corpus_identity,best_gguf_sha256=best_hash,assignment=dict(result.state.assignment),selection_kld=result.score,
             evaluations=result.evaluations,budget_exhausted=result.budget_exhausted,trace=result.trace,
             warning='Selection objective only; not an untouched-test result or quality conclusion.')
         summary['checksum']=digest(summary)
@@ -296,26 +330,27 @@ def select_config(config,*,resume=None):
 def validate_config_artifacts(config):
     path=Path(config['artifact_manifest']);run=_json(path)
     surrogate=dict(config,candidate_manifest=str(path))
-    run,store,source=_run(surrogate)
-    if 'source_gguf' in config and file_digest(config['source_gguf'])!=run['source_sha256']:raise ValueError('validation source mismatch')
-    _,locked=_stock_baseline(surrogate,run,source)
-    return dict(status='PASS',source_sha256=run['source_sha256'],stock_baseline_sha256=locked['baseline_sha256'] if locked else None,
-        tensor_count=len(run['tensors']))
+    with _run(surrogate) as (run,store,source):
+        if 'source_gguf' in config and file_digest(config['source_gguf'])!=run['source_sha256']:raise ValueError('validation source mismatch')
+        _,locked=_stock_baseline(surrogate,run,source)
+        return dict(status='PASS',source_sha256=run['source_sha256'],stock_baseline_sha256=locked['baseline_sha256'] if locked else None,
+            tensor_count=len(run['tensors']))
 
 
 def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('config');parser.add_argument('--plan',action='store_true')
-    parser.add_argument('--resume',metavar='RUN_DIRECTORY',help='resume a strictly matching existing selection run')
+    parser.add_argument('--resume',metavar='RUN_DIRECTORY',help='resume a strictly matching existing generation or selection run')
     args=parser.parse_args(argv);config=load_config(args.config)
-    if args.resume is not None and (config['operation']!='select' or args.plan):
-        raise ValueError('--resume requires select without --plan')
+    if args.resume is not None and (config['operation'] not in ('generate','select') or args.plan):
+        raise ValueError('--resume requires generate or select without --plan')
     if args.plan:
         result=preflight(config) if config['operation']=='generate' else dict(status='PLAN',operation=config['operation'],resource_bounds=config['resource_bounds'])
     else:
         os.environ['HF_HUB_OFFLINE']='1';os.environ['TRANSFORMERS_OFFLINE']='1'
-        if config['operation']=='select':result=select_config(config,resume=args.resume)
-        else:result={'generate':generate,'score':score_config,'assemble':assemble_config,'lock_baseline':lock_baseline_config,
+        if config['operation'] in ('select','generate'):
+            result=({'select':select_config,'generate':generate}[config['operation']])(config,resume=args.resume)
+        else:result={'score':score_config,'assemble':assemble_config,'lock_baseline':lock_baseline_config,'lock_corpora':lock_corpora_config,
                      'validate':validate_config_artifacts}[config['operation']](config)
     print(json.dumps(result,sort_keys=True,allow_nan=False))
     return 0

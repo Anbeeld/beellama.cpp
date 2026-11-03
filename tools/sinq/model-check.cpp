@@ -14,7 +14,7 @@ int main(int argc,char**argv) try {
     const int vocab=llama_vocab_n_tokens(llama_model_get_vocab(model));
     for(int i=3;i<argc;++i){const int t=std::stoi(argv[i]);if(t<0 || t>=vocab)throw std::runtime_error("token outside vocabulary");tokens.push_back(t);}
     if(tokens.empty() || tokens.size()>32)throw std::runtime_error("forward token budget 1..32");
-    auto cp=llama_context_default_params();cp.n_ctx=64;cp.n_batch=24;cp.n_ubatch=24;cp.n_threads=24;cp.n_threads_batch=24;
+    auto cp=llama_context_default_params();cp.n_ctx=64;cp.n_batch=32;cp.n_ubatch=24;cp.n_threads=24;cp.n_threads_batch=24;
     auto*ctx=llama_init_from_model(model,cp);if(!ctx)throw std::runtime_error("native context rejected model");
     if(llama_decode(ctx,llama_batch_get_one(tokens.data(),int(tokens.size())))!=0)throw std::runtime_error("native forward failed");
     const auto*logits=llama_get_logits_ith(ctx,-1);if(!logits)throw std::runtime_error("native logits missing");

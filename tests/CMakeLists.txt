@@ -922,7 +922,7 @@ target_compile_features(test-sinq-research-config PRIVATE cxx_std_17)
 target_link_libraries(test-sinq-research-config PRIVATE llama-sinq-optimizer)
 add_test(NAME test-sinq-research-config COMMAND test-sinq-research-config)
 if (Python3_Interpreter_FOUND)
-    foreach(research_test blockwise fisher research-config candidate-cache hybrid groupwise-kl stock-baseline research-repairs)
+    foreach(research_test blockwise fisher research-config candidate-cache hybrid groupwise-kl stock-baseline research-repairs implementation corpora generation-resume)
         add_test(NAME test-sinq-research-${research_test} COMMAND ${Python3_EXECUTABLE}
             ${PROJECT_SOURCE_DIR}/tests/test-sinq-${research_test}.py)
         set_tests_properties(test-sinq-research-${research_test} PROPERTIES
@@ -933,6 +933,6 @@ if (Python3_Interpreter_FOUND)
 endif()
 
 if (Python3_Interpreter_FOUND AND LLAMA_BUILD_TOOLS AND LLAMA_BUILD_SINQ_RESEARCH)
-    set_tests_properties(test-sinq-research-hybrid test-sinq-research-groupwise-kl test-sinq-research-stock-baseline PROPERTIES
+    set_tests_properties(test-sinq-research-hybrid test-sinq-research-groupwise-kl test-sinq-research-stock-baseline test-sinq-research-generation-resume PROPERTIES
         ENVIRONMENT "OMP_NUM_THREADS=24;MKL_NUM_THREADS=24;HF_HUB_OFFLINE=1;TRANSFORMERS_OFFLINE=1;CUDA_VISIBLE_DEVICES=0;SINQ_NATIVE_BIN=$<TARGET_FILE_DIR:llama-quantize>")
 endif()

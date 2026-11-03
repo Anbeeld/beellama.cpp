@@ -39,7 +39,7 @@ def _manifest(config, key):
     return value,validated
 
 
-def preflight(config):
+def preflight(config,*,resume=None):
     """No writes, no encode: resolve candidates, inputs, native v1 manifests and bounds."""
     source=Path(config['source_gguf']).resolve()
     if not Path(config['native_bridge']).is_file():
@@ -76,13 +76,16 @@ def preflight(config):
         if manifest.get('provenance',{}).get('token_count',max(t['count'] for t in activations['tensors'].values()))>config['budgets']['max_tokens']:
             raise ValueError('activation token budget exceeded')
         output=Path(config['output_directory']).resolve()
-        if output.exists():
-            raise FileExistsError('research output must be a new immutable directory')
+        if resume is not None:
+            if Path(resume).resolve()!=output or not output.is_dir():
+                raise ValueError('resume directory must be the existing configured output directory')
+        elif output.exists():
+            raise FileExistsError('research output must be new; use --resume RUN_DIRECTORY')
         for name in ('source_gguf','activation_manifest','validation_manifest','pairing_manifest'):
             if name in config and Path(config[name]).resolve()==output:
                 raise ValueError('output aliases input')
         bound=config['resource_bounds']['candidates_per_tensor']+1 # include stock
-        total=0;details=[]
+        total=1<<20;details=[] # reserve the bounded implementation/run identity
         for name in config['tensor_list']:
             if not exporter.PATTERN.fullmatch(name) or name not in tensors:
                 raise ValueError('missing/ineligible exact text projection: '+name)
@@ -104,7 +107,7 @@ def preflight(config):
             count=n*k//block*size
             total+=bound*(count+k*2+8192)
             details.append(dict(name=name,shape=[n,k],qtype=qtype.name,packed_bytes=count))
-        files=bound*len(details)*4+2
+        files=bound*len(details)*4+5
         if bound*len(details)>config['budgets']['max_evaluations']:
             raise ValueError('native candidate plus stock work budget exceeded')
         if total>config['budgets']['max_output_bytes'] or files>config['budgets']['max_files']:
@@ -136,27 +139,31 @@ def _importance(path,name,k):
         reader.data._mmap.close()
 
 
-def generate(config):
-    from .cache import CandidateStore
+def _generate(config,plan,output,store,completed,save,verify,bindings,corpus_identity,identity_sha256):
     from .resources import atomic_write
-    plan=preflight(config)
-    output=Path(config['output_directory']).resolve()
-    output.mkdir(parents=True,exist_ok=False)
-    store=CandidateStore(output/'cache',max_bytes=config['budgets']['max_output_bytes'],max_files=config['budgets']['max_files'])
+    from .generation_state import validate_completed
+    from .implementation import native_runtime_fingerprint
     reader=gguf.GGUFReader(config['source_gguf'])
     source_sha=plan['source_sha256'];q=config['native_quantizer'];budgets=config['budgets']
     recipe_sha=plan['stock_baseline']['recipe_sha256'] if plan['stock_baseline'] else digest(q['recipe']);imatrix_sha=native_codec.file_sha256(q['imatrix_path']) if 'imatrix_path' in q else None
-    producer=dict(binary_sha256=native_codec.file_sha256(config['native_bridge']),source_sha256=source_identity())
+    producer=dict(binary_sha256=native_codec.file_sha256(config['native_bridge']),source_sha256=source_identity(),
+        runtime_sha256=digest(native_runtime_fingerprint({'bridge':config['native_bridge']})))
     run=dict(schema_version=1,source_gguf=os.path.relpath(Path(config['source_gguf']).resolve(),output),source_sha256=source_sha,
              cache='cache',recipe_sha256=recipe_sha,imatrix_sha256=imatrix_sha,producer=producer,
              config_sha256=digest({k:v for k,v in config.items() if k not in ('source_gguf','activation_manifest','validation_manifest','pairing_manifest','native_bridge','output_directory')}),
-             tensors={},status='PASS',purpose='implementation-only; no quality conclusions')
+             tensors=dict(completed),corpus_bindings=bindings,generation_identity_sha256=identity_sha256,status='PASS',purpose='implementation-only; no quality conclusions')
+    if corpus_identity is not None:
+        run['corpus_partitions']=dict(manifest=os.path.relpath(Path(config['corpus_partitions_manifest']).resolve(),output),
+            file_sha256=native_codec.file_sha256(config['corpus_partitions_manifest']),identity=corpus_identity)
     if plan['stock_baseline']:
         run['stock_baseline']={**plan['stock_baseline'],'manifest':os.path.relpath(plan['stock_baseline']['manifest'],output)}
     try:
         tensors={t.name:t for t in reader.tensors}
         for details in plan['tensor_details']:
             name=details['name'];tensor=tensors[name];n,k=details['shape'];a=plan['activation']['tensors'][name]
+            if name in completed:
+                validate_completed(store,run,name,tensor,details,config)
+                continue
             with tempfile.TemporaryDirectory(prefix='sinq-generate-') as temp:
                 d=Path(temp);weights=d/'source.bin';native_codec.copy_tensor_bytes(tensor,weights,max_bytes=budgets['workspace_bytes'])
                 importance=_importance(q.get('imatrix_path'),name,k)
@@ -192,6 +199,7 @@ def generate(config):
                                         encoded=c['encoded'],duplicate_of=c['duplicate_of'],stage=c['stage'],encode_reason=c['encode_reason']))
                 run['tensors'][name]=dict(stock=stock_id,candidates=records,selected=records[found['selected']]['candidate_id'],
                     skipped=found['skipped'],encode_count=found['encode_count'],workspace_bytes=found['workspace_bytes'],elapsed_seconds=found['elapsed_seconds'])
+            save(run['tensors'])
         if native_codec.file_sha256(config['source_gguf'])!=source_sha:
             raise ValueError('source mutated during generation')
         if plan['stock_baseline']:
@@ -200,7 +208,17 @@ def generate(config):
             if locked['baseline_sha256']!=plan['stock_baseline']['baseline_sha256'] or native_codec.file_sha256(plan['stock_baseline']['manifest'])!=plan['stock_baseline']['manifest_sha256']:
                 raise ValueError('stock baseline changed during generation')
         run['checksum']=digest(run)
+        verify(run)
         atomic_write(output/'run-manifest.json',canonical(run),max_bytes=budgets['max_output_bytes'])
         return run
     finally:
         reader.data._mmap.close()
+
+
+def generate(config,*,resume=None):
+    if resume is not None:
+        output=Path(config['output_directory']).resolve()
+        if Path(resume).resolve()!=output or not output.is_dir():
+            raise ValueError('resume directory must be the existing configured output directory')
+    from .generation_state import run_generation
+    return run_generation(config,resume,_generate)

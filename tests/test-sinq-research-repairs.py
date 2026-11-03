@@ -8,6 +8,8 @@ import os
 from pathlib import Path
 import sys
 import subprocess
+import struct
+import shutil
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -43,6 +45,8 @@ class RepairTests(unittest.TestCase):
             records[name]={'stock':stock,'selected':ordinary,'candidates':[{'candidate_id':ordinary}]}
         self.run=dict(schema_version=1,source_gguf='../source.gguf',source_sha256=self.source_hash,
             cache='cache',recipe_sha256=p['recipe_sha256'],imatrix_sha256=None,tensors=records)
+        self.run['corpus_bindings']=dict(calibration=dict(manifest_sha256='c'*64,
+            token_sha256=hashlib.sha256(np.array([10,11],dtype='<u4').tobytes()).hexdigest()),validation=None)
         self.run['checksum']=digest(self.run)
         self.manifest=run_dir/'run-manifest.json';self.manifest.write_bytes(canonical_json(self.run))
         self.budgets=dict(workspace_bytes=1<<20,max_candidates=8,max_output_bytes=1<<20,max_files=100,
@@ -84,7 +88,14 @@ class RepairTests(unittest.TestCase):
     def selection_config(self):
         executable=self.d/'perplexity';executable.write_bytes(b'version-one')
         loader=self.d/'loader';loader.write_bytes(b'loader-one')
-        reference=self.d/'reference.bin';reference.write_bytes(b'reference')
+        (self.d/'ggml-test.dll').write_bytes(b'local-shared-runtime-one')
+        reference=self.d/'reference.bin'
+        reference.write_bytes(struct.pack('<8sIIQ',b'_logitF1',32,32,3)+np.array([1,2,3],dtype='<i4').tobytes()+bytes(144))
+        from tools.sinq.research.corpora import lock_corpora
+        master=self.d/'master.u32';np.array([10,11,1,2,3,12,13],dtype='<u4').tofile(master)
+        partitions={role:[dict(source='master',start=start,end=end)] for role,start,end in
+            [('calibration',0,2),('selection',2,5),('final_test',5,7)]}
+        lock_corpora({'master':master},partitions,self.d/'corpus-partitions.json',max_tokens=32,max_output_bytes=1<<20,max_files=100)
         reference.with_suffix('.bin.json').write_bytes(canonical_json({'source_sha256':self.source_hash}))
         corpus=self.d/'corpus.txt';corpus.write_bytes(b'abc')
         selection=self.d/'selection.json';selection.write_bytes(canonical_json(dict(schema_version=1,split='selection',
@@ -95,7 +106,7 @@ class RepairTests(unittest.TestCase):
             alternatives={'group':[{name:self.ids[name]['ordinary'] for name in self.names}]})))
         return dict(schema_version=1,operation='select',source_gguf=str(self.source),candidate_manifest=str(self.manifest),
             baseline={name:self.ids[name]['stock'] for name in self.names},groups={'group':self.names},
-            selection_manifest=str(selection),selection_split='selection',evaluator=str(evaluator),
+            corpus_partitions_manifest=str(self.d/'corpus-partitions.json'),selection_manifest=str(selection),selection_split='selection',evaluator=str(evaluator),
             output_directory=str(self.d/'selection-run'),max_passes=1,tolerance=0,budgets=self.budgets)
 
     def test_cli_resume_failure_recovery_and_identity(self):
@@ -126,7 +137,19 @@ class RepairTests(unittest.TestCase):
             original=copy.deepcopy(config);config['tolerance']=.1;path.write_bytes(canonical_json(config))
             with self.assertRaisesRegex(ValueError,'identity'):cli.main([str(path),'--resume',str(output)])
             path.write_bytes(canonical_json(original))
-            for name in ['corpus.txt','perplexity','loader','reference.bin','reference.bin.json','selection.json',
+            # A previously omitted transitive dependency changes even with its
+            # original timestamp restored. Fingerprint a private source snapshot,
+            # never edit live repository code to exercise this regression.
+            from tools.sinq.research import run_state
+            fingerprint=run_state.implementation_fingerprint;snapshot=self.d/'implementation'
+            for name in fingerprint()['files']:
+                target=snapshot/name;target.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(ROOT/name,target)
+            self.assertEqual(fingerprint(),fingerprint(root=snapshot))
+            dependency=snapshot/'tools/sinq/research/resources.py';info=dependency.stat()
+            dependency.write_bytes(dependency.read_bytes()+b'\n# dependency change\n');os.utime(dependency,ns=(info.st_atime_ns,info.st_mtime_ns))
+            with patch.object(run_state,'implementation_fingerprint',side_effect=lambda:fingerprint(root=snapshot)):
+                with self.assertRaisesRegex(ValueError,'identity'):cli.main([str(path),'--resume',str(output)])
+            for name in ['ggml-test.dll','corpus-partitions.json','corpus.txt','perplexity','loader','reference.bin','reference.bin.json','selection.json',
                          'evaluator.json','source.gguf','run/run-manifest.json']:
                 artifact=self.d/name;data=artifact.read_bytes();artifact.write_bytes(data+b' ')
                 with self.assertRaises((ValueError,RuntimeError)):
@@ -144,6 +167,23 @@ class RepairTests(unittest.TestCase):
             (output/'best.gguf').write_bytes(b'tampered')
             with self.assertRaisesRegex(ValueError,'best|collision|checksum'):
                 cli.main([str(path),'--resume',str(output)])
+
+    def test_selection_rejects_overlap_with_each_restricted_stage(self):
+        config=self.selection_config();path=self.d/'corpus-partitions.json'
+        original=json.loads(path.read_bytes())
+        for role in ('calibration','validation','final_test'):
+            value=copy.deepcopy(original)
+            value['partitions'][role]=copy.deepcopy(value['partitions']['selection'])
+            value['checksum']=digest({k:v for k,v in value.items() if k!='checksum'})
+            path.write_bytes(canonical_json(value))
+            with patch('tools.sinq.research.kl.NativeKLEvaluator') as evaluator:
+                with self.assertRaisesRegex(ValueError,'overlapping'):cli.select_config(validate_config(config))
+                evaluator.assert_not_called()
+            self.assertFalse(Path(config['output_directory']).exists())
+        path.write_bytes(canonical_json(original))
+        # A label-only stream cannot claim independence without a stage lock.
+        del config['corpus_partitions_manifest']
+        with self.assertRaisesRegex(ValueError,'corpus_partitions'):cli.select_config(validate_config(config))
 
     def test_run_ownership_lock_releases_after_process_death(self):
         from tools.sinq.research.run_state import selection_lock

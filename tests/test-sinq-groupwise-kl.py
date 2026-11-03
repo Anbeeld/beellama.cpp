@@ -1,4 +1,4 @@
-import sys, tempfile, unittest, math, os, subprocess, hashlib, importlib.util
+import sys, tempfile, unittest, math, os, subprocess, hashlib, importlib.util, json
 from pathlib import Path
 import numpy as np
 ROOT=Path(__file__).resolve().parents[1]; sys.path[:0]=[str(ROOT),str(ROOT/'gguf-py')]
@@ -61,6 +61,13 @@ class SelectionTest(unittest.TestCase):
         binaries=Path(os.environ['SINQ_NATIVE_BIN']); suffix='.exe' if os.name=='nt' else ''
         with tempfile.TemporaryDirectory() as d:
             d=Path(d); source=d/'source.gguf'; native_fixture(source)
+            for count in (24,32):
+                forward=subprocess.run([str(binaries/('llama-sinq-model'+suffix)),'--forward',str(source),*map(str,[1]+[3]*(count-1))],capture_output=True,timeout=120)
+                self.assertEqual(forward.returncode,0,forward.stderr.decode(errors='replace')[-1500:])
+                self.assertTrue(np.isfinite(json.loads(forward.stdout)['logits']).all())
+            rejected=subprocess.run([str(binaries/('llama-sinq-model'+suffix)),'--forward',str(source),*map(str,[1]+[3]*32)],capture_output=True,timeout=120)
+            self.assertEqual(rejected.returncode,1)
+            self.assertIn(b'forward token budget',rejected.stderr)
             corpus=d/'tokens.txt'; corpus.write_text('abcdefg',encoding='utf-8')
             evaluator=NativeKLEvaluator(binaries/('llama-perplexity'+suffix),context=32,batch=24,microbatch=24,max_tokens=32)
             ref=d/'reference.bin'; manifest=evaluator.create_reference(source,corpus,ref,expected_tokens=[1,3,4,5,6,7,8,9])

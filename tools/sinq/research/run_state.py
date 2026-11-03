@@ -3,6 +3,7 @@ from contextlib import contextmanager
 import os
 from pathlib import Path
 from .resources import atomic_write,canonical_json,digest,file_digest,reject_alias
+from .implementation import implementation_fingerprint,native_runtime_fingerprint
 
 
 def selection_identity(config,evaluator,policy,stock_baseline=None):
@@ -12,15 +13,17 @@ def selection_identity(config,evaluator,policy,stock_baseline=None):
         'reference_manifest':str(evaluator['reference'])+'.json',
         'evaluator_binary':evaluator['executable'],'native_loader':evaluator['native_loader']}
     if stock_baseline is not None:paths['stock_baseline_manifest']=stock_baseline
-    implementations=['cli.py','run_state.py','selector.py','hybrid.py','baseline.py','kl.py','provenance.py']
+    if 'corpus_partitions_manifest' in config:paths['corpus_partitions']=config['corpus_partitions_manifest']
+    implementation=implementation_fingerprint()
     body={'schema_version':1,'kind':'sinq-selection-run','config_sha256':digest(config),
         'bindings':{name:file_digest(path) for name,path in sorted(paths.items())},'policy':policy,
-        'implementation_sha256':digest({name:file_digest(Path(__file__).parent/name) for name in implementations})}
+        'implementation_sha256':implementation['checksum'],'implementation':implementation,
+        'native_runtime':native_runtime_fingerprint({'evaluator':evaluator['executable'],'loader':evaluator['native_loader']})}
     body['checksum']=digest(body)
     return body
 
 
-def open_selection(config,resume,identity,inputs,read_json):
+def open_run(config,resume,identity,inputs,read_json):
     output=Path(config['output_directory']).resolve()
     reject_alias(output,inputs)
     if resume is not None:
@@ -28,7 +31,7 @@ def open_selection(config,resume,identity,inputs,read_json):
             raise ValueError('resume directory must be the existing configured output directory')
         path=output/'run-identity.json'
         if not path.is_file() or read_json(path)!=identity:
-            raise ValueError('selection resume identity mismatch; configuration or inputs changed')
+            raise ValueError('research resume identity mismatch; configuration, code, dependencies or inputs changed')
     else:
         if output.exists():raise FileExistsError('immutable research output already exists; use --resume RUN_DIRECTORY')
         output.mkdir(parents=True,exist_ok=False)
@@ -36,10 +39,14 @@ def open_selection(config,resume,identity,inputs,read_json):
     return output
 
 
+open_selection=open_run
+
+
 @contextmanager
-def selection_lock(output):
+def selection_lock(output,*,name='selection'):
     """OS locks release on process death, unlike a stale sentinel after a crash."""
-    path=Path(output)/'selection.lock'
+    if name not in ('selection','generation'):raise ValueError('unknown run lock kind')
+    path=Path(output)/(name+'.lock')
     if path.is_symlink() or (path.exists() and (path.stat().st_size>1 or path.stat().st_nlink>1)):
         raise ValueError('unsafe selection lock artifact')
     with path.open('a+b') as stream:

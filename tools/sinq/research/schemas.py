@@ -25,14 +25,15 @@ COMMON = {'schema_version', 'operation', 'budgets', 'threads'}
 OPERATION_FIELDS = {
     'generate': ({'source_gguf', 'activation_manifest', 'tensor_list', 'native_quantizer',
         'generators', 'alphas', 'correction_strengths', 'search', 'output_directory', 'native_bridge'},
-        {'validation_manifest', 'pairing_manifest', 'stock_baseline_manifest'}),
+        {'validation_manifest', 'pairing_manifest', 'stock_baseline_manifest', 'corpus_partitions_manifest'}),
     'score': ({'method', 'objective', 'candidate_manifest', 'capture_manifest', 'output_directory'},
         {'families', 'device', 'context', 'checkpoint', 'native_bridge', 'probes', 'seed',
          'validation_manifest', 'pairing_manifest', 'selection_policy', 'assignments'}),
     'assemble': ({'source_gguf', 'candidate_manifest', 'assignment', 'output_gguf'}, {'native_loader', 'stock_baseline_manifest'}),
+    'lock_corpora': ({'token_sources', 'partitions', 'output_manifest'}, set()),
     'lock_baseline': ({'source_gguf', 'stock_gguf', 'recipe', 'quantizer', 'native_loader', 'output_manifest'}, {'imatrix_path', 'timeout'}),
     'select': ({'source_gguf', 'candidate_manifest', 'baseline', 'groups', 'selection_manifest',
-        'selection_split', 'evaluator', 'output_directory'}, {'max_passes', 'tolerance', 'stock_baseline_manifest'}),
+        'selection_split', 'evaluator', 'output_directory'}, {'max_passes', 'tolerance', 'stock_baseline_manifest', 'corpus_partitions_manifest'}),
     'validate': ({'artifact_manifest'}, {'source_gguf', 'native_loader'}),
 }
 
@@ -174,7 +175,7 @@ def validate_config(config):
     for key in ('source_gguf', 'activation_manifest', 'validation_manifest', 'pairing_manifest',
                 'output_directory', 'native_bridge', 'candidate_manifest', 'capture_manifest',
                 'checkpoint', 'output_gguf', 'native_loader', 'selection_manifest', 'evaluator', 'artifact_manifest',
-                'stock_baseline_manifest', 'stock_gguf', 'quantizer', 'output_manifest', 'imatrix_path'):
+                'stock_baseline_manifest', 'stock_gguf', 'quantizer', 'output_manifest', 'imatrix_path', 'corpus_partitions_manifest'):
         if key in c:
             _text(c[key], key)
     tensors, candidates = 0, 0
@@ -216,6 +217,17 @@ def validate_config(config):
             _integer(c.get('probes'), 'probes'); _integer(c.get('seed'), 'seed', 0)
             if c['probes'] > c['budgets']['max_probes']:
                 raise ValueError('probe budget exceeded')
+    elif operation == 'lock_corpora':
+        _mapping(c['token_sources'],'token_sources')
+        _fields(c['partitions'], {'calibration','selection','final_test'}, {'validation'}, 'corpus partitions')
+        for role,chunks in c['partitions'].items():
+            if role=='validation' and chunks is None:continue
+            for chunk in _list(chunks,'original token chunks'):
+                _fields(chunk,{'source','start','end'},label='token chunk')
+                _text(chunk['source'],'token source');_integer(chunk['start'],'start',0);_integer(chunk['end'],'end')
+                if chunk['source'] not in c['token_sources'] or chunk['start']>=chunk['end']:raise ValueError('invalid token source range')
+        if len(c['token_sources'])+1>c['budgets']['max_files']:raise ValueError('corpus file budget exceeded')
+        if any(Path(p).resolve()==Path(c['output_manifest']).resolve() for p in c['token_sources'].values()):raise ValueError('corpus output aliases input')
     elif operation == 'lock_baseline':
         _mapping(c['recipe'],'complete stock recipe');tensors=len(c['recipe']);candidates=1
         for qtype in c['recipe'].values():
@@ -253,7 +265,7 @@ def validate_config(config):
         target = Path(output).resolve()
         for key in ('source_gguf', 'activation_manifest', 'validation_manifest', 'pairing_manifest',
                     'candidate_manifest', 'capture_manifest', 'selection_manifest', 'stock_baseline_manifest',
-                    'stock_gguf', 'quantizer', 'imatrix_path'):
+                    'stock_gguf', 'quantizer', 'imatrix_path', 'corpus_partitions_manifest'):
             if key in c and Path(c[key]).resolve() == target:
                 raise ValueError('output aliases input ' + key)
     return c

@@ -13,6 +13,7 @@ import time
 import re
 import io
 from contextlib import redirect_stdout
+from unittest.mock import patch
 
 ROOT=Path(__file__).resolve().parents[1]
 sys.path[:0]=[str(ROOT),str(ROOT/'gguf-py')]
@@ -104,9 +105,32 @@ def main():
         assert stock_payloads['token_embd.weight'][0]=='Q5_0'
         stock_reader.data._mmap.close()
         raw_config['stock_baseline_manifest']=str(baseline_manifest)
+        # Lock actual original input occurrences for every research stage before
+        # generation. Reserved final tokens are hashed, never model-evaluated.
+        from tools.sinq.research.cli import lock_corpora_config
+        master=d/'master.u32';np.asarray(tokens+[1,3,4,5,6,7,8,9]+[10,11,12],dtype='<u4').tofile(master)
+        corpus_lock=d/'corpus-partitions.json'
+        partitions={role:[dict(source='master',start=start,end=end)] for role,start,end in
+            [('calibration',0,4),('validation',4,7),('selection',7,15),('final_test',15,18)]}
+        lock_corpora_config(validate_config(dict(common,operation='lock_corpora',token_sources={'master':str(master)},
+            partitions=partitions,output_manifest=str(corpus_lock))))
+        raw_config['corpus_partitions_manifest']=str(corpus_lock)
         config=validate_config(raw_config);plan=preflight(config)
         assert plan['status']=='PLAN' and not (d/'run').exists()
-        run=generate(config);manifest=d/'run/run-manifest.json'
+        from tools.sinq.research import native_codec
+        actual_request=native_codec.request;calls={'generate':0}
+        def interrupt(binary,request,directory):
+            if request['operation']=='generate':
+                calls['generate']+=1
+                if calls['generate']==2:raise TimeoutError('injected after complete first tensor')
+            return actual_request(binary,request,directory)
+        with patch.object(native_codec,'request',side_effect=interrupt):
+            try:generate(config)
+            except TimeoutError:pass
+            else:raise AssertionError('generation interruption was not exercised')
+        partial=json.loads((d/'run/generation-checkpoint.json').read_text())
+        assert set(partial['completed'])=={names[0]}
+        run=generate(config,resume=d/'run');manifest=d/'run/run-manifest.json'
         store=CandidateStore(d/'run/cache',max_bytes=budgets['max_output_bytes'],max_files=budgets['max_files'])
         ids={}
         for name,record in run['tensors'].items():
@@ -196,7 +220,7 @@ def main():
             corpus=str(corpus),native_loader=loader,context=32,batch=24,microbatch=24,max_tokens=32,timeout=120,alternatives=alternatives))
         selection_raw=dict(common,budgets={**budgets,'max_evaluations':3},operation='select',source_gguf=str(source),
             candidate_manifest=str(manifest),baseline={name:ids[name]['stock'] for name in names},groups=groups,
-            selection_manifest=str(d/'selection-stream.json'),selection_split='selection',evaluator=str(d/'evaluator.json'),
+            corpus_partitions_manifest=str(corpus_lock),selection_manifest=str(d/'selection-stream.json'),selection_split='selection',evaluator=str(d/'evaluator.json'),
             output_directory=str(d/'selection'),max_passes=1,tolerance=0)
         selected=select_config(validate_config(selection_raw))
         assert selected['status']=='PASS' and 1<=selected['evaluations']<=3
@@ -234,7 +258,7 @@ def main():
         assert not (d/'bad').exists()
         summary=dict(status='PASS',purpose='functional correctness only; no A/B experiments',source_sha256=source_hash,
             tensor_count=3,candidates_per_tensor=5,complete_stock_baseline_verified=True,joint_block_and_fisher_verified=True,
-            cli_resume_verified=True,strength_zero_metadata_verified=True,split_before_reservoir_native_validated=True,codecs=['Q3_K','IQ3_S','IQ4_XS'],
+            cli_resume_verified=True,generation_resume_verified=True,corpus_partitions_verified=True,strength_zero_metadata_verified=True,split_before_reservoir_native_validated=True,codecs=['Q3_K','IQ3_S','IQ4_XS'],
             cache_ids={n:[c['candidate_id'] for c in r['candidates']] for n,r in run['tensors'].items()},
             hybrid_sha256=outputs,deterministic_forward_tokens=len(tokens),native_kld_tokens=8,selection_evaluations=selected['evaluations'],cpu_threads=24,
             elapsed_seconds=time.monotonic()-start)
