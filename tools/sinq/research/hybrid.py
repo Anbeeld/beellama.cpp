@@ -19,17 +19,23 @@ def _bytes_hash(data):
     return h.hexdigest()
 
 
-def assemble(source, output, store, assignment, *, native_validate, max_output_bytes=1 << 34):
+def assemble(source, output, store, assignment, *, native_validate, max_output_bytes=1 << 34, stock_baseline=None):
     reader=gguf.GGUFReader(source)
-    maps=[]
+    maps=[]; stock_reader=None; manifest=None
     try:
-        return _assemble(source,output,store,assignment,native_validate=native_validate,max_output_bytes=max_output_bytes,reader=reader,maps=maps)
+        if stock_baseline is not None:
+            from .baseline import load_baseline
+            manifest,baseline_path=load_baseline(stock_baseline,source)
+            reject_alias(output,[baseline_path,stock_baseline])
+            stock_reader=gguf.GGUFReader(baseline_path)
+        return _assemble(source,output,store,assignment,native_validate=native_validate,max_output_bytes=max_output_bytes,reader=reader,maps=maps,stock_reader=stock_reader,manifest=manifest,stock_baseline=stock_baseline)
     finally:
         for mapped in maps: mapped._mmap.close()
+        if stock_reader is not None: stock_reader.data._mmap.close()
         reader.data._mmap.close()
 
 
-def _assemble(source, output, store, assignment, *, native_validate, max_output_bytes, reader, maps):
+def _assemble(source, output, store, assignment, *, native_validate, max_output_bytes, reader, maps, stock_reader, manifest, stock_baseline):
     """Validate callback must raise on native loader failure; publication follows it.
 
     Assignment replaces complete payload/sidecar pairs. Existing conditioned tensors
@@ -74,6 +80,16 @@ def _assemble(source, output, store, assignment, *, native_validate, max_output_
             raise ValueError('candidate tensor shape mismatch')
         if t.tensor_type.name!=c.provenance['source_qtype'] or _bytes_hash(t.data)!=c.provenance['input_sha256']:
             raise ValueError('candidate original tensor qtype/digest mismatch')
+    if manifest is not None:
+        stock_tensors={t.name:t for t in stock_reader.tensors}
+        for name,c in candidates.items():
+            allocation=manifest['tensors'][name]
+            if c.provenance['qtype']!=allocation['qtype'] or c.provenance['shape']!=allocation['shape']:
+                raise ValueError('candidate differs from baseline allocation')
+            if c.provenance['recipe_sha256']!=manifest['recipe_sha256'] or c.provenance['imatrix_sha256']!=manifest['imatrix_sha256']:
+                raise ValueError('candidate recipe/imatrix differs from stock baseline')
+            if c.provenance['generator']['family']=='stock' and (c.scales is not None or file_digest(c.payload)!=_bytes_hash(stock_tensors[name].data)):
+                raise ValueError('stock candidate differs from baseline payload')
     conditioned={n:c for n,c in candidates.items() if c.scales is not None}
     semantics={(c.provenance['sinq']['strip_width'],c.provenance['sinq']['iterations'],c.provenance['sinq']['algorithm'],c.provenance['sinq']['numerics']) for c in conditioned.values()}
     if len(semantics)>1:
@@ -82,7 +98,7 @@ def _assemble(source, output, store, assignment, *, native_validate, max_output_
     if len(compatibility)>1:
         raise ValueError('mixed recipe/imatrix provenance')
     items=[]
-    for t in reader.tensors:
+    for t in (stock_reader if stock_reader is not None else reader).tensors:
         if t.name.endswith('.sinq_scale2'):
             continue
         c=candidates.get(t.name)
@@ -104,9 +120,10 @@ def _assemble(source, output, store, assignment, *, native_validate, max_output_
     fd,temp=tempfile.mkstemp(prefix='.hybrid-',suffix='.gguf',dir=output.parent); os.close(fd)
     writer=None
     try:
-        arch=reader.fields['general.architecture'].contents()
+        metadata_reader=stock_reader if stock_reader is not None else reader
+        arch=metadata_reader.fields['general.architecture'].contents()
         writer=gguf.GGUFWriter(temp,arch)
-        for key,field in reader.fields.items():
+        for key,field in metadata_reader.fields.items():
             if key.startswith('GGUF.') or key.startswith(PREFIX) or key in ('general.architecture','general.file_type','general.quantization_version'):
                 continue
             writer.add_key_value(key,field.contents(),field.types[0],field.types[1] if len(field.types)>1 else None)
@@ -148,6 +165,15 @@ def _assemble(source, output, store, assignment, *, native_validate, max_output_
         for name,c in candidates.items():
             store.get(c.candidate_id,expected={'source_sha256':source_hash,'tensor_name':name})
         native_validate(Path(temp))
+        # Validation may execute external code; recheck the entire closure afterwards.
+        if file_digest(source)!=source_hash:
+            raise ValueError('source GGUF changed during native validation')
+        for name,c in candidates.items():
+            store.get(c.candidate_id,expected={'source_sha256':source_hash,'tensor_name':name})
+        if manifest is not None:
+            from .baseline import load_baseline
+            current,_=load_baseline(stock_baseline,source)
+            if current!=manifest: raise ValueError('stock baseline changed during assembly')
         os.link(temp,output)
         return file_digest(output)
     finally:

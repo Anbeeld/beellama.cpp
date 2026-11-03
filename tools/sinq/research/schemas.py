@@ -25,13 +25,14 @@ COMMON = {'schema_version', 'operation', 'budgets', 'threads'}
 OPERATION_FIELDS = {
     'generate': ({'source_gguf', 'activation_manifest', 'tensor_list', 'native_quantizer',
         'generators', 'alphas', 'correction_strengths', 'search', 'output_directory', 'native_bridge'},
-        {'validation_manifest', 'pairing_manifest'}),
+        {'validation_manifest', 'pairing_manifest', 'stock_baseline_manifest'}),
     'score': ({'method', 'objective', 'candidate_manifest', 'capture_manifest', 'output_directory'},
         {'families', 'device', 'context', 'checkpoint', 'native_bridge', 'probes', 'seed',
-         'validation_manifest', 'pairing_manifest', 'selection_policy'}),
-    'assemble': ({'source_gguf', 'candidate_manifest', 'assignment', 'output_gguf'}, {'native_loader'}),
+         'validation_manifest', 'pairing_manifest', 'selection_policy', 'assignments'}),
+    'assemble': ({'source_gguf', 'candidate_manifest', 'assignment', 'output_gguf'}, {'native_loader', 'stock_baseline_manifest'}),
+    'lock_baseline': ({'source_gguf', 'stock_gguf', 'recipe', 'quantizer', 'native_loader', 'output_manifest'}, {'imatrix_path', 'timeout'}),
     'select': ({'source_gguf', 'candidate_manifest', 'baseline', 'groups', 'selection_manifest',
-        'selection_split', 'evaluator', 'output_directory'}, {'max_passes', 'tolerance'}),
+        'selection_split', 'evaluator', 'output_directory'}, {'max_passes', 'tolerance', 'stock_baseline_manifest'}),
     'validate': ({'artifact_manifest'}, {'source_gguf', 'native_loader'}),
 }
 
@@ -172,7 +173,8 @@ def validate_config(config):
     # Paths/text fields do not trigger filesystem I/O.
     for key in ('source_gguf', 'activation_manifest', 'validation_manifest', 'pairing_manifest',
                 'output_directory', 'native_bridge', 'candidate_manifest', 'capture_manifest',
-                'checkpoint', 'output_gguf', 'native_loader', 'selection_manifest', 'evaluator', 'artifact_manifest'):
+                'checkpoint', 'output_gguf', 'native_loader', 'selection_manifest', 'evaluator', 'artifact_manifest',
+                'stock_baseline_manifest', 'stock_gguf', 'quantizer', 'output_manifest', 'imatrix_path'):
         if key in c:
             _text(c[key], key)
     tensors, candidates = 0, 0
@@ -187,8 +189,21 @@ def validate_config(config):
                 raise ValueError('unsupported family/method combination')
         _choice(c.setdefault('device', 'cpu'), ('cpu', 'cuda'), 'device')
         _choice(c.setdefault('selection_policy', 'in_sample'), ('in_sample', 'held_out'), 'selection_policy')
+        if method!='local' and c['selection_policy']=='held_out':
+            raise ValueError('advanced held_out capture provenance is not supported; use local held_out scoring')
+        if method!='local' and any(k in c for k in ('validation_manifest','pairing_manifest')):
+            raise ValueError('advanced scoring cannot accept unused validation/pairing manifests')
         if c['selection_policy'] == 'held_out' and not {'validation_manifest', 'pairing_manifest'} <= c.keys():
             raise ValueError('held_out requires validation_manifest and pairing_manifest')
+        if 'assignments' in c:
+            if method=='local':raise ValueError('joint assignments require an advanced scoring method')
+            if not isinstance(c['assignments'],dict) or not c['assignments']:
+                raise ValueError('assignments must contain named nonempty tensor mappings')
+            for name,assignment in c['assignments'].items():
+                _text(name,'assignment name');_mapping(assignment,'assignment')
+                for key in assignment.values():_hash(key,'candidate ID')
+                if len(assignment)>c['budgets']['max_tensors']:raise ValueError('joint tensor budget exceeded')
+            if len(c['assignments'])>c['budgets']['max_evaluations']:raise ValueError('joint observation budget exceeded')
         if method == 'local' and any(k in c for k in ('context', 'checkpoint', 'probes', 'seed')):
             raise ValueError('local scoring cannot accept blockwise/Fisher controls')
         if method != 'local':
@@ -201,6 +216,12 @@ def validate_config(config):
             _integer(c.get('probes'), 'probes'); _integer(c.get('seed'), 'seed', 0)
             if c['probes'] > c['budgets']['max_probes']:
                 raise ValueError('probe budget exceeded')
+    elif operation == 'lock_baseline':
+        _mapping(c['recipe'],'complete stock recipe');tensors=len(c['recipe']);candidates=1
+        for qtype in c['recipe'].values():
+            if qtype!=qtype.upper():raise ValueError('stock recipe requires uppercase exact native qtypes')
+        _integer(c.setdefault('timeout',3600),'timeout')
+        if c['budgets']['max_files']<3:raise ValueError('stock lock needs three temporary/output files')
     elif operation == 'assemble':
         _mapping(c['assignment'], 'assignment'); tensors = len(c['assignment'])
     elif operation == 'select':
@@ -227,11 +248,12 @@ def validate_config(config):
     c.setdefault('resolved_candidates', [])
     c['resource_bounds'] = dict(tensor_count=tensors, candidates_per_tensor=candidates,
         max_candidate_evaluations=evaluations, **b)
-    output = c.get('output_gguf', c.get('output_directory'))
+    output = c.get('output_gguf', c.get('output_directory',c.get('output_manifest')))
     if output is not None:
         target = Path(output).resolve()
         for key in ('source_gguf', 'activation_manifest', 'validation_manifest', 'pairing_manifest',
-                    'candidate_manifest', 'capture_manifest', 'selection_manifest'):
+                    'candidate_manifest', 'capture_manifest', 'selection_manifest', 'stock_baseline_manifest',
+                    'stock_gguf', 'quantizer', 'imatrix_path'):
             if key in c and Path(c[key]).resolve() == target:
                 raise ValueError('output aliases input ' + key)
     return c

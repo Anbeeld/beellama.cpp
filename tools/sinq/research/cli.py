@@ -14,6 +14,7 @@ from .resources import atomic_write, canonical_json, digest, file_digest, reject
 from .cache import CandidateStore
 from .generate import generate, preflight
 from . import native_codec
+from .provenance import candidate_for,graph_assignment,observations
 
 
 def _json(path):
@@ -36,11 +37,12 @@ def _run(config):
     ids=[];requested_scores=0
     for name,record in sorted(run['tensors'].items()):
         for key in [record['stock'],*[r['candidate_id'] for r in record['candidates']]]:
-            candidate=store.get(key,expected={'source_sha256':run['source_sha256'],'tensor_name':name})
+            candidate=candidate_for(run,store,name,key)
             if candidate.provenance['generator']['family'] in config.get('families',[]):requested_scores+=1
             ids.append(key)
     if len(run['tensors'])>b['max_tensors'] or len(ids)>b['max_candidates']*b['max_tensors']:
         raise ValueError('candidate manifest count budget exceeded')
+    if 'assignments' in config:requested_scores=len(config['assignments'])
     if config['operation']=='score' and requested_scores>b['max_evaluations']:
         raise ValueError('requested candidate scoring work budget exceeded')
     return run,store,source
@@ -58,12 +60,43 @@ def _validator(binary):
     return validate
 
 
+def _stock_baseline(config,run,source):
+    recorded=run.get('stock_baseline')
+    path=config.get('stock_baseline_manifest')
+    if recorded:
+        recorded_path=(Path(config['candidate_manifest']).resolve().parent/recorded['manifest']).resolve()
+        if file_digest(recorded_path)!=recorded['manifest_sha256']:
+            raise ValueError('run stock baseline manifest checksum mismatch')
+        if path is not None and Path(path).resolve()!=recorded_path:
+            raise ValueError('configured stock baseline differs from candidate run')
+        path=recorded_path
+    if path is None:return None,None
+    from .baseline import load_baseline
+    manifest,baseline=load_baseline(path,source)
+    if manifest['recipe_sha256']!=run['recipe_sha256'] or manifest['imatrix_sha256']!=run['imatrix_sha256']:
+        raise ValueError('candidate run recipe/imatrix differs from complete stock baseline')
+    if recorded and (manifest['baseline_sha256']!=recorded['baseline_sha256'] or manifest['recipe_sha256']!=recorded['recipe_sha256']):
+        raise ValueError('candidate run stock baseline model/recipe checksum mismatch')
+    return Path(path).resolve(),manifest
+
+
+def lock_baseline_config(config):
+    from .baseline import lock_baseline
+    return lock_baseline(config['source_gguf'],config['stock_gguf'],config['recipe'],config['output_manifest'],
+        quantizer=config['quantizer'],native_validate=_validator(config['native_loader']),
+        imatrix=config.get('imatrix_path'),workspace_bytes=config['budgets']['workspace_bytes'],
+        max_output_bytes=config['budgets']['max_output_bytes'],threads=config['threads'],timeout=config['timeout'])
+
+
 def assemble_config(config):
     from .hybrid import assemble
     run,store,source=_run(config)
     if file_digest(config['source_gguf'])!=run['source_sha256']:
         raise ValueError('assembly source mismatch')
-    return dict(status='PASS',output_sha256=assemble(source,config['output_gguf'],store,config['assignment'],
+    for name,key in config['assignment'].items():candidate_for(run,store,name,key)
+    baseline,locked=_stock_baseline(config,run,source)
+    return dict(status='PASS',source_sha256=run['source_sha256'],stock_baseline_sha256=locked['baseline_sha256'] if locked else None,
+        output_sha256=assemble(source,config['output_gguf'],store,config['assignment'],stock_baseline=baseline,
         native_validate=_validator(config.get('native_loader')),max_output_bytes=config['budgets']['max_output_bytes']))
 
 
@@ -109,6 +142,9 @@ def _advanced_reference(checkpoint,source,budget,threads):
 def score_config(config):
     import gguf
     run,store,source=_run(config);method=config['method'];b=config['budgets']
+    if method!='local' and (config.get('selection_policy','in_sample')!='in_sample' or any(k in config for k in ('validation_manifest','pairing_manifest'))):
+        raise ValueError('advanced held_out capture provenance is not supported')
+    _stock_baseline(config,run,source)
     if not config.get('native_bridge'):raise ValueError('native_bridge is required for actual candidate decoding/scoring')
     capture=_json(config['capture_manifest']);records=[]
     if method=='local':
@@ -124,7 +160,7 @@ def score_config(config):
                 if name not in validated['tensors']:raise ValueError('missing local capture site: '+name)
                 a=validated['tensors'][name];v=validation['tensors'][name] if validation else None
                 for key in [t['stock'],*[c['candidate_id'] for c in t['candidates']]]:
-                    c=store.get(key)
+                    c=candidate_for(run,store,name,key)
                     if c.provenance['generator']['family'] not in config['families']:continue
                     score=native_codec.rescore(config['native_bridge'],c,tensors[name],a,validation=v,
                         objective=config['objective'],workspace_bytes=b['workspace_bytes'])
@@ -144,25 +180,33 @@ def score_config(config):
         if tokens.ndim!=2 or tokens.numel()>b['max_tokens']:raise ValueError('block token budget exceeded')
         mask=torch.tensor(capture['attention_mask']) if 'attention_mask' in capture else None
         positions=torch.tensor(capture['position_ids'],dtype=torch.long) if 'position_ids' in capture else None
+        layers=capture['layers']
+        if not isinstance(layers,list) or not layers or len(set(layers))!=len(layers) or any(type(layer)!=int or layer<0 for layer in layers):
+            raise ValueError('capture layers must be unique nonnegative integers')
+        if len(layers)>b['max_tensors']:raise ValueError('capture layer budget exceeded')
+        upstream=graph_assignment(run,store,capture.get('baseline',{}),before_layer=min(layers))
+        requested=observations(run,store,config,layers)
         adapter=_advanced_reference(config['checkpoint'],source,b['workspace_bytes'],config['threads'])
-        baseline={name:native_codec.decode(config['native_bridge'],store.get(key),workspace_bytes=b['workspace_bytes'])
-                  for name,key in capture.get('baseline',{}).items()}
-        for layer in capture['layers']:
+        baseline={name:native_codec.decode(config['native_bridge'],candidate,workspace_bytes=b['workspace_bytes'])
+                  for name,candidate in upstream.items()}
+        for layer in layers:
             locked=capture_block(adapter,tokens,layer,context=config['context'],baseline=baseline,
                 attention_mask=mask,position_ids=positions,max_tokens=b['max_tokens'],max_capture_bytes=b['workspace_bytes'])
             probes=qwen_probes(adapter,locked,probes=config['probes'],seed=config['seed'],max_vjps=b['max_probes'],max_cache_bytes=b['workspace_bytes']) if method=='fisher_vjp_mc' else None
-            for name,t in sorted(run['tensors'].items()):
-                if not name.startswith(f'blk.{layer}.'):continue
-                for key in [t['stock'],*[c['candidate_id'] for c in t['candidates']]]:
-                    c=store.get(key)
-                    if c.provenance['generator']['family'] not in config['families']:continue
-                    effective=native_codec.decode(config['native_bridge'],c,workspace_bytes=b['workspace_bytes'])
-                    if probes is None:
-                        score=score_block(adapter,locked,{name:effective});value=score[config['objective']]
-                    else:
-                        value=probes.score(block_delta(adapter,locked,{name:effective}));score=dict(provenance=probes.metadata)
-                    records.append(dict(candidate_id=key,tensor=name,layer=layer,method=method,
-                        objective=config['objective'],score=value,details=score))
+            for label,index,candidates in requested:
+                if index!=layer:continue
+                if sum(c.provenance['shape'][0]*c.provenance['shape'][1]*32 for c in candidates.values())>b['workspace_bytes']:
+                    raise ValueError('joint candidate decode/swap workspace budget exceeded')
+                effective={name:native_codec.decode(config['native_bridge'],c,workspace_bytes=b['workspace_bytes']) for name,c in candidates.items()}
+                if probes is None:
+                    score=score_block(adapter,locked,effective);value=score[config['objective']]
+                else:
+                    value=probes.score(block_delta(adapter,locked,effective));score=dict(provenance=probes.metadata)
+                record=dict(assignment_name=label,assignment={name:c.candidate_id for name,c in candidates.items()},
+                    layer=layer,method=method,objective=config['objective'],score=value,details=score)
+                if len(candidates)==1:
+                    name=next(iter(candidates));record.update(tensor=name,candidate_id=candidates[name].candidate_id)
+                records.append(record)
     if not records:raise ValueError('requested score stage produced no candidate observations')
     output=_new_output(config,[source,config['candidate_manifest'],config['capture_manifest']])
     result=dict(schema_version=1,status='PASS',method=method,objective=config['objective'],records=records,
@@ -171,10 +215,11 @@ def score_config(config):
     return result
 
 
-def select_config(config):
+def select_config(config,*,resume=None):
     from .selector import State,Group,coordinate_descent
     from .hybrid import assemble
     from .kl import NativeKLEvaluator
+    from .run_state import selection_identity,open_selection,selection_lock
     run,store,source=_run(config);b=config['budgets']
     if file_digest(config['source_gguf'])!=run['source_sha256']:
         raise ValueError('selection source does not match candidate provenance')
@@ -189,32 +234,63 @@ def select_config(config):
     if e['max_tokens']>b['max_tokens']:raise ValueError('KL token budget exceeded')
     if b['max_evaluations']+8>b['max_files']:raise ValueError('selector file budget cannot hold score/checkpoint closure')
     if source.stat().st_size*2>b['max_output_bytes']:raise ValueError('selector disk budget cannot hold a bounded hybrid evaluation')
+    stock,locked=_stock_baseline(config,run,source)
     evaluator=NativeKLEvaluator(e['executable'],context=e['context'],batch=e['batch'],microbatch=e['microbatch'],max_tokens=e['max_tokens'],timeout=e['timeout'])
     validator=_validator(e['native_loader'])
-    for name,key in config['baseline'].items():store.get(key,expected={'tensor_name':name,'source_sha256':run['source_sha256']})
-    groups=[]
+    for name,key in config['baseline'].items():candidate_for(run,store,name,key)
+    groups=[];seen=set()
     if set(e['alternatives'])!=set(config['groups']):raise ValueError('group alternatives mismatch')
     for name,members in sorted(config['groups'].items()):
+        if seen.intersection(members):raise ValueError('overlapping selection groups')
+        seen.update(members)
         for alternative in e['alternatives'][name]:
-            for tensor,key in alternative.items():store.get(key,expected={'tensor_name':tensor,'source_sha256':run['source_sha256']})
+            if set(alternative)!=set(members):raise ValueError('group alternative must assign exactly its tensors')
+            for tensor,key in alternative.items():candidate_for(run,store,tensor,key)
         groups.append(Group(name,tuple(members),tuple(e['alternatives'][name])))
-    output=_new_output(config,[source,config['candidate_manifest'],config['selection_manifest'],config['evaluator']])
-    provenance=dict(source_sha256=run['source_sha256'],selection_sha256=file_digest(config['selection_manifest']),evaluator_sha256=file_digest(config['evaluator']),policy=evaluator.policy)
-    initial=State.create(config['baseline'],provenance)
-    def evaluate(state):
-        # Each state is a full immutable assignment; no partial GGUF modification.
-        with tempfile.TemporaryDirectory(prefix='.evaluation-',dir=output) as temporary:
-            path=Path(temporary)/'hybrid.gguf'
-            assemble(source,path,store,dict(state.assignment),native_validate=validator,max_output_bytes=b['max_output_bytes'])
-            return evaluator.evaluate(path,e['corpus'],e['reference'],split=config['selection_split'],cache_directory=output/'scores')
-    result=coordinate_descent(initial,groups,evaluate,checkpoint=output/'checkpoint.json',
-        max_evaluations=b['max_evaluations'],max_passes=config['max_passes'],tolerance=config['tolerance'],split=config['selection_split'])
-    best_hash=assemble(source,output/'best.gguf',store,dict(result.state.assignment),native_validate=validator,max_output_bytes=b['max_output_bytes'])
-    summary=dict(schema_version=1,status='PASS',best_gguf_sha256=best_hash,assignment=dict(result.state.assignment),selection_kld=result.score,
-        evaluations=result.evaluations,budget_exhausted=result.budget_exhausted,trace=result.trace,
-        warning='Selection objective only; not an untouched-test result or quality conclusion.')
-    atomic_write(output/'selection.json',canonical_json(summary),max_bytes=b['max_output_bytes'])
-    return summary
+    if seen!=set(config['baseline']):raise ValueError('groups must cover the complete run tensor allocation')
+    identity=selection_identity(config,e,evaluator.policy,stock)
+    inputs=[source,config['candidate_manifest'],config['selection_manifest'],config['evaluator'],e['corpus'],e['reference']]
+    if stock:inputs.append(stock)
+    output=open_selection(config,resume,identity,inputs,_json)
+    with selection_lock(output):
+        completed=None
+        if (output/'selection.json').exists():
+            completed=_json(output/'selection.json')
+            if completed.get('checksum')!=digest({k:v for k,v in completed.items() if k!='checksum'}) or completed.get('run_identity_sha256')!=identity['checksum']:
+                raise ValueError('completed selection identity/checksum mismatch')
+            if not (output/'best.gguf').is_file() or file_digest(output/'best.gguf')!=completed['best_gguf_sha256']:
+                raise ValueError('completed selection best checksum mismatch')
+        initial=State.create(config['baseline'],{'run_identity_sha256':identity['checksum']})
+        def evaluate(state):
+            with tempfile.TemporaryDirectory(prefix='.evaluation-',dir=output) as temporary:
+                path=Path(temporary)/'hybrid.gguf'
+                assemble(source,path,store,dict(state.assignment),stock_baseline=stock,
+                    native_validate=validator,max_output_bytes=b['max_output_bytes'])
+                return evaluator.evaluate(path,e['corpus'],e['reference'],split=config['selection_split'],cache_directory=output/'scores')
+        result=coordinate_descent(initial,groups,evaluate,checkpoint=output/'checkpoint.json',
+            max_evaluations=b['max_evaluations'],max_passes=config['max_passes'],tolerance=config['tolerance'],split=config['selection_split'])
+        if completed is not None:
+            if completed['assignment']!=dict(result.state.assignment) or completed['selection_kld']!=result.score:
+                raise ValueError('completed result differs from resumed checkpoint')
+            return completed
+        # A crash after best.gguf publication but before selection.json must also
+        # be resumable, without overwriting an unrelated or corrupted artifact.
+        with tempfile.TemporaryDirectory(prefix='.finalize-',dir=output) as temporary:
+            path=Path(temporary)/'best.gguf'
+            best_hash=assemble(source,path,store,dict(result.state.assignment),stock_baseline=stock,
+                native_validate=validator,max_output_bytes=b['max_output_bytes'])
+            best=output/'best.gguf'
+            if best.exists():
+                if file_digest(best)!=best_hash:raise ValueError('existing best model collision on resume')
+            else:os.link(path,best)
+        summary=dict(schema_version=1,status='PASS',run_identity_sha256=identity['checksum'],
+            source_sha256=run['source_sha256'],stock_baseline_sha256=locked['baseline_sha256'] if locked else None,
+            best_gguf_sha256=best_hash,assignment=dict(result.state.assignment),selection_kld=result.score,
+            evaluations=result.evaluations,budget_exhausted=result.budget_exhausted,trace=result.trace,
+            warning='Selection objective only; not an untouched-test result or quality conclusion.')
+        summary['checksum']=digest(summary)
+        atomic_write(output/'selection.json',canonical_json(summary),max_bytes=b['max_output_bytes'])
+        return summary
 
 
 def validate_config_artifacts(config):
@@ -222,18 +298,25 @@ def validate_config_artifacts(config):
     surrogate=dict(config,candidate_manifest=str(path))
     run,store,source=_run(surrogate)
     if 'source_gguf' in config and file_digest(config['source_gguf'])!=run['source_sha256']:raise ValueError('validation source mismatch')
-    return dict(status='PASS',source_sha256=run['source_sha256'],tensor_count=len(run['tensors']))
+    _,locked=_stock_baseline(surrogate,run,source)
+    return dict(status='PASS',source_sha256=run['source_sha256'],stock_baseline_sha256=locked['baseline_sha256'] if locked else None,
+        tensor_count=len(run['tensors']))
 
 
 def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('config');parser.add_argument('--plan',action='store_true')
+    parser.add_argument('--resume',metavar='RUN_DIRECTORY',help='resume a strictly matching existing selection run')
     args=parser.parse_args(argv);config=load_config(args.config)
+    if args.resume is not None and (config['operation']!='select' or args.plan):
+        raise ValueError('--resume requires select without --plan')
     if args.plan:
         result=preflight(config) if config['operation']=='generate' else dict(status='PLAN',operation=config['operation'],resource_bounds=config['resource_bounds'])
     else:
         os.environ['HF_HUB_OFFLINE']='1';os.environ['TRANSFORMERS_OFFLINE']='1'
-        result={'generate':generate,'score':score_config,'assemble':assemble_config,'select':select_config,'validate':validate_config_artifacts}[config['operation']](config)
+        if config['operation']=='select':result=select_config(config,resume=args.resume)
+        else:result={'generate':generate,'score':score_config,'assemble':assemble_config,'lock_baseline':lock_baseline_config,
+                     'validate':validate_config_artifacts}[config['operation']](config)
     print(json.dumps(result,sort_keys=True,allow_nan=False))
     return 0
 

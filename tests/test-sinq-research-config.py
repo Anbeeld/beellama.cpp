@@ -122,6 +122,35 @@ class ConfigTests(unittest.TestCase):
         c['native_quantizer']['recipe']['blk.0.attn_k.weight'] = 'q5_0'
         with self.assertRaises(ValueError): validate_config(c)
 
+    def test_advanced_held_out_is_rejected_until_capture_contract_exists(self):
+        for method,objective in [('blockwise','output_mse'),('fisher_vjp_mc','fisher_quadratic')]:
+            c=dict(schema_version=1,operation='score',method=method,objective=objective,
+                candidate_manifest='c.json',capture_manifest='capture.json',output_directory='scores',
+                checkpoint='checkpoint',native_bridge='bridge',context='reference_inputs',
+                selection_policy='held_out',validation_manifest='validation.json',pairing_manifest='pairing.json',
+                budgets=config()['budgets'])
+            if method=='fisher_vjp_mc':c.update(probes=2,seed=1)
+            with self.assertRaisesRegex(ValueError,'advanced.*held_out'):
+                validate_config(c)
+
+    def test_joint_advanced_assignments(self):
+        c=dict(schema_version=1,operation='score',method='blockwise',objective='output_mse',
+            candidate_manifest='c.json',capture_manifest='capture.json',output_directory='scores',
+            checkpoint='checkpoint',native_bridge='bridge',context='reference_inputs',
+            assignments={'joint':{'blk.0.ffn_up.weight':'a'*64,'blk.0.ffn_gate.weight':'b'*64}},
+            budgets=config()['budgets'])
+        self.assertEqual(validate_config(c)['assignments'],c['assignments'])
+        c['method']='local'
+        with self.assertRaises(ValueError):validate_config(c)
+
+    def test_complete_stock_baseline_operation_and_bindings(self):
+        c=dict(schema_version=1,operation='lock_baseline',source_gguf='source.gguf',stock_gguf='stock.gguf',
+            recipe={'norm.weight':'F32','token_embd.weight':'Q5_0'},quantizer='quantizer',native_loader='loader',
+            output_manifest='baseline.json',budgets=config()['budgets'])
+        self.assertEqual(validate_config(c)['operation'],'lock_baseline')
+        c=config();c['stock_baseline_manifest']='baseline.json'
+        self.assertEqual(validate_config(c)['stock_baseline_manifest'],'baseline.json')
+
     def test_operation_unknowns(self):
         for op in ('assemble', 'validate', 'select', 'score', 'generate_candidates'):
             c = config(); c['operation'] = op

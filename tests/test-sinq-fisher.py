@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 import unittest
 import tempfile
+from types import SimpleNamespace
 os.environ['OMP_NUM_THREADS'] = '24'
 os.environ['MKL_NUM_THREADS'] = '24'
 os.environ['HF_HUB_OFFLINE'] = '1'
@@ -89,6 +90,76 @@ class FisherTests(unittest.TestCase):
         d = torch.zeros_like(z); d[:, 0] = 1
         self.assertAlmostEqual(cache.score(d), 0.5 * 0.7**4, places=14)
         self.assertGreater(cache.score(d), 0)
+
+    def test_masked_output_analytic_full_site_pairing(self):
+        block = torch.nn.Identity()
+        mask = torch.tensor([[1, 0, 1], [0, 1, 0]])
+        hidden = torch.zeros(2, 3, 1, dtype=torch.float64)
+        capture = SimpleNamespace(validate=lambda adapter: None, layer=0,
+            tokens=torch.zeros(2, 3, dtype=torch.long), attention_mask=mask,
+            position_ids=None, hidden_states=hidden, kwargs={}, reference_output=hidden,
+            context_id='toy-mask-bound-context', context='reference_inputs', baseline_sha256='toy-baseline')
+        def logits(tokens, **kwargs):
+            site = block(hidden)
+            state = torch.zeros(2, 1, dtype=site.dtype)
+            outputs = []
+            for t in range(3):
+                state = 0.7 * state + site[:, t]
+                outputs.append(torch.cat([state, -state], -1))
+            return torch.stack(outputs, 1)
+        adapter = SimpleNamespace(text=SimpleNamespace(layers=[block]), logits=logits,
+            source_id='toy', identity={'source_gguf_sha256': 'toy-source'})
+        probes = qwen_probes(adapter, capture, estimator='fisher_vjp_exact')
+        self.assertEqual(probes.metadata['positions'], [[0, 0], [0, 2], [1, 1]])
+        self.assertEqual(probes.metadata['requested_vjps'], 6)
+        self.assertEqual(probes.metadata['output_position_selection'], 'capture-attention-mask')
+        self.assertEqual(probes.metadata['output_position_mask_context_id'], capture.context_id)
+        delta = torch.zeros_like(hidden); delta[0, 0] = 1
+        self.assertAlmostEqual(probes.score(delta), 0.5 * (1 + 0.7**4) / 3, places=14)
+        # A masked site coordinate still affects a later valid output: mask only outputs.
+        delta.zero_(); delta[0, 1] = 1
+        self.assertAlmostEqual(probes.score(delta), 0.5 * 0.7**2 / 3, places=14)
+        repeat = qwen_probes(adapter, capture, estimator='fisher_vjp_exact')
+        self.assertEqual(probes.metadata, repeat.metadata)
+        torch.testing.assert_close(probes.gradients, repeat.gradients, rtol=0, atol=0)
+        selected = qwen_probes(adapter, capture, estimator='fisher_vjp_exact', positions=[(1, 1), (0, 2)])
+        self.assertEqual(selected.metadata['positions'], [[1, 1], [0, 2]])
+        self.assertEqual(selected.metadata['output_position_selection'], 'explicit')
+        for positions in [[(0, 1)], [(0, 0), (1, 2)], [(2, 0)], [(0, 3)], [(-1, 0)], []]:
+            with self.subTest(positions=positions), self.assertRaises(ValueError):
+                qwen_probes(adapter, capture, positions=positions)
+        capture.attention_mask = torch.zeros_like(mask)
+        with self.assertRaises(ValueError):
+            qwen_probes(adapter, capture)
+        capture.attention_mask = None
+        unmasked = qwen_probes(adapter, capture, estimator='fisher_vjp_exact')
+        self.assertEqual(unmasked.metadata['positions'], [[i, j] for i in range(2) for j in range(3)])
+        self.assertEqual(unmasked.metadata['output_position_selection'], 'all-batch-time')
+        self.assertIsNone(unmasked.metadata['output_position_mask_context_id'])
+
+    def test_genuine_qwen_masked_outputs(self):
+        spec = importlib.util.spec_from_file_location('block_test', ROOT / 'tests/test-sinq-blockwise.py')
+        module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as temp:
+            adapter = module.tiny_adapter(Path(temp))
+            tokens = torch.tensor([[1, 7, 3, 11], [5, 19, 2, 0]])
+            mask = torch.tensor([[1, 1, 1, 1], [1, 1, 0, 0]])
+            captured = capture_block(adapter, tokens, 0, attention_mask=mask)
+            probes = qwen_probes(adapter, captured, probes=3, seed=8)
+            self.assertEqual(probes.metadata['positions'], [[0, 0], [0, 1], [0, 2], [0, 3], [1, 0], [1, 1]])
+            self.assertEqual(probes.metadata['requested_vjps'], 18)
+            self.assertEqual(probes.metadata['output_position_mask_context_id'], captured.context_id)
+            repeat = qwen_probes(adapter, captured, probes=3, seed=8)
+            self.assertEqual(probes.metadata, repeat.metadata)
+            torch.testing.assert_close(probes.gradients, repeat.gradients, rtol=0, atol=0)
+            late = qwen_probes(adapter, captured, probes=3, seed=8, positions=[(0, 3)])
+            self.assertGreater(late.gradients[:, 0, 0].abs().max().item(), 0)
+            for positions in [[(1, 2)], [(0, 0), (1, 3)], [(2, 0)], [(0, 4)], []]:
+                with self.subTest(positions=positions), self.assertRaises(ValueError):
+                    qwen_probes(adapter, captured, positions=positions)
+            empty = capture_block(adapter, tokens, 0, attention_mask=torch.zeros_like(mask))
+            with self.assertRaises(ValueError):
+                qwen_probes(adapter, empty)
 
     def test_genuine_qwen_downstream_site(self):
         spec = importlib.util.spec_from_file_location('block_test', ROOT / 'tests/test-sinq-blockwise.py')

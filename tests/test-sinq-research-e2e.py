@@ -10,6 +10,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import re
+import io
+from contextlib import redirect_stdout
 
 ROOT=Path(__file__).resolve().parents[1]
 sys.path[:0]=[str(ROOT),str(ROOT/'gguf-py')]
@@ -24,7 +27,7 @@ import numpy as np
 from tools.sinq import export_activations as exporter
 from tools.sinq.research.schemas import validate_config
 from tools.sinq.research.generate import generate,preflight
-from tools.sinq.research.cli import score_config,assemble_config,validate_config_artifacts,select_config,_advanced_reference
+from tools.sinq.research.cli import score_config,assemble_config,validate_config_artifacts,select_config,_advanced_reference,lock_baseline_config,main as research_cli
 from tools.sinq.research.kl import NativeKLEvaluator
 from tools.sinq.research.cache import CandidateStore
 from tools.sinq.research.native_codec import decode,file_sha256,validate_activations
@@ -78,6 +81,29 @@ def main():
             generators=['ordinary','awq_weight_activation','awq_activation_only'],alphas=[.5],correction_strengths=[.5,1],
             search=dict(strategy='small_grid',local_objective='output_l1',selection_policy='held_out',max_shortlist=1,refine_step=.1,tolerance=0),
             output_directory=str(d/'run'),native_bridge=bridge)
+        # Verify a complete native stock allocation, including quantized
+        # embeddings; selected codec choices remain exactly the configured map.
+        import gguf
+        original=gguf.GGUFReader(source)
+        complete_recipe={t.name:('Q5_0' if len(t.shape)>1 and int(t.shape[0])%32==0 else t.tensor_type.name) for t in original.tensors}
+        original.data._mmap.close()
+        complete_recipe.update({name:q.upper() for name,q in raw_config['native_quantizer']['recipe'].items()})
+        type_file=d/'stock-types.txt';type_file.write_text('\n'.join('^'+re.escape(name)+'$='+q.lower() for name,q in sorted(complete_recipe.items())))
+        stock_model=d/'complete-stock.gguf'
+        produced=subprocess.run([str(binaries/('llama-quantize'+suffix)),'--pure','--tensor-type-file',str(type_file),
+            '--max-buffer-size','64',str(source),str(stock_model),'Q8_0','24'],capture_output=True,timeout=120)
+        assert produced.returncode==0,produced.stderr[-1500:]
+        baseline_manifest=d/'stock-baseline.json'
+        lock=lock_baseline_config(validate_config(dict(common,operation='lock_baseline',source_gguf=str(source),
+            stock_gguf=str(stock_model),recipe=complete_recipe,quantizer=str(binaries/('llama-quantize'+suffix)),
+            native_loader=loader,output_manifest=str(baseline_manifest),timeout=120,
+            budgets={**budgets,'max_tensors':len(complete_recipe)})))
+        assert lock['verification']=='native-reencode-exact'
+        stock_reader=gguf.GGUFReader(stock_model)
+        stock_payloads={t.name:(t.tensor_type.name,hashlib.sha256(t.data.tobytes()).hexdigest()) for t in stock_reader.tensors}
+        assert stock_payloads['token_embd.weight'][0]=='Q5_0'
+        stock_reader.data._mmap.close()
+        raw_config['stock_baseline_manifest']=str(baseline_manifest)
         config=validate_config(raw_config);plan=preflight(config)
         assert plan['status']=='PLAN' and not (d/'run').exists()
         run=generate(config);manifest=d/'run/run-manifest.json'
@@ -120,6 +146,25 @@ def main():
             validated=validate_activations(
                 bridge,d/'production-split'/split/'activations.json',source)
             assert set(names)==set(validated['tensors'])
+        # Joint CLI observations must execute both substitutions in one real
+        # block, rather than adding two independent projection/block losses.
+        from tools.sinq.research.capture import capture_block
+        from tools.sinq.research.blockwise import score_block
+        joint_names=names[:2]
+        joint_assignment={name:ids[name]['ordinary'] for name in joint_names}
+        write(d/'joint-blocks.json',{**capture,'layers':[0]})
+        joint_weights={name:decode(bridge,store.get(key)) for name,key in joint_assignment.items()}
+        locked_block=capture_block(adapter,torch.tensor([tokens]),0,attention_mask=torch.tensor(capture['attention_mask']))
+        expected_joint=score_block(adapter,locked_block,joint_weights)['output_mse']
+        for method,objective in [('blockwise','output_mse'),('fisher_vjp_mc','fisher_quadratic')]:
+            score=dict(common,operation='score',method=method,objective=objective,candidate_manifest=str(manifest),
+                capture_manifest=str(d/'joint-blocks.json'),context='reference_inputs',checkpoint=str(checkpoint),native_bridge=bridge,
+                families=['ordinary'],assignments={'joint':joint_assignment},output_directory=str(d/('joint-'+method)))
+            if method=='fisher_vjp_mc':score.update(probes=2,seed=617)
+            result=score_config(validate_config(score));assert len(result['records'])==1
+            record=result['records'][0];assert record['assignment']==joint_assignment
+            if method=='blockwise':assert record['score']==expected_joint
+            else:assert record['details']['provenance']['positions']==[[0,i] for i in range(1,len(tokens))]
         del adapter
         outputs={}
         for state in ('stock','ordinary','awq','mixed'):
@@ -128,6 +173,11 @@ def main():
             cfg=validate_config(dict(common,operation='assemble',source_gguf=str(source),candidate_manifest=str(manifest),
                 assignment=assignment,output_gguf=str(path),native_loader=loader))
             assembled=assemble_config(cfg);assert assembled['status']=='PASS'
+            assert assembled['stock_baseline_sha256']==file_sha256(stock_model)
+            hybrid=gguf.GGUFReader(path)
+            assert all((t.tensor_type.name,hashlib.sha256(t.data.tobytes()).hexdigest())==stock_payloads[t.name]
+                for t in hybrid.tensors if t.name not in names and not t.name.endswith('.sinq_scale2'))
+            hybrid.data._mmap.close()
             proc=subprocess.run([loader,'--forward',str(path),*map(str,tokens)],capture_output=True,text=True,timeout=120)
             assert proc.returncode==0,proc.stderr[-4000:]
             logits=json.loads(proc.stdout)['logits'];assert len(logits)==32 and np.isfinite(logits).all()
@@ -144,15 +194,34 @@ def main():
         alternatives={f'g{i}':([{name:ids[name]['ordinary']}] if i==0 else [{name:ids[name]['stock']}]) for i,name in enumerate(names)}
         write(d/'evaluator.json',dict(schema_version=1,executable=str(binaries/('llama-perplexity'+suffix)),reference=str(reference),
             corpus=str(corpus),native_loader=loader,context=32,batch=24,microbatch=24,max_tokens=32,timeout=120,alternatives=alternatives))
-        selected=select_config(validate_config(dict(common,budgets={**budgets,'max_evaluations':3},operation='select',source_gguf=str(source),
+        selection_raw=dict(common,budgets={**budgets,'max_evaluations':3},operation='select',source_gguf=str(source),
             candidate_manifest=str(manifest),baseline={name:ids[name]['stock'] for name in names},groups=groups,
             selection_manifest=str(d/'selection-stream.json'),selection_split='selection',evaluator=str(d/'evaluator.json'),
-            output_directory=str(d/'selection'),max_passes=1,tolerance=0)))
+            output_directory=str(d/'selection'),max_passes=1,tolerance=0)
+        selected=select_config(validate_config(selection_raw))
         assert selected['status']=='PASS' and 1<=selected['evaluations']<=3
+        assert selected['stock_baseline_sha256']==file_sha256(stock_model)
+        write(d/'select-config.json',selection_raw)
+        before=file_sha256(d/'selection/selection.json')
+        with redirect_stdout(io.StringIO()):research_cli([str(d/'select-config.json'),'--resume',str(d/'selection')])
+        assert before==file_sha256(d/'selection/selection.json')
         assert file_sha256(reference)==json.loads(reference.with_suffix('.bin.json').read_text())['reference_sha256']
         validation=validate_config(dict(common,operation='validate',artifact_manifest=str(manifest),source_gguf=str(source)))
         assert validate_config_artifacts(validation)['status']=='PASS'
         assert file_sha256(source)==source_hash
+        # Strength zero disables base Sinkhorn, not the AWQ correction. Runtime
+        # provenance must still name sinkhorn_log rather than identity.
+        zero=generate(validate_config(dict(raw_config,output_directory=str(d/'strength-zero'),
+            native_quantizer={**raw_config['native_quantizer'],'sinq_strength':0})))
+        zero_store=CandidateStore(d/'strength-zero/cache')
+        corrected_nonidentity=False
+        for record in zero['tensors'].values():
+            for item in record['candidates']:
+                candidate=zero_store.get(item['candidate_id'])
+                assert candidate.provenance['sinq']['algorithm']=='sinkhorn_log'
+                if item['generator']['family']!='ordinary':
+                    corrected_nonidentity|=bool(np.any(np.fromfile(candidate.scales,dtype='<f2')!=1))
+        assert corrected_nonidentity,'strength-zero AWQ fixture must not be a trivial identity'
         # Repeat full native generation and compare immutable candidate bytes/IDs.
         repeated=generate(validate_config(dict(raw_config,output_directory=str(d/'repeat'))))
         assert {n:[c['candidate_id'] for c in r['candidates']] for n,r in repeated['tensors'].items()}=={n:[c['candidate_id'] for c in r['candidates']] for n,r in run['tensors'].items()}
@@ -164,7 +233,8 @@ def main():
         else:raise AssertionError('overlapping heldout samples accepted')
         assert not (d/'bad').exists()
         summary=dict(status='PASS',purpose='functional correctness only; no A/B experiments',source_sha256=source_hash,
-            tensor_count=3,candidates_per_tensor=5,split_before_reservoir_native_validated=True,codecs=['Q3_K','IQ3_S','IQ4_XS'],
+            tensor_count=3,candidates_per_tensor=5,complete_stock_baseline_verified=True,joint_block_and_fisher_verified=True,
+            cli_resume_verified=True,strength_zero_metadata_verified=True,split_before_reservoir_native_validated=True,codecs=['Q3_K','IQ3_S','IQ4_XS'],
             cache_ids={n:[c['candidate_id'] for c in r['candidates']] for n,r in run['tensors'].items()},
             hybrid_sha256=outputs,deterministic_forward_tokens=len(tokens),native_kld_tokens=8,selection_evaluations=selected['evaluations'],cpu_threads=24,
             elapsed_seconds=time.monotonic()-start)

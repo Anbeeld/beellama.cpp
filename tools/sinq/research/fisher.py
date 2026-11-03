@@ -113,10 +113,25 @@ def qwen_probes(adapter, capture, **options):
     The captured incoming states override the target block input, so selected
     upstream inputs remain locked. All downstream weights are verified stock.
     Each call starts with no attention/recurrent cache; no graph is cached.
+    The capture mask selects output distributions only, never site coordinates.
     """
     capture.validate(adapter)
     if 'metadata' in options:
         raise ValueError('Qwen Fisher provenance is derived from the capture')
+    b, t = capture.tokens.shape
+    mask = capture.attention_mask
+    valid_positions = ([(i, j) for i in range(b) for j in range(t)] if mask is None
+                       else [tuple(p) for p in torch.nonzero(mask, as_tuple=False).tolist()])
+    requested_positions = options.pop('positions', None)
+    selection = ('all-batch-time' if mask is None else 'capture-attention-mask')
+    if requested_positions is None:
+        positions = valid_positions
+    else:
+        positions = [tuple(p) for p in requested_positions]
+        selection = 'explicit'
+    valid = set(valid_positions)
+    if not positions or len(set(positions)) != len(positions) or any(p not in valid for p in positions):
+        raise ValueError('invalid, duplicate, or masked Fisher output positions')
     saved = {}
     def before(module, args, kwargs):
         return (capture.hidden_states,), dict(capture.kwargs)
@@ -133,7 +148,10 @@ def qwen_probes(adapter, capture, **options):
             return build_probes(logits, saved['site'], metadata=dict(source_id=adapter.source_id,
                 source_gguf_sha256=adapter.identity['source_gguf_sha256'], context_id=capture.context_id,
                 site=f'block.{capture.layer}.output', input_context=capture.context,
-                baseline_sha256=capture.baseline_sha256, downstream='stock', reset='fresh-sequence-cache-none'), **options)
+                baseline_sha256=capture.baseline_sha256, downstream='stock', reset='fresh-sequence-cache-none',
+                output_position_selection=selection,
+                output_position_mask_context_id=capture.context_id if mask is not None else None),
+                positions=positions, **options)
     finally:
         for handle in handles:
             handle.remove()

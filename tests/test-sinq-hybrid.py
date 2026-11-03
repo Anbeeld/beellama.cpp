@@ -65,6 +65,90 @@ class HybridTest(unittest.TestCase):
                 assemble(base,d/'failed.gguf',s,{n:choices[n][0] for n in names},native_validate=reject)
             self.assertFalse((d/'failed.gguf').exists())
 
+    @unittest.skipUnless(os.environ.get('SINQ_NATIVE_BIN'),'requires native CPU binaries')
+    def test_complete_stock_baseline_preserves_unselected_quantized_bytes(self):
+        import re
+        from tools.sinq.research.baseline import lock_baseline
+        spec=importlib.util.spec_from_file_location('baseline_fixture',ROOT/'tests/test-sinq-groupwise-kl.py')
+        fixture=importlib.util.module_from_spec(spec); spec.loader.exec_module(fixture)
+        binaries=Path(os.environ['SINQ_NATIVE_BIN']); suffix='.exe' if os.name=='nt' else ''
+        quantizer=binaries/('llama-quantize'+suffix)
+        env=dict(os.environ,OMP_NUM_THREADS='24',MKL_NUM_THREADS='24',CUDA_VISIBLE_DEVICES='')
+        def run(args):
+            result=subprocess.run([str(x) for x in args],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,timeout=120)
+            self.assertEqual(result.returncode,0,result.stderr.decode(errors='replace')[-2000:])
+        def load(path): run([binaries/('test-qk-sinq-model'+suffix),'--load-only',path])
+        with tempfile.TemporaryDirectory() as directory:
+            d=Path(directory); source=d/'source.gguf'; tied=d/'tied.gguf'; fixture.native_fixture(tied)
+            # The shared fixture ties output to embeddings; explicitly materialize
+            # output so this regression covers both independently quantized tables.
+            r=gguf.GGUFReader(tied); w=gguf.GGUFWriter(source,'qwen35')
+            for key,field in r.fields.items():
+                if key.startswith('GGUF.') or key=='general.architecture': continue
+                w.add_key_value(key,field.contents(),field.types[0],field.types[1] if len(field.types)>1 else None)
+            for tensor in r.tensors: w.add_tensor(tensor.name,tensor.data)
+            embedding=next(t for t in r.tensors if t.name=='token_embd.weight')
+            w.add_tensor('output.weight',embedding.data)
+            w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close(); r.data._mmap.close()
+            r=gguf.GGUFReader(source)
+            recipe={t.name:('Q5_0' if len(t.shape)>1 and int(t.shape[0])%32==0 else t.tensor_type.name) for t in r.tensors}
+            source_tensors={t.name:(list(reversed(t.shape.tolist())),t.tensor_type.name,hashlib.sha256(t.data.tobytes()).hexdigest()) for t in r.tensors}
+            r.data._mmap.close()
+            types=d/'types.txt'; types.write_text('\n'.join('^'+re.escape(n)+'$='+q.lower() for n,q in sorted(recipe.items())))
+            stock=d/'stock.gguf'
+            common=[quantizer,'--pure','--tensor-type-file',types,'--max-buffer-size','64']
+            run(common+[source,stock,'Q8_0','24'])
+            lock=d/'baseline.json'; manifest=lock_baseline(source,stock,recipe,lock,quantizer=quantizer,native_validate=load)
+            selected=['blk.0.ffn_up.weight','blk.0.ssm_out.weight','blk.1.attn_output.weight']
+            self.assertTrue(set(selected)<=set(recipe))
+            names=d/'selected.txt'; names.write_text('\n'.join(selected))
+            conditioned=d/'conditioned.gguf'
+            run(common+['--sinq-precondition','sidecar','--sinq-tensor-list',names,'--sinq-strip-width','64',source,conditioned,'Q8_0','24'])
+            r=gguf.GGUFReader(conditioned); stock_reader=gguf.GGUFReader(stock)
+            expected={t.name:(t.tensor_type.name,t.shape.tolist(),t.data.tobytes()) for t in stock_reader.tensors}
+            for name in ['token_embd.weight','output.weight']+selected:
+                self.assertEqual(expected[name][0],'Q5_0')
+            data={t.name:t for t in r.tensors}; store=CandidateStore(d/'cache'); assignment={}
+            for name in selected:
+                shape,source_qtype,input_sha256=source_tensors[name]
+                p=m.provenance(name); p.update(source_sha256=file_digest(source),input_sha256=input_sha256,source_qtype=source_qtype,shape=shape,qtype=recipe[name],recipe_sha256=manifest['recipe_sha256'])
+                p['sinq'].update(strength=1.0,numerics=r.fields['beellama.qk_sinq.numerics'].contents())
+                p['producer']['binary_sha256']=file_digest(quantizer)
+                assignment[name]=store.put(p,data[name].data.tobytes(),data[name+'.sinq_scale2'].data.tobytes())
+            r.data._mmap.close(); stock_reader.data._mmap.close()
+            output=d/'hybrid.gguf'; assemble(source,output,store,assignment,native_validate=load,stock_baseline=lock)
+            r=gguf.GGUFReader(output)
+            for t in r.tensors:
+                if t.name not in selected and not t.name.endswith('.sinq_scale2'):
+                    self.assertEqual((t.tensor_type.name,t.shape.tolist(),t.data.tobytes()),expected[t.name])
+            self.assertEqual(len([k for k in r.fields if k.startswith('beellama.qk_sinq.')]),7)
+            r.data._mmap.close()
+            run([binaries/('llama-completion'+suffix),'-m',output,'-p','abc','-n','2','-c','32','-b','24','-ub','24','-t','24','-ngl','0','--no-warmup','--seed','0'])
+            # A stock candidate is not allowed to claim arbitrary baseline bytes.
+            name=selected[0]; p=dict(store.get(assignment[name]).provenance)
+            p.update(sinq=None,generator={'family':'stock'})
+            payload=bytearray(expected[name][2]); payload[0]^=1
+            bad_store=CandidateStore(d/'bad-cache'); bad=bad_store.put(p,bytes(payload))
+            with self.assertRaisesRegex(ValueError,'stock candidate differs'):
+                assemble(source,d/'bad.gguf',bad_store,{name:bad},native_validate=load,stock_baseline=lock)
+            self.assertFalse((d/'bad.gguf').exists())
+            good=store.put(p,expected[name][2])
+            stock_copy=d/'stock-copy.gguf'
+            assemble(source,stock_copy,store,{name:good},native_validate=load,stock_baseline=lock)
+            r=gguf.GGUFReader(stock_copy)
+            self.assertFalse(any(k.startswith('beellama.qk_sinq.') for k in r.fields))
+            self.assertEqual({t.name:(t.tensor_type.name,t.shape.tolist(),t.data.tobytes()) for t in r.tensors},expected)
+            r.data._mmap.close()
+            incompatible=dict(p); incompatible['imatrix_sha256']='0'*64
+            wrong=store.put(incompatible,expected[name][2])
+            with self.assertRaisesRegex(ValueError,'recipe/imatrix'):
+                assemble(source,d/'imatrix.gguf',store,{name:wrong},native_validate=load,stock_baseline=lock)
+            incompatible=dict(p); incompatible['qtype']='Q8_0'
+            block,size=gguf.GGML_QUANT_SIZES[gguf.GGMLQuantizationType.Q8_0]
+            wrong=store.put(incompatible,bytes(int(np.prod(p['shape']))//block*size))
+            with self.assertRaisesRegex(ValueError,'allocation'):
+                assemble(source,d/'allocation.gguf',store,{name:wrong},native_validate=load,stock_baseline=lock)
+
     @unittest.skipUnless(os.environ.get('SINQ_NATIVE_BIN'),'set SINQ_NATIVE_BIN for actual native codec/loader smoke')
     def test_actual_native_payload_and_loader(self):
         spec=importlib.util.spec_from_file_location('kl_fixture',Path(__file__).with_name('test-sinq-groupwise-kl.py'))

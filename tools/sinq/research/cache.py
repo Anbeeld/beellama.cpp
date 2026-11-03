@@ -132,6 +132,8 @@ class CandidateStore:
             values = np.frombuffer(scales, dtype='<f2')
             if len(scales) != p['shape'][1]*2 or not _valid_scales(values):
                 raise ValueError('invalid serialized F16 diagonal')
+            if p['sinq']['algorithm']=='identity' and not np.all(values==1):
+                raise ValueError('identity metadata requires an actual identity compensation')
         desc = {'schema_version':1,'provenance':p,'payload':hashlib.sha256(payload).hexdigest(),'payload_bytes':len(payload),'scales':None if scales is None else hashlib.sha256(scales).hexdigest(),'scale_bytes':0 if scales is None else len(scales)}
         key = digest(desc)
         identity=self.root/'identities'/f'{digest(p)}.json'
@@ -183,6 +185,10 @@ class CandidateStore:
             paths.append(blob)
         if paths[1] is not None:
             scales=np.memmap(paths[1],dtype='<f2',mode='r')
-            if not _valid_scales(scales):
-                raise ValueError('invalid F16 companion')
+            try:
+                if not _valid_scales(scales):
+                    raise ValueError('invalid F16 companion')
+                if p['sinq']['algorithm']=='identity' and not np.all(scales==1):
+                    raise ValueError('identity metadata requires an actual identity compensation')
+            finally:scales._mmap.close()
         return Candidate(key,p,*paths)

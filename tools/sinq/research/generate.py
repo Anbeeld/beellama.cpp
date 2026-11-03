@@ -53,6 +53,19 @@ def preflight(config):
         tensors={t.name:t for t in reader.tensors}
         if len(tensors)!=len(reader.tensors):
             raise ValueError('duplicate source tensor names')
+        stock=None
+        if 'stock_baseline_manifest' in config:
+            from .baseline import load_baseline
+            locked,_=load_baseline(config['stock_baseline_manifest'],source)
+            imatrix=config['native_quantizer'].get('imatrix_path')
+            if locked['imatrix_sha256']!=(native_codec.file_sha256(imatrix) if imatrix else None):
+                raise ValueError('generation imatrix differs from stock baseline')
+            stock=dict(manifest=str(Path(config['stock_baseline_manifest']).resolve()),
+                manifest_sha256=native_codec.file_sha256(config['stock_baseline_manifest']),
+                baseline_sha256=locked['baseline_sha256'],recipe_sha256=locked['recipe_sha256'])
+            for name,qtype in config['native_quantizer']['recipe'].items():
+                if locked['recipe'].get(name)!=qtype.upper():
+                    raise ValueError('selected recipe differs from complete stock baseline allocation: '+name)
         manifest,activations=_manifest(config,'activation_manifest')
         validation=None;pairing=None
         if 'validation_manifest' in config:
@@ -99,7 +112,7 @@ def preflight(config):
         return dict(schema_version=1,operation='generate',status='PLAN',source_sha256=native_codec.file_sha256(source),
                     resolved_candidates=config['resolved_candidates'],search_policy=config['search'],tensor_details=details,
                     expected_output_bytes_upper_bound=total,expected_files_upper_bound=files,
-                    activation=activations,validation=validation,pairing=pairing)
+                    activation=activations,validation=validation,pairing=pairing,stock_baseline=stock)
     finally:
         reader.data._mmap.close()
 
@@ -132,12 +145,14 @@ def generate(config):
     store=CandidateStore(output/'cache',max_bytes=config['budgets']['max_output_bytes'],max_files=config['budgets']['max_files'])
     reader=gguf.GGUFReader(config['source_gguf'])
     source_sha=plan['source_sha256'];q=config['native_quantizer'];budgets=config['budgets']
-    recipe_sha=digest(q['recipe']);imatrix_sha=native_codec.file_sha256(q['imatrix_path']) if 'imatrix_path' in q else None
+    recipe_sha=plan['stock_baseline']['recipe_sha256'] if plan['stock_baseline'] else digest(q['recipe']);imatrix_sha=native_codec.file_sha256(q['imatrix_path']) if 'imatrix_path' in q else None
     producer=dict(binary_sha256=native_codec.file_sha256(config['native_bridge']),source_sha256=source_identity())
     run=dict(schema_version=1,source_gguf=os.path.relpath(Path(config['source_gguf']).resolve(),output),source_sha256=source_sha,
              cache='cache',recipe_sha256=recipe_sha,imatrix_sha256=imatrix_sha,producer=producer,
              config_sha256=digest({k:v for k,v in config.items() if k not in ('source_gguf','activation_manifest','validation_manifest','pairing_manifest','native_bridge','output_directory')}),
              tensors={},status='PASS',purpose='implementation-only; no quality conclusions')
+    if plan['stock_baseline']:
+        run['stock_baseline']={**plan['stock_baseline'],'manifest':os.path.relpath(plan['stock_baseline']['manifest'],output)}
     try:
         tensors={t.name:t for t in reader.tensors}
         for details in plan['tensor_details']:
@@ -166,7 +181,7 @@ def generate(config):
                     v=plan['validation']['tensors'][name]
                     request.update(held_out=True,validation=v['data_file'],validation_samples=v['count'])
                 found=native_codec.request(config['native_bridge'],request,req_dir)
-                sinq=dict(strip_width=q['sinq_strip_width'],iterations=q['sinq_iterations'],strength=q['sinq_strength'],algorithm='sinkhorn_log' if q['sinq_strength'] else 'identity',numerics=NUMERICS)
+                sinq=dict(strip_width=q['sinq_strip_width'],iterations=q['sinq_iterations'],strength=q['sinq_strength'],algorithm='sinkhorn_log',numerics=NUMERICS)
                 records=[]
                 for c in found['candidates']:
                     generator={key:c[key] for key in ('family','alpha','lambda')}
@@ -179,6 +194,11 @@ def generate(config):
                     skipped=found['skipped'],encode_count=found['encode_count'],workspace_bytes=found['workspace_bytes'],elapsed_seconds=found['elapsed_seconds'])
         if native_codec.file_sha256(config['source_gguf'])!=source_sha:
             raise ValueError('source mutated during generation')
+        if plan['stock_baseline']:
+            from .baseline import load_baseline
+            locked,_=load_baseline(plan['stock_baseline']['manifest'],config['source_gguf'])
+            if locked['baseline_sha256']!=plan['stock_baseline']['baseline_sha256'] or native_codec.file_sha256(plan['stock_baseline']['manifest'])!=plan['stock_baseline']['manifest_sha256']:
+                raise ValueError('stock baseline changed during generation')
         run['checksum']=digest(run)
         atomic_write(output/'run-manifest.json',canonical(run),max_bytes=budgets['max_output_bytes'])
         return run

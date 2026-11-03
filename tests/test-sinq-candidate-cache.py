@@ -33,6 +33,14 @@ class CacheTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'budget'):
                 CandidateStore(d/'small',max_bytes=50).put(provenance(),bytes(352),scales.read_bytes())
 
+    def test_identity_metadata_requires_actual_identity_compensation(self):
+        with tempfile.TemporaryDirectory() as d:
+            s=CandidateStore(d);p=provenance();p['sinq']={**p['sinq'],'algorithm':'identity','strength':0}
+            with self.assertRaisesRegex(ValueError,'identity'):
+                s.put(p,bytes(352),np.full(256,2,dtype='<f2').tobytes())
+            key=s.put(p,bytes(352),np.ones(256,dtype='<f2').tobytes())
+            self.assertEqual(s.get(key).provenance['sinq']['algorithm'],'identity')
+
     def test_validation(self):
         with tempfile.TemporaryDirectory() as d:
             s=CandidateStore(d,max_bytes=1024)
