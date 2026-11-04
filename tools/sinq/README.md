@@ -26,6 +26,14 @@ and headerless little-endian float32 files. Existing directories or files are
 never overwritten. Failed exports can leave partial files, but no final manifest;
 use a new output directory after diagnosing the failure.
 
+## Advanced Tier-C scoring
+
+Blockwise reconstruction and output-Fisher scoring have opt-in CPU/CUDA and
+FP32/BF16 execution controls. See [Tier-C execution backends](../../docs/sinq-tier-c-execution.md)
+for configuration, exact-reference precision rules, layerwise placement, resource
+limits and engineering validation. These controls do not change the native codec
+or the activation export interface below.
+
 ## CPU threads
 
 CPU thread defaults use all logical CPUs. Set exporter `--threads N` or the

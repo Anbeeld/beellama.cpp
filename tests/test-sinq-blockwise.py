@@ -9,8 +9,8 @@ import unittest
 
 os.environ['HF_HUB_OFFLINE'] = '1'
 os.environ['TRANSFORMERS_OFFLINE'] = '1'
-os.environ['OMP_NUM_THREADS'] = '24'
-os.environ['MKL_NUM_THREADS'] = '24'
+os.environ['OMP_NUM_THREADS'] = '32'
+os.environ['MKL_NUM_THREADS'] = '32'
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / 'gguf-py')]
 # Dependency-bound correctness coverage must be an explicit SKIP, never a stub.
@@ -25,7 +25,7 @@ from tools.sinq.research.qwen35_adapter import Qwen35Adapter
 from tools.sinq.research.capture import capture_block
 from tools.sinq.research.blockwise import block_delta, score_block
 
-torch.set_num_threads(24)
+torch.set_num_threads(32)
 
 
 def tiny_adapter(directory):
@@ -33,7 +33,7 @@ def tiny_adapter(directory):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     module.fixture(directory, 'f32')
-    torch.set_num_threads(24)
+    torch.set_num_threads(32)
     from transformers import Qwen3_5TextModel
     model = Qwen3_5TextModel.from_pretrained(directory, local_files_only=True, trust_remote_code=False).float().eval()
     return Qwen35Adapter(model, directory / 'model.gguf')
@@ -157,6 +157,21 @@ class BlockwiseTests(unittest.TestCase):
         # fixture's strong decay washes it below F32 resolution by position 6.
         later = self.adapter.config.linear_conv_kernel_dim
         self.assertGreater((output[:, later] - capture.reference_output[:, later]).abs().max().item(), 0)
+
+    def test_locked_buffers_and_execution_settings(self):
+        adapter=self.adapter
+        frequencies=adapter.text.rotary_emb.inv_freq
+        original=frequencies.clone()
+        try:
+            frequencies.add_(0.01)
+            with self.assertRaisesRegex(ValueError,'buffers'):adapter.assert_reference()
+        finally:
+            frequencies.copy_(original)
+        threads=torch.get_num_threads()
+        from unittest.mock import patch
+        with patch.object(torch,'get_num_threads',return_value=threads+1):
+            with self.assertRaisesRegex(ValueError,'settings'):adapter.assert_reference()
+        adapter.assert_reference()
 
     def test_full_source_identity_rejects_changed_norm(self):
         from transformers import Qwen3_5TextModel

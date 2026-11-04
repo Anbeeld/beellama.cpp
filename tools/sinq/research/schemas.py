@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 import os
+import re
 from pathlib import Path
 
 FAMILIES = ('ordinary', 'awq_weight_activation', 'awq_activation_only')
@@ -28,7 +29,7 @@ OPERATION_FIELDS = {
         'generators', 'alphas', 'correction_strengths', 'search', 'output_directory', 'native_bridge'},
         {'validation_manifest', 'pairing_manifest', 'stock_baseline_manifest', 'corpus_partitions_manifest'}),
     'score': ({'method', 'objective', 'candidate_manifest', 'capture_manifest', 'output_directory'},
-        {'families', 'device', 'context', 'checkpoint', 'native_bridge', 'probes', 'seed',
+        {'families', 'device', 'reference_dtype', 'cuda_devices', 'memory_policy', 'context', 'checkpoint', 'native_bridge', 'probes', 'seed',
          'validation_manifest', 'pairing_manifest', 'selection_policy', 'assignments'}),
     'assemble': ({'source_gguf', 'candidate_manifest', 'assignment', 'output_gguf'}, {'native_loader', 'stock_baseline_manifest'}),
     'lock_corpora': ({'token_sources', 'partitions', 'output_manifest'}, set()),
@@ -158,6 +159,46 @@ def _generate(c):
     return len(names), count
 
 
+def validate_execution_config(config, *, local=False):
+    """Validate execution controls without importing Torch or touching CUDA."""
+    c = copy.deepcopy(config)
+    if local:
+        if any(k in c for k in ('reference_dtype', 'cuda_devices', 'memory_policy')) or c.get('device', 'cpu') != 'cpu':
+            raise ValueError('local scoring only accepts device cpu and no precision/placement/memory controls')
+        c.setdefault('device', 'cpu')
+        return c
+    explicit = c.get('device')
+    if explicit is not None and (not isinstance(explicit, str) or not re.fullmatch(r'cpu|cuda(?::(?:0|[1-9][0-9]*))?', explicit)):
+        raise ValueError('device must be cpu, cuda, or cuda:<nonnegative index>')
+    _choice(c.setdefault('reference_dtype', 'fp32'), ('fp32', 'bf16'), 'reference_dtype')
+    if 'cuda_devices' in c:
+        devices = _names(c['cuda_devices'], 'cuda_devices')
+        if any(not re.fullmatch(r'cuda:(?:0|[1-9][0-9]*)', d) for d in devices):
+            raise ValueError('cuda_devices requires absolute cuda:N entries')
+        if explicit not in (None, 'cuda'):
+            raise ValueError('cuda_devices conflicts with device')
+        c['device'] = 'cuda'
+    else:
+        c.setdefault('device', 'cpu')
+    if 'memory_policy' in c:
+        m = c['memory_policy']
+        _fields(m, (), ('host_limit_bytes', 'cuda_limit_bytes', 'reserve_bytes'), 'memory_policy')
+        for key in ('host_limit_bytes', 'reserve_bytes'):
+            if key in m: _integer(m[key], key, 0 if key == 'reserve_bytes' else 1)
+        if 'cuda_limit_bytes' in m:
+            limits = m['cuda_limit_bytes']
+            if not isinstance(limits, dict) or not limits:
+                raise ValueError('cuda_limit_bytes must be a nonempty mapping')
+            for name, limit in limits.items():
+                if not isinstance(name, str) or not re.fullmatch(r'cuda:(?:0|[1-9][0-9]*)', name):
+                    raise ValueError('cuda_limit_bytes requires absolute cuda:N keys')
+                _integer(limit, 'cuda limit')
+            if c['device'] == 'cpu': raise ValueError('CPU policy cannot have CUDA limits')
+            if 'cuda_devices' in c and not limits.keys() <= set(c['cuda_devices']):
+                raise ValueError('CUDA limits name unselected devices')
+    return c
+
+
 def validate_config(config):
     """Return a detached canonical dict; never open/create operation inputs or outputs."""
     if not isinstance(config, dict):
@@ -191,7 +232,7 @@ def validate_config(config):
         for family in _names(c.setdefault('families', list(FAMILIES)), 'families'):
             if family not in METHOD_COMPATIBILITY or method not in METHOD_COMPATIBILITY[family]:
                 raise ValueError('unsupported family/method combination')
-        _choice(c.setdefault('device', 'cpu'), ('cpu', 'cuda'), 'device')
+        c.update(validate_execution_config(c, local=method == 'local'))
         _choice(c.setdefault('selection_policy', 'in_sample'), ('in_sample', 'held_out'), 'selection_policy')
         if method!='local' and c['selection_policy']=='held_out':
             raise ValueError('advanced held_out capture provenance is not supported; use local held_out scoring')

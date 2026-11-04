@@ -12,7 +12,7 @@ def native_fixture(path):
     directory=path.parent/'checkpoint'
     parity.fixture(directory,'bf16')
     import torch
-    torch.set_num_threads(24)
+    torch.set_num_threads(32)
     # Use the proven recurrent/full-attention model and BF16-rounded F32 payloads.
     # Replace all tokenizer metadata so the corpus has a known native tokenization.
     reader=gguf.GGUFReader(directory/'model.gguf')
@@ -77,8 +77,8 @@ class SelectionTest(unittest.TestCase):
             self.assertLess(identity_score,1e-4)
             name='blk.0.ffn_up.weight'; selected=d/'selected.txt'; selected.write_text(name+'\n')
             quantized=d/'quantized.gguf'
-            args=[str(binaries/('llama-quantize'+suffix)),'--pure','--sinq-precondition','sidecar','--sinq-tensor-list',str(selected),'--sinq-strip-width','64',str(source),str(quantized),'Q5_0','24']
-            result=subprocess.run(args,env=dict(os.environ,OMP_NUM_THREADS='24',MKL_NUM_THREADS='24',CUDA_VISIBLE_DEVICES=''),capture_output=True,timeout=120)
+            args=[str(binaries/('llama-quantize'+suffix)),'--pure','--sinq-precondition','sidecar','--sinq-tensor-list',str(selected),'--sinq-strip-width','64',str(source),str(quantized),'Q5_0','32']
+            result=subprocess.run(args,env=dict(os.environ,OMP_NUM_THREADS='32',MKL_NUM_THREADS='32',CUDA_VISIBLE_DEVICES=''),capture_output=True,timeout=120)
             self.assertEqual(result.returncode,0,result.stderr.decode(errors='replace')[-1500:])
             r=gguf.GGUFReader(quantized); original=gguf.GGUFReader(source)
             tensor=next(t for t in r.tensors if t.name==name); scale=next(t for t in r.tensors if t.name==name+'.sinq_scale2')

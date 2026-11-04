@@ -12,7 +12,6 @@ import subprocess
 import sys
 import tempfile
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,14 +24,14 @@ def report(message):
     sys.stdout.flush()
 
 
-def fixture(directory, dtype_name, key_heads=2, value_heads=4):
+def fixture(directory, dtype_name, key_heads=2, value_heads=4, fp32_norms=False):
     import numpy as np
     import torch
     import gguf
     from transformers import Qwen3_5TextConfig, Qwen3_5TextModel
     from conversion.qwen import Qwen3_5TextModel as Converter
 
-    torch.set_num_threads(24)
+    torch.set_num_threads(int(os.environ.get('OMP_NUM_THREADS', '32')))
     torch.manual_seed(41721)
     config = Qwen3_5TextConfig(
         vocab_size=32, hidden_size=256, intermediate_size=512,
@@ -58,6 +57,13 @@ def fixture(directory, dtype_name, key_heads=2, value_heads=4):
     with torch.no_grad():
         for parameter in model.parameters():
             parameter.copy_(parameter.to(dtype).float())
+    if fp32_norms:
+        # Characterize real mixed checkpoint storage: keep exact FP32 gated
+        # norms that cannot be represented by BF16, as in the original 9B.
+        with torch.no_grad():
+            for name, parameter in model.named_parameters():
+                if name.endswith('linear_attn.norm.weight'):
+                    parameter.add_(torch.linspace(0.0001, 0.0003, parameter.numel()).reshape(parameter.shape))
     hparams = config.to_dict()
     hparams["architectures"] = ["Qwen3_5TextModel"]
     hparams["full_attention_interval"] = 2
@@ -133,7 +139,8 @@ def fixture(directory, dtype_name, key_heads=2, value_heads=4):
     np.savez(directory / "hf-inputs.npz", **captured)
     (directory / "tokens.json").write_text(json.dumps(tokens), encoding="utf-8")
     report(f"fixture {directory.name}: 15 sites, 12 roles, {len(tokens)} rows/site, "
-           f"CPU F32 execution, {dtype_name}-rounded weights, K/V heads={key_heads}/{value_heads}")
+           f"CPU F32 execution, {dtype_name}-rounded bulk weights, "
+           f"exact FP32 norm fixture={fp32_norms}, K/V heads={key_heads}/{value_heads}")
     return captured, tokens
 
 

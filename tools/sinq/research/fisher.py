@@ -50,8 +50,6 @@ def build_probes(logits, site, *, estimator='fisher_vjp_mc', probes=16, seed=0,
         raise ValueError('Fisher requires differentiable [batch,time,vocab] logits and site')
     if not torch.isfinite(logits).all() or not torch.isfinite(site).all():
         raise ValueError('nonfinite reference Fisher graph')
-    if logits.device.type != 'cpu' or site.device.type != 'cpu':
-        raise ValueError('this Fisher implementation requires explicit CPU execution')
     if not isinstance(seed, int) or not 0 <= seed <= 0xffffffff:
         raise ValueError('Fisher seed must be uint32')
     if not isinstance(probes, int) or probes <= 0 or max_vjps <= 0 or max_cache_bytes <= 0:
@@ -65,12 +63,17 @@ def build_probes(logits, site, *, estimator='fisher_vjp_mc', probes=16, seed=0,
     if requested > max_vjps:
         raise ValueError('Fisher VJP budget exceeded')
     max_rank = len(positions) * (vocab if estimator == 'fisher_vjp_exact' else min(probes, vocab))
-    if (max_rank * (site.numel() + 1) + len(positions) * vocab) * 8 > max_cache_bytes:
+    retained_bytes = (max_rank * (site.numel() + 1) + 2 * len(positions) * vocab) * 8
+    normalization_bytes = logits.numel() * max(4, logits.element_size()) * 2
+    gradient_bytes = site.numel() * site.element_size()
+    if retained_bytes + normalization_bytes + gradient_bytes > max_cache_bytes:
         raise ValueError('Fisher probe cache byte budget exceeded')
-    logp = logits.log_softmax(-1)
+    # Preserve F64 analytic oracles; promote low precision before normalization.
+    normalized = logits.float() if logits.dtype in (torch.bfloat16, torch.float16) else logits
+    logp = normalized.log_softmax(-1)
     if not torch.isfinite(logp).all():
         raise ValueError('nonfinite reference log probabilities')
-    probabilities = torch.stack([logp[i, j].detach().double().exp() for i, j in positions])
+    probabilities = torch.stack([logp[i, j].detach().cpu().double().exp() for i, j in positions])
     probabilities /= probabilities.sum(-1, keepdim=True)
     generator = torch.Generator(device='cpu').manual_seed(seed)
     outcomes, coefficients, sampled = [], [], []
@@ -87,23 +90,29 @@ def build_probes(logits, site, *, estimator='fisher_vjp_mc', probes=16, seed=0,
             outcomes.append((i, j, target))
             coefficient = probabilities[index, target].item() if counts is None else counts[target].item() / probes
             coefficients.append(coefficient / len(positions))
-    gradients = []
+    # Preallocate the bounded CPU F64 cache; stacking a list duplicates it.
+    gradients = torch.empty((len(outcomes), *site.shape), dtype=torch.float64, device='cpu')
     for index, (i, j, target) in enumerate(outcomes):
         gradient, = torch.autograd.grad(logp[i, j, target], site,
             retain_graph=index < len(outcomes) - 1, create_graph=False, allow_unused=False)
         if not torch.isfinite(gradient).all():
             raise ValueError('nonfinite downstream score gradient')
-        gradients.append(gradient.detach().cpu().double())
+        source = gradient.detach().reshape(-1)
+        target = gradients[index].view(-1)
+        for first in range(0, source.numel(), 131072):
+            target[first:first + 131072].copy_(source[first:first + 131072])
+        del gradient, source
     reserved = dict(estimator=estimator, seed=seed, probes_per_position=probes if estimator == 'fisher_vjp_mc' else vocab,
         requested_vjps=requested, actual_vjps=len(outcomes), rank=len(outcomes),
-        positions=[list(p) for p in positions], site_shape=list(site.shape), device='cpu',
+        positions=[list(p) for p in positions], site_shape=list(site.shape), device=str(site.device),
+        logits_device=str(logits.device), execution_dtype=str(site.dtype),
         gradient_dtype='float64', objective='half-mean-context-expected-squared-full-site-pairing',
         max_vjps=max_vjps, max_cache_bytes=max_cache_bytes,
         sampled_targets_sha256=hashlib.sha256(str(sampled).encode()).hexdigest(),
         probabilities_sha256=hashlib.sha256(probabilities.numpy().tobytes()).hexdigest())
     if set(metadata or {}) & set(reserved):
         raise ValueError('caller metadata cannot override Fisher estimator identity')
-    return FisherProbes(torch.stack(gradients), torch.tensor(coefficients, dtype=torch.float64),
+    return FisherProbes(gradients, torch.tensor(coefficients, dtype=torch.float64),
                         probabilities, {**(metadata or {}), **reserved})
 
 
@@ -132,6 +141,23 @@ def qwen_probes(adapter, capture, **options):
     valid = set(valid_positions)
     if not positions or len(set(positions)) != len(positions) or any(p not in valid for p in positions):
         raise ValueError('invalid, duplicate, or masked Fisher output positions')
+    # Reject impossible probe/output plans before constructing downstream logits
+    # or retaining autograd state. Saved kernel workspace remains runtime-monitored.
+    vocab = adapter.config.vocab_size
+    count = len(positions)
+    estimator = options.get('estimator', 'fisher_vjp_mc')
+    per_position = vocab if estimator == 'fisher_vjp_exact' else options.get('probes', 16)
+    if count * per_position > options.get('max_vjps', 256):
+        raise ValueError('Fisher VJP budget exceeded before downstream graph')
+    ranks = count * (vocab if estimator == 'fisher_vjp_exact' else min(per_position, vocab))
+    cache_bytes = (ranks * (capture.reference_output.numel() + 1) + count * vocab) * 8
+    execution_bytes = capture.reference_output.element_size()
+    # Full logits, promoted normalization and its gradient, CPU probabilities,
+    # retained F64 site probes, and at least one saved hidden per downstream layer.
+    output_bytes = b * t * vocab * (execution_bytes + 12)
+    hidden_bytes = capture.reference_output.numel() * execution_bytes * (len(adapter.text.layers)-capture.layer)
+    if cache_bytes + output_bytes + hidden_bytes > options.get('max_cache_bytes', 64 * 1024 * 1024):
+        raise ValueError('Fisher graph/output/probe workspace budget exceeded before downstream graph')
     saved = {}
     def before(module, args, kwargs):
         return (capture.hidden_states,), dict(capture.kwargs)

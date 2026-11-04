@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "operation": "score",
+  "method": "blockwise",
+  "objective": "output_mse",
+  "candidate_manifest": "artifacts/sinq-tier-c-backend-implementation/tiny-verified/run/run-manifest.json",
+  "capture_manifest": "artifacts/sinq-tier-c-backend-implementation/tiny-verified/capture.json",
+  "checkpoint": "artifacts/sinq-tier-c-backend-implementation/tiny-verified/checkpoint",
+  "native_bridge": "build-sinq-cpu-threaded/bin/llama-sinq-native.exe",
+  "context": "reference_inputs",
+  "families": [
+    "stock"
+  ],
+  "threads": 32,
+  "memory_policy": {
+    "host_limit_bytes": 8589934592,
+    "reserve_bytes": 67108864
+  },
+  "budgets": {
+    "workspace_bytes": 134217728,
+    "max_candidates": 4,
+    "max_output_bytes": 67108864,
+    "max_files": 100,
+    "max_tensors": 4,
+    "max_tokens": 16,
+    "max_probes": 16,
+    "max_evaluations": 8
+  },
+  "device": "cpu",
+  "reference_dtype": "bf16",
+  "output_directory": "sinq-score-cpu-bf16-output"
+}

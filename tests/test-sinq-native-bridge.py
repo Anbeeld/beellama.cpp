@@ -27,7 +27,7 @@ class Bridge(unittest.TestCase):
                     work=d/codec;work.mkdir()
                     cfg=dict(schema_version=1,operation='generate',weights=str(d/'w.bin'),source_type='f32',
                         activations=str(d/'x.bin'),samples=samples,importance=str(d/'im.bin'),
-                        rows=n,columns=k,codec=codec,output=str(work/'out'),threads=24,
+                        rows=n,columns=k,codec=codec,output=str(work/'out'),threads=32,
                         strip_width=64,iterations=16,strength=.75,workspace_bytes=4<<20,max_output_bytes=4<<20,
                         candidates=[dict(family='awq_weight_activation',alpha=.5,**{'lambda':1}),
                                     dict(family='awq_weight_activation',alpha=.5,**{'lambda':.5}),

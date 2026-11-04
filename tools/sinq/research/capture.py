@@ -23,7 +23,12 @@ def _digest(value):
     def add(v):
         if isinstance(v, torch.Tensor):
             digest.update(str((tuple(v.shape), v.dtype)).encode())
-            digest.update(v.detach().cpu().contiguous().numpy().tobytes())
+            # Serialize original bytes, including BF16, in bounded host slabs.
+            flat = v.detach().reshape(-1)
+            chunk = max(1, (1 << 20) // v.element_size())
+            for first in range(0, flat.numel(), chunk):
+                slab = flat[first:first + chunk].contiguous().cpu()
+                digest.update(slab.view(torch.uint8).numpy().tobytes())
         elif isinstance(v, dict):
             for key in sorted(v):
                 digest.update(key.encode()); add(v[key])
@@ -79,7 +84,7 @@ def capture_block(adapter, tokens, layer, *, attention_mask=None, position_ids=N
     adapter.assert_reference()
     if not 0 <= layer < len(adapter.text.layers):
         raise ValueError('invalid block index')
-    if tokens.ndim != 2 or tokens.dtype != torch.long or tokens.device.type != 'cpu' or not 0 < tokens.numel() <= max_tokens:
+    if tokens.ndim != 2 or tokens.dtype != torch.long or tokens.device.type not in ('cpu', 'cuda') or not 0 < tokens.numel() <= max_tokens:
         raise ValueError('invalid token coordinates or token budget')
     if (tokens < 0).any() or (tokens >= adapter.config.vocab_size).any():
         raise ValueError('token ID outside vocabulary')
@@ -100,6 +105,9 @@ def capture_block(adapter, tokens, layer, *, attention_mask=None, position_ids=N
             raise ValueError('attention mask must be binary [batch,time]')
     if position_ids is not None and (position_ids.shape != tokens.shape or position_ids.dtype != torch.long):
         raise ValueError('position IDs must be int64 [batch,time]')
+    for value in (attention_mask, position_ids):
+        if value is not None and value.device != tokens.device:
+            raise ValueError('mixed-device token coordinates')
     # Bound the captured hidden/output, RoPE and dense causal-mask payload before forward.
     b, t = tokens.shape
     estimate = 4 * (2 * b * t * adapter.config.hidden_size + 2 * b * t * adapter.config.head_dim + b * t * t) + 32 * b * t

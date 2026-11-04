@@ -38,8 +38,8 @@ class BaselineTest(unittest.TestCase):
             r=gguf.GGUFReader(source); recipe={t.name:('Q5_0' if len(t.shape)>1 and int(t.shape[0])%32==0 else t.tensor_type.name) for t in r.tensors}; r.data._mmap.close()
             import re
             types=d/'types.txt'; types.write_text('\n'.join('^'+re.escape(n)+'$='+q.lower() for n,q in sorted(recipe.items())))
-            stock=d/'stock.gguf'; env=dict(os.environ,OMP_NUM_THREADS='24',CUDA_VISIBLE_DEVICES='')
-            result=subprocess.run([str(quantizer),'--pure','--tensor-type-file',str(types),'--max-buffer-size','64',str(source),str(stock),'Q8_0','24'],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=120)
+            stock=d/'stock.gguf'; env=dict(os.environ,OMP_NUM_THREADS='32',CUDA_VISIBLE_DEVICES='')
+            result=subprocess.run([str(quantizer),'--pure','--tensor-type-file',str(types),'--max-buffer-size','64',str(source),str(stock),'Q8_0','32'],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=120)
             self.assertEqual(result.returncode,0)
             def validate(path):
                 result=subprocess.run([str(binaries/('test-qk-sinq-model'+suffix)),'--load-only',str(path)],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=120)
@@ -64,7 +64,7 @@ class BaselineTest(unittest.TestCase):
             im_types=d/'im-types.txt';im_types.write_text('\n'.join('^'+re.escape(n)+'$='+q.lower() for n,q in sorted(im_recipe.items())))
             im_stock=d/'im-stock.gguf'
             result=subprocess.run([str(quantizer),'--pure','--tensor-type-file',str(im_types),'--imatrix',str(importance),
-                '--max-buffer-size','64',str(source),str(im_stock),'Q8_0','24'],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=120)
+                '--max-buffer-size','64',str(source),str(im_stock),'Q8_0','32'],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=120)
             self.assertEqual(result.returncode,0)
             im_lock=lock_baseline(source,im_stock,im_recipe,d/'im-lock.json',quantizer=quantizer,native_validate=validate,imatrix=importance)
             self.assertEqual(im_lock['imatrix_sha256'],file_digest(importance))

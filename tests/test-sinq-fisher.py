@@ -7,8 +7,8 @@ import sys
 import unittest
 import tempfile
 from types import SimpleNamespace
-os.environ['OMP_NUM_THREADS'] = '24'
-os.environ['MKL_NUM_THREADS'] = '24'
+os.environ['OMP_NUM_THREADS'] = '32'
+os.environ['MKL_NUM_THREADS'] = '32'
 os.environ['HF_HUB_OFFLINE'] = '1'
 os.environ['TRANSFORMERS_OFFLINE'] = '1'
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,7 +18,7 @@ from tools.sinq.research.fisher import build_probes, qwen_probes
 from tools.sinq.research.capture import capture_block
 from tools.sinq.research.blockwise import block_delta
 
-torch.set_num_threads(24)
+torch.set_num_threads(32)
 
 
 class FisherTests(unittest.TestCase):
@@ -107,7 +107,7 @@ class FisherTests(unittest.TestCase):
                 state = 0.7 * state + site[:, t]
                 outputs.append(torch.cat([state, -state], -1))
             return torch.stack(outputs, 1)
-        adapter = SimpleNamespace(text=SimpleNamespace(layers=[block]), logits=logits,
+        adapter = SimpleNamespace(config=SimpleNamespace(vocab_size=2), text=SimpleNamespace(layers=[block]), logits=logits,
             source_id='toy', identity={'source_gguf_sha256': 'toy-source'})
         probes = qwen_probes(adapter, capture, estimator='fisher_vjp_exact')
         self.assertEqual(probes.metadata['positions'], [[0, 0], [0, 2], [1, 1]])

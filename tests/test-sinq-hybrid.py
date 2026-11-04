@@ -73,7 +73,7 @@ class HybridTest(unittest.TestCase):
         fixture=importlib.util.module_from_spec(spec); spec.loader.exec_module(fixture)
         binaries=Path(os.environ['SINQ_NATIVE_BIN']); suffix='.exe' if os.name=='nt' else ''
         quantizer=binaries/('llama-quantize'+suffix)
-        env=dict(os.environ,OMP_NUM_THREADS='24',MKL_NUM_THREADS='24',CUDA_VISIBLE_DEVICES='')
+        env=dict(os.environ,OMP_NUM_THREADS='32',MKL_NUM_THREADS='32',CUDA_VISIBLE_DEVICES='')
         def run(args):
             result=subprocess.run([str(x) for x in args],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,timeout=120)
             self.assertEqual(result.returncode,0,result.stderr.decode(errors='replace')[-2000:])
@@ -97,13 +97,13 @@ class HybridTest(unittest.TestCase):
             types=d/'types.txt'; types.write_text('\n'.join('^'+re.escape(n)+'$='+q.lower() for n,q in sorted(recipe.items())))
             stock=d/'stock.gguf'
             common=[quantizer,'--pure','--tensor-type-file',types,'--max-buffer-size','64']
-            run(common+[source,stock,'Q8_0','24'])
+            run(common+[source,stock,'Q8_0','32'])
             lock=d/'baseline.json'; manifest=lock_baseline(source,stock,recipe,lock,quantizer=quantizer,native_validate=load)
             selected=['blk.0.ffn_up.weight','blk.0.ssm_out.weight','blk.1.attn_output.weight']
             self.assertTrue(set(selected)<=set(recipe))
             names=d/'selected.txt'; names.write_text('\n'.join(selected))
             conditioned=d/'conditioned.gguf'
-            run(common+['--sinq-precondition','sidecar','--sinq-tensor-list',names,'--sinq-strip-width','64',source,conditioned,'Q8_0','24'])
+            run(common+['--sinq-precondition','sidecar','--sinq-tensor-list',names,'--sinq-strip-width','64',source,conditioned,'Q8_0','32'])
             r=gguf.GGUFReader(conditioned); stock_reader=gguf.GGUFReader(stock)
             expected={t.name:(t.tensor_type.name,t.shape.tolist(),t.data.tobytes()) for t in stock_reader.tensors}
             for name in ['token_embd.weight','output.weight']+selected:
@@ -154,7 +154,7 @@ class HybridTest(unittest.TestCase):
         spec=importlib.util.spec_from_file_location('kl_fixture',Path(__file__).with_name('test-sinq-groupwise-kl.py'))
         fixture=importlib.util.module_from_spec(spec); spec.loader.exec_module(fixture)
         binaries=Path(os.environ['SINQ_NATIVE_BIN']); suffix='.exe' if os.name=='nt' else ''
-        env=dict(os.environ,OMP_NUM_THREADS='24',MKL_NUM_THREADS='24',CUDA_VISIBLE_DEVICES='')
+        env=dict(os.environ,OMP_NUM_THREADS='32',MKL_NUM_THREADS='32',CUDA_VISIBLE_DEVICES='')
         with tempfile.TemporaryDirectory() as d:
             d=Path(d); source=d/'source.gguf'; fixture.native_fixture(source)
             name='blk.0.ffn_up.weight'; selected=d/'selected.txt'; selected.write_text(name+'\n')

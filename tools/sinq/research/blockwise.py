@@ -11,11 +11,12 @@ def block_delta(adapter, capture, weights):
         actual = adapter.text.layers[capture.layer](capture.hidden_states, **capture.kwargs)
     if actual.shape != capture.reference_output.shape or not torch.isfinite(actual).all():
         raise ValueError('invalid whole-block candidate output')
-    return actual.detach() - capture.reference_output
+    # Promotion must precede subtraction: BF16 subtraction can erase deltas.
+    return actual.detach().float() - capture.reference_output.float()
 
 
 def score_block(adapter, capture, weights):
-    delta = block_delta(adapter, capture, weights).double().reshape(-1)
+    delta = block_delta(adapter, capture, weights).cpu().double().reshape(-1)
     # CPU F64, fixed original coordinate order, independent of candidate ordering.
     return dict(output_l1=float(delta.abs().mean()), output_mse=float(delta.square().mean()),
                 source_id=adapter.source_id, context_id=capture.context_id,

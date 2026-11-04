@@ -126,35 +126,16 @@ def _new_output(config,inputs):
     return output
 
 
-def _advanced_reference(checkpoint,source,budget,threads):
-    import torch
-    from safetensors import safe_open
-    from transformers import Qwen3_5TextConfig,Qwen3_5TextModel,Qwen3_5ForConditionalGeneration
-    from .qwen35_adapter import Qwen35Adapter
-    checkpoint=Path(checkpoint)
-    if not checkpoint.is_dir():raise ValueError('explicit local checkpoint directory required')
-    # Bound full reference residency before allocation. This first graph adapter
-    # uses one resident reference, never multiple candidate model copies.
-    files=sorted(checkpoint.glob('*.safetensors'))
-    if not files:raise ValueError('local safetensors checkpoint required')
-    elements=0
-    for path in files:
-        with safe_open(path,framework='pt',device='cpu') as weights:
-            for name in weights.keys():
-                import math
-                elements+=math.prod(weights.get_slice(name).get_shape())
-    if elements*8>budget:raise ValueError('reference graph exceeds configured resident memory budget')
-    torch.set_num_threads(threads)
-    torch.use_deterministic_algorithms(True)
-    cfg=_json(checkpoint/'config.json')
-    if 'Qwen3_5TextModel' in cfg.get('architectures',[]):
-        model=Qwen3_5TextModel.from_pretrained(str(checkpoint),local_files_only=True,trust_remote_code=False,
-            dtype=torch.float32,attn_implementation='eager').eval()
-        return Qwen35Adapter(model,source,workspace_limit=budget,max_swap_bytes=budget)
-    model=Qwen3_5ForConditionalGeneration.from_pretrained(str(checkpoint),local_files_only=True,
-        trust_remote_code=False,dtype=torch.float32,attn_implementation='eager').eval()
-    return Qwen35Adapter(model.model.language_model,source,lm_head=model.lm_head,
-                         workspace_limit=budget,max_swap_bytes=budget)
+def _advanced_reference(checkpoint,source,budget,threads,*,policy=None,monitor=None):
+    from .reference_loader import load_reference
+    try:
+        return load_reference(checkpoint,source,budget,threads,policy=policy,monitor=monitor)
+    except Exception as error:
+        import traceback
+        message=str(error)
+        kind=ValueError if isinstance(error,ValueError) else RuntimeError
+        traceback.clear_frames(error.__traceback__)
+        raise kind(message) from None
 
 
 def score_config(config):
@@ -194,7 +175,11 @@ def _score(config,run,store,source):
         from .blockwise import score_block,block_delta
         from .capture import capture_block
         from .fisher import qwen_probes
-        if config['device']!='cpu':raise ValueError('this graph/VJP adapter supports explicit CPU execution only')
+        from .execution_backend import resolve_policy
+        from .memory_accounting import ResourceMonitor
+        policy=resolve_policy(config)
+        print('SINQ execution policy: '+canonical_json(policy.identity()).decode(),file=sys.stderr)
+        monitor=ResourceMonitor(policy)
         allowed={'schema_version','source_sha256','tokens','layers','attention_mask','position_ids','baseline'}
         if set(capture)-allowed or not {'schema_version','source_sha256','tokens','layers'}<=set(capture) or capture['schema_version']!=1 or capture['source_sha256']!=run['source_sha256']:
             raise ValueError('invalid versioned block capture specification')
@@ -208,31 +193,84 @@ def _score(config,run,store,source):
         if len(layers)>b['max_tensors']:raise ValueError('capture layer budget exceeded')
         upstream=graph_assignment(run,store,capture.get('baseline',{}),before_layer=min(layers))
         requested=observations(run,store,config,layers)
-        adapter=_advanced_reference(config['checkpoint'],source,b['workspace_bytes'],config['threads'])
-        baseline={name:native_codec.decode(config['native_bridge'],candidate,workspace_bytes=b['workspace_bytes'],threads=config['threads'])
-                  for name,candidate in upstream.items()}
-        for layer in layers:
-            locked=capture_block(adapter,tokens,layer,context=config['context'],baseline=baseline,
-                attention_mask=mask,position_ids=positions,max_tokens=b['max_tokens'],max_capture_bytes=b['workspace_bytes'])
-            probes=qwen_probes(adapter,locked,probes=config['probes'],seed=config['seed'],max_vjps=b['max_probes'],max_cache_bytes=b['workspace_bytes']) if method=='fisher_vjp_mc' else None
-            for label,index,candidates in requested:
-                if index!=layer:continue
-                if sum(c.provenance['shape'][0]*c.provenance['shape'][1]*32 for c in candidates.values())>b['workspace_bytes']:
-                    raise ValueError('joint candidate decode/swap workspace budget exceeded')
-                effective={name:native_codec.decode(config['native_bridge'],c,workspace_bytes=b['workspace_bytes'],threads=config['threads']) for name,c in candidates.items()}
-                if probes is None:
-                    score=score_block(adapter,locked,effective);value=score[config['objective']]
-                else:
-                    value=probes.score(block_delta(adapter,locked,effective));score=dict(provenance=probes.metadata)
-                record=dict(assignment_name=label,assignment={name:c.candidate_id for name,c in candidates.items()},
-                    layer=layer,method=method,objective=config['objective'],score=value,details=score)
-                if len(candidates)==1:
-                    name=next(iter(candidates));record.update(tensor=name,candidate_id=candidates[name].candidate_id)
-                records.append(record)
+        # Check the entire decoded baseline before loading or decoding tensors.
+        baseline_bytes=sum(c.provenance['shape'][0]*c.provenance['shape'][1]*
+            (12+2*torch.empty((),dtype=policy.dtype).element_size()) for c in upstream.values())
+        if baseline_bytes>b['workspace_bytes']:
+            raise ValueError('aggregate baseline decode/swap exceeds workspace budget')
+        phase_records=2*(2+len(layers)*(1+(method=='fisher_vjp_mc'))+len(requested))+1
+        if phase_records*4096>min(b['max_output_bytes'],b['workspace_bytes']):
+            raise ValueError('phase diagnostics exceed bounded output/workspace budget')
+        monitor.max_records=phase_records
+        with monitor.phase('load-and-source-verify'):
+            adapter=_advanced_reference(config['checkpoint'],source,b['workspace_bytes'],config['threads'],policy=policy,monitor=monitor)
+        if adapter.identity['source_gguf_sha256']!=run['source_sha256']:
+            raise ValueError('reference source changed after candidate provenance validation')
+        # Cooperative guards at layer boundaries complement polling and allocator caps.
+        guard_handles=[layer.register_forward_pre_hook(lambda *args: monitor.check() and None)
+                       for layer in adapter.text.layers]
+        try:
+            with monitor.phase('baseline-decode'):
+                baseline={name:native_codec.decode(config['native_bridge'],candidate,workspace_bytes=b['workspace_bytes'],threads=config['threads'])
+                          for name,candidate in upstream.items()}
+            for layer in layers:
+                with monitor.phase(f'capture-{layer}'):
+                    locked=capture_block(adapter,tokens,layer,context=config['context'],baseline=baseline,
+                        attention_mask=mask,position_ids=positions,max_tokens=b['max_tokens'],max_capture_bytes=b['workspace_bytes'])
+                probes=None
+                if method=='fisher_vjp_mc':
+                    with monitor.phase(f'fisher-{layer}'):
+                        probes=qwen_probes(adapter,locked,probes=config['probes'],seed=config['seed'],
+                            max_vjps=b['max_probes'],max_cache_bytes=b['workspace_bytes'])
+                for label,index,candidates in requested:
+                    if index!=layer:continue
+                    if sum(c.provenance['shape'][0]*c.provenance['shape'][1]*(12+2*torch.empty((),dtype=policy.dtype).element_size()) for c in candidates.values())>b['workspace_bytes']:
+                        raise ValueError('joint candidate decode/swap workspace budget exceeded')
+                    with monitor.phase(f'candidate-{layer}-{label}'):
+                        effective={name:native_codec.decode(config['native_bridge'],c,workspace_bytes=b['workspace_bytes'],threads=config['threads']) for name,c in candidates.items()}
+                        if probes is None:
+                            score=score_block(adapter,locked,effective);value=score[config['objective']]
+                        else:
+                            value=probes.score(block_delta(adapter,locked,effective));score=dict(provenance=probes.metadata)
+                        record=dict(assignment_name=label,assignment={name:c.candidate_id for name,c in candidates.items()},
+                            layer=layer,method=method,objective=config['objective'],score=value,details=score)
+                        if len(candidates)==1:
+                            name=next(iter(candidates));record.update(tensor=name,candidate_id=candidates[name].candidate_id)
+                        records.append(record)
+                        del effective
+                del probes,locked
+            adapter.assert_reference()
+            monitor.check()
+        except (ValueError,RuntimeError,NotImplementedError) as error:
+            import traceback
+            diagnostic=canonical_json(dict(code='BACKEND_EXECUTION_FAILED',reason=str(error),
+                execution_policy=policy.identity(),resource_measurements=monitor.records)).decode()
+            # Do not retain failed autograd graphs in chained callee frames.
+            traceback.clear_frames(error.__traceback__)
+            raise RuntimeError(diagnostic) from None
+        except BaseException as error:
+            import traceback
+            traceback.clear_frames(error.__traceback__)
+            raise
+        finally:
+            for handle in guard_handles:handle.remove()
+            guard_handles.clear()
+            baseline=None; probes=None; locked=None; effective=None
+            if sys.exc_info()[0] is not None: adapter=None
     if not records:raise ValueError('requested score stage produced no candidate observations')
-    output=_new_output(config,[source,config['candidate_manifest'],config['capture_manifest']])
     result=dict(schema_version=1,status='PASS',method=method,objective=config['objective'],records=records,
                 candidate_manifest_sha256=file_digest(config['candidate_manifest']))
+    if method!='local':
+        result['reference_identity']=adapter.identity
+        result['execution_policy']=policy.identity()
+        result['resource_measurements']=monitor.records
+        result['loading_estimates']=adapter.loading_estimates
+        result['execution_identity_sha256']=adapter.source_id
+    result['checksum']=digest(result)
+    # Validate serialized size before creating an immutable output directory.
+    if len(canonical_json(result))>b['max_output_bytes']:
+        raise ValueError('score output byte budget exceeded')
+    output=_new_output(config,[source,config['candidate_manifest'],config['capture_manifest']])
     atomic_write(output/'scores.json',canonical_json(result),max_bytes=b['max_output_bytes'])
     return result
 

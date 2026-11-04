@@ -17,7 +17,7 @@ from unittest.mock import patch
 
 ROOT=Path(__file__).resolve().parents[1]
 sys.path[:0]=[str(ROOT),str(ROOT/'gguf-py')]
-os.environ.update(OMP_NUM_THREADS='24',MKL_NUM_THREADS='24',HF_HUB_OFFLINE='1',TRANSFORMERS_OFFLINE='1',CUDA_VISIBLE_DEVICES='0')
+os.environ.update(OMP_NUM_THREADS='32',MKL_NUM_THREADS='32',HF_HUB_OFFLINE='1',TRANSFORMERS_OFFLINE='1',CUDA_VISIBLE_DEVICES='0')
 # Dependency-bound correctness coverage must be an explicit SKIP, never a stub.
 import importlib.util
 if any(importlib.util.find_spec(name) is None for name in ('torch','transformers','numpy','safetensors')):
@@ -75,7 +75,7 @@ def main():
         write(d/'pairing.json',pairing)
         budgets=dict(workspace_bytes=128<<20,max_candidates=32,max_output_bytes=64<<20,max_files=2000,
             max_tensors=8,max_tokens=32,max_probes=32,max_evaluations=200)
-        common=dict(schema_version=1,budgets=budgets,threads=24)
+        common=dict(schema_version=1,budgets=budgets,threads=32)
         raw_config=dict(common,operation='generate',source_gguf=str(source),activation_manifest=str(d/'train/activations.json'),
             validation_manifest=str(d/'validation/activations.json'),pairing_manifest=str(d/'pairing.json'),tensor_list=names,
             native_quantizer=dict(recipe={name:q for name,q in zip(names,['q3_k','iq3_s','iq4_xs'])},sinq_strip_width=64,sinq_iterations=16,sinq_strength=.75),
@@ -92,7 +92,7 @@ def main():
         type_file=d/'stock-types.txt';type_file.write_text('\n'.join('^'+re.escape(name)+'$='+q.lower() for name,q in sorted(complete_recipe.items())))
         stock_model=d/'complete-stock.gguf'
         produced=subprocess.run([str(binaries/('llama-quantize'+suffix)),'--pure','--tensor-type-file',str(type_file),
-            '--max-buffer-size','64',str(source),str(stock_model),'Q8_0','24'],capture_output=True,timeout=120)
+            '--max-buffer-size','64',str(source),str(stock_model),'Q8_0','32'],capture_output=True,timeout=120)
         assert produced.returncode==0,produced.stderr[-1500:]
         baseline_manifest=d/'stock-baseline.json'
         lock=lock_baseline_config(validate_config(dict(common,operation='lock_baseline',source_gguf=str(source),
@@ -163,7 +163,7 @@ def main():
             assert all(np.isfinite(c['score']) and c['score']>=0 for c in result['records'])
         from tools.sinq.research.partition import capture_splits
         import torch
-        adapter=_advanced_reference(checkpoint,source,budgets['workspace_bytes'],24)
+        adapter=_advanced_reference(checkpoint,source,budgets['workspace_bytes'],32)
         capture_splits(adapter,torch.tensor([tokens]),names,d/'production-split',context=2,rows=2,seed=17,
             validation_chunks=1,max_tokens=32,max_output_bytes=budgets['max_output_bytes'])
         for split in ('train','validation'):
@@ -260,7 +260,7 @@ def main():
             tensor_count=3,candidates_per_tensor=5,complete_stock_baseline_verified=True,joint_block_and_fisher_verified=True,
             cli_resume_verified=True,generation_resume_verified=True,corpus_partitions_verified=True,strength_zero_metadata_verified=True,split_before_reservoir_native_validated=True,codecs=['Q3_K','IQ3_S','IQ4_XS'],
             cache_ids={n:[c['candidate_id'] for c in r['candidates']] for n,r in run['tensors'].items()},
-            hybrid_sha256=outputs,deterministic_forward_tokens=len(tokens),native_kld_tokens=8,selection_evaluations=selected['evaluations'],cpu_threads=24,
+            hybrid_sha256=outputs,deterministic_forward_tokens=len(tokens),native_kld_tokens=8,selection_evaluations=selected['evaluations'],cpu_threads=32,
             elapsed_seconds=time.monotonic()-start)
         from tools.sinq.research.resources import peak_rss_bytes
         summary['parent_peak_rss_bytes']=peak_rss_bytes()

@@ -76,6 +76,20 @@ class RepairTests(unittest.TestCase):
             reference.assert_not_called();decode.assert_not_called()
         self.assertFalse((self.d/'scores').exists())
 
+    def test_aggregate_baseline_rejected_before_decode(self):
+        value=json.loads(self.capture.read_bytes())
+        value['baseline']={name:self.ids[name]['ordinary'] for name in self.names}
+        self.capture.write_bytes(canonical_json(value))
+        config=validate_config(dict(schema_version=1,operation='score',method='blockwise',objective='output_mse',
+            candidate_manifest=str(self.manifest),capture_manifest=str(self.capture),output_directory=str(self.d/'scores'),
+            checkpoint='unused',native_bridge='unused',context='selected_quantized_inputs',
+            budgets={**self.budgets,'workspace_bytes':1024}))
+        with patch.object(cli,'_advanced_reference') as reference,patch.object(cli.native_codec,'decode') as decode:
+            reference.return_value.identity={'source_gguf_sha256':self.source_hash}
+            with self.assertRaisesRegex(ValueError,'aggregate baseline'):cli.score_config(config)
+            decode.assert_not_called()
+        self.assertFalse((self.d/'scores').exists())
+
     def test_artifact_validation_checks_stock_baseline_closure(self):
         run=copy.deepcopy(self.run)
         run['stock_baseline']={'manifest':'../missing-baseline.json','manifest_sha256':'a'*64,

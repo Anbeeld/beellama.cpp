@@ -170,7 +170,7 @@ def verify_reference_config(reader, config):
 
 
 def verify_reference_identity(model, config, tensors, workspace_limit=64 * 1024 * 1024,
-                              require_exact_execution_storage=False):
+                              require_exact_execution_storage=False, resource_check=None):
     """Check the complete text network with bounded row buffers, before capture."""
     import numpy as np
     import torch
@@ -191,8 +191,13 @@ def verify_reference_identity(model, config, tensors, workspace_limit=64 * 1024 
         if mapped is None:
             raise ValueError('unmapped reference text parameter: ' + name)
         if mapped == 'output.weight' and mapped not in tensors and getattr(config, 'tie_word_embeddings', False):
-            if embedding is None or not torch.equal(parameter.detach().cpu(), embedding.detach().cpu()):
+            if embedding is None or parameter.shape != embedding.shape:
                 raise ValueError('reference output is not tied to token embeddings')
+            width = max(1, workspace_limit // max(1, parameter.shape[-1] * 16))
+            for first in range(0, parameter.shape[0], width):
+                if not torch.equal(parameter[first:first + width].detach().cpu(),
+                                   embedding[first:first + width].detach().cpu()):
+                    raise ValueError('reference output is not tied to token embeddings')
             aliases.append(name)
             continue
         if mapped not in tensors:
@@ -229,11 +234,12 @@ def verify_reference_identity(model, config, tensors, workspace_limit=64 * 1024 
         slab = min(rows, workspace_limit // row_bytes)
         digest = hashlib.sha256()
         for first in range(0, rows, slab):
+            if resource_check is not None: resource_check()
             stop = min(rows, first + slab)
             if matrix:
-                block = value[first:stop] if row_order is None else value[torch.from_numpy(row_order[first:stop])]
+                block = value[first:stop] if row_order is None else value[torch.as_tensor(row_order[first:stop], device=value.device)]
                 if column_order is not None:
-                    block = block[:, torch.from_numpy(column_order)]
+                    block = block[:, torch.as_tensor(column_order, device=value.device)]
                 expected = floating_tensor(tensors[mapped], slice(first, stop))
             else:
                 block = value

@@ -56,7 +56,7 @@ class NativeGenerationResumeTests(unittest.TestCase):
             native_quantizer=dict(recipe={name:'q5_0' for name in self.names},sinq_strip_width=64,sinq_iterations=4,sinq_strength=.75),
             generators=['ordinary','awq_weight_activation'],alphas=[.5],correction_strengths=[1],
             search=dict(strategy='small_grid',local_objective='output_mse',selection_policy='in_sample',max_shortlist=0,refine_step=.1,tolerance=0),
-            output_directory=str(self.d/'run'),native_bridge=str(bridge),threads=24,
+            output_directory=str(self.d/'run'),native_bridge=str(bridge),threads=32,
             budgets=dict(workspace_bytes=32<<20,max_candidates=8,max_output_bytes=8<<20,max_files=100,max_tensors=2,max_tokens=16,max_probes=4,max_evaluations=16))
         self.config=validate_config(self.raw);self.output=Path(self.raw['output_directory'])
 
