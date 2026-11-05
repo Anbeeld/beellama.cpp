@@ -220,8 +220,11 @@ def _score(config,run,store,source):
                 probes=None
                 if method=='fisher_vjp_mc':
                     with monitor.phase(f'fisher-{layer}'):
+                        fisher_options={}
+                        if 'fisher_positions' in config:
+                            fisher_options['positions']=config['fisher_positions']
                         probes=qwen_probes(adapter,locked,probes=config['probes'],seed=config['seed'],
-                            max_vjps=b['max_probes'],max_cache_bytes=b['workspace_bytes'])
+                            max_vjps=b['max_probes'],max_cache_bytes=b['workspace_bytes'],**fisher_options)
                 for label,index,candidates in requested:
                     if index!=layer:continue
                     if sum(c.provenance['shape'][0]*c.provenance['shape'][1]*(12+2*torch.empty((),dtype=policy.dtype).element_size()) for c in candidates.values())>b['workspace_bytes']:

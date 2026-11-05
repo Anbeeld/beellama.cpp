@@ -158,9 +158,11 @@ def main():
             score=dict(common,operation='score',method=method,objective=objective,candidate_manifest=str(manifest),
                 capture_manifest=str(d/'blocks.json'),context='reference_inputs',checkpoint=str(checkpoint),native_bridge=bridge,
                 families=['ordinary'],output_directory=str(d/method))
-            if method=='fisher_vjp_mc':score.update(probes=2,seed=617)
+            if method=='fisher_vjp_mc':score.update(probes=2,seed=617,fisher_positions=[[0,1],[0,3]])
             result=score_config(validate_config(score));assert len(result['records'])==3
             assert all(np.isfinite(c['score']) and c['score']>=0 for c in result['records'])
+            if method=='fisher_vjp_mc':
+                assert all(c['details']['provenance']['positions']==[[0,1],[0,3]] for c in result['records'])
         from tools.sinq.research.partition import capture_splits
         import torch
         adapter=_advanced_reference(checkpoint,source,budgets['workspace_bytes'],32)

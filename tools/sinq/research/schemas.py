@@ -30,7 +30,7 @@ OPERATION_FIELDS = {
         {'validation_manifest', 'pairing_manifest', 'stock_baseline_manifest', 'corpus_partitions_manifest'}),
     'score': ({'method', 'objective', 'candidate_manifest', 'capture_manifest', 'output_directory'},
         {'families', 'device', 'reference_dtype', 'cuda_devices', 'memory_policy', 'context', 'checkpoint', 'native_bridge', 'probes', 'seed',
-         'validation_manifest', 'pairing_manifest', 'selection_policy', 'assignments'}),
+         'validation_manifest', 'pairing_manifest', 'selection_policy', 'assignments', 'fisher_positions'}),
     'assemble': ({'source_gguf', 'candidate_manifest', 'assignment', 'output_gguf'}, {'native_loader', 'stock_baseline_manifest'}),
     'lock_corpora': ({'token_sources', 'partitions', 'output_manifest'}, set()),
     'lock_baseline': ({'source_gguf', 'stock_gguf', 'recipe', 'quantizer', 'native_loader', 'output_manifest'}, {'imatrix_path', 'timeout'}),
@@ -227,6 +227,8 @@ def validate_config(config):
         tensors, candidates = _generate(c)
     elif operation == 'score':
         method = _choice(c['method'], ('local', 'blockwise', 'fisher_vjp_mc'), 'method')
+        if 'fisher_positions' in c and method != 'fisher_vjp_mc':
+            raise ValueError('fisher_positions is only valid for fisher_vjp_mc')
         objectives = ('fisher_quadratic',) if method == 'fisher_vjp_mc' else ('output_l1', 'output_mse')
         _choice(c['objective'], objectives, 'objective')
         for family in _names(c.setdefault('families', list(FAMILIES)), 'families'):
@@ -261,6 +263,20 @@ def validate_config(config):
             _integer(c.get('probes'), 'probes'); _integer(c.get('seed'), 'seed', 0)
             if c['probes'] > c['budgets']['max_probes']:
                 raise ValueError('probe budget exceeded')
+            if 'fisher_positions' in c:
+                positions = c['fisher_positions']
+                if not isinstance(positions, list) or not positions:
+                    raise ValueError('fisher_positions must be a nonempty list of [batch,time] pairs')
+                normalized = []
+                for position in positions:
+                    if (not isinstance(position, list) or len(position) != 2 or
+                            any(type(index) is not int or index < 0 for index in position)):
+                        raise ValueError('fisher_positions entries must be nonnegative integer [batch,time] pairs')
+                    normalized.append(tuple(position))
+                if len(set(normalized)) != len(normalized):
+                    raise ValueError('fisher_positions must be unique')
+                if 'max_probes' not in c['budgets'] or len(positions) * c['probes'] > c['budgets']['max_probes']:
+                    raise ValueError('fisher_positions exceed the VJP budget')
     elif operation == 'lock_corpora':
         _mapping(c['token_sources'],'token_sources')
         _fields(c['partitions'], {'calibration','selection','final_test'}, {'validation'}, 'corpus partitions')

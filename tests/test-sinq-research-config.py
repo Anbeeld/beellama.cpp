@@ -144,6 +144,20 @@ class ConfigTests(unittest.TestCase):
         c['method']='local'
         with self.assertRaises(ValueError):validate_config(c)
 
+    def test_advanced_fisher_positions_are_bounded_and_unique(self):
+        c=dict(schema_version=1,operation='score',method='fisher_vjp_mc',objective='fisher_quadratic',
+            candidate_manifest='c.json',capture_manifest='capture.json',output_directory='scores',
+            checkpoint='checkpoint',native_bridge='bridge',context='reference_inputs',probes=2,seed=17,
+            fisher_positions=[[0,0],[0,10],[0,21],[0,31]],budgets=config()['budgets'])
+        self.assertEqual(validate_config(c)['fisher_positions'],[[0,0],[0,10],[0,21],[0,31]])
+        for positions in ([],[[0,0],[0,0]],[[True,1]],[[0,-1]],[[0,1,2]],'0,1'):
+            bad=dict(c,fisher_positions=positions)
+            with self.subTest(positions=positions),self.assertRaises(ValueError):validate_config(bad)
+        bad=dict(c,method='blockwise',objective='output_mse')
+        with self.assertRaises(ValueError):validate_config(bad)
+        bad=dict(c,budgets={**c['budgets'],'max_probes':7})
+        with self.assertRaises(ValueError):validate_config(bad)
+
     def test_complete_stock_baseline_operation_and_bindings(self):
         c=dict(schema_version=1,operation='lock_baseline',source_gguf='source.gguf',stock_gguf='stock.gguf',
             recipe={'norm.weight':'F32','token_embd.weight':'Q5_0'},quantizer='quantizer',native_loader='loader',
