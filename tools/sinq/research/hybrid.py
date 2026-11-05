@@ -6,7 +6,7 @@ from pathlib import Path
 import tempfile
 import numpy as np
 import gguf
-from .resources import digest, file_digest, reject_alias
+from .resources import digest, file_digest, reject_alias, tensor_hashes
 
 PREFIX='beellama.qk_sinq.'
 FIELDS={'version','tensors','algorithm','strip_width','iterations','producer','numerics'}
@@ -20,7 +20,8 @@ def _bytes_hash(data):
     return h.hexdigest()
 
 
-def assemble(source, output, store, assignment, *, native_validate, max_output_bytes=1 << 34, stock_baseline=None):
+def assemble(source, output, store, assignment, *, native_validate, max_output_bytes=1 << 34, stock_baseline=None, threads=1):
+    """Use up to threads hash workers; GGUF writes and store access stay serial."""
     reader=gguf.GGUFReader(source)
     maps=[]; stock_reader=None; manifest=None
     try:
@@ -29,20 +30,21 @@ def assemble(source, output, store, assignment, *, native_validate, max_output_b
             manifest,baseline_path=load_baseline(stock_baseline,source)
             reject_alias(output,[baseline_path,stock_baseline])
             stock_reader=gguf.GGUFReader(baseline_path)
-        return _assemble(source,output,store,assignment,native_validate=native_validate,max_output_bytes=max_output_bytes,reader=reader,maps=maps,stock_reader=stock_reader,manifest=manifest,stock_baseline=stock_baseline)
+        return _assemble(source,output,store,assignment,native_validate=native_validate,max_output_bytes=max_output_bytes,reader=reader,maps=maps,stock_reader=stock_reader,manifest=manifest,stock_baseline=stock_baseline,threads=threads)
     finally:
         for mapped in maps: mapped._mmap.close()
         if stock_reader is not None: stock_reader.data._mmap.close()
         reader.data._mmap.close()
 
 
-def assemble_from_anchor(source, anchor, anchor_manifest, candidate_manifest, output, store, assignment, *, native_validate, max_output_bytes=1 << 34):
+def assemble_from_anchor(source, anchor, anchor_manifest, candidate_manifest, output, store, assignment, *, native_validate, max_output_bytes=1 << 34, threads=1):
     """Assemble from a locked historical conditioned anchor without requantizing it.
 
     Candidate provenance is checked against the original floating source, while all
     unassigned tensors and metadata originate from the historical mixed-quant anchor.
     The complete conditioned allocation must be explicit so no stale scale pair can
-    survive a replacement.
+    survive a replacement. threads bounds parallel tensor hashing only; writing
+    and candidate-store verification remain sequential.
     """
     source,anchor,anchor_manifest,candidate_manifest,output=map(Path,(source,anchor,anchor_manifest,candidate_manifest,output))
     reject_alias(output,[source,anchor,anchor_manifest,candidate_manifest])
@@ -130,13 +132,13 @@ def assemble_from_anchor(source, anchor, anchor_manifest, candidate_manifest, ou
                 raise ValueError('historical anchor or input lock changed during assembly')
         return _assemble(source,output,store,assignment,native_validate=native_validate,max_output_bytes=max_output_bytes,
             reader=source_reader,maps=maps,stock_reader=anchor_reader,manifest=None,stock_baseline=None,
-            prepublish_check=prepublish_check)
+            prepublish_check=prepublish_check,threads=threads)
     finally:
         for mapped in maps: mapped._mmap.close()
         anchor_reader.data._mmap.close();source_reader.data._mmap.close()
 
 
-def _assemble(source, output, store, assignment, *, native_validate, max_output_bytes, reader, maps, stock_reader, manifest, stock_baseline, prepublish_check=None):
+def _assemble(source, output, store, assignment, *, native_validate, max_output_bytes, reader, maps, stock_reader, manifest, stock_baseline, prepublish_check=None, threads=1):
     """Validate callback must raise on native loader failure; publication follows it.
 
     Assignment replaces complete payload/sidecar pairs. Existing conditioned tensors
@@ -174,12 +176,13 @@ def _assemble(source, output, store, assignment, *, native_validate, max_output_
         raise ValueError('existing conditioned tensors require explicit candidate assignment')
     source_hash=file_digest(source)
     candidates={name:store.get(key,expected={'source_sha256':source_hash,'tensor_name':name}) for name,key in sorted(assignment.items())}
+    source_hashes=tensor_hashes(((name,tensors[name].data) for name in candidates),threads=threads)
     for name,c in candidates.items():
         reject_alias(output,[c.payload]+([c.scales] if c.scales else []))
         t=tensors[name]
         if list(reversed(t.shape.tolist())) != c.provenance['shape']:
             raise ValueError('candidate tensor shape mismatch')
-        if t.tensor_type.name!=c.provenance['source_qtype'] or _bytes_hash(t.data)!=c.provenance['input_sha256']:
+        if t.tensor_type.name!=c.provenance['source_qtype'] or source_hashes[name]!=c.provenance['input_sha256']:
             raise ValueError('candidate original tensor qtype/digest mismatch')
     if manifest is not None:
         stock_tensors={t.name:t for t in stock_reader.tensors}
@@ -248,11 +251,10 @@ def _assemble(source, output, store, assignment, *, native_validate, max_output_
             writer.add_uint32(PREFIX+'iterations',iterations)
             writer.add_string(PREFIX+'producer','beellama-sinq-research-v1')
             writer.add_string(PREFIX+'numerics',numerics)
-        hashes={}
+        hashes=tensor_hashes(((name,data) for name,_,_,data in items),threads=threads)
         for name,shape,q,data in items:
             # Logical shape is already known; uint8 would trigger byte-shape conversion.
             writer.add_tensor_info(name,shape,np.dtype('float16'),data.nbytes,raw_dtype=q)
-            hashes[name]=_bytes_hash(data)
         writer.write_header_to_file(); writer.write_kv_data_to_file(); writer.write_ti_data_to_file()
         for _,_,_,data in items:
             writer.write_tensor_data(data)
@@ -260,7 +262,7 @@ def _assemble(source, output, store, assignment, *, native_validate, max_output_
         with open(temp,'r+b') as f: os.fsync(f.fileno())
         check=gguf.GGUFReader(temp)
         try:
-            if {t.name:_bytes_hash(t.data) for t in check.tensors} != hashes:
+            if tensor_hashes(((t.name,t.data) for t in check.tensors),threads=threads) != hashes:
                 raise ValueError('GGUF payload readback mismatch')
             keys={k[len(PREFIX):] for k in check.fields if k.startswith(PREFIX)}
             if keys != (FIELDS if conditioned else set()):

@@ -12,6 +12,19 @@ m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 from tools.sinq.research.resources import file_digest
 
 class HybridTest(unittest.TestCase):
+    def test_parallel_hashes_match_independent_digests(self):
+        from tools.sinq.research.resources import tensor_hashes
+        arrays=[(str(i),np.arange((1<<20)+i,dtype=np.float32)) for i in range(5)]
+        expected={name:hashlib.sha256(data.tobytes()).hexdigest() for name,data in arrays}
+        for threads in (1,2,4):
+            self.assertEqual(tensor_hashes(arrays,threads=threads),expected)
+            self.assertEqual(list(tensor_hashes(arrays,threads=threads)),list(expected))
+        self.assertEqual(tensor_hashes([],threads=4),{})
+        for threads in (0,-1,True,1.5):
+            with self.assertRaises(ValueError):tensor_hashes(arrays,threads=threads)
+        with self.assertRaises(AttributeError):
+            tensor_hashes([('valid',arrays[0][1]),('invalid',None)],threads=2)
+
     def test_imported_anchor_preserves_unassigned_quantized_payloads(self):
         from tools.sinq.research.resources import digest
         with tempfile.TemporaryDirectory() as directory:
@@ -101,6 +114,14 @@ class HybridTest(unittest.TestCase):
             self.assertEqual(after['norm'],before['norm'])
             changed_audit=audit_assembled_model(changed,anchor,lock,run_path,store,{selected:alternate_key,selected2:anchor_key2},recipe='T340')
             self.assertEqual(changed_audit['changed_tensors'],[selected])
+            parallel=d/'parallel.gguf'
+            assemble_from_anchor(source,anchor,lock,run_path,parallel,store,
+                {selected:alternate_key,selected2:anchor_key2},native_validate=lambda path:None,threads=4)
+            self.assertEqual(parallel.read_bytes(),changed.read_bytes())
+            parallel_audit=audit_assembled_model(parallel,anchor,lock,run_path,store,
+                {selected:alternate_key,selected2:anchor_key2},recipe='T340',threads=4)
+            self.assertEqual({k:v for k,v in parallel_audit.items() if k!='model_path'},
+                             {k:v for k,v in changed_audit.items() if k!='model_path'})
             missing=d/'missing.gguf'
             with self.assertRaisesRegex(ValueError,'all conditioned anchor tensors'):
                 assemble_from_anchor(source,anchor,lock,run_path,missing,store,{},native_validate=lambda path:None)

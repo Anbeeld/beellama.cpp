@@ -22,6 +22,30 @@ def file_digest(path, chunk_bytes=1 << 20):
     return h.hexdigest()
 
 
+def tensor_hashes(items, *, threads=1):
+    """Hash independent (name, ndarray) buffers without copying or reordering them.
+
+    Workers only read buffers; the caller must keep mappings open until return.
+    The pool is joined on errors too, before callers can close those mappings.
+    """
+    import numpy as np
+    from concurrent.futures import ThreadPoolExecutor
+    if isinstance(threads, bool) or not isinstance(threads, int) or threads < 1:
+        raise ValueError('hash threads must be a positive integer')
+    items = list(items)
+    def hash_item(item):
+        name, data = item
+        raw = data.view(np.uint8).reshape(-1)
+        h = hashlib.sha256()
+        for start in range(0, raw.size, 1 << 20):
+            h.update(raw[start:start + (1 << 20)])
+        return name, h.hexdigest()
+    if threads == 1 or len(items) < 2:
+        return dict(map(hash_item, items))
+    with ThreadPoolExecutor(max_workers=min(threads, len(items))) as pool:
+        return dict(pool.map(hash_item, items))
+
+
 def reject_alias(output, inputs):
     output = Path(output)
     for item in inputs:

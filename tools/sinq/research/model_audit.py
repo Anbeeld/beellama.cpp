@@ -1,22 +1,15 @@
 """Audit an assembled model against its locked historical anchor and candidates."""
 from __future__ import annotations
-import hashlib
 import json
 import math
 from pathlib import Path
 import numpy as np
 import gguf
-from .resources import digest, file_digest
+from .resources import digest, file_digest, tensor_hashes
 
 PREFIX='beellama.qk_sinq.'
 SINQ_FIELDS={'version','tensors','algorithm','strip_width','iterations','producer','numerics'}
 _METADATA_EXCEPTIONS={'GGUF.version','GGUF.tensor_count','GGUF.kv_count','general.file_type',PREFIX+'producer'}
-
-
-def _array_sha(data):
-    h=hashlib.sha256();raw=data.view(np.uint8).reshape(-1)
-    for start in range(0,raw.size,1<<20):h.update(raw[start:start+(1<<20)])
-    return h.hexdigest()
 
 
 def _simple(value):
@@ -28,15 +21,19 @@ def _simple(value):
     return value
 
 
-def _inventory(reader):
+def _inventory(reader, *, threads=1):
+    hashes=tensor_hashes(((t.name,t.data) for t in reader.tensors),threads=threads)
     return {tensor.name:{'qtype':tensor.tensor_type.name,
             'shape':list(reversed(tensor.shape.tolist())),
-            'bytes':int(tensor.data.nbytes),'sha256':_array_sha(tensor.data)}
+            'bytes':int(tensor.data.nbytes),'sha256':hashes[tensor.name]}
             for tensor in reader.tensors}
 
 
-def audit_assembled_model(model,anchor,anchor_manifest,candidate_manifest,store,assignment,*,recipe):
-    """Verify complete weight/sidecar identity, anchor inheritance and GGUF metadata."""
+def audit_assembled_model(model,anchor,anchor_manifest,candidate_manifest,store,assignment,*,recipe,threads=1):
+    """Verify anchor inheritance and metadata with up to threads tensor hash workers.
+
+    Candidate-store verification remains serial; no validation is skipped.
+    """
     model,anchor,anchor_manifest,candidate_manifest=map(Path,(model,anchor,anchor_manifest,candidate_manifest))
     lock=json.loads(anchor_manifest.read_text(encoding='utf-8'))
     if lock.get('schema_version')!=1 or lock.get('checksum')!=digest({k:v for k,v in lock.items() if k!='checksum'}):
@@ -59,7 +56,7 @@ def audit_assembled_model(model,anchor,anchor_manifest,candidate_manifest,store,
     source_sha=lock['source_sha256'];recipe_sha=lock['recipe_sha256'];imatrix_sha=lock['imatrix_sha256']
     anchor_reader=gguf.GGUFReader(anchor);model_reader=gguf.GGUFReader(model)
     try:
-        anchor_inventory=_inventory(anchor_reader);model_inventory=_inventory(model_reader)
+        anchor_inventory=_inventory(anchor_reader,threads=threads);model_inventory=_inventory(model_reader,threads=threads)
         base_names=set(records)
         if set(n for n in anchor_inventory if not n.endswith('.sinq_scale2'))!=base_names:
             raise ValueError('anchor audit base tensor inventory differs from lock')

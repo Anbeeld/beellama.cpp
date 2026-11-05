@@ -115,7 +115,7 @@ def _assemble(config,run,store,source):
     baseline,locked=_stock_baseline(config,run,source)
     return dict(status='PASS',source_sha256=run['source_sha256'],stock_baseline_sha256=locked['baseline_sha256'] if locked else None,
         output_sha256=assemble(source,config['output_gguf'],store,config['assignment'],stock_baseline=baseline,
-        native_validate=_validator(config.get('native_loader'),threads=config['threads']),max_output_bytes=config['budgets']['max_output_bytes']))
+        native_validate=_validator(config.get('native_loader'),threads=config['threads']),max_output_bytes=config['budgets']['max_output_bytes'],threads=config['threads']))
 
 
 def _new_output(config,inputs):
@@ -341,7 +341,7 @@ def _select(config,run,store,source,*,resume=None):
             with tempfile.TemporaryDirectory(prefix='.evaluation-',dir=output) as temporary:
                 path=Path(temporary)/'hybrid.gguf'
                 assemble(source,path,store,dict(state.assignment),stock_baseline=stock,
-                    native_validate=validator,max_output_bytes=b['max_output_bytes'])
+                    native_validate=validator,max_output_bytes=b['max_output_bytes'],threads=config['threads'])
                 return evaluator.evaluate(path,e['corpus'],e['reference'],split=config['selection_split'],cache_directory=output/'scores')
         result=coordinate_descent(initial,groups,evaluate,checkpoint=output/'checkpoint.json',
             max_evaluations=b['max_evaluations'],max_passes=config['max_passes'],tolerance=config['tolerance'],split=config['selection_split'])
@@ -354,7 +354,7 @@ def _select(config,run,store,source,*,resume=None):
         with tempfile.TemporaryDirectory(prefix='.finalize-',dir=output) as temporary:
             path=Path(temporary)/'best.gguf'
             best_hash=assemble(source,path,store,dict(result.state.assignment),stock_baseline=stock,
-                native_validate=validator,max_output_bytes=b['max_output_bytes'])
+                native_validate=validator,max_output_bytes=b['max_output_bytes'],threads=config['threads'])
             best=output/'best.gguf'
             if best.exists():
                 if file_digest(best)!=best_hash:raise ValueError('existing best model collision on resume')
