@@ -1,16 +1,111 @@
-import sys, tempfile, unittest, importlib.util, hashlib, itertools, os, subprocess
+import sys, tempfile, unittest, importlib.util, hashlib, itertools, json, os, subprocess
 from pathlib import Path
 import numpy as np
 ROOT=Path(__file__).resolve().parents[1]
 sys.path[:0]=[str(ROOT),str(ROOT/'gguf-py')]
 import gguf
 from tools.sinq.research.cache import CandidateStore
-from tools.sinq.research.hybrid import assemble
+from tools.sinq.research.hybrid import assemble, assemble_from_anchor
+from tools.sinq.research.model_audit import audit_assembled_model
 spec=importlib.util.spec_from_file_location('cache_test',Path(__file__).with_name('test-sinq-candidate-cache.py'))
 m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 from tools.sinq.research.resources import file_digest
 
 class HybridTest(unittest.TestCase):
+    def test_imported_anchor_preserves_unassigned_quantized_payloads(self):
+        from tools.sinq.research.resources import digest
+        with tempfile.TemporaryDirectory() as directory:
+            d=Path(directory); source=d/'source.gguf'; anchor=d/'anchor.gguf'
+            selected='blk.0.ffn_down.weight';selected2='blk.1.ffn_down.weight';untouched='output.weight'
+            writer=gguf.GGUFWriter(source,'qwen35')
+            writer.add_tensor(selected,np.ones((2,256),dtype='<f2'))
+            writer.add_tensor(selected2,np.full((2,256),3,dtype='<f2'))
+            writer.add_tensor(untouched,np.full((2,256),2,dtype='<f2'))
+            writer.add_tensor('norm',np.ones(4,dtype='<f4'))
+            writer.write_header_to_file();writer.write_kv_data_to_file();writer.write_tensors_to_file();writer.close()
+            original=gguf.GGUFReader(source);source_tensors={t.name:t for t in original.tensors}
+            source_sha=file_digest(source);recipe=hashlib.sha256(b'recipe').hexdigest();imatrix=hashlib.sha256(b'imatrix').hexdigest()
+            store=CandidateStore(d/'cache')
+            p=m.provenance(selected);p.update(source_sha256=source_sha,input_sha256=hashlib.sha256(source_tensors[selected].data.tobytes()).hexdigest(),
+                source_qtype='F16',shape=[2,256],qtype='Q5_0',recipe_sha256=recipe,imatrix_sha256=imatrix)
+            p['sinq'].update(strip_width=64,strength=1.0,numerics='fp16-source-statistics;fp32-best-preupdate;serialized-f16-diagonal;original-W/t;imatrix*t^2')
+            p['generator']={'family':'ordinary'}
+            packed=bytes(2*8*22);scales=np.ones(256,dtype='<f2').tobytes();anchor_key=store.put(p,packed,scales)
+            p2=m.provenance(selected2);p2.update(source_sha256=source_sha,input_sha256=hashlib.sha256(source_tensors[selected2].data.tobytes()).hexdigest(),
+                source_qtype='F16',shape=[2,256],qtype='Q5_0',recipe_sha256=recipe,imatrix_sha256=imatrix)
+            p2['sinq'].update(strip_width=64,strength=1.0,numerics='fp16-source-statistics;fp32-best-preupdate;serialized-f16-diagonal;original-W/t;imatrix*t^2')
+            p2['generator']={'family':'ordinary'}
+            anchor_key2=store.put(p2,bytes([1])*len(packed),scales)
+            q=m.provenance(untouched);q.update(source_sha256=source_sha,input_sha256=hashlib.sha256(source_tensors[untouched].data.tobytes()).hexdigest(),
+                source_qtype='F16',shape=[2,256],qtype='Q4_0',recipe_sha256=recipe,imatrix_sha256=imatrix)
+            q.update(sinq=None,generator={'family':'stock'},activation=None)
+            stock_key=store.put(q,bytes(2*8*18))
+            assemble(source,anchor,store,{selected:anchor_key,selected2:anchor_key2,untouched:stock_key},native_validate=lambda path:None)
+            original_anchor=gguf.GGUFReader(anchor);reordered=d/'anchor-reordered.gguf'
+            rewrite=gguf.GGUFWriter(reordered,'qwen35')
+            for key,field in original_anchor.fields.items():
+                if key.startswith('GGUF.') or key=='general.architecture':continue
+                value=field.contents()
+                if key=='beellama.qk_sinq.tensors':value=list(reversed(value))
+                rewrite.add_key_value(key,value,field.types[0],field.types[1] if len(field.types)>1 else None)
+            for tensor in original_anchor.tensors:
+                rewrite.add_tensor(tensor.name,tensor.data,raw_dtype=tensor.tensor_type)
+            rewrite.write_header_to_file();rewrite.write_kv_data_to_file();rewrite.write_tensors_to_file();rewrite.close()
+            original_anchor.data._mmap.close();anchor=reordered
+            ar=gguf.GGUFReader(anchor);anchor_tensors={t.name:t for t in ar.tensors}
+            records={}
+            for name,src in source_tensors.items():
+                target=anchor_tensors[name];companion=anchor_tensors.get(name+'.sinq_scale2')
+                records[name]={'candidate_id':anchor_key if name==selected else anchor_key2 if name==selected2 else None,
+                    'companion_bytes':0 if companion is None else companion.data.nbytes,
+                    'companion_sha256':None if companion is None else hashlib.sha256(companion.data.tobytes()).hexdigest(),
+                    'packed_bytes':target.data.nbytes,'packed_sha256':hashlib.sha256(target.data.tobytes()).hexdigest(),
+                    'qtype':target.tensor_type.name,'shape':list(reversed(target.shape.tolist())),
+                    'source_qtype':src.tensor_type.name,'source_tensor_sha256':hashlib.sha256(src.data.tobytes()).hexdigest()}
+            ar.data._mmap.close();original.data._mmap.close()
+            manifest={'schema_version':1,'kind':'fixture-anchor-lock','source_path':str(source.resolve()),
+                'source_sha256':source_sha,'anchor_path':str(anchor.resolve()),'anchor_sha256':file_digest(anchor),
+                'recipe_sha256':recipe,'imatrix_sha256':imatrix,'algorithm':'sinkhorn_log','width':64,
+                'iterations':16,'numerics':p['sinq']['numerics'],'tensors':records}
+            manifest['checksum']=digest(manifest);lock=d/'anchor-lock.json'
+            lock.write_text(json.dumps(manifest,sort_keys=True,separators=(',',':')))
+            alternate=dict(p);alternate['generator']={'family':'awq_weight_activation','alpha':0.35,'lambda':0.5}
+            alternate['activation']={'source_sha256':source_sha,'split_sha256':source_sha}
+            alternate_key=store.put(alternate,bytes([1])*len(packed),np.full(256,1.5,dtype='<f2').tobytes())
+            candidate_run={'schema_version':1,'source_sha256':source_sha,'recipe_sha256':recipe,
+                'imatrix_sha256':imatrix,'cache':'cache','tensors':{selected:{'stock':anchor_key,
+                'anchor_candidate_id':anchor_key,'candidates':[{'candidate_id':alternate_key}]},
+                selected2:{'stock':anchor_key2,'anchor_candidate_id':anchor_key2,'candidates':[]}}}
+            candidate_run['checksum']=digest(candidate_run);run_path=d/'candidate-run.json'
+            run_path.write_text(json.dumps(candidate_run,sort_keys=True,separators=(',',':')))
+            no_op=d/'no-op.gguf'
+            assemble_from_anchor(source,anchor,lock,run_path,no_op,store,{selected:anchor_key,selected2:anchor_key2},native_validate=lambda path:None)
+            def inventory(path):
+                r=gguf.GGUFReader(path)
+                try:return {t.name:(t.tensor_type.name,t.shape.tolist(),t.data.tobytes()) for t in r.tensors}
+                finally:r.data._mmap.close()
+            self.assertEqual(inventory(no_op),inventory(anchor))
+            no_op_reader=gguf.GGUFReader(no_op);anchor_reader=gguf.GGUFReader(anchor)
+            self.assertEqual(no_op_reader.fields['beellama.qk_sinq.tensors'].contents(),anchor_reader.fields['beellama.qk_sinq.tensors'].contents())
+            no_op_reader.data._mmap.close();anchor_reader.data._mmap.close()
+            self.assertEqual(inventory(no_op)[untouched][0],'Q4_0')
+            self.assertNotEqual(inventory(no_op)[untouched][0],source_tensors[untouched].tensor_type.name)
+            no_op_audit=audit_assembled_model(no_op,anchor,lock,run_path,store,{selected:anchor_key,selected2:anchor_key2},recipe='T340')
+            self.assertEqual(no_op_audit['tensor_inventory_sha256'],no_op_audit['anchor_tensor_inventory_sha256'])
+            self.assertEqual(no_op_audit['changed_tensors'],[])
+            changed=d/'changed.gguf'
+            assemble_from_anchor(source,anchor,lock,run_path,changed,store,{selected:alternate_key,selected2:anchor_key2},native_validate=lambda path:None)
+            before=inventory(anchor);after=inventory(changed)
+            self.assertEqual({n for n in before if before[n]!=after[n]},{selected,selected+'.sinq_scale2'})
+            self.assertEqual(after[untouched],before[untouched])
+            self.assertEqual(after['norm'],before['norm'])
+            changed_audit=audit_assembled_model(changed,anchor,lock,run_path,store,{selected:alternate_key,selected2:anchor_key2},recipe='T340')
+            self.assertEqual(changed_audit['changed_tensors'],[selected])
+            missing=d/'missing.gguf'
+            with self.assertRaisesRegex(ValueError,'all conditioned anchor tensors'):
+                assemble_from_anchor(source,anchor,lock,run_path,missing,store,{},native_validate=lambda path:None)
+            self.assertFalse(missing.exists())
+
     def test_bytes_namespace_stock_and_alias(self):
         with tempfile.TemporaryDirectory() as d:
             d=Path(d); base=d/'base.gguf'; name='blk.0.ffn_down.weight'
