@@ -31,7 +31,11 @@ void sinq::transform_importance(const float * importance, float * output,
 
 #include <mutex>
 #include <stdexcept>
-size_t sinq::native_encode(enum ggml_type new_type, const float * f32_data, void * new_data, const int64_t chunk_size, int64_t first_row, int64_t nrows, int64_t nrows_per_expert, int64_t n_per_row, const float * imatrix, std::vector<std::thread> & workers, const int nthread) {
+size_t sinq::native_encode(enum ggml_type new_type, const float * f32_data, void * new_data, const int64_t chunk_size, int64_t first_row, int64_t nrows, int64_t nrows_per_expert, int64_t n_per_row, const float * imatrix, std::vector<std::thread> & workers, const int nthread, const native_encode_hooks * hooks) {
+    require(f32_data && new_data && nrows > 0 && nrows_per_expert > 0 &&
+        n_per_row > 0 && first_row >= 0 && chunk_size >= n_per_row && nthread > 0 &&
+        workers.empty(), "invalid native encoder buffers/shape/workers");
+    const auto quantize = hooks ? hooks->quantize : ggml_quantize_chunk;
     const size_t row_size = ggml_row_size(new_type, n_per_row);
 
     auto imatrix_for_row = [=](int64_t row_global) {
@@ -45,7 +49,7 @@ size_t sinq::native_encode(enum ggml_type new_type, const float * f32_data, void
             const int64_t row_global = first_row + row;
             const int64_t this_nrow  = std::min(nrows - row, nrows_per_expert - row_global % nrows_per_expert);
             void * this_data = (char *) new_data + row * row_size;
-            size_t this_size = ggml_quantize_chunk(new_type, f32_data + row * n_per_row, this_data, 0, this_nrow, n_per_row, imatrix_for_row(row_global));
+            size_t this_size = quantize(new_type, f32_data + row * n_per_row, this_data, 0, this_nrow, n_per_row, imatrix_for_row(row_global));
             if (!ggml_validate_row_data(new_type, this_data, this_size)) {
                 throw std::runtime_error("quantized data validation failed");
             }
@@ -55,49 +59,68 @@ size_t sinq::native_encode(enum ggml_type new_type, const float * f32_data, void
         return new_size;
     }
 
+    // Count actual tasks, including partial chunks at expert boundaries.
+    const int64_t rows_per_chunk = std::max<int64_t>(1, chunk_size / n_per_row);
+    int64_t tasks = 0;
+    for (int64_t row = 0; row < nrows;) {
+        row += std::min({nrows - row, rows_per_chunk,
+            nrows_per_expert - (first_row + row) % nrows_per_expert});
+        ++tasks;
+    }
+    const int use = int(std::min<int64_t>(nthread, tasks));
+    // Allocate before launching: allocation failure must not destroy a temporary
+    // joinable thread during insertion into the caller-owned vector.
+    workers.reserve(size_t(std::max(0, use - 1)));
     std::mutex mutex;
     int64_t counter = 0;
     size_t new_size = 0;
-    bool valid = true;
-    auto compute = [&mutex, &counter, &new_size, &valid, new_type, f32_data, new_data, chunk_size,
-            first_row, nrows, nrows_per_expert, n_per_row, row_size, imatrix_for_row]() {
-        const int64_t nrows_per_chunk = chunk_size / n_per_row;
-        size_t local_size = 0;
-        while (true) {
-            std::unique_lock<std::mutex> lock(mutex);
-            if (counter >= nrows) {
-                if (local_size > 0) {
-                    new_size += local_size;
+    std::exception_ptr failure;
+    bool cancelled = false;
+    auto compute = [&]() {
+        try {
+            while (true) {
+                int64_t row, this_nrow;
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (cancelled || counter >= nrows) return;
+                    row = counter;
+                    this_nrow = std::min({nrows - row, rows_per_chunk,
+                        nrows_per_expert - (first_row + row) % nrows_per_expert});
+                    counter += this_nrow;
                 }
-                break;
+                void * this_data = (char *) new_data + row * row_size;
+                const size_t bytes = quantize(new_type, f32_data + row * n_per_row,
+                    this_data, 0, this_nrow, n_per_row, imatrix_for_row(first_row + row));
+                if (!ggml_validate_row_data(new_type, this_data, bytes)) {
+                    throw std::runtime_error("quantized data validation failed");
+                }
+                std::lock_guard<std::mutex> lock(mutex);
+                new_size += bytes;
             }
-            const int64_t row        = counter;
-            const int64_t row_global = first_row + row;
-            // stop at the expert boundary
-            const int64_t this_nrow  = std::min(std::min(nrows - row, nrows_per_chunk), nrows_per_expert - row_global % nrows_per_expert);
-            counter += this_nrow;
-            lock.unlock();
-
-            void * this_data = (char *) new_data + row * row_size;
-            size_t this_size = ggml_quantize_chunk(new_type, f32_data + row * n_per_row, this_data, 0, this_nrow, n_per_row, imatrix_for_row(row_global));
-            local_size += this_size;
-
-            // validate the quantized data
-            if (!ggml_validate_row_data(new_type, this_data, this_size)) {
-                std::unique_lock<std::mutex> lock(mutex);
-                valid = false;
-                break;
-            }
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (!failure) failure = std::current_exception();
+            cancelled = true;
         }
     };
-    for (int it = 0; it < nthread - 1; ++it) {
-        workers.emplace_back(compute);
+    const auto join = [&]() {
+        for (auto & worker : workers) if (worker.joinable()) worker.join();
+        workers.clear();
+    };
+    try {
+        for (int it = 1; it < use; ++it) {
+            workers.push_back(hooks ? hooks->launch(compute) : std::thread(compute));
+        }
+        compute();
+    } catch (...) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            cancelled = true;
+        }
+        join();
+        throw;
     }
-    compute();
-    for (auto & w : workers) { w.join(); }
-    workers.clear();
-    if (!valid) {
-        throw std::runtime_error("quantized data validation failed");
-    }
+    join();
+    if (failure) std::rethrow_exception(failure);
     return new_size;
 }

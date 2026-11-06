@@ -2,6 +2,8 @@
 #include "sinq/sinq-local-score.h"
 #include "sinq/sinq-bridge-config.h"
 #include "sinq/sinq-candidates.h"
+#include "sinq/sinq-native-codec.h"
+#include <atomic>
 #include <limits>
 #include <mutex>
 #include <cmath>
@@ -96,8 +98,54 @@ static void candidate_threads() {
     }
 }
 
+static std::thread::id encode_caller;
+static std::atomic<bool> worker_threw{false};
+static size_t throwing_quantize(ggml_type type, const float * input, void * output,
+        int64_t start, int64_t rows, int64_t columns, const float * importance) {
+    if (std::this_thread::get_id()!=encode_caller) {
+        worker_threw=true;
+        throw std::runtime_error("injected worker codec failure");
+    }
+    while (!worker_threw.load()) std::this_thread::yield();
+    return ggml_quantize_chunk(type,input,output,start,rows,columns,importance);
+}
+
+static void native_failures_and_parity() {
+    constexpr int64_t columns=256, rows=37, experts=11;
+    std::vector<float> input(rows*columns),importance(5*columns,1.f);
+    for(size_t i=0;i<input.size();++i)input[i]=std::sin(float(i)*.031f);
+    std::vector<std::thread> workers;
+    for(auto type:{GGML_TYPE_Q3_K,GGML_TYPE_Q4_K,GGML_TYPE_Q5_0,GGML_TYPE_IQ4_XS}) {
+        std::vector<uint8_t> expected(rows*ggml_row_size(type,columns)),actual(expected.size());
+        check(sinq::native_encode(type,input.data(),expected.data(),3*columns,2,rows,experts,columns,importance.data(),workers,1)==expected.size(),"serial byte count");
+        for(int threads:{2,4,8,16,32}) {
+            check(sinq::native_encode(type,input.data(),actual.data(),3*columns,2,rows,experts,columns,importance.data(),workers,threads)==actual.size(),"parallel byte count");
+            check(actual==expected&&workers.empty(),"thread/expert-boundary packed parity and cleanup");
+        }
+    }
+    std::vector<uint8_t> output(rows*ggml_row_size(GGML_TYPE_Q4_K,columns));
+    sinq::native_encode_hooks hooks;
+    hooks.quantize=throwing_quantize;encode_caller=std::this_thread::get_id();worker_threw=false;
+    bool caught=false;
+    try {sinq::native_encode(GGML_TYPE_Q4_K,input.data(),output.data(),columns,0,rows,experts,columns,importance.data(),workers,4,&hooks);}
+    catch(const std::runtime_error &) {caught=true;}
+    check(caught&&worker_threw&&workers.empty(),"non-main worker exception propagates and joins");
+    hooks=sinq::native_encode_hooks{};
+    int launches=0;std::atomic<int> active{0};
+    hooks.launch=[&](std::function<void()> work) {
+        if(++launches==2)throw std::runtime_error("injected thread launch failure");
+        return std::thread([&,work] {++active;work();--active;});
+    };
+    caught=false;
+    try {sinq::native_encode(GGML_TYPE_Q4_K,input.data(),output.data(),columns,0,rows,experts,columns,importance.data(),workers,4,&hooks);}
+    catch(const std::runtime_error &) {caught=true;}
+    check(caught&&launches==2&&active==0&&workers.empty(),"partial launch failure joins and clears");
+    check(sinq::native_encode(GGML_TYPE_Q4_K,input.data(),output.data(),columns,0,rows,experts,columns,importance.data(),workers,32)==output.size(),"encode succeeds after injected failures");
+}
+
 int main() try {
     auto * context=ggml_init({1024,nullptr,true});check(context!=nullptr,"ggml initialization");ggml_free(context);
+    native_failures_and_parity();
     candidate_threads();
     std::vector<int> visits(10000, 0);
     std::mutex mutex;
