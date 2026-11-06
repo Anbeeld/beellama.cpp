@@ -70,6 +70,23 @@ class RepairTests(unittest.TestCase):
             path=self.d/'invalid.json';path.write_text(text,encoding='utf-8')
             with self.assertRaises(ValueError):stages._json(path)
 
+    def test_score_artifact_uses_configured_artifact_byte_budget(self):
+        bridge=self.d/'bridge';bridge.write_bytes(b'fixture')
+        score_config=dict(method='local',objective='output_mse',scorer_name='local_output_mse',threads=1,
+            selection_policy='in_sample',device='cpu',native_bridge=str(bridge),
+            candidate_manifest=str(self.manifest),capture_manifest=str(self.capture))
+        context=stages._scorer_context(score_config,self.run,None,stages._score_input_hashes(score_config))
+        value=dict(schema_version=2,method='local',objective='output_mse',candidate_manifest_sha256=file_digest(self.manifest),records=[],
+            scorer_context=context,context_identity=digest(context),scorer_configuration_identity=digest(context['scorer_configuration']),
+            data_partition_identity=None,resource_measurements=['x'*2048 for _ in range(5000)])
+        value['checksum']=digest(value)
+        path=self.d/'large-scores.json';path.write_bytes(canonical_json(value))
+        self.assertGreater(path.stat().st_size,8<<20)
+        config=dict(candidate_manifest=str(self.manifest),budgets=dict(max_output_bytes=16<<20))
+        self.assertEqual(stages._score_artifact(path,config),value)
+        config['budgets']['max_output_bytes']=8<<20
+        with self.assertRaisesRegex(ValueError,'byte budget'):stages._score_artifact(path,config)
+
     def test_exact_current_run_candidate_binding(self):
         from tools.sinq.optimizer.provenance import candidate_for
         name=self.names[0];key=self.ids[name]['ordinary']

@@ -1,5 +1,6 @@
 """Typed stage orchestration. Scoring mathematics live in native/backend modules."""
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -11,7 +12,7 @@ from contextlib import contextmanager
 
 ROOT=Path(__file__).resolve().parents[3]
 sys.path.insert(0,str(ROOT/'gguf-py'))
-from .schemas import load_config, validate_pairing, read_json
+from .schemas import load_config, validate_pairing, read_json, SCORERS
 from .resources import atomic_write, canonical_json, digest, file_digest, reject_alias
 from .cache import CandidateStore
 from .generate import generate, preflight
@@ -153,6 +154,105 @@ def _score_partition(config,run,capture):
     return bind_corpora(partitions,bindings)
 
 
+_SCORER_CONFIGURATION_FIELDS=('scorer_name','method','objective','threads','context','probes','seed',
+    'fisher_positions','reference_dtype','device','cuda_devices','memory_policy')
+_SCORE_INPUTS={'candidate_manifest_sha256':'candidate_manifest','training_capture_sha256':'capture_manifest',
+    'validation_manifest_sha256':'validation_manifest','pairing_manifest_sha256':'pairing_manifest'}
+
+
+def _score_input_hashes(config):
+    return {key:file_digest(config[path]) if config.get(path) is not None else None
+        for key,path in _SCORE_INPUTS.items()}
+
+
+def _scorer_context(config,run,partition_identity,input_hashes,*,reference=None,execution_policy=None,execution_identity=None):
+    from .implementation import implementation_fingerprint,native_runtime_fingerprint
+    local=config['method']=='local'
+    return dict(schema_version=2,source_sha256=run['source_sha256'],**input_hashes,
+        selection_policy=config['selection_policy'],data_partition_identity=partition_identity,
+        scorer_configuration={key:config.get(key) for key in _SCORER_CONFIGURATION_FIELDS},
+        reference_identity=reference,execution_identity_sha256=execution_identity,execution_policy=execution_policy,
+        backend_identity=dict(implementation_sha256=implementation_fingerprint()['checksum'],
+            native_runtime=native_runtime_fingerprint({'bridge':config['native_bridge']})),
+        precision_identity=dict(decoded_weights='float32',activations='float32',output_accumulation='float64') if local else
+            {key:execution_policy[key] for key in ('reference_dtype','execution_dtype','parameter_storage_policy')},
+        device_identity=dict(devices=['cpu'],device_identifiers=None) if local else
+            {key:execution_policy[key] for key in ('devices','device_identifiers')})
+
+
+def _validate_score_context(value):
+    """Check the serialized context closure, including nested tensor observations."""
+    context=value.get('scorer_context')
+    fields={'schema_version','source_sha256',*_SCORE_INPUTS,'selection_policy','data_partition_identity',
+        'scorer_configuration','reference_identity','execution_identity_sha256','execution_policy',
+        'backend_identity','precision_identity','device_identity'}
+    if not isinstance(context,dict) or set(context)!=fields or context['schema_version']!=2:
+        raise ValueError('score context schema mismatch')
+    configuration=context['scorer_configuration']
+    if not isinstance(configuration,dict) or set(configuration)!=set(_SCORER_CONFIGURATION_FIELDS):
+        raise ValueError('score context scorer configuration mismatch')
+    if not isinstance(configuration['scorer_name'],str) or SCORERS.get(configuration['scorer_name'])!=(configuration['method'],configuration['objective']):
+        raise ValueError('score context scorer name/method/objective mismatch')
+    for key in ('source_sha256',*_SCORE_INPUTS):
+        sha=context[key]
+        if sha is None and key in ('validation_manifest_sha256','pairing_manifest_sha256'):continue
+        if not isinstance(sha,str) or len(sha)!=64 or any(c not in '0123456789abcdef' for c in sha):
+            raise ValueError('score context invalid content hash: '+key)
+    configuration_identity=digest(configuration);context_identity=digest(context)
+    if (value.get('context_identity')!=context_identity or value.get('scorer_configuration_identity')!=configuration_identity or
+            value.get('candidate_manifest_sha256')!=context['candidate_manifest_sha256'] or
+            value.get('data_partition_identity')!=context['data_partition_identity'] or
+            value.get('method')!=configuration['method'] or value.get('objective')!=configuration['objective'] or
+            context['selection_policy'] not in ('in_sample','held_out') or
+            context['backend_identity'] is None or context['precision_identity'] is None or context['device_identity'] is None):
+        raise ValueError('score context identity/metadata mismatch')
+    backend=context['backend_identity']
+    if (not isinstance(backend,dict) or set(backend)!={'implementation_sha256','native_runtime'} or
+            not isinstance(backend['implementation_sha256'],str) or len(backend['implementation_sha256'])!=64 or
+            not isinstance(backend['native_runtime'],dict) or set(backend['native_runtime'])!={'bridge'} or
+            not isinstance(backend['native_runtime']['bridge'],dict) or 'executable' not in backend['native_runtime']['bridge']):
+        raise ValueError('score context backend identity schema mismatch')
+    if context['selection_policy']=='held_out' and any(context[key] is None for key in ('validation_manifest_sha256','pairing_manifest_sha256')):
+        raise ValueError('score context held-out provenance missing')
+    if configuration['method']=='local':
+        if configuration['device']!='cpu' or any(configuration[key] is not None for key in ('context','probes','seed','fisher_positions','reference_dtype','cuda_devices','memory_policy')):
+            raise ValueError('local score context has unsupported execution controls')
+        if any(context[key] is not None or value.get(key) is not None for key in ('reference_identity','execution_identity_sha256','execution_policy')):
+            raise ValueError('local score context has advanced reference metadata')
+        if context['precision_identity']!=dict(decoded_weights='float32',activations='float32',output_accumulation='float64') or context['device_identity']!=dict(devices=['cpu'],device_identifiers=None):
+            raise ValueError('local score context precision/device mismatch')
+    else:
+        policy=context['execution_policy']
+        if (not isinstance(policy,dict) or set(policy)!={'reference_dtype','execution_dtype','parameter_storage_policy','devices','memory_policy','deterministic','versions','device_identifiers'} or
+                any(context[key] is None or value.get(key)!=context[key]
+                for key in ('reference_identity','execution_identity_sha256','execution_policy')) or
+                context['precision_identity']!={key:policy.get(key) for key in ('reference_dtype','execution_dtype','parameter_storage_policy')} or
+                context['device_identity']!={key:policy.get(key) for key in ('devices','device_identifiers')}):
+            raise ValueError('advanced score context execution/reference mismatch')
+        reference=context['reference_identity']
+        if (not isinstance(reference,dict) or reference.get('source_gguf_sha256')!=context['source_sha256'] or
+                reference.get('execution_policy')!=policy or
+                context['execution_identity_sha256']!=hashlib.sha256(json.dumps(reference,sort_keys=True,separators=(',',':')).encode()).hexdigest() or
+                context['selection_policy']!='in_sample' or any(context[key] is not None for key in ('validation_manifest_sha256','pairing_manifest_sha256'))):
+            raise ValueError('advanced score context reference identity closure mismatch')
+    def validate_record(record):
+        if not isinstance(record,dict) or any(record.get(key)!=expected for key,expected in (
+                ('context_identity',context_identity),('scorer_configuration_identity',configuration_identity),
+                ('method',configuration['method']),('objective',configuration['objective']),('scorer_name',configuration['scorer_name']))):
+            raise ValueError('score record context mismatch')
+        if 'capture_sha256' in record and record['capture_sha256']!=context['training_capture_sha256']:
+            raise ValueError('score record capture context mismatch')
+        if configuration['method']=='local':
+            selected='validation_score' if context['selection_policy']=='held_out' else 'train_score'
+            if record.get(selected) is None or record.get('score')!=record[selected]:
+                raise ValueError('score record selection policy context mismatch')
+        members=record.get('tensor_scores',[])
+        if not isinstance(members,list):raise ValueError('score record tensor context must be a list')
+        for member in members:validate_record(member)
+    if not isinstance(value.get('records'),list):raise ValueError('score context records must be a list')
+    for record in value['records']:validate_record(record)
+
+
 def score_config(config):
     with _run(config) as inputs:return _score(config,*inputs)
 
@@ -164,6 +264,7 @@ def _score(config,run,store,source):
         raise ValueError('advanced held_out capture provenance is not supported')
     _stock_baseline(config,run,source)
     if not config.get('native_bridge'):raise ValueError('native_bridge is required for actual candidate decoding/scoring')
+    input_hashes=_score_input_hashes(config)
     capture=_json(config['capture_manifest']);records=[]
     partition_identity=_score_partition(config,run,capture)
     if method=='local':
@@ -292,17 +393,21 @@ def _score(config,run,store,source):
             baseline=None; probes=None; locked=None; effective=None
             if sys.exc_info()[0] is not None: adapter=None
     if not records:raise ValueError('requested score stage produced no candidate observations')
-    score_config_identity=digest({k:config[k] for k in ('method','objective','threads','context','probes','seed','fisher_positions','reference_dtype','device','cuda_devices') if k in config})
-    context_identity=digest(dict(source=run['source_sha256'],capture=file_digest(config['capture_manifest']),
-        candidate_manifest=file_digest(config['candidate_manifest']),scorer=score_config_identity,
-        reference=adapter.source_id if method!='local' else None))
-    for record in records:
+    if _score_input_hashes(config)!=input_hashes:raise ValueError('score context inputs changed during scoring')
+    scorer_context=_scorer_context(config,run,partition_identity,input_hashes,
+        reference=adapter.identity if method!='local' else None,
+        execution_policy=policy.identity() if method!='local' else None,
+        execution_identity=adapter.source_id if method!='local' else None)
+    score_config_identity=digest(scorer_context['scorer_configuration']);context_identity=digest(scorer_context)
+    def bind_record(record):
         if 'assignment' not in record:record['assignment']={record['tensor']:record['candidate_id']}
         value=record.get('score',record.get('validation_score') if config.get('selection_policy')=='held_out' else record.get('train_score'))
         if value is None:raise ValueError('scorer did not return requested numeric objective')
         record.update(score=value,scorer_name=config['scorer_name'],scorer_configuration_identity=score_config_identity,
             context_identity=context_identity,direction='minimize',scope='tensor' if len(record['assignment'])==1 else 'group')
-    result=dict(schema_version=2,status='PASS',method=method,objective=config['objective'],records=records,
+        for member in record.get('tensor_scores',[]):bind_record(member)
+    for record in records:bind_record(record)
+    result=dict(schema_version=2,status='PASS',method=method,objective=config['objective'],records=records,scorer_context=scorer_context,
                 candidate_manifest_sha256=file_digest(config['candidate_manifest']),context_identity=context_identity,scorer_configuration_identity=score_config_identity,
                 data_partition_identity=partition_identity)
     if method!='local':
@@ -311,6 +416,7 @@ def _score(config,run,store,source):
         result['resource_measurements']=monitor.records
         result['loading_estimates']=adapter.loading_estimates
         result['execution_identity_sha256']=adapter.source_id
+    _validate_score_context(result)
     result['checksum']=digest(result)
     # Validate serialized size before creating an immutable output directory.
     if len(canonical_json(result))>b['max_output_bytes']:
@@ -421,10 +527,16 @@ def validate_config_artifacts(config):
 
 
 def _score_artifact(path,config):
-    value=_json(path)
+    # Score matrices can legitimately exceed read_json's conservative generic
+    # default because their per-record runtime/resource measurements are retained.
+    # Respect the explicit artifact budget on the selection config instead.
+    value=read_json(path,max_bytes=config['budgets']['max_output_bytes'])
     if (value.get('schema_version')!=2 or value.get('checksum')!=digest({k:v for k,v in value.items() if k!='checksum'}) or
             value.get('candidate_manifest_sha256')!=file_digest(config['candidate_manifest'])):
         raise ValueError('score artifact version/checksum/candidate context mismatch')
+    _validate_score_context(value)
+    if value['scorer_context']['source_sha256']!=_json(config['candidate_manifest'])['source_sha256']:
+        raise ValueError('score artifact source context mismatch')
     return value
 
 
