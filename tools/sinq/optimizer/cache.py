@@ -91,7 +91,7 @@ class _WriterLock:
     """Persistent lock inode; kernel ownership, not file existence, is the lock."""
     def __init__(self, root):
         if (root/'.write-lock').exists():
-            raise RuntimeError('legacy cache writer lock requires explicit recovery')
+            raise RuntimeError('unowned cache writer lock requires explicit recovery')
         self.file = None
         self.handle = None
         try:
@@ -289,7 +289,7 @@ class CandidateStore:
         Windows mandatory guards enable reuse. Other platforms (and guard/watch
         failures) retain full validation and a fresh census for every put/get.
         The persistent .writer-lock is OS-owned and survives safely after kill;
-        a legacy .write-lock is deliberately never recovered automatically.
+        an unowned .write-lock is deliberately never recovered automatically.
         """
         if self._depth:
             self._depth += 1

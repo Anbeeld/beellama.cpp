@@ -29,8 +29,8 @@ double output_l1(const float * w,const float * dq,const ggml_fp16_t * u,int64_t 
 namespace sinq {
 void output_scores(const float * w, const float * dq, const ggml_fp16_t * u, int64_t n, int64_t k,
         const float * x, int samples, local_objective objective, double * losses, int threads) {
-    require(w && dq && u && x && losses && n>0 && k>0 && samples>0, "research invalid score dimensions");
-    require(objective==local_objective::output_l1 || objective==local_objective::output_mse, "research invalid local objective");
+    require(w && dq && u && x && losses && n>0 && k>0 && samples>0, "SINQ invalid score dimensions");
+    require(objective==local_objective::output_l1 || objective==local_objective::output_mse, "SINQ invalid local objective");
     parallel_for(n, threads, [&](int64_t begin, int64_t end) {
         std::vector<double> error(objective==local_objective::output_l1 ? size_t(k) : 0);
         for (int64_t row=begin; row<end; ++row) {
@@ -44,8 +44,8 @@ void output_scores(const float * w, const float * dq, const ggml_fp16_t * u, int
 double output_score(const float * w,const float * dq,const ggml_fp16_t * u,int64_t n,int64_t k,
         const float * x,int samples,local_objective objective) {
     if(objective==local_objective::output_l1) return output_l1(w,dq,u,n,k,x,samples);
-    require(objective==local_objective::output_mse,"research invalid local objective");
-    require(w && dq && u && x && n>0 && k>0 && samples>0,"research invalid score dimensions");
+    require(objective==local_objective::output_mse,"SINQ invalid local objective");
+    require(w && dq && u && x && n>0 && k>0 && samples>0,"SINQ invalid score dimensions");
     sum result;
     for(int64_t r=0;r<n;++r) {
         sum row;
@@ -54,13 +54,13 @@ double output_score(const float * w,const float * dq,const ggml_fp16_t * u,int64
             for(int64_t j=0;j<k;++j) {
                 const double scale=ggml_fp16_to_fp32(u[j]);
                 require(scale>0 && std::isfinite(scale) && std::isfinite(w[r*k+j]) &&
-                    std::isfinite(dq[r*k+j]) && std::isfinite(x[size_t(t)*k+j]),"research nonfinite score input");
+                    std::isfinite(dq[r*k+j]) && std::isfinite(x[size_t(t)*k+j]),"SINQ nonfinite score input");
                 dot.add(double(x[size_t(t)*k+j])*(double(dq[r*k+j])*scale-double(w[r*k+j])));
             }
             row.add(dot.value*dot.value);
         }
         result.add(row.value/double(samples));
     }
-    const double value=result.value/double(n);require(std::isfinite(value),"research score overflow");return value;
+    const double value=result.value/double(n);require(std::isfinite(value),"SINQ score overflow");return value;
 }
 }
