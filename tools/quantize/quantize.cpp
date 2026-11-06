@@ -125,8 +125,7 @@ static void usage(const char * executable) {
     printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--include-weights]\n", executable);
     printf("       [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--tensor-type] [--tensor-type-file]\n");
     printf("       [--prune-layers] [--keep-split] [--override-kv] [--dry-run] [--max-buffer-size]\n");
-    printf("       [--sinq-precondition none|sidecar|identity] [--sinq-strip-width 32|64|128|256|512] [--sinq-iterations 4|8|16]\n");
-    printf("       [--sinq-strength FLOAT] [--sinq-tensor-list PATH] [--sinq-diagnostics-json PATH] [--sinq-coverage]\n");
+    printf("       [--sinq-config PATH] [--sinq-diagnostics-json PATH]\n");
     printf("       model-f32.gguf [model-quant.gguf] type [nthreads]\n\n");
     printf("  --allow-requantize\n");
     printf("                                      allow requantizing tensors that have already been quantized\n");
@@ -135,27 +134,11 @@ static void usage(const char * executable) {
     printf("  --leave-output-tensor\n");
     printf("                                      leave output.weight un(re)quantized\n");
     printf("                                      increases model size but may also increase quality, especially when requantizing\n");
-    printf("  --sinq-precondition none|sidecar|identity\n");
-    printf("                                      default none; identity is TEST ONLY; sidecar companions REQUIRE BeeLlama\n");
-    printf("                                      Qwen3.5 primary-trunk 2D projections from original F32/F16/BF16 weights only\n");
-    printf("                                      native IQ1_S/M, IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_NL/XS,\n");
-    printf("                                      Q3_K/Q4_K/Q6_K, Q5_0/1 and Q8_0 only\n");
-    printf("                                      no embedding/output transform, codec fallback or copy mode\n");
-    printf("  --sinq-strip-width 32|64|128|256|512  default 64; full-height input-column strips, dimensions must be aligned\n");
-    printf("  --sinq-iterations 4|8|16              best-intermediate normalization steps (default 16)\n");
-    printf("  --sinq-strength FLOAT                 default 1.0; finite [0,1], nondefault requires sidecar\n");
-    printf("                                      0 disables Sinkhorn (A-SINQ may still apply AWQ); 1 preserves ordinary rounding; F16 scales authoritative\n");
-    printf("  --sinq-calibration PATH              opt-in offline real-activation manifest/directory; requires sidecar\n");
-    printf("                                      A-SINQ adapted to native GGUF codecs, not paper RTN; fixed-strength 20-alpha L1 search\n");
-    printf("                                      no measured end-to-end quality guarantee; missing selected samples are errors\n");
-    printf("  --sinq-tensor-list PATH               default absent (all eligible); UTF-8 exact base names, one per line\n");
-    printf("                                      requires conditioning; no duplicates, blank lines, regex or unsupported selections\n");
-    printf("                                      excludes only conditioning, never changes stock allocation/payloads\n");
+    printf("  --sinq-config PATH                   strict v2 JSON defaults, targets and disjoint tensor/layer/role overrides\n");
+    printf("                                      original floating Qwen3.5 projections; companions REQUIRE BeeLlama\n");
+    printf("                                      settings never change the stock qtype allocation; no codec fallback\n");
     printf("  --sinq-diagnostics-json PATH          default absent; external deterministic JSON, valid with stock too\n");
     printf("                                      not compatible with --dry-run or COPY; write failures are fatal\n");
-    printf("  --sinq-coverage                       default off; HISTORICAL REPRODUCTION ONLY, not a conditioning mask\n");
-    printf("                                      preserves noneligible source types and CHANGES stock allocation\n");
-    printf("                                      cannot combine with --sinq-tensor-list; do not use for settings ablations\n");
     printf("  --pure\n");
     printf("                                      disable k-quant mixtures and quantize all tensors to the same type\n");
     printf("  --imatrix file_name\n");
@@ -439,7 +422,6 @@ int llama_quantize(int argc, char ** argv) {
     llama_model_quantize_params params = llama_model_quantize_default_params();
 
     int arg_idx = 1;
-    bool sinq_strength_set = false;
     std::string imatrix_file;
     std::vector<std::string> included_weights, excluded_weights;
     std::vector<llama_model_kv_override> kv_overrides;
@@ -487,38 +469,13 @@ int llama_quantize(int argc, char ** argv) {
             params.dry_run = true;
         } else if (strcmp(argv[arg_idx], "--allow-requantize") == 0) {
             params.allow_requantize = true;
-        } else if (strcmp(argv[arg_idx], "--sinq-precondition") == 0) {
-            if (++arg_idx >= argc) { usage(argv[0]); }
-            const std::string mode(argv[arg_idx]);
-            if (mode == "none") { params.sinq_precondition = LLAMA_SINQ_NONE; }
-            else if (mode == "sidecar") { params.sinq_precondition = LLAMA_SINQ_SIDECAR; }
-            else if (mode == "identity") { params.sinq_precondition = LLAMA_SINQ_IDENTITY; }
-            else { usage(argv[0]); }
-        } else if (strcmp(argv[arg_idx], "--sinq-strip-width") == 0 || strcmp(argv[arg_idx], "--sinq-iterations") == 0) {
-            const bool strip = strcmp(argv[arg_idx],"--sinq-strip-width") == 0;
-            if (++arg_idx >= argc) { usage(argv[0]); }
-            char * end = nullptr;
-            const long value = std::strtol(argv[arg_idx],&end,10);
-            if (!end || *end || (strip ? (value != 32 && value != 64 && value != 128 && value != 256 && value != 512) : (value != 4 && value != 8 && value != 16))) { usage(argv[0]); }
-            if (strip) { params.sinq_strip_width = int32_t(value); } else { params.sinq_iterations = int32_t(value); }
-        } else if (strcmp(argv[arg_idx], "--sinq-strength") == 0) {
-            if (++arg_idx >= argc) { usage(argv[0]); }
-            char * end = nullptr;
-            const float value = std::strtof(argv[arg_idx], &end);
-            if (end == argv[arg_idx] || *end || !std::isfinite(value) || value < 0.f || value > 1.f) { usage(argv[0]); }
-            params.sinq_strength = value;
-            sinq_strength_set = true;
-        } else if (strcmp(argv[arg_idx], "--sinq-tensor-list") == 0) {
+        } else if (strcmp(argv[arg_idx], "--sinq-config") == 0) {
             if (++arg_idx >= argc || !*argv[arg_idx]) { usage(argv[0]); }
-            params.sinq_tensor_list = argv[arg_idx];
-        } else if (strcmp(argv[arg_idx], "--sinq-calibration") == 0) {
-            if (++arg_idx >= argc || !*argv[arg_idx]) { usage(argv[0]); }
-            params.sinq_calibration = argv[arg_idx];
+            params.sinq_config = argv[arg_idx];
         } else if (strcmp(argv[arg_idx], "--sinq-diagnostics-json") == 0) {
             if (++arg_idx >= argc || !*argv[arg_idx]) { usage(argv[0]); }
             params.sinq_diagnostics_json = argv[arg_idx];
-        } else if (strcmp(argv[arg_idx], "--sinq-coverage") == 0) {
-            params.sinq_coverage = true;
+
         } else if (strcmp(argv[arg_idx], "--pure") == 0) {
             params.pure = true;
         } else if (strcmp(argv[arg_idx], "--imatrix") == 0) {
@@ -564,10 +521,6 @@ int llama_quantize(int argc, char ** argv) {
         usage(argv[0]);
     }
 
-    if (sinq_strength_set && params.sinq_precondition == LLAMA_SINQ_NONE) {
-        fprintf(stderr,"--sinq-strength requires conditioning\n");
-        return 1;
-    }
     std::vector<std::string> imatrix_datasets;
     std::unordered_map<std::string, std::vector<float>> imatrix_data;
     int m_last_call = prepare_imatrix(imatrix_file, imatrix_datasets, included_weights, excluded_weights, imatrix_data);

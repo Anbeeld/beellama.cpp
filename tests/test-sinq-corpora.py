@@ -11,8 +11,8 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from tools.sinq.research.corpora import lock_corpora, load_corpora, bind_corpora
-from tools.sinq.research.resources import canonical_json, digest
+from tools.sinq.optimizer.corpora import lock_corpora, load_corpora, bind_corpora
+from tools.sinq.optimizer.resources import canonical_json, digest
 
 
 def token_digest(tokens):
@@ -54,7 +54,7 @@ class CorporaTest(unittest.TestCase):
     def test_lock_all_stages_actual_hashes_and_no_data_leak(self):
         manifest = self.lock()
         source_hash = token_digest(self.tokens)
-        self.assertEqual(manifest['schema_version'], 1)
+        self.assertEqual(manifest['schema_version'], 2)
         self.assertEqual(manifest['kind'], 'sinq-corpus-partitions')
         self.assertEqual(manifest['sources'], {source_hash: {'token_count': 12}})
         for i, role in enumerate(('calibration', 'validation', 'selection', 'final_test')):
@@ -158,7 +158,7 @@ class CorporaTest(unittest.TestCase):
                 self.assertFalse(self.output.exists())
 
     def test_input_rechecked_after_stage_hashing_no_publication(self):
-        from tools.sinq.research import corpora
+        from tools.sinq.optimizer import corpora
         original = corpora._stage_digest
         changed = False
 
@@ -177,7 +177,7 @@ class CorporaTest(unittest.TestCase):
         self.assertEqual(set(self.root.iterdir()), {self.source})
 
     def test_source_truncation_after_scan_no_publication(self):
-        from tools.sinq.research import corpora
+        from tools.sinq.optimizer import corpora
         original = corpora._stage_digest
 
         def truncate_after_slice(chunks, paths):
@@ -244,7 +244,9 @@ class CorporaTest(unittest.TestCase):
             with self.assertRaises(ValueError): bind_corpora(manifest, good, tokens)
         unknown_count = copy.deepcopy(good); del unknown_count['calibration']['token_count']
         self.assertIsNotNone(bind_corpora(manifest, unknown_count, self.tokens[6:9]))
-        with self.assertRaises(ValueError): bind_corpora(manifest, {'calibration': None, 'validation': None})
+        ordinary=bind_corpora(manifest, {'calibration':None,'validation':None},self.tokens[6:9])
+        self.assertIsNone(ordinary['calibration'])
+        with self.assertRaises(ValueError):bind_corpora(manifest,{'calibration':None,'validation':None},self.tokens[6:8])
         value = copy.deepcopy(manifest); value['checksum'] = '0'*64
         with self.assertRaises(ValueError): bind_corpora(value, good)
 

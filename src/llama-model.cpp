@@ -8,6 +8,7 @@
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
 #include "llama-sinq.h"
+#include "sinq/sinq-parameters.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-placement.h"
@@ -1663,27 +1664,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const int64_t sinq_manifest_key = gguf_find_key(ml.metadata, "beellama.qk_sinq.tensors");
     if (sinq_version_key >= 0 &&
         (gguf_get_kv_type(ml.metadata, sinq_version_key) != GGUF_TYPE_UINT32 ||
-         gguf_get_val_u32(ml.metadata, sinq_version_key) != 1)) {
-        throw std::runtime_error("QK SINQ requires uint32 beellama.qk_sinq.version=1");
+         gguf_get_val_u32(ml.metadata, sinq_version_key) != 2)) {
+        throw std::runtime_error("QK SINQ requires uint32 beellama.qk_sinq.version=2; old versions are unsupported");
     }
-    if (sinq_version_key >= 0) {
-        const int64_t width_key = gguf_find_key(ml.metadata,"beellama.qk_sinq.strip_width");
-        const int64_t steps_key = gguf_find_key(ml.metadata,"beellama.qk_sinq.iterations");
-        const int64_t algorithm_key = gguf_find_key(ml.metadata,"beellama.qk_sinq.algorithm");
-        if (width_key < 0 || steps_key < 0 || algorithm_key < 0 ||
-            gguf_get_kv_type(ml.metadata,width_key) != GGUF_TYPE_UINT32 ||
-            gguf_get_kv_type(ml.metadata,steps_key) != GGUF_TYPE_UINT32 ||
-            gguf_get_kv_type(ml.metadata,algorithm_key) != GGUF_TYPE_STRING) {
-            throw std::runtime_error("QK SINQ requires typed qk_sinq algorithm, strip_width and iterations metadata");
-        }
-        const uint32_t width = gguf_get_val_u32(ml.metadata,width_key);
-        const uint32_t steps = gguf_get_val_u32(ml.metadata,steps_key);
-        const std::string algorithm = gguf_get_val_str(ml.metadata,algorithm_key);
-        if (!llama_sinq_valid_strip_width(width) || (steps != 4 && steps != 8 && steps != 16) ||
-            (algorithm != "identity" && algorithm != "sinkhorn_log")) {
-            throw std::runtime_error("QK SINQ unsupported qk_sinq normalization recipe");
+    bool sinq_metadata_present=false;
+    for (int64_t i=0;i<gguf_get_n_kv(ml.metadata);++i) {
+        const std::string key=gguf_get_key(ml.metadata,i);
+        if (key.find("beellama.qk_sinq.")==0) {
+            sinq_metadata_present=true;
+            if (!llama_sinq_supported_metadata_key(key)) { throw std::runtime_error("QK SINQ unknown metadata key: "+key); }
         }
     }
+    const int64_t recipes_key=gguf_find_key(ml.metadata,"beellama.qk_sinq.recipes");
+    const int64_t transform_key=gguf_find_key(ml.metadata,"beellama.qk_sinq.transform");
+    const int64_t producer_key=gguf_find_key(ml.metadata,"beellama.qk_sinq.producer");
     std::unordered_set<std::string> sinq_allowed;
     if (arch == LLM_ARCH_QWEN35) {
         const auto tn = LLM_TN(arch);
@@ -1694,13 +1688,28 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
     std::unordered_set<std::string> sinq_declared;
-    if (sinq_manifest_key >= 0 || sinq_version_key >= 0) {
-        if (sinq_version_key < 0 || sinq_manifest_key < 0 ||
+    if (sinq_metadata_present) {
+        if (sinq_version_key < 0 || sinq_manifest_key < 0 || recipes_key < 0 || transform_key < 0 || producer_key < 0 ||
             gguf_get_kv_type(ml.metadata,sinq_manifest_key) != GGUF_TYPE_ARRAY ||
             gguf_get_arr_type(ml.metadata,sinq_manifest_key) != GGUF_TYPE_STRING ||
-            gguf_get_arr_n(ml.metadata,sinq_manifest_key) == 0) {
-            throw std::runtime_error("QK SINQ requires beellama.qk_sinq.version=1 and a nonempty beellama.qk_sinq.tensors string array");
+            gguf_get_kv_type(ml.metadata,recipes_key) != GGUF_TYPE_ARRAY ||
+            gguf_get_arr_type(ml.metadata,recipes_key) != GGUF_TYPE_STRING ||
+            gguf_get_kv_type(ml.metadata,transform_key) != GGUF_TYPE_STRING ||
+            gguf_get_kv_type(ml.metadata,producer_key) != GGUF_TYPE_STRING ||
+            std::string(gguf_get_val_str(ml.metadata,transform_key)) != "f16_input_diagonal" ||
+            gguf_get_arr_n(ml.metadata,sinq_manifest_key) > 100000 ||
+            gguf_get_arr_n(ml.metadata,sinq_manifest_key) != gguf_get_arr_n(ml.metadata,recipes_key)) {
+            throw std::runtime_error("QK SINQ requires the five typed v2 metadata keys and aligned recipes");
         }
+        std::vector<std::string> names,recipes;
+        size_t metadata_bytes=0;
+        for (size_t i=0;i<gguf_get_arr_n(ml.metadata,sinq_manifest_key);++i) {
+            names.emplace_back(gguf_get_arr_str(ml.metadata,sinq_manifest_key,i));
+            recipes.emplace_back(gguf_get_arr_str(ml.metadata,recipes_key,i));
+            metadata_bytes+=names.back().size()+recipes.back().size();
+            if (metadata_bytes>16*1024*1024) { throw std::runtime_error("QK SINQ metadata exceeds 16 MiB"); }
+        }
+        const auto settings=sinq::validate_metadata(names,recipes,gguf_get_val_str(ml.metadata,producer_key));
         if (ml.files.empty()) { throw std::runtime_error("QK SINQ companions require file-backed GGUF loading for shard validation"); }
         for (size_t i = 0; i < gguf_get_arr_n(ml.metadata,sinq_manifest_key); ++i) {
             const std::string name = gguf_get_arr_str(ml.metadata,sinq_manifest_key,i);
@@ -1716,7 +1725,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             const auto & weight = base->second;
             if (ggml_n_dims(weight.tensor) != 2 || !ggml_is_contiguous(weight.tensor) ||
                 weight.tensor->ne[0] % ggml_blck_size(weight.tensor->type) ||
-                weight.tensor->ne[0] % gguf_get_val_u32(ml.metadata,gguf_find_key(ml.metadata,"beellama.qk_sinq.strip_width"))) {
+                weight.tensor->ne[0] % settings[i].strip_width) {
                 throw std::runtime_error("QK SINQ weight must be a contiguous block-aligned matrix with strip-aligned input columns");
             }
             const auto scale = ml.weights_map.find(name+sinq_suffix);

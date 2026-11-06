@@ -3,6 +3,8 @@
 #include <map>
 #include <string>
 #include <vector>
+#include <algorithm>
+#include <thread>
 
 struct llama_sinq_activation_entry {
     std::string name, site, reference_module, data_file, sha256;
@@ -17,5 +19,6 @@ struct llama_sinq_activation_manifest {
 // Throws on unsupported schema/source/site, malformed data or resource bounds.
 // All entries are validated in bounded memory; samples are loaded per tensor.
 llama_sinq_activation_manifest llama_sinq_load_activations(const std::string & path,
-                                                          const std::string & original_gguf);
+                                                          const std::string & original_gguf,
+                                                          int threads = int(std::max(1u,std::thread::hardware_concurrency())));
 std::vector<float> llama_sinq_load_activation_samples(const llama_sinq_activation_entry & entry);

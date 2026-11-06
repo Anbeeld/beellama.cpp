@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from tools.sinq.research import implementation
+from tools.sinq.optimizer import implementation
 
 
 class Distribution:
@@ -24,8 +24,8 @@ class ImplementationTest(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.paths = [
-            'tools/sinq/research/cache.py', 'tools/sinq/research/resources.py',
-            'tools/sinq/research/schemas.py', 'tools/sinq/research/nested/helper.py',
+            'tools/sinq/optimizer/cache.py', 'tools/sinq/optimizer/resources.py',
+            'tools/sinq/optimizer/schemas.py', 'tools/sinq/optimizer/nested/helper.py',
             'tools/sinq/export_activations.py', 'gguf-py/gguf/gguf_writer.py',
             'gguf-py/gguf/gguf_reader.py', 'gguf-py/gguf/quants.py',
             'gguf-py/gguf/py.typed', 'conversion/base.py',
@@ -55,9 +55,9 @@ class ImplementationTest(unittest.TestCase):
                 self.assertNotEqual(before['checksum'], after['checksum'])
                 self.assertEqual(after['files'][name], hashlib.sha256(b'changed!\n').hexdigest())
 
-    def test_add_delete_research_file(self):
+    def test_add_delete_optimizer_file(self):
         before = self.fingerprint()
-        extra = self.root / 'tools/sinq/research/new.py'
+        extra = self.root / 'tools/sinq/optimizer/new.py'
         extra.write_text('new')
         self.assertNotEqual(before['checksum'], self.fingerprint()['checksum'])
         extra.unlink()
@@ -79,7 +79,7 @@ class ImplementationTest(unittest.TestCase):
                 Distribution('indirect-helper', '1.0'), Distribution('numpy', '2.0')]):
             self.assertEqual(before, self.fingerprint())
         self.assertEqual(list(before['files']), sorted(self.paths))
-        self.assertEqual(before['schema_version'], 1)
+        self.assertEqual(before['schema_version'], 2)
         payload = {key: value for key, value in before.items() if key != 'checksum'}
         canonical = json.dumps(payload, sort_keys=True, separators=(',', ':'), ensure_ascii=True)
         self.assertEqual(before['checksum'], hashlib.sha256(canonical.encode('utf-8')).hexdigest())
@@ -110,19 +110,19 @@ class ImplementationTest(unittest.TestCase):
                 path.write_bytes((self.root / name).read_bytes())
             self.assertEqual(before, implementation.implementation_fingerprint(root))
 
-    def test_ignored_cache_and_nonresearch_data(self):
+    def test_ignored_cache_and_nonimplementation_data(self):
         before = self.fingerprint()
-        for name in ('tools/sinq/research/__pycache__/module.py',
+        for name in ('tools/sinq/optimizer/__pycache__/module.py',
                      'gguf-py/gguf/__pycache__/module.pyc',
                      'conversion/__pycache__/module.pyc',
-                     'tools/sinq/research/checkpoint.bin', 'model.gguf'):
+                     'tools/sinq/optimizer/checkpoint.bin', 'model.gguf'):
             path = self.root / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b'not implementation')
         self.assertEqual(before, self.fingerprint())
 
     def test_missing_required_inputs_fail_closed(self):
-        for name in ('tools/sinq/research', 'gguf-py/gguf', 'conversion',
+        for name in ('tools/sinq/optimizer', 'gguf-py/gguf', 'conversion',
                      'tools/sinq/export_activations.py', 'convert_hf_to_gguf.py'):
             with self.subTest(name=name):
                 path = self.root / name
@@ -135,9 +135,9 @@ class ImplementationTest(unittest.TestCase):
                     moved.rename(path)
 
     def test_symlink_escape_fails_closed(self):
-        link = self.root / 'tools/sinq/research/escape.py'
+        link = self.root / 'tools/sinq/optimizer/escape.py'
         try:
-            link.symlink_to(ROOT / 'tools/sinq/research/cache.py')
+            link.symlink_to(ROOT / 'tools/sinq/optimizer/cache.py')
         except (OSError, NotImplementedError) as error:
             self.skipTest('symlink creation unavailable: ' + str(error))
         with self.assertRaises(ValueError):

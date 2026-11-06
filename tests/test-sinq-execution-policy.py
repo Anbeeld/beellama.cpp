@@ -7,10 +7,10 @@ import unittest
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import torch
-from tools.sinq.research.schemas import validate_execution_config
-from tools.sinq.research.execution_backend import resolve_policy
-from tools.sinq.research.device_placement import place_reference
-from tools.sinq.research.memory_accounting import ResourceMonitor, ResourceLimitError
+from tools.sinq.optimizer.schemas import validate_execution_config
+from tools.sinq.optimizer.execution_backend import resolve_policy
+from tools.sinq.optimizer.device_placement import place_reference
+from tools.sinq.optimizer.memory_accounting import ResourceMonitor, ResourceLimitError
 
 class ExecutionTests(unittest.TestCase):
     def test_schema(self):
@@ -98,7 +98,7 @@ class ExecutionTests(unittest.TestCase):
             def start(self):pass
             def join(self):
                 monitor._failure=ResourceLimitError({'code':'RESOURCE_LIMIT','reason':'late poll'})
-        with patch('tools.sinq.research.memory_accounting.threading.Thread',LateFailure):
+        with patch('tools.sinq.optimizer.memory_accounting.threading.Thread',LateFailure):
             with self.assertRaisesRegex(ResourceLimitError,'late poll'):
                 with monitor.phase('final'):pass
 

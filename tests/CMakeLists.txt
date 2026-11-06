@@ -860,14 +860,15 @@ if (GGML_CPU)
     endif()
 endif()
 
-add_executable(test-sinq-calibration test-sinq-calibration.cpp)
-target_include_directories(test-sinq-calibration PRIVATE ../src)
-target_compile_features(test-sinq-calibration PRIVATE cxx_std_17)
-target_link_libraries(test-sinq-calibration PRIVATE llama-sinq-optimizer)
-add_test(NAME test-sinq-calibration COMMAND test-sinq-calibration)
+add_executable(test-sinq-parameters test-sinq-parameters.cpp)
+target_include_directories(test-sinq-parameters PRIVATE ../src ../vendor/nlohmann)
+target_compile_features(test-sinq-parameters PRIVATE cxx_std_17)
+target_link_libraries(test-sinq-parameters PRIVATE llama-sinq-optimizer)
+add_test(NAME test-sinq-parameters COMMAND test-sinq-parameters)
 
 add_executable(test-qk-sinq-model test-qk-sinq-model.cpp)
 target_compile_features(test-qk-sinq-model PRIVATE cxx_std_17)
+target_include_directories(test-qk-sinq-model PRIVATE ../src ../vendor/nlohmann)
 target_link_libraries(test-qk-sinq-model PRIVATE llama ggml)
 add_test(NAME test-qk-sinq-model COMMAND test-qk-sinq-model ${CMAKE_CURRENT_BINARY_DIR}/qk-sinq-model-fixtures)
 
@@ -893,11 +894,11 @@ if (Python3_Interpreter_FOUND)
         LABELS "python behavior cpu" ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1;HF_HUB_OFFLINE=1;TRANSFORMERS_OFFLINE=1")
     if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS)
         set_tests_properties(test-qk-sinq-model PROPERTIES FIXTURES_SETUP sinq-synthetic-source)
-        add_test(NAME test-sinq-calibration-e2e COMMAND ${Python3_EXECUTABLE}
-            ${PROJECT_SOURCE_DIR}/tests/test-sinq-calibration-e2e.py
+        add_test(NAME test-sinq-direct-config-e2e COMMAND ${Python3_EXECUTABLE}
+            ${PROJECT_SOURCE_DIR}/tests/test-sinq-direct-config-e2e.py
             --source ${CMAKE_CURRENT_BINARY_DIR}/qk-sinq-model-fixtures/source.gguf
             --quantize $<TARGET_FILE:llama-quantize>)
-        set_tests_properties(test-sinq-calibration-e2e PROPERTIES FIXTURES_REQUIRED sinq-synthetic-source SKIP_RETURN_CODE 77)
+        set_tests_properties(test-sinq-direct-config-e2e PROPERTIES FIXTURES_REQUIRED sinq-synthetic-source SKIP_RETURN_CODE 77)
     endif()
     add_test(NAME test-sinq-exporter COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-sinq-exporter.py)
     set_tests_properties(test-sinq-exporter PROPERTIES WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
@@ -911,33 +912,34 @@ target_include_directories(test-sinq-awq-methods PRIVATE ../src)
 target_compile_features(test-sinq-awq-methods PRIVATE cxx_std_17)
 target_link_libraries(test-sinq-awq-methods PRIVATE llama-sinq-optimizer)
 add_test(NAME test-sinq-awq-methods COMMAND test-sinq-awq-methods)
-add_executable(test-sinq-search test-sinq-search.cpp)
-target_include_directories(test-sinq-search PRIVATE ../src)
-target_compile_features(test-sinq-search PRIVATE cxx_std_17)
-target_link_libraries(test-sinq-search PRIVATE llama-sinq-optimizer)
-add_test(NAME test-sinq-search COMMAND test-sinq-search)
+add_executable(test-sinq-candidates test-sinq-candidates.cpp)
+target_include_directories(test-sinq-candidates PRIVATE ../src)
+target_compile_features(test-sinq-candidates PRIVATE cxx_std_17)
+target_link_libraries(test-sinq-candidates PRIVATE llama-sinq-optimizer)
+add_test(NAME test-sinq-candidates COMMAND test-sinq-candidates)
 add_executable(test-sinq-threading test-sinq-threading.cpp)
 target_include_directories(test-sinq-threading PRIVATE ../src)
 target_compile_features(test-sinq-threading PRIVATE cxx_std_17)
+target_include_directories(test-sinq-threading PRIVATE ../vendor/nlohmann)
 target_link_libraries(test-sinq-threading PRIVATE llama-sinq-optimizer)
 add_test(NAME test-sinq-threading COMMAND test-sinq-threading)
-add_executable(test-sinq-research-config test-sinq-research-config.cpp ../src/sinq/sinq-research-config.cpp)
-target_include_directories(test-sinq-research-config PRIVATE ../src)
-target_compile_features(test-sinq-research-config PRIVATE cxx_std_17)
-target_link_libraries(test-sinq-research-config PRIVATE llama-sinq-optimizer)
-add_test(NAME test-sinq-research-config COMMAND test-sinq-research-config)
+add_executable(test-sinq-bridge-config test-sinq-bridge-config.cpp ../src/sinq/sinq-bridge-config.cpp)
+target_include_directories(test-sinq-bridge-config PRIVATE ../src ../vendor/nlohmann)
+target_compile_features(test-sinq-bridge-config PRIVATE cxx_std_17)
+target_link_libraries(test-sinq-bridge-config PRIVATE llama-sinq-optimizer)
+add_test(NAME test-sinq-bridge-config COMMAND test-sinq-bridge-config)
 if (Python3_Interpreter_FOUND)
-    foreach(research_test blockwise fisher research-config candidate-cache hybrid groupwise-kl stock-baseline research-repairs implementation corpora generation-resume threading backend-scoring reference-loader execution-policy)
-        add_test(NAME test-sinq-research-${research_test} COMMAND ${Python3_EXECUTABLE}
-            ${PROJECT_SOURCE_DIR}/tests/test-sinq-${research_test}.py)
-        set_tests_properties(test-sinq-research-${research_test} PROPERTIES
+    foreach(optimizer_test blockwise fisher optimizer-config optimizer-contract optimizer-selection candidate-cache assembly groupwise-kl stock-baseline optimizer-integrity implementation corpora generation-resume threading backend-scoring reference-loader execution-policy)
+        add_test(NAME test-sinq-optimizer-${optimizer_test} COMMAND ${Python3_EXECUTABLE}
+            ${PROJECT_SOURCE_DIR}/tests/test-sinq-${optimizer_test}.py)
+        set_tests_properties(test-sinq-optimizer-${optimizer_test} PROPERTIES
             SKIP_RETURN_CODE 77
             WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
             ENVIRONMENT "OMP_NUM_THREADS=32;MKL_NUM_THREADS=32;HF_HUB_OFFLINE=1;TRANSFORMERS_OFFLINE=1")
     endforeach()
 endif()
 
-if (Python3_Interpreter_FOUND AND LLAMA_BUILD_TOOLS AND LLAMA_BUILD_SINQ_RESEARCH)
-    set_tests_properties(test-sinq-research-hybrid test-sinq-research-groupwise-kl test-sinq-research-stock-baseline test-sinq-research-generation-resume PROPERTIES
+if (Python3_Interpreter_FOUND AND LLAMA_BUILD_TOOLS AND LLAMA_BUILD_SINQ_OPTIMIZER)
+    set_tests_properties(test-sinq-optimizer-assembly test-sinq-optimizer-groupwise-kl test-sinq-optimizer-stock-baseline test-sinq-optimizer-generation-resume PROPERTIES
         ENVIRONMENT "OMP_NUM_THREADS=32;MKL_NUM_THREADS=32;HF_HUB_OFFLINE=1;TRANSFORMERS_OFFLINE=1;SINQ_NATIVE_BIN=$<TARGET_FILE_DIR:llama-quantize>")
 endif()

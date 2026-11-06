@@ -51,13 +51,17 @@ set(LLAMA_CORE_SOURCES
 
 # Object linkage keeps the offline optimizer inside installed libllama archives,
 # rather than introducing an uninstalled private static-library dependency.
-add_library(llama-sinq-optimizer OBJECT llama-sinq.cpp llama-sinq-calibration.cpp llama-sinq-activation.cpp
-    sinq/sinq-awq.cpp sinq/sinq-local-score.cpp sinq/sinq-search.cpp sinq/sinq-native-codec.cpp
+add_library(llama-sinq-optimizer OBJECT llama-sinq.cpp llama-sinq-activation.cpp
+    sinq/sinq-awq.cpp sinq/sinq-local-score.cpp sinq/sinq-candidates.cpp sinq/sinq-native-codec.cpp
+    sinq/sinq-parameters.cpp
     ../vendor/hash/sha256/sha256.c)
 set_target_properties(llama-sinq-optimizer PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_features(llama-sinq-optimizer PRIVATE cxx_std_17)
-target_include_directories(llama-sinq-optimizer PRIVATE ../vendor/hash)
+target_include_directories(llama-sinq-optimizer PRIVATE . ../vendor/hash ../vendor/nlohmann)
 target_link_libraries(llama-sinq-optimizer PUBLIC ggml)
+if (WIN32)
+    target_link_libraries(llama-sinq-optimizer PUBLIC bcrypt)
+endif()
 
 add_library(llama
             ../include/llama.h
@@ -80,7 +84,7 @@ set_source_files_properties(${LLAMA_CORE_SOURCES} ../include/llama.h unicode.h
 
 configure_file(llama-version.h.in ${CMAKE_CURRENT_BINARY_DIR}/llama-version.h @ONLY)
 
-target_include_directories(llama PRIVATE . ${CMAKE_CURRENT_BINARY_DIR} ../vendor/hash)
+target_include_directories(llama PRIVATE . ${CMAKE_CURRENT_BINARY_DIR} ../vendor/hash ../vendor/nlohmann)
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 

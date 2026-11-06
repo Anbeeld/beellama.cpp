@@ -1,4 +1,12 @@
 #include "llama-sinq-activation.h"
+#include "sinq/sinq-parallel.h"
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <bcrypt.h>
+#endif
 #include "../vendor/nlohmann/json.hpp"
 extern "C" {
 #include "../vendor/hash/sha256/sha256.h"
@@ -26,17 +34,59 @@ std::string finish_hash(sha256_t & hash) {
     for (unsigned char b : bytes) { out += hex[b >> 4]; out += hex[b & 15]; }
     return out;
 }
+#ifdef _WIN32
+// CNG uses the OS's hardware-accelerated SHA-256 implementation. The digest
+// remains standard SHA-256; one stream cannot be split into independent hashes.
+struct source_hasher {
+    std::vector<unsigned char> object;
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    ~source_hasher() {
+        if (hash) BCryptDestroyHash(hash);
+        if (algorithm) BCryptCloseAlgorithmProvider(algorithm,0);
+    }
+    void initialize() {
+        if (BCryptOpenAlgorithmProvider(&algorithm,BCRYPT_SHA256_ALGORITHM,nullptr,0)<0) invalid("cannot initialize SHA256 provider");
+        DWORD bytes=0,written=0;
+        if (BCryptGetProperty(algorithm,BCRYPT_OBJECT_LENGTH,reinterpret_cast<PUCHAR>(&bytes),sizeof(bytes),&written,0)<0 || written!=sizeof(bytes) || bytes==0 || bytes>1024*1024) invalid("invalid SHA256 provider workspace");
+        object.resize(bytes);
+        if (BCryptCreateHash(algorithm,&hash,object.data(),bytes,nullptr,0,0)<0) invalid("cannot create SHA256 state");
+    }
+    void update(const unsigned char * data,size_t size) {
+        if (size && BCryptHashData(hash,const_cast<PUCHAR>(data),ULONG(size),0)<0) invalid("source SHA256 update failed");
+    }
+    std::string finish() {
+        unsigned char bytes[32];
+        if (BCryptFinishHash(hash,bytes,sizeof(bytes),0)<0) invalid("source SHA256 finish failed");
+        const char * hex="0123456789abcdef";std::string result;result.reserve(64);
+        for (unsigned char value:bytes) { result+=hex[value>>4];result+=hex[value&15]; }
+        return result;
+    }
+};
+#endif
 std::string hash_file(const fs::path & path) {
     std::ifstream file(path,std::ios::binary);
     if (!file) { invalid("cannot open source GGUF"); }
+#ifdef _WIN32
+    source_hasher hash;hash.initialize();
+#else
     sha256_t hash; sha256_init(&hash);
+#endif
     std::array<char,65536> buffer;
     while (file) {
         file.read(buffer.data(),buffer.size());
+#ifdef _WIN32
+        hash.update(reinterpret_cast<const unsigned char *>(buffer.data()),size_t(file.gcount()));
+#else
         sha256_update(&hash,reinterpret_cast<const unsigned char *>(buffer.data()),size_t(file.gcount()));
+#endif
     }
     if (!file.eof()) { invalid("source GGUF read failed"); }
+#ifdef _WIN32
+    return hash.finish();
+#else
     return finish_hash(hash);
+#endif
 }
 void fields(const json & j, std::initializer_list<const char *> required,
             std::initializer_list<const char *> optional = {}) {
@@ -127,7 +177,8 @@ fs::path contained_file(const fs::path & dir, const std::string & name) {
 }
 
 llama_sinq_activation_manifest llama_sinq_load_activations(const std::string & path,
-                                                          const std::string & original_gguf) {
+                                                          const std::string & original_gguf, int threads) {
+    if (threads<1 || threads>1024) { invalid("threads must be in 1..1024"); }
     fs::path manifest_path = fs::u8path(path);
     if (fs::is_directory(manifest_path)) { manifest_path /= "activations.json"; }
     manifest_path = fs::canonical(manifest_path);
@@ -197,9 +248,16 @@ llama_sinq_activation_manifest llama_sinq_load_activations(const std::string & p
         entry.sha256 = hash_text(tensor,"sha256");
         entry.data_file = contained_file(manifest_path.parent_path(),text(tensor,"data_file")).u8string();
         if (out.tensors.count(entry.name)) { invalid("duplicate tensor " + entry.name); }
-        read_samples(entry,nullptr);
         out.tensors.emplace(entry.name,std::move(entry));
     }
+    std::vector<const llama_sinq_activation_entry *> entries;
+    entries.reserve(out.tensors.size());
+    for (const auto & item:out.tensors) entries.push_back(&item.second);
+    // Each worker uses one fixed 64 KiB read buffer; mappings and output tables
+    // remain read-only until all workers have joined, including on failure.
+    sinq::parallel_for(int64_t(entries.size()),threads,[&](int64_t begin,int64_t end) {
+        for (int64_t i=begin;i<end;++i) read_samples(*entries[size_t(i)],nullptr);
+    });
     return out;
 }
 

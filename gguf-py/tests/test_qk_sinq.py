@@ -1,22 +1,21 @@
-"""Storage inspection checks, independent GGUFWriter and standard Q_K payloads."""
-import importlib.util
+"""Independent storage inspection of the closed SINQ GGUF v2 contract."""
 import json
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
-
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from gguf import GGUFWriter, GGMLQuantizationType, GGUFValueType
+from gguf import GGUFWriter, GGMLQuantizationType
 from gguf.quants import dequantize
 
 ROOT = Path(__file__).resolve().parents[2]
+DEFAULT = {'generator': 'sinq', 'iterations': 16, 'strength': 1.0, 'strip_width': 64}
 
 
-def write(path, kind=None, scales=None, manifest=True, version=1, metadata=None, columns=256):
+def write(path, kind=None, scales=None, manifest=True, version=2, metadata=None, columns=256, recipe=None):
     w = GGUFWriter(path, 'qwen35')
     name = 'blk.0.ffn_up.weight'
     if kind is None:
@@ -24,7 +23,6 @@ def write(path, kind=None, scales=None, manifest=True, version=1, metadata=None,
     else:
         block = 110 if kind == GGMLQuantizationType.Q3_K else 144
         packed = np.zeros((2, block * (columns // 256)), dtype=np.uint8)
-        # Independent reader/official decoder sees an ordinary 256-weight block.
         decoded = dequantize(packed, kind)
         assert decoded.shape == (2, columns) and np.all(decoded == 0)
         w.add_tensor(name, packed, raw_dtype=kind)
@@ -34,6 +32,11 @@ def write(path, kind=None, scales=None, manifest=True, version=1, metadata=None,
         w.add_uint32('beellama.qk_sinq.version', version)
         if manifest:
             w.add_array('beellama.qk_sinq.tensors', [name])
+        w.add_string('beellama.qk_sinq.transform', 'f16_input_diagonal')
+        w.add_string('beellama.qk_sinq.producer', 'test')
+        recipe = DEFAULT if recipe is None else recipe
+        encoded = recipe if isinstance(recipe, str) else json.dumps(recipe, sort_keys=True, separators=(',', ':'))
+        w.add_array('beellama.qk_sinq.recipes', [encoded])
     for key, value in (metadata or {}).items():
         if isinstance(value, bool):
             w.add_bool(key, value)
@@ -68,71 +71,61 @@ class TestQKSidecar(unittest.TestCase):
                 self.assertEqual(record['tensor_inventory'][0]['dtype'], kind.name)
                 self.assertEqual(record['tensor_inventory'][0]['companion']['min'], 1)
 
-    def test_strip_width_metadata(self):
+    def test_per_tensor_width(self):
         with tempfile.TemporaryDirectory() as directory:
             d = Path(directory)
-            write(d / 'source.gguf', columns=512)
+            write(d/'source.gguf', columns=512)
             for width in (32, 64, 128, 256, 512):
-                write(d / 'model.gguf', GGMLQuantizationType.Q3_K, np.ones(512),
-                      metadata={'beellama.qk_sinq.strip_width': width}, columns=512)
-                result = self.inspect(d / 'source.gguf', d / 'model.gguf', d / 'out.json')
+                write(d/'model.gguf', GGMLQuantizationType.Q3_K, np.ones(512), columns=512,
+                      recipe={**DEFAULT, 'strip_width': width})
+                result = self.inspect(d/'source.gguf', d/'model.gguf', d/'out.json')
                 self.assertEqual(result.returncode, 0, result.stderr)
             for width in (0, 48, 1024, '64', True):
-                write(d / 'model.gguf', GGMLQuantizationType.Q3_K, np.ones(512),
-                      metadata={'beellama.qk_sinq.strip_width': width}, columns=512)
-                self.assertNotEqual(self.inspect(d / 'source.gguf', d / 'model.gguf', d / 'out.json').returncode, 0)
-            write(d / 'source.gguf')
-            write(d / 'model.gguf', GGMLQuantizationType.Q3_K, np.ones(256),
-                  metadata={'beellama.qk_sinq.strip_width': 512})
-            self.assertNotEqual(self.inspect(d / 'source.gguf', d / 'model.gguf', d / 'out.json').returncode, 0)
+                write(d/'model.gguf', GGMLQuantizationType.Q3_K, np.ones(512), columns=512,
+                      recipe={**DEFAULT, 'strip_width': width})
+                self.assertNotEqual(self.inspect(d/'source.gguf', d/'model.gguf', d/'out.json').returncode, 0)
+            write(d/'source.gguf')
+            write(d/'model.gguf', GGMLQuantizationType.Q3_K, np.ones(256), recipe={**DEFAULT, 'strip_width': 512})
+            self.assertNotEqual(self.inspect(d/'source.gguf', d/'model.gguf', d/'out.json').returncode, 0)
 
-    def test_supported_sinq_metadata(self):
-        metadata = {'beellama.qk_sinq.algorithm': 'normalization',
-                    'beellama.qk_sinq.strip_width': 64,
-                    'beellama.qk_sinq.iterations': 16,
-                    'beellama.qk_sinq.producer': 'test',
-                    'beellama.qk_sinq.numerics': 'test'}
+    def test_malformed_recipes(self):
+        bad = [json.dumps(DEFAULT), '{"generator":"sinq","iterations":16,"strength":1.0,"strength":1.0,"strip_width":64}',
+               {**DEFAULT, 'unexpected': True}, {**DEFAULT, 'strength': float('nan')},
+               {**DEFAULT, 'iterations': 3}, {**DEFAULT, 'generator': 'awq'},
+               {key: value for key, value in DEFAULT.items() if key != 'strength'}]
         with tempfile.TemporaryDirectory() as directory:
             d = Path(directory)
-            write(d/'source.gguf', metadata=metadata)
-            write(d/'model.gguf', GGMLQuantizationType.Q3_K, np.ones(256), metadata=metadata)
-            result = self.inspect(d/'source.gguf', d/'model.gguf', d/'out.json')
-            self.assertEqual(result.returncode, 0, result.stderr)
+            write(d/'source.gguf')
+            for recipe in bad:
+                write(d/'model.gguf', GGMLQuantizationType.Q3_K, np.ones(256), recipe=recipe)
+                self.assertNotEqual(self.inspect(d/'source.gguf', d/'model.gguf', d/'out.json').returncode, 0, repr(recipe))
 
     def test_unsupported_sinq_metadata(self):
-        cases = [('beellama.qk_sinq.kurtosis_gate', True),
-                 ('beellama.qk_sinq.kurtosis_gate', False),
-                 ('beellama.qk_sinq.kurtosis_gate', 'false'),
-                 ('beellama.qk_sinq.future_control', True)]
+        cases = [('beellama.qk_sinq.strip_width', 64), ('beellama.qk_sinq.algorithm', 'sinkhorn_log'),
+                 ('beellama.qk_sinq.numerics', 'old'), ('beellama.qk_sinq.future_control', True)]
         with tempfile.TemporaryDirectory() as directory:
             d = Path(directory)
             for target in ['source', 'model']:
-                for transformed in [False, True]:
-                    for key, value in cases:
-                        with self.subTest(target=target, transformed=transformed,
-                                          key=key, value=value):
-                            for name in ['source', 'model']:
-                                kind = GGMLQuantizationType.Q3_K if transformed else None
-                                scales = np.ones(256) if kind is not None else None
-                                metadata = {key: value} if name == target else None
-                                write(d/f'{name}.gguf', kind, scales, metadata=metadata)
-                            result = self.inspect(d/'source.gguf', d/'model.gguf', d/'out.json')
-                            self.assertNotEqual(result.returncode, 0, result.stdout)
-                            self.assertIn('unsupported SINQ metadata', result.stderr)
-                            self.assertIn(key, result.stderr)
-                            self.assertIn(str(d/f'{target}.gguf'), result.stderr)
+                for key, value in cases:
+                    for name in ['source', 'model']:
+                        kind = GGMLQuantizationType.Q3_K if name == 'model' else None
+                        write(d/f'{name}.gguf', kind, np.ones(256) if kind else None,
+                              metadata={key: value} if name == target else None)
+                    result = self.inspect(d/'source.gguf', d/'model.gguf', d/'out.json')
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('unsupported SINQ metadata', result.stderr)
+                    self.assertIn(key, result.stderr)
 
     def test_bad_association_and_values(self):
         with tempfile.TemporaryDirectory() as directory:
             d = Path(directory)
             write(d/'source.gguf')
-            cases = [(None, True, 1), (np.ones(255), True, 1),
-                     (np.zeros(256), True, 1), (np.full(256, np.nan), True, 1),
-                     (np.ones(256), False, 1), (np.ones(256), True, 2)]
+            cases = [(None, True, 2), (np.ones(255), True, 2), (np.zeros(256), True, 2),
+                     (np.full(256, np.nan), True, 2), (np.ones(256), False, 2), (np.ones(256), True, 1)]
             for scales, manifest, version in cases:
                 write(d/'model.gguf', GGMLQuantizationType.Q3_K, scales, manifest, version)
                 result = self.inspect(d/'source.gguf', d/'model.gguf', d/'out.json')
-                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertNotEqual(result.returncode, 0)
 
 
 if __name__ == '__main__':

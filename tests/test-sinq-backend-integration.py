@@ -16,16 +16,16 @@ sys.path[:0] = [str(ROOT), str(ROOT/'gguf-py')]
 import numpy as np
 import torch
 import gguf
-from tools.sinq.research import native_codec
-from tools.sinq.research.cache import CandidateStore
-from tools.sinq.research.cli import score_config, _advanced_reference
-from tools.sinq.research.schemas import validate_config
-from tools.sinq.research.capture import capture_block
-from tools.sinq.research.blockwise import score_block, block_delta
-from tools.sinq.research.fisher import qwen_probes
-from tools.sinq.research.resources import canonical_json, digest, file_digest
-from tools.sinq.research.execution_backend import resolve_policy
-from tools.sinq.research.generate import source_identity
+from tools.sinq.optimizer import native_codec
+from tools.sinq.optimizer.cache import CandidateStore
+from tools.sinq.optimizer.stages import score_config, _advanced_reference
+from tools.sinq.optimizer.schemas import validate_config
+from tools.sinq.optimizer.capture import capture_block
+from tools.sinq.optimizer.blockwise import score_block, block_delta
+from tools.sinq.optimizer.fisher import qwen_probes
+from tools.sinq.optimizer.resources import canonical_json, digest, file_digest
+from tools.sinq.optimizer.execution_backend import resolve_policy
+from tools.sinq.optimizer.generate import source_identity
 
 torch.set_num_threads(32)
 
@@ -54,29 +54,30 @@ def main():
             for qtype,label in [('q5_0','q5'),('q8_0','q8')]:
                 request_dir=output/f'encode-{index}-{label}'; request_dir.mkdir()
                 packed=request_dir/'packed'
-                response=native_codec.request(bridge,dict(schema_version=1,operation='stock',weights=str(raw),
+                response=native_codec.request(bridge,dict(schema_version=2,operation='stock',weights=str(raw),
                     source_type='f32',rows=n,columns=k,codec=qtype,threads=32,workspace_bytes=64<<20,
-                    max_output_bytes=8<<20,strip_width=64,iterations=16,strength=1.,output=str(packed)),request_dir)
+                    max_output_bytes=8<<20,output=str(packed)),request_dir)
                 provenance=dict(source_sha256=source_hash,tensor_name=name,shape=[n,k],source_qtype='F32',
                     qtype=qtype.upper(),input_sha256=file_digest(raw),recipe_sha256=recipe,imatrix_sha256=None,
                     codec=dict(implementation='ggml',chunk_rows=max(1,(16384+k-1)//k),rows_per_expert=n),
                     producer=dict(binary_sha256=file_digest(bridge),source_sha256=native_source_sha256),
-                    sinq=None,generator={'family':'stock'},activation=None)
+                    sinq=None,generator={'generator':'stock'},activation=None)
                 key=store.put_files(provenance,packed/response['payload']); ids.append(key);assignments[label][name]=key
             records[name]=dict(stock=ids[0],candidates=[dict(candidate_id=ids[1])])
     finally: reader.data._mmap.close()
-    run=dict(schema_version=1,source_gguf='../checkpoint/model.gguf',source_sha256=source_hash,cache='cache',
+    run=dict(schema_version=2,source_gguf='../checkpoint/model.gguf',source_sha256=source_hash,cache='cache',
              recipe_sha256=recipe,imatrix_sha256=None,tensors=records)
     run['checksum']=digest(run); manifest=output/'run/run-manifest.json';manifest.write_bytes(canonical_json(run))
     tokens=torch.tensor([[1,7,3,11,5,19,2]])
-    capture_file=output/'capture.json';capture_file.write_bytes(canonical_json(dict(schema_version=1,
+    capture_file=output/'capture.json';capture_file.write_bytes(canonical_json(dict(schema_version=2,
         source_sha256=source_hash,tokens=tokens.tolist(),layers=[0])))
     budgets=dict(workspace_bytes=128<<20,max_candidates=4,max_output_bytes=64<<20,max_files=100,
                  max_tensors=4,max_tokens=16,max_probes=16,max_evaluations=8)
-    common=dict(schema_version=1,operation='score',threads=32,budgets=budgets,candidate_manifest=str(manifest),
-                capture_manifest=str(capture_file),checkpoint=str(checkpoint),context='reference_inputs',
-                native_bridge=str(bridge),families=['stock'],assignments=assignments,
-                memory_policy=dict(host_limit_bytes=8<<30,reserve_bytes=64<<20))
+    common=dict(schema_version=2,
+        inputs=dict(candidate_manifest=str(manifest),capture_manifest=str(capture_file),
+            checkpoint=str(checkpoint),native_bridge=str(bridge)),
+        limits=dict(workspace_bytes=128<<20,max_artifact_bytes=64<<20,max_files=100,
+            max_tensors=4,max_tokens=16,max_block_scores=8,max_fisher_vjps=16))
     modes=[('cpu',{}),]
     if torch.cuda.is_available():
         # Both devices are exercised in the same run, including cross-device VJPs.
@@ -88,8 +89,10 @@ def main():
     for device,extra in modes:
         for dtype in ('fp32','bf16'):
             label=device.replace(':','-')+('-layerwise' if extra else '')+'-'+dtype
-            cfg=dict(common,device=device,reference_dtype=dtype,**extra)
-            policy=resolve_policy(cfg)
+            execution=dict(device=device,reference_dtype=dtype,
+                memory_policy=dict(host_limit_bytes=8<<30,reserve_bytes=64<<20),**extra)
+            cfg={**common,'execution':dict(threads=32,scoring=execution)}
+            policy=resolve_policy(execution)
             adapter=_advanced_reference(checkpoint,source,budgets['workspace_bytes'],32,policy=policy)
             assert all(not p.requires_grad and p.grad is None for p in adapter.reference.parameters())
             assert adapter.reference.lm_head.weight is adapter.text.embed_tokens.weight
@@ -132,10 +135,13 @@ def main():
             entry=dict(label=label,device=device,dtype=dtype,logits=logits.tolist())
             for method,objective in [('blockwise','output_mse'),('fisher_vjp_mc','fisher_quadratic')]:
                 path=output/(label+'-'+method)
-                raw=dict(cfg,method=method,objective=objective,output_directory=str(path))
-                if method=='fisher_vjp_mc':raw.update(probes=2,seed=617)
+                raw=dict(cfg,scoring=dict(kind='blockwise_output_mse' if method=='blockwise' else 'fisher_vjp_mc',
+                    context='reference_inputs',assignments=assignments),output=dict(directory=str(path)))
+                raw['limits']=dict(raw['limits'])
+                if method=='fisher_vjp_mc':raw['scoring'].update(probes=2,seed=617)
+                else:raw['limits'].pop('max_fisher_vjps')
                 (output/(label+'-'+method+'-config.json')).write_bytes(canonical_json(raw))
-                result=score_config(validate_config(raw))
+                result=score_config(validate_config(raw,'score'))
                 assert len(result['records'])==2
                 assert all(np.isfinite(r['score']) and r['score']>0 for r in result['records'])
                 assert result['reference_identity']['source_gguf_sha256']==source_hash

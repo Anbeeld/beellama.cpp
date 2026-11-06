@@ -1,5 +1,8 @@
 # A-SINQ audit follow-up
 
+> Historical pre-refactor report. Its removed interfaces and v1 artifacts are
+> not current instructions or v2 verification. Use [current SINQ settings](sinq-settings.md).
+
 Reviewed against `5336b2b5ddad878af523609b6b07b3c660a064f7`. The checkpoint
 identity concern was valid. The activation and additional-codec requests were
 validation gaps, not demonstrated errors in the candidate scorer. This update

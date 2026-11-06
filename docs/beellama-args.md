@@ -7,51 +7,34 @@ limits, and measurement guidance.
 
 ## SINQ-derived native IQ/Q preconditioning
 
-`llama-quantize` can condition selected Qwen3.5 input columns before the
-unchanged selected native IQ/Q encoder. Companion vectors require BeeLlama at
-inference. These are not portable, ordinary scale-free Q_K models, despite
-using standard weight types.
+`llama-quantize --sinq-config FILE` applies strict v2 per-tensor/layer settings
+before the unchanged selected native codec. Without the config, stock
+quantization is unchanged. Conditioned GGUFs require BeeLlama at inference.
 
 | Option | Default | Behavior |
-|---|---|---|
-| `--sinq-precondition none\|sidecar\|identity` | `none` | `sidecar` computes column scales; `identity` writes all-one controls. Only supported native IQ/Q weights within the selected primary-trunk mask receive companions. |
-| `--sinq-strip-width 32\|64\|128\|256\|512` | `64` | Full-height normalization-strip width, separate from native 256-element Q_K superblocks. |
-| `--sinq-iterations 4\|8\|16` | `16` | Best-intermediate float32 normalization steps. |
-| `--sinq-strength FLOAT` | `1.0` | Fixed finite Sinkhorn exponent in `[0,1]`; no automatic-strength search. |
-| `--sinq-tensor-list FILE` | All eligible | Exact names, one per line, selecting conditioning only; codec allocation stays unchanged. |
-| `--sinq-calibration PATH` | Off | Offline actual-activation manifest/directory. A-SINQ adapted to the selected native codec with fixed-strength AWQ candidates and L1 output scoring; requires sidecar. |
-| `--sinq-diagnostics-json FILE` | Off | Producer-side scale and optional calibration diagnostics. |
-| `--sinq-coverage` | Off | Historical reproduction only, restricts ordinary allocation to primary-trunk projections. Not a conditioning mask. |
-| `--tensor-type tensor_name=ggml_type` | Unused | Existing repeatable selector can retain floats or mix standard quantization types. |
-| `--tensor-type-file FILE` | Unused | Reads the existing selectors from a file. |
-| `--pure` | Off | Disables conventional K-quant mixture heuristics for controlled comparisons. |
-| `--keep-split` | Off | Keeps input shards and each scale vector with its base matrix. |
-
-SINQ options accept either `--option=value` or `--option value`.
+| --- | --- | --- |
+| `--sinq-config FILE` | Off | JSON defaults, targets and disjoint selector overrides; resolves before encoding |
+| `--sinq-diagnostics-json FILE` | Off | Shared external per-tensor report; does not supply settings |
+| `--tensor-type tensor_name=ggml_type` | Unused | Existing exact/regex codec allocation selector |
+| `--tensor-type-file FILE` | Unused | Existing codec allocation selectors from a file |
+| `--pure` | Off | Disables conventional K-quant mixture heuristics |
+| `--keep-split` | Off | Keeps each companion with its base matrix's input shard |
 
 ```sh
-llama-quantize --pure --sinq-precondition=sidecar source-bf16.gguf model.beellama-qk-sinq.gguf Q3_K
-llama-quantize --pure source-bf16.gguf ordinary-control.gguf Q3_K
+llama-quantize --pure --sinq-config direct.json source-bf16.gguf model.beellama-qk-sinq.gguf Q3_K
+llama-quantize --pure source-bf16.gguf stock.gguf Q3_K
+python -m tools.sinq.optimizer.cli plan --config generate.json
+python -m tools.sinq.optimizer.cli generate --config generate.json
 ```
 
-Sources must be F32/F16/BF16. The text-only 9B conditioning policy selects 248
-projection matrices. Embedding and output matrices are ordinarily quantized,
-not conditioned; norms, convolution filters and architectural state retain
-their required types. To verify pure coverage, inspect every final tensor:
-`--pure` disables mixture heuristics but shape fallbacks may still apply.
-Use explicit `--output-tensor-type` and `--token-embedding-type` overrides
-where required. `--sinq-coverage` restricts quantization to the projection mask
-only when explicitly requested.
-
-Admitted placements are CPU and single-GPU CUDA, including partial layer
-offload. Hadamard, row/tensor splitting and conditioning an already transformed
-source fail closed. See the [companion contract](../../beellama.doc/docs/explanation/sinq-format.md)
-for manifest/version checks, LoRA input separation and third-party loader
-warnings. Conditioning is experimental and disabled by default; measured
-quality gains depend on format and metric. Native-codec A-SINQ results on
-Thireus recipes have not been measured. Calibration L1 does not imply better
-KLD/PPL. See [SINQ settings](sinq-settings.md) for all 15 supported codecs,
-activation acquisition, format constraints and usage examples.
+See [SINQ settings](sinq-settings.md) for the complete supported schema, manual,
+automatic and locked-hybrid examples, v2 metadata and resource limits. Old
+unreleased SINQ switches/artifacts are unsupported, with no compatibility aliases.
+Only original floating Qwen3.5 supported projections can be conditioned;
+embeddings/output heads and other tensors keep the ordinary exact codec recipe.
+CPU and qualified CUDA placements retain base-only compensation and original
+LoRA inputs. Hadamard and row/tensor split combinations remain unsupported.
+This refactor makes no quality-improvement claim.
 
 ## KVarN cache types and SWA overrides
 

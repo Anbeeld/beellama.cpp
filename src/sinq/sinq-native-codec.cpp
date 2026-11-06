@@ -1,5 +1,34 @@
 #include "sinq-native-codec.h"
+#include "sinq-numeric.h"
+#include "sinq-parallel.h"
+#include <cmath>
 #include <algorithm>
+
+void sinq::precondition_weights(const float * weights, float * output, int64_t rows,
+        int64_t columns, const ggml_fp16_t * scales, int threads) {
+    require(weights && output && scales && rows > 0 && columns > 0 && threads > 0, "invalid preconditioning buffers/shape");
+    for (int64_t j = 0; j < columns; ++j) {
+        const float u = ggml_fp16_to_fp32(scales[j]);
+        require(std::isfinite(u) && u > 0, "invalid serialized compensation");
+    }
+    parallel_for(rows, threads, [&](int64_t begin, int64_t end) {
+        for (int64_t i = begin*columns; i < end*columns; ++i) {
+            output[i] = weights[i]/ggml_fp16_to_fp32(scales[i%columns]);
+        }
+    });
+}
+
+void sinq::transform_importance(const float * importance, float * output,
+        int64_t columns, const ggml_fp16_t * scales) {
+    require(importance && output && scales && columns > 0, "invalid importance buffers/shape");
+    for (int64_t j = 0; j < columns; ++j) {
+        const float u = ggml_fp16_to_fp32(scales[j]);
+        require(std::isfinite(u) && u > 0 && std::isfinite(importance[j]) && importance[j] >= 0, "invalid importance/compensation");
+        output[j] = importance[j]*u*u;
+        require(std::isfinite(output[j]) && output[j] >= 0, "transformed importance overflow");
+    }
+}
+
 #include <mutex>
 #include <stdexcept>
 size_t sinq::native_encode(enum ggml_type new_type, const float * f32_data, void * new_data, const int64_t chunk_size, int64_t first_row, int64_t nrows, int64_t nrows_per_expert, int64_t n_per_row, const float * imatrix, std::vector<std::thread> & workers, const int nthread) {

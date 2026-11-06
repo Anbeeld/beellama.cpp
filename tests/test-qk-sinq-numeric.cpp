@@ -269,9 +269,12 @@ static void synthetic() {
         const void * input=type==GGML_TYPE_F32?static_cast<const void *>(w.data()):type==GGML_TYPE_F16?static_cast<const void *>(h.data()):static_cast<const void *>(b.data());
         for (int width:{32,64,128,256,512}) { for (int it:{4,8,16}) {
             llama_sinq_options o; o.strip_width=width; o.iterations=it;
-            llama_sinq_statistics s,rs; std::vector<ggml_fp16_t> t,t4,rt;
-            CHECK(llama_sinq_compute_scales(input,type,n,k,o,1,t,s));
+            llama_sinq_statistics s,rs; std::vector<ggml_fp16_t> t,t4,t32,rt;
+            std::vector<float> raw,raw32;
+            CHECK(llama_sinq_compute_scales(input,type,n,k,o,1,t,s,&raw));
             CHECK(llama_sinq_compute_scales(input,type,n,k,o,4,t4,rs)); CHECK(t==t4);
+            CHECK(llama_sinq_compute_scales(input,type,n,k,o,32,t32,rs,&raw32));
+            CHECK(t==t32 && raw==raw32);
             CHECK(llama_sinq_compute_scales(rounded.data(),GGML_TYPE_F32,n,k,o,1,rt,rs)); CHECK(t==rt);
             std::vector<float> scaled(n*k), x(k), compensated(k);
             bool rounded_factor=false;
@@ -281,6 +284,7 @@ static void synthetic() {
                 CHECK(llama_sinq_balance_tile(tile.data(),n,width,it,col.data(),row.data()));
                 for (int j=0;j<width;++j) {
                     CHECK(t[start+j]==ggml_fp32_to_fp16(col[j]));
+                    CHECK(raw[start+j]==col[j]);
                     rounded_factor=rounded_factor || col[j]!=half(col[j]);
                 }
             }
@@ -348,7 +352,7 @@ static void synthetic() {
             for (int j=0;j<width;++j) { CHECK(t[start+j]==ggml_fp32_to_fp16(columns[j])); }
         }
     }
-    std::puts("synthetic: source F32/F16/BF16, widths 32/64/128/256/512, iterations 4/8/16, threads 1/4, native Q3_K/Q4_K, exact serialized compensation");
+    std::puts("synthetic: source F32/F16/BF16, widths 32/64/128/256/512, iterations 4/8/16, threads 1/4/32, exact raw/scales, native Q3_K/Q4_K, exact serialized compensation");
 }
 // Independent scalar two-pass FP64 sample moments audit the initial Welford
 // reductions without repeating their lane/tree algorithm. Best-iterate parity
@@ -411,7 +415,16 @@ static void strength_and_diagnostics() {
         for(float alpha:{0.f,.5f,.75f,1.f}) {
             o.strength=alpha;
             CHECK(llama_sinq_compute_scales(w.data(),GGML_TYPE_F32,n,k,o,4,actual,s));
-            if(alpha==0) { CHECK(actual==identity && s.identity && s.strips.empty());continue; }
+            std::vector<ggml_fp16_t> one,many;std::vector<float> raw_one,raw_many;
+            llama_sinq_statistics one_stats,many_stats;
+            CHECK(llama_sinq_compute_scales(w.data(),GGML_TYPE_F32,n,k,o,1,one,one_stats,&raw_one));
+            CHECK(llama_sinq_compute_scales(w.data(),GGML_TYPE_F32,n,k,o,32,many,many_stats,&raw_many));
+            CHECK(one==actual && many==actual && raw_one==raw_many);
+            if(alpha==0) {
+                CHECK(actual==identity && s.identity && s.strips.empty());
+                for(float value:raw_one)CHECK(value==1.f);
+                continue;
+            }
             if(alpha==1)CHECK(actual==legacy);
             CHECK(s.strips.size()==size_t(k/width));
             size_t selected_identity=0;
@@ -431,6 +444,7 @@ static void strength_and_diagnostics() {
                 for(int j=0;j<width;++j) {
                     const float value=alpha==1 ? ec[j] : std::exp(alpha*std::log(ec[j]));
                     CHECK(actual[group*width+j]==ggml_fp32_to_fp16(value));
+                    CHECK(close(raw_one[group*width+j],value));
                     const double t=ggml_fp16_to_fp32(actual[group*width+j]);
                     const double x=.375,I=1.25,W=w[group*width+j];
                     CHECK(std::abs((W/t)*(x*t)-W*x)<=1.e-12*(1+std::abs(W*x)));
@@ -451,8 +465,44 @@ static void strength_and_diagnostics() {
     std::puts("strength/diagnostics: independent preupdate oracle, serialized compensation and constant normalization passed");
 }
 
+static void parallel_source_validation() {
+    // 32 coarse scan tasks, with bad values in both the caller's range and
+    // later worker ranges. Identity isolates validation from strip work.
+    constexpr int n=64,k=32768;
+    std::vector<float> w(n*k,.125f);
+    std::vector<ggml_fp16_t> h(n*k,ggml_fp32_to_fp16(.125f));
+    std::vector<ggml_bf16_t> b(n*k,ggml_fp32_to_bf16(.125f));
+    for(auto type:{GGML_TYPE_F32,GGML_TYPE_F16,GGML_TYPE_BF16}) {
+        const void * input=type==GGML_TYPE_F32?static_cast<const void *>(w.data()):
+            type==GGML_TYPE_F16?static_cast<const void *>(h.data()):static_cast<const void *>(b.data());
+        llama_sinq_options o;o.identity=true;
+        llama_sinq_statistics s1,s32;
+        std::vector<ggml_fp16_t> one,many;std::vector<float> raw_one,raw_many;
+        CHECK(llama_sinq_compute_scales(input,type,n,k,o,1,one,s1,&raw_one));
+        CHECK(llama_sinq_compute_scales(input,type,n,k,o,32,many,s32,&raw_many));
+        CHECK(one==many && raw_one==raw_many && s1.identity && s32.identity);
+        CHECK(one.size()==size_t(k) && raw_one.size()==size_t(k));
+        for(int j=0;j<k;++j)CHECK(one[j]==ggml_fp32_to_fp16(1.f) && raw_one[j]==1.f);
+        for(int index:{17,n*k/2+3,n*k-1})for(float bad:{INFINITY,-INFINITY,NAN,70000.f}) {
+            w[index]=bad;h[index]=ggml_fp32_to_fp16(bad);b[index]=ggml_fp32_to_bf16(bad);
+            for(int mode=0;mode<3;++mode) {
+                o.identity=mode==1;o.strength=mode==2?0.f:1.f;
+                for(int threads:{1,32}) {
+                    std::vector<ggml_fp16_t> output{ggml_fp32_to_fp16(2.f)};
+                    std::vector<float> raw{3.f};llama_sinq_statistics stats;stats.min_scale=7.f;
+                    CHECK(!llama_sinq_compute_scales(input,type,n,k,o,threads,output,stats,&raw));
+                    CHECK(output.size()==1 && output[0]==ggml_fp32_to_fp16(2.f));
+                    CHECK(raw.size()==1 && raw[0]==3.f && stats.min_scale==7.f);
+                }
+            }
+            w[index]=.125f;h[index]=ggml_fp32_to_fp16(.125f);b[index]=ggml_fp32_to_bf16(.125f);
+        }
+    }
+    std::puts("parallel source validation: exact identity outputs, F32/F16/BF16 nonfinite and FP16 overflow rejected at 1/32 threads without publishing outputs");
+}
+
 int main(int argc,char ** argv) {
     // Initialize conversion tables on platforms that use them.
     ggml_context * ctx=ggml_init({1024,nullptr,true}); CHECK(ctx); ggml_free(ctx);
-    strength_and_diagnostics(); fixtures(argc,argv); invalid(); width_edges(); synthetic(); row_shapes(); std::puts("test-qk-sinq-numeric: PASS");
+    parallel_source_validation(); strength_and_diagnostics(); fixtures(argc,argv); invalid(); width_edges(); synthetic(); row_shapes(); std::puts("test-qk-sinq-numeric: PASS");
 }

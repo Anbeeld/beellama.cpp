@@ -14,9 +14,9 @@ os.environ['TRANSFORMERS_OFFLINE'] = '1'
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / 'gguf-py')]
 import torch
-from tools.sinq.research.fisher import build_probes, qwen_probes
-from tools.sinq.research.capture import capture_block
-from tools.sinq.research.blockwise import block_delta
+from tools.sinq.optimizer.fisher import build_probes, qwen_probes
+from tools.sinq.optimizer.capture import capture_block
+from tools.sinq.optimizer.blockwise import block_delta
 
 torch.set_num_threads(32)
 

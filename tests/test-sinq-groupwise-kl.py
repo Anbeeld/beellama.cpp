@@ -2,8 +2,8 @@ import sys, tempfile, unittest, math, os, subprocess, hashlib, importlib.util, j
 from pathlib import Path
 import numpy as np
 ROOT=Path(__file__).resolve().parents[1]; sys.path[:0]=[str(ROOT),str(ROOT/'gguf-py')]
-from tools.sinq.research.selector import coordinate_descent, Group, State
-from tools.sinq.research.kl import full_vocabulary_kl, validate_split, NativeKLEvaluator
+from tools.sinq.optimizer.selector import coordinate_descent, Group, State
+from tools.sinq.optimizer.kl import full_vocabulary_kl, validate_split, NativeKLEvaluator
 import gguf
 
 def native_fixture(path):
@@ -55,9 +55,9 @@ class SelectionTest(unittest.TestCase):
             self.assertLessEqual(r.evaluations,8)
     @unittest.skipUnless(os.environ.get('SINQ_NATIVE_BIN'),'set SINQ_NATIVE_BIN for actual native CPU KL/assembly smoke')
     def test_native_cpu_kl_and_hybrid(self):
-        from tools.sinq.research.cache import CandidateStore
-        from tools.sinq.research.hybrid import assemble
-        from tools.sinq.research.resources import file_digest
+        from tools.sinq.optimizer.cache import CandidateStore
+        from tools.sinq.optimizer.assembly import assemble
+        from tools.sinq.optimizer.resources import file_digest
         binaries=Path(os.environ['SINQ_NATIVE_BIN']); suffix='.exe' if os.name=='nt' else ''
         with tempfile.TemporaryDirectory() as d:
             d=Path(d); source=d/'source.gguf'; native_fixture(source)
@@ -77,13 +77,14 @@ class SelectionTest(unittest.TestCase):
             self.assertLess(identity_score,1e-4)
             name='blk.0.ffn_up.weight'; selected=d/'selected.txt'; selected.write_text(name+'\n')
             quantized=d/'quantized.gguf'
-            args=[str(binaries/('llama-quantize'+suffix)),'--pure','--sinq-precondition','sidecar','--sinq-tensor-list',str(selected),'--sinq-strip-width','64',str(source),str(quantized),'Q5_0','32']
+            config=d/'direct.json';config.write_text(json.dumps(dict(schema_version=2,defaults=dict(generator='sinq',strip_width=64,iterations=16,strength=1.0),targets=dict(include=[name]))))
+            args=[str(binaries/('llama-quantize'+suffix)),'--pure','--sinq-config',str(config),str(source),str(quantized),'Q5_0','32']
             result=subprocess.run(args,env=dict(os.environ,OMP_NUM_THREADS='32',MKL_NUM_THREADS='32',CUDA_VISIBLE_DEVICES=''),capture_output=True,timeout=120)
             self.assertEqual(result.returncode,0,result.stderr.decode(errors='replace')[-1500:])
             r=gguf.GGUFReader(quantized); original=gguf.GGUFReader(source)
             tensor=next(t for t in r.tensors if t.name==name); scale=next(t for t in r.tensors if t.name==name+'.sinq_scale2')
             h=file_digest(source)
-            p=dict(source_sha256=h,tensor_name=name,shape=[512,256],source_qtype='F32',qtype='Q5_0',input_sha256=hashlib.sha256(next(t for t in original.tensors if t.name==name).data.tobytes()).hexdigest(),recipe_sha256=h,imatrix_sha256=None,codec={'implementation':'ggml','chunk_rows':512},sinq={'strip_width':64,'iterations':16,'strength':1.0,'algorithm':'sinkhorn_log','numerics':r.fields['beellama.qk_sinq.numerics'].contents()},generator={'family':'ordinary','alpha':0.0,'lambda':0.0},activation=None,producer={'source_sha256':h,'binary_sha256':file_digest(binaries/('llama-quantize'+suffix))})
+            p=dict(source_sha256=h,tensor_name=name,shape=[512,256],source_qtype='F32',qtype='Q5_0',input_sha256=hashlib.sha256(next(t for t in original.tensors if t.name==name).data.tobytes()).hexdigest(),recipe_sha256=h,imatrix_sha256=None,codec={'implementation':'ggml','chunk_rows':512},sinq={'strip_width':64,'iterations':16,'strength':1.0,'algorithm':'sinkhorn_log','numerics':'serialized-f16-diagonal'},generator={'generator':'sinq','strip_width':64,'iterations':16,'strength':1.0},activation=None,producer={'source_sha256':h,'binary_sha256':file_digest(binaries/('llama-quantize'+suffix))})
             store=CandidateStore(d/'cache'); key=store.put(p,tensor.data.tobytes(),scale.data.tobytes())
             r.data._mmap.close(); original.data._mmap.close()
             output=d/'hybrid.gguf'

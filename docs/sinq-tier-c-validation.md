@@ -1,3 +1,6 @@
+> Historical pre-refactor v1 engineering report. Commands, schemas and results below
+> do not describe or verify the current v2 optimizer. See [current execution docs](sinq-tier-c-execution.md).
+
 # Tier-C implementation validation
 
 CPU and CUDA FP32/BF16 execution passed the available-device checks. The original

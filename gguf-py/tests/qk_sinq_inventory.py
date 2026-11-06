@@ -3,6 +3,7 @@ import argparse
 from collections import Counter
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 import sys
@@ -17,16 +18,71 @@ ROLES = {'attn_gate', 'attn_k', 'attn_output', 'attn_q', 'attn_qkv', 'attn_v',
 
 
 SINQ_FIELDS = {'beellama.qk_sinq.' + name for name in
-               ('version', 'tensors', 'algorithm', 'strip_width', 'iterations', 'producer', 'numerics')}
+               ('version', 'transform', 'tensors', 'recipes', 'producer')}
 
 
 def validate_sinq_metadata(reader, path):
     for key in reader.fields:
         if key.startswith('beellama.qk_sinq.') and key not in SINQ_FIELDS:
             raise ValueError(f'{path}: unsupported SINQ metadata {key}')
-    width = reader.fields.get('beellama.qk_sinq.strip_width')
-    if width is not None and (width.types != [GGUFValueType.UINT32] or width.contents() not in (32, 64, 128, 256, 512)):
-        raise ValueError(f'{path}: unsupported SINQ strip width')
+    present = SINQ_FIELDS.intersection(reader.fields)
+    if not present:
+        return {}
+    if present != SINQ_FIELDS:
+        raise ValueError(f'{path}: SINQ requires exactly five metadata keys')
+    def field(name, types):
+        value = reader.fields['beellama.qk_sinq.' + name]
+        if value.types != types:
+            raise ValueError(f'{path}: invalid SINQ {name} type')
+        return value.contents()
+    if field('version', [GGUFValueType.UINT32]) != 2:
+        raise ValueError(f'{path}: unsupported SINQ version; only v2 is supported')
+    if field('transform', [GGUFValueType.STRING]) != 'f16_input_diagonal':
+        raise ValueError(f'{path}: unsupported SINQ transform')
+    producer = field('producer', [GGUFValueType.STRING])
+    if not producer or len(producer.encode('utf-8')) > 1024:
+        raise ValueError(f'{path}: invalid SINQ producer')
+    names = field('tensors', [GGUFValueType.ARRAY, GGUFValueType.STRING])
+    recipes = field('recipes', [GGUFValueType.ARRAY, GGUFValueType.STRING])
+    if not names or len(names) > 100000 or names != sorted(set(names)) or len(names) != len(recipes):
+        raise ValueError(f'{path}: invalid SINQ recipe coverage/order')
+    if sum(len(v.encode('utf-8')) for v in names + recipes) > 16 * 1024 * 1024:
+        raise ValueError(f'{path}: SINQ metadata exceeds 16 MiB')
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('duplicate SINQ recipe key')
+            result[key] = value
+        return result
+    resolved = {}
+    for name, text in zip(names, recipes):
+        if len(text.encode('utf-8')) > 4096:
+            raise ValueError(f'{path}: SINQ recipe exceeds 4096 bytes')
+        p = json.loads(text, object_pairs_hook=unique)
+        if not isinstance(p, dict):
+            raise ValueError(f'{path}: SINQ recipe must be object')
+        generator = p.get('generator')
+        keys = {'generator', 'strip_width', 'iterations', 'strength'}
+        if generator == 'awq':
+            keys |= {'correction', 'alpha', 'lambda'}
+        if generator not in ('sinq', 'awq') or set(p) != keys:
+            raise ValueError(f'{path}: incomplete/unknown SINQ recipe fields')
+        if type(p['strip_width']) is not int or p['strip_width'] not in (32, 64, 128, 256, 512):
+            raise ValueError(f'{path}: invalid SINQ strip width')
+        if type(p['iterations']) is not int or p['iterations'] not in (4, 8, 16):
+            raise ValueError(f'{path}: invalid SINQ iterations')
+        if generator == 'awq' and p['correction'] not in ('weight_activation', 'activation_only'):
+            raise ValueError(f'{path}: invalid AWQ correction')
+        for key in ('strength', 'alpha', 'lambda') if generator == 'awq' else ('strength',):
+            value = p[key]
+            if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1:
+                raise ValueError(f'{path}: invalid SINQ {key}')
+            p[key] = float(value)
+        if json.dumps(p, sort_keys=True, separators=(',', ':'), allow_nan=False) != text:
+            raise ValueError(f'{path}: noncanonical SINQ recipe')
+        resolved[name] = p
+    return resolved
 
 
 def main():
@@ -52,22 +108,11 @@ def main():
     results = []
     for path in args.models:
         reader = GGUFReader(path)
-        validate_sinq_metadata(reader, path)
+        settings = validate_sinq_metadata(reader, path)
         tensors = {t.name: t for t in reader.tensors}
         if len(tensors) != len(reader.tensors):
             raise ValueError(f'{path}: duplicate names')
-        version = reader.fields.get('beellama.qk_sinq.version')
-        declared_field = reader.fields.get('beellama.qk_sinq.tensors')
-        declared = declared_field.contents() if declared_field is not None else []
-        if not isinstance(declared,list) or len(declared) != len(set(declared)):
-            raise ValueError(f'{path}: duplicate or invalid transformation manifest')
-        declared = set(declared)
-        if declared_field is not None and declared_field.types != [GGUFValueType.ARRAY, GGUFValueType.STRING]:
-            raise ValueError(f'{path}: transformation manifest must be a string array')
-        if declared and (version is None or version.types != [GGUFValueType.UINT32] or int(version.contents()) != 1):
-            raise ValueError(f'{path}: missing or unsupported qk_sinq version')
-        if version is not None and not declared:
-            raise ValueError(f'{path}: version requires nonempty transformation manifest')
+        declared = set(settings)
         if not declared.issubset(eligible):
             raise ValueError(f'{path}: transform outside supported primary-trunk mask')
         by_type = Counter()
@@ -90,11 +135,11 @@ def main():
                 unquantized_bytes += tensor.n_bytes
             side_summary = None
             if name in declared:
-                width = reader.fields.get('beellama.qk_sinq.strip_width')
-                if width is not None and int(tensor.shape[0]) % int(width.contents()):
+                if int(tensor.shape[0]) % settings[name]['strip_width']:
                     raise ValueError(f'{path}: input dimension is not strip aligned')
-                if kind not in ('Q3_K','Q4_K'):
-                    raise ValueError(f'{path}: transformed base is not ordinary Q3_K/Q4_K')
+                if kind not in ('Q3_K', 'Q4_K', 'Q6_K', 'Q5_0', 'Q5_1', 'Q8_0', 'IQ1_S', 'IQ1_M',
+                                'IQ2_XXS', 'IQ2_XS', 'IQ2_S', 'IQ3_XXS', 'IQ3_S', 'IQ4_NL', 'IQ4_XS'):
+                    raise ValueError(f'{path}: transformed base has unsupported native codec')
                 side_name = name + '.sinq_scale2'
                 side = tensors.get(side_name)
                 if side is None or GGMLQuantizationType(side.tensor_type).name != 'F16' or tuple(side.shape) != (int(tensor.shape[0]),):

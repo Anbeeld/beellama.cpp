@@ -35,7 +35,7 @@ class AdapterFixture:
         self.text, self.head, self.policy = text, lm_head, policy
         self.source = source
         self.options = kwargs
-        from tools.sinq.research.execution_backend import parameter_storage_dtype
+        from tools.sinq.optimizer.execution_backend import parameter_storage_dtype
         assert all(p.device.type == 'cpu' and p.dtype == parameter_storage_dtype(
             text.get_submodule(name.rpartition('.')[0]), policy.dtype, p.dtype)
             for name, p in text.named_parameters())
@@ -46,7 +46,7 @@ class AdapterFixture:
 class ReferenceLoaderTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.loader = importlib.import_module('tools.sinq.research.reference_loader')
+        cls.loader = importlib.import_module('tools.sinq.optimizer.reference_loader')
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -95,7 +95,7 @@ class ReferenceLoaderTests(unittest.TestCase):
             json.dumps({'weight_map': mapping}), encoding='utf-8')
 
     def load(self, *, dtype=torch.float32, budget=10**8):
-        with patch('tools.sinq.research.qwen35_adapter.Qwen35Adapter', AdapterFixture):
+        with patch('tools.sinq.optimizer.qwen35_adapter.Qwen35Adapter', AdapterFixture):
             return self.loader.load_reference(self.directory, 'source.gguf', budget, 32,
                                               policy=Policy(dtype))
 
@@ -132,7 +132,7 @@ class ReferenceLoaderTests(unittest.TestCase):
 
     def test_default_policy_is_cpu_fp32(self):
         self.checkpoint()
-        with patch('tools.sinq.research.qwen35_adapter.Qwen35Adapter', AdapterFixture):
+        with patch('tools.sinq.optimizer.qwen35_adapter.Qwen35Adapter', AdapterFixture):
             loaded = self.loader.load_reference(self.directory, 'source.gguf', 10**8, 32)
         self.assertEqual(loaded.policy.dtype, torch.float32)
         self.assertEqual(str(loaded.policy.input_device), 'cpu')
@@ -217,7 +217,7 @@ class ReferenceLoaderTests(unittest.TestCase):
         self.checkpoint()
         policy = Policy()
         policy.memory_policy = {'host_limit_bytes': 10**8}
-        with patch('tools.sinq.research.qwen35_adapter.Qwen35Adapter', AdapterFixture):
+        with patch('tools.sinq.optimizer.qwen35_adapter.Qwen35Adapter', AdapterFixture):
             loaded = self.loader.load_reference(self.directory, 'source.gguf', 1024, 32, policy=policy)
         self.assertGreater(loaded.loading_estimates['storage_weight_bytes'], 1024)
 

@@ -1,9 +1,11 @@
-// Research-only filesystem bridge; numerical algorithms remain in src/sinq.
-#include "sinq/sinq-research-config.h"
+// Offline optimizer filesystem bridge; numerical algorithms remain in src/sinq.
+#include "sinq/sinq-bridge-config.h"
 #include "sinq/sinq-native-codec.h"
 #include "sinq/sinq-numeric.h"
 #include "sinq/sinq-local-score.h"
 #include "sinq/sinq-parallel.h"
+#include "sinq/sinq-parameters.h"
+#include <regex>
 #include "llama-sinq-activation.h"
 #include <filesystem>
 #include <fstream>
@@ -27,8 +29,36 @@ static void write(const fs::path&p,const void*data,size_t count) {
     std::ofstream f(p,std::ios::binary);f.write((const char*)data,count);f.flush();sinq::require(bool(f),"research output write failure");
 }
 int main(int argc,char**argv) try {
-    if(argc==4 && std::string(argv[1])=="--validate-activations") {
-        const auto manifest=llama_sinq_load_activations(argv[2],argv[3]);
+    if(argc==4 && std::string(argv[1])=="--plan-config") {
+        sinq::require(fs::file_size(argv[2])<=1024*1024 && fs::file_size(argv[3])<=16*1024*1024,"plan input exceeds byte budget");
+        std::ifstream config(argv[2]),inventory_file(argv[3]);
+        const auto config_json=sinq::parse_bridge_json(config),inventory=sinq::parse_bridge_json(inventory_file);
+        sinq::require(inventory.is_array() && inventory.size()<=100000,"plan inventory must be a bounded array");
+        const auto type=[](const std::string&name){for(int t=0;t<GGML_TYPE_COUNT;++t){const char*n=ggml_type_name(ggml_type(t));if(!n)continue;std::string canonical(n);std::transform(canonical.begin(),canonical.end(),canonical.begin(),[](unsigned char c){return char(std::tolower(c));});if(name==canonical)return ggml_type(t);}throw std::runtime_error("unknown inventory type");};
+        std::vector<sinq::tensor_descriptor>tensors;
+        const std::regex pattern("^blk\\.([0-9]+)\\.(attn_q|attn_k|attn_v|attn_qkv|attn_gate|attn_output|ssm_beta|ssm_alpha|ssm_out|ffn_gate|ffn_up|ffn_down)\\.weight$");
+        for(const auto&item:inventory) {
+            sinq::require(item.is_object() && item.size()==5 && item.contains("name") && item.contains("rows") && item.contains("columns") && item.contains("qtype") && item.contains("source_type"),"invalid inventory fields");
+            sinq::require(item.at("rows").is_number_integer() && item.at("columns").is_number_integer(),"inventory dimensions must be integers");
+            sinq::tensor_descriptor d;d.name=item.at("name").get<std::string>();d.rows=item.at("rows");d.columns=item.at("columns");d.qtype=type(item.at("qtype"));
+            sinq::require(!d.name.empty() && d.rows>0 && d.columns>0,"invalid inventory name/dimensions");
+            const auto source=type(item.at("source_type"));std::smatch match;
+            const bool projection=std::regex_match(d.name,match,pattern);
+            if(projection){d.layer=std::stoi(match[1]);d.role=match[2];}
+            d.eligible=projection && d.rows>=2 && llama_sinq_supported_type(d.qtype) && (source==GGML_TYPE_F32 || source==GGML_TYPE_F16 || source==GGML_TYPE_BF16);
+            tensors.push_back(std::move(d));
+        }
+        json entries=json::array();
+        for(const auto&entry:sinq::resolve_direct(config_json,tensors))entries.push_back({{"name",entry.tensor.name},{"parameters",sinq::parameters_json(entry.settings)},{"shape",{entry.tensor.columns,entry.tensor.rows}},{"qtype",ggml_type_name(entry.tensor.qtype)},{"locked",entry.locked}});
+        std::cout<<json({{"tensors",entries}}).dump()<<"\n";return 0;
+    }
+    if((argc==4 || argc==5) && std::string(argv[1])=="--validate-activations") {
+        int threads=int(std::max(1u,std::thread::hardware_concurrency()));
+        if(argc==5) {
+            size_t used=0;threads=std::stoi(argv[4],&used);
+            sinq::require(used==std::strlen(argv[4]) && threads>=1 && threads<=1024,"invalid activation validation thread count");
+        }
+        const auto manifest=llama_sinq_load_activations(argv[2],argv[3],threads);
         json entries=json::object();
         for(const auto & item:manifest.tensors) { const auto & e=item.second;
             entries[item.first]={{"input_dim",e.input_dim},{"output_dim",e.output_dim},{"count",e.count},{"data_file",e.data_file},{"sha256",e.sha256},{"site",e.site},{"reference_module",e.reference_module}};
@@ -38,7 +68,7 @@ int main(int argc,char**argv) try {
     }
     sinq::require(argc==2,"usage: llama-sinq-native request.json | --validate-activations manifest source.gguf");
     sinq::require(fs::file_size(argv[1])<=1024*1024,"research bridge config too large");
-    std::ifstream config(argv[1]);json j;config>>j;const auto r=sinq::parse_bridge_request(j);
+    std::ifstream config(argv[1]);const auto j=sinq::parse_bridge_json(config);const auto r=sinq::parse_bridge_request(j);
     auto *ctx=ggml_init({1024,nullptr,true});ggml_free(ctx);
     const size_t row_bytes=ggml_row_size(r.codec,r.columns);
     const size_t cells=size_t(r.rows)*r.columns;
@@ -72,31 +102,26 @@ int main(int argc,char**argv) try {
     // tensor allocation: large tensors require an explicitly larger budget.
     sinq::require(source_bytes+cells*4<r.workspace/2,"research source exceeds resident budget");
     sinq::require(!fs::exists(r.output),"research output directory already exists");
-    const size_t candidate_bound=r.operation=="stock"?1:1+r.search.candidates.size()+2*r.search.max_shortlist;
-    sinq::require(candidate_bound<=r.max_output_bytes/(packed_size+size_t(r.columns)*2),"research output byte budget exceeded");
+    const size_t candidate_bound=r.operation=="stock"?1:r.search.candidates.size();
+    if(r.operation!="score")sinq::require(candidate_bound<=r.max_output_bytes/(packed_size+size_t(r.columns)*2),"research output byte budget exceeded");
     const auto source=load(r.weights,source_bytes,r.workspace);
     std::vector<float>w(cells);
-    if(r.source_type==GGML_TYPE_F32)std::memcpy(w.data(),source.data(),source.size());
-    else if(r.source_type==GGML_TYPE_F16)ggml_fp16_to_fp32_row((const ggml_fp16_t*)source.data(),w.data(),cells);
-    else ggml_bf16_to_fp32_row((const ggml_bf16_t*)source.data(),w.data(),cells);
-    for(float v:w)sinq::require(std::isfinite(v),"research nonfinite source weight");
+    const int conversion_threads=int(std::min<size_t>(r.threads,(cells+16383)/16384));
+    sinq::parallel_for(r.rows,conversion_threads,[&](int64_t begin,int64_t end) {
+        const size_t first=size_t(begin)*r.columns,count=size_t(end-begin)*r.columns;
+        if(r.source_type==GGML_TYPE_F32)std::memcpy(w.data()+first,source.data()+first*sizeof(float),count*sizeof(float));
+        else if(r.source_type==GGML_TYPE_F16)ggml_fp16_to_fp32_row((const ggml_fp16_t*)source.data()+first,w.data()+first,count);
+        else ggml_bf16_to_fp32_row((const ggml_bf16_t*)source.data()+first,w.data()+first,count);
+        for(size_t i=first;i<first+count;++i)sinq::require(std::isfinite(w[i]),"optimizer nonfinite source weight");
+    });
     std::vector<float>importance;
     if(!r.importance.empty())importance=floats(r.importance,r.columns,r.workspace);
-    sinq::require(!importance.empty() || !ggml_quantize_requires_imatrix(r.codec),"research required imatrix missing");
+    sinq::require(r.operation=="score" || !importance.empty() || !ggml_quantize_requires_imatrix(r.codec),"research required imatrix missing");
     for(float v:importance)sinq::require(std::isfinite(v)&&v>=0,"research invalid importance");
-    std::vector<float>x,validation,raw;
-    std::vector<ggml_fp16_t>ordinary;llama_sinq_statistics stats;
+    std::vector<float>x,validation;
     if(r.operation=="generate" || r.operation=="score") {
-        x=floats(r.activations,size_t(r.samples)*r.columns,r.workspace);
+        if(r.samples)x=floats(r.activations,size_t(r.samples)*r.columns,r.workspace);
         if(r.search.held_out)validation=floats(r.validation,size_t(r.validation_samples)*r.columns,r.workspace);
-        if(r.operation=="generate") {
-            size_t per_worker=0;
-            sinq::require(llama_sinq_workspace_size(r.rows,r.normalization.strip_width,per_worker),"research normalization shape exceeds canonical limit");
-            const size_t workers=std::min<size_t>(size_t(r.columns/r.normalization.strip_width),std::min<size_t>(r.threads,(128ull*1024*1024)/per_worker));
-            const size_t resident=source_bytes+w.size()*4+(x.size()+validation.size())*4+size_t(r.columns)*32;
-            sinq::require(resident<r.workspace && (r.normalization.strength==0 || per_worker*workers<=r.workspace-resident),"research normalization exceeds aggregate workspace budget");
-            sinq::require(llama_sinq_compute_scales(source.data(),r.source_type,r.rows,r.columns,r.normalization,r.threads,ordinary,stats,&raw),"research Sinkhorn failed");
-        }
     }
     if(r.operation=="score") {
         const size_t per=row_bytes+size_t(r.columns)*4+2*sizeof(double);
@@ -130,7 +155,7 @@ int main(int argc,char**argv) try {
                 if(r.search.held_out)val.add(validation_rows[size_t(row)]);
             }
         }
-        const auto text=json({{"schema_version",1},{"objective",r.search.objective==sinq::local_objective::output_l1?"output_l1":"output_mse"},{"train_score",train.value/double(r.rows)},{"validation_score",r.search.held_out?json(val.value/double(r.rows)):json(nullptr)},{"encode_count",0}}).dump(2)+"\n";
+        const auto text=json({{"schema_version",2},{"objective",r.search.objective==sinq::local_objective::output_l1?"output_l1":"output_mse"},{"train_score",train.value/double(r.rows)},{"validation_score",r.search.held_out?json(val.value/double(r.rows)):json(nullptr)},{"encode_count",0}}).dump(2)+"\n";
         write(r.output,text.data(),text.size());std::cout<<text;return 0;
     }
     const auto temporary=fs::path(r.output+".partial");
@@ -139,7 +164,7 @@ int main(int argc,char**argv) try {
     std::vector<std::thread>workers;
     const int64_t chunk=r.columns*std::max<int64_t>(1,(16384+r.columns-1)/r.columns);
     auto encode=[&](const float*in,void*out,int64_t first,int64_t rows,const float*im){return sinq::native_encode(r.codec,in,out,chunk,first,rows,r.rows,r.columns,im,workers,r.threads);};
-    json result={{"schema_version",1},{"operation",r.operation},{"codec",ggml_type_name(r.codec)},{"rows",r.rows},{"columns",r.columns}};
+    json result={{"schema_version",2},{"operation",r.operation},{"codec",ggml_type_name(r.codec)},{"rows",r.rows},{"columns",r.columns}};
     if(r.operation=="stock") {
         std::vector<uint8_t>packed(packed_size);
         sinq::require(encode(w.data(),packed.data(),0,r.rows,importance.empty()?nullptr:importance.data())==packed.size(),"research native size mismatch");
@@ -152,19 +177,33 @@ int main(int argc,char**argv) try {
             std::ofstream out(temporary/(name+".bin"),std::ios::binary|std::ios::app);out.write((const char*)bytes,count);out.flush();sinq::require(bool(out),"research slab write failed");
         };
         const size_t resident=source_bytes+w.size()*4+size_t(r.columns)*32;
-        sinq::require(resident<r.workspace,"research resident workspace exhausted");
-        const auto found=sinq::research_search(r.codec,r.rows,r.columns,raw,x,r.samples,validation,r.validation_samples,
-            importance.empty()?nullptr:importance.data(),r.workspace-resident,read,encode,emit,r.search);
-        result["skipped"]=json::array();
-        for(const auto & skipped:found.skipped) {
-            result["skipped"].push_back({{"family",skipped.spec.family==sinq::scale_family::weight_activation?"awq_weight_activation":"awq_activation_only"},{"alpha",skipped.spec.alpha},{"lambda",skipped.spec.lambda},{"reason",skipped.reason}});
+        size_t normalization_reserve=0;
+        for(const auto&spec:r.search.candidates)if(spec.strength!=0) {
+            size_t bytes=0;sinq::require(llama_sinq_workspace_size(r.rows,spec.strip_width,bytes),"invalid normalization workspace");
+            const size_t workers=std::min<size_t>(size_t(r.columns/spec.strip_width),std::min<size_t>(r.threads,(128ull*1024*1024)/bytes));
+            normalization_reserve=std::max(normalization_reserve,bytes*workers);
         }
-        result["selected"]=found.selected;result["encode_count"]=found.encode_count;result["workspace_bytes"]=found.workspace_bytes+resident;result["candidates"]=json::array();
-        for(size_t id=0;id<found.candidates.size();++id){const auto&c=found.candidates[id];const auto index=c.duplicate_of;const auto name="candidate-"+std::to_string(index);
-            result["candidates"].push_back({{"index",id},{"family",c.spec.family==sinq::scale_family::ordinary?"ordinary":c.spec.family==sinq::scale_family::weight_activation?"awq_weight_activation":"awq_activation_only"},{"alpha",c.spec.alpha},{"lambda",c.spec.lambda},{"encoded",c.encoded},{"duplicate_of",index},{"stage",id<1+r.search.candidates.size()?"coarse":"refinement"},{"encode_reason",c.encoded?(id==0?"mandatory_ordinary":"distinct_f16_hypothesis"):"duplicate_f16"},{"payload",name+".bin"},{"scales",name+".f16"},{"train_score",c.train_score},{"validation_score",c.has_validation?json(c.validation_score):json(nullptr)}});
+        sinq::require(resident<r.workspace && normalization_reserve<r.workspace-resident,"research resident workspace exhausted");
+        std::vector<json>diagnostics;
+        auto compute=[&](const sinq::candidate_spec&spec) {
+            llama_sinq_options normalization;normalization.strip_width=spec.strip_width;normalization.iterations=spec.iterations;normalization.strength=float(spec.strength);
+            size_t per_worker=0;
+            sinq::require(llama_sinq_workspace_size(r.rows,spec.strip_width,per_worker),"normalization shape exceeds canonical limit");
+            const size_t workers=std::min<size_t>(size_t(r.columns/spec.strip_width),std::min<size_t>(r.threads,(128ull*1024*1024)/per_worker));
+            sinq::require(spec.strength==0 || per_worker*workers<=normalization_reserve,"normalization exceeds aggregate workspace budget");
+            std::vector<ggml_fp16_t>ordinary;std::vector<float>raw;llama_sinq_statistics stats;
+            sinq::require(llama_sinq_compute_scales(source.data(),r.source_type,r.rows,r.columns,normalization,r.threads,ordinary,stats,&raw),"Sinkhorn failed");
+            diagnostics.push_back({{"min_scale",stats.min_scale},{"max_scale",stats.max_scale},{"median_scale",stats.median_scale},{"identity_strips",stats.selected_identity_count},{"packed_bytes",packed_size}});
+            return raw;
+        };
+        const auto found=sinq::materialize_candidates(r.codec,r.rows,r.columns,x,r.samples,validation,r.validation_samples,
+            importance.empty()?nullptr:importance.data(),r.workspace-resident-normalization_reserve,read,encode,emit,compute,r.search);
+        result["encode_count"]=found.encode_count;result["workspace_bytes"]=found.workspace_bytes+resident+normalization_reserve;result["candidates"]=json::array();
+        for(size_t id=0;id<found.candidates.size();++id){const auto&c=found.candidates[id];const auto name="candidate-"+std::to_string(id);
+            result["candidates"].push_back({{"index",id},{"parameters",sinq::candidate_spec_json(c.spec)},{"diagnostics",diagnostics.at(id)},{"encoded",c.encoded},{"payload",name+".bin"},{"scales",name+".f16"},{"train_score",c.has_score?json(c.train_score):json(nullptr)},{"validation_score",c.has_validation?json(c.validation_score):json(nullptr)}});
         }
     }
     result["elapsed_seconds"]=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
     const auto text=result.dump(2)+"\n";write(temporary/"result.json",text.data(),text.size());fs::rename(temporary,r.output);
     ggml_quantize_free();std::cout<<result.dump()<<"\n";return 0;
-} catch(const std::exception&e){std::cerr<<"research native: "<<e.what()<<"\n";return 1;}
+} catch(const std::exception&e){std::cerr<<"SINQ optimizer native: "<<e.what()<<"\n";return 1;}

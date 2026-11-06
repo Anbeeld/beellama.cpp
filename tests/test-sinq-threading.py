@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / 'gguf-py'))
 import numpy as np
-from tools.sinq.research import cli, kl, native_codec, schemas
+from tools.sinq.optimizer import stages as cli, kl, native_codec, schemas
 from tools.sinq import export_activations as exporter
 
 
@@ -87,14 +87,14 @@ class ThreadingTests(unittest.TestCase):
                 kl.NativeKLEvaluator(self.binary, threads=threads)
 
     def test_schema_thread_bounds(self):
-        fixture = load_test('test-sinq-research-config')
+        fixture = load_test('test-sinq-optimizer-contract')
         for threads in (1, 1024):
-            config = fixture.config(); config['threads'] = threads
-            self.assertEqual(schemas.validate_config(config)['threads'], threads)
+            config = fixture.config(); config['execution'] = {'threads':threads}
+            self.assertEqual(schemas.validate_config(config,'generate')['threads'], threads)
         for threads in (0, -1, 1025, True, 1.5):
-            config = fixture.config(); config['threads'] = threads
+            config = fixture.config(); config['execution'] = {'threads':threads}
             with self.subTest(threads=threads), self.assertRaises(ValueError):
-                schemas.validate_config(config)
+                schemas.validate_config(config,'generate')
 
     def test_loader_threads_reach_environment(self):
         with patch.object(cli.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0)) as run:
@@ -102,12 +102,12 @@ class ThreadingTests(unittest.TestCase):
         self.assert_env(run.call_args.kwargs['env'], 7)
 
     def test_cli_local_scoring_forwards_threads(self):
-        candidate = types.SimpleNamespace(provenance={'generator': {'family': 'ordinary'}})
+        candidate = types.SimpleNamespace(provenance={'generator': {'generator': 'sinq','strip_width':64,'iterations':4,'strength':.75}})
         tensor = types.SimpleNamespace(name='weight')
         reader = types.SimpleNamespace(tensors=[tensor], data=types.SimpleNamespace(_mmap=Mock()))
-        config = dict(method='local', budgets={'workspace_bytes': 1024, 'max_output_bytes': 1024}, native_bridge='bridge', capture_manifest='capture', validation_manifest='validation', pairing_manifest='pair', selection_policy='held_out', families=['ordinary'], objective='output_l1', candidate_manifest='manifest', threads=7)
-        with patch.object(cli, '_stock_baseline'), patch.object(cli, '_json', return_value={}), patch.object(cli, 'validate_pairing'), patch.object(cli, 'candidate_for', return_value=candidate), patch.object(cli, 'file_digest', return_value='digest'), patch.object(cli, '_new_output', return_value=self.root), patch.object(cli, 'atomic_write'), patch('gguf.GGUFReader', return_value=reader), patch.object(native_codec, 'validate_activations', return_value={'tensors': {'weight': {}}}) as validate, patch.object(native_codec, 'rescore', return_value={}) as rescore:
-            cli._score(config, {'tensors': {'weight': {'stock': 'id', 'candidates': []}}}, None, 'source')
+        config = dict(scorer_name='local_output_l1',method='local', budgets={'workspace_bytes': 1024, 'max_output_bytes': 4096}, native_bridge='bridge', capture_manifest='capture', validation_manifest='validation', pairing_manifest='pair', selection_policy='held_out', objective='output_l1', candidate_manifest='manifest', threads=7)
+        with patch.object(cli, '_stock_baseline'), patch.object(cli, '_json', return_value={}), patch.object(cli, 'validate_pairing'), patch.object(cli, 'candidate_for', return_value=candidate), patch.object(cli, 'file_digest', return_value='digest'), patch.object(cli, '_new_output', return_value=self.root), patch.object(cli, 'atomic_write'), patch('gguf.GGUFReader', return_value=reader), patch.object(native_codec, 'validate_activations', return_value={'tensors': {'weight': {}}}) as validate, patch.object(native_codec, 'rescore', return_value={'train_score':1.0,'validation_score':2.0}) as rescore:
+            cli._score(config, {'source_sha256':'digest','tensors': {'weight': {'stock': 'id', 'candidates': []}}}, None, 'source')
         self.assertEqual(validate.call_count, 2)
         for call in validate.call_args_list:
             self.assertEqual(call.kwargs['threads'], 7)

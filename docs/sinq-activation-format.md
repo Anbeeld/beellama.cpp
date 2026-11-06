@@ -6,8 +6,10 @@ The consumer reads JSON and raw little-endian float32, never pickle.
 
 ## Files and validation
 
-Pass an explicit JSON file or a directory containing `activations.json` to
-`--sinq-calibration`. The root object requires:
+Pass the `activations.json` path as `inputs.activation_manifest` for optimizer
+generation or `inputs.capture_manifest` for local scoring. This independent
+export format remains version 1; it is not a v1 optimizer cache/config reader.
+The root object requires:
 
 | Field | Value |
 | --- | --- |
@@ -120,5 +122,5 @@ AWQ multiplies normalized weights and divides column compensation. BeeLlama
 uses the original weights and actual activation means to construct factors,
 but substitutes the destination native GGML codec for upstream row-scale RTN.
 The native codec handles its own internal row/block scaling. See
-[SINQ settings](sinq-settings.md) for the fixed grid, F16 rounding, objective,
-tie policy and memory bounds. No claim of improved global KLD/PPL follows.
+[SINQ settings](sinq-settings.md) for explicitly declared AWQ configurations, F16 rounding,
+objective, selection policy and memory bounds. No claim of improved global KLD/PPL follows.

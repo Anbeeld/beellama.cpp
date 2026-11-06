@@ -25,8 +25,8 @@ inline bool llama_sinq_supported_type(ggml_type type) {
 // silently loading a model with semantics this runtime does not implement.
 inline bool llama_sinq_supported_metadata_key(const std::string & key) {
     for (const char * supported : {"beellama.qk_sinq.version", "beellama.qk_sinq.tensors",
-            "beellama.qk_sinq.algorithm", "beellama.qk_sinq.strip_width", "beellama.qk_sinq.iterations",
-            "beellama.qk_sinq.producer", "beellama.qk_sinq.numerics"}) {
+            "beellama.qk_sinq.transform", "beellama.qk_sinq.recipes",
+            "beellama.qk_sinq.producer"}) {
         if (key == supported) { return true; }
     }
     return false;

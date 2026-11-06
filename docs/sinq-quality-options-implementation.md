@@ -1,5 +1,8 @@
 # SINQ quality options implementation
 
+> Historical pre-refactor report. Its removed interfaces and v1 artifacts are
+> not current instructions or v2 verification. Use [current SINQ settings](sinq-settings.md).
+
 Audit follow-up: [complete reference identity and CPU numerical validation](sinq-audit-followup.md).
 The original capture and GPU timing evidence below is historical and was not
 relabelled as verification of the follow-up. No GPU tests were needed for that update.

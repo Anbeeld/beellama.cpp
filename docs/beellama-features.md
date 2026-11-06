@@ -4,42 +4,27 @@ BeeLlama v0.5.0 keeps a small fork surface on top of upstream llama.cpp. Use
 this page to choose a feature; use the [argument reference](beellama-args.md)
 for exact names, environment variables, defaults, and validation ranges.
 
-## SINQ-derived Q_K weight preconditioning
+## SINQ offline quantization optimizer
 
-The quantizer can apply SINQ-derived column scales before the standard
-Q3_K/Q4_K encoders. Inference multiplies base-layer activations by the stored
-FP16 channel vector and uses the existing Q_K CPU/CUDA kernels.
+Use `llama-quantize --sinq-config FILE` for uniform or manual per-tensor/layer
+normalization. Use `python -m tools.sinq.optimizer.cli` for bounded ordinary
+SINQ parameter candidates, optional activation-bound AWQ alternatives, local,
+blockwise or Fisher score selection, full-model KLD coordinate descent, and
+explicit filter-then-select pipelines. Locked tensors remain fixed.
 
-Conditioning is opt-in through `--sinq-precondition=sidecar`; normal quantization
-is unchanged. `identity` supplies all-one companions for an exact output and
-same-byte-budget control. Normalization-strip widths 64/128 do not alter Q_K
-superblocks. Iteration counts 4/8/16 and a threshold-5 identity gate are explicit.
+The v2 GGUF format permits different widths, iterations and strengths in one
+model. Each conditioned native IQ/Q weight stores `W/u` plus its exact positive
+finite F16 input-channel companion `u`. Existing matrix kernels consume `u*x`;
+LoRA continues to receive original inputs. Producer widths require no new
+inference kernels. Unselected tensors retain the verified stock allocation.
 
-Conditioning covers Qwen3.5 primary-trunk FFN, attention and Gated DeltaNet
-projections. The text-only 9B model has 248 such matrices. Embedding and output
-matrices remain eligible for ordinary quantization but receive no conditioning
-companion. Norms, convolution filters and architectural state retain their
-required types. `--pure` and explicit tensor selectors allow uniform Q3_K or
-Q4_K coverage; `--sinq-coverage` separately restricts quantization to the
-projection mask when a partial-coverage control is wanted.
-
-LoRA reads original inputs, not conditioned inputs. NVFP4 scalar input scales
-are separate. Windows CPU, single-GPU CUDA and partial layer offload have been
-tested, including independently masked physical GPUs. Split-file companions
-stay with their base matrices. Row/tensor splitting and Hadamard combinations
-fail closed; non-CUDA backends and true multi-GPU splitting are not qualified.
-
-**These sidecar GGUFs require BeeLlama.** A third-party loader may recognize the
-Q_K weights but ignore their companions, producing incorrect output. See the
-[argument reference](beellama-args.md#sinq-derived-standard-q_k-preconditioning)
-and [companion contract](../../beellama.doc/docs/explanation/sinq-format.md).
-
-Full-coverage measurements found lower KL and perplexity for conditioned Q3_K.
-Conditioned Q4_K lowered KL but increased perplexity. Conditioning remains
-experimental and disabled by default; it is not an unconditional quality win
-or a portable scale-free export. Keep inference speed trials separate from
-synchronized `--kv-memory` accounting. Detailed measurements are maintained in
-[beellama.doc](../../beellama.doc/docs/records/benchmarks/sinq-v050/docs/qk-sinq-v050-pure-practical-report.md).
+**Conditioned GGUFs require BeeLlama.** Other engines may recognize the codec
+but ignore compensation. V1 conditioned metadata and old unreleased optimizer
+artifacts are rejected. CPU and qualified CUDA placements preserve existing
+runtime restrictions; no new backend qualification or quality improvement is
+implied. See [settings and schemas](sinq-settings.md),
+[execution policies](sinq-tier-c-execution.md), and the
+[argument reference](beellama-args.md#sinq-derived-native-iqq-preconditioning).
 
 ## KVarN target KV cache
 

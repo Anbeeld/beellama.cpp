@@ -21,9 +21,9 @@ if any(importlib.util.find_spec(name) is None for name in ('torch','transformers
 
 import numpy as np
 import torch
-from tools.sinq.research.qwen35_adapter import Qwen35Adapter
-from tools.sinq.research.capture import capture_block
-from tools.sinq.research.blockwise import block_delta, score_block
+from tools.sinq.optimizer.qwen35_adapter import Qwen35Adapter
+from tools.sinq.optimizer.capture import capture_block
+from tools.sinq.optimizer.blockwise import block_delta, score_block
 
 torch.set_num_threads(32)
 
@@ -76,8 +76,8 @@ class BlockwiseTests(unittest.TestCase):
                 score_block(adapter, captured, {'blk.0.ffn_up.weight' if layer else 'blk.1.ffn_up.weight': np.ones((1, 1))})
 
     def test_split_before_reservoir_capture(self):
-        from tools.sinq.research.partition import capture_splits
-        from tools.sinq.research.schemas import validate_pairing
+        from tools.sinq.optimizer.partition import capture_splits
+        from tools.sinq.optimizer.schemas import validate_pairing
         import json
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory)

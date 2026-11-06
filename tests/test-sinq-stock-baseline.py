@@ -4,7 +4,7 @@ import numpy as np
 ROOT=Path(__file__).resolve().parents[1]
 sys.path[:0]=[str(ROOT),str(ROOT/'gguf-py')]
 import gguf
-from tools.sinq.research.baseline import lock_baseline, load_baseline
+from tools.sinq.optimizer.baseline import lock_baseline, load_baseline
 
 class BaselineTest(unittest.TestCase):
     def fixture(self,path,value=1):
@@ -46,9 +46,13 @@ class BaselineTest(unittest.TestCase):
                 self.assertEqual(result.returncode,0)
             manifest=lock_baseline(source,stock,recipe,d/'lock.json',quantizer=quantizer,native_validate=validate)
             loaded,path=load_baseline(d/'lock.json',source); self.assertEqual(loaded,manifest); self.assertEqual(path,stock.resolve())
+            for threads in (2,4,32):self.assertEqual(load_baseline(d/'lock.json',source,threads=threads),(loaded,path))
+            for threads in (0,-1,True,1.5):
+                with self.assertRaises(ValueError):load_baseline(d/'lock.json',source,threads=threads)
+            self.assertEqual(manifest['version'],2)
             self.assertEqual(manifest['verification'],'native-reencode-exact')
             # Verify real importance-aware full stock allocation as well.
-            from tools.sinq.research.resources import file_digest
+            from tools.sinq.optimizer.resources import file_digest
             importance=d/'imatrix.gguf';writer=gguf.GGUFWriter(importance,'imatrix')
             writer.add_array('imatrix.datasets',['synthetic-baseline-verification'])
             writer.add_uint32('imatrix.chunk_count',1);writer.add_uint32('imatrix.chunk_size',4)
@@ -73,7 +77,7 @@ class BaselineTest(unittest.TestCase):
                 lock_baseline(source,im_stock,im_recipe,d/'missing-imatrix.json',quantizer=quantizer,native_validate=validate)
             self.assertFalse((d/'missing-imatrix.json').exists())
             import json
-            from tools.sinq.research.resources import digest
+            from tools.sinq.optimizer.resources import digest
             corrupt=dict(manifest); corrupt['source_sha256']='0'*64
             (d/'corrupt.json').write_text(json.dumps(corrupt))
             with self.assertRaisesRegex(ValueError,'checksum'): load_baseline(d/'corrupt.json',source)
@@ -85,7 +89,8 @@ class BaselineTest(unittest.TestCase):
             changed=d/'changed.gguf'; self.fixture(changed,2)
             with self.assertRaises(ValueError): load_baseline(d/'lock.json',changed)
             with open(stock,'r+b') as f: f.seek(-1,2); b=f.read(1); f.seek(-1,2); f.write(bytes([b[0]^1]))
-            with self.assertRaises(ValueError): load_baseline(d/'lock.json',source)
+            for threads in (1,4):
+                with self.assertRaises(ValueError): load_baseline(d/'lock.json',source,threads=threads)
             with self.assertRaises(ValueError): lock_baseline(source,stock,recipe,d/'bad.json',quantizer=quantizer,native_validate=validate)
             self.assertFalse((d/'bad.json').exists())
 

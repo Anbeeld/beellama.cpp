@@ -17,10 +17,10 @@ sys.path[:0]=[str(ROOT),str(ROOT/'gguf-py')]
 import gguf
 import numpy as np
 from tools.sinq import export_activations as exporter
-from tools.sinq.research import cli,native_codec
-from tools.sinq.research.generate import generate
-from tools.sinq.research.resources import canonical_json,file_digest
-from tools.sinq.research.schemas import validate_config
+from tools.sinq.optimizer import cli,native_codec
+from tools.sinq.optimizer.generate import generate
+from tools.sinq.optimizer.resources import canonical_json,file_digest
+from tools.sinq.optimizer.schemas import validate_config
 
 class ResumeGuardTests(unittest.TestCase):
     def test_resume_requires_existing_configured_directory_before_work(self):
@@ -32,9 +32,25 @@ class ResumeGuardTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get('SINQ_NATIVE_BIN'),'local native binaries not configured')
 class NativeGenerationResumeTests(unittest.TestCase):
+    def test_automatic_width_applicability_does_not_require_default64(self):
+        from tools.sinq.optimizer.generate import preflight
+        source=self.d/'narrow.gguf';writer=gguf.GGUFWriter(source,'qwen35');name=self.names[0]
+        writer.add_tensor(name,np.ones((2,32),dtype='<f4'))
+        writer.write_header_to_file();writer.write_kv_data_to_file();writer.write_tensors_to_file();writer.close()
+        raw=copy.deepcopy(self.raw);raw['inputs'].pop('activation_manifest');raw['inputs']['source_gguf']=str(source)
+        raw['quantization']['recipe']={name:'Q5_0'};raw['targets']['include']=[name]
+        raw['candidate_generators']=[dict(type='sinq',expansion='cartesian',parameters=dict(strip_width=[32,64],iterations=[4],strength=[1.0]))]
+        config=validate_config(raw,'generate');plan=preflight(config)
+        self.assertEqual([c['strip_width'] for c in plan['tensor_details'][0]['candidates']],[32])
+        self.assertEqual(plan['tensor_details'][0]['skipped'][0]['parameters']['strip_width'],64)
+        run=generate(config);self.assertEqual(len(run['tensors'][name]['candidates']),1)
+        raw['output']['directory']=str(self.d/'invalid')
+        raw['parameters']={'defaults':dict(generator='sinq',strip_width=64,iterations=16,strength=1.0)}
+        with self.assertRaisesRegex(RuntimeError,'alignment'):preflight(validate_config(raw,'generate'))
+
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup);self.d=Path(self.temp.name)
-        self.names=['blk.0.ffn_up.weight','blk.0.ffn_gate.weight'];self.hashes={}
+        self.names=sorted(['blk.0.ffn_up.weight','blk.0.ffn_gate.weight']);self.hashes={}
         source=self.d/'source.gguf';writer=gguf.GGUFWriter(source,'qwen35')
         rng=np.random.default_rng(17)
         for name in self.names:
@@ -52,13 +68,15 @@ class NativeGenerationResumeTests(unittest.TestCase):
         activation.write_bytes(canonical_json(dict(schema_version=1,architecture='qwen3_5',source_sha256=file_digest(source),source_revision='resume-fixture',
             sampling=dict(contract='valid-token-prefill-reservoir-v1',seed=17,max_rows=2,corpus_sha256=tokens,token_sha256=tokens),tensors=records)))
         bridge=Path(os.environ['SINQ_NATIVE_BIN'])/('llama-sinq-native.exe' if os.name=='nt' else 'llama-sinq-native')
-        self.raw=dict(schema_version=1,operation='generate',source_gguf=str(source),activation_manifest=str(activation),tensor_list=self.names,
-            native_quantizer=dict(recipe={name:'q5_0' for name in self.names},sinq_strip_width=64,sinq_iterations=4,sinq_strength=.75),
-            generators=['ordinary','awq_weight_activation'],alphas=[.5],correction_strengths=[1],
-            search=dict(strategy='small_grid',local_objective='output_mse',selection_policy='in_sample',max_shortlist=0,refine_step=.1,tolerance=0),
-            output_directory=str(self.d/'run'),native_bridge=str(bridge),threads=32,
-            budgets=dict(workspace_bytes=32<<20,max_candidates=8,max_output_bytes=8<<20,max_files=100,max_tensors=2,max_tokens=16,max_probes=4,max_evaluations=16))
-        self.config=validate_config(self.raw);self.output=Path(self.raw['output_directory'])
+        self.raw=dict(schema_version=2,
+            inputs=dict(source_gguf=str(source),activation_manifest=str(activation),native_bridge=str(bridge)),
+            quantization=dict(recipe={name:'Q5_0' for name in self.names}),targets=dict(include=self.names),
+            candidate_generators=[dict(type='sinq',configurations=[dict(strip_width=64,iterations=4,strength=.75)]),
+                dict(type='awq',configurations=[dict(strip_width=64,iterations=4,strength=.75,
+                    correction='weight_activation',alpha=.5,**{'lambda':1})])],
+            execution=dict(threads=32),output=dict(directory=str(self.d/'run')),
+            limits=dict(workspace_bytes=32<<20,max_candidates_per_tensor=8,max_artifact_bytes=8<<20,max_files=100,max_tensors=2))
+        self.config=validate_config(self.raw,'generate');self.output=Path(self.raw['output']['directory'])
 
     def test_partial_tensor_recovery_completed_reuse_and_mismatch(self):
         real=native_codec.request;seen=[]
@@ -81,11 +99,11 @@ class NativeGenerationResumeTests(unittest.TestCase):
         path=self.d/'config.json';path.write_bytes(canonical_json(self.raw))
         before=(self.output/'run-manifest.json').read_bytes()
         with patch.object(native_codec,'request',side_effect=AssertionError('completed generation reencoded')):
-            with redirect_stdout(io.StringIO()):cli.main([str(path),'--resume',str(self.output)])
+            with redirect_stdout(io.StringIO()):cli.main(['generate','--config',str(path),'--resume',str(self.output)])
         self.assertEqual(before,(self.output/'run-manifest.json').read_bytes())
-        changed=copy.deepcopy(self.raw);changed['search']['tolerance']=.1
-        with self.assertRaisesRegex(ValueError,'identity'):generate(validate_config(changed),resume=self.output)
-        artifact=Path(self.raw['activation_manifest']);content=artifact.read_bytes();artifact.write_bytes(content+b' ')
+        changed=copy.deepcopy(self.raw);changed['candidate_generators'][0]['configurations'][0]['strength']=.5
+        with self.assertRaisesRegex(ValueError,'identity'):generate(validate_config(changed,'generate'),resume=self.output)
+        artifact=Path(self.raw['inputs']['activation_manifest']);content=artifact.read_bytes();artifact.write_bytes(content+b' ')
         with self.assertRaisesRegex(ValueError,'identity'):generate(self.config,resume=self.output)
         artifact.write_bytes(content)
         # Completed bundles remain cryptographically verified, not merely trusted
@@ -100,7 +118,7 @@ class NativeGenerationResumeTests(unittest.TestCase):
     def test_resumed_cache_must_be_run_owned(self):
         generate(self.config)
         actual=Path.is_symlink
-        with patch.object(Path,'is_symlink',side_effect=None,autospec=True) as symlink,patch('tools.sinq.research.cache.CandidateStore') as constructor:
+        with patch.object(Path,'is_symlink',side_effect=None,autospec=True) as symlink,patch('tools.sinq.optimizer.cache.CandidateStore') as constructor:
             symlink.side_effect=lambda path:path==self.output/'cache' or actual(path)
             with self.assertRaisesRegex(ValueError,'run-owned'):generate(self.config,resume=self.output)
             constructor.assert_not_called()
@@ -109,8 +127,8 @@ class NativeGenerationResumeTests(unittest.TestCase):
         path=self.d/'config.json';path.write_bytes(canonical_json(self.raw));(self.d/'child-temp').mkdir()
         code='''import sys,json,tempfile
 from pathlib import Path
-from tools.sinq.research import cli,native_codec
-raw=json.loads(Path(sys.argv[1]).read_text());tempfile.tempdir=str(Path(raw['output_directory']).parent/'child-temp')
+from tools.sinq.optimizer import cli,native_codec
+raw=json.loads(Path(sys.argv[1]).read_text());tempfile.tempdir=str(Path(raw['output']['directory']).parent/'child-temp')
 real=native_codec.request
 count=0
 def request(binary,value,directory):
@@ -121,7 +139,7 @@ def request(binary,value,directory):
    print('tensor-boundary',flush=True);sys.stdin.read()
  return real(binary,value,directory)
 native_codec.request=request
-cli.main([sys.argv[1]])
+cli.main(['generate','--config',sys.argv[1]])
 '''
         process=subprocess.Popen([sys.executable,'-c',code,str(path)],cwd=ROOT,
             stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)

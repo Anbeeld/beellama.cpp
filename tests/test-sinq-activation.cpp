@@ -42,9 +42,9 @@ struct fixture {
         }
     }
     ~fixture() { std::error_code ec; fs::remove_all(dir,ec); }
-    llama_sinq_activation_manifest load(const json & value) {
+    llama_sinq_activation_manifest load(const json & value, int threads = 1) {
         put(dir / "activations.json",value.dump());
-        return llama_sinq_load_activations(dir.u8string(),(dir / "source.gguf").u8string());
+        return llama_sinq_load_activations(dir.u8string(),(dir / "source.gguf").u8string(),threads);
     }
     void reject(const json & value, const std::string & label) {
         bool threw = false; try { load(value); } catch (const std::exception &) { threw = true; }
@@ -57,6 +57,28 @@ int main() {
         fixture f;
         auto m = f.load(f.root);
         require(m.tensors.size()==2,"valid table missing entries");
+        auto parallel=f.load(f.root,32);
+        require(parallel.manifest_sha256==m.manifest_sha256 && parallel.source_sha256==m.source_sha256 && parallel.tensors.size()==m.tensors.size(),"parallel manifest validation changed identities");
+        for (int threads : {0,-1,1025}) {
+            bool rejected=false;try { f.load(f.root,threads); } catch(const std::exception &) { rejected=true; }
+            require(rejected,"invalid validation thread limit accepted");
+        }
+        for (size_t size : {size_t(0),size_t(64),size_t(65536),size_t(65537),size_t(2*1024*1024+17)}) {
+            const std::string bytes(size,'x');put(f.dir / "source.gguf",bytes);auto j=f.root;j["source_sha256"]=digest(bytes);
+            require(f.load(j,32).source_sha256==digest(bytes),"source hashing differs from independent SHA256 oracle");
+        }
+        put(f.dir / "source.gguf","abc");
+        auto many=f.root;many["tensors"]=json::array();
+        for (int layer=0;layer<32;++layer) for (const auto & entry:f.root["tensors"]) {
+            auto copy=entry;const std::string role=entry["name"].get<std::string>().substr(6);
+            copy["name"]="blk."+std::to_string(layer)+"."+role;
+            copy["site"]="qwen3_5.layers."+std::to_string(layer)+"."+role.substr(0,role.size()-7)+".input";
+            many["tensors"].push_back(copy);
+        }
+        require(f.load(many,32).tensors.size()==64,"parallel manifest lost entries");
+        auto bad=many;bad["tensors"][37]["sha256"]=std::string(64,'0');bool rejected=false;
+        try { f.load(bad,32); } catch(const std::exception &) { rejected=true; }
+        require(rejected,"parallel sample checksum failure not propagated");
         require(m.manifest_sha256==digest(f.root.dump()),"manifest digest mismatch");
         auto x = llama_sinq_load_activation_samples(m.tensors.at("blk.0.attn_q.weight"));
         require(x.size()==2 && x[0]==1.0f && x[1]==-2.0f,"little-endian decode mismatch");

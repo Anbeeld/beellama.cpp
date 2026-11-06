@@ -2,6 +2,7 @@
 // Copyright 2025 Huawei Technologies Switzerland AG, Apache-2.0.
 // See licenses/LICENSE-SINQ and licenses/NOTICE-SINQ for attribution and changes.
 #include "llama-sinq.h"
+#include "sinq/sinq-parallel.h"
 
 #include <algorithm>
 #include <atomic>
@@ -157,10 +158,24 @@ bool llama_sinq_compute_scales(const void * source, ggml_type source_type,
     size_t workspace = 0;
     if (!(options.identity || options.strength == 0.f) && !llama_sinq_workspace_size(n,options.strip_width,workspace)) { return false; }
     // Explicit identity must not bypass finite validation of the same
-    // FP16-rounded source convention used by normalization.
-    for (int64_t i = 0; i < n*k; ++i) {
-        if (!std::isfinite(source_at(source,source_type,i))) { return false; }
-    }
+    // FP16-rounded source convention used by normalization. Coarse tasks
+    // keep small inputs serial without restricting large scans' thread count.
+    try {
+        constexpr int64_t scan_chunk = 65536;
+        const int64_t count = n*k, tasks = count/scan_chunk + (count%scan_chunk != 0);
+        std::atomic<bool> finite{true};
+        sinq::parallel_for(tasks,threads,[&](int64_t begin,int64_t end) {
+            for (int64_t task = begin; task < end && finite.load(std::memory_order_relaxed); ++task) {
+                const int64_t first = task*scan_chunk, stop = first+std::min(scan_chunk,count-first);
+                for (int64_t i = first; i < stop; ++i) {
+                    if (!std::isfinite(source_at(source,source_type,i))) {
+                        finite.store(false,std::memory_order_relaxed); return;
+                    }
+                }
+            }
+        });
+        if (!finite.load(std::memory_order_relaxed)) { return false; }
+    } catch (...) { return false; }
     llama_sinq_statistics result;
     result.identity = options.identity || options.strength == 0.f;
     try {

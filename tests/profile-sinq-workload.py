@@ -16,7 +16,7 @@ import time
 ROOT=Path(__file__).resolve().parents[1]
 sys.path[:0]=[str(ROOT),str(ROOT/'gguf-py')]
 os.environ.update(OMP_NUM_THREADS='24',MKL_NUM_THREADS='24',CUDA_VISIBLE_DEVICES='0',HF_HUB_OFFLINE='1',TRANSFORMERS_OFFLINE='1')
-from tools.sinq.research.resources import canonical_json,file_digest,peak_rss_bytes
+from tools.sinq.optimizer.resources import canonical_json,file_digest,peak_rss_bytes
 
 
 def process_io():
@@ -91,14 +91,14 @@ def main():
     if shutil.disk_usage(output.parent).free<8<<30:raise ValueError('profile requires 8 GiB free temporary disk')
     output.mkdir(parents=True)
     import numpy as np,torch,gguf
-    from tools.sinq.research import native_codec
-    from tools.sinq.research.cache import CandidateStore
-    from tools.sinq.research.generate import source_identity
-    from tools.sinq.research.cli import _advanced_reference,_validator
-    from tools.sinq.research.capture import capture_block
-    from tools.sinq.research.blockwise import block_delta
-    from tools.sinq.research.fisher import qwen_probes
-    from tools.sinq.research.hybrid import assemble
+    from tools.sinq.optimizer import native_codec
+    from tools.sinq.optimizer.cache import CandidateStore
+    from tools.sinq.optimizer.generate import source_identity
+    from tools.sinq.optimizer.stages import _advanced_reference,_validator
+    from tools.sinq.optimizer.capture import capture_block
+    from tools.sinq.optimizer.blockwise import block_delta
+    from tools.sinq.optimizer.fisher import qwen_probes
+    from tools.sinq.optimizer.assembly import assemble
     torch.set_num_threads(24);torch.use_deterministic_algorithms(True)
     phases=[]
     @contextmanager
@@ -132,12 +132,12 @@ def main():
                     raw=d/f'weights-{index}.bin';packed=d/f'packed-{index}';request_dir=d/f'request-{index}';request_dir.mkdir()
                     with phase('native_stock_encode_'+str(index),input_bytes=tensor.n_bytes):
                         native_codec.copy_tensor_bytes(tensor,raw,max_bytes=512<<20)
-                        response=native_codec.request(bridge,dict(schema_version=1,operation='stock',weights=str(raw),source_type='f32',rows=n,columns=k,
-                            codec='q5_0',threads=24,workspace_bytes=512<<20,max_output_bytes=64<<20,strip_width=64,iterations=16,strength=.75,output=str(packed)),request_dir)
+                        response=native_codec.request(bridge,dict(schema_version=2,operation='stock',weights=str(raw),source_type='f32',rows=n,columns=k,
+                            codec='q5_0',threads=24,workspace_bytes=512<<20,max_output_bytes=64<<20,output=str(packed)),request_dir)
                         provenance=dict(source_sha256=source_sha,tensor_name=name,shape=[n,k],source_qtype='F32',qtype='Q5_0',input_sha256=file_digest(raw),
                             recipe_sha256=hashlib.sha256(b'engineering-only-Q5_0').hexdigest(),imatrix_sha256=None,
                             codec=dict(implementation='ggml',chunk_rows=max(1,(16384+k-1)//k),rows_per_expert=n),
-                            producer=dict(binary_sha256=file_digest(bridge),source_sha256=source_identity()),sinq=None,generator={'family':'stock'},activation=None)
+                            producer=dict(binary_sha256=file_digest(bridge),source_sha256=source_identity()),sinq=None,generator={'generator':'stock'},activation=None)
                         assignment[name]=store.put_files(provenance,packed/response['payload'])
             finally:reader.data._mmap.close()
             with phase('repeated_integrity_retrieval',retrievals=40):
@@ -168,7 +168,7 @@ def main():
                     logits=json.loads(result.stdout)['logits']
                     if len(logits)!=512 or not np.isfinite(logits).all():raise ValueError('profile native forward invalid')
             cache_stats=dict(store.index_stats)
-        summary=dict(schema_version=1,status='PASS',purpose='engineering profiling only; no quality A/B or recipe selection',seed=41721,
+        summary=dict(schema_version=2,status='PASS',purpose='engineering profiling only; no quality A/B or recipe selection',seed=41721,
             synthetic=True,model=dict(architecture='qwen35',layers=args.layers,hidden_size=args.hidden_size,intermediate_size=args.intermediate_size,vocabulary=512,
                 parameter_count=parameter_count,reference_parameter_bytes=parameter_count*4,source_bytes=source_bytes,source_sha256=source_sha),
             tokens=args.tokens,batch=1,cpu_threads=24,advanced_device='cpu',cuda_visible_devices='0',probes_per_layer=args.probes,

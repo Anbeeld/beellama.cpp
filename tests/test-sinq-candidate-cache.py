@@ -4,11 +4,11 @@ from pathlib import Path
 import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / 'gguf-py')]
-from tools.sinq.research.cache import CandidateStore
+from tools.sinq.optimizer.cache import CandidateStore
 
 def provenance(name='blk.0.ffn_down.weight', width=64):
     h = hashlib.sha256(b'fixture').hexdigest()
-    return dict(source_sha256=h, tensor_name=name, shape=[2,256], source_qtype='F16', qtype='Q5_0', input_sha256=h, recipe_sha256=h, imatrix_sha256=None, codec={'implementation':'ggml','chunk_rows':2}, sinq={'strip_width':width,'iterations':16,'strength':0.75,'algorithm':'sinkhorn_log','numerics':'f32-f16'}, generator={'family':'ordinary','alpha':0.0,'lambda':0.0}, activation=None, producer={'source_sha256':h,'binary_sha256':h})
+    return dict(source_sha256=h, tensor_name=name, shape=[2,256], source_qtype='F16', qtype='Q5_0', input_sha256=h, recipe_sha256=h, imatrix_sha256=None, codec={'implementation':'ggml','chunk_rows':2}, sinq={'strip_width':width,'iterations':16,'strength':0.75,'algorithm':'sinkhorn_log','numerics':'f32-f16'}, generator={'generator':'sinq','strip_width':width,'iterations':16,'strength':0.75}, activation=None, producer={'source_sha256':h,'binary_sha256':h})
 
 class CacheTest(unittest.TestCase):
     def test_roundtrip_and_corruption(self):
@@ -34,13 +34,20 @@ class CacheTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'budget'):
                 CandidateStore(d/'small',max_bytes=50).put(provenance(),bytes(352),scales.read_bytes())
 
-    def test_identity_metadata_requires_actual_identity_compensation(self):
+    def test_public_identity_algorithm_is_rejected(self):
         with tempfile.TemporaryDirectory() as d:
             s=CandidateStore(d);p=provenance();p['sinq']={**p['sinq'],'algorithm':'identity','strength':0}
-            with self.assertRaisesRegex(ValueError,'identity'):
-                s.put(p,bytes(352),np.full(256,2,dtype='<f2').tobytes())
-            key=s.put(p,bytes(352),np.ones(256,dtype='<f2').tobytes())
-            self.assertEqual(s.get(key).provenance['sinq']['algorithm'],'identity')
+            for scales in (np.full(256,2,dtype='<f2'),np.ones(256,dtype='<f2')):
+                with self.assertRaises(ValueError):
+                    s.put(p,bytes(352),scales.tobytes())
+
+    def test_complete_generator_provenance_is_required(self):
+        with tempfile.TemporaryDirectory() as d:
+            for generator in ({'family':'ordinary'}, {'generator':'sinq'},
+                              {'generator':'stock','strip_width':64}):
+                p=provenance();p['generator']=generator
+                with self.subTest(generator=generator),self.assertRaises(ValueError):
+                    CandidateStore(d).put(p,bytes(352),np.ones(256,dtype='<f2').tobytes())
 
     def test_validation(self):
         with tempfile.TemporaryDirectory() as d:
@@ -107,7 +114,7 @@ class VerifiedSessionTest(unittest.TestCase):
             legacy.unlink()
             store=CandidateStore(d); key=self.put(store)
             orphan=Path(d)/'.pending-interrupted';orphan.write_bytes(b'interrupted')
-            code="import sys,time;from pathlib import Path;root=Path(sys.argv[1]);sys.path[:0]=[str(root),str(root/'gguf-py')];from tools.sinq.research.cache import CandidateStore;s=CandidateStore(sys.argv[2]);ctx=s.verified_session();ctx.__enter__();print('ready',flush=True);time.sleep(120)"
+            code="import sys,time;from pathlib import Path;root=Path(sys.argv[1]);sys.path[:0]=[str(root),str(root/'gguf-py')];from tools.sinq.optimizer.cache import CandidateStore;s=CandidateStore(sys.argv[2]);ctx=s.verified_session();ctx.__enter__();print('ready',flush=True);time.sleep(120)"
             process=subprocess.Popen([sys.executable,'-c',code,str(ROOT),d],stdout=subprocess.PIPE,text=True)
             try:
                 self.assertEqual(process.stdout.readline().strip(),'ready')
@@ -124,7 +131,7 @@ class VerifiedSessionTest(unittest.TestCase):
     def test_non_windows_fallback_and_guard_failure(self):
         with tempfile.TemporaryDirectory() as d:
             store=CandidateStore(d)
-            with mock.patch('tools.sinq.research.cache._WindowsIndex',side_effect=OSError('no guards')):
+            with mock.patch('tools.sinq.optimizer.cache._WindowsIndex',side_effect=OSError('no guards')):
                 with store.verified_session():
                     key=self.put(store)
                     before=store.index_stats['hash_calls']
@@ -136,7 +143,7 @@ class VerifiedSessionTest(unittest.TestCase):
     def test_non_windows_branch_does_not_reuse_receipts(self):
         # Exercise capability selection on Windows too; real POSIX flock is
         # covered only when this suite runs on a POSIX host.
-        import tools.sinq.research.cache as cache
+        import tools.sinq.optimizer.cache as cache
         class NoWindows:
             name='posix'
             def __getattr__(self, name): return getattr(os,name)

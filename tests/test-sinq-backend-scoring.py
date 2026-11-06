@@ -5,9 +5,9 @@ import unittest
 import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from tools.sinq.research.capture import _digest
-from tools.sinq.research.fisher import build_probes
-from tools.sinq.research.blockwise import block_delta
+from tools.sinq.optimizer.capture import _digest
+from tools.sinq.optimizer.fisher import build_probes
+from tools.sinq.optimizer.blockwise import block_delta
 from contextlib import nullcontext
 from types import SimpleNamespace
 
