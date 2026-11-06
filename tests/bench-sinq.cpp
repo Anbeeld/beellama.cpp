@@ -50,10 +50,21 @@ int main() try {
                 });
                 if (reference_scales.empty()) reference_scales=scales;
                 check(scales==reference_scales,"normalization thread/repeat parity");
+                double launch_seconds=0;int launched=0;
+                sinq::native_encode_hooks hooks;
+                hooks.launch=[&](std::function<void()> work) {
+                    const auto begin=std::chrono::steady_clock::now();
+                    std::thread worker(std::move(work));
+                    launch_seconds+=std::chrono::duration<double>(std::chrono::steady_clock::now()-begin).count();
+                    ++launched;return worker;
+                };
                 measure("native_pack",int(std::min<int64_t>(threads,tasks)),[&] {
                     check(sinq::native_encode(GGML_TYPE_Q4_K,w.data(),packed.data(),rows_per_chunk*k,0,n,n,k,
-                        importance.data(),workers,threads)==bytes,"native byte count");
+                        importance.data(),workers,threads,&hooks)==bytes,"native byte count");
                 });
+                check(launched==std::min<int64_t>(threads,tasks)-1,"packing launch ceiling");
+                records.back()["worker_launch_seconds"]=launch_seconds;
+                records.back()["workers_spawned"]=launched;
                 if (reference_bytes.empty()) reference_bytes=packed;
                 check(packed==reference_bytes&&workers.empty(),"packing thread/repeat parity and cleanup");
                 for (int64_t row=0;row<n;++row) ggml_get_type_traits(GGML_TYPE_Q4_K)->to_float(
