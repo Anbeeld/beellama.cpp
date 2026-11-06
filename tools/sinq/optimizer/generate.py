@@ -58,7 +58,7 @@ def preflight(config,*,resume=None):
         manual=config.get('parameters',{})
         # Automatic candidates already contain complete settings. Discover targets
         # with the minimum codec-aligned width, not a hidden width-64 candidate.
-        discovery_width=64 if manual.get('overrides') else 32
+        discovery_width=32
         direct=dict(schema_version=2,defaults=manual.get('defaults',dict(generator='sinq',strip_width=discovery_width,iterations=16,strength=1.0)),
             targets=config['targets'],overrides=manual.get('overrides',[]))
         resolved=native_codec.resolve_plan(config['native_bridge'],direct,inventory,threads=config['threads'])

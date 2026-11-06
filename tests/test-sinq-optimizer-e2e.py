@@ -47,10 +47,34 @@ def fixture_validator(binary,*,threads=None):
     return validate
 
 
+def narrow_discovery(d,binaries):
+    """Overrides must not introduce a hidden width-64 discovery constraint."""
+    source=d/'narrow-source.gguf'
+    names=['blk.0.attn_q.weight','blk.0.attn_k.weight']
+    writer=gguf.GGUFWriter(source,'qwen35')
+    for name in names:writer.add_tensor(name,np.ones((2,96),dtype=np.float32))
+    writer.write_header_to_file();writer.write_kv_data_to_file();writer.write_tensors_to_file();writer.close()
+    suffix='.exe' if os.name=='nt' else ''
+    raw=dict(schema_version=2,inputs=dict(source_gguf=str(source),native_bridge=str(binaries/('llama-sinq-native'+suffix))),
+        quantization=dict(recipe={name:'Q5_0' for name in names}),targets=dict(include=names),
+        candidate_generators=[dict(type='sinq',configurations=[dict(strip_width=32,iterations=4,strength=.5)])],
+        parameters=dict(overrides=[dict(selector=dict(tensor=names[0]),parameters=dict(strip_width=32))]),
+        limits=dict(workspace_bytes=4<<20,max_artifact_bytes=4<<20,max_files=64,max_tensors=2,max_candidates_per_tensor=4),
+        output=dict(directory=str(d/'narrow-run')))
+    plan=preflight(validate_config(raw,'generate'))
+    assert len(plan['tensor_details'])==2
+    assert all(t['candidates'][0]['strip_width']==32 for t in plan['tensor_details'])
+    raw['parameters']['defaults']=dict(generator='sinq',strip_width=64,iterations=4,strength=.5)
+    try:preflight(validate_config(raw,'generate'))
+    except RuntimeError:pass
+    else:raise AssertionError('explicit invalid width-64 defaults were silently ignored')
+
+
 def workflow(d,binaries):
     suffix='.exe' if os.name=='nt' else ''
     binary=lambda name:str(binaries/(name+suffix))
     bridge=binary('llama-sinq-native');loader=binary('llama-sinq-model');quantizer=binary('llama-quantize')
+    narrow_discovery(d,binaries)
     spec=importlib.util.spec_from_file_location('fixture',ROOT/'tests/test-sinq-groupwise-kl.py')
     module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
     source=d/'source.gguf';module.native_fixture(source)
