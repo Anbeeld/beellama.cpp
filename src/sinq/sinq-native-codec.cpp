@@ -31,6 +31,7 @@ void sinq::transform_importance(const float * importance, float * output,
 
 #include <mutex>
 #include <stdexcept>
+#include <string>
 size_t sinq::native_encode(enum ggml_type new_type, const float * f32_data, void * new_data, const int64_t chunk_size, int64_t first_row, int64_t nrows, int64_t nrows_per_expert, int64_t n_per_row, const float * imatrix, std::vector<std::thread> & workers, const int nthread, const native_encode_hooks * hooks) {
     require(f32_data && new_data && nrows > 0 && nrows_per_expert > 0 &&
         n_per_row > 0 && first_row >= 0 && chunk_size >= n_per_row && nthread > 0 &&
@@ -42,18 +43,33 @@ size_t sinq::native_encode(enum ggml_type new_type, const float * f32_data, void
         return imatrix ? imatrix + (row_global / nrows_per_expert) * n_per_row : nullptr;
     };
 
+    const auto encode_rows = [&](int64_t row, int64_t rows) {
+        const auto context = [&]() {
+            return std::string("SINQ native ") + ggml_type_name(new_type) + " rows [" +
+                std::to_string(first_row + row) + "," + std::to_string(first_row + row + rows) + ")";
+        };
+        try {
+            void * data = (char *) new_data + row * row_size;
+            const auto bytes = quantize(new_type, f32_data + row * n_per_row,
+                data, 0, rows, n_per_row, imatrix_for_row(first_row + row));
+            if (!ggml_validate_row_data(new_type, data, bytes)) {
+                throw std::runtime_error("quantized data validation failed");
+            }
+            return bytes;
+        } catch (const std::exception & error) {
+            std::throw_with_nested(std::runtime_error(context() + ": " + error.what()));
+        } catch (...) {
+            std::throw_with_nested(std::runtime_error(context() + ": unknown codec failure"));
+        }
+    };
+
     if (nthread < 2) {
         // single-thread
         size_t new_size = 0;
         for (int64_t row = 0; row < nrows;) {
             const int64_t row_global = first_row + row;
             const int64_t this_nrow  = std::min(nrows - row, nrows_per_expert - row_global % nrows_per_expert);
-            void * this_data = (char *) new_data + row * row_size;
-            size_t this_size = quantize(new_type, f32_data + row * n_per_row, this_data, 0, this_nrow, n_per_row, imatrix_for_row(row_global));
-            if (!ggml_validate_row_data(new_type, this_data, this_size)) {
-                throw std::runtime_error("quantized data validation failed");
-            }
-            new_size += this_size;
+            new_size += encode_rows(row, this_nrow);
             row += this_nrow;
         }
         return new_size;
@@ -88,12 +104,7 @@ size_t sinq::native_encode(enum ggml_type new_type, const float * f32_data, void
                         nrows_per_expert - (first_row + row) % nrows_per_expert});
                     counter += this_nrow;
                 }
-                void * this_data = (char *) new_data + row * row_size;
-                const size_t bytes = quantize(new_type, f32_data + row * n_per_row,
-                    this_data, 0, this_nrow, n_per_row, imatrix_for_row(first_row + row));
-                if (!ggml_validate_row_data(new_type, this_data, bytes)) {
-                    throw std::runtime_error("quantized data validation failed");
-                }
+                const size_t bytes = encode_rows(row, this_nrow);
                 std::lock_guard<std::mutex> lock(mutex);
                 new_size += bytes;
             }

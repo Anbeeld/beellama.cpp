@@ -140,7 +140,17 @@ static void native_failures_and_parity() {
     hooks.quantize=throwing_quantize;encode_caller=std::this_thread::get_id();worker_threw=false;
     bool caught=false;
     try {sinq::native_encode(GGML_TYPE_Q4_K,input.data(),output.data(),columns,0,rows,experts,columns,importance.data(),workers,4,&hooks);}
-    catch(const std::runtime_error &) {caught=true;}
+    catch(const std::runtime_error & error) {
+        caught=true;
+        const std::string message=error.what();
+        check(message.find(ggml_type_name(GGML_TYPE_Q4_K))!=std::string::npos&&message.find("rows [")!=std::string::npos,
+            "worker failure reports codec and global row range");
+        bool nested=false;
+        try {std::rethrow_if_nested(error);} catch(const std::runtime_error & cause) {
+            nested=std::string(cause.what())=="injected worker codec failure";
+        }
+        check(nested,"worker failure preserves original codec exception");
+    }
     check(caught&&worker_threw&&workers.empty(),"non-main worker exception propagates and joins");
     hooks=sinq::native_encode_hooks{};
     int launches=0;std::atomic<int> active{0};
