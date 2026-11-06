@@ -410,7 +410,8 @@ static void strength_and_diagnostics() {
         llama_sinq_options o;o.strip_width=width;o.iterations=iterations;
         std::vector<ggml_fp16_t> legacy,actual,identity;
         llama_sinq_statistics ls,s;
-        CHECK(llama_sinq_compute_scales(w.data(),GGML_TYPE_F32,n,k,o,1,legacy,ls));
+        std::vector<float> cached_factors;
+        CHECK(llama_sinq_compute_scales(w.data(),GGML_TYPE_F32,n,k,o,1,legacy,ls,&cached_factors));
         o.identity=true;CHECK(llama_sinq_compute_scales(w.data(),GGML_TYPE_F32,n,k,o,1,identity,s));o.identity=false;
         for(float alpha:{0.f,.5f,.75f,1.f}) {
             o.strength=alpha;
@@ -420,6 +421,12 @@ static void strength_and_diagnostics() {
             CHECK(llama_sinq_compute_scales(w.data(),GGML_TYPE_F32,n,k,o,1,one,one_stats,&raw_one));
             CHECK(llama_sinq_compute_scales(w.data(),GGML_TYPE_F32,n,k,o,32,many,many_stats,&raw_many));
             CHECK(one==actual && many==actual && raw_one==raw_many);
+            std::vector<ggml_fp16_t> cached;
+            std::vector<float> cached_raw;
+            auto cached_stats=ls;
+            CHECK(llama_sinq_apply_strength(cached_factors,alpha,cached,cached_stats,&cached_raw));
+            CHECK(cached==actual && cached_raw==raw_one);
+            CHECK(cached_stats.min_scale==s.min_scale && cached_stats.max_scale==s.max_scale && cached_stats.median_scale==s.median_scale);
             if(alpha==0) {
                 CHECK(actual==identity && s.identity && s.strips.empty());
                 for(float value:raw_one)CHECK(value==1.f);

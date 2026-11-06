@@ -148,6 +148,39 @@ bool llama_sinq_balance_tile(const float * weights, int64_t n, int g, int iterat
     } catch (const std::exception &) { return false; }
 }
 
+bool llama_sinq_apply_strength(const std::vector<float> & factors, float strength,
+                              std::vector<ggml_fp16_t> & scales,
+                              llama_sinq_statistics & statistics, std::vector<float> * unrounded) {
+    if (factors.empty() || !std::isfinite(strength) || strength < 0.f || strength > 1.f) return false;
+    try {
+        auto result = statistics;
+        result.identity = strength == 0.f;
+        std::vector<ggml_fp16_t> output(factors.size());
+        std::vector<float> raw_output(unrounded ? factors.size() : 0);
+        result.min_scale = std::numeric_limits<float>::infinity(); result.max_scale = 0;
+        std::vector<float> ordered; ordered.reserve(factors.size());
+        for (size_t j = 0; j < factors.size(); ++j) {
+            if (!(factors[j] > 0) || !std::isfinite(factors[j])) return false;
+            // Do not derive fractional strengths from an already rounded F16.
+            const float value = strength == 0.f ? 1.f : strength == 1.f ? factors[j] :
+                std::exp(strength*std::log(factors[j]));
+            const auto h = ggml_fp32_to_fp16(value);
+            const float f = ggml_fp16_to_fp32(h);
+            if (!(f > 0) || !std::isfinite(f)) return false;
+            output[j] = h;
+            if (unrounded) raw_output[j] = value;
+            result.min_scale = std::min(result.min_scale,f); result.max_scale = std::max(result.max_scale,f);
+            ordered.push_back(f);
+        }
+        std::sort(ordered.begin(),ordered.end());
+        result.median_scale = ordered.size()%2 ? ordered[ordered.size()/2] :
+            (ordered[ordered.size()/2-1]+ordered[ordered.size()/2])*.5f;
+        if (unrounded) unrounded->swap(raw_output);
+        scales.swap(output); statistics = std::move(result);
+        return true;
+    } catch (const std::exception &) { return false; }
+}
+
 bool llama_sinq_compute_scales(const void * source, ggml_type source_type,
                               int64_t n, int64_t k, const llama_sinq_options & options,
                               int threads, std::vector<ggml_fp16_t> & scales,
@@ -179,8 +212,7 @@ bool llama_sinq_compute_scales(const void * source, ggml_type source_type,
     llama_sinq_statistics result;
     result.identity = options.identity || options.strength == 0.f;
     try {
-        std::vector<ggml_fp16_t> output(size_t(k),ggml_fp32_to_fp16(1.f));
-        std::vector<float> raw_output(unrounded ? size_t(k) : 0,1.f);
+        std::vector<float> factors(size_t(k),1.f);
         if (!result.identity) {
             const int g = options.strip_width;
             const int64_t groups = k/g;
@@ -195,13 +227,7 @@ bool llama_sinq_compute_scales(const void * source, ggml_type source_type,
                         }
                         if (!llama_sinq_balance_tile(tile.data(),n,g,options.iterations,t.data(),r.data(),&result.strips[size_t(group)])) { ok = false; break; }
                         for (int j = 0; j < g; ++j) {
-                            // Preserve the exact legacy rounding path at strength1.
-                            const float value = options.strength == 1.f ? t[j] : std::exp(options.strength*std::log(t[j]));
-                            const ggml_fp16_t h = ggml_fp32_to_fp16(value);
-                            const float f = ggml_fp16_to_fp32(h);
-                            if (!(f > 0) || !std::isfinite(f)) { ok = false; break; }
-                            output[group*g+j] = h;
-                            if (unrounded) { raw_output[group*g+j] = value; }
+                            factors[group*g+j] = t[j];
                         }
                     }
                 } catch (const std::exception &) { ok = false; }
@@ -217,19 +243,9 @@ bool llama_sinq_compute_scales(const void * source, ggml_type source_type,
             for (auto & worker : pool) { worker.join(); }
             if (!ok.load()) { return false; }
         }
-        result.min_scale = std::numeric_limits<float>::infinity(); result.max_scale = 0;
-        for (ggml_fp16_t h : output) {
-            const float f = ggml_fp16_to_fp32(h);
-            result.min_scale = std::min(result.min_scale,f); result.max_scale = std::max(result.max_scale,f);
-        }
-        std::vector<float> ordered; ordered.reserve(output.size());
-        for (ggml_fp16_t h : output) { ordered.push_back(ggml_fp16_to_fp32(h)); }
-        std::sort(ordered.begin(),ordered.end());
-        result.median_scale = ordered.size()%2 ? ordered[ordered.size()/2] :
-            (ordered[ordered.size()/2-1]+ordered[ordered.size()/2])*.5f;
         for (const auto & strip : result.strips) { result.selected_identity_count += strip.chosen_iteration == 0; }
-        if (unrounded) { unrounded->swap(raw_output); }
-        scales.swap(output); statistics = std::move(result);
+        if (!llama_sinq_apply_strength(factors,result.identity ? 0.f : options.strength,scales,result,unrounded)) return false;
+        statistics = std::move(result);
         return true;
     } catch (const std::exception &) { return false; }
 }

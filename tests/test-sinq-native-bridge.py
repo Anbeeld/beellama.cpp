@@ -33,6 +33,33 @@ def spec(width=64, iterations=16, strength=1., **kw):
 
 
 class Bridge(unittest.TestCase):
+    def test_normalization_cache_equivalence_and_eviction(self):
+        with tempfile.TemporaryDirectory(prefix='sinq-cache-equivalence-') as tmp:
+            d=Path(tmp);n,k,samples=7,256,3
+            w=np.sin(np.arange(n*k,dtype=np.float32)*.17).reshape(n,k)
+            x=np.cos(np.arange(samples*k,dtype=np.float32)*.31).reshape(samples,k)
+            w.tofile(d/'w.bin');x.tofile(d/'x.bin');(x*.75).tofile(d/'v.bin')
+            base=[spec(width,it,s) for width in (32,64,128) for it in (4,8,16) for s in (0.,.5,1.)]
+            # Revisit old keys beyond the four-entry FIFO, including both AWQ modes.
+            candidates=base+[dict(s,generator='awq',correction='weight_activation',alpha=.5,**{'lambda':.75}) for s in base]+[
+                dict(base[1],generator='awq',correction='activation_only',alpha=.5,**{'lambda':1.}),
+                dict(base[1],generator='awq',correction='weight_activation',alpha=.5,**{'lambda':0.})]
+            cfg=dict(schema_version=2,operation='generate',weights=str(d/'w.bin'),rows=n,columns=k,
+                codec='q5_0',activations=str(d/'x.bin'),samples=samples,validation=str(d/'v.bin'),validation_samples=samples,
+                held_out=True,objective='output_mse',workspace_bytes=8<<20,max_output_bytes=8<<20,candidates=candidates)
+            references=[]
+            for i,candidate in enumerate(candidates):
+                directory=d/f'isolated-{i}'
+                r=request(dict(cfg,output=str(directory),threads=1,candidates=[candidate]),d)['candidates'][0]
+                references.append((digest(directory/'candidate-0.f16'),digest(directory/'candidate-0.bin'),r['train_score'],r['validation_score']))
+            for threads in (1,32):
+                directory=d/f'grid-{threads}';result=request(dict(cfg,output=str(directory),threads=threads),d)
+                self.assertLess(result['normalization_calls'],sum(c['strength']!=0 for c in candidates))
+                self.assertGreater(result['normalization_cache_hits'],0)
+                self.assertLessEqual(result['workspace_bytes'],cfg['workspace_bytes'])
+                for i,r in enumerate(result['candidates']):
+                    self.assertEqual((digest(directory/f'candidate-{i}.f16'),digest(directory/f'candidate-{i}.bin'),r['train_score'],r['validation_score']),references[i])
+
     def test_plan_config(self):
         with tempfile.TemporaryDirectory(prefix='sinq-plan-') as tmp:
             d=Path(tmp)

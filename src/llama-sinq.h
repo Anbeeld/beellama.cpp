@@ -71,6 +71,13 @@ bool llama_sinq_balance_tile(const float * weights, int64_t rows, int width,
                             int iterations, float * columns, float * row_factors,
                             llama_sinq_tile_statistics * statistics = nullptr);
 
+// Apply strength to unrounded strength-1 factors using the canonical arithmetic,
+// then serialize to F16. Existing strip diagnostics in statistics are retained.
+bool llama_sinq_apply_strength(const std::vector<float> & factors, float strength,
+                              std::vector<ggml_fp16_t> & scales,
+                              llama_sinq_statistics & statistics,
+                              std::vector<float> * unrounded = nullptr);
+
 // Full-height strips, aggregate worker workspace bounded to 128 MiB. Reject
 // shapes requiring more than that for one strip, without changing the width.
 // F16-round t BEFORE W/t:
