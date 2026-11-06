@@ -4,6 +4,7 @@
 #include "sinq/sinq-candidates.h"
 #include "sinq/sinq-native-codec.h"
 #include <atomic>
+#include <cstring>
 #include <limits>
 #include <mutex>
 #include <cmath>
@@ -110,6 +111,17 @@ static size_t throwing_quantize(ggml_type type, const float * input, void * outp
     return ggml_quantize_chunk(type,input,output,start,rows,columns,importance);
 }
 
+static size_t invalid_quantize(ggml_type type, const float *, void * output,
+        int64_t, int64_t rows, int64_t columns, const float *) {
+    const auto bytes=rows*ggml_row_size(type,columns);
+    std::memset(output,0xff,bytes);return bytes;
+}
+
+static size_t throw_any_quantize(ggml_type, const float *, void *,
+        int64_t, int64_t, int64_t, const float *) {
+    throw std::runtime_error("injected serial codec failure");
+}
+
 static void native_failures_and_parity() {
     constexpr int64_t columns=256, rows=37, experts=11;
     std::vector<float> input(rows*columns),importance(5*columns,1.f);
@@ -141,6 +153,20 @@ static void native_failures_and_parity() {
     catch(const std::runtime_error &) {caught=true;}
     check(caught&&launches==2&&active==0&&workers.empty(),"partial launch failure joins and clears");
     check(sinq::native_encode(GGML_TYPE_Q4_K,input.data(),output.data(),columns,0,rows,experts,columns,importance.data(),workers,32)==output.size(),"encode succeeds after injected failures");
+    for(int threads:{1,32}) {
+        hooks=sinq::native_encode_hooks{};hooks.quantize=invalid_quantize;caught=false;
+        try {sinq::native_encode(GGML_TYPE_Q4_K,input.data(),output.data(),columns,0,rows,experts,columns,importance.data(),workers,threads,&hooks);}
+        catch(const std::runtime_error &) {caught=true;}
+        check(caught&&workers.empty(),"invalid packed data fails with all workers joined");
+    }
+    hooks=sinq::native_encode_hooks{};hooks.quantize=throw_any_quantize;caught=false;
+    try {sinq::native_encode(GGML_TYPE_Q4_K,input.data(),output.data(),columns,0,rows,experts,columns,importance.data(),workers,1,&hooks);}
+    catch(const std::runtime_error &) {caught=true;}
+    check(caught&&workers.empty(),"serial callback exception remains controlled");
+    hooks=sinq::native_encode_hooks{};launches=0;
+    hooks.launch=[&](std::function<void()> work) {++launches;return std::thread(std::move(work));};
+    check(sinq::native_encode(GGML_TYPE_Q4_K,input.data(),output.data(),columns*rows,0,rows,rows,columns,importance.data(),workers,32,&hooks)==output.size(),"single-task size");
+    check(launches==0&&workers.empty(),"small slabs never launch idle workers");
 }
 
 int main() try {
