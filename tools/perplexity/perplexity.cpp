@@ -2278,7 +2278,11 @@ static bool perplexity_full(llama_context * ctx, const common_params & params) {
     if (params.kl_divergence) {
         kld_values.reserve(size_t(token_count - 1));
     }
-    std::vector<std::thread> workers(std::max(1u, std::thread::hardware_concurrency()) - 1);
+    // The parsed CPU parameters already resolve -t/defaults. Scoring is row-parallel,
+    // so do not launch more threads than the largest batch can actually use.
+    const int scoring_rows = int(std::min<uint64_t>(n_batch, token_count - 1));
+    const int scoring_threads = std::max(1, std::min(params.cpuparams.n_threads, scoring_rows));
+    std::vector<std::thread> workers(scoring_threads - 1);
     common_batch batch(ctx);
     double candidate_nll = 0, base_nll = 0, nll2 = 0, sum_kld = 0;
     uint64_t same_top = 0;
@@ -2292,13 +2296,13 @@ static bool perplexity_full(llama_context * ctx, const common_params & params) {
         const int64_t start = ggml_time_us();
         if (params.kl_divergence) {
             if (!perplexity_full_compare_batch(int(n_vocab),scoring_logits.data(),scoring_encoded.data(),
-                    tokens.data()+first+1,count,int(workers.size()+1),batch_metrics.data())) {
+                    tokens.data()+first+1,count,scoring_threads,batch_metrics.data())) {
                 return fail("nonfinite candidate logits");
             }
             scoring_us += ggml_time_us()-start;
         } else if (discard_reference) {
             if (!perplexity_full_nll_batch(int(n_vocab), scoring_logits.data(), tokens.data()+first+1,
-                    count, int(workers.size()+1), batch_nll.data())) {
+                    count, scoring_threads, batch_nll.data())) {
                 return fail("nonfinite candidate logits or invalid target");
             }
             for (int i = 0; i < count; ++i) {
@@ -2394,6 +2398,7 @@ static bool perplexity_full(llama_context * ctx, const common_params & params) {
             std::copy_n(logits, size_t(count)*n_vocab, scoring_logits.data());
             scoring_job = std::async(std::launch::async,finish_batch,first,position,count);
         } else {
+            workers.resize(std::min(scoring_threads, count) - 1);
             if (!process_logits(baseline, int(n_vocab), logits, tokens.data() + first, count,
                     workers, encoded, candidate_nll, nll2, batch_nll.data())) { return false; }
             scoring_us += ggml_time_us()-stage_start;
@@ -2403,9 +2408,9 @@ static bool perplexity_full(llama_context * ctx, const common_params & params) {
     }
     if (scoring_job.valid() && !scoring_job.get()) { return false; }
     LOG_INF("ppl-full timing: decode_and_logits_ms=%.3f validation_ms=%.3f reference_read_ms=%.3f "
-            "probability_scoring_ms=%.3f token_output_ms=%.3f scoring_threads=%zu "
+            "probability_scoring_ms=%.3f token_output_ms=%.3f scoring_threads=%d "
             "reference_io_overlapped=%d scoring_includes_parallel_validation=%d previous_batch_scoring_overlapped=%d\n",
-        decode_us/1000.0,validation_us/1000.0,reference_us/1000.0,scoring_us/1000.0,output_us/1000.0,workers.size()+1,
+        decode_us/1000.0,validation_us/1000.0,reference_us/1000.0,scoring_us/1000.0,output_us/1000.0,scoring_threads,
         int(params.kl_divergence),int(pipeline_scoring),int(pipeline_scoring));
     if (baseline.is_open()) {
         baseline.flush();

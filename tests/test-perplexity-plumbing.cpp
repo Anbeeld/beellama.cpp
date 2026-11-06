@@ -48,6 +48,9 @@ int main(int argc, char ** argv) {
     const std::string ppl = slice_between(perplexity,
             "static results_perplexity perplexity(llama_context * ctx, const common_params & params, const int32_t n_ctx)",
             "static bool decode_helper");
+    const std::string full = slice_between(perplexity,
+            "static bool perplexity_full(llama_context * ctx, const common_params & params)",
+            "// satisfies -Wmissing-declarations");
     const std::string kl = slice_between(perplexity,
             "static bool kl_divergence(llama_context * ctx, const common_params & params)",
             "if (kld.count < 100) return true;");
@@ -86,6 +89,18 @@ int main(int argc, char ** argv) {
         "KL divergence must consume current decode logits directly");
     ok &= expect(kl.find("std::vector<float> logits") == std::string::npos,
         "KL divergence must not buffer full-vocab logits across the half-context");
+
+    ok &= expect(full.find("hardware_concurrency") == std::string::npos &&
+                 full.find("const int scoring_rows = int(std::min<uint64_t>(n_batch, token_count - 1))") != std::string::npos &&
+                 full.find("const int scoring_threads = std::max(1, std::min(params.cpuparams.n_threads, scoring_rows))") != std::string::npos,
+        "full-corpus probability scoring must honor effective -t and available batch rows, with at least one thread");
+    ok &= expect(full.find("count,scoring_threads,batch_metrics.data()") != std::string::npos &&
+                 full.find("count, scoring_threads, batch_nll.data()") != std::string::npos &&
+                 full.find("workers.resize(std::min(scoring_threads, count) - 1)") != std::string::npos,
+        "full-corpus comparison, null-sink NLL and reference encoding must all use the scoring thread ceiling");
+    ok &= expect(full.find("scoring_threads=%d") != std::string::npos &&
+                 full.find("output_us/1000.0,scoring_threads,") != std::string::npos,
+        "full-corpus timing must report the actual peak scoring thread count, not hardware concurrency or the last partial batch");
 
     return ok ? 0 : 1;
 }
