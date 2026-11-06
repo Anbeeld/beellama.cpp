@@ -6,6 +6,7 @@
 #include "sinq-parallel.h"
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 namespace sinq {
 search_result materialize_candidates(ggml_type codec,int64_t n,int64_t k,
         const std::vector<float>&x,int samples,const std::vector<float>&validation,int validation_samples,
@@ -22,9 +23,16 @@ search_result materialize_candidates(ggml_type codec,int64_t n,int64_t k,
     require(importance||!ggml_quantize_requires_imatrix(codec),"codec requires imatrix");
     for(int64_t j=0;importance&&j<k;++j)require(std::isfinite(importance[j])&&importance[j]>=0,"invalid importance");
     // Validate every complete specification before encoding anything.
+    bool need_activation_means=false,need_weight_means=false;
     for(const auto&s:options.candidates) {
         require((s.generator==generator_kind::sinq||s.generator==generator_kind::awq)&&llama_sinq_valid_strip_width(s.strip_width)&&k%s.strip_width==0&&(s.iterations==4||s.iterations==8||s.iterations==16)&&std::isfinite(s.strength)&&s.strength>=0&&s.strength<=1,"invalid candidate normalization");
         if(s.generator==generator_kind::awq)require(samples>0&&(s.correction==correction_kind::weight_activation||s.correction==correction_kind::activation_only)&&std::isfinite(s.alpha)&&s.alpha>=0&&s.alpha<=1&&std::isfinite(s.lambda)&&s.lambda>=0&&s.lambda<=1,"AWQ requires activations and valid correction parameters");
+        // Match compensation's effective-correction predicate, including its
+        // activation-only alpha=0 identity. Weight/activation still needs both
+        // means at either alpha endpoint.
+        const bool corrected=s.generator==generator_kind::awq&&s.lambda!=0&&!(s.correction==correction_kind::activation_only&&s.alpha==0);
+        need_activation_means|=corrected;
+        need_weight_means|=corrected&&s.correction==correction_kind::weight_activation;
     }
     const size_t fixed=size_t(k)*(96+size_t(samples+validation_samples)*4+options.candidates.size()*2)+options.candidates.size()*256+4096;
     const size_t row_bytes=ggml_row_size(codec,k),per_row=size_t(k)*12+row_bytes+2*sizeof(double),scratch=size_t(k)*sizeof(double);
@@ -34,23 +42,38 @@ search_result materialize_candidates(ggml_type codec,int64_t n,int64_t k,
     const int64_t slab=std::min<int64_t>(n,(limit-resident)/per_row);
     std::vector<float>w(size_t(slab)*k),pre(w.size()),dq(w.size()),im(importance?size_t(k):0);
     std::vector<uint8_t>packed(size_t(slab)*row_bytes);
-    std::vector<double>train_rows(size_t(slab),0.),validation_rows(size_t(slab),0.),mx(size_t(k),0),mw(size_t(k),0);
-    std::vector<sum>sums(size_t(k),sum{});
-    if(samples)parallel_for(k,threads,[&](int64_t begin,int64_t end){
+    search_result result;result.workspace_bytes=resident+size_t(slab)*per_row;
+    result.effective_threads=threads;result.slab_rows=slab;
+    result.activation_statistics=need_activation_means;result.weight_statistics=need_weight_means;
+    const auto elapsed=[](std::chrono::steady_clock::time_point begin) {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now()-begin).count();
+    };
+    const auto statistics_start=std::chrono::steady_clock::now();
+    std::vector<double>train_rows(size_t(slab),0.),validation_rows(size_t(slab),0.),mx(need_activation_means?size_t(k):0,0),mw(need_weight_means?size_t(k):0,0);
+    std::vector<sum>sums(need_weight_means?size_t(k):0,sum{});
+    if(need_activation_means)parallel_for(k,threads,[&](int64_t begin,int64_t end){
         for(int64_t j=begin;j<end;++j){sum v;for(int t=0;t<samples;++t)v.add(std::abs(double(x[size_t(t)*k+j])));mx[j]=v.value/samples;}
     });
     for(int64_t first=0;first<n;first+=slab) {
         const auto rows=std::min(slab,n-first);read(first,rows,w.data());
-        // Each worker owns contiguous columns; every column still adds rows
-        // in source order across serial slabs, with no parallel reduction.
+        // Validate the entire source before any emission, even when no means
+        // are needed. Each column retains source-order sums across serial slabs.
         parallel_for(k,threads,[&](int64_t begin,int64_t end){
-            for(int64_t r=0;r<rows;++r)for(int64_t j=begin;j<end;++j){require(std::isfinite(w[r*k+j]),"nonfinite source weight");sums[j].add(std::abs(double(w[r*k+j])));}
+            if(need_weight_means) {
+                for(int64_t r=0;r<rows;++r)for(int64_t j=begin;j<end;++j){require(std::isfinite(w[r*k+j]),"nonfinite source weight");sums[j].add(std::abs(double(w[r*k+j])));}
+            } else {
+                for(int64_t r=0;r<rows;++r)for(int64_t j=begin;j<end;++j)require(std::isfinite(w[r*k+j]),"nonfinite source weight");
+            }
         });
     }
-    parallel_for(k,threads,[&](int64_t begin,int64_t end){for(int64_t j=begin;j<end;++j)mw[j]=sums[j].value/double(n);});
-    search_result result;result.workspace_bytes=resident+size_t(slab)*per_row;
+    if(need_weight_means)parallel_for(k,threads,[&](int64_t begin,int64_t end){for(int64_t j=begin;j<end;++j)mw[j]=sums[j].value/double(n);});
+    result.statistics_seconds=elapsed(statistics_start);
     for(size_t index=0;index<options.candidates.size();++index) {
-        candidate_result r;r.spec=options.candidates[index];r.scales=compensation(compute(r.spec),mx,mw,r.spec);
+        candidate_result r;r.spec=options.candidates[index];
+        const auto raw=compute(r.spec);
+        const auto compensation_start=std::chrono::steady_clock::now();
+        r.scales=compensation(raw,mx,mw,r.spec);
+        result.compensation_seconds+=elapsed(compensation_start);
         require(r.scales.size()==size_t(k),"normalization cardinality mismatch");
         r.has_score=samples>0;r.has_validation=options.held_out;r.duplicate_of=index;
         // Always materialize every requested descriptor; equal payloads never erase provenance.
@@ -62,12 +85,16 @@ search_result materialize_candidates(ggml_type codec,int64_t n,int64_t k,
             const size_t bytes=encode(pre.data(),packed.data(),first,rows,importance?im.data():nullptr);
             require(bytes==size_t(rows)*row_bytes&&ggml_validate_row_data(codec,packed.data(),bytes),"invalid native packed bytes");
             if(samples) {
+                const auto score_start=std::chrono::steady_clock::now();
                 parallel_for(rows,threads,[&](int64_t begin,int64_t end){for(int64_t row=begin;row<end;++row)ggml_get_type_traits(codec)->to_float(packed.data()+row*row_bytes,dq.data()+row*k,k);});
                 output_scores(w.data(),dq.data(),r.scales.data(),rows,k,x.data(),samples,options.objective,train_rows.data(),threads);
                 if(options.held_out)output_scores(w.data(),dq.data(),r.scales.data(),rows,k,validation.data(),validation_samples,options.objective,validation_rows.data(),threads);
                 for(int64_t row=0;row<rows;++row){train.add(train_rows[size_t(row)]);if(options.held_out)val.add(validation_rows[size_t(row)]);}
+                result.score_seconds+=elapsed(score_start);
             }
+            const auto emit_start=std::chrono::steady_clock::now();
             emit(index,r.scales,first,rows,packed.data(),bytes);
+            result.emit_seconds+=elapsed(emit_start);
         }
         r.train_score=train.value/double(n);r.validation_score=val.value/double(n);
         require(std::isfinite(r.train_score)&&std::isfinite(r.validation_score),"score overflow");

@@ -11,7 +11,14 @@ struct search_options {
     bool held_out=false;
     size_t max_candidates=128;
 };
-struct search_result { std::vector<candidate_result> candidates; size_t encode_count=0; size_t workspace_bytes=0; };
+struct search_result {
+    std::vector<candidate_result> candidates;
+    size_t encode_count=0,workspace_bytes=0;
+    int effective_threads=1;
+    int64_t slab_rows=0;
+    bool activation_statistics=false,weight_statistics=false;
+    double statistics_seconds=0,compensation_seconds=0,score_seconds=0,emit_seconds=0;
+};
 using candidate_writer=std::function<void(size_t,const std::vector<ggml_fp16_t>&,int64_t,int64_t,const uint8_t*,size_t)>;
 // Normalization uses the canonical native implementation, one complete spec at a time.
 using scale_computer=std::function<std::vector<float>(const candidate_spec&)>;
