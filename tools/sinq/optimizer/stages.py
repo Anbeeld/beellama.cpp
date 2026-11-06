@@ -393,6 +393,12 @@ def _score(config,run,store,source):
             baseline=None; probes=None; locked=None; effective=None
             if sys.exc_info()[0] is not None: adapter=None
     if not records:raise ValueError('requested score stage produced no candidate observations')
+    if method=='local':
+        # Manifest bytes bind the declared dataset; revalidate its actual data
+        # after native subprocesses too, before any score artifact is published.
+        for key,expected in [('capture_manifest',validated),*([('validation_manifest',validation)] if validation else [])]:
+            if native_codec.validate_activations(config['native_bridge'],config[key],source,threads=config['threads'])!=expected:
+                raise ValueError('score capture data changed during scoring')
     if _score_input_hashes(config)!=input_hashes:raise ValueError('score context inputs changed during scoring')
     scorer_context=_scorer_context(config,run,partition_identity,input_hashes,
         reference=adapter.identity if method!='local' else None,

@@ -80,6 +80,15 @@ class ScoreContextTests(unittest.TestCase):
         changed=stages._scorer_context(config,dict(self.run,source_sha256='f'*64),context['data_partition_identity'],stages._score_input_hashes(config))
         self.assertNotEqual(digest(changed),baseline['context_identity'])
 
+    def test_local_capture_revalidation_prevents_publication(self):
+        config=self.config()
+        initial={'tensors':{name:object() for name in self.names},'data_identity':'original'}
+        changed={**initial,'data_identity':'changed'}
+        with patch.object(stages,'_score_partition',return_value=None),patch.object(stages.native_codec,'validate_activations',side_effect=[initial,changed]),patch.object(stages.native_codec,'rescore',return_value=dict(train_score=2.,validation_score=None,encode_count=0)):
+            with self.assertRaisesRegex(ValueError,'capture.*changed'):
+                stages._score(config,self.run,self.store,self.source)
+        self.assertFalse(Path(config['output_directory']).exists())
+
     def test_reader_rejects_resigned_internal_inconsistency(self):
         baseline=self.score(self.config())
         mutations=[lambda r:r['scorer_context'].__setitem__('selection_policy','held_out'),
