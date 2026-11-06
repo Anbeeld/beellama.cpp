@@ -6,18 +6,21 @@ from pathlib import Path
 import tempfile
 import numpy as np
 import gguf
-from .resources import canonical_json, digest, file_digest, reject_alias, tensor_hashes
+from .resources import canonical_json, digest, file_digest, reject_alias, tensor_hashes, observe_phase
 
 PREFIX='beellama.qk_sinq.'
 FIELDS={'version','tensors','transform','recipes','producer'}
 
 
 def _bytes_hash(data):
-    h=hashlib.sha256()
-    raw=data.view(np.uint8).reshape(-1)
-    for start in range(0,raw.size,1 << 20):
-        h.update(raw[start:start+(1 << 20)])
-    return h.hexdigest()
+    with observe_phase('tensor_hash') as measured:
+        h=hashlib.sha256()
+        raw=data.view(np.uint8).reshape(-1)
+        for start in range(0,raw.size,1 << 20):
+            block=raw[start:start+(1 << 20)]
+            h.update(block)
+            if measured is not None:measured['bytes_hashed']+=block.nbytes
+        return h.hexdigest()
 
 
 def assemble(source, output, store, assignment, *, native_validate, max_output_bytes=1 << 34, stock_baseline=None, threads=1):
@@ -73,9 +76,12 @@ def _assemble(source, output, store, assignment, *, native_validate, max_output_
                 raise ValueError('orphan or invalid source scale companion')
     if not existing<=set(assignment):
         raise ValueError('existing conditioned tensors require explicit candidate assignment')
-    source_hash=file_digest(source)
-    candidates={name:store.get(key,expected={'source_sha256':source_hash,'tensor_name':name}) for name,key in sorted(assignment.items())}
-    source_hashes=tensor_hashes(((name,tensors[name].data) for name in candidates),threads=threads)
+    with observe_phase('assembly_source_hash'):
+        source_hash=file_digest(source)
+    with observe_phase('assembly_cache_get'):
+        candidates={name:store.get(key,expected={'source_sha256':source_hash,'tensor_name':name}) for name,key in sorted(assignment.items())}
+    with observe_phase('assembly_source_hash'):
+        source_hashes=tensor_hashes(((name,tensors[name].data) for name in candidates),threads=threads)
     for name,c in candidates.items():
         reject_alias(output,[c.payload]+([c.scales] if c.scales else []))
         t=tensors[name]
@@ -120,60 +126,68 @@ def _assemble(source, output, store, assignment, *, native_validate, max_output_
     fd,temp=tempfile.mkstemp(prefix='.hybrid-',suffix='.gguf',dir=output.parent); os.close(fd)
     writer=None
     try:
-        metadata_reader=stock_reader if stock_reader is not None else reader
-        arch=metadata_reader.fields['general.architecture'].contents()
-        writer=gguf.GGUFWriter(temp,arch)
-        for key,field in metadata_reader.fields.items():
-            if key.startswith('GGUF.') or key.startswith(PREFIX) or key in ('general.architecture','general.file_type','general.quantization_version'):
-                continue
-            writer.add_key_value(key,field.contents(),field.types[0],field.types[1] if len(field.types)>1 else None)
-        # Let the native loader infer mixed allocation from actual tensor types,
-        # rather than preserving an original floating-only file classification.
-        if any(gguf.GGML_QUANT_SIZES[q][0]>1 for _,_,q,_ in items):
-            writer.add_uint32('general.quantization_version',gguf.GGML_QUANT_VERSION)
-        if conditioned:
-            tensor_names=sorted(conditioned)
-            writer.add_uint32(PREFIX+'version',2)
-            writer.add_string(PREFIX+'transform','f16_input_diagonal')
-            writer.add_array(PREFIX+'tensors',tensor_names)
-            writer.add_array(PREFIX+'recipes',[canonical_json(conditioned[n].provenance['generator']).decode('utf-8') for n in tensor_names])
-            writer.add_string(PREFIX+'producer','beellama-sinq-optimizer-v2')
+        with observe_phase('assembly_metadata'):
+            metadata_reader=stock_reader if stock_reader is not None else reader
+            arch=metadata_reader.fields['general.architecture'].contents()
+            writer=gguf.GGUFWriter(temp,arch)
+            for key,field in metadata_reader.fields.items():
+                if key.startswith('GGUF.') or key.startswith(PREFIX) or key in ('general.architecture','general.file_type','general.quantization_version'):
+                    continue
+                writer.add_key_value(key,field.contents(),field.types[0],field.types[1] if len(field.types)>1 else None)
+            # Let the native loader infer mixed allocation from actual tensor types,
+            # rather than preserving an original floating-only file classification.
+            if any(gguf.GGML_QUANT_SIZES[q][0]>1 for _,_,q,_ in items):
+                writer.add_uint32('general.quantization_version',gguf.GGML_QUANT_VERSION)
+            if conditioned:
+                tensor_names=sorted(conditioned)
+                writer.add_uint32(PREFIX+'version',2)
+                writer.add_string(PREFIX+'transform','f16_input_diagonal')
+                writer.add_array(PREFIX+'tensors',tensor_names)
+                writer.add_array(PREFIX+'recipes',[canonical_json(conditioned[n].provenance['generator']).decode('utf-8') for n in tensor_names])
+                writer.add_string(PREFIX+'producer','beellama-sinq-optimizer-v2')
         hashes=tensor_hashes(((name,data) for name,_,_,data in items),threads=threads)
         for name,shape,q,data in items:
             # Logical shape is already known; uint8 would trigger byte-shape conversion.
             writer.add_tensor_info(name,shape,np.dtype('float16'),data.nbytes,raw_dtype=q)
-        writer.write_header_to_file(); writer.write_kv_data_to_file(); writer.write_ti_data_to_file()
-        for _,_,_,data in items:
-            writer.write_tensor_data(data)
-        writer.close(); writer=None
-        with open(temp,'r+b') as f: os.fsync(f.fileno())
-        check=gguf.GGUFReader(temp)
-        try:
-            if tensor_hashes(((t.name,t.data) for t in check.tensors),threads=threads) != hashes:
-                raise ValueError('GGUF payload readback mismatch')
-            keys={k[len(PREFIX):] for k in check.fields if k.startswith(PREFIX)}
-            if keys != (FIELDS if conditioned else set()):
-                raise ValueError('GGUF SINQ namespace mismatch')
-        finally:
-            check.data._mmap.close()
-        del check
+        with observe_phase('assembly_write'):
+            writer.write_header_to_file(); writer.write_kv_data_to_file(); writer.write_ti_data_to_file()
+            for _,_,_,data in items:
+                writer.write_tensor_data(data)
+            writer.close(); writer=None
+            with open(temp,'r+b') as f: os.fsync(f.fileno())
+        with observe_phase('assembly_readback'):
+            check=gguf.GGUFReader(temp)
+            try:
+                if tensor_hashes(((t.name,t.data) for t in check.tensors),threads=threads) != hashes:
+                    raise ValueError('GGUF payload readback mismatch')
+                keys={k[len(PREFIX):] for k in check.fields if k.startswith(PREFIX)}
+                if keys != (FIELDS if conditioned else set()):
+                    raise ValueError('GGUF SINQ namespace mismatch')
+            finally:
+                check.data._mmap.close()
+            del check
         if file_digest(source)!=source_hash:
             raise ValueError('source GGUF changed during assembly')
-        for name,c in candidates.items():
-            store.get(c.candidate_id,expected={'source_sha256':source_hash,'tensor_name':name})
-        native_validate(Path(temp))
+        with observe_phase('assembly_cache_get'):
+            for name,c in candidates.items():
+                store.get(c.candidate_id,expected={'source_sha256':source_hash,'tensor_name':name})
+        with observe_phase('assembly_native_load'):
+            native_validate(Path(temp))
         # Validation may execute external code; recheck the entire closure afterwards.
-        if file_digest(source)!=source_hash:
-            raise ValueError('source GGUF changed during native validation')
-        for name,c in candidates.items():
-            store.get(c.candidate_id,expected={'source_sha256':source_hash,'tensor_name':name})
-        if manifest is not None:
-            from .baseline import load_baseline
-            current,_=load_baseline(stock_baseline,source,threads=threads)
-            if current!=manifest: raise ValueError('stock baseline changed during assembly')
-        if prepublish_check is not None: prepublish_check()
+        with observe_phase('assembly_final_integrity'):
+            if file_digest(source)!=source_hash:
+                raise ValueError('source GGUF changed during native validation')
+            with observe_phase('assembly_cache_get'):
+                for name,c in candidates.items():
+                    store.get(c.candidate_id,expected={'source_sha256':source_hash,'tensor_name':name})
+            if manifest is not None:
+                from .baseline import load_baseline
+                current,_=load_baseline(stock_baseline,source,threads=threads)
+                if current!=manifest: raise ValueError('stock baseline changed during assembly')
+            if prepublish_check is not None: prepublish_check()
         os.link(temp,output)
-        return file_digest(output)
+        with observe_phase('assembly_final_integrity'):
+            return file_digest(output)
     finally:
         if writer is not None: writer.close()
         if os.path.exists(temp): os.unlink(temp)

@@ -6,6 +6,7 @@ from pathlib import Path
 import platform
 import re
 import sys
+from .resources import file_digest, observe_phase
 
 
 _REQUIRED_DEPENDENCIES = (
@@ -72,6 +73,7 @@ def _versions():
     }
 
 
+@observe_phase('native_runtime_fingerprint')
 def native_runtime_fingerprint(executables):
     """Conservatively bind local shared libraries alongside configured binaries.
 
@@ -82,23 +84,19 @@ def native_runtime_fingerprint(executables):
     for role,value in sorted(executables.items()):
         executable=Path(value).resolve()
         if not executable.is_file():raise ValueError('native executable unavailable')
-        def file_hash(path):
-            h=hashlib.sha256()
-            with path.open('rb') as stream:
-                for block in iter(lambda:stream.read(1<<20),b''):h.update(block)
-            return h.hexdigest()
-        files={'executable':file_hash(executable)}
+        files={'executable':file_digest(executable)}
         for label,directory in [('bin',executable.parent),('lib',executable.parent.parent/'lib'),('lib64',executable.parent.parent/'lib64')]:
             if not directory.is_dir():continue
             for path in sorted(directory.iterdir()):
                 if not path.is_file() or not (path.suffix.lower() in ('.dll','.so','.dylib') or '.so.' in path.name):continue
                 if label!='bin' and not path.name.startswith(('ggml','llama','libggml','libllama')):continue
                 if not path.resolve().is_relative_to(executable.parent.parent):raise ValueError('native dependency escapes configured prefix')
-                files[label+'/'+path.name]=file_hash(path)
+                files[label+'/'+path.name]=file_digest(path)
         result[role]=files
     return result
 
 
+@observe_phase('implementation_fingerprint')
 def implementation_fingerprint(root=None):
     """Return a versioned manifest and SHA-256 of its canonical JSON identity.
 
@@ -125,11 +123,7 @@ def implementation_fingerprint(root=None):
         paths.append(path)
     files = {}
     for path in sorted(paths, key=lambda item: item.relative_to(root).as_posix()):
-        digest = hashlib.sha256()
-        with path.open('rb') as source:
-            for block in iter(lambda: source.read(1024 * 1024), b''):
-                digest.update(block)
-        files[path.relative_to(root).as_posix()] = digest.hexdigest()
+        files[path.relative_to(root).as_posix()] = file_digest(path)
     result = {'schema_version': 2, 'files': files, 'versions': _versions()}
     canonical = json.dumps(result, sort_keys=True, separators=(',', ':'), ensure_ascii=True)
     result['checksum'] = hashlib.sha256(canonical.encode('utf-8')).hexdigest()

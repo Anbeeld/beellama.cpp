@@ -5,7 +5,38 @@ import os
 from pathlib import Path
 import tempfile
 from contextlib import contextmanager
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
+from threading import Lock
+from time import perf_counter
+
+_PERFORMANCE_OBSERVATIONS=ContextVar('sinq_performance_observations',default=None)
+
+
+@contextmanager
+def observe_performance():
+    """Opt-in invocation-local metrics; worker contexts share a locked aggregate."""
+    metrics={};token=_PERFORMANCE_OBSERVATIONS.set((metrics,Lock()))
+    try:yield metrics
+    finally:_PERFORMANCE_OBSERVATIONS.reset(token)
+
+
+@contextmanager
+def observe_phase(name):
+    """Inclusive wall time and direct hash bytes; nested times are not additive."""
+    state=_PERFORMANCE_OBSERVATIONS.get()
+    if state is None:
+        yield None
+        return
+    measured={'bytes_hashed':0};started=perf_counter()
+    try:yield measured
+    finally:
+        elapsed=perf_counter()-started
+        metrics,lock=state
+        with lock:
+            total=metrics.setdefault(name,dict(calls=0,seconds=0.0,bytes_hashed=0))
+            total['calls']+=1
+            total['seconds']+=elapsed
+            total['bytes_hashed']+=measured['bytes_hashed']
 
 _CACHE_OBSERVATIONS=ContextVar('sinq_cache_observations',default=None)
 
@@ -33,11 +64,13 @@ def digest(value):
 
 
 def file_digest(path, chunk_bytes=1 << 20):
-    h = hashlib.sha256()
-    with open(path, 'rb') as f:
-        while block := f.read(chunk_bytes):
-            h.update(block)
-    return h.hexdigest()
+    with observe_phase('file_hash') as measured:
+        h = hashlib.sha256()
+        with open(path, 'rb') as f:
+            while block := f.read(chunk_bytes):
+                h.update(block)
+                if measured is not None:measured['bytes_hashed']+=len(block)
+        return h.hexdigest()
 
 
 def file_digests(paths, *, threads=1):
@@ -50,8 +83,9 @@ def file_digests(paths, *, threads=1):
         name,path=item
         return name,file_digest(path)
     if threads==1 or len(items)<2:return dict(map(hash_item,items))
+    context=copy_context()
     with ThreadPoolExecutor(max_workers=min(threads,len(items))) as pool:
-        return dict(pool.map(hash_item,items))
+        return dict(pool.map(lambda item:context.copy().run(hash_item,item),items))
 
 
 def tensor_hashes(items, *, threads=1):
@@ -67,15 +101,19 @@ def tensor_hashes(items, *, threads=1):
     items = list(items)
     def hash_item(item):
         name, data = item
-        raw = data.view(np.uint8).reshape(-1)
-        h = hashlib.sha256()
-        for start in range(0, raw.size, 1 << 20):
-            h.update(raw[start:start + (1 << 20)])
-        return name, h.hexdigest()
+        with observe_phase('tensor_hash') as measured:
+            raw = data.view(np.uint8).reshape(-1)
+            h = hashlib.sha256()
+            for start in range(0, raw.size, 1 << 20):
+                block=raw[start:start + (1 << 20)]
+                h.update(block)
+                if measured is not None:measured['bytes_hashed']+=block.nbytes
+            return name, h.hexdigest()
     if threads == 1 or len(items) < 2:
         return dict(map(hash_item, items))
+    context=copy_context()
     with ThreadPoolExecutor(max_workers=min(threads, len(items))) as pool:
-        return dict(pool.map(hash_item, items))
+        return dict(pool.map(lambda item:context.copy().run(hash_item,item), items))
 
 
 def reject_alias(output, inputs):

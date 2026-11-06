@@ -929,7 +929,7 @@ target_compile_features(test-sinq-bridge-config PRIVATE cxx_std_17)
 target_link_libraries(test-sinq-bridge-config PRIVATE llama-sinq-optimizer)
 add_test(NAME test-sinq-bridge-config COMMAND test-sinq-bridge-config)
 if (Python3_Interpreter_FOUND)
-    foreach(optimizer_test blockwise fisher optimizer-config optimizer-contract optimizer-selection candidate-cache assembly groupwise-kl stock-baseline optimizer-integrity implementation corpora generation-resume threading backend-scoring reference-loader execution-policy)
+    foreach(optimizer_test blockwise fisher optimizer-config optimizer-contract optimizer-selection candidate-cache assembly groupwise-kl stock-baseline optimizer-integrity score-context observation implementation corpora generation-resume threading backend-scoring reference-loader execution-policy)
         add_test(NAME test-sinq-optimizer-${optimizer_test} COMMAND ${Python3_EXECUTABLE}
             ${PROJECT_SOURCE_DIR}/tests/test-sinq-${optimizer_test}.py)
         set_tests_properties(test-sinq-optimizer-${optimizer_test} PROPERTIES

@@ -48,8 +48,8 @@ def main(argv=None):
         if name in ('generate','select'):sub.add_argument('--resume',metavar='RUN_DIR')
     args=parser.parse_args(argv);config=load_config(args.config,args.stage);started=time.monotonic()
     os.environ['HF_HUB_OFFLINE']='1';os.environ['TRANSFORMERS_OFFLINE']='1'
-    from .resources import observe_caches
-    with observe_caches() as caches:
+    from .resources import observe_caches,observe_performance
+    with observe_caches() as caches,observe_performance() as performance:
         if args.stage=='plan':
             from .generate import preflight
             result=preflight(config)
@@ -60,7 +60,10 @@ def main(argv=None):
             from .stages import score_config,select_config,assemble_config,validate_config_artifacts
             dispatch={'score':score_config,'select':select_config,'assemble':assemble_config,'validate':validate_config_artifacts}
             result=dispatch[args.stage](config,**({'resume':args.resume} if args.stage=='select' else {}))
-    print(json.dumps({**result,'stage_summary':_stage_summary(args.stage,config,result,started,caches)},sort_keys=True,allow_nan=False))
+        summary=_stage_summary(args.stage,config,result,started,caches)
+    summary['performance']=performance
+    summary['performance_scope']='Inclusive wall seconds (nested phases overlap); bytes_hashed count direct file/tensor hash input, including repeated checks. Includes stage-summary hashing.'
+    print(json.dumps({**result,'stage_summary':summary},sort_keys=True,allow_nan=False))
     return 0
 
 
