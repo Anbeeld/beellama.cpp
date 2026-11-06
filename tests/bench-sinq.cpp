@@ -9,6 +9,8 @@
 #include <cmath>
 #include <cstdio>
 #include <stdexcept>
+#include <string>
+#include <utility>
 #include <thread>
 #include <vector>
 
@@ -16,10 +18,22 @@ static void check(bool ok, const char * message) {
     if (!ok) throw std::runtime_error(message);
 }
 
-int main() try {
+int main(int argc,char ** argv) try {
+    check(argc<=3,"usage: bench-sinq [THREADS [SHAPE_INDEX]]");
+    const auto integer=[](const char * text) {
+        size_t used=0;const int value=std::stoi(text,&used);
+        check(used==std::string(text).size(),"invalid benchmark integer");return value;
+    };
+    const int requested_threads=argc>=2?integer(argv[1]):0;
+    const int requested_shape=argc==3?integer(argv[2]):-1;
+    check(argc<2||requested_threads==1||requested_threads==2||requested_threads==4||requested_threads==8||requested_threads==16||requested_threads==32,"benchmark threads must be 1/2/4/8/16/32");
+    check(argc<3||(requested_shape>=0&&requested_shape<3),"benchmark shape index must be 0/1/2");
     auto * context=ggml_init({1024,nullptr,true});check(context!=nullptr,"ggml initialization");ggml_free(context);
     nlohmann::json records=nlohmann::json::array();
+    int shape_index=0;
     for (const auto shape : {std::pair<int64_t,int64_t>{32,256},{512,1024},{4096,1024}}) {
+        const int index=shape_index++;
+        if(requested_shape>=0&&requested_shape!=index)continue;
         const auto n=shape.first,k=shape.second;
         constexpr int samples=4,repetitions=3;
         std::vector<float> w(size_t(n*k)),x(size_t(samples*k)),dq(w.size()),importance(size_t(k),1.f);
@@ -33,6 +47,7 @@ int main() try {
         const int64_t rows_per_chunk=std::max<int64_t>(1,16384/k);
         const int64_t tasks=(n+rows_per_chunk-1)/rows_per_chunk;
         for (int threads : {1,2,4,8,16,32}) {
+            if(requested_threads&&threads!=requested_threads)continue;
             for (int repeat=0;repeat<repetitions;++repeat) {
                 const auto measure=[&](const char * phase,int effective,const auto & work) {
                     const auto begin=std::chrono::steady_clock::now();work();
