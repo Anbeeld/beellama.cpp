@@ -2168,7 +2168,10 @@ bool perplexity_full_same_file(const std::string & a, const std::string & b) {
     const bool b_null = _stricmp(b.c_str(), "NUL") == 0;
     if (a_null || b_null) { return a_null && b_null; }
 #endif
-    return std::filesystem::weakly_canonical(a) == std::filesystem::weakly_canonical(b) ||
+    // libstdc++ may retain a relative path when none of its components exist.
+    // Start from absolute paths so a new output and its ./ alias compare equally.
+    return std::filesystem::weakly_canonical(std::filesystem::absolute(a)) ==
+        std::filesystem::weakly_canonical(std::filesystem::absolute(b)) ||
         (std::filesystem::exists(a) && std::filesystem::exists(b) && std::filesystem::equivalent(a, b));
 }
 
