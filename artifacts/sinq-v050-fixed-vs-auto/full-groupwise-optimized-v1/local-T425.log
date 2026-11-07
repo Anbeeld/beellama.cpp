@@ -1,0 +1,6 @@
+{"tensor": "blk.0.attn_gate.weight", "objective": "output_l1", "legacy_seconds": 5.944856100017205, "batched_seconds": 4.871354400063865, "max_absolute_score_difference": 0.0}
+{"tensor": "blk.0.attn_gate.weight", "objective": "output_mse", "legacy_seconds": 19.48099379998166, "batched_seconds": 18.41929320001509, "max_absolute_score_difference": 0.0}
+{"tensor": "blk.0.attn_qkv.weight", "objective": "output_l1", "legacy_seconds": 11.512949299998581, "batched_seconds": 9.847212300053798, "max_absolute_score_difference": 0.0}
+{"tensor": "blk.0.attn_qkv.weight", "objective": "output_mse", "legacy_seconds": 38.32711269997526, "batched_seconds": 36.64139150001574, "max_absolute_score_difference": 0.0}
+{"tensor": "blk.0.ffn_down.weight", "objective": "output_l1", "legacy_seconds": 16.09726840001531, "batched_seconds": 13.639105700072832, "max_absolute_score_difference": 0.0}
+{"tensor": "blk.0.ffn_down.weight", "objective": "output_mse", "legacy_seconds": 54.242757199914195, "batched_seconds": 52.165697000105865, "max_absolute_score_difference": 0.0}

@@ -1,0 +1,10 @@
+{
+  "stage": "F-before-launch",
+  "utc": "2026-11-07T14:53:51.383490+00:00",
+  "free_bytes": 67093061632,
+  "conservative_combined_scratch_estimate_bytes": 35087852608,
+  "reserve_bytes": 8589934592,
+  "estimate_scope": "Private baseline snapshots + starting and final GGUFs + 4 GiB score/row allowance and two maximum checkpoints per recipe; source/candidate pools already exist.",
+  "concurrency_choice": "parallel-one-recipe-per-physical-GPU",
+  "basis": "Single pair launch 265.993 s versus concurrent pair 162.107 s; identical per-recipe model hashes and exact canonical parity."
+}

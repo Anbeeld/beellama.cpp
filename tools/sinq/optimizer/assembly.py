@@ -23,8 +23,20 @@ def _bytes_hash(data):
         return h.hexdigest()
 
 
-def assemble(source, output, store, assignment, *, native_validate, max_output_bytes=1 << 34, stock_baseline=None, threads=1):
-    """Use up to threads hash workers; GGUF writes and store access stay serial."""
+@observe_phase('canonical_assembly')
+def assemble(source, output, store, assignment, *, native_validate, max_output_bytes=1 << 34, stock_baseline=None, threads=1, prepared=None):
+    """Canonical output; optional session reuses only guarded INPUT inventories."""
+    if prepared is not None:
+        prepared.check(source,stock_baseline)
+        reject_alias(output,[prepared.baseline_path,prepared.stock_baseline])
+        maps=[]
+        try:
+            return _assemble(source,output,store,assignment,native_validate=native_validate,
+                max_output_bytes=max_output_bytes,reader=prepared.reader,maps=maps,
+                stock_reader=prepared.stock_reader,manifest=prepared.manifest,
+                stock_baseline=prepared.stock_baseline,threads=threads,prepared=prepared)
+        finally:
+            for mapped in maps:mapped._mmap.close()
     reader=gguf.GGUFReader(source)
     maps=[]; stock_reader=None; manifest=None
     try:
@@ -40,7 +52,7 @@ def assemble(source, output, store, assignment, *, native_validate, max_output_b
         reader.data._mmap.close()
 
 
-def _assemble(source, output, store, assignment, *, native_validate, max_output_bytes, reader, maps, stock_reader, manifest, stock_baseline, prepublish_check=None, threads=1):
+def _assemble(source, output, store, assignment, *, native_validate, max_output_bytes, reader, maps, stock_reader, manifest, stock_baseline, prepublish_check=None, threads=1, prepared=None):
     """Validate callback must raise on native loader failure; publication follows it.
 
     Assignment replaces complete payload/sidecar pairs. Existing conditioned tensors
@@ -77,11 +89,12 @@ def _assemble(source, output, store, assignment, *, native_validate, max_output_
     if not existing<=set(assignment):
         raise ValueError('existing conditioned tensors require explicit candidate assignment')
     with observe_phase('assembly_source_hash'):
-        source_hash=file_digest(source)
+        source_hash=prepared.inputs.fingerprint(source) if prepared is not None else file_digest(source)
     with observe_phase('assembly_cache_get'):
         candidates={name:store.get(key,expected={'source_sha256':source_hash,'tensor_name':name}) for name,key in sorted(assignment.items())}
     with observe_phase('assembly_source_hash'):
-        source_hashes=tensor_hashes(((name,tensors[name].data) for name in candidates),threads=threads)
+        source_hashes=({name:manifest['tensors'][name]['source_sha256'] for name in candidates} if prepared is not None
+            else tensor_hashes(((name,tensors[name].data) for name in candidates),threads=threads))
     for name,c in candidates.items():
         reject_alias(output,[c.payload]+([c.scales] if c.scales else []))
         t=tensors[name]
@@ -97,7 +110,7 @@ def _assemble(source, output, store, assignment, *, native_validate, max_output_
                 raise ValueError('candidate differs from baseline allocation')
             if c.provenance['recipe_sha256']!=manifest['recipe_sha256'] or c.provenance['imatrix_sha256']!=manifest['imatrix_sha256']:
                 raise ValueError('candidate recipe/imatrix differs from stock baseline')
-            if c.provenance['generator']['generator']=='stock' and (c.scales is not None or file_digest(c.payload)!=_bytes_hash(stock_tensors[name].data)):
+            if c.provenance['generator']['generator']=='stock' and (c.scales is not None or file_digest(c.payload)!=(manifest['tensors'][name]['stock_sha256'] if prepared is not None else _bytes_hash(stock_tensors[name].data))):
                 raise ValueError('stock candidate differs from baseline payload')
     conditioned={n:c for n,c in candidates.items() if c.scales is not None}
     compatibility={(c.provenance['recipe_sha256'],c.provenance['imatrix_sha256']) for c in candidates.values()}
@@ -145,16 +158,29 @@ def _assemble(source, output, store, assignment, *, native_validate, max_output_
                 writer.add_array(PREFIX+'tensors',tensor_names)
                 writer.add_array(PREFIX+'recipes',[canonical_json(conditioned[n].provenance['generator']).decode('utf-8') for n in tensor_names])
                 writer.add_string(PREFIX+'producer','beellama-sinq-optimizer-v2')
-        hashes=tensor_hashes(((name,data) for name,_,_,data in items),threads=threads)
+        if prepared is None:
+            hashes=tensor_hashes(((name,data) for name,_,_,data in items),threads=threads)
+        else:
+            # CandidateStore.get authenticated content-addressed blobs while its
+            # immutable receipts were live; these names are content digests, not
+            # metadata guesses. Output readback below still reads EVERY payload.
+            hashes={}
+            for name,_,_,_ in items:
+                base=name.removesuffix('.sinq_scale2')
+                candidate=candidates.get(base)
+                if candidate is not None:
+                    hashes[name]=(candidate.scales if name.endswith('.sinq_scale2') else candidate.payload).name
+                else:hashes[name]=manifest['tensors'][name]['stock_sha256']
         for name,shape,q,data in items:
             # Logical shape is already known; uint8 would trigger byte-shape conversion.
             writer.add_tensor_info(name,shape,np.dtype('float16'),data.nbytes,raw_dtype=q)
-        with observe_phase('assembly_write'):
+        with observe_phase('assembly_write') as measured:
             writer.write_header_to_file(); writer.write_kv_data_to_file(); writer.write_ti_data_to_file()
             for _,_,_,data in items:
                 writer.write_tensor_data(data)
             writer.close(); writer=None
             with open(temp,'r+b') as f: os.fsync(f.fileno())
+            if measured is not None:measured['bytes_written']+=Path(temp).stat().st_size
         with observe_phase('assembly_readback'):
             check=gguf.GGUFReader(temp)
             try:
@@ -166,7 +192,8 @@ def _assemble(source, output, store, assignment, *, native_validate, max_output_
             finally:
                 check.data._mmap.close()
             del check
-        if file_digest(source)!=source_hash:
+        if prepared is not None:prepared.check()
+        elif file_digest(source)!=source_hash:
             raise ValueError('source GGUF changed during assembly')
         with observe_phase('assembly_cache_get'):
             for name,c in candidates.items():
@@ -175,12 +202,14 @@ def _assemble(source, output, store, assignment, *, native_validate, max_output_
             native_validate(Path(temp))
         # Validation may execute external code; recheck the entire closure afterwards.
         with observe_phase('assembly_final_integrity'):
-            if file_digest(source)!=source_hash:
+            if prepared is not None:prepared.check()
+            elif file_digest(source)!=source_hash:
                 raise ValueError('source GGUF changed during native validation')
             with observe_phase('assembly_cache_get'):
                 for name,c in candidates.items():
                     store.get(c.candidate_id,expected={'source_sha256':source_hash,'tensor_name':name})
-            if manifest is not None:
+            if prepared is not None:prepared.check()
+            elif manifest is not None:
                 from .baseline import load_baseline
                 current,_=load_baseline(stock_baseline,source,threads=threads)
                 if current!=manifest: raise ValueError('stock baseline changed during assembly')

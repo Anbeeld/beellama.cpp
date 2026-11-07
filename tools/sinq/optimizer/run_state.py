@@ -6,7 +6,7 @@ from .resources import atomic_write,canonical_json,digest,file_digest,reject_ali
 from .implementation import implementation_fingerprint,native_runtime_fingerprint
 
 
-def selection_identity(config,evaluator,policy,stock_baseline=None):
+def selection_identity(config,evaluator,policy,stock_baseline=None,*,verified_inputs=None):
     paths={'source':config['source_gguf'],'candidates':config['candidate_manifest'],
         'selection':config['selection_manifest'],'evaluator_config':config['evaluator'],
         'corpus':evaluator['corpus'],'reference':evaluator['reference'],
@@ -17,8 +17,9 @@ def selection_identity(config,evaluator,policy,stock_baseline=None):
     for i,stage in enumerate(config.get('stages',[])):
         if 'scores' in stage:paths['stage_scores_'+str(i)]=stage['scores']
     implementation=implementation_fingerprint()
+    fingerprint=verified_inputs.fingerprint if verified_inputs is not None else file_digest
     body={'schema_version':2,'kind':'sinq-selection-run','config_sha256':digest(config),
-        'bindings':{name:file_digest(path) for name,path in sorted(paths.items())},'policy':policy,
+        'bindings':{name:fingerprint(path) for name,path in sorted(paths.items())},'policy':policy,
         'implementation_sha256':implementation['checksum'],'implementation':implementation,
         'native_runtime':native_runtime_fingerprint({'evaluator':evaluator['executable'],'loader':evaluator['native_loader']})}
     body['checksum']=digest(body)

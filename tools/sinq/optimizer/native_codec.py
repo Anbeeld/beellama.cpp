@@ -3,22 +3,19 @@
 No quantization formulas/codecs are implemented in Python. GGUF matrices are
 [output,input], activation matrices [tokens,input], all packed bytes immutable.
 """
-import hashlib
 import json
 import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 
 import numpy as np
 
 
 def file_sha256(path):
-    h = hashlib.sha256()
-    with open(path, 'rb') as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b''):
-            h.update(block)
-    return h.hexdigest()
+    from .resources import file_digest
+    return file_digest(path)
 
 
 def _thread_count(threads=None):
@@ -71,9 +68,12 @@ def copy_tensor_bytes(tensor, destination, *, max_bytes):
     raw = np.asarray(tensor.data).view(np.uint8).reshape(-1)
     if len(raw) != tensor.n_bytes:
         raise ValueError('source tensor byte cardinality mismatch')
-    with Path(destination).open('xb') as stream:
+    from .resources import observe_phase
+    with observe_phase('native_source_export') as measured, Path(destination).open('xb') as stream:
         for offset in range(0, len(raw), 1024 * 1024):
-            stream.write(raw[offset:offset + 1024 * 1024])
+            block=raw[offset:offset + 1024 * 1024]
+            stream.write(block)
+            if measured is not None:measured['bytes_written']+=block.nbytes
 
 
 def decode(binary, candidate, *, first_row=0, rows=None, workspace_bytes=64 << 20, threads=None):
@@ -106,6 +106,68 @@ def decode(binary, candidate, *, first_row=0, rows=None, workspace_bytes=64 << 2
         request(binary, config, d)
         out = np.fromfile(output, dtype='<f4').reshape(native_rows, shape[1])
         return out[first_row - native_first:first_row - native_first + rows].copy()
+
+
+def rescore_many(binary, candidates, source_tensor, activation, *, objective='output_l1',
+                 validation=None, workspace_bytes=64 << 20, threads=None, metrics=None):
+    """Score ordered (ID, verified Candidate) pairs in one bounded tensor session.
+
+    CandidateStore remains the payload/provenance trust boundary. Every candidate
+    must bind the same freshly exported source. No result is returned unless the
+    native response preserves the exact ID order. Optional metrics count fresh
+    source I/O and the one native request, not whole-stage integrity work.
+    """
+    if objective not in ('output_l1', 'output_mse'):
+        raise ValueError('unsupported local objective')
+    candidates = list(candidates)
+    ids = [key for key, _ in candidates]
+    if (not ids or len(ids) > 1024 or any(not isinstance(key, str) or not key for key in ids)
+            or len(set(ids)) != len(ids)):
+        raise ValueError('invalid/duplicate candidate ID list')
+    shape = list(map(int, source_tensor.shape))[::-1]
+    expected = candidates[0][1].provenance['input_sha256']
+    codec = candidates[0][1].provenance['qtype'].lower()
+    items = []
+    for key, candidate in candidates:
+        if candidate.provenance['shape'] != shape:
+            raise ValueError('rescore source shape mismatch')
+        if candidate.provenance['input_sha256'] != expected:
+            raise ValueError('rescore source reference mismatch')
+        if candidate.provenance['qtype'].lower() != codec:
+            raise ValueError('rescore codec mismatch')
+        item = dict(candidate_id=key, payload=str(candidate.payload.resolve()))
+        if candidate.scales is not None:
+            item['scales'] = str(candidate.scales.resolve())
+        items.append(item)
+    start = time.perf_counter()
+    with tempfile.TemporaryDirectory(prefix='sinq-native-score-many-') as d:
+        weights = Path(d) / 'weights.bin'
+        copy_tensor_bytes(source_tensor, weights, max_bytes=workspace_bytes)
+        if file_sha256(weights) != expected:
+            raise ValueError('rescore source bytes differ from candidate reference')
+        config = dict(schema_version=2, operation='score-many', codec=codec,
+                      source_type=source_tensor.tensor_type.name.lower(), rows=shape[0], columns=shape[1],
+                      weights=str(weights), score_items=items,
+                      activations=str(Path(activation['data_file']).resolve()), samples=activation['count'],
+                      objective=objective, workspace_bytes=workspace_bytes, max_output_bytes=workspace_bytes,
+                      output=str(Path(d) / 'score.json'), threads=_thread_count(threads))
+        if validation is not None:
+            config.update(held_out=True, validation=str(Path(validation['data_file']).resolve()),
+                          validation_samples=validation['count'])
+        result = request(binary, config, d)
+        scores = result.get('scores', [])
+        if ([item.get('candidate_id') for item in scores] != ids
+                or any(not isinstance(item.get('score'), dict) for item in scores)):
+            raise ValueError('native score-many candidate ID mapping mismatch')
+    if metrics is not None:
+        metrics.update(source_bytes_copied=int(source_tensor.n_bytes),
+                       source_fresh_hash_bytes=int(source_tensor.n_bytes), process_launches=1,
+                       native_compute_seconds=result['native_compute_seconds'],
+                       native_scoring_seconds_inclusive=result['native_scoring_seconds_inclusive'],
+                       source_bytes_read=result['source_bytes_read'],
+                       activation_bytes_read=result['activation_bytes_read'],
+                       elapsed_seconds=time.perf_counter() - start)
+    return [(item['candidate_id'], item['score']) for item in scores]
 
 
 def rescore(binary, candidate, source_tensor, activation, *, objective='output_l1',

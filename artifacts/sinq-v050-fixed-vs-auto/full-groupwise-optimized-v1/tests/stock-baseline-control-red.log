@@ -1,0 +1,77 @@
+EEEEEE
+======================================================================
+ERROR: test_bad_checksum_rejected (__main__.StockBaselineControl.test_bad_checksum_rejected)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\anbee\projects\beellama-v050-sinq\tests\test-sinq-final-stock-control.py", line 16, in setUp
+    self.module=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.module)
+                                                      ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "<frozen importlib._bootstrap_external>", line 1022, in exec_module
+  File "<frozen importlib._bootstrap_external>", line 1159, in get_code
+  File "<frozen importlib._bootstrap_external>", line 1217, in get_data
+FileNotFoundError: [Errno 2] No such file or directory: 'C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\final_control_validation.py'
+
+======================================================================
+ERROR: test_changed_manifest_rejected (__main__.StockBaselineControl.test_changed_manifest_rejected)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\anbee\projects\beellama-v050-sinq\tests\test-sinq-final-stock-control.py", line 16, in setUp
+    self.module=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.module)
+                                                      ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "<frozen importlib._bootstrap_external>", line 1022, in exec_module
+  File "<frozen importlib._bootstrap_external>", line 1159, in get_code
+  File "<frozen importlib._bootstrap_external>", line 1217, in get_data
+FileNotFoundError: [Errno 2] No such file or directory: 'C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\final_control_validation.py'
+
+======================================================================
+ERROR: test_valid (__main__.StockBaselineControl.test_valid)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\anbee\projects\beellama-v050-sinq\tests\test-sinq-final-stock-control.py", line 16, in setUp
+    self.module=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.module)
+                                                      ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "<frozen importlib._bootstrap_external>", line 1022, in exec_module
+  File "<frozen importlib._bootstrap_external>", line 1159, in get_code
+  File "<frozen importlib._bootstrap_external>", line 1217, in get_data
+FileNotFoundError: [Errno 2] No such file or directory: 'C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\final_control_validation.py'
+
+======================================================================
+ERROR: test_wrong_kind_rejected (__main__.StockBaselineControl.test_wrong_kind_rejected)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\anbee\projects\beellama-v050-sinq\tests\test-sinq-final-stock-control.py", line 16, in setUp
+    self.module=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.module)
+                                                      ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "<frozen importlib._bootstrap_external>", line 1022, in exec_module
+  File "<frozen importlib._bootstrap_external>", line 1159, in get_code
+  File "<frozen importlib._bootstrap_external>", line 1217, in get_data
+FileNotFoundError: [Errno 2] No such file or directory: 'C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\final_control_validation.py'
+
+======================================================================
+ERROR: test_wrong_model_rejected (__main__.StockBaselineControl.test_wrong_model_rejected)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\anbee\projects\beellama-v050-sinq\tests\test-sinq-final-stock-control.py", line 16, in setUp
+    self.module=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.module)
+                                                      ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "<frozen importlib._bootstrap_external>", line 1022, in exec_module
+  File "<frozen importlib._bootstrap_external>", line 1159, in get_code
+  File "<frozen importlib._bootstrap_external>", line 1217, in get_data
+FileNotFoundError: [Errno 2] No such file or directory: 'C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\final_control_validation.py'
+
+======================================================================
+ERROR: test_wrong_source_rejected (__main__.StockBaselineControl.test_wrong_source_rejected)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\anbee\projects\beellama-v050-sinq\tests\test-sinq-final-stock-control.py", line 16, in setUp
+    self.module=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.module)
+                                                      ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "<frozen importlib._bootstrap_external>", line 1022, in exec_module
+  File "<frozen importlib._bootstrap_external>", line 1159, in get_code
+  File "<frozen importlib._bootstrap_external>", line 1217, in get_data
+FileNotFoundError: [Errno 2] No such file or directory: 'C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\final_control_validation.py'
+
+----------------------------------------------------------------------
+Ran 6 tests in 0.002s
+
+FAILED (errors=6)

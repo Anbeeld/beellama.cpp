@@ -29,7 +29,7 @@ class ScoreContextTests(unittest.TestCase):
 
     def score(self,config,partition=None):
         activations={'tensors':{name:object() for name in self.names}}
-        with patch.object(stages,'_score_partition',return_value=partition),patch.object(stages.native_codec,'validate_activations',return_value=activations),patch.object(stages.native_codec,'rescore',return_value=dict(train_score=2.,validation_score=1.,encode_count=0)),patch.object(stages,'validate_pairing'):
+        with patch.object(stages,'_score_partition',return_value=partition),patch.object(stages.native_codec,'validate_activations',return_value=activations),patch.object(stages.native_codec,'rescore_many',side_effect=lambda binary,candidates,*args,**kwargs:[(key,dict(train_score=2.,validation_score=1.,encode_count=0)) for key,candidate in candidates]),patch.object(stages,'validate_pairing'):
             return stages._score(config,self.run,self.store,self.source)
 
     def replay(self,result):
@@ -84,7 +84,7 @@ class ScoreContextTests(unittest.TestCase):
         config=self.config()
         initial={'tensors':{name:object() for name in self.names},'data_identity':'original'}
         changed={**initial,'data_identity':'changed'}
-        with patch.object(stages,'_score_partition',return_value=None),patch.object(stages.native_codec,'validate_activations',side_effect=[initial,changed]),patch.object(stages.native_codec,'rescore',return_value=dict(train_score=2.,validation_score=None,encode_count=0)):
+        with patch.object(stages,'_score_partition',return_value=None),patch.object(stages.native_codec,'validate_activations',side_effect=[initial,changed]),patch.object(stages.native_codec,'rescore_many',side_effect=lambda binary,candidates,*args,**kwargs:[(key,dict(train_score=2.,validation_score=None,encode_count=0)) for key,candidate in candidates]):
             with self.assertRaisesRegex(ValueError,'capture.*changed'):
                 stages._score(config,self.run,self.store,self.source)
         self.assertFalse(Path(config['output_directory']).exists())

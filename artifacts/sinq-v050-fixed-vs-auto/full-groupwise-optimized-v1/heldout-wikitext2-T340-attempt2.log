@@ -1,0 +1,6 @@
+{"status": "PASS", "completed": 1, "expected": 6, "label": "BEST-HISTORICAL-AUTOMATIC", "mean_test_KL": 0.09605248810121755, "WikiPPL": 7.101471233329179, "seconds": 182.86007489997428}
+{"status": "PASS", "completed": 2, "expected": 6, "label": "BEST-HISTORICAL-FIXED-SELECTION-KL", "mean_test_KL": 0.10225859835259059, "WikiPPL": 7.254296405690195, "seconds": 183.29018480004743}
+{"status": "PASS", "completed": 3, "expected": 6, "label": "CURRENT-GROUP-KLD-CUDA27", "mean_test_KL": 0.09605248810121755, "WikiPPL": 7.101471233329179, "seconds": 184.1254704000894}
+{"status": "PASS", "completed": 4, "expected": 6, "label": "FIXED-ANCHOR", "mean_test_KL": 0.09656198289967496, "WikiPPL": 7.112570775527451, "seconds": 182.25995880004484}
+{"status": "PASS", "completed": 5, "expected": 6, "label": "LOCKED-STOCK-BASELINE-CONTROL", "mean_test_KL": 0.10408145408685424, "WikiPPL": 7.209603480866912, "seconds": 184.0466607999988}
+{"status": "PASS", "completed": 6, "expected": 6, "label": "NEW-FULL-248-GROUPWISE", "mean_test_KL": 0.0965658336455855, "WikiPPL": 7.118288354409345, "seconds": 179.71504859998822}

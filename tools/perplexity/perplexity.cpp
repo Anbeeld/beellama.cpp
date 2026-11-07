@@ -2179,7 +2179,10 @@ bool perplexity_full_same_file(const std::string & a, const std::string & b) {
         (std::filesystem::exists(a) && std::filesystem::exists(b) && std::filesystem::equivalent(a, b));
 }
 
-static bool perplexity_full(llama_context * ctx, const common_params & params) {
+// Shared with the optional offline persistent SINQ evaluator. Same token reset,
+// reference reader, full-vocabulary math and per-token output as the CLI oracle.
+bool perplexity_full(llama_context * ctx, const common_params & params);
+bool perplexity_full(llama_context * ctx, const common_params & params) {
     auto fail = [](const char * message) {
         LOG_ERR("ppl-full: %s\n", message);
         return false;

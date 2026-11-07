@@ -1,0 +1,1661 @@
+{
+  "scope": "Measured select_config stage, not the post-invocation report hash scans; real local scorer controls exclude one-time input setup.",
+  "large_reference_hash_bytes": 0,
+  "microbenchmarks": {
+    "T340": {
+      "before_seconds": 612.2412940999493,
+      "after_seconds": 142.5135327000171,
+      "stage_speedup": 4.29602215663745,
+      "before_source": {
+        "calls": 27,
+        "seconds": 284.12357090006117,
+        "bytes_hashed": 483858829152,
+        "bytes_read": 483858829152
+      },
+      "after_source": {
+        "calls": 1,
+        "seconds": 10.79767959995661,
+        "bytes_hashed": 17920697376,
+        "bytes_read": 17920697376
+      },
+      "before_baseline": {
+        "calls": 14,
+        "seconds": 32.747787599801086,
+        "bytes_hashed": 53445817152,
+        "bytes_read": 53445817152
+      },
+      "after_baseline": {
+        "calls": 1,
+        "seconds": 2.6635923999128863,
+        "bytes_hashed": 3817558368,
+        "bytes_read": 3817558368
+      },
+      "before_file_hash_input_bytes": 599245879600,
+      "after_file_hash_input_bytes": 70410100049,
+      "before_tensor_hash_input_bytes": 216380136448,
+      "after_tensor_hash_input_bytes": 29334610944,
+      "before_canonical_assemblies": 3,
+      "after_canonical_assemblies": 2,
+      "after_native_candidate_responses": 3,
+      "after_native_candidate_response_seconds": 1.4516596999019384,
+      "before_gguf_file_bytes_materialized": 11460471360,
+      "after_gguf_write_bytes": 7640314240,
+      "before_temp_write_syscall_bytes": "not measured; output lengths above are not physical I/O counters",
+      "before_parent_peak_working_set_bytes": 42812776448,
+      "after_parent_peak_working_set_bytes": 23524536320,
+      "before_vram_peak_bytes": {
+        "GPU-5e87a39a-204c-4054-14a8-5b97ae4f16fd": 3675258880,
+        "GPU-5f3a3f44-a860-109d-a6e5-c9972f0f9842": 235929600
+      },
+      "after_vram_peak_bytes": {
+        "GPU-5e87a39a-204c-4054-14a8-5b97ae4f16fd": 7377780736,
+        "GPU-5f3a3f44-a860-109d-a6e5-c9972f0f9842": 0
+      },
+      "before_cache": {
+        "registry_receipts": {
+          "hits": 5704,
+          "misses": 3224
+        },
+        "model_kl": {
+          "hits": 0,
+          "misses": 2
+        }
+      },
+      "after_cache": {
+        "registry_receipts": {
+          "hits": 4962,
+          "misses": 3224
+        }
+      },
+      "selected_model_sha256": "77dec45d5ecee35bbf5815b0c0199a3b79735049c8382fd88f96fa3e650b1264",
+      "study_coverage": "2 scores, 0 complete groups; profiling only",
+      "native_version_note": "Two-score after pilot used v1 private-diagonal prototype; production v2 canonical identity elision has separate all-role parity and 13-score concurrency qualification."
+    },
+    "T425": {
+      "before_seconds": 606.4353380999528,
+      "after_seconds": 182.55855720001273,
+      "stage_speedup": 3.3218675004948524,
+      "before_source": {
+        "calls": 27,
+        "seconds": 285.3454486003611,
+        "bytes_hashed": 483858829152,
+        "bytes_read": 483858829152
+      },
+      "after_source": {
+        "calls": 1,
+        "seconds": 10.565192099893466,
+        "bytes_hashed": 17920697376,
+        "bytes_read": 17920697376
+      },
+      "before_baseline": {
+        "calls": 14,
+        "seconds": 41.086020799935795,
+        "bytes_hashed": 66766211904,
+        "bytes_read": 66766211904
+      },
+      "after_baseline": {
+        "calls": 1,
+        "seconds": 3.0384025999810547,
+        "bytes_hashed": 4769015136,
+        "bytes_read": 4769015136
+      },
+      "before_file_hash_input_bytes": 627729842962,
+      "after_file_hash_input_bytes": 83670688030,
+      "before_tensor_hash_input_bytes": 228749074432,
+      "after_tensor_hash_input_bytes": 32188981248,
+      "before_canonical_assemblies": 3,
+      "after_canonical_assemblies": 2,
+      "after_native_candidate_responses": 3,
+      "after_native_candidate_response_seconds": 1.5027306999545544,
+      "before_gguf_file_bytes_materialized": 14314840992,
+      "after_gguf_write_bytes": 9543227328,
+      "before_temp_write_syscall_bytes": "not measured; output lengths above are not physical I/O counters",
+      "before_parent_peak_working_set_bytes": 44714790912,
+      "after_parent_peak_working_set_bytes": 24476045312,
+      "before_vram_peak_bytes": {
+        "GPU-5e87a39a-204c-4054-14a8-5b97ae4f16fd": 4579131392,
+        "GPU-5f3a3f44-a860-109d-a6e5-c9972f0f9842": 235929600
+      },
+      "after_vram_peak_bytes": {
+        "GPU-5e87a39a-204c-4054-14a8-5b97ae4f16fd": 9185525760,
+        "GPU-5f3a3f44-a860-109d-a6e5-c9972f0f9842": 235929600
+      },
+      "before_cache": {
+        "registry_receipts": {
+          "hits": 5704,
+          "misses": 3224
+        },
+        "model_kl": {
+          "hits": 0,
+          "misses": 2
+        }
+      },
+      "after_cache": {
+        "registry_receipts": {
+          "hits": 4961,
+          "misses": 3224
+        }
+      },
+      "selected_model_sha256": "64f38b34d7acdbd2d33aec6f8529e57b1aa61d972c1fb7d0ed7979412e69c9ac",
+      "study_coverage": "2 scores, 0 complete groups; profiling only",
+      "native_version_note": "Two-score after pilot used v1 private-diagonal prototype; production v2 canonical identity elision has separate all-role parity and 13-score concurrency qualification."
+    }
+  },
+  "local_bounded_controls": {
+    "T340": {
+      "output_l1": {
+        "tensor_count": 3,
+        "candidates_per_tensor": 13,
+        "before_seconds": 34.716610400006175,
+        "after_seconds": 27.962937299977057,
+        "speedup": 1.241522306028797,
+        "source_bytes_copied_before": 2617245696,
+        "source_bytes_copied_after": 201326592,
+        "source_fresh_hash_bytes_before": 2617245696,
+        "source_fresh_hash_bytes_after": 201326592,
+        "native_process_launches_before": 39,
+        "native_process_launches_after": 3,
+        "native_process_seconds_inclusive_before": 32.03330140025355,
+        "native_process_seconds_inclusive_after": 27.756465800106525,
+        "native_compute_seconds_after": 26.3853763,
+        "native_compute_seconds_before": "not measured separately from process startup and native I/O",
+        "score_difference_max": 0.0,
+        "scope": "Three real tensors and original 256-row captures; not the full historical 248-tensor stage."
+      },
+      "output_mse": {
+        "tensor_count": 3,
+        "candidates_per_tensor": 13,
+        "before_seconds": 110.57016710017342,
+        "after_seconds": 104.39137069997378,
+        "speedup": 1.0591887658794885,
+        "source_bytes_copied_before": 2617245696,
+        "source_bytes_copied_after": 201326592,
+        "source_fresh_hash_bytes_before": 2617245696,
+        "source_fresh_hash_bytes_after": 201326592,
+        "native_process_launches_before": 39,
+        "native_process_launches_after": 3,
+        "native_process_seconds_inclusive_before": 107.98918739962392,
+        "native_process_seconds_inclusive_after": 104.18398010008968,
+        "native_compute_seconds_after": 102.9056458,
+        "native_compute_seconds_before": "not measured separately from process startup and native I/O",
+        "score_difference_max": 0.0,
+        "scope": "Three real tensors and original 256-row captures; not the full historical 248-tensor stage."
+      }
+    },
+    "T425": {
+      "output_l1": {
+        "tensor_count": 3,
+        "candidates_per_tensor": 13,
+        "before_seconds": 33.555073800031096,
+        "after_seconds": 28.357672400190495,
+        "speedup": 1.1832802539818355,
+        "source_bytes_copied_before": 2617245696,
+        "source_bytes_copied_after": 201326592,
+        "source_fresh_hash_bytes_before": 2617245696,
+        "source_fresh_hash_bytes_after": 201326592,
+        "native_process_launches_before": 39,
+        "native_process_launches_after": 3,
+        "native_process_seconds_inclusive_before": 30.89447670034133,
+        "native_process_seconds_inclusive_after": 28.153643000056036,
+        "native_compute_seconds_after": 26.7578287,
+        "native_compute_seconds_before": "not measured separately from process startup and native I/O",
+        "score_difference_max": 0.0,
+        "scope": "Three real tensors and original 256-row captures; not the full historical 248-tensor stage."
+      },
+      "output_mse": {
+        "tensor_count": 3,
+        "candidates_per_tensor": 13,
+        "before_seconds": 112.05086369987112,
+        "after_seconds": 107.2263817001367,
+        "speedup": 1.0449934234769414,
+        "source_bytes_copied_before": 2617245696,
+        "source_bytes_copied_after": 201326592,
+        "source_fresh_hash_bytes_before": 2617245696,
+        "source_fresh_hash_bytes_after": 201326592,
+        "native_process_launches_before": 39,
+        "native_process_launches_after": 3,
+        "native_process_seconds_inclusive_before": 109.45657729997765,
+        "native_process_seconds_inclusive_after": 107.02230530022644,
+        "native_compute_seconds_after": 105.6441407,
+        "native_compute_seconds_before": "not measured separately from process startup and native I/O",
+        "score_difference_max": 0.0,
+        "scope": "Three real tensors and original 256-row captures; not the full historical 248-tensor stage."
+      }
+    }
+  },
+  "full_search": {
+    "T340": {
+      "status": "PASS",
+      "completed_invocation_seconds": 2237.241286400007,
+      "timing_scope": "Final resumed invocation, including deterministic cached-score replay and remaining proposals; not the full active duration across interrupted attempts.",
+      "complete_study_active_wall_seconds": "not measured across killed attempts",
+      "runtime_report_path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\full-groupwise-optimized-v1\\runtime\\T340\\T340-T340-select-runtime.json",
+      "evaluations": 2977,
+      "before_full_248_seconds": "not measured",
+      "parent_peak_working_set_bytes": 31174615040,
+      "vram_peak_bytes": {
+        "GPU-5e87a39a-204c-4054-14a8-5b97ae4f16fd": 9913237504,
+        "GPU-5f3a3f44-a860-109d-a6e5-c9972f0f9842": 7154434048
+      }
+    },
+    "T425": {
+      "status": "PASS",
+      "completed_invocation_seconds": 2250.49299519998,
+      "timing_scope": "Final resumed invocation, including deterministic cached-score replay and remaining proposals; not the full active duration across interrupted attempts.",
+      "complete_study_active_wall_seconds": "not measured across killed attempts",
+      "runtime_report_path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\full-groupwise-optimized-v1\\runtime\\T425\\T425-T425-select-runtime.json",
+      "evaluations": 2977,
+      "before_full_248_seconds": "not measured",
+      "parent_peak_working_set_bytes": 33874407424,
+      "vram_peak_bytes": {
+        "GPU-5e87a39a-204c-4054-14a8-5b97ae4f16fd": 9959374848,
+        "GPU-5f3a3f44-a860-109d-a6e5-c9972f0f9842": 10347347968
+      }
+    }
+  },
+  "attribution_note": "Phase seconds are explicitly inclusive. exclusive_seconds are per-thread wall seconds; concurrent worker times are not additive top-level wall attribution.",
+  "one_complete_group_control": {
+    "recipe": "T340",
+    "group": "blk.0.attn_gate.weight",
+    "candidate_count": 13,
+    "before_seconds": 2256.794959699968,
+    "after_seconds": 112.27464369998779,
+    "speedup": 20.100664632082136,
+    "all_assignment_mean_scores_exact": true,
+    "selected_model_sha256": "3364bb34a9b58dbff0653317fb7ece1a55f0093701c9f8ec5d6710fc4f612bb0",
+    "before_canonical_assemblies": 14,
+    "after_canonical_assemblies": 2,
+    "before_source_hash": {
+      "calls": 104,
+      "seconds": 1063.6849126003217,
+      "bytes_hashed": 1863752527104,
+      "bytes_read": 1863752527104
+    },
+    "after_source_hash": {
+      "calls": 1,
+      "seconds": 10.699583500041626,
+      "bytes_hashed": 17920697376,
+      "bytes_read": 17920697376
+    },
+    "scope": "Same GPU0, frozen selection inputs and 13 identical assignments. Legacy original snapshot with telemetry only; prepared canonical v2. Additional benchmark does not change either frozen full-study assignment."
+  },
+  "held_out": {
+    "T340/wikitext2": {
+      "models": 6,
+      "runner_wall_seconds": 1132.4796895000618,
+      "native_process_elapsed_seconds": 1096.297398300143,
+      "orchestration_including_setup_hashes_and_summaries_seconds": 36.182291199918836,
+      "reference_setup_only_seconds": "not measured separately",
+      "reference_new_hash_bytes": 0,
+      "reference_inference_input_bytes_by_format": 885608987184,
+      "reference_inference_input_bytes_scope": "logical complete input-format size per successful arm, not OS physical disk-I/O counters",
+      "peak_working_set_bytes": 4832657408,
+      "gpu_global_peak_mib": 5967,
+      "temp_disk_peak_bytes": "not measured",
+      "physical_disk_write_bytes": "not measured"
+    },
+    "T340/ptb": {
+      "models": 6,
+      "runner_wall_seconds": 339.15174489992205,
+      "native_process_elapsed_seconds": 310.9241364999907,
+      "orchestration_including_setup_hashes_and_summaries_seconds": 28.22760839993134,
+      "reference_setup_only_seconds": "not measured separately",
+      "reference_new_hash_bytes": 0,
+      "reference_inference_input_bytes_by_format": 0,
+      "reference_inference_input_bytes_scope": "logical complete input-format size per successful arm, not OS physical disk-I/O counters",
+      "peak_working_set_bytes": 4520153088,
+      "gpu_global_peak_mib": 5967,
+      "temp_disk_peak_bytes": "not measured",
+      "physical_disk_write_bytes": "not measured"
+    },
+    "T425/wikitext2": {
+      "models": 6,
+      "runner_wall_seconds": 1133.5576251000166,
+      "native_process_elapsed_seconds": 1092.7024163001915,
+      "orchestration_including_setup_hashes_and_summaries_seconds": 40.85520879982505,
+      "reference_setup_only_seconds": "not measured separately",
+      "reference_new_hash_bytes": 0,
+      "reference_inference_input_bytes_by_format": 885608987184,
+      "reference_inference_input_bytes_scope": "logical complete input-format size per successful arm, not OS physical disk-I/O counters",
+      "peak_working_set_bytes": 5735772160,
+      "gpu_global_peak_mib": 6817,
+      "temp_disk_peak_bytes": "not measured",
+      "physical_disk_write_bytes": "not measured"
+    },
+    "T425/ptb": {
+      "models": 6,
+      "runner_wall_seconds": 336.5755922999233,
+      "native_process_elapsed_seconds": 303.1760450003203,
+      "orchestration_including_setup_hashes_and_summaries_seconds": 33.399547299603,
+      "reference_setup_only_seconds": "not measured separately",
+      "reference_new_hash_bytes": 0,
+      "reference_inference_input_bytes_by_format": 0,
+      "reference_inference_input_bytes_scope": "logical complete input-format size per successful arm, not OS physical disk-I/O counters",
+      "peak_working_set_bytes": 5420924928,
+      "gpu_global_peak_mib": 6817,
+      "temp_disk_peak_bytes": "not measured",
+      "physical_disk_write_bytes": "not measured"
+    }
+  },
+  "production_v2_concurrency": {
+    "commands": [
+      {
+        "recipe": "T340",
+        "mode": "single",
+        "command": [
+          "C:\\Python313\\python.exe",
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\run_measured_selection.py",
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\full-groupwise-optimized-v1\\configs\\T340-prepared13-single-v2.json",
+          "--report-directory",
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\full-groupwise-optimized-v1\\concurrency\\single"
+        ],
+        "launch_wall_time": "2026-11-07T14:39:38.867658+00:00",
+        "end_wall_time": "2026-11-07T14:41:36.117026+00:00",
+        "elapsed_seconds": 117.24924210004974,
+        "exit_code": 0
+      },
+      {
+        "recipe": "T425",
+        "mode": "single",
+        "command": [
+          "C:\\Python313\\python.exe",
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\run_measured_selection.py",
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\full-groupwise-optimized-v1\\configs\\T425-prepared13-single-v2.json",
+          "--report-directory",
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\full-groupwise-optimized-v1\\concurrency\\single"
+        ],
+        "launch_wall_time": "2026-11-07T14:41:36.135736+00:00",
+        "end_wall_time": "2026-11-07T14:44:04.880052+00:00",
+        "elapsed_seconds": 148.74432190007064,
+        "exit_code": 0
+      },
+      {
+        "recipe": "T340",
+        "mode": "parallel",
+        "command": [
+          "C:\\Python313\\python.exe",
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\run_measured_selection.py",
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\full-groupwise-optimized-v1\\configs\\T340-prepared13-parallel-v2.json",
+          "--report-directory",
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\full-groupwise-optimized-v1\\concurrency\\parallel"
+        ],
+        "launch_wall_time": "2026-11-07T14:44:04.895791+00:00",
+        "end_wall_time": "2026-11-07T14:46:36.807014+00:00",
+        "elapsed_seconds": 151.91123889992014,
+        "exit_code": 0
+      },
+      {
+        "recipe": "T425",
+        "mode": "parallel",
+        "command": [
+          "C:\\Python313\\python.exe",
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\run_measured_selection.py",
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\full-groupwise-optimized-v1\\configs\\T425-prepared13-parallel-v2.json",
+          "--report-directory",
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\full-groupwise-optimized-v1\\concurrency\\parallel"
+        ],
+        "launch_wall_time": "2026-11-07T14:44:04.896107+00:00",
+        "end_wall_time": "2026-11-07T14:46:46.988276+00:00",
+        "elapsed_seconds": 162.09217369998805,
+        "exit_code": 0
+      }
+    ],
+    "concurrent_pair": {
+      "launch_wall_time": "2026-11-07T14:44:04.895058+00:00",
+      "end_wall_time": "2026-11-07T14:46:47.002450+00:00",
+      "elapsed_seconds": 162.10740580002312
+    },
+    "errors": []
+  },
+  "advanced_fixture_profile": {
+    "full_gguf_assemblies": 0,
+    "limitation": "First native activation validation and individual native candidate-decode process boundaries remain explicit; this fixture is not a full-model stage performance claim.",
+    "native_candidate_decode_launches": 3,
+    "records": [
+      {
+        "block": {
+          "context_id": "d74fefbe191bb7b5dafe26dda4f667ed9290f5be0442c54c688b7e265a793297",
+          "input_context": "reference_inputs",
+          "layer": 0,
+          "output_l1": 0.00012420303736299893,
+          "output_mse": 3.1064264776969794e-08,
+          "output_shape": [
+            1,
+            7,
+            256
+          ],
+          "remaining_weights": "stock",
+          "reset": "fresh-sequence-cache-none",
+          "site": "block.0.output",
+          "source_id": "71d8b7a5af3a71dd3ef0a19794556061e0459e01a489f83eb80aab8e84d1a780"
+        },
+        "block_seconds": 0.008612800040282309,
+        "fisher_score": 2.4060134638505657e-06,
+        "fisher_seconds": 0.007343700039200485,
+        "iteration": 0
+      },
+      {
+        "block": {
+          "context_id": "d74fefbe191bb7b5dafe26dda4f667ed9290f5be0442c54c688b7e265a793297",
+          "input_context": "reference_inputs",
+          "layer": 0,
+          "output_l1": 0.00012420303736299893,
+          "output_mse": 3.1064264776969794e-08,
+          "output_shape": [
+            1,
+            7,
+            256
+          ],
+          "remaining_weights": "stock",
+          "reset": "fresh-sequence-cache-none",
+          "site": "block.0.output",
+          "source_id": "71d8b7a5af3a71dd3ef0a19794556061e0459e01a489f83eb80aab8e84d1a780"
+        },
+        "block_seconds": 0.0075533000053837895,
+        "fisher_score": 2.4060134638505657e-06,
+        "fisher_seconds": 0.005698600085452199,
+        "iteration": 1
+      },
+      {
+        "block": {
+          "context_id": "d74fefbe191bb7b5dafe26dda4f667ed9290f5be0442c54c688b7e265a793297",
+          "input_context": "reference_inputs",
+          "layer": 0,
+          "output_l1": 0.00012420303736299893,
+          "output_mse": 3.1064264776969794e-08,
+          "output_shape": [
+            1,
+            7,
+            256
+          ],
+          "remaining_weights": "stock",
+          "reset": "fresh-sequence-cache-none",
+          "site": "block.0.output",
+          "source_id": "71d8b7a5af3a71dd3ef0a19794556061e0459e01a489f83eb80aab8e84d1a780"
+        },
+        "block_seconds": 0.008935200050473213,
+        "fisher_score": 2.4060134638505657e-06,
+        "fisher_seconds": 0.05149009998422116,
+        "iteration": 2
+      }
+    ],
+    "reference_loading_seconds": 14.927030900027603,
+    "scope": "Tiny offline genuine Qwen3.5 fixture, not a 9B throughput estimate",
+    "setup_observations": {
+      "file_hash": {
+        "bytes_hashed": 11114884,
+        "bytes_read": 11114884,
+        "bytes_written": 0,
+        "calls": 189,
+        "exclusive_seconds": 0.3043191008036956,
+        "files": {
+          "C:\\Users\\anbee\\AppData\\Local\\Temp\\sinq-advanced-profile-d81kq2wg\\cache\\blobs\\2743ea6caeee81039246aa09aa0d9c2a42f8b999bdf03a60df0d1106e2156b26": {
+            "bytes_hashed": 180224,
+            "bytes_read": 180224,
+            "calls": 2,
+            "seconds": 0.006922700209543109
+          },
+          "C:\\Users\\anbee\\AppData\\Local\\Temp\\sinq-advanced-profile-d81kq2wg\\cache\\blobs\\b835802e44ec2cafb6fbc2fedd1dbfe07f26df85328cbaabcc65bd0a401d19e4": {
+            "bytes_hashed": 2048,
+            "bytes_read": 2048,
+            "calls": 2,
+            "seconds": 0.0069417000049725175
+          },
+          "C:\\Users\\anbee\\AppData\\Local\\Temp\\sinq-advanced-profile-d81kq2wg\\cache\\identities\\07ab0230f791aebe8551d70d4bc9553594a9424151050ee1d32937472b79371c.json": {
+            "bytes_hashed": 83,
+            "bytes_read": 83,
+            "calls": 1,
+            "seconds": 0.03237849997822195
+          },
+          "C:\\Users\\anbee\\AppData\\Local\\Temp\\sinq-advanced-profile-d81kq2wg\\cache\\tensors\\77da0c19082e6c44e7a381899b6b1b82fb70683137c310109ee513f890b7f224.json": {
+            "bytes_hashed": 1318,
+            "bytes_read": 1318,
+            "calls": 1,
+            "seconds": 0.006588399992324412
+          },
+          "C:\\Users\\anbee\\AppData\\Local\\Temp\\sinq-advanced-profile-d81kq2wg\\checkpoint\\model.gguf": {
+            "bytes_hashed": 6359040,
+            "bytes_read": 6359040,
+            "calls": 1,
+            "seconds": 0.00553229998331517
+          },
+          "C:\\Users\\anbee\\AppData\\Local\\Temp\\sinq-advanced-profile-d81kq2wg\\weights.bin": {
+            "bytes_hashed": 524288,
+            "bytes_read": 524288,
+            "calls": 1,
+            "seconds": 0.0008024999406188726
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\build-sinq-clean\\bin\\llama-sinq-native.exe": {
+            "bytes_hashed": 905728,
+            "bytes_read": 905728,
+            "calls": 1,
+            "seconds": 0.0014468999579548836
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\__init__.py": {
+            "bytes_hashed": 18991,
+            "bytes_read": 18991,
+            "calls": 1,
+            "seconds": 0.0005884000565856695
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\afmoe.py": {
+            "bytes_hashed": 3309,
+            "bytes_read": 3309,
+            "calls": 1,
+            "seconds": 0.0005055000074207783
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\arctic.py": {
+            "bytes_hashed": 7030,
+            "bytes_read": 7030,
+            "calls": 1,
+            "seconds": 0.00048449996393173933
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\baichuan.py": {
+            "bytes_hashed": 2610,
+            "bytes_read": 2610,
+            "calls": 1,
+            "seconds": 0.00046929996460676193
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\bailingmoe.py": {
+            "bytes_hashed": 9701,
+            "bytes_read": 9701,
+            "calls": 1,
+            "seconds": 0.0004795000422745943
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\bailingmoe3.py": {
+            "bytes_hashed": 14362,
+            "bytes_read": 14362,
+            "calls": 1,
+            "seconds": 0.0004912000149488449
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\base.py": {
+            "bytes_hashed": 181701,
+            "bytes_read": 181701,
+            "calls": 1,
+            "seconds": 0.0007118999492377043
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\beam.py": {
+            "bytes_hashed": 7165,
+            "bytes_read": 7165,
+            "calls": 1,
+            "seconds": 0.0005940999835729599
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\bert.py": {
+            "bytes_hashed": 33729,
+            "bytes_read": 33729,
+            "calls": 1,
+            "seconds": 0.0005213998956605792
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\bitnet.py": {
+            "bytes_hashed": 1933,
+            "bytes_read": 1933,
+            "calls": 1,
+            "seconds": 0.0004849000833928585
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\bloom.py": {
+            "bytes_hashed": 3051,
+            "bytes_read": 3051,
+            "calls": 1,
+            "seconds": 0.0004605000140145421
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\chameleon.py": {
+            "bytes_hashed": 2496,
+            "bytes_read": 2496,
+            "calls": 1,
+            "seconds": 0.0004705999745056033
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\chatglm.py": {
+            "bytes_hashed": 8605,
+            "bytes_read": 8605,
+            "calls": 1,
+            "seconds": 0.00047279999125748873
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\clef.py": {
+            "bytes_hashed": 6789,
+            "bytes_read": 6789,
+            "calls": 1,
+            "seconds": 0.00047480000648647547
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\codeshell.py": {
+            "bytes_hashed": 1042,
+            "bytes_read": 1042,
+            "calls": 1,
+            "seconds": 0.0004592000041157007
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\cogvlm.py": {
+            "bytes_hashed": 1120,
+            "bytes_read": 1120,
+            "calls": 1,
+            "seconds": 0.0004626000300049782
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\command_r.py": {
+            "bytes_hashed": 9689,
+            "bytes_read": 9689,
+            "calls": 1,
+            "seconds": 0.00045519997365772724
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\dbrx.py": {
+            "bytes_hashed": 3765,
+            "bytes_read": 3765,
+            "calls": 1,
+            "seconds": 0.0004526999546214938
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\deci.py": {
+            "bytes_hashed": 9567,
+            "bytes_read": 9567,
+            "calls": 1,
+            "seconds": 0.00048260006587952375
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\deepseek.py": {
+            "bytes_hashed": 52711,
+            "bytes_read": 52711,
+            "calls": 1,
+            "seconds": 0.0005099999252706766
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\deepseek41.py": {
+            "bytes_hashed": 25706,
+            "bytes_read": 25706,
+            "calls": 1,
+            "seconds": 0.00048340007197111845
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\dots1.py": {
+            "bytes_hashed": 1235,
+            "bytes_read": 1235,
+            "calls": 1,
+            "seconds": 0.0004773000255227089
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\dots3.py": {
+            "bytes_hashed": 17242,
+            "bytes_read": 17242,
+            "calls": 1,
+            "seconds": 0.0004642999265342951
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\dotsocr.py": {
+            "bytes_hashed": 2191,
+            "bytes_read": 2191,
+            "calls": 1,
+            "seconds": 0.00048210006207227707
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\dream.py": {
+            "bytes_hashed": 2978,
+            "bytes_read": 2978,
+            "calls": 1,
+            "seconds": 0.00046719994861632586
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\ernie.py": {
+            "bytes_hashed": 9039,
+            "bytes_read": 9039,
+            "calls": 1,
+            "seconds": 0.0004884999943897128
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\exaone.py": {
+            "bytes_hashed": 15615,
+            "bytes_read": 15615,
+            "calls": 1,
+            "seconds": 0.0005061000119894743
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\falcon.py": {
+            "bytes_hashed": 2808,
+            "bytes_read": 2808,
+            "calls": 1,
+            "seconds": 0.0005034999921917915
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\falcon_h1.py": {
+            "bytes_hashed": 5625,
+            "bytes_read": 5625,
+            "calls": 1,
+            "seconds": 0.0004974999465048313
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\flint.py": {
+            "bytes_hashed": 1619,
+            "bytes_read": 1619,
+            "calls": 1,
+            "seconds": 0.00048500008415430784
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\gemma.py": {
+            "bytes_hashed": 59169,
+            "bytes_read": 59169,
+            "calls": 1,
+            "seconds": 0.0005129999481141567
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\glm.py": {
+            "bytes_hashed": 28121,
+            "bytes_read": 28121,
+            "calls": 1,
+            "seconds": 0.0006351000629365444
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\gpt2.py": {
+            "bytes_hashed": 3399,
+            "bytes_read": 3399,
+            "calls": 1,
+            "seconds": 0.0004987999564036727
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\gpt_oss.py": {
+            "bytes_hashed": 6107,
+            "bytes_read": 6107,
+            "calls": 1,
+            "seconds": 0.00048399996012449265
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\gptneox.py": {
+            "bytes_hashed": 3013,
+            "bytes_read": 3013,
+            "calls": 1,
+            "seconds": 0.0004781000316143036
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\granite.py": {
+            "bytes_hashed": 41935,
+            "bytes_read": 41935,
+            "calls": 1,
+            "seconds": 0.000506900018081069
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\grok.py": {
+            "bytes_hashed": 5321,
+            "bytes_read": 5321,
+            "calls": 1,
+            "seconds": 0.0005405999254435301
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\grovemoe.py": {
+            "bytes_hashed": 4973,
+            "bytes_read": 4973,
+            "calls": 1,
+            "seconds": 0.0006364999571815133
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\h2o_lightning.py": {
+            "bytes_hashed": 4682,
+            "bytes_read": 4682,
+            "calls": 1,
+            "seconds": 0.0005235000280663371
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\hrm_text.py": {
+            "bytes_hashed": 3881,
+            "bytes_read": 3881,
+            "calls": 1,
+            "seconds": 0.0005083000287413597
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\hunyuan.py": {
+            "bytes_hashed": 23095,
+            "bytes_read": 23095,
+            "calls": 1,
+            "seconds": 0.0004771000239998102
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\hy_v4.py": {
+            "bytes_hashed": 12077,
+            "bytes_read": 12077,
+            "calls": 1,
+            "seconds": 0.0004463000223040581
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\internlm.py": {
+            "bytes_hashed": 11225,
+            "bytes_read": 11225,
+            "calls": 1,
+            "seconds": 0.00046140002086758614
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\internvl.py": {
+            "bytes_hashed": 4622,
+            "bytes_read": 4622,
+            "calls": 1,
+            "seconds": 0.00047099997755140066
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\jais.py": {
+            "bytes_hashed": 4287,
+            "bytes_read": 4287,
+            "calls": 1,
+            "seconds": 0.00048230006359517574
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\jamba.py": {
+            "bytes_hashed": 5175,
+            "bytes_read": 5175,
+            "calls": 1,
+            "seconds": 0.0004677999531850219
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\januspro.py": {
+            "bytes_hashed": 4508,
+            "bytes_read": 4508,
+            "calls": 1,
+            "seconds": 0.0007702000439167023
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\k2_horizon.py": {
+            "bytes_hashed": 5071,
+            "bytes_read": 5071,
+            "calls": 1,
+            "seconds": 0.00048319995403289795
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\kimi_k3.py": {
+            "bytes_hashed": 17018,
+            "bytes_read": 17018,
+            "calls": 1,
+            "seconds": 0.0004813999403268099
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\kimi_linear.py": {
+            "bytes_hashed": 11903,
+            "bytes_read": 11903,
+            "calls": 1,
+            "seconds": 0.0005501999985426664
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\kimivl.py": {
+            "bytes_hashed": 7989,
+            "bytes_read": 7989,
+            "calls": 1,
+            "seconds": 0.0005486001027747989
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\kolibri1.py": {
+            "bytes_hashed": 1046,
+            "bytes_read": 1046,
+            "calls": 1,
+            "seconds": 0.0005721999332308769
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\laguna.py": {
+            "bytes_hashed": 10772,
+            "bytes_read": 10772,
+            "calls": 1,
+            "seconds": 0.0005148000782355666
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\lev.py": {
+            "bytes_hashed": 14434,
+            "bytes_read": 14434,
+            "calls": 1,
+            "seconds": 0.0004992999602109194
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\lfm2.py": {
+            "bytes_hashed": 24754,
+            "bytes_read": 24754,
+            "calls": 1,
+            "seconds": 0.0005113000515848398
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\lfm3.py": {
+            "bytes_hashed": 33094,
+            "bytes_read": 33094,
+            "calls": 1,
+            "seconds": 0.0005058000097051263
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\lighton_ocr.py": {
+            "bytes_hashed": 963,
+            "bytes_read": 963,
+            "calls": 1,
+            "seconds": 0.00046690006274729967
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\limite.py": {
+            "bytes_hashed": 8857,
+            "bytes_read": 8857,
+            "calls": 1,
+            "seconds": 0.00047450000420212746
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\llada.py": {
+            "bytes_hashed": 7299,
+            "bytes_read": 7299,
+            "calls": 1,
+            "seconds": 0.0004860999761149287
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\llama.py": {
+            "bytes_hashed": 21766,
+            "bytes_read": 21766,
+            "calls": 1,
+            "seconds": 0.0005339999916031957
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\llama4.py": {
+            "bytes_hashed": 1753,
+            "bytes_read": 1753,
+            "calls": 1,
+            "seconds": 0.0004752000095322728
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\llava.py": {
+            "bytes_hashed": 7319,
+            "bytes_read": 7319,
+            "calls": 1,
+            "seconds": 0.00046930008102208376
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\maincoder.py": {
+            "bytes_hashed": 468,
+            "bytes_read": 468,
+            "calls": 1,
+            "seconds": 0.00046330003533512354
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\mamba.py": {
+            "bytes_hashed": 9939,
+            "bytes_read": 9939,
+            "calls": 1,
+            "seconds": 0.0005307999672368169
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\maple.py": {
+            "bytes_hashed": 3675,
+            "bytes_read": 3675,
+            "calls": 1,
+            "seconds": 0.0005248000379651785
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\mellum.py": {
+            "bytes_hashed": 6124,
+            "bytes_read": 6124,
+            "calls": 1,
+            "seconds": 0.0006096001015976071
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\mimo.py": {
+            "bytes_hashed": 24011,
+            "bytes_read": 24011,
+            "calls": 1,
+            "seconds": 0.0005519000114873052
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\minicpm.py": {
+            "bytes_hashed": 13729,
+            "bytes_read": 13729,
+            "calls": 1,
+            "seconds": 0.0005176999839022756
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\minimax.py": {
+            "bytes_hashed": 12531,
+            "bytes_read": 12531,
+            "calls": 1,
+            "seconds": 0.0005242000333964825
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\mistral.py": {
+            "bytes_hashed": 9661,
+            "bytes_read": 9661,
+            "calls": 1,
+            "seconds": 0.0004986999556422234
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\mistral3.py": {
+            "bytes_hashed": 4296,
+            "bytes_read": 4296,
+            "calls": 1,
+            "seconds": 0.0005341999931260943
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\mistral4.py": {
+            "bytes_hashed": 10708,
+            "bytes_read": 10708,
+            "calls": 1,
+            "seconds": 0.0005393000319600105
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\mpt.py": {
+            "bytes_hashed": 2148,
+            "bytes_read": 2148,
+            "calls": 1,
+            "seconds": 0.0005357000045478344
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\muse_glimmer.py": {
+            "bytes_hashed": 8280,
+            "bytes_read": 8280,
+            "calls": 1,
+            "seconds": 0.0005187999922782183
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\muse_spark.py": {
+            "bytes_hashed": 10086,
+            "bytes_read": 10086,
+            "calls": 1,
+            "seconds": 0.0005246000364422798
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\nanbeige.py": {
+            "bytes_hashed": 862,
+            "bytes_read": 862,
+            "calls": 1,
+            "seconds": 0.0004996999632567167
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\nemotron.py": {
+            "bytes_hashed": 42682,
+            "bytes_read": 42682,
+            "calls": 1,
+            "seconds": 0.0005277999443933368
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\olmo.py": {
+            "bytes_hashed": 4645,
+            "bytes_read": 4645,
+            "calls": 1,
+            "seconds": 0.0004971000598743558
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\openelm.py": {
+            "bytes_hashed": 3808,
+            "bytes_read": 3808,
+            "calls": 1,
+            "seconds": 0.00048669998068362474
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\orion.py": {
+            "bytes_hashed": 1756,
+            "bytes_read": 1756,
+            "calls": 1,
+            "seconds": 0.0004904000088572502
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\pangu.py": {
+            "bytes_hashed": 1888,
+            "bytes_read": 1888,
+            "calls": 1,
+            "seconds": 0.00048800010699778795
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\phi.py": {
+            "bytes_hashed": 18613,
+            "bytes_read": 18613,
+            "calls": 1,
+            "seconds": 0.0005000999663025141
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\pixtral.py": {
+            "bytes_hashed": 1449,
+            "bytes_read": 1449,
+            "calls": 1,
+            "seconds": 0.0005099000409245491
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\plamo.py": {
+            "bytes_hashed": 9755,
+            "bytes_read": 9755,
+            "calls": 1,
+            "seconds": 0.0005223000189289451
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\plm.py": {
+            "bytes_hashed": 859,
+            "bytes_read": 859,
+            "calls": 1,
+            "seconds": 0.0005049000028520823
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\pockettts.py": {
+            "bytes_hashed": 19328,
+            "bytes_read": 19328,
+            "calls": 1,
+            "seconds": 0.0005245000356808305
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\pplx_decider.py": {
+            "bytes_hashed": 4746,
+            "bytes_read": 4746,
+            "calls": 1,
+            "seconds": 0.0005047000013291836
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\qwen.py": {
+            "bytes_hashed": 54868,
+            "bytes_read": 54868,
+            "calls": 1,
+            "seconds": 0.0005795999895781279
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\qwen3tts.py": {
+            "bytes_hashed": 26239,
+            "bytes_read": 26239,
+            "calls": 1,
+            "seconds": 0.0005552000366151333
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\qwen3vl.py": {
+            "bytes_hashed": 19084,
+            "bytes_read": 19084,
+            "calls": 1,
+            "seconds": 0.000498899957165122
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\qwen4exp.py": {
+            "bytes_hashed": 13005,
+            "bytes_read": 13005,
+            "calls": 1,
+            "seconds": 0.00047850003466010094
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\qwenvl.py": {
+            "bytes_hashed": 9355,
+            "bytes_read": 9355,
+            "calls": 1,
+            "seconds": 0.00048280006740242243
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\refact.py": {
+            "bytes_hashed": 3343,
+            "bytes_read": 3343,
+            "calls": 1,
+            "seconds": 0.0004743000026792288
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\rwkv.py": {
+            "bytes_hashed": 14748,
+            "bytes_read": 14748,
+            "calls": 1,
+            "seconds": 0.0004934000317007303
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\sarashina2.py": {
+            "bytes_hashed": 1108,
+            "bytes_read": 1108,
+            "calls": 1,
+            "seconds": 0.0005126000614836812
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\sensenova_u1.py": {
+            "bytes_hashed": 5668,
+            "bytes_read": 5668,
+            "calls": 1,
+            "seconds": 0.0005135999526828527
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\smallthinker.py": {
+            "bytes_hashed": 3600,
+            "bytes_read": 3600,
+            "calls": 1,
+            "seconds": 0.0005280000623315573
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\smolvlm.py": {
+            "bytes_hashed": 2201,
+            "bytes_read": 2201,
+            "calls": 1,
+            "seconds": 0.0005264999344944954
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\soprano.py": {
+            "bytes_hashed": 5175,
+            "bytes_read": 5175,
+            "calls": 1,
+            "seconds": 0.000508400029502809
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\spark2_5.py": {
+            "bytes_hashed": 2941,
+            "bytes_read": 2941,
+            "calls": 1,
+            "seconds": 0.0005717000458389521
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\stablelm.py": {
+            "bytes_hashed": 4123,
+            "bytes_read": 4123,
+            "calls": 1,
+            "seconds": 0.0005557999247685075
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\starcoder.py": {
+            "bytes_hashed": 1007,
+            "bytes_read": 1007,
+            "calls": 1,
+            "seconds": 0.0005196999991312623
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\step3.py": {
+            "bytes_hashed": 17065,
+            "bytes_read": 17065,
+            "calls": 1,
+            "seconds": 0.0004926000256091356
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\t5.py": {
+            "bytes_hashed": 14561,
+            "bytes_read": 14561,
+            "calls": 1,
+            "seconds": 0.0004901000065729022
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\talkie.py": {
+            "bytes_hashed": 2192,
+            "bytes_read": 2192,
+            "calls": 1,
+            "seconds": 0.0005090999184176326
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\ultravox.py": {
+            "bytes_hashed": 11548,
+            "bytes_read": 11548,
+            "calls": 1,
+            "seconds": 0.0005138000706210732
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\vllm_d3.py": {
+            "bytes_hashed": 2405,
+            "bytes_read": 2405,
+            "calls": 1,
+            "seconds": 0.0005026999861001968
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\vllm_decision2.py": {
+            "bytes_hashed": 5151,
+            "bytes_read": 5151,
+            "calls": 1,
+            "seconds": 0.0005382000235840678
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\wavtokenizer.py": {
+            "bytes_hashed": 1818,
+            "bytes_read": 1818,
+            "calls": 1,
+            "seconds": 0.0005405000410974026
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\xverse.py": {
+            "bytes_hashed": 4000,
+            "bytes_read": 4000,
+            "calls": 1,
+            "seconds": 0.0005144999595358968
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\conversion\\youtuvl.py": {
+            "bytes_hashed": 2996,
+            "bytes_read": 2996,
+            "calls": 1,
+            "seconds": 0.0005397000350058079
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\convert_hf_to_gguf.py": {
+            "bytes_hashed": 15321,
+            "bytes_read": 15321,
+            "calls": 1,
+            "seconds": 0.0005520000122487545
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\ggml\\src\\ggml-quants.c": {
+            "bytes_hashed": 247760,
+            "bytes_read": 247760,
+            "calls": 1,
+            "seconds": 0.008721299935132265
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\ggml\\src\\ggml.c": {
+            "bytes_hashed": 284095,
+            "bytes_read": 284095,
+            "calls": 1,
+            "seconds": 0.01073720003478229
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\gguf-py\\gguf\\__init__.py": {
+            "bytes_hashed": 228,
+            "bytes_read": 228,
+            "calls": 1,
+            "seconds": 0.0005200000014156103
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\gguf-py\\gguf\\constants.py": {
+            "bytes_hashed": 271465,
+            "bytes_read": 271465,
+            "calls": 1,
+            "seconds": 0.0006542999763041735
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\gguf-py\\gguf\\gguf.py": {
+            "bytes_hashed": 493,
+            "bytes_read": 493,
+            "calls": 1,
+            "seconds": 0.0004794999258592725
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\gguf-py\\gguf\\gguf_reader.py": {
+            "bytes_hashed": 16711,
+            "bytes_read": 16711,
+            "calls": 1,
+            "seconds": 0.0004952000454068184
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\gguf-py\\gguf\\gguf_writer.py": {
+            "bytes_hashed": 83239,
+            "bytes_read": 83239,
+            "calls": 1,
+            "seconds": 0.0005163999740034342
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\gguf-py\\gguf\\lazy.py": {
+            "bytes_hashed": 12308,
+            "bytes_read": 12308,
+            "calls": 1,
+            "seconds": 0.000493000028654933
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\gguf-py\\gguf\\metadata.py": {
+            "bytes_hashed": 40049,
+            "bytes_read": 40049,
+            "calls": 1,
+            "seconds": 0.0005067000165581703
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\gguf-py\\gguf\\py.typed": {
+            "bytes_hashed": 0,
+            "bytes_read": 0,
+            "calls": 1,
+            "seconds": 0.00029669993091374636
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\gguf-py\\gguf\\quants.py": {
+            "bytes_hashed": 67627,
+            "bytes_read": 67627,
+            "calls": 1,
+            "seconds": 0.000506900018081069
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\gguf-py\\gguf\\scripts\\gguf_convert_endian.py": {
+            "bytes_hashed": 7266,
+            "bytes_read": 7266,
+            "calls": 1,
+            "seconds": 0.0005269000539556146
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\gguf-py\\gguf\\scripts\\gguf_dump.py": {
+            "bytes_hashed": 23581,
+            "bytes_read": 23581,
+            "calls": 1,
+            "seconds": 0.0005631000967696309
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\gguf-py\\gguf\\scripts\\gguf_editor_gui.py": {
+            "bytes_hashed": 66059,
+            "bytes_read": 66059,
+            "calls": 1,
+            "seconds": 0.0006004000315442681
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\gguf-py\\gguf\\scripts\\gguf_hash.py": {
+            "bytes_hashed": 3827,
+            "bytes_read": 3827,
+            "calls": 1,
+            "seconds": 0.0005429000593721867
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\gguf-py\\gguf\\scripts\\gguf_new_metadata.py": {
+            "bytes_hashed": 10447,
+            "bytes_read": 10447,
+            "calls": 1,
+            "seconds": 0.0005409999284893274
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\gguf-py\\gguf\\scripts\\gguf_set_metadata.py": {
+            "bytes_hashed": 4240,
+            "bytes_read": 4240,
+            "calls": 1,
+            "seconds": 0.0005631999811157584
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\gguf-py\\gguf\\tensor_mapping.py": {
+            "bytes_hashed": 150805,
+            "bytes_read": 150805,
+            "calls": 1,
+            "seconds": 0.0006318999221548438
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\gguf-py\\gguf\\utility.py": {
+            "bytes_hashed": 13874,
+            "bytes_read": 13874,
+            "calls": 1,
+            "seconds": 0.0005785999819636345
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\gguf-py\\gguf\\vocab.py": {
+            "bytes_hashed": 45828,
+            "bytes_read": 45828,
+            "calls": 1,
+            "seconds": 0.0005593000678345561
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\src\\llama-sinq.cpp": {
+            "bytes_hashed": 13571,
+            "bytes_read": 13571,
+            "calls": 1,
+            "seconds": 0.011187400086782873
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\src\\sinq\\sinq-awq.cpp": {
+            "bytes_hashed": 2462,
+            "bytes_read": 2462,
+            "calls": 1,
+            "seconds": 0.008492199936881661
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\src\\sinq\\sinq-awq.h": {
+            "bytes_hashed": 327,
+            "bytes_read": 327,
+            "calls": 1,
+            "seconds": 0.006501900032162666
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\src\\sinq\\sinq-bridge-config.cpp": {
+            "bytes_hashed": 6319,
+            "bytes_read": 6319,
+            "calls": 1,
+            "seconds": 0.008383900043554604
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\src\\sinq\\sinq-bridge-config.h": {
+            "bytes_hashed": 748,
+            "bytes_read": 748,
+            "calls": 1,
+            "seconds": 0.01143070007674396
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\src\\sinq\\sinq-candidates.cpp": {
+            "bytes_hashed": 8305,
+            "bytes_read": 8305,
+            "calls": 1,
+            "seconds": 0.010030800011008978
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\src\\sinq\\sinq-candidates.h": {
+            "bytes_hashed": 1253,
+            "bytes_read": 1253,
+            "calls": 1,
+            "seconds": 0.007957400055602193
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\src\\sinq\\sinq-local-score.cpp": {
+            "bytes_hashed": 3425,
+            "bytes_read": 3425,
+            "calls": 1,
+            "seconds": 0.00932529999408871
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\src\\sinq\\sinq-local-score.h": {
+            "bytes_hashed": 651,
+            "bytes_read": 651,
+            "calls": 1,
+            "seconds": 0.006873299949802458
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\src\\sinq\\sinq-native-codec.cpp": {
+            "bytes_hashed": 6012,
+            "bytes_read": 6012,
+            "calls": 1,
+            "seconds": 0.009222700027748942
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\src\\sinq\\sinq-native-codec.h": {
+            "bytes_hashed": 1097,
+            "bytes_read": 1097,
+            "calls": 1,
+            "seconds": 0.0086806999752298
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\src\\sinq\\sinq-numeric.h": {
+            "bytes_hashed": 317,
+            "bytes_read": 317,
+            "calls": 1,
+            "seconds": 0.008955299970693886
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\src\\sinq\\sinq-parallel.h": {
+            "bytes_hashed": 1435,
+            "bytes_read": 1435,
+            "calls": 1,
+            "seconds": 0.006779800052754581
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\src\\sinq\\sinq-parameters.cpp": {
+            "bytes_hashed": 9874,
+            "bytes_read": 9874,
+            "calls": 1,
+            "seconds": 0.00756649998947978
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\src\\sinq\\sinq-parameters.h": {
+            "bytes_hashed": 1688,
+            "bytes_read": 1688,
+            "calls": 1,
+            "seconds": 0.005521900020539761
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\src\\sinq\\sinq-types.h": {
+            "bytes_hashed": 952,
+            "bytes_read": 952,
+            "calls": 1,
+            "seconds": 0.005181399988941848
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\tools\\sinq\\export_activations.py": {
+            "bytes_hashed": 28065,
+            "bytes_read": 28065,
+            "calls": 1,
+            "seconds": 0.0005419000517576933
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\tools\\sinq\\native-codec.cpp": {
+            "bytes_hashed": 24171,
+            "bytes_read": 24171,
+            "calls": 1,
+            "seconds": 0.008859600056894124
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\tools\\sinq\\optimizer\\__init__.py": {
+            "bytes_hashed": 93,
+            "bytes_read": 93,
+            "calls": 1,
+            "seconds": 0.0005220999009907246
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\tools\\sinq\\optimizer\\assembly.py": {
+            "bytes_hashed": 13339,
+            "bytes_read": 13339,
+            "calls": 1,
+            "seconds": 0.0005865000421181321
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\tools\\sinq\\optimizer\\baseline.py": {
+            "bytes_hashed": 11421,
+            "bytes_read": 11421,
+            "calls": 1,
+            "seconds": 0.0005963000003248453
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\tools\\sinq\\optimizer\\blockwise.py": {
+            "bytes_hashed": 1441,
+            "bytes_read": 1441,
+            "calls": 1,
+            "seconds": 0.0005793999880552292
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\tools\\sinq\\optimizer\\cache.py": {
+            "bytes_hashed": 27030,
+            "bytes_read": 27030,
+            "calls": 1,
+            "seconds": 0.0005119999404996634
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\tools\\sinq\\optimizer\\capture.py": {
+            "bytes_hashed": 7334,
+            "bytes_read": 7334,
+            "calls": 1,
+            "seconds": 0.0005756999598816037
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\tools\\sinq\\optimizer\\cli.py": {
+            "bytes_hashed": 8163,
+            "bytes_read": 8163,
+            "calls": 1,
+            "seconds": 0.00048289995174854994
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\tools\\sinq\\optimizer\\corpora.py": {
+            "bytes_hashed": 13681,
+            "bytes_read": 13681,
+            "calls": 1,
+            "seconds": 0.000510699930600822
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\tools\\sinq\\optimizer\\device_placement.py": {
+            "bytes_hashed": 4299,
+            "bytes_read": 4299,
+            "calls": 1,
+            "seconds": 0.0004787000361829996
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\tools\\sinq\\optimizer\\execution_backend.py": {
+            "bytes_hashed": 5352,
+            "bytes_read": 5352,
+            "calls": 1,
+            "seconds": 0.0005102000432088971
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\tools\\sinq\\optimizer\\fisher.py": {
+            "bytes_hashed": 10927,
+            "bytes_read": 10927,
+            "calls": 1,
+            "seconds": 0.0005105000454932451
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\tools\\sinq\\optimizer\\generate.py": {
+            "bytes_hashed": 19178,
+            "bytes_read": 19178,
+            "calls": 1,
+            "seconds": 0.0004941999213770032
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\tools\\sinq\\optimizer\\generation_state.py": {
+            "bytes_hashed": 10910,
+            "bytes_read": 10910,
+            "calls": 1,
+            "seconds": 0.00048729998525232077
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\tools\\sinq\\optimizer\\implementation.py": {
+            "bytes_hashed": 6380,
+            "bytes_read": 6380,
+            "calls": 1,
+            "seconds": 0.0004797999281436205
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\tools\\sinq\\optimizer\\kl.py": {
+            "bytes_hashed": 15142,
+            "bytes_read": 15142,
+            "calls": 1,
+            "seconds": 0.000493000028654933
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\tools\\sinq\\optimizer\\memory_accounting.py": {
+            "bytes_hashed": 11487,
+            "bytes_read": 11487,
+            "calls": 1,
+            "seconds": 0.00048479996621608734
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\tools\\sinq\\optimizer\\model_audit.py": {
+            "bytes_hashed": 4610,
+            "bytes_read": 4610,
+            "calls": 1,
+            "seconds": 0.00048049993347376585
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\tools\\sinq\\optimizer\\native_codec.py": {
+            "bytes_hashed": 11010,
+            "bytes_read": 11010,
+            "calls": 1,
+            "seconds": 0.0005099000409245491
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\tools\\sinq\\optimizer\\partition.py": {
+            "bytes_hashed": 6409,
+            "bytes_read": 6409,
+            "calls": 1,
+            "seconds": 0.0004876999882981181
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\tools\\sinq\\optimizer\\prepared.py": {
+            "bytes_hashed": 5507,
+            "bytes_read": 5507,
+            "calls": 1,
+            "seconds": 0.0005234000273048878
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\tools\\sinq\\optimizer\\prepared_kl.py": {
+            "bytes_hashed": 12470,
+            "bytes_read": 12470,
+            "calls": 1,
+            "seconds": 0.0005695000290870667
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\tools\\sinq\\optimizer\\provenance.py": {
+            "bytes_hashed": 3003,
+            "bytes_read": 3003,
+            "calls": 1,
+            "seconds": 0.0005152999656274915
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\tools\\sinq\\optimizer\\qwen35_adapter.py": {
+            "bytes_hashed": 12255,
+            "bytes_read": 12255,
+            "calls": 1,
+            "seconds": 0.0005616999696940184
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\tools\\sinq\\optimizer\\reference_loader.py": {
+            "bytes_hashed": 13354,
+            "bytes_read": 13354,
+            "calls": 1,
+            "seconds": 0.0006715999916195869
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\tools\\sinq\\optimizer\\resources.py": {
+            "bytes_hashed": 9637,
+            "bytes_read": 9637,
+            "calls": 1,
+            "seconds": 0.0005515000084415078
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\tools\\sinq\\optimizer\\run_state.py": {
+            "bytes_hashed": 3998,
+            "bytes_read": 3998,
+            "calls": 1,
+            "seconds": 0.0005333999870344996
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\tools\\sinq\\optimizer\\schemas.py": {
+            "bytes_hashed": 23647,
+            "bytes_read": 23647,
+            "calls": 1,
+            "seconds": 0.0005233000265434384
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\tools\\sinq\\optimizer\\selector.py": {
+            "bytes_hashed": 14685,
+            "bytes_read": 14685,
+            "calls": 1,
+            "seconds": 0.0005512000061571598
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\tools\\sinq\\optimizer\\stages.py": {
+            "bytes_hashed": 49974,
+            "bytes_read": 49974,
+            "calls": 1,
+            "seconds": 0.0005767000839114189
+          },
+          "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\tools\\sinq\\optimizer\\trusted_reference.py": {
+            "bytes_hashed": 12224,
+            "bytes_read": 12224,
+            "calls": 1,
+            "seconds": 0.0005369000136852264
+          }
+        },
+        "inclusive": true,
+        "seconds": 0.3043191008036956,
+        "time_scope": "per-thread wall seconds; concurrent workers not additive"
+      },
+      "implementation_fingerprint": {
+        "bytes_hashed": 0,
+        "bytes_read": 0,
+        "bytes_written": 0,
+        "calls": 1,
+        "exclusive_seconds": 0.11436079954728484,
+        "inclusive": true,
+        "seconds": 0.19765760004520416,
+        "time_scope": "per-thread wall seconds; concurrent workers not additive"
+      },
+      "native_source_export": {
+        "bytes_hashed": 0,
+        "bytes_read": 0,
+        "bytes_written": 524288,
+        "calls": 1,
+        "exclusive_seconds": 0.0006664000684395432,
+        "inclusive": true,
+        "seconds": 0.0006664000684395432,
+        "time_scope": "per-thread wall seconds; concurrent workers not additive"
+      }
+    },
+    "source_bytes_newly_file_hashed_during_candidate_trials": 0,
+    "status": "BOUNDED_PROFILE_AND_DETERMINISTIC_SCORES_PASS",
+    "trial_observations": {
+      "bounded_advanced_native_decode": {
+        "bytes_hashed": 0,
+        "bytes_read": 0,
+        "bytes_written": 0,
+        "calls": 3,
+        "exclusive_seconds": 0.6319400999927893,
+        "inclusive": true,
+        "seconds": 0.6319400999927893,
+        "time_scope": "per-thread wall seconds; concurrent workers not additive"
+      }
+    },
+    "unchanged_kernel_sources": {
+      "tools\\sinq\\optimizer\\blockwise.py": "b1562a54db15bd5939272f45ec81c8be3bc2ade347dd78628ba73066a655b36a",
+      "tools\\sinq\\optimizer\\fisher.py": "ddf1f943b97a4f0ed83d7133e7350c3cc27ceaef7e5e3fa39f6c7131a10bc08b",
+      "tools\\sinq\\optimizer\\qwen35_adapter.py": "63918851e9bf188f84b5fbb25218a69a8de20123bade1f2b45735eddc9d968cd",
+      "tools\\sinq\\optimizer\\reference_loader.py": "4bf0163412347850abc75d943b75f2fa0a03dc925c157ae8ed83a0b4de49f1fd"
+    }
+  }
+}

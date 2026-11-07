@@ -1,0 +1,7 @@
+{
+  "operation": "read-only remote preflight",
+  "returncode": 0,
+  "remote_head": "ff7994f358f3b1e31341dcdd0dc2defe44c18fcd",
+  "expected_base": "ff7994f358f3b1e31341dcdd0dc2defe44c18fcd",
+  "matches_base": true
+}

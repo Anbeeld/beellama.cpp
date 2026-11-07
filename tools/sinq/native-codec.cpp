@@ -68,7 +68,27 @@ int main(int argc,char**argv) try {
     }
     sinq::require(argc==2,"usage: llama-sinq-native request.json | --validate-activations manifest source.gguf");
     sinq::require(fs::file_size(argv[1])<=1024*1024,"SINQ bridge config too large");
-    std::ifstream config(argv[1]);const auto j=sinq::parse_bridge_json(config);const auto r=sinq::parse_bridge_request(j);
+    std::ifstream config(argv[1]);auto j=sinq::parse_bridge_json(config);
+    const bool score_many=j.value("operation",std::string())=="score-many";
+    json score_items=json::array();
+    std::vector<sinq::bridge_request> score_requests;
+    if(score_many) {
+        sinq::require(j.contains("score_items") && j.at("score_items").is_array() &&
+            !j.at("score_items").empty() && j.at("score_items").size()<=1024,"invalid score-many candidate budget");
+        score_items=j.at("score_items");j.erase("score_items");j["operation"]="score";
+        sinq::require(!j.contains("payload") && !j.contains("scales"),"score-many payload must be per candidate");
+        std::vector<std::string> ids;
+        for(const auto & item:score_items) {
+            sinq::require(item.is_object() && item.contains("candidate_id") && item.contains("payload") &&
+                (item.size()==2 || (item.size()==3 && item.contains("scales"))),"invalid score-many candidate fields");
+            const auto id=item.at("candidate_id").get<std::string>();
+            sinq::require(!id.empty() && std::find(ids.begin(),ids.end(),id)==ids.end(),"duplicate/empty score-many candidate ID");
+            ids.push_back(id);auto single=j;single["payload"]=item.at("payload");
+            if(item.contains("scales"))single["scales"]=item.at("scales");
+            score_requests.push_back(sinq::parse_bridge_request(single));
+        }
+    }
+    const auto r=score_many?score_requests.front():sinq::parse_bridge_request(j);
     auto *ctx=ggml_init({1024,nullptr,true});ggml_free(ctx);
     const size_t row_bytes=ggml_row_size(r.codec,r.columns);
     const size_t cells=size_t(r.rows)*r.columns;
@@ -124,6 +144,12 @@ int main(int argc,char**argv) try {
         if(r.search.held_out)validation=floats(r.validation,size_t(r.validation_samples)*r.columns,r.workspace);
     }
     if(r.operation=="score") {
+        if(!score_many)score_requests.push_back(r);
+        json scores=json::array();
+        const auto scoring_start=std::chrono::steady_clock::now();
+        double score_compute_seconds=0;
+        for(size_t score_index=0;score_index<score_requests.size();++score_index) {
+        const auto & r=score_requests[score_index];
         const size_t per=row_bytes+size_t(r.columns)*4+2*sizeof(double);
         const size_t base_resident=source_bytes+w.size()*4+(x.size()+validation.size())*4+size_t(r.columns)*32;
         const size_t scratch=size_t(r.columns)*sizeof(double);
@@ -142,6 +168,7 @@ int main(int argc,char**argv) try {
         for(int64_t first=0;first<r.rows;first+=slab) {
             const auto rows=std::min(slab,r.rows-first);const auto count=size_t(rows)*row_bytes;
             f.read((char*)packed.data(),count);sinq::require(bool(f)&&ggml_validate_row_data(r.codec,packed.data(),count),"SINQ score invalid native payload");
+            const auto compute_start=std::chrono::steady_clock::now();
             sinq::parallel_for(rows,scoring_threads,[&](int64_t begin,int64_t end){
                 for(int64_t row=begin;row<end;++row)
                     ggml_get_type_traits(r.codec)->to_float(packed.data()+row*row_bytes,dq.data()+row*r.columns,r.columns);
@@ -154,8 +181,17 @@ int main(int argc,char**argv) try {
                 train.add(train_rows[size_t(row)]);
                 if(r.search.held_out)val.add(validation_rows[size_t(row)]);
             }
+            score_compute_seconds+=std::chrono::duration<double>(std::chrono::steady_clock::now()-compute_start).count();
         }
         const auto text=json({{"schema_version",2},{"objective",r.search.objective==sinq::local_objective::output_l1?"output_l1":"output_mse"},{"train_score",train.value/double(r.rows)},{"validation_score",r.search.held_out?json(val.value/double(r.rows)):json(nullptr)},{"encode_count",0}}).dump(2)+"\n";
+        if(!score_many) {write(r.output,text.data(),text.size());std::cout<<text;return 0;}
+        scores.push_back({{"candidate_id",score_items.at(score_index).at("candidate_id")},{"score",json::parse(text)}});
+        }
+        const auto text=json({{"schema_version",2},{"operation","score-many"},{"scores",scores},
+            {"native_compute_seconds",score_compute_seconds},
+            {"native_scoring_seconds_inclusive",std::chrono::duration<double>(std::chrono::steady_clock::now()-scoring_start).count()},
+            {"source_bytes_read",source_bytes},{"activation_bytes_read",(x.size()+validation.size())*sizeof(float)}}).dump(2)+"\n";
+        sinq::require(text.size()<=r.max_output_bytes,"SINQ score-many output byte budget exceeded");
         write(r.output,text.data(),text.size());std::cout<<text;return 0;
     }
     const auto temporary=fs::path(r.output+".partial");

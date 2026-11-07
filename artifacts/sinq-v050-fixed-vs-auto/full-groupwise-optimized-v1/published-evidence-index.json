@@ -1,0 +1,41 @@
+{
+  "purpose": "Lossless small archives of large assignment/checkpoint JSON; GGUFs/logits and temporary score TSVs stay local. Restore these archives beside progress.json when replaying evidence.",
+  "artifacts": [
+    {
+      "path": "selection\\T340\\checkpoint.json.gz",
+      "compression": "gzip",
+      "compressed_bytes": 1485975,
+      "compressed_sha256": "a4fbe5d1c091c6783fb635c4b953c1cf21c1e86f1bd4134f3f5d7db43f802deb",
+      "uncompressed_bytes": 69424631,
+      "uncompressed_sha256": "37673fe5097110afc60adb356f7b9be577a0a9d6dce842761c122d2157592168",
+      "restores_exactly": "checkpoint.json"
+    },
+    {
+      "path": "selection\\T340\\selection.json.gz",
+      "compression": "gzip",
+      "compressed_bytes": 1344486,
+      "compressed_sha256": "8e3d1c02cb64736cb555993bf7f1d8fc2bb146680fa88c1995ea8f5b54c327a0",
+      "uncompressed_bytes": 69165715,
+      "uncompressed_sha256": "a0914f125b2b30ebe023d5c85e98ca570608e13dc1e471c240412f4172d32f5b",
+      "restores_exactly": "selection.json"
+    },
+    {
+      "path": "selection\\T425\\checkpoint.json.gz",
+      "compression": "gzip",
+      "compressed_bytes": 1479120,
+      "compressed_sha256": "4ebc1d54287c8072e075f2030b6ad5a2e20314c76cb5725e34319e2a8867ebe0",
+      "uncompressed_bytes": 69421747,
+      "uncompressed_sha256": "6c4058e7de8f7b8cd980f161e20608084bc639905a2ce4fad4d792240424f20d",
+      "restores_exactly": "checkpoint.json"
+    },
+    {
+      "path": "selection\\T425\\selection.json.gz",
+      "compression": "gzip",
+      "compressed_bytes": 1337560,
+      "compressed_sha256": "b700c475021319573c3fb1411a81294d9433c540c53922bcac9d6f0a0f078dd2",
+      "uncompressed_bytes": 69161074,
+      "uncompressed_sha256": "aad91e4dbe63f7ef97bac03b5cbe9dcd2d0ee2e866a5189e9ba1c599f1cc0dae",
+      "restores_exactly": "selection.json"
+    }
+  ]
+}

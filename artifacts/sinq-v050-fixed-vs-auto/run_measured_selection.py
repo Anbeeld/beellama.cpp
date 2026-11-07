@@ -10,7 +10,8 @@ import tools.sinq.optimizer.kl as kl
 import tools.sinq.optimizer.stages as stages
 parser=argparse.ArgumentParser();parser.add_argument('config');parser.add_argument('--report-directory',type=Path,default=ROOT/'report');parser.add_argument('--resume',action='store_true');args=parser.parse_args()
 REPORT=args.report_directory.resolve();REPORT.mkdir(parents=True,exist_ok=True)
-CONFIG=Path(args.config).resolve();cfg=load_config(CONFIG,'select');label=Path(cfg['output_directory']).name;recipe='T340' if '/T340/' in cfg['output_directory'].replace('\\','/') else 'T425'
+CONFIG=Path(args.config).resolve();cfg=load_config(CONFIG,'select');label=Path(cfg['output_directory']).name;recipe=next((part for part in Path(cfg['output_directory']).parts if part in ('T340','T425')),None)
+if recipe is None:raise ValueError('measured A/B output path must identify T340 or T425')
 BASE_OUT=REPORT/f'{recipe}-{label}-select-runtime.json';BASE_LOG=REPORT/f'{recipe}-{label}-select.log';OUT=BASE_OUT;LOG=BASE_LOG;retry=0;run_dir=Path(cfg['output_directory'])
 while OUT.exists() or LOG.exists():
  retry+=1;OUT=REPORT/f'{recipe}-{label}-select-runtime-retry{retry}.json';LOG=REPORT/f'{recipe}-{label}-select-retry{retry}.log'

@@ -1,0 +1,310 @@
+{
+  "scope": "Measured select_config stage, not the post-invocation report hash scans; real local scorer controls exclude one-time input setup.",
+  "large_reference_hash_bytes": 0,
+  "microbenchmarks": {
+    "T340": {
+      "before_seconds": 612.2412940999493,
+      "after_seconds": 142.5135327000171,
+      "stage_speedup": 4.29602215663745,
+      "before_source": {
+        "calls": 27,
+        "seconds": 284.12357090006117,
+        "bytes_hashed": 483858829152,
+        "bytes_read": 483858829152
+      },
+      "after_source": {
+        "calls": 1,
+        "seconds": 10.79767959995661,
+        "bytes_hashed": 17920697376,
+        "bytes_read": 17920697376
+      },
+      "before_baseline": {
+        "calls": 14,
+        "seconds": 32.747787599801086,
+        "bytes_hashed": 53445817152,
+        "bytes_read": 53445817152
+      },
+      "after_baseline": {
+        "calls": 1,
+        "seconds": 2.6635923999128863,
+        "bytes_hashed": 3817558368,
+        "bytes_read": 3817558368
+      },
+      "before_file_hash_input_bytes": 599245879600,
+      "after_file_hash_input_bytes": 70410100049,
+      "before_tensor_hash_input_bytes": 216380136448,
+      "after_tensor_hash_input_bytes": 29334610944,
+      "before_canonical_assemblies": 3,
+      "after_canonical_assemblies": 2,
+      "after_native_candidate_responses": 3,
+      "after_native_candidate_response_seconds": 1.4516596999019384,
+      "before_gguf_file_bytes_materialized": 11460471360,
+      "after_gguf_write_bytes": 7640314240,
+      "before_temp_write_syscall_bytes": "not measured; output lengths above are not physical I/O counters",
+      "before_parent_peak_working_set_bytes": 42812776448,
+      "after_parent_peak_working_set_bytes": 23524536320,
+      "before_vram_peak_bytes": {
+        "GPU-5e87a39a-204c-4054-14a8-5b97ae4f16fd": 3675258880,
+        "GPU-5f3a3f44-a860-109d-a6e5-c9972f0f9842": 235929600
+      },
+      "after_vram_peak_bytes": {
+        "GPU-5e87a39a-204c-4054-14a8-5b97ae4f16fd": 7377780736,
+        "GPU-5f3a3f44-a860-109d-a6e5-c9972f0f9842": 0
+      },
+      "before_cache": {
+        "registry_receipts": {
+          "hits": 5704,
+          "misses": 3224
+        },
+        "model_kl": {
+          "hits": 0,
+          "misses": 2
+        }
+      },
+      "after_cache": {
+        "registry_receipts": {
+          "hits": 4962,
+          "misses": 3224
+        }
+      },
+      "selected_model_sha256": "77dec45d5ecee35bbf5815b0c0199a3b79735049c8382fd88f96fa3e650b1264",
+      "study_coverage": "2 scores, 0 complete groups; profiling only",
+      "native_version_note": "Two-score after pilot used v1 private-diagonal prototype; production v2 canonical identity elision has separate all-role parity and 13-score concurrency qualification."
+    },
+    "T425": {
+      "before_seconds": 606.4353380999528,
+      "after_seconds": 182.55855720001273,
+      "stage_speedup": 3.3218675004948524,
+      "before_source": {
+        "calls": 27,
+        "seconds": 285.3454486003611,
+        "bytes_hashed": 483858829152,
+        "bytes_read": 483858829152
+      },
+      "after_source": {
+        "calls": 1,
+        "seconds": 10.565192099893466,
+        "bytes_hashed": 17920697376,
+        "bytes_read": 17920697376
+      },
+      "before_baseline": {
+        "calls": 14,
+        "seconds": 41.086020799935795,
+        "bytes_hashed": 66766211904,
+        "bytes_read": 66766211904
+      },
+      "after_baseline": {
+        "calls": 1,
+        "seconds": 3.0384025999810547,
+        "bytes_hashed": 4769015136,
+        "bytes_read": 4769015136
+      },
+      "before_file_hash_input_bytes": 627729842962,
+      "after_file_hash_input_bytes": 83670688030,
+      "before_tensor_hash_input_bytes": 228749074432,
+      "after_tensor_hash_input_bytes": 32188981248,
+      "before_canonical_assemblies": 3,
+      "after_canonical_assemblies": 2,
+      "after_native_candidate_responses": 3,
+      "after_native_candidate_response_seconds": 1.5027306999545544,
+      "before_gguf_file_bytes_materialized": 14314840992,
+      "after_gguf_write_bytes": 9543227328,
+      "before_temp_write_syscall_bytes": "not measured; output lengths above are not physical I/O counters",
+      "before_parent_peak_working_set_bytes": 44714790912,
+      "after_parent_peak_working_set_bytes": 24476045312,
+      "before_vram_peak_bytes": {
+        "GPU-5e87a39a-204c-4054-14a8-5b97ae4f16fd": 4579131392,
+        "GPU-5f3a3f44-a860-109d-a6e5-c9972f0f9842": 235929600
+      },
+      "after_vram_peak_bytes": {
+        "GPU-5e87a39a-204c-4054-14a8-5b97ae4f16fd": 9185525760,
+        "GPU-5f3a3f44-a860-109d-a6e5-c9972f0f9842": 235929600
+      },
+      "before_cache": {
+        "registry_receipts": {
+          "hits": 5704,
+          "misses": 3224
+        },
+        "model_kl": {
+          "hits": 0,
+          "misses": 2
+        }
+      },
+      "after_cache": {
+        "registry_receipts": {
+          "hits": 4961,
+          "misses": 3224
+        }
+      },
+      "selected_model_sha256": "64f38b34d7acdbd2d33aec6f8529e57b1aa61d972c1fb7d0ed7979412e69c9ac",
+      "study_coverage": "2 scores, 0 complete groups; profiling only",
+      "native_version_note": "Two-score after pilot used v1 private-diagonal prototype; production v2 canonical identity elision has separate all-role parity and 13-score concurrency qualification."
+    }
+  },
+  "local_bounded_controls": {
+    "T340": {
+      "output_l1": {
+        "tensor_count": 3,
+        "candidates_per_tensor": 13,
+        "before_seconds": 34.716610400006175,
+        "after_seconds": 27.962937299977057,
+        "speedup": 1.241522306028797,
+        "source_bytes_copied_before": 2617245696,
+        "source_bytes_copied_after": 201326592,
+        "source_fresh_hash_bytes_before": 2617245696,
+        "source_fresh_hash_bytes_after": 201326592,
+        "native_process_launches_before": 39,
+        "native_process_launches_after": 3,
+        "native_process_seconds_inclusive_before": 32.03330140025355,
+        "native_process_seconds_inclusive_after": 27.756465800106525,
+        "native_compute_seconds_after": 26.3853763,
+        "native_compute_seconds_before": "not measured separately from process startup and native I/O",
+        "score_difference_max": 0.0,
+        "scope": "Three real tensors and original 256-row captures; not the full historical 248-tensor stage."
+      },
+      "output_mse": {
+        "tensor_count": 3,
+        "candidates_per_tensor": 13,
+        "before_seconds": 110.57016710017342,
+        "after_seconds": 104.39137069997378,
+        "speedup": 1.0591887658794885,
+        "source_bytes_copied_before": 2617245696,
+        "source_bytes_copied_after": 201326592,
+        "source_fresh_hash_bytes_before": 2617245696,
+        "source_fresh_hash_bytes_after": 201326592,
+        "native_process_launches_before": 39,
+        "native_process_launches_after": 3,
+        "native_process_seconds_inclusive_before": 107.98918739962392,
+        "native_process_seconds_inclusive_after": 104.18398010008968,
+        "native_compute_seconds_after": 102.9056458,
+        "native_compute_seconds_before": "not measured separately from process startup and native I/O",
+        "score_difference_max": 0.0,
+        "scope": "Three real tensors and original 256-row captures; not the full historical 248-tensor stage."
+      }
+    },
+    "T425": {
+      "output_l1": {
+        "tensor_count": 3,
+        "candidates_per_tensor": 13,
+        "before_seconds": 33.555073800031096,
+        "after_seconds": 28.357672400190495,
+        "speedup": 1.1832802539818355,
+        "source_bytes_copied_before": 2617245696,
+        "source_bytes_copied_after": 201326592,
+        "source_fresh_hash_bytes_before": 2617245696,
+        "source_fresh_hash_bytes_after": 201326592,
+        "native_process_launches_before": 39,
+        "native_process_launches_after": 3,
+        "native_process_seconds_inclusive_before": 30.89447670034133,
+        "native_process_seconds_inclusive_after": 28.153643000056036,
+        "native_compute_seconds_after": 26.7578287,
+        "native_compute_seconds_before": "not measured separately from process startup and native I/O",
+        "score_difference_max": 0.0,
+        "scope": "Three real tensors and original 256-row captures; not the full historical 248-tensor stage."
+      },
+      "output_mse": {
+        "tensor_count": 3,
+        "candidates_per_tensor": 13,
+        "before_seconds": 112.05086369987112,
+        "after_seconds": 107.2263817001367,
+        "speedup": 1.0449934234769414,
+        "source_bytes_copied_before": 2617245696,
+        "source_bytes_copied_after": 201326592,
+        "source_fresh_hash_bytes_before": 2617245696,
+        "source_fresh_hash_bytes_after": 201326592,
+        "native_process_launches_before": 39,
+        "native_process_launches_after": 3,
+        "native_process_seconds_inclusive_before": 109.45657729997765,
+        "native_process_seconds_inclusive_after": 107.02230530022644,
+        "native_compute_seconds_after": 105.6441407,
+        "native_compute_seconds_before": "not measured separately from process startup and native I/O",
+        "score_difference_max": 0.0,
+        "scope": "Three real tensors and original 256-row captures; not the full historical 248-tensor stage."
+      }
+    }
+  },
+  "attribution_note": "Phase seconds are explicitly inclusive. exclusive_seconds are per-thread wall seconds; concurrent worker times are not additive top-level wall attribution.",
+  "one_complete_group_control": {
+    "recipe": "T340",
+    "group": "blk.0.attn_gate.weight",
+    "candidate_count": 13,
+    "before_seconds": 2256.794959699968,
+    "after_seconds": 112.27464369998779,
+    "speedup": 20.100664632082136,
+    "all_assignment_mean_scores_exact": true,
+    "selected_model_sha256": "3364bb34a9b58dbff0653317fb7ece1a55f0093701c9f8ec5d6710fc4f612bb0",
+    "before_canonical_assemblies": 14,
+    "after_canonical_assemblies": 2,
+    "before_source_hash": {
+      "calls": 104,
+      "seconds": 1063.6849126003217,
+      "bytes_hashed": 1863752527104,
+      "bytes_read": 1863752527104
+    },
+    "after_source_hash": {
+      "calls": 1,
+      "seconds": 10.699583500041626,
+      "bytes_hashed": 17920697376,
+      "bytes_read": 17920697376
+    },
+    "scope": "Same GPU0, frozen selection inputs and 13 identical assignments. Legacy original snapshot with telemetry only; prepared canonical v2. Additional benchmark does not change either frozen full-study assignment."
+  },
+  "held_out": {
+    "T340/wikitext2": {
+      "models": 6,
+      "runner_wall_seconds": 1132.4796895000618,
+      "native_process_elapsed_seconds": 1096.297398300143,
+      "orchestration_including_setup_hashes_and_summaries_seconds": 36.182291199918836,
+      "reference_setup_only_seconds": "not measured separately",
+      "reference_new_hash_bytes": 0,
+      "reference_inference_input_bytes_by_format": 885608987184,
+      "reference_inference_input_bytes_scope": "logical complete input-format size per successful arm, not OS physical disk-I/O counters",
+      "peak_working_set_bytes": 4832657408,
+      "gpu_global_peak_mib": 5967,
+      "temp_disk_peak_bytes": "not measured",
+      "physical_disk_write_bytes": "not measured"
+    },
+    "T340/ptb": {
+      "models": 6,
+      "runner_wall_seconds": 339.15174489992205,
+      "native_process_elapsed_seconds": 310.9241364999907,
+      "orchestration_including_setup_hashes_and_summaries_seconds": 28.22760839993134,
+      "reference_setup_only_seconds": "not measured separately",
+      "reference_new_hash_bytes": 0,
+      "reference_inference_input_bytes_by_format": 0,
+      "reference_inference_input_bytes_scope": "logical complete input-format size per successful arm, not OS physical disk-I/O counters",
+      "peak_working_set_bytes": 4520153088,
+      "gpu_global_peak_mib": 5967,
+      "temp_disk_peak_bytes": "not measured",
+      "physical_disk_write_bytes": "not measured"
+    },
+    "T425/wikitext2": {
+      "models": 6,
+      "runner_wall_seconds": 1133.5576251000166,
+      "native_process_elapsed_seconds": 1092.7024163001915,
+      "orchestration_including_setup_hashes_and_summaries_seconds": 40.85520879982505,
+      "reference_setup_only_seconds": "not measured separately",
+      "reference_new_hash_bytes": 0,
+      "reference_inference_input_bytes_by_format": 885608987184,
+      "reference_inference_input_bytes_scope": "logical complete input-format size per successful arm, not OS physical disk-I/O counters",
+      "peak_working_set_bytes": 5735772160,
+      "gpu_global_peak_mib": 6817,
+      "temp_disk_peak_bytes": "not measured",
+      "physical_disk_write_bytes": "not measured"
+    },
+    "T425/ptb": {
+      "models": 6,
+      "runner_wall_seconds": 336.5755922999233,
+      "native_process_elapsed_seconds": 303.1760450003203,
+      "orchestration_including_setup_hashes_and_summaries_seconds": 33.399547299603,
+      "reference_setup_only_seconds": "not measured separately",
+      "reference_new_hash_bytes": 0,
+      "reference_inference_input_bytes_by_format": 0,
+      "reference_inference_input_bytes_scope": "logical complete input-format size per successful arm, not OS physical disk-I/O counters",
+      "peak_working_set_bytes": 5420924928,
+      "gpu_global_peak_mib": 6817,
+      "temp_disk_peak_bytes": "not measured",
+      "physical_disk_write_bytes": "not measured"
+    }
+  }
+}

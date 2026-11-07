@@ -23,15 +23,35 @@ def source_identity():
     return digest({p.relative_to(ROOT).as_posix():file_digest(p) for p in paths if p.is_file()})
 
 
-def _manifest(config,key):
+def _fingerprint(path,verified_inputs=None):
+    return verified_inputs.fingerprint(path) if verified_inputs is not None else file_digest(path)
+
+
+def _runtime_fingerprint(binary,verified_inputs=None):
+    from .implementation import native_runtime_fingerprint
+    if verified_inputs is None:return native_runtime_fingerprint({'bridge':binary})
+    executable=Path(binary).resolve()
+    files={'executable':verified_inputs.fingerprint(executable)}
+    for label,directory in [('bin',executable.parent),('lib',executable.parent.parent/'lib'),('lib64',executable.parent.parent/'lib64')]:
+        if not directory.is_dir():continue
+        for path in sorted(directory.iterdir()):
+            if not path.is_file() or not (path.suffix.lower() in ('.dll','.so','.dylib') or '.so.' in path.name):continue
+            if label!='bin' and not path.name.startswith(('ggml','llama','libggml','libllama')):continue
+            if not path.resolve().is_relative_to(executable.parent.parent):raise ValueError('native dependency escapes configured prefix')
+            files[label+'/'+path.name]=verified_inputs.fingerprint(path)
+    return {'bridge':files}
+
+
+def _manifest(config,key,verified_inputs=None):
     p=Path(config[key]);value=read_json(p)
     validated=native_codec.validate_activations(config['native_bridge'],p,config['source_gguf'],threads=config['threads'])
-    if validated['source_sha256']!=file_digest(config['source_gguf']):raise ValueError('activation/source identity changed')
+    if validated['source_sha256']!=_fingerprint(config['source_gguf'],verified_inputs):raise ValueError('activation/source identity changed')
     return value,validated
 
 
-def preflight(config,*,resume=None):
+def preflight(config,*,resume=None,verified_inputs=None):
     source=Path(config['source_gguf']).resolve();q=config['native_quantizer'];b=config['budgets']
+    if verified_inputs is not None:verified_inputs.fingerprint(source)
     if not Path(config['native_bridge']).is_file():raise ValueError('configured native bridge unavailable')
     reader=gguf.GGUFReader(source)
     try:
@@ -46,9 +66,9 @@ def preflight(config,*,resume=None):
         stock=None
         if 'stock_baseline_manifest' in config:
             from .baseline import load_baseline
-            locked,_=load_baseline(config['stock_baseline_manifest'],source,threads=config['threads'])
+            locked,_=load_baseline(config['stock_baseline_manifest'],source,threads=config['threads'],verified_inputs=verified_inputs)
             imatrix=q.get('imatrix_path')
-            if locked['imatrix_sha256']!=(file_digest(imatrix) if imatrix else None):raise ValueError('imatrix differs from stock baseline')
+            if locked['imatrix_sha256']!=(_fingerprint(imatrix,verified_inputs) if imatrix else None):raise ValueError('imatrix differs from stock baseline')
             if any(locked['recipe'].get(n)!=qt for n,qt in recipe.items()):raise ValueError('recipe differs from stock allocation')
             stock=dict(manifest=str(Path(config['stock_baseline_manifest']).resolve()),manifest_sha256=file_digest(config['stock_baseline_manifest']),
                 baseline_sha256=locked['baseline_sha256'],recipe_sha256=locked['recipe_sha256'])
@@ -67,9 +87,9 @@ def preflight(config,*,resume=None):
         if not names or len(set(names))!=len(names) or len(names)>b['max_tensors']:raise ValueError('resolved target count invalid/exceeds limit')
         activations=None;validation=None;pairing=None
         if 'activation_manifest' in config:
-            manifest,activations=_manifest(config,'activation_manifest')
+            manifest,activations=_manifest(config,'activation_manifest',verified_inputs)
             if 'validation_manifest' in config:
-                val,validation=_manifest(config,'validation_manifest');pairing=validate_pairing(read_json(config['pairing_manifest']),manifest,val)
+                val,validation=_manifest(config,'validation_manifest',verified_inputs);pairing=validate_pairing(read_json(config['pairing_manifest']),manifest,val)
         if ('validation_manifest' in config)!=('pairing_manifest' in config):raise ValueError('validation and pairing must be supplied together')
         output=Path(config['output_directory']).resolve()
         if resume is not None:
@@ -110,50 +130,58 @@ def preflight(config,*,resume=None):
                 parameters=lock if isinstance(lock,dict) else (item['parameters'] if manual.get('defaults') or manual.get('overrides') else None),
                 locked=lock is not None,locked_candidate_id=locked_id))
         if total>b['max_output_bytes'] or files>b['max_files']:raise ValueError('preflight artifact/file budget exceeded')
-        return dict(schema_version=2,operation='generate',status='PLAN',source_sha256=file_digest(source),
+        return dict(schema_version=2,operation='generate',status='PLAN',source_sha256=_fingerprint(source,verified_inputs),
             resolved_candidates=config['resolved_candidates'],tensor_details=details,expected_output_bytes_upper_bound=total,
             expected_files_upper_bound=files,activation=activations,validation=validation,pairing=pairing,stock_baseline=stock)
     finally:reader.data._mmap.close()
 
 
-def _importance(path,name,k):
+def _importance(path,name,k,*,reader=None,tensors=None):
     if path is None:return None
-    reader=gguf.GGUFReader(path)
+    owned=reader is None
+    if owned:reader=gguf.GGUFReader(path)
     try:
-        tensors={t.name:t for t in reader.tensors}
+        if tensors is None:tensors={t.name:t for t in reader.tensors}
         if name+'.in_sum2' not in tensors or name+'.counts' not in tensors:raise ValueError('imatrix lacks selected tensor: '+name)
         sums=tensors[name+'.in_sum2'];counts=tensors[name+'.counts']
         if sums.tensor_type!=gguf.GGMLQuantizationType.F32 or counts.tensor_type!=gguf.GGMLQuantizationType.F32:raise ValueError('imatrix requires floating sums/counts')
         a=np.asarray(sums.data,dtype=np.float32).reshape(-1);c=np.asarray(counts.data,dtype=np.float32).reshape(-1)
         if a.size!=k or c.size!=1 or not np.isfinite(a).all() or not np.isfinite(c).all() or c[0]<=0 or (a<0).any():raise ValueError('invalid imatrix statistics')
         return (a/c[0]).astype('<f4')
-    finally:reader.data._mmap.close()
+    finally:
+        if owned:reader.data._mmap.close()
 
 
-def _generate(config,plan,output,store,completed,save,verify,bindings,corpus_identity,identity_sha256):
+def _generate(config,plan,output,store,completed,save,verify,bindings,corpus_identity,identity_sha256,verified_inputs=None):
     from .generation_state import validate_completed
-    from .implementation import native_runtime_fingerprint
-    reader=gguf.GGUFReader(config['source_gguf']);started=time.monotonic()
+    started=time.monotonic()
     source_sha=plan['source_sha256'];q=config['native_quantizer'];b=config['budgets']
     recipe_sha=plan['stock_baseline']['recipe_sha256'] if plan['stock_baseline'] else digest(q['recipe'])
-    imatrix_sha=file_digest(q['imatrix_path']) if 'imatrix_path' in q else None
-    producer=dict(binary_sha256=file_digest(config['native_bridge']),source_sha256=source_identity(),
-        runtime_sha256=digest(native_runtime_fingerprint({'bridge':config['native_bridge']})))
+    imatrix_sha=_fingerprint(q['imatrix_path'],verified_inputs) if 'imatrix_path' in q else None
+    producer=dict(binary_sha256=_fingerprint(config['native_bridge'],verified_inputs),source_sha256=source_identity(),
+        runtime_sha256=digest(_runtime_fingerprint(config['native_bridge'],verified_inputs)))
     run=dict(schema_version=2,source_gguf=os.path.relpath(Path(config['source_gguf']).resolve(),output),source_sha256=source_sha,
         cache='cache',recipe_sha256=recipe_sha,imatrix_sha256=imatrix_sha,producer=producer,config_sha256=digest(config),tensors=dict(completed),
         corpus_bindings=bindings,generation_identity_sha256=identity_sha256,status='PASS',purpose='correctness integration; no quality conclusions')
     if corpus_identity is not None:run['corpus_partitions']=dict(manifest=os.path.relpath(Path(config['corpus_partitions_manifest']).resolve(),output),
         file_sha256=file_digest(config['corpus_partitions_manifest']),identity=corpus_identity)
     if plan['stock_baseline']:run['stock_baseline']={**plan['stock_baseline'],'manifest':os.path.relpath(plan['stock_baseline']['manifest'],output)}
+    reader=None;imatrix_reader=None
     try:
+        reader=gguf.GGUFReader(config['source_gguf'])
+        imatrix_tensors=None
+        if q.get('imatrix_path') is not None:
+            imatrix_reader=gguf.GGUFReader(q['imatrix_path'])
+            imatrix_tensors={t.name:t for t in imatrix_reader.tensors}
         tensors={t.name:t for t in reader.tensors}
         for details in plan['tensor_details']:
+            if verified_inputs is not None:verified_inputs.check()
             name=details['name'];tensor=tensors[name];n,k=details['shape']
             if name in completed:
                 validate_completed(store,run,name,tensor,details,config);continue
             with tempfile.TemporaryDirectory(prefix='sinq-generate-') as temp:
                 d=Path(temp);weights=d/'source.bin';native_codec.copy_tensor_bytes(tensor,weights,max_bytes=b['workspace_bytes'])
-                importance=_importance(q.get('imatrix_path'),name,k)
+                importance=_importance(q.get('imatrix_path'),name,k,reader=imatrix_reader,tensors=imatrix_tensors)
                 if importance is not None:importance.tofile(d/'imatrix.f32')
                 base=dict(schema_version=2,weights=str(weights),source_type=tensor.tensor_type.name.lower(),rows=n,columns=k,
                     codec=details['qtype'].lower(),threads=config['threads'],workspace_bytes=b['workspace_bytes'],max_output_bytes=b['max_output_bytes'])
@@ -189,7 +217,7 @@ def _generate(config,plan,output,store,completed,save,verify,bindings,corpus_ide
                 run['tensors'][name]=dict(stock=stock_id,candidates=records,selected=locked_id or stock_id,locked=locked_id,
                     skipped=details['skipped'],encode_count=found['encode_count'],workspace_bytes=found.get('workspace_bytes',0),elapsed_seconds=found.get('elapsed_seconds',0))
             save(run['tensors'])
-        if file_digest(config['source_gguf'])!=source_sha:raise ValueError('source mutated during generation')
+        if _fingerprint(config['source_gguf'],verified_inputs)!=source_sha:raise ValueError('source mutated during generation')
         run['diagnostics']=dict(selected_tensors=len(run['tensors']),candidate_count=sum(len(r['candidates']) for r in run['tensors'].values()),
             skipped_count=sum(len(r['skipped']) for r in run['tensors'].values()),execution_policy=dict(threads=config['threads']),
             elapsed_seconds=time.monotonic()-started,cache=dict(store.index_stats))
@@ -202,7 +230,9 @@ def _generate(config,plan,output,store,completed,save,verify,bindings,corpus_ide
         summary=output/'generation-summary.json'
         if not summary.exists():atomic_write(summary,canonical(dict(schema_version=2,run_sha256=run['checksum'],**diagnostics)),max_bytes=b['max_output_bytes'])
         return run
-    finally:reader.data._mmap.close()
+    finally:
+        if imatrix_reader is not None:imatrix_reader.data._mmap.close()
+        if reader is not None:reader.data._mmap.close()
 
 
 def generate(config,*,resume=None):

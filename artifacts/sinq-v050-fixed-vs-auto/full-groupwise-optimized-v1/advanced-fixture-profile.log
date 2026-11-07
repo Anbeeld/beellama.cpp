@@ -1,0 +1,6 @@
+[transformers] The fast path is not available because one of the required library is not installed. Falling back to torch implementation. To install follow https://github.com/fla-org/flash-linear-attention#installation and https://github.com/Dao-AILab/causal-conv1d
+Writing model shards:   0%|          | 0/1 [00:00<?, ?it/s]Writing model shards: 100%|##########| 1/1 [00:00<00:00, 130.78it/s]
+Unknown RoPE type: default
+fixture checkpoint: 15 sites, 12 roles, 7 rows/site, CPU F32 execution, f32-rounded bulk weights, exact FP32 norm fixture=False, K/V heads=2/4
+Loading weights:   0%|          | 0/27 [00:00<?, ?it/s]Loading weights: 100%|##########| 27/27 [00:00<00:00, 16963.18it/s]
+BOUNDED_PROFILE_AND_DETERMINISTIC_SCORES_PASS

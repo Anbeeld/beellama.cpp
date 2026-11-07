@@ -36,8 +36,9 @@ def full_vocabulary_kl(reference_logits,candidate_logits,reference_targets,candi
     return max(0.0,value)
 
 
-def _model_identity(path, reference=False):
-    r=gguf.GGUFReader(path)
+def _model_identity(path, reference=False, *, reader=None):
+    owned=reader is None
+    r=gguf.GGUFReader(path) if owned else reader
     try:
         if reference and any(t.tensor_type not in (gguf.GGMLQuantizationType.BF16,gguf.GGMLQuantizationType.F32) for t in r.tensors):
             raise ValueError('reference must contain BF16/F32 original weights, not quantized/F16 weights')
@@ -45,7 +46,7 @@ def _model_identity(path, reference=False):
         return digest({k:v.contents() for k,v in r.fields.items()
             if k.startswith('tokenizer.') or k.startswith(architecture+'.') or k=='general.architecture'})
     finally:
-        r.data._mmap.close()
+        if owned:r.data._mmap.close()
 
 
 def _header(path, max_tokens):
@@ -162,10 +163,17 @@ class NativeKLEvaluator:
             atomic_write(output.with_suffix(output.suffix+'.json'),canonical_json(manifest),max_bytes=1 << 20)
         return manifest
 
+    @observe_phase('canonical_native_kl_evaluation')
     def evaluate(self,model,corpus,reference,*,split='selection',cache_directory=None):
         validate_split(split)
-        self._check_runtime()
         reference=Path(reference)
+        # Selection references retain their existing content-verification policy.
+        # Held-out large references must use the dedicated guarded final runner,
+        # never fall through to this evaluator's generic digest checks.
+        if (reference.name.casefold() == 'qwen3.5-9b-wikitext2-64k-bf16.logits' or
+                reference.stat().st_size >= 147601497864):
+            raise ValueError('large held-out reference requires TrustedLargeReference and the final-evaluation runner; no automatic reference hash')
+        self._check_runtime()
         sidecar=reference.with_suffix(reference.suffix+'.json')
         if sidecar.stat().st_size>1 << 20 or Path(corpus).stat().st_size>self.max_tokens*1024:
             raise ValueError('reference manifest/corpus byte budget exceeded')

@@ -13,24 +13,81 @@ from .schemas import load_config
 
 
 def _stage_summary(stage,config,result,started,caches):
-    from .resources import file_digest,peak_rss_bytes,digest
-    inputs={key:file_digest(config[key]) for key in ('source_gguf','native_bridge','native_loader','candidate_manifest',
-        'capture_manifest','activation_manifest','validation_manifest','pairing_manifest','stock_baseline_manifest',
-        'corpus_partitions_manifest','selection_manifest','evaluator','artifact_manifest') if key in config and Path(config[key]).is_file()}
-    imatrix=config.get('native_quantizer',{}).get('imatrix_path')
-    if imatrix:inputs['imatrix']=file_digest(imatrix)
+    import hashlib
+    from .resources import peak_rss_bytes,digest,observe_phase
+    limits=config.get('budgets',{})
+    remaining_bytes=limits.get('max_output_bytes',8<<20)
+    remaining_files=limits.get('max_files',20)
+
+    def small_file(path,expected=None,identity=None):
+        nonlocal remaining_bytes,remaining_files
+        path=Path(path)
+        if path.is_symlink():raise ValueError('unexpected symlink in summary inventory')
+        size=path.stat().st_size
+        if remaining_files<1 or size>remaining_bytes:raise ValueError('summary inventory resource budget exceeded')
+        # Limit the read as well as the stat check: a growing file cannot cause
+        # unbounded summary I/O. No process-global stat/digest cache is involved.
+        count=0;body=[];hasher=hashlib.sha256()
+        with observe_phase('file_hash') as measured:
+            with path.open('rb') as stream:
+                while block:=stream.read(min(1<<20,remaining_bytes-count+1)):
+                    count+=len(block)
+                    if count>remaining_bytes:raise ValueError('summary inventory byte budget exceeded')
+                    hasher.update(block)
+                    if measured is not None:measured['bytes_hashed']+=len(block)
+                    if identity is not None:body.append(block)
+            sha=hasher.hexdigest()
+        if expected is not None and sha!=expected:raise ValueError('summary manifest digest mismatch')
+        if identity is not None:
+            value=json.loads(b''.join(body))
+            if value.get('checksum')!=identity or digest({k:v for k,v in value.items() if k!='checksum'})!=identity:
+                raise ValueError('summary run identity mismatch')
+        remaining_files-=1;remaining_bytes-=count
+        return dict(path=str(path),bytes=count,sha256=sha,fresh_content_hash=True,hash_scope='fresh-bounded-file-hash')
+
+    inputs={};input_evidence={}
+    if 'source_gguf' in config:
+        sha=result.get('source_sha256')
+        if sha is not None:
+            inputs['source_gguf']=sha
+            input_evidence['source_gguf']=dict(path=str(config['source_gguf']),sha256=sha,fresh_content_hash=False,
+                hash_scope='live-stage-verification-event-not-fresh-hash')
+        elif stage=='plan' and Path(config['source_gguf']).is_file():
+            # Compatibility for preflight callers without a returned identity.
+            evidence=small_file(config['source_gguf'])
+            inputs['source_gguf']=evidence['sha256'];input_evidence['source_gguf']=evidence
+    for key in ('candidate_manifest','capture_manifest','activation_manifest','validation_manifest','pairing_manifest',
+            'stock_baseline_manifest','corpus_partitions_manifest','selection_manifest','evaluator','artifact_manifest'):
+        if key in config and Path(config[key]).is_file():
+            evidence=small_file(config[key],expected=result.get(key+'_sha256'))
+            inputs[key]=evidence['sha256'];input_evidence[key]=evidence
     output=Path(config['output_directory']) if 'output_directory' in config else None
     artifacts={}
-    if stage!='plan' and output is not None and output.is_dir():
-        for path in output.rglob('*'):
-            if path.is_symlink():raise ValueError('unexpected symlink in stage output')
+    # Only stage-owned publications, never caches, logs, native runtimes,
+    # references, or arbitrary files left in a resumed run directory.
+    names={'generate':('run-manifest.json','run-identity.json'),
+        'select':('selection.json','checkpoint.json','run-identity.json'),
+        'score':('scores.json',)}.get(stage,())
+    primary={'generate':'run-manifest.json','select':'selection.json','score':'scores.json'}.get(stage)
+    if output is not None:
+        for name in names:
+            path=output/name
+            if path.is_symlink():raise ValueError('unexpected symlink in summary inventory')
             if path.is_file():
-                if len(artifacts)>=config['budgets']['max_files']:raise ValueError('stage output file budget exceeded')
-                artifacts[path.relative_to(output).as_posix()]=dict(bytes=path.stat().st_size,sha256=file_digest(path))
+                artifacts[name]=small_file(path,expected=digest(result) if name==primary else None,
+                    identity=result.get('run_identity_sha256') if name=='run-identity.json' else None)
+    model=None;published=None
+    if stage=='select' and output is not None:
+        model=output/'best.gguf';published=result.get('best_gguf_sha256')
     elif stage=='assemble':
-        path=Path(config['output_gguf']);artifacts[path.name]=dict(bytes=path.stat().st_size,sha256=file_digest(path))
+        model=Path(config['output_gguf']);published=result.get('output_sha256')
+    if model is not None and published is not None:
+        if model.is_symlink():raise ValueError('unexpected symlink in summary inventory')
+        artifacts[model.name]=dict(path=str(model),bytes=model.stat().st_size,sha256=published,
+            fresh_content_hash=False,hash_scope='published-output-evidence-not-fresh-hash')
     tensors=result.get('tensors',{})
-    return dict(stage=stage,config_sha256=digest(config),input_hashes=inputs,artifacts=artifacts,
+    return dict(stage=stage,config_sha256=digest(config),input_hashes=inputs,input_hash_evidence=input_evidence,artifacts=artifacts,
+        inventory_scope='Explicit stage publications and bounded input metadata only; not a directory census or fresh model verification',
         selected_tensors=len(result.get('assignment',tensors)),
         candidate_count=sum(len(r['candidates']) for r in tensors.values()),skipped_candidate_count=sum(len(r.get('skipped',[])) for r in tensors.values()),
         parameter_space=config.get('resolved_candidates'),execution_policy={k:config[k] for k in ('threads','device','reference_dtype','cuda_devices','memory_policy') if k in config},

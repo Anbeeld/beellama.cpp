@@ -106,12 +106,13 @@ class ThreadingTests(unittest.TestCase):
         tensor = types.SimpleNamespace(name='weight')
         reader = types.SimpleNamespace(tensors=[tensor], data=types.SimpleNamespace(_mmap=Mock()))
         config = dict(scorer_name='local_output_l1',method='local', budgets={'workspace_bytes': 1024, 'max_output_bytes': 4096}, native_bridge=str(self.binary), capture_manifest='capture', validation_manifest='validation', pairing_manifest='pair', selection_policy='held_out', objective='output_l1', candidate_manifest='manifest', threads=7, device='cpu')
-        with patch.object(cli, '_stock_baseline'), patch.object(cli, '_json', return_value={}), patch.object(cli, 'validate_pairing'), patch.object(cli, 'candidate_for', return_value=candidate), patch.object(cli, 'file_digest', return_value='a'*64), patch.object(cli, '_new_output', return_value=self.root), patch.object(cli, 'atomic_write'), patch('gguf.GGUFReader', return_value=reader), patch.object(native_codec, 'validate_activations', return_value={'tensors': {'weight': {}}}) as validate, patch.object(native_codec, 'rescore', return_value={'train_score':1.0,'validation_score':2.0}) as rescore:
+        with patch.object(cli, '_stock_baseline'), patch.object(cli, '_json', return_value={}), patch.object(cli, 'validate_pairing'), patch.object(cli, 'candidate_for', return_value=candidate), patch.object(cli, 'file_digest', return_value='a'*64), patch.object(cli, '_new_output', return_value=self.root), patch.object(cli, 'atomic_write'), patch('gguf.GGUFReader', return_value=reader), patch.object(native_codec, 'validate_activations', return_value={'tensors': {'weight': {}}}) as validate, patch.object(native_codec, 'rescore_many', return_value=[('id', {'train_score':1.0,'validation_score':2.0})]) as rescore:
             cli._score(config, {'source_sha256':'a'*64,'tensors': {'weight': {'stock': 'id', 'candidates': []}}}, None, 'source')
         self.assertEqual(validate.call_count, 4)
         for call in validate.call_args_list:
             self.assertEqual(call.kwargs['threads'], 7)
         self.assertEqual(rescore.call_args.kwargs['threads'], 7)
+        self.assertEqual(rescore.call_args.args[1], [('id', candidate)])
 
     def test_export_cli_threads_option_and_default(self):
         base = ['export', '--checkpoint', 'checkpoint', '--gguf', 'source', '--tensor-list', 'list', '--tokens', 'tokens', '--output', 'out']

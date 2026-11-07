@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 import time
 import gguf
-from .resources import atomic_write, canonical_json, digest, file_digest, file_digests, tensor_hashes, reject_alias
+from .resources import atomic_write, canonical_json, digest, file_digest, file_digests, tensor_hashes, reject_alias, observe_phase
 
 PREFIX='beellama.qk_sinq.'
 
@@ -20,11 +20,15 @@ def _metadata(reader):
             and k not in ('general.file_type','general.quantization_version')}
 
 
-def _inspect(source, baseline, recipe, *, threads=1):
-    readers=[]
+@observe_phase('baseline_tensor_inventory')
+def _inspect(source, baseline, recipe, *, threads=1, readers=None):
+    owned=readers is None
+    if owned:readers=[]
     try:
-        for path in (source,baseline):
-            r=gguf.GGUFReader(path); readers.append(r)
+        if owned:
+            for path in (source,baseline):readers.append(gguf.GGUFReader(path))
+        if len(readers)!=2:raise ValueError('baseline inspection requires source and stock readers')
+        for r in readers:
             if r.endianess!=gguf.GGUFEndian.LITTLE or any(k.startswith(('split.',PREFIX)) for k in r.fields) or any(t.name.endswith('.sinq_scale2') for t in r.tensors):
                 raise ValueError('baseline requires untransformed single-file GGUF')
             if r.fields['general.architecture'].contents()!='qwen35':
@@ -52,7 +56,8 @@ def _inspect(source, baseline, recipe, *, threads=1):
                 'qtype':b.tensor_type.name,'source_sha256':hashes['0:'+t.name],'stock_sha256':hashes['1:'+b.name]}
         return records,digest(_metadata(original))
     finally:
-        for r in readers: r.data._mmap.close()
+        if owned:
+            for r in readers:r.data._mmap.close()
 
 
 def _run(command, output, *, timeout, max_output_bytes, threads):
@@ -124,7 +129,8 @@ def lock_baseline(source, baseline, recipe, output, *, quantizer, native_validat
         return manifest
 
 
-def load_baseline(manifest_path, source, *, threads=1):
+@observe_phase('baseline_validation')
+def load_baseline(manifest_path, source, *, threads=1, verified_inputs=None, baseline_override=None, readers=None):
     """Validate the entire closure, using bounded independent hash workers."""
     if isinstance(threads,bool) or not isinstance(threads,int) or not 1<=threads<=1024:
         raise ValueError('baseline threads must be an integer in 1..1024')
@@ -151,15 +157,20 @@ def load_baseline(manifest_path, source, *, threads=1):
     if not isinstance(manifest['baseline_path'],str) or Path(manifest['baseline_path']).is_absolute():
         raise ValueError('baseline path must be relative to manifest')
     baseline=(manifest_path.parent/manifest['baseline_path']).resolve()
+    if baseline_override is not None:
+        if verified_inputs is None:raise ValueError('baseline snapshot override requires guarded verification')
+        baseline=Path(baseline_override).resolve()
     paths={'source_sha256':source,'baseline_sha256':baseline}
     expected={key:manifest[key] for key in paths}
-    if file_digests(paths,threads=threads)!=expected:
+    fingerprints = (lambda: {key:verified_inputs.fingerprint(path) for key,path in paths.items()}) if verified_inputs is not None else (lambda:file_digests(paths,threads=threads))
+    if fingerprints()!=expected:
         raise ValueError('baseline/source checkpoint digest mismatch')
     if digest(manifest['recipe'])!=manifest['recipe_sha256']:
         raise ValueError('baseline recipe digest mismatch')
-    records,metadata=_inspect(source,baseline,manifest['recipe'],threads=threads)
+    if readers is not None and verified_inputs is None:raise ValueError('borrowed baseline inventories require a guarded session')
+    records,metadata=_inspect(source,baseline,manifest['recipe'],threads=threads,readers=readers)
     if records!=manifest['tensors'] or metadata!=manifest['metadata_sha256']:
         raise ValueError('baseline tensor or metadata closure mismatch')
-    if file_digests(paths,threads=threads)!=expected:
+    if fingerprints()!=expected:
         raise ValueError('baseline/source changed during readback')
     return manifest,baseline

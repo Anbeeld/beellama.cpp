@@ -49,7 +49,7 @@ int main(int argc, char ** argv) {
             "static results_perplexity perplexity(llama_context * ctx, const common_params & params, const int32_t n_ctx)",
             "static bool decode_helper");
     const std::string full = slice_between(perplexity,
-            "static bool perplexity_full(llama_context * ctx, const common_params & params)",
+            "bool perplexity_full(llama_context * ctx, const common_params & params) {",
             "// satisfies -Wmissing-declarations");
     const std::string kl = slice_between(perplexity,
             "static bool kl_divergence(llama_context * ctx, const common_params & params)",

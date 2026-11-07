@@ -11,10 +11,17 @@ PREFIX='beellama.qk_sinq.'
 SINQ_FIELDS={'version','transform','tensors','recipes','producer'}
 
 
-def audit_assembled_model(model,source,stock_manifest,store,assignment,*,threads=1):
+def audit_assembled_model(model,source,stock_manifest,store,assignment,*,threads=1,prepared=None):
     from .baseline import load_baseline
-    manifest,stock=load_baseline(stock_manifest,source,threads=threads)
-    original=gguf.GGUFReader(source);baseline=gguf.GGUFReader(stock);output=gguf.GGUFReader(model)
+    if prepared is not None:
+        prepared.check(source,stock_manifest)
+        manifest=prepared.manifest
+        original,baseline=prepared.reader,prepared.stock_reader
+    else:
+        manifest,stock=load_baseline(stock_manifest,source,threads=threads)
+        original,baseline=gguf.GGUFReader(source),gguf.GGUFReader(stock)
+    # The output always receives an independent complete inventory/hash audit.
+    output=gguf.GGUFReader(model)
     try:
         maps=[{t.name:t for t in r.tensors} for r in (original,baseline,output)]
         src,base,result=maps
@@ -52,4 +59,7 @@ def audit_assembled_model(model,source,stock_manifest,store,assignment,*,threads
             tensor_inventory_sha256=digest(inventory),base_tensor_count=len(src),conditioned_tensor_count=len(conditioned),
             payload_bpw=payload*8/count,file_bpw=Path(model).stat().st_size*8/count,parameter_count=count)
     finally:
-        for r in (original,baseline,output):r.data._mmap.close()
+        output.data._mmap.close()
+        if prepared is not None:prepared.check()
+        else:
+            for r in (original,baseline):r.data._mmap.close()

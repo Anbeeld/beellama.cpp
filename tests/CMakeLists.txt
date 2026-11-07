@@ -934,7 +934,7 @@ target_compile_features(test-sinq-bridge-config PRIVATE cxx_std_17)
 target_link_libraries(test-sinq-bridge-config PRIVATE llama-sinq-optimizer)
 add_test(NAME test-sinq-bridge-config COMMAND test-sinq-bridge-config)
 if (Python3_Interpreter_FOUND)
-    foreach(optimizer_test blockwise fisher optimizer-config optimizer-contract optimizer-selection candidate-cache assembly groupwise-kl kl-execution kl-provenance stock-baseline optimizer-integrity score-context observation implementation corpora generation-resume threading backend-scoring reference-loader execution-policy)
+    foreach(optimizer_test blockwise fisher optimizer-config optimizer-contract optimizer-selection candidate-cache assembly groupwise-kl kl-execution kl-provenance stock-baseline optimizer-integrity score-context observation implementation corpora generation-resume threading backend-scoring reference-loader execution-policy final-stock-control trusted-reference prepared-assembly prepared-kl groupwise-progress summary-inventory generation-input-session)
         add_test(NAME test-sinq-optimizer-${optimizer_test} COMMAND ${Python3_EXECUTABLE}
             ${PROJECT_SOURCE_DIR}/tests/test-sinq-${optimizer_test}.py)
         set_tests_properties(test-sinq-optimizer-${optimizer_test} PROPERTIES
@@ -945,6 +945,6 @@ if (Python3_Interpreter_FOUND)
 endif()
 
 if (Python3_Interpreter_FOUND AND LLAMA_BUILD_TOOLS AND LLAMA_BUILD_SINQ_OPTIMIZER)
-    set_tests_properties(test-sinq-optimizer-assembly test-sinq-optimizer-groupwise-kl test-sinq-optimizer-stock-baseline test-sinq-optimizer-generation-resume PROPERTIES
+    set_tests_properties(test-sinq-optimizer-assembly test-sinq-optimizer-groupwise-kl test-sinq-optimizer-stock-baseline test-sinq-optimizer-generation-resume test-sinq-optimizer-generation-input-session PROPERTIES
         ENVIRONMENT "OMP_NUM_THREADS=32;MKL_NUM_THREADS=32;HF_HUB_OFFLINE=1;TRANSFORMERS_OFFLINE=1;SINQ_NATIVE_BIN=$<TARGET_FILE_DIR:llama-quantize>")
 endif()

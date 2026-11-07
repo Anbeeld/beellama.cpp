@@ -1,0 +1,107 @@
+Test project C:/Users/anbee/projects/beellama-v050-sinq/build-sinq-clean
+      Start 106: test-perplexity-plumbing
+ 1/49 Test #106: test-perplexity-plumbing .......................   Passed    0.02 sec
+      Start 142: test-perplexity-full
+ 2/49 Test #142: test-perplexity-full ...........................   Passed    0.35 sec
+      Start 143: test-qk-sinq-numeric
+ 3/49 Test #143: test-qk-sinq-numeric ...........................   Passed    4.21 sec
+      Start 144: test-sinq-activation
+ 4/49 Test #144: test-sinq-activation ...........................   Passed    0.39 sec
+      Start 145: test-sinq-activation-parity
+ 5/49 Test #145: test-sinq-activation-parity ....................   Passed   17.37 sec
+      Start 146: test-sinq-parameters
+ 6/49 Test #146: test-sinq-parameters ...........................   Passed    0.03 sec
+      Start 147: test-qk-sinq-model
+ 7/49 Test #147: test-qk-sinq-model .............................   Passed    8.53 sec
+      Start 148: test-qk-sinq-graph
+ 8/49 Test #148: test-qk-sinq-graph .............................   Passed    0.36 sec
+      Start 149: test-qk-sinq-cpu
+ 9/49 Test #149: test-qk-sinq-cpu ...............................   Passed    4.21 sec
+      Start 150: test-qk-sinq-cuda
+10/49 Test #150: test-qk-sinq-cuda ..............................   Passed    5.41 sec
+      Start 151: test-sinq-reference-identity
+11/49 Test #151: test-sinq-reference-identity ...................   Passed    4.29 sec
+      Start 152: test-sinq-direct-config-e2e
+12/49 Test #152: test-sinq-direct-config-e2e ....................   Passed    1.09 sec
+      Start 153: test-sinq-exporter
+13/49 Test #153: test-sinq-exporter .............................   Passed    1.86 sec
+      Start 154: test-qk-sinq-python-storage
+14/49 Test #154: test-qk-sinq-python-storage ....................   Passed    7.81 sec
+      Start 155: test-sinq-awq-methods
+15/49 Test #155: test-sinq-awq-methods ..........................   Passed    0.02 sec
+      Start 156: test-sinq-candidates
+16/49 Test #156: test-sinq-candidates ...........................   Passed    0.05 sec
+      Start 157: test-sinq-threading
+17/49 Test #157: test-sinq-threading ............................   Passed    0.10 sec
+      Start 158: test-sinq-bridge-config
+18/49 Test #158: test-sinq-bridge-config ........................   Passed    0.02 sec
+      Start 159: test-sinq-optimizer-blockwise
+19/49 Test #159: test-sinq-optimizer-blockwise ..................   Passed    5.33 sec
+      Start 160: test-sinq-optimizer-fisher
+20/49 Test #160: test-sinq-optimizer-fisher .....................   Passed    4.75 sec
+      Start 161: test-sinq-optimizer-optimizer-config
+21/49 Test #161: test-sinq-optimizer-optimizer-config ...........   Passed    0.30 sec
+      Start 162: test-sinq-optimizer-optimizer-contract
+22/49 Test #162: test-sinq-optimizer-optimizer-contract .........   Passed    0.11 sec
+      Start 163: test-sinq-optimizer-optimizer-selection
+23/49 Test #163: test-sinq-optimizer-optimizer-selection ........   Passed    0.23 sec
+      Start 164: test-sinq-optimizer-candidate-cache
+24/49 Test #164: test-sinq-optimizer-candidate-cache ............   Passed    0.96 sec
+      Start 165: test-sinq-optimizer-assembly
+25/49 Test #165: test-sinq-optimizer-assembly ...................   Passed   13.20 sec
+      Start 166: test-sinq-optimizer-groupwise-kl
+26/49 Test #166: test-sinq-optimizer-groupwise-kl ...............   Passed    9.10 sec
+      Start 167: test-sinq-optimizer-kl-execution
+27/49 Test #167: test-sinq-optimizer-kl-execution ...............   Passed    0.32 sec
+      Start 168: test-sinq-optimizer-kl-provenance
+28/49 Test #168: test-sinq-optimizer-kl-provenance ..............   Passed    0.74 sec
+      Start 169: test-sinq-optimizer-stock-baseline
+29/49 Test #169: test-sinq-optimizer-stock-baseline .............   Passed    6.87 sec
+      Start 170: test-sinq-optimizer-optimizer-integrity
+30/49 Test #170: test-sinq-optimizer-optimizer-integrity ........   Passed    7.10 sec
+      Start 171: test-sinq-optimizer-score-context
+31/49 Test #171: test-sinq-optimizer-score-context ..............   Passed    7.84 sec
+      Start 172: test-sinq-optimizer-observation
+32/49 Test #172: test-sinq-optimizer-observation ................   Passed    0.51 sec
+      Start 173: test-sinq-optimizer-implementation
+33/49 Test #173: test-sinq-optimizer-implementation .............   Passed    0.80 sec
+      Start 174: test-sinq-optimizer-corpora
+34/49 Test #174: test-sinq-optimizer-corpora ....................   Passed    0.37 sec
+      Start 175: test-sinq-optimizer-generation-resume
+35/49 Test #175: test-sinq-optimizer-generation-resume ..........   Passed    4.96 sec
+      Start 176: test-sinq-optimizer-threading
+36/49 Test #176: test-sinq-optimizer-threading ..................   Passed    0.48 sec
+      Start 177: test-sinq-optimizer-backend-scoring
+37/49 Test #177: test-sinq-optimizer-backend-scoring ............   Passed    1.60 sec
+      Start 178: test-sinq-optimizer-reference-loader
+38/49 Test #178: test-sinq-optimizer-reference-loader ...........   Passed    4.38 sec
+      Start 179: test-sinq-optimizer-execution-policy
+39/49 Test #179: test-sinq-optimizer-execution-policy ...........   Passed    3.78 sec
+      Start 180: test-sinq-optimizer-final-stock-control
+40/49 Test #180: test-sinq-optimizer-final-stock-control ........   Passed    0.25 sec
+      Start 181: test-sinq-optimizer-trusted-reference
+41/49 Test #181: test-sinq-optimizer-trusted-reference ..........   Passed    1.56 sec
+      Start 182: test-sinq-optimizer-prepared-assembly
+42/49 Test #182: test-sinq-optimizer-prepared-assembly ..........   Passed    0.42 sec
+      Start 183: test-sinq-optimizer-prepared-kl
+43/49 Test #183: test-sinq-optimizer-prepared-kl ................   Passed    0.27 sec
+      Start 184: test-sinq-optimizer-groupwise-progress
+44/49 Test #184: test-sinq-optimizer-groupwise-progress .........   Passed    3.29 sec
+      Start 185: test-sinq-optimizer-summary-inventory
+45/49 Test #185: test-sinq-optimizer-summary-inventory ..........   Passed    1.72 sec
+      Start 186: test-sinq-optimizer-generation-input-session
+46/49 Test #186: test-sinq-optimizer-generation-input-session ...   Passed    2.79 sec
+      Start 189: test-sinq-native-bridge
+47/49 Test #189: test-sinq-native-bridge ........................   Passed   39.72 sec
+      Start 190: test-sinq-local-scoring
+48/49 Test #190: test-sinq-local-scoring ........................   Passed    0.51 sec
+      Start 191: test-sinq-optimizer-e2e
+49/49 Test #191: test-sinq-optimizer-e2e ........................   Passed   42.56 sec
+
+100% tests passed, 0 tests failed out of 49
+
+Label Time Summary:
+main                   =   0.02 sec*proc (1 test)
+python behavior cpu    =  21.66 sec*proc (2 tests)
+
+Total Test time (real) = 224.51 sec

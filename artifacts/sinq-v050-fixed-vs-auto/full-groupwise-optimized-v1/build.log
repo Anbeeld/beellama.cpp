@@ -1,0 +1,89 @@
+[0/1] Re-running CMake...
+-- llama.cpp version: 0.5.0
+CMAKE_BUILD_TYPE=Release
+-- CMAKE_SYSTEM_PROCESSOR: AMD64
+-- CMAKE_GENERATOR_PLATFORM: 
+-- GGML_SYSTEM_ARCH: x86
+-- Including CPU backend
+-- x86 detected
+-- Adding CPU backend variant ggml-cpu: /arch:AVX2 GGML_AVX2;GGML_FMA;GGML_F16C;__BMI2__;GGML_BMI2
+-- CUDA Toolkit found
+-- Using CMAKE_CUDA_ARCHITECTURES=86 CMAKE_CUDA_ARCHITECTURES_NATIVE=86-real
+-- FlashAttention K-V type combinations: f16-f16;bf16-bf16;q8_0-q8_0;q8_0-q6_1;q8_0-q6_0;q8_0-q5_1;q8_0-q5_0;q6_1-q6_1;q6_1-q6_0;q6_0-q6_0;q6_1-q5_1;q6_1-q5_0;q6_0-q5_1;q6_0-q5_0;q6_1-q4_1;q6_1-q4_0;q6_0-q4_1;q6_0-q4_0;q5_1-q5_1;q5_1-q5_0;q5_0-q5_0;q5_1-q4_1;q5_1-q4_0;q5_0-q4_1;q5_0-q4_0;q5_1-q3_1;q5_1-q3_0;q5_0-q3_1;q5_0-q3_0;q4_1-q4_1;q4_1-q4_0;q4_0-q4_0;q4_1-q3_1;q4_1-q3_0;q4_0-q3_1;q4_0-q3_0;q4_1-q2_1;q4_1-q2_0s;q4_0-q2_1;q4_0-q2_0s;q3_1-q3_1;q3_1-q3_0;q3_0-q3_0;q3_1-q2_1;q3_1-q2_0s;q3_0-q2_1;q3_0-q2_0s;q2_1-q2_1;q2_1-q2_0s;q2_0s-q2_0s
+-- Could NOT find NCCL (missing: NCCL_LIBRARY NCCL_INCLUDE_DIR) 
+-- Warning: NCCL not found, performance for multiple CUDA GPUs will be suboptimal
+-- Including CUDA backend
+-- Using RPC backend
+--   RDMA transport disabled
+-- Including RPC backend
+-- ggml version: 0.28.0
+-- ggml commit:  ff7994f35
+-- Fetching BoringSSL version 0.20261020.0
+CMake Warning at common/CMakeLists.txt:30 (message):
+  Git index not found in git repository.
+
+
+-- Generating embedded license file for target: llama-app
+-- Configuring done (2.7s)
+-- Generating done (0.7s)
+-- Build files have been written to: C:/Users/anbee/projects/beellama-v050-sinq/build-sinq-clean
+[1/15] Building CXX object common\CMakeFiles\llama-common-base.dir\build-info.cpp.obj
+[2/15] Linking CXX static library common\llama-common-base.lib
+[3/15] Building C object ggml\src\CMakeFiles\ggml-base.dir\ggml.c.obj
+[4/15] Linking CXX static library ggml\src\ggml-base.lib
+[5/15] Building CXX object src\CMakeFiles\llama.dir\llama.cpp.obj
+[6/15] Building CXX object tools\perplexity\CMakeFiles\llama-perplexity-impl.dir\perplexity.cpp.obj
+[7/15] Building CXX object tools\sinq\CMakeFiles\llama-sinq-groupwise.dir\groupwise-evaluator.cpp.obj
+[8/15] Building CXX object src\CMakeFiles\llama.dir\llama-quant.cpp.obj
+C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\include\type_traits(1680): warning C4244: 'argument': conversion from 'unsigned __int64' to 'int', possible loss of data
+C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\include\type_traits(1680): note: the template instantiation context (the oldest one first) is
+C:\Users\anbee\projects\beellama-v050-sinq\src\llama-quant.cpp(302): note: see reference to function template instantiation 'std::thread &std::vector<std::thread,std::allocator<std::thread>>::emplace_back<llama_tensor_dequantize_impl::<lambda_1db969dacb6f483255da34cc1ce4835b>&,ggml_type&,const uint8_t*,float*,size_t&>(llama_tensor_dequantize_impl::<lambda_1db969dacb6f483255da34cc1ce4835b> &,ggml_type &,const uint8_t *&&,float *&&,size_t &)' being compiled
+C:\Users\anbee\projects\beellama-v050-sinq\src\llama-quant.cpp(302): note: see the first reference to 'std::vector<std::thread,std::allocator<std::thread>>::emplace_back' in 'llama_tensor_dequantize_impl'
+C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\include\vector(924): note: see reference to function template instantiation '_Ty &std::vector<_Ty,std::allocator<_Ty>>::_Emplace_one_at_back<llama_tensor_dequantize_impl::<lambda_1db969dacb6f483255da34cc1ce4835b>&,ggml_type&,const unsigned char*,float*,size_t&>(llama_tensor_dequantize_impl::<lambda_1db969dacb6f483255da34cc1ce4835b> &,ggml_type &,const unsigned char *&&,float *&&,size_t &)' being compiled
+        with
+        [
+            _Ty=std::thread
+        ]
+C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\include\vector(845): note: see reference to function template instantiation '_Ty &std::vector<_Ty,std::allocator<_Ty>>::_Emplace_back_with_unused_capacity<llama_tensor_dequantize_impl::<lambda_1db969dacb6f483255da34cc1ce4835b>&,ggml_type&,const unsigned char*,float*,size_t&>(llama_tensor_dequantize_impl::<lambda_1db969dacb6f483255da34cc1ce4835b> &,ggml_type &,const unsigned char *&&,float *&&,size_t &)' being compiled
+        with
+        [
+            _Ty=std::thread
+        ]
+C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\include\vector(863): note: see reference to function template instantiation 'void std::_Default_allocator_traits<_Alloc>::construct<_Ty,llama_tensor_dequantize_impl::<lambda_1db969dacb6f483255da34cc1ce4835b>&,ggml_type&,const unsigned char*,float*,size_t&>(_Alloc &,_Objty *const ,llama_tensor_dequantize_impl::<lambda_1db969dacb6f483255da34cc1ce4835b> &,ggml_type &,const unsigned char *&&,float *&&,size_t &)' being compiled
+        with
+        [
+            _Alloc=std::allocator<std::thread>,
+            _Ty=std::thread,
+            _Objty=std::thread
+        ]
+C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\include\xmemory(732): note: see reference to function template instantiation 'std::thread::thread<llama_tensor_dequantize_impl::<lambda_1db969dacb6f483255da34cc1ce4835b>&,ggml_type&,_T,float*,uint64_t&,0>(_Fn,ggml_type &,_T &&,float *&&,uint64_t &)' being compiled
+        with
+        [
+            _T=const uint8_t *,
+            _Fn=llama_tensor_dequantize_impl::<lambda_1db969dacb6f483255da34cc1ce4835b> &
+        ]
+C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\include\thread(93): note: see reference to function template instantiation 'void std::thread::_Start<llama_tensor_dequantize_impl::<lambda_1db969dacb6f483255da34cc1ce4835b>&,ggml_type&,_Ty,float*,size_t&>(_Fn,ggml_type &,_Ty &&,float *&&,size_t &)' being compiled
+        with
+        [
+            _Ty=const uint8_t *,
+            _Fn=llama_tensor_dequantize_impl::<lambda_1db969dacb6f483255da34cc1ce4835b> &
+        ]
+C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\include\thread(76): note: see reference to function template instantiation 'unsigned int (__cdecl *std::thread::_Get_invoke<std::thread::_Start::_Tuple,0,1,2,3,4>(std::integer_sequence<size_t,0,1,2,3,4>) noexcept)(void *) noexcept' being compiled
+C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\include\thread(67): note: see reference to function template instantiation 'unsigned int std::thread::_Invoke<_Tuple,0,1,2,3,4>(void *) noexcept' being compiled
+        with
+        [
+            _Tuple=std::thread::_Start::_Tuple
+        ]
+C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\include\thread(60): note: see reference to function template instantiation 'void std::invoke<llama_tensor_dequantize_impl::<lambda_1db969dacb6f483255da34cc1ce4835b>,ggml_type,const uint8_t*,_Ty*,unsigned __int64>(_Callable &&,_Ty1 &&,const uint8_t *&&,_Ty *&&,unsigned __int64 &&) noexcept(false)' being compiled
+        with
+        [
+            _Ty=float,
+            _Callable=llama_tensor_dequantize_impl::<lambda_1db969dacb6f483255da34cc1ce4835b>,
+            _Ty1=ggml_type
+        ]
+[9/15] Linking CXX static library src\llama.lib
+[10/15] Linking CXX static library tools\perplexity\llama-perplexity-impl.lib
+[11/15] Linking CXX executable bin\test-perplexity-full.exe
+[12/15] Linking CXX executable bin\llama-sinq-model.exe
+[13/15] Linking CXX executable bin\llama-sinq-groupwise.exe
+[14/15] Linking CXX executable bin\llama-perplexity.exe

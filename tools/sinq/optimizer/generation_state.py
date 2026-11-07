@@ -2,12 +2,13 @@
 import hashlib
 import json
 import math
+import os
+from contextlib import ExitStack
 from pathlib import Path
 import numpy as np
 from .resources import atomic_write,canonical_json,digest,file_digest
 from .run_state import implementation_fingerprint,open_run,selection_lock
 from .corpora import load_corpora,bind_corpora
-from .implementation import native_runtime_fingerprint
 from .schemas import read_json
 
 
@@ -27,16 +28,16 @@ def capture_bindings(config):
     return result
 
 
-def generation_identity(config,plan):
-    from .generate import source_identity
+def generation_identity(config,plan,verified_inputs=None):
+    from .generate import source_identity,_fingerprint,_runtime_fingerprint
     paths={key:config[key] for key in ('source_gguf','activation_manifest','validation_manifest','pairing_manifest',
         'native_bridge','stock_baseline_manifest','corpus_partitions_manifest') if key in config}
     if 'imatrix_path' in config['native_quantizer']:paths['imatrix']=config['native_quantizer']['imatrix_path']
     implementation=implementation_fingerprint()
     identity=dict(schema_version=2,kind='sinq-generation-run',config_sha256=digest(config),
-        bindings={key:file_digest(path) for key,path in sorted(paths.items())},native_source_sha256=source_identity(),
+        bindings={key:_fingerprint(path,verified_inputs) for key,path in sorted(paths.items())},native_source_sha256=source_identity(),
         stock_baseline=plan['stock_baseline'],implementation=implementation,implementation_sha256=implementation['checksum'],
-        native_runtime=native_runtime_fingerprint({'bridge':config['native_bridge']}))
+        native_runtime=_runtime_fingerprint(config['native_bridge'],verified_inputs))
     identity['checksum']=digest(identity)
     return identity
 
@@ -79,14 +80,39 @@ def validate_completed(store,run,name,tensor,details,config):
     if type(record['elapsed_seconds']) not in (int,float) or not math.isfinite(record['elapsed_seconds']) or record['elapsed_seconds']<0:raise ValueError('checkpoint elapsed diagnostic mismatch')
 
 
-def run_generation(config,resume,execute):
+def run_generation(config,resume,execute,verified_inputs=None):
+    if verified_inputs is not None or os.name!='nt':
+        return _run_generation(config,resume,execute,verified_inputs)
+    from .prepared import VerifiedInputs
+    from .generate import _runtime_fingerprint
+    # Only acquisition failures may fall back. Once execution starts, guard or
+    # integrity failures propagate; they never switch to a weaker session.
+    with ExitStack() as stack:
+        try:
+            inputs=stack.enter_context(VerifiedInputs())
+            inputs.fingerprint(config['source_gguf'])
+            if 'imatrix_path' in config['native_quantizer']:
+                inputs.fingerprint(config['native_quantizer']['imatrix_path'])
+            if 'stock_baseline_manifest' in config:
+                manifest_path=Path(config['stock_baseline_manifest']).resolve()
+                inputs.fingerprint(manifest_path)
+                stock=read_json(manifest_path,max_bytes=64<<20)
+                inputs.fingerprint((manifest_path.parent/stock['baseline_path']).resolve(),stock['baseline_sha256'])
+            _runtime_fingerprint(config['native_bridge'],inputs)
+        except OSError:
+            stack.close()
+            return _run_generation(config,resume,execute,None)
+        return _run_generation(config,resume,execute,inputs)
+
+
+def _run_generation(config,resume,execute,verified_inputs=None):
     from .generate import preflight
     from .cache import CandidateStore
-    plan=preflight(config,resume=resume)
+    plan=preflight(config,resume=resume,verified_inputs=verified_inputs)
     bindings=capture_bindings(config)
     corpus=load_corpora(config['corpus_partitions_manifest']) if 'corpus_partitions_manifest' in config else None
     corpus_identity=bind_corpora(corpus,bindings)
-    identity=generation_identity(config,plan)
+    identity=generation_identity(config,plan,verified_inputs)
     inputs=[config[key] for key in ('source_gguf','activation_manifest','validation_manifest','pairing_manifest',
         'native_bridge','stock_baseline_manifest','corpus_partitions_manifest') if key in config]
     read=read_json
@@ -120,7 +146,8 @@ def run_generation(config,resume,execute):
             data=canonical_json(state);output_budget(checkpoint,data)
             atomic_write(checkpoint,data,max_bytes=budget['max_output_bytes'],immutable=False)
         def verify(run):
-            if generation_identity(config,preflight(config,resume=output))!=identity:
+            if verified_inputs is not None:verified_inputs.check()
+            if generation_identity(config,preflight(config,resume=output,verified_inputs=verified_inputs),verified_inputs)!=identity:
                 raise ValueError('generation inputs or implementation changed during execution')
             output_budget(output/'run-manifest.json',canonical_json(run))
-        return execute(config,plan,output,store,completed,save,verify,bindings,corpus_identity,identity['checksum'])
+        return execute(config,plan,output,store,completed,save,verify,bindings,corpus_identity,identity['checksum'],verified_inputs=verified_inputs)
