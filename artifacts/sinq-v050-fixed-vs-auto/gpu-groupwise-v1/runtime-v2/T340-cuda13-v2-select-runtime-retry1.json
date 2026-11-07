@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "status": "PASS",
+  "recipe": "T340",
+  "method": "cuda13-v2",
+  "config_path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\gpu-groupwise-v1\\configs-v2\\T340-cuda13.json",
+  "config_sha256": "c550ad80115a47ce604d8cab241a78d0ec2c280cc68f52efd1c9337c1e2556c9",
+  "normalized_config_sha256": "e282fc342fd51d3fb868e6d656d0bee42aba64830db24b69832d45b9b13f5c56",
+  "selection_run_identity_sha256": "e9f499f603508e68a383b518df97e16c74d14a79f5efaee0950591c1f9ceaf54",
+  "best_model_sha256": "3364bb34a9b58dbff0653317fb7ece1a55f0093701c9f8ec5d6710fc4f612bb0",
+  "selection_sha256": "e26e2beddac7d4267f91939ffd06fd855848b768acb4af95f2301637ec69f76f",
+  "selection_total_time_sec": 164.33021440007724,
+  "assembly_time_sec": 0.0,
+  "assembly_including_validation_sec": 0,
+  "native_validation_time_sec": 0,
+  "native_kl_evaluation_time_sec": 0,
+  "native_evaluator_process_time_sec": 0,
+  "native_evaluations": 0,
+  "assembly_calls": [],
+  "native_validation_calls": [],
+  "native_evaluator_process_calls": [],
+  "selection_evaluations": 13,
+  "budget_exhausted": true,
+  "trace_events": 14,
+  "threads": 32,
+  "cpu_only": false,
+  "performance": {
+    "file_hash": {
+      "calls": 6390,
+      "seconds": 104.0037549979752,
+      "bytes_hashed": 159477904241
+    },
+    "native_runtime_fingerprint": {
+      "calls": 2,
+      "seconds": 0.3939252001000568,
+      "bytes_hashed": 0
+    },
+    "tensor_hash": {
+      "calls": 854,
+      "seconds": 35.71132190001663,
+      "bytes_hashed": 21716319232
+    },
+    "implementation_fingerprint": {
+      "calls": 1,
+      "seconds": 0.2558275000192225,
+      "bytes_hashed": 0
+    }
+  },
+  "cache": {
+    "registry_receipts": {
+      "hits": 3472,
+      "misses": 3224
+    }
+  },
+  "resume": true,
+  "parent_peak_working_set_bytes": 23520800768,
+  "vram_start_bytes": {
+    "GPU-5e87a39a-204c-4054-14a8-5b97ae4f16fd": 13631488,
+    "GPU-5f3a3f44-a860-109d-a6e5-c9972f0f9842": 0
+  },
+  "vram_peak_bytes": {
+    "GPU-5e87a39a-204c-4054-14a8-5b97ae4f16fd": 13631488,
+    "GPU-5f3a3f44-a860-109d-a6e5-c9972f0f9842": 0
+  },
+  "vram_sampling_errors": [],
+  "vram_scope": "device memory.used sampled every 2 s, includes other allocations; not exact transient/process peak",
+  "selected_model_bytes": 3820157120,
+  "selected_model_recorded_sha256": "3364bb34a9b58dbff0653317fb7ece1a55f0093701c9f8ec5d6710fc4f612bb0",
+  "subprocess_calls": [
+    {
+      "stage": "selection",
+      "command": [
+        "nvidia-smi",
+        "--query-gpu=index,uuid,name,pci.bus_id,driver_version",
+        "--format=csv,noheader"
+      ],
+      "wall_seconds": 0.09100160002708435,
+      "peak_child_working_set_bytes": 0,
+      "return_code": 0,
+      "captured_log_sha256": "30235d1341d6c323b3801d6115425f3171c37cb0c3914e3c60b88a2d968639b3"
+    },
+    {
+      "stage": "selection",
+      "command": [
+        "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\build-sinq-clean\\bin\\llama-perplexity.exe",
+        "--list-devices"
+      ],
+      "wall_seconds": 0.3009616999188438,
+      "peak_child_working_set_bytes": 0,
+      "return_code": 0,
+      "captured_log_sha256": "2fc42f2ae58887187f847a32d7d16a5b97e261856078404127a317a88ad0822c"
+    }
+  ]
+}

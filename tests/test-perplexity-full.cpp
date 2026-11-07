@@ -14,6 +14,7 @@ bool perplexity_full_compare_batch(int, const float *, const uint16_t *, const i
 bool perplexity_full_nll_batch(int, const float *, const int *, int, int, double *);
 bool perplexity_full_same_file(const std::string &, const std::string &);
 
+int perplexity_full_top1(int n_vocab, const float * logits);
 double perplexity_full_encode(int n_vocab, const float * logits, uint16_t * encoded, int target);
 std::array<double, 4> perplexity_full_compare(int n_vocab, const float * logits, const uint16_t * encoded, int target);
 
@@ -41,6 +42,9 @@ int main() {
     std::filesystem::remove(linked); std::filesystem::remove(original);
     std::vector<uint16_t> encoded(8);
     const float uniform[] = {0, 0, 0};
+    const float top1_probe[] = {-1, 4, 4};
+    require(perplexity_full_top1(3, uniform) == 0, "top1 tie uses first token");
+    require(perplexity_full_top1(3, top1_probe) == 1, "candidate top1 token ID");
     require(std::abs(perplexity_full_encode(3, uniform, encoded.data(), 2) - std::log(3.0)) < 1e-6,
             "uniform reference NLL");
     auto result = perplexity_full_compare(3, uniform, encoded.data(), 2);

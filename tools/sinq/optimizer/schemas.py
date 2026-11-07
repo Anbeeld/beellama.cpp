@@ -262,6 +262,26 @@ def validate_config(value,stage):
     return c
 
 
+def native_kl_execution(value):
+    """Native KL numerical policy; CPU remains the default, CUDA is explicit/full-only."""
+    _fields(value,(),('backend','cuda_device','gpu_layers','cache_type_k','cache_type_v',
+        'flash_attention','cublas_compute_type','mmq_precision'),'native KL execution')
+    p=copy.deepcopy(value)
+    _choice(p.setdefault('backend','cpu'),('cpu','cuda'),'backend')
+    for name in ('cache_type_k','cache_type_v'):
+        _choice(p.setdefault(name,'f16'),('f32','f16','bf16'),'native '+name)
+    _choice(p.setdefault('flash_attention','auto'),('on','off','auto'),'flash_attention')
+    _choice(p.setdefault('cublas_compute_type','auto'),('auto','f32','f16','bf16'),'cublas_compute_type')
+    _choice(p.setdefault('mmq_precision','auto'),('auto','q4','q8'),'mmq_precision')
+    if p['backend']=='cuda':
+        if 'cuda_device' not in p:raise ValueError('CUDA requires an explicit cuda_device index')
+        _integer(p['cuda_device'],'cuda_device',0)
+        if p.setdefault('gpu_layers','all')!='all':raise ValueError('CUDA KL requires full model offload')
+    elif 'cuda_device' in p or 'gpu_layers' in p or p['cublas_compute_type']!='auto' or p['mmq_precision']!='auto':
+        raise ValueError('CPU execution cannot request CUDA placement/compute controls')
+    return p
+
+
 def validate_pairing(pairing,train_manifest,val_manifest):
     """Pair independently verified capture partitions; final test cannot enter either."""
     _fields(pairing,('schema_version','source_sha256','split_method','train','validation'),label='pairing')

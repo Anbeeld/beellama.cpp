@@ -1,0 +1,431 @@
+{
+  "schema_version": 1,
+  "status": "PASS",
+  "label": "FIXED-ANCHOR",
+  "recipe": "T425",
+  "kind": "fixed",
+  "arm": "T425-W064-S050",
+  "model_path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\fixed\\T425\\T425-W064-S050\\model.gguf",
+  "model_sha256_before": "ca88481fdc5e9b009af3d69593af2a9bdcc881075408f4aca33f93416a8d5153",
+  "model_sha256_after": "ca88481fdc5e9b009af3d69593af2a9bdcc881075408f4aca33f93416a8d5153",
+  "selection_manifest_sha256": null,
+  "source_sha256": "da9df48e961a191aafca383628f983da4552a0a61c1257b93e1d678966f1c4af",
+  "raw_corpus_path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050\\data\\ptb.test.txt",
+  "raw_corpus_sha256": "dd65dff31e70846b2a6030a87482edcd5d199130cdcfa1f3dccbb033728deee0",
+  "normalized_input_path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\data\\ptb-common-file-normalized.txt",
+  "normalized_input_sha256": "91a2fa938d84baddaa05a3d67a5698924847eca8a4e7faa1518f3fd11c3d6d73",
+  "token_stream_path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\data\\ptb-test-native.u32",
+  "token_stream_sha256": "b6d8698e4f22e42171e7c55e2ce3b8995edca7bdc5379c79477cb22408caae33",
+  "target_count": 98776,
+  "reference_path": null,
+  "reference_sha256": null,
+  "reference_status": "NO_PTB_BF16_DISTRIBUTION_REFERENCE; no full-vocabulary KL/top-1 claim",
+  "context": 65536,
+  "batch": 512,
+  "microbatch": 256,
+  "cache_type_k": "bf16",
+  "cache_type_v": "bf16",
+  "flash_attention": "on",
+  "gpu_uuid": "GPU-5f3a3f44-a860-109d-a6e5-c9972f0f9842",
+  "visible_cuda_devices": 1,
+  "threads_argument": 16,
+  "command": [
+    "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\build-sinq-clean\\bin\\llama-perplexity.exe",
+    "-m",
+    "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\fixed\\T425\\T425-W064-S050\\model.gguf",
+    "-f",
+    "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\data\\ptb-common-file-normalized.txt",
+    "--ppl-full",
+    "-c",
+    "65536",
+    "-b",
+    "512",
+    "-ub",
+    "256",
+    "-ctk",
+    "bf16",
+    "-ctv",
+    "bf16",
+    "-fa",
+    "on",
+    "-t",
+    "16",
+    "--no-warmup",
+    "--split-mode",
+    "none",
+    "--fit",
+    "off",
+    "--verbose",
+    "--kld-token-output",
+    "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\gpu-groupwise-v1\\held-out\\ptb\\T425\\FIXED-ANCHOR\\tokens.tsv",
+    "-ngl",
+    "999",
+    "--device",
+    "CUDA0",
+    "--save-all-logits",
+    "NUL"
+  ],
+  "executable_sha256": "50d96fe6dd501cba9a7b92a7238d3f0b68c9494357ac887909d684925d832eb2",
+  "config_identity": "9c679ec74cc7df7b31ad76bd03a2809db57e79d016ce5de5961a384688ae0f19",
+  "elapsed_seconds": 51.20445479999762,
+  "peak_process_working_set_bytes": 5420609536,
+  "gpu_global_memory_baseline_mib": 0,
+  "gpu_global_memory_peak_mib": 6817,
+  "gpu_global_memory_peak_includes_other_processes": true,
+  "token_tsv_path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\gpu-groupwise-v1\\held-out\\ptb\\T425\\FIXED-ANCHOR\\tokens.tsv",
+  "token_tsv_sha256": "60d92814e5106822d0de8ba12964b14e4597bf23d687d5c0671f23de046e0efb",
+  "combined_log_path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\gpu-groupwise-v1\\held-out\\ptb\\T425\\FIXED-ANCHOR\\combined.log",
+  "combined_log_sha256": "65883bf9134476e78466c2942e6aa7bc066457797ae23aa39b209dae70ca7361",
+  "metrics": {
+    "targets": 98776,
+    "input_tokens": 98777,
+    "mean_nll": 2.401525940193441,
+    "ppl": 11.04000992876765,
+    "nll_distribution": {
+      "mean": 2.401525940193441,
+      "median": 1.4834756042485697,
+      "p90": 6.387309667038325,
+      "p95": 8.15631917884661,
+      "p99": 11.342608481810657,
+      "p99_9": 14.583953537646115,
+      "maximum": 26.457404334309953,
+      "minimum": 3.75033464346884e-07,
+      "nonfinite_count": 0,
+      "negative_count": 0
+    },
+    "context_depth_bins_4096": {
+      "0": {
+        "targets": 8192,
+        "mean_nll": 2.6717850985042824,
+        "ppl": 14.465768980941363
+      },
+      "1": {
+        "targets": 8192,
+        "mean_nll": 2.4978456652563765,
+        "ppl": 12.156277040850341
+      },
+      "2": {
+        "targets": 8192,
+        "mean_nll": 2.4305532468469497,
+        "ppl": 11.36516808439281
+      },
+      "3": {
+        "targets": 8192,
+        "mean_nll": 2.438311508000851,
+        "ppl": 11.453684950943172
+      },
+      "4": {
+        "targets": 8192,
+        "mean_nll": 2.3772419845598525,
+        "ppl": 10.775143831802165
+      },
+      "5": {
+        "targets": 8192,
+        "mean_nll": 2.231656511789204,
+        "ppl": 9.315284183892482
+      },
+      "6": {
+        "targets": 8192,
+        "mean_nll": 2.376734715460007,
+        "ppl": 10.769679320395971
+      },
+      "7": {
+        "targets": 8192,
+        "mean_nll": 2.4086911912261515,
+        "ppl": 11.119398451000636
+      },
+      "8": {
+        "targets": 4568,
+        "mean_nll": 2.3542600320233737,
+        "ppl": 10.53033386818273
+      },
+      "9": {
+        "targets": 4096,
+        "mean_nll": 2.2220733250776123,
+        "ppl": 9.226440459218406
+      },
+      "10": {
+        "targets": 4096,
+        "mean_nll": 2.376993514604849,
+        "ppl": 10.772466864885818
+      },
+      "11": {
+        "targets": 4096,
+        "mean_nll": 2.42417015765498,
+        "ppl": 11.292854241212217
+      },
+      "12": {
+        "targets": 4096,
+        "mean_nll": 2.36376774879534,
+        "ppl": 10.630930765719643
+      },
+      "13": {
+        "targets": 4096,
+        "mean_nll": 2.3480912745041516,
+        "ppl": 10.465574738995551
+      },
+      "14": {
+        "targets": 4096,
+        "mean_nll": 2.297458399083122,
+        "ppl": 9.948864251555834
+      },
+      "15": {
+        "targets": 4096,
+        "mean_nll": 2.389614926998592,
+        "ppl": 10.909292260202708
+      }
+    },
+    "corpus_position_bins_4096": {
+      "0": {
+        "targets": 4096,
+        "mean_nll": 2.6386999261601116,
+        "ppl": 13.994997245682034
+      },
+      "1": {
+        "targets": 4096,
+        "mean_nll": 2.502707793554206,
+        "ppl": 12.215526341575238
+      },
+      "2": {
+        "targets": 4096,
+        "mean_nll": 2.351657835549078,
+        "ppl": 10.502967492303647
+      },
+      "3": {
+        "targets": 4096,
+        "mean_nll": 2.3241443751607673,
+        "ppl": 10.217933626664154
+      },
+      "4": {
+        "targets": 4096,
+        "mean_nll": 2.2621742034898475,
+        "ppl": 9.60394741950053
+      },
+      "5": {
+        "targets": 4096,
+        "mean_nll": 2.2188026677304706,
+        "ppl": 9.196313228722794
+      },
+      "6": {
+        "targets": 4096,
+        "mean_nll": 2.437216846187578,
+        "ppl": 11.441153899289295
+      },
+      "7": {
+        "targets": 4096,
+        "mean_nll": 2.4154873828617958,
+        "ppl": 11.195225389088865
+      },
+      "8": {
+        "targets": 4096,
+        "mean_nll": 2.3656851280355466,
+        "ppl": 10.651333845644121
+      },
+      "9": {
+        "targets": 4096,
+        "mean_nll": 2.2220733250776123,
+        "ppl": 9.226440459218406
+      },
+      "10": {
+        "targets": 4096,
+        "mean_nll": 2.376993514604849,
+        "ppl": 10.772466864885818
+      },
+      "11": {
+        "targets": 4096,
+        "mean_nll": 2.42417015765498,
+        "ppl": 11.292854241212217
+      },
+      "12": {
+        "targets": 4096,
+        "mean_nll": 2.36376774879534,
+        "ppl": 10.630930765719643
+      },
+      "13": {
+        "targets": 4096,
+        "mean_nll": 2.3480912745041516,
+        "ppl": 10.465574738995551
+      },
+      "14": {
+        "targets": 4096,
+        "mean_nll": 2.297458399083122,
+        "ppl": 9.948864251555834
+      },
+      "15": {
+        "targets": 4096,
+        "mean_nll": 2.389614926998592,
+        "ppl": 10.909292260202708
+      },
+      "16": {
+        "targets": 4096,
+        "mean_nll": 2.7048702708484536,
+        "ppl": 14.95237680554237
+      },
+      "17": {
+        "targets": 4096,
+        "mean_nll": 2.492983536958547,
+        "ppl": 12.097315118625414
+      },
+      "18": {
+        "targets": 4096,
+        "mean_nll": 2.509448658144821,
+        "ppl": 12.298147707412381
+      },
+      "19": {
+        "targets": 4096,
+        "mean_nll": 2.552478640840934,
+        "ppl": 12.838887366925539
+      },
+      "20": {
+        "targets": 4096,
+        "mean_nll": 2.4923097656298574,
+        "ppl": 12.089167039823547
+      },
+      "21": {
+        "targets": 4096,
+        "mean_nll": 2.2445103558479373,
+        "ppl": 9.43579424368181
+      },
+      "22": {
+        "targets": 4096,
+        "mean_nll": 2.3162525847324367,
+        "ppl": 10.137613188768444
+      },
+      "23": {
+        "targets": 4096,
+        "mean_nll": 2.4018949995905072,
+        "ppl": 11.044085100119457
+      },
+      "24": {
+        "targets": 472,
+        "mean_nll": 2.255113436121123,
+        "ppl": 9.536375018184854
+      }
+    },
+    "worst_nll_examples": [
+      {
+        "input_index": 77033,
+        "target_token": 3022,
+        "context_position": 11497,
+        "nll": 26.457404334309953
+      },
+      {
+        "input_index": 3226,
+        "target_token": 3022,
+        "context_position": 3226,
+        "nll": 20.287023437008546
+      },
+      {
+        "input_index": 95466,
+        "target_token": 81793,
+        "context_position": 29930,
+        "nll": 19.065993868410885
+      },
+      {
+        "input_index": 92850,
+        "target_token": 3022,
+        "context_position": 27314,
+        "nll": 18.69797407772037
+      },
+      {
+        "input_index": 88055,
+        "target_token": 52579,
+        "context_position": 22519,
+        "nll": 18.353681756093703
+      },
+      {
+        "input_index": 92832,
+        "target_token": 3022,
+        "context_position": 27296,
+        "nll": 18.035763051874756
+      },
+      {
+        "input_index": 41270,
+        "target_token": 1443,
+        "context_position": 41270,
+        "nll": 18.024613941686443
+      },
+      {
+        "input_index": 260,
+        "target_token": 81467,
+        "context_position": 260,
+        "nll": 17.898387095163432
+      },
+      {
+        "input_index": 32605,
+        "target_token": 38038,
+        "context_position": 32605,
+        "nll": 17.887571127059143
+      },
+      {
+        "input_index": 81030,
+        "target_token": 22889,
+        "context_position": 15494,
+        "nll": 17.830075873199018
+      },
+      {
+        "input_index": 20632,
+        "target_token": 70693,
+        "context_position": 20632,
+        "nll": 17.737217713869317
+      },
+      {
+        "input_index": 1508,
+        "target_token": 191056,
+        "context_position": 1508,
+        "nll": 17.709866004615836
+      },
+      {
+        "input_index": 44028,
+        "target_token": 7139,
+        "context_position": 44028,
+        "nll": 17.67859065017215
+      },
+      {
+        "input_index": 89527,
+        "target_token": 52097,
+        "context_position": 23991,
+        "nll": 17.645297217398408
+      },
+      {
+        "input_index": 77707,
+        "target_token": 3956,
+        "context_position": 12171,
+        "nll": 17.61968827826248
+      },
+      {
+        "input_index": 29923,
+        "target_token": 41530,
+        "context_position": 29923,
+        "nll": 17.451449336412736
+      },
+      {
+        "input_index": 64863,
+        "target_token": 64782,
+        "context_position": 64863,
+        "nll": 17.36417891546919
+      },
+      {
+        "input_index": 3088,
+        "target_token": 901,
+        "context_position": 3088,
+        "nll": 17.279126473300284
+      },
+      {
+        "input_index": 9761,
+        "target_token": 503,
+        "context_position": 9761,
+        "nll": 17.107568006791414
+      },
+      {
+        "input_index": 644,
+        "target_token": 157671,
+        "context_position": 644,
+        "nll": 17.022091404607224
+      }
+    ],
+    "full_vocabulary_KL": null,
+    "top1_agreement_to_BF16": null,
+    "reference_dependent_metric_note": "No PTB BF16 distribution reference is locked; KL and top-1 agreement are intentionally not claimed."
+  }
+}

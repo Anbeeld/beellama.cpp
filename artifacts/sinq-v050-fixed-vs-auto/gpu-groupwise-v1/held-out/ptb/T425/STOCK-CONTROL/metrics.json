@@ -1,0 +1,431 @@
+{
+  "schema_version": 1,
+  "status": "PASS",
+  "label": "STOCK-CONTROL",
+  "recipe": "T425",
+  "kind": "stock",
+  "arm": "T425-stock",
+  "model_path": "C:\\models\\Qwen3.5-9B-thireus-v050\\T425-stock.gguf",
+  "model_sha256_before": "90f6bf84cebec8d5defb7b76bbf1b4479011a74af42e8d8a044dfe42263d4bd2",
+  "model_sha256_after": "90f6bf84cebec8d5defb7b76bbf1b4479011a74af42e8d8a044dfe42263d4bd2",
+  "selection_manifest_sha256": null,
+  "source_sha256": "da9df48e961a191aafca383628f983da4552a0a61c1257b93e1d678966f1c4af",
+  "raw_corpus_path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050\\data\\ptb.test.txt",
+  "raw_corpus_sha256": "dd65dff31e70846b2a6030a87482edcd5d199130cdcfa1f3dccbb033728deee0",
+  "normalized_input_path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\data\\ptb-common-file-normalized.txt",
+  "normalized_input_sha256": "91a2fa938d84baddaa05a3d67a5698924847eca8a4e7faa1518f3fd11c3d6d73",
+  "token_stream_path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\data\\ptb-test-native.u32",
+  "token_stream_sha256": "b6d8698e4f22e42171e7c55e2ce3b8995edca7bdc5379c79477cb22408caae33",
+  "target_count": 98776,
+  "reference_path": null,
+  "reference_sha256": null,
+  "reference_status": "NO_PTB_BF16_DISTRIBUTION_REFERENCE; no full-vocabulary KL/top-1 claim",
+  "context": 65536,
+  "batch": 512,
+  "microbatch": 256,
+  "cache_type_k": "bf16",
+  "cache_type_v": "bf16",
+  "flash_attention": "on",
+  "gpu_uuid": "GPU-5f3a3f44-a860-109d-a6e5-c9972f0f9842",
+  "visible_cuda_devices": 1,
+  "threads_argument": 16,
+  "command": [
+    "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\build-sinq-clean\\bin\\llama-perplexity.exe",
+    "-m",
+    "C:\\models\\Qwen3.5-9B-thireus-v050\\T425-stock.gguf",
+    "-f",
+    "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\data\\ptb-common-file-normalized.txt",
+    "--ppl-full",
+    "-c",
+    "65536",
+    "-b",
+    "512",
+    "-ub",
+    "256",
+    "-ctk",
+    "bf16",
+    "-ctv",
+    "bf16",
+    "-fa",
+    "on",
+    "-t",
+    "16",
+    "--no-warmup",
+    "--split-mode",
+    "none",
+    "--fit",
+    "off",
+    "--verbose",
+    "--kld-token-output",
+    "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\gpu-groupwise-v1\\held-out\\ptb\\T425\\STOCK-CONTROL\\tokens.tsv",
+    "-ngl",
+    "999",
+    "--device",
+    "CUDA0",
+    "--save-all-logits",
+    "NUL"
+  ],
+  "executable_sha256": "50d96fe6dd501cba9a7b92a7238d3f0b68c9494357ac887909d684925d832eb2",
+  "config_identity": "9c679ec74cc7df7b31ad76bd03a2809db57e79d016ce5de5961a384688ae0f19",
+  "elapsed_seconds": 49.1147767000366,
+  "peak_process_working_set_bytes": 5410222080,
+  "gpu_global_memory_baseline_mib": 0,
+  "gpu_global_memory_peak_mib": 6809,
+  "gpu_global_memory_peak_includes_other_processes": true,
+  "token_tsv_path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\gpu-groupwise-v1\\held-out\\ptb\\T425\\STOCK-CONTROL\\tokens.tsv",
+  "token_tsv_sha256": "47f9b377b8a6bb1a707a81217e666b6d41bf7910a17ff1cfac596344cff8fe95",
+  "combined_log_path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\gpu-groupwise-v1\\held-out\\ptb\\T425\\STOCK-CONTROL\\combined.log",
+  "combined_log_sha256": "f0b84280b6647c0bdfd1421877918799c7b16cfe7b5a0b88101dafccd42dfb47",
+  "metrics": {
+    "targets": 98776,
+    "input_tokens": 98777,
+    "mean_nll": 2.3918958079152994,
+    "ppl": 10.934203455669095,
+    "nll_distribution": {
+      "mean": 2.3918958079152994,
+      "median": 1.4809249595191039,
+      "p90": 6.357321167190676,
+      "p95": 8.114739927271263,
+      "p99": 11.308487392354367,
+      "p99_9": 14.571030804855306,
+      "maximum": 19.307484002882088,
+      "minimum": 2.2299340818917797e-07,
+      "nonfinite_count": 0,
+      "negative_count": 0
+    },
+    "context_depth_bins_4096": {
+      "0": {
+        "targets": 8192,
+        "mean_nll": 2.6656015792595995,
+        "ppl": 14.376595606831284
+      },
+      "1": {
+        "targets": 8192,
+        "mean_nll": 2.486567586117706,
+        "ppl": 12.019947797381302
+      },
+      "2": {
+        "targets": 8192,
+        "mean_nll": 2.4183554791179005,
+        "ppl": 11.227380462994864
+      },
+      "3": {
+        "targets": 8192,
+        "mean_nll": 2.4332560498565745,
+        "ppl": 11.395927444416493
+      },
+      "4": {
+        "targets": 8192,
+        "mean_nll": 2.3622053604723274,
+        "ppl": 10.614334092229077
+      },
+      "5": {
+        "targets": 8192,
+        "mean_nll": 2.223181690143457,
+        "ppl": 9.236672392816905
+      },
+      "6": {
+        "targets": 8192,
+        "mean_nll": 2.360621996861246,
+        "ppl": 10.59754104013379
+      },
+      "7": {
+        "targets": 8192,
+        "mean_nll": 2.395444454355122,
+        "ppl": 10.973074005963264
+      },
+      "8": {
+        "targets": 4568,
+        "mean_nll": 2.34413213272853,
+        "ppl": 10.424221959615073
+      },
+      "9": {
+        "targets": 4096,
+        "mean_nll": 2.2106611080923666,
+        "ppl": 9.121744859429853
+      },
+      "10": {
+        "targets": 4096,
+        "mean_nll": 2.37478280857425,
+        "ppl": 10.748678411749873
+      },
+      "11": {
+        "targets": 4096,
+        "mean_nll": 2.410964504748334,
+        "ppl": 11.144705083914609
+      },
+      "12": {
+        "targets": 4096,
+        "mean_nll": 2.3658592001387935,
+        "ppl": 10.653188107111932
+      },
+      "13": {
+        "targets": 4096,
+        "mean_nll": 2.3375899890265033,
+        "ppl": 10.356247792397438
+      },
+      "14": {
+        "targets": 4096,
+        "mean_nll": 2.290827698389149,
+        "ppl": 9.883114534702264
+      },
+      "15": {
+        "targets": 4096,
+        "mean_nll": 2.385717573159243,
+        "ppl": 10.866857633218936
+      }
+    },
+    "corpus_position_bins_4096": {
+      "0": {
+        "targets": 4096,
+        "mean_nll": 2.636642560742421,
+        "ppl": 13.966234020705912
+      },
+      "1": {
+        "targets": 4096,
+        "mean_nll": 2.4924701174039385,
+        "ppl": 12.091105714636365
+      },
+      "2": {
+        "targets": 4096,
+        "mean_nll": 2.332450464274979,
+        "ppl": 10.303158145175738
+      },
+      "3": {
+        "targets": 4096,
+        "mean_nll": 2.3193672636431186,
+        "ppl": 10.169237823497108
+      },
+      "4": {
+        "targets": 4096,
+        "mean_nll": 2.248263243503988,
+        "ppl": 9.471272250270621
+      },
+      "5": {
+        "targets": 4096,
+        "mean_nll": 2.2132745543705075,
+        "ppl": 9.145615227959357
+      },
+      "6": {
+        "targets": 4096,
+        "mean_nll": 2.4325746023568993,
+        "ppl": 11.388164363519461
+      },
+      "7": {
+        "targets": 4096,
+        "mean_nll": 2.403200703346742,
+        "ppl": 11.058514821939793
+      },
+      "8": {
+        "targets": 4096,
+        "mean_nll": 2.3549273051074433,
+        "ppl": 10.537362821394073
+      },
+      "9": {
+        "targets": 4096,
+        "mean_nll": 2.2106611080923666,
+        "ppl": 9.121744859429853
+      },
+      "10": {
+        "targets": 4096,
+        "mean_nll": 2.37478280857425,
+        "ppl": 10.748678411749873
+      },
+      "11": {
+        "targets": 4096,
+        "mean_nll": 2.410964504748334,
+        "ppl": 11.144705083914609
+      },
+      "12": {
+        "targets": 4096,
+        "mean_nll": 2.3658592001387935,
+        "ppl": 10.653188107111932
+      },
+      "13": {
+        "targets": 4096,
+        "mean_nll": 2.3375899890265033,
+        "ppl": 10.356247792397438
+      },
+      "14": {
+        "targets": 4096,
+        "mean_nll": 2.290827698389149,
+        "ppl": 9.883114534702264
+      },
+      "15": {
+        "targets": 4096,
+        "mean_nll": 2.385717573159243,
+        "ppl": 10.866857633218936
+      },
+      "16": {
+        "targets": 4096,
+        "mean_nll": 2.6945605977767784,
+        "ppl": 14.799014604504947
+      },
+      "17": {
+        "targets": 4096,
+        "mean_nll": 2.4806650548314733,
+        "ppl": 11.949208654827876
+      },
+      "18": {
+        "targets": 4096,
+        "mean_nll": 2.5042604939608215,
+        "ppl": 12.234508126992228
+      },
+      "19": {
+        "targets": 4096,
+        "mean_nll": 2.5471448360700304,
+        "ppl": 12.77058955375526
+      },
+      "20": {
+        "targets": 4096,
+        "mean_nll": 2.476147477440667,
+        "ppl": 11.895348929309616
+      },
+      "21": {
+        "targets": 4096,
+        "mean_nll": 2.233088825916407,
+        "ppl": 9.328636156855072
+      },
+      "22": {
+        "targets": 4096,
+        "mean_nll": 2.288669391365593,
+        "ppl": 9.861806741838393
+      },
+      "23": {
+        "targets": 4096,
+        "mean_nll": 2.3876882053635016,
+        "ppl": 10.888293326827194
+      },
+      "24": {
+        "targets": 472,
+        "mean_nll": 2.250451992762366,
+        "ppl": 9.492025193593989
+      }
+    },
+    "worst_nll_examples": [
+      {
+        "input_index": 3088,
+        "target_token": 901,
+        "context_position": 3088,
+        "nll": 19.307484002882088
+      },
+      {
+        "input_index": 95466,
+        "target_token": 81793,
+        "context_position": 29930,
+        "nll": 19.263254575798474
+      },
+      {
+        "input_index": 77033,
+        "target_token": 3022,
+        "context_position": 11497,
+        "nll": 18.865798691580416
+      },
+      {
+        "input_index": 1508,
+        "target_token": 191056,
+        "context_position": 1508,
+        "nll": 18.434296074344974
+      },
+      {
+        "input_index": 89527,
+        "target_token": 52097,
+        "context_position": 23991,
+        "nll": 18.22977201121761
+      },
+      {
+        "input_index": 260,
+        "target_token": 81467,
+        "context_position": 260,
+        "nll": 17.91375568715431
+      },
+      {
+        "input_index": 32605,
+        "target_token": 38038,
+        "context_position": 32605,
+        "nll": 17.706957617404985
+      },
+      {
+        "input_index": 29923,
+        "target_token": 41530,
+        "context_position": 29923,
+        "nll": 17.670073570302268
+      },
+      {
+        "input_index": 20632,
+        "target_token": 70693,
+        "context_position": 20632,
+        "nll": 17.643881430978475
+      },
+      {
+        "input_index": 81030,
+        "target_token": 22889,
+        "context_position": 15494,
+        "nll": 17.548703949011376
+      },
+      {
+        "input_index": 77707,
+        "target_token": 3956,
+        "context_position": 12171,
+        "nll": 17.528744087413926
+      },
+      {
+        "input_index": 644,
+        "target_token": 157671,
+        "context_position": 644,
+        "nll": 17.188366294735804
+      },
+      {
+        "input_index": 96055,
+        "target_token": 32845,
+        "context_position": 30519,
+        "nll": 17.100671904885726
+      },
+      {
+        "input_index": 92408,
+        "target_token": 76797,
+        "context_position": 26872,
+        "nll": 17.068716796389722
+      },
+      {
+        "input_index": 44028,
+        "target_token": 7139,
+        "context_position": 44028,
+        "nll": 17.02320089935496
+      },
+      {
+        "input_index": 13478,
+        "target_token": 5595,
+        "context_position": 13478,
+        "nll": 17.01073685177796
+      },
+      {
+        "input_index": 64863,
+        "target_token": 64782,
+        "context_position": 64863,
+        "nll": 16.982514977186806
+      },
+      {
+        "input_index": 179,
+        "target_token": 4586,
+        "context_position": 179,
+        "nll": 16.73650003543494
+      },
+      {
+        "input_index": 92850,
+        "target_token": 3022,
+        "context_position": 27314,
+        "nll": 16.716633129174685
+      },
+      {
+        "input_index": 67445,
+        "target_token": 36935,
+        "context_position": 1909,
+        "nll": 16.601805695578086
+      }
+    ],
+    "full_vocabulary_KL": null,
+    "top1_agreement_to_BF16": null,
+    "reference_dependent_metric_note": "No PTB BF16 distribution reference is locked; KL and top-1 agreement are intentionally not claimed."
+  }
+}

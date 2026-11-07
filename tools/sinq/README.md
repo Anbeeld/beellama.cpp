@@ -133,6 +133,60 @@ there is no implicit Cartesian product of joint alternatives.
   `{"type":"select","method":"groupwise_kl"}`. Filters retain deterministic
   ties and locks, but are not rescored in each changing model context.
 
+### Native Groupwise KLD execution
+
+The schema-v2 JSON file named by `inputs.evaluator` retains its existing
+`executable`, `native_loader`, `reference`, `corpus`, `context`, `batch`,
+`microbatch`, `max_tokens` and `timeout` fields. Its optional `execution` object
+selects the native backend, independently of Torch surrogate scoring:
+
+```json
+{
+  "backend": "cuda",
+  "cuda_device": 0,
+  "gpu_layers": "all",
+  "cache_type_k": "bf16",
+  "cache_type_v": "bf16",
+  "flash_attention": "on",
+  "cublas_compute_type": "auto",
+  "mmq_precision": "auto"
+}
+```
+
+This object is a fragment of the evaluator file, not a complete select config.
+Omitting it selects CPU placement, F16 K/V and automatic Flash Attention.
+CPU mode explicitly uses `--device none --no-op-offload`; an empty CUDA visibility
+variable alone is not sufficient to prevent operation offload on every platform.
+`backend` accepts `cpu` or `cuda`; CUDA requires an explicit physical
+`nvidia-smi` index. The evaluator resolves that index to a UUID, pins visibility
+to that UUID and selects native `CUDA0` with no tensor splitting. CUDA supports
+only `gpu_layers: "all"`; partial/zero offload and missing or mismatched native
+PCI-device/full-layer evidence fail rather than silently accepting CPU inference.
+Unavailable capacity remains a native process error, not a fallback policy.
+K/V types are deliberately limited to `f32`, `f16` and `bf16` here; Flash
+Attention accepts `on`, `off`, `auto`. CPU rejects CUDA placement/compute controls.
+`cublas_compute_type` accepts `auto`, `f32`, `f16`, `bf16`; `mmq_precision` accepts
+`auto`, `q4`, `q8`. These select existing native compute controls, not new kernels.
+
+Native evaluation disables warmup and automatic fitting and explicitly binds
+context, batching and stage threads. Inherited `LLAMA_ARG_*`, `GGML_*`,
+`CUDA_*`, `CUBLAS_*` and `NVIDIA_TF32_*` overrides are removed from its environment;
+only the declared native CUDA controls are installed. Policies bind the GPU
+UUID/PCI identity and driver, executable and adjacent shared-runtime hashes,
+KV/FA/compute settings and context/batching. Actual layer counts, native timing
+lines and command evidence accompany references and uncached scores.
+
+Create a **new selection-only reference** with
+`NativeKLEvaluator(..., execution=the_same_object).create_reference(...)`, using
+the existing selection token alignment. Never overwrite a CPU or final-test
+reference. Expanded policy identities intentionally reject older reference
+manifests and score/checkpoint identities; regenerate references into new paths,
+not candidate matrices. CPU and CUDA KL values with different references are
+not interchangeable. Resume uses the existing `select --resume RUN_DIR` path.
+Native token TSV keeps its original columns and appends `candidate_top1` for
+comparison rows (NA for reference generation), so numerical investigations can
+compare actual predictions rather than only reference-agreement flags.
+
 `select` publishes `selection.json` and `best.gguf`. For separate assembly, copy
 the selected assignment into `selection.assignment` in an `assemble` config.
 `validate` checks the candidate artifact manifest and its content closure; it is

@@ -1,0 +1,249 @@
+{
+  "schema_version": 1,
+  "status": "PASS",
+  "numerical_parity_status": "DIVERGENT",
+  "divergence_policy_sha256": "8663c82bd308bc1b238c27a6fd332bb37bc39eabdcde8d9708d25cecf82e1cd2",
+  "model_path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\fixed\\T340\\T340-W128-S100\\model.gguf",
+  "model_sha256_before": "9c23848879505d1699a039459f72c7899b9f5fe75c4c8fda7cf28fba69aeba70",
+  "model_sha256_after": "9c23848879505d1699a039459f72c7899b9f5fe75c4c8fda7cf28fba69aeba70",
+  "corpus_sha256": "b2ad9c44ace4c1c61fd974ed25ceec90cfe4c4f86bb4606f2b34fcd36f9781bf",
+  "reference_sha256": "4172910d566b2a4ddbe908d773f87f6689b5d9f77e1b7e9e7b690ffc520c1b0a",
+  "targets": 564,
+  "evaluator_runs": [
+    {
+      "policy": {
+        "context": 65536,
+        "batch": 512,
+        "microbatch": 256,
+        "threads": 32,
+        "device": "cpu",
+        "execution": {
+          "backend": "cpu",
+          "cache_type_k": "bf16",
+          "cache_type_v": "bf16",
+          "flash_attention": "on",
+          "cublas_compute_type": "auto",
+          "mmq_precision": "auto"
+        },
+        "gpu": null,
+        "warmup": false,
+        "fit": false,
+        "split_mode": "none",
+        "op_offload": false,
+        "runtime": {
+          "evaluator": {
+            "executable": "e1d10c5c756f61a7f9f431e047c1eb61cb7a5eb65994be251f46be203b371fdd"
+          }
+        },
+        "reset": "every-context-no-overlap",
+        "format": "_logitF1",
+        "binary_sha256": "e1d10c5c756f61a7f9f431e047c1eb61cb7a5eb65994be251f46be203b371fdd"
+      },
+      "actual_offload": null,
+      "timings": [
+        "0.05.061.291 I ppl-full timing: decode_and_logits_ms=4297.893 validation_ms=0.000 reference_read_ms=201.444 probability_scoring_ms=98.169 token_output_ms=2.317 scoring_threads=32 reference_io_overlapped=1 scoring_includes_parallel_validation=1 previous_batch_scoring_overlapped=1",
+        "0.05.077.543 I llama_perf_context_print:        load time =     673.14 ms",
+        "0.05.077.551 I llama_perf_context_print: prompt eval time =    2382.41 ms /   564 tokens (    4.22 ms per token,   236.73 tokens per second)",
+        "0.05.077.554 I llama_perf_context_print:        eval time =       0.00 ms /     1 runs   (    0.00 ms per token,      inf tokens per second)",
+        "0.05.077.555 I llama_perf_context_print:       total time =    5024.86 ms /   565 tokens"
+      ],
+      "name": "cpu",
+      "path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\build-sinq-optimizer-cpu-clean\\bin\\llama-perplexity.exe",
+      "sha256": "e1d10c5c756f61a7f9f431e047c1eb61cb7a5eb65994be251f46be203b371fdd",
+      "command": [
+        "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\build-sinq-optimizer-cpu-clean\\bin\\llama-perplexity.exe",
+        "-m",
+        "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\fixed\\T340\\T340-W128-S100\\model.gguf",
+        "-f",
+        "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\data\\selection.valid-prefix.native-prompt.raw",
+        "--ppl-full",
+        "-c",
+        "65536",
+        "-b",
+        "512",
+        "-ub",
+        "256",
+        "-ctk",
+        "bf16",
+        "-ctv",
+        "bf16",
+        "-fa",
+        "on",
+        "-t",
+        "32",
+        "-tb",
+        "32",
+        "--no-warmup",
+        "--split-mode",
+        "none",
+        "--fit",
+        "off",
+        "--verbose",
+        "--kld-token-output",
+        "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\gpu-groupwise-v1\\numerics-v2\\T340-historical-reference\\attempt-01\\cpu.tokens.tsv",
+        "-ngl",
+        "0",
+        "--device",
+        "none",
+        "--no-op-offload",
+        "--kl-divergence",
+        "--kl-divergence-base",
+        "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\locks\\selection-reference.logits"
+      ],
+      "threads": 32,
+      "ngl": 0,
+      "gpu_uuid": null,
+      "elapsed_seconds": 5.87786720006261,
+      "peak_process_working_set_bytes": 6827753472,
+      "token_tsv": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\gpu-groupwise-v1\\numerics-v2\\T340-historical-reference\\attempt-01\\cpu.tokens.tsv",
+      "token_tsv_sha256": "ba84dbd8a1cf230d23606f69c62fb25764a77a3119b3059829bae30631e37a58",
+      "log_path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\gpu-groupwise-v1\\numerics-v2\\T340-historical-reference\\attempt-01\\cpu.combined.log",
+      "log_sha256": "2aa26877b0ce6959bc0089d784bd2fe41f728a3bb2eb04582aff073657d63511"
+    },
+    {
+      "policy": {
+        "context": 65536,
+        "batch": 512,
+        "microbatch": 256,
+        "threads": 16,
+        "device": "cuda",
+        "execution": {
+          "backend": "cuda",
+          "cache_type_k": "bf16",
+          "cache_type_v": "bf16",
+          "flash_attention": "on",
+          "cuda_device": 0,
+          "cublas_compute_type": "auto",
+          "mmq_precision": "auto",
+          "gpu_layers": "all"
+        },
+        "gpu": {
+          "uuid": "GPU-5e87a39a-204c-4054-14a8-5b97ae4f16fd",
+          "name": "NVIDIA GeForce RTX 3090",
+          "pci_bus_id": "0000:01:00.0",
+          "driver": "616.56"
+        },
+        "warmup": false,
+        "fit": false,
+        "split_mode": "none",
+        "op_offload": true,
+        "runtime": {
+          "evaluator": {
+            "executable": "50d96fe6dd501cba9a7b92a7238d3f0b68c9494357ac887909d684925d832eb2"
+          }
+        },
+        "reset": "every-context-no-overlap",
+        "format": "_logitF1",
+        "binary_sha256": "50d96fe6dd501cba9a7b92a7238d3f0b68c9494357ac887909d684925d832eb2"
+      },
+      "actual_offload": [
+        "33",
+        "33"
+      ],
+      "timings": [
+        "0.02.269.690 I ppl-full timing: decode_and_logits_ms=290.522 validation_ms=0.000 reference_read_ms=161.643 probability_scoring_ms=104.339 token_output_ms=16.209 scoring_threads=16 reference_io_overlapped=1 scoring_includes_parallel_validation=1 previous_batch_scoring_overlapped=1",
+        "0.02.284.964 I llama_perf_context_print:        load time =    1768.65 ms",
+        "0.02.284.970 I llama_perf_context_print: prompt eval time =     127.81 ms /   564 tokens (    0.23 ms per token,  4412.73 tokens per second)",
+        "0.02.284.971 I llama_perf_context_print:        eval time =       0.00 ms /     1 runs   (    0.00 ms per token,      inf tokens per second)",
+        "0.02.284.972 I llama_perf_context_print:       total time =    2130.12 ms /   565 tokens"
+      ],
+      "name": "cuda",
+      "path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\build-sinq-clean\\bin\\llama-perplexity.exe",
+      "sha256": "50d96fe6dd501cba9a7b92a7238d3f0b68c9494357ac887909d684925d832eb2",
+      "command": [
+        "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\build-sinq-clean\\bin\\llama-perplexity.exe",
+        "-m",
+        "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\fixed\\T340\\T340-W128-S100\\model.gguf",
+        "-f",
+        "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\data\\selection.valid-prefix.native-prompt.raw",
+        "--ppl-full",
+        "-c",
+        "65536",
+        "-b",
+        "512",
+        "-ub",
+        "256",
+        "-ctk",
+        "bf16",
+        "-ctv",
+        "bf16",
+        "-fa",
+        "on",
+        "-t",
+        "16",
+        "-tb",
+        "16",
+        "--no-warmup",
+        "--split-mode",
+        "none",
+        "--fit",
+        "off",
+        "--verbose",
+        "--kld-token-output",
+        "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\gpu-groupwise-v1\\numerics-v2\\T340-historical-reference\\attempt-01\\cuda.tokens.tsv",
+        "-ngl",
+        "999",
+        "--device",
+        "CUDA0",
+        "--kl-divergence",
+        "--kl-divergence-base",
+        "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\locks\\selection-reference.logits"
+      ],
+      "threads": 16,
+      "ngl": 999,
+      "gpu_uuid": "GPU-5e87a39a-204c-4054-14a8-5b97ae4f16fd",
+      "elapsed_seconds": 3.0676390000153333,
+      "peak_process_working_set_bytes": 4736188416,
+      "token_tsv": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\gpu-groupwise-v1\\numerics-v2\\T340-historical-reference\\attempt-01\\cuda.tokens.tsv",
+      "token_tsv_sha256": "b8763899fe426e9243b0d007b8324e5a09c8371cc4344ca0771cb4bd3e82bccf",
+      "log_path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\gpu-groupwise-v1\\numerics-v2\\T340-historical-reference\\attempt-01\\cuda.combined.log",
+      "log_sha256": "3bba51df96a7aa093615f9313a479c1152c9425fb840fb81c30ed049449deb30"
+    }
+  ],
+  "exact_alignment_fields": [
+    "input_index",
+    "context_position",
+    "target_token"
+  ],
+  "top1_comparison_field": "top1_agree",
+  "top1_agree_comparison": {
+    "mismatch_count": 11,
+    "mismatch_rate": 0.01950354609929078,
+    "maximum_allowed_rate": 0.01,
+    "categorical_addendum_sha256": "13b34c0021253b4d531aaf2d6a4eec226df5f868202a43375a2cc7a7149ce760"
+  },
+  "numerical_tolerances": {
+    "absolute_tolerance": 1e-05,
+    "relative_tolerance": 1e-05,
+    "addendum_sha256": "0ed7919f3007cf525ebf17eaa2befc3031878a7327dec75e3e2b3bef9e702772"
+  },
+  "metric_comparison": {
+    "kld": {
+      "max_abs_delta": 0.2053334286027803,
+      "mean_abs_delta": 0.008797916260873478,
+      "mean_cpu": 0.06452233347080401,
+      "mean_cuda": 0.0633774495999235,
+      "mean_delta": -0.001144883870880516,
+      "within_tolerance": false
+    },
+    "base_nll": {
+      "max_abs_delta": 0.0,
+      "mean_abs_delta": 0.0,
+      "mean_cpu": 1.5496924268850056,
+      "mean_cuda": 1.5496924268850056,
+      "mean_delta": 0.0,
+      "within_tolerance": true
+    },
+    "candidate_nll": {
+      "max_abs_delta": 0.6356077419725672,
+      "mean_abs_delta": 0.042236311065440235,
+      "mean_cpu": 1.610241638865662,
+      "mean_cuda": 1.605589682453599,
+      "mean_delta": -0.004651956412063011,
+      "within_tolerance": false
+    }
+  },
+  "CPU_WikiPPL": 5.004020247530994,
+  "CUDA_WikiPPL": 4.980795824838142,
+  "provenance_note": "Validated current CUDA and CPU build paths on the frozen disjoint selection stream. The archived prior evaluator binary (3022...) is unavailable, so this does not prove byte-identical behavior to that historical executable."
+}

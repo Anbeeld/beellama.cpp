@@ -1,0 +1,6 @@
+{
+  "budget_per_recipe": 27,
+  "reason": "13-evaluation CUDA pilot took 2272.208 seconds, including 1955.944 seconds assembly and 37.812 seconds native evaluator processes. 27 evaluations reaches actual candidate assignments in at least a third singleton group, with a projected ~80 minute run. No final-test or quality tuning informed this budget.",
+  "pilot": "T340/cuda13-v2/selection.json",
+  "unused_configs": "cuda37 configs were prepared but never executed"
+}

@@ -1,0 +1,12 @@
+{
+  "schema_version": 2,
+  "split": "selection",
+  "corpus_sha256": "b2ad9c44ace4c1c61fd974ed25ceec90cfe4c4f86bb4606f2b34fcd36f9781bf",
+  "reference_sha256": "a4dc5cceb3c995cb03734bc9db817929bc50a91b35c0e60db3f8424dc9618b34",
+  "token_count": 565,
+  "token_sha256": "2934b74af4cc47e19db6b56b2a1383fc25727dfc80586b41c9970b9f3199c001",
+  "reference_manifest_sha256": "c410f8e52402fe98899e19a5fc8936ac3d169bc0c2218f237bfbfdf0e5675c00",
+  "context": 65536,
+  "vocabulary": 248320,
+  "targets": 564
+}

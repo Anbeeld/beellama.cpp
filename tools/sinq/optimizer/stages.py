@@ -432,7 +432,24 @@ def _score(config,run,store,source):
     return result
 
 
+def _kl_evaluator(config):
+    from .kl import NativeKLEvaluator
+    from .schemas import native_kl_execution
+    e=_json(config['evaluator'])
+    allowed={'schema_version','executable','reference','corpus','native_loader','context','batch','microbatch','max_tokens','timeout'}
+    if not allowed<=e.keys() or e.keys()-allowed-{'execution'} or e['schema_version']!=2:raise ValueError('invalid native evaluator configuration')
+    execution=native_kl_execution(e.get('execution',{}))
+    if e['max_tokens']>config['budgets']['max_tokens']:raise ValueError('KL token budget exceeded')
+    evaluator=NativeKLEvaluator(e['executable'],context=e['context'],batch=e['batch'],microbatch=e['microbatch'],max_tokens=e['max_tokens'],timeout=e['timeout'],threads=config['threads'],execution=execution)
+    if _json(str(e['reference'])+'.json').get('policy')!=evaluator.policy:
+        raise ValueError('native KL reference policy identity mismatch')
+    return e,evaluator
+
+
 def select_config(config,*,resume=None):
+    if config['policy'] in ('groupwise_kl','pipeline'):
+        from .schemas import native_kl_execution
+        native_kl_execution(_json(config['evaluator']).get('execution',{}))
     with _run(config) as inputs:return _select(config,*inputs,resume=resume)
 
 
@@ -445,8 +462,6 @@ def _select_kl(config,run,store,source,*,resume=None):
     if file_digest(config['source_gguf'])!=run['source_sha256']:
         raise ValueError('selection source does not match candidate provenance')
     selection=_json(config['selection_manifest']);e=_json(config['evaluator'])
-    allowed={'schema_version','executable','reference','corpus','native_loader','context','batch','microbatch','max_tokens','timeout'}
-    if set(e)!=allowed or e['schema_version']!=2:raise ValueError('invalid native evaluator configuration')
     if selection.get('split')!='selection' or selection.get('corpus_sha256')!=file_digest(e['corpus']) or selection.get('reference_sha256')!=file_digest(e['reference']):
         raise ValueError('selection stream/reference provenance mismatch (final-test prohibited)')
     if selection.get('schema_version')!=2 or _json(str(e['reference'])+'.json').get('source_sha256')!=run['source_sha256']:
@@ -464,8 +479,8 @@ def _select_kl(config,run,store,source,*,resume=None):
     if e['max_tokens']>b['max_tokens']:raise ValueError('KL token budget exceeded')
     if b['max_evaluations']+8>b['max_files']:raise ValueError('selector file budget cannot hold score/checkpoint closure')
     if source.stat().st_size*2>b['max_output_bytes']:raise ValueError('selector disk budget cannot hold a bounded hybrid evaluation')
+    e,evaluator=_kl_evaluator(config)
     stock,locked=_stock_baseline(config,run,source)
-    evaluator=NativeKLEvaluator(e['executable'],context=e['context'],batch=e['batch'],microbatch=e['microbatch'],max_tokens=e['max_tokens'],timeout=e['timeout'],threads=config['threads'])
     validator=_validator(e['native_loader'],threads=config['threads'])
     for name,key in config['baseline'].items():candidate_for(run,store,name,key)
     groups=_selection_groups(config,run,store)

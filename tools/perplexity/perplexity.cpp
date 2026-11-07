@@ -154,6 +154,10 @@ static void process_logits(
 }
 
 // Full-reference numeric helpers have external linkage for deterministic no-model tests.
+int perplexity_full_top1(int n_vocab, const float * logits);
+int perplexity_full_top1(int n_vocab, const float * logits) {
+    return int(std::max_element(logits, logits + n_vocab) - logits);
+}
 double perplexity_full_encode(int n_vocab, const float * logits, uint16_t * encoded, int target);
 std::array<double, 4> perplexity_full_compare(int n_vocab, const float * logits, const uint16_t * encoded, int target);
 
@@ -185,7 +189,7 @@ std::array<double, 4> perplexity_full_compare(int n_vocab, const float * logits,
     std::memcpy(metadata, encoded, sizeof(metadata));
     const double scale = metadata[0];
     encoded += 4;
-    const int candidate_top = int(std::max_element(logits, logits + n_vocab) - logits);
+    const int candidate_top = perplexity_full_top1(n_vocab, logits);
     const int base_top = scale == 0 ? 0 : int(std::max_element(encoded, encoded + n_vocab) - encoded);
     const double maximum = logits[candidate_top];
     // Normalize the reconstructed reference too: quantization changes its total probability mass.
@@ -2260,7 +2264,7 @@ static bool perplexity_full(llama_context * ctx, const common_params & params) {
     std::ofstream output;
     if (!params.kld_token_output.empty()) {
         output.open(params.kld_token_output, std::ios::trunc);
-        output << "input_index\tcontext_position\ttarget_token\tkld\tbase_nll\tcandidate_nll\ttop1_agree\n";
+        output << "input_index\tcontext_position\ttarget_token\tkld\tbase_nll\tcandidate_nll\ttop1_agree\tcandidate_top1\n";
         output << std::setprecision(17);
         if (!output) {
             return fail("cannot open or write token output");
@@ -2329,9 +2333,10 @@ static bool perplexity_full(llama_context * ctx, const common_params & params) {
             if (output.is_open()) {
                 output << first+i << '\t' << position+i << '\t' << tokens[first+i+1] << '\t';
                 if (params.kl_divergence) {
-                    output << metrics[0] << '\t' << metrics[1] << '\t' << metrics[2] << '\t' << int(metrics[3]);
+                    output << metrics[0] << '\t' << metrics[1] << '\t' << metrics[2] << '\t' << int(metrics[3]) << '\t'
+                           << perplexity_full_top1(int(n_vocab), scoring_logits.data()+size_t(i)*n_vocab);
                 } else {
-                    output << "NA\t" << batch_nll[i] << "\tNA\tNA";
+                    output << "NA\t" << batch_nll[i] << "\tNA\tNA\tNA";
                 }
                 output << '\n';
             }

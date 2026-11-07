@@ -1,0 +1,495 @@
+{
+  "schema_version": 1,
+  "status": "PASS",
+  "label": "CURRENT-GROUP-KLD-CUDA13",
+  "recipe": "T340",
+  "kind": "auto",
+  "arm": "CURRENT-GROUP-KLD-CUDA13",
+  "model_path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\gpu-groupwise-v1\\T340\\cuda13-v2\\best.gguf",
+  "model_sha256_before": "3364bb34a9b58dbff0653317fb7ece1a55f0093701c9f8ec5d6710fc4f612bb0",
+  "model_sha256_after": "3364bb34a9b58dbff0653317fb7ece1a55f0093701c9f8ec5d6710fc4f612bb0",
+  "selection_manifest_sha256": "e26e2beddac7d4267f91939ffd06fd855848b768acb4af95f2301637ec69f76f",
+  "source_sha256": "da9df48e961a191aafca383628f983da4552a0a61c1257b93e1d678966f1c4af",
+  "corpus_path": "C:\\Users\\anbee\\projects\\beellama.cpp\\artifacts\\wikitext-2-raw-v1\\wikitext-2-raw\\wiki.test.raw",
+  "corpus_sha256": "173c87a53759e0201f33e0ccf978e510c2042d7f2cb78229d9a50d79b9e7dd08",
+  "reference_path": "D:\\Qwen3.5-9B-wikitext2-64k-bf16.logits",
+  "reference_sha256": "b0963bb182cfb65b9f317aab36203718d5730c21f82eb57ca401bdb89969d89b",
+  "reference_targets": 297193,
+  "context": 65536,
+  "batch": 512,
+  "microbatch": 256,
+  "cache_type_k": "bf16",
+  "cache_type_v": "bf16",
+  "flash_attention": "on",
+  "gpu_uuid": "GPU-5e87a39a-204c-4054-14a8-5b97ae4f16fd",
+  "visible_cuda_devices": 1,
+  "threads": 16,
+  "command": [
+    "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\build-sinq-clean\\bin\\llama-perplexity.exe",
+    "-m",
+    "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\gpu-groupwise-v1\\T340\\cuda13-v2\\best.gguf",
+    "-f",
+    "C:\\Users\\anbee\\projects\\beellama.cpp\\artifacts\\wikitext-2-raw-v1\\wikitext-2-raw\\wiki.test.raw",
+    "--ppl-full",
+    "-c",
+    "65536",
+    "-b",
+    "512",
+    "-ub",
+    "256",
+    "-ctk",
+    "bf16",
+    "-ctv",
+    "bf16",
+    "-fa",
+    "on",
+    "-t",
+    "16",
+    "--no-warmup",
+    "--split-mode",
+    "none",
+    "--fit",
+    "off",
+    "--verbose",
+    "--kld-token-output",
+    "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\gpu-groupwise-v1\\held-out\\wikitext2\\T340\\CURRENT-GROUP-KLD-CUDA13\\tokens.tsv",
+    "-ngl",
+    "999",
+    "--device",
+    "CUDA0",
+    "--kl-divergence",
+    "--kl-divergence-base",
+    "D:\\Qwen3.5-9B-wikitext2-64k-bf16.logits"
+  ],
+  "executable_sha256": "50d96fe6dd501cba9a7b92a7238d3f0b68c9494357ac887909d684925d832eb2",
+  "elapsed_seconds": 179.29678279999644,
+  "peak_process_working_set_bytes": 4830945280,
+  "gpu_global_memory_baseline_mib": 13,
+  "gpu_global_memory_peak_mib": 5967,
+  "gpu_global_memory_peak_includes_other_processes": true,
+  "token_tsv_sha256": "6c92e6cc223760b2799605e2e2ac01668f44a2545045360ae39bc3997653a725",
+  "token_tsv_path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\gpu-groupwise-v1\\held-out\\wikitext2\\T340\\CURRENT-GROUP-KLD-CUDA13\\tokens.tsv",
+  "combined_log_sha256": "a6ba50c51dc4ebcc1e7d41342de7681cc18d3116f34752a5dc32f53ef5ef2dbb",
+  "combined_log_path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\gpu-groupwise-v1\\held-out\\wikitext2\\T340\\CURRENT-GROUP-KLD-CUDA13\\combined.log",
+  "metrics": {
+    "targets": 297193,
+    "mean_test_KL": 0.09605248810121755,
+    "WikiPPL": 7.101471233329179,
+    "mean_candidate_NLL": 1.960301978542864,
+    "mean_reference_NLL": 1.8963918943035667,
+    "top1_agreement": 0.8739943403781381,
+    "tails": {
+      "KL": {
+        "mean": 0.09605248810121755,
+        "median": 0.041123526254958256,
+        "p90": 0.1542511894400715,
+        "p95": 0.23123968321628682,
+        "p99": 0.6780517540882819,
+        "p99_9": 10.0085873192529,
+        "maximum": 33.82498208950647
+      },
+      "candidate_NLL": {
+        "mean": 1.960301978542864,
+        "median": 0.9090067475764799,
+        "p90": 5.569016497387762,
+        "p95": 7.418933968041218,
+        "p99": 10.930360300568118,
+        "p99_9": 15.001221511629417,
+        "maximum": 29.937652495131072
+      },
+      "paired_NLL_delta": {
+        "mean": 0.06391008423929741,
+        "median": 0.0005365897088290177,
+        "p90": 0.521799411764602,
+        "p95": 0.802506037402048,
+        "p99": 1.57987974408125,
+        "p99_9": 3.9867214027346405,
+        "maximum": 19.23502629727785
+      }
+    },
+    "fraction_better_NLL": 0.4479950739082011,
+    "fraction_worse_NLL": 0.552004926091799,
+    "depth_bins": {
+      "0": {
+        "count": 20480,
+        "mean_KL": 0.1095664377713877,
+        "mean_candidate_NLL": 2.029359366989543,
+        "mean_reference_NLL": 1.96327195523576
+      },
+      "1": {
+        "count": 20480,
+        "mean_KL": 0.11724496387882018,
+        "mean_candidate_NLL": 2.0278764850202373,
+        "mean_reference_NLL": 1.9723070101014735
+      },
+      "2": {
+        "count": 20480,
+        "mean_KL": 0.10689454619602046,
+        "mean_candidate_NLL": 1.7587631637675631,
+        "mean_reference_NLL": 1.696778914792457
+      },
+      "3": {
+        "count": 20480,
+        "mean_KL": 0.10095924110244844,
+        "mean_candidate_NLL": 1.7142205781567814,
+        "mean_reference_NLL": 1.664432987620727
+      },
+      "4": {
+        "count": 20480,
+        "mean_KL": 0.09980676359883463,
+        "mean_candidate_NLL": 1.888647120123665,
+        "mean_reference_NLL": 1.829798714263907
+      },
+      "5": {
+        "count": 20480,
+        "mean_KL": 0.08757521343862369,
+        "mean_candidate_NLL": 2.199073809128852,
+        "mean_reference_NLL": 2.1304260861079025
+      },
+      "6": {
+        "count": 20480,
+        "mean_KL": 0.0905790561901706,
+        "mean_candidate_NLL": 2.050612262410714,
+        "mean_reference_NLL": 1.978381313480129
+      },
+      "7": {
+        "count": 20480,
+        "mean_KL": 0.09547253723607746,
+        "mean_candidate_NLL": 2.035974967917376,
+        "mean_reference_NLL": 1.9607079615802168
+      },
+      "8": {
+        "count": 18665,
+        "mean_KL": 0.0844768891830378,
+        "mean_candidate_NLL": 1.9873222738556044,
+        "mean_reference_NLL": 1.920328042085901
+      },
+      "9": {
+        "count": 16384,
+        "mean_KL": 0.09884377253115686,
+        "mean_candidate_NLL": 1.8166371578277318,
+        "mean_reference_NLL": 1.7497266584926074
+      },
+      "10": {
+        "count": 16384,
+        "mean_KL": 0.10029635566451406,
+        "mean_candidate_NLL": 1.8931824485598838,
+        "mean_reference_NLL": 1.830067858575403
+      },
+      "11": {
+        "count": 16384,
+        "mean_KL": 0.08073836009728418,
+        "mean_candidate_NLL": 1.8262143505617154,
+        "mean_reference_NLL": 1.7614733466626704
+      },
+      "12": {
+        "count": 16384,
+        "mean_KL": 0.0821852979237951,
+        "mean_candidate_NLL": 1.8458667560747979,
+        "mean_reference_NLL": 1.7991760837015929
+      },
+      "13": {
+        "count": 16384,
+        "mean_KL": 0.08811576088679889,
+        "mean_candidate_NLL": 2.106605419479242,
+        "mean_reference_NLL": 2.039632368046038
+      },
+      "14": {
+        "count": 16384,
+        "mean_KL": 0.0961291459879019,
+        "mean_candidate_NLL": 2.1398927286771543,
+        "mean_reference_NLL": 2.0686726228785286
+      },
+      "15": {
+        "count": 16384,
+        "mean_KL": 0.08964732295457814,
+        "mean_candidate_NLL": 2.0352929891364173,
+        "mean_reference_NLL": 1.9675135190313078
+      }
+    },
+    "worst_KL_examples": [
+      {
+        "input_index": 201972,
+        "target_token": 15,
+        "context_position": 5364,
+        "KL": 33.82498208950647,
+        "paired_NLL_delta": -6.498917936525341
+      },
+      {
+        "input_index": 250051,
+        "target_token": 15518,
+        "context_position": 53443,
+        "KL": 30.399479020740323,
+        "paired_NLL_delta": -20.54326431355018
+      },
+      {
+        "input_index": 144533,
+        "target_token": 15,
+        "context_position": 13461,
+        "KL": 28.00986782089005,
+        "paired_NLL_delta": -15.057131809047219
+      },
+      {
+        "input_index": 261825,
+        "target_token": 24,
+        "context_position": 65217,
+        "KL": 27.97824683065672,
+        "paired_NLL_delta": -3.1674600986304995
+      },
+      {
+        "input_index": 281495,
+        "target_token": 31,
+        "context_position": 19351,
+        "KL": 27.26632911703559,
+        "paired_NLL_delta": -7.456239894163963
+      },
+      {
+        "input_index": 241495,
+        "target_token": 20,
+        "context_position": 44887,
+        "KL": 26.710599411383495,
+        "paired_NLL_delta": -7.168423128196886
+      },
+      {
+        "input_index": 281367,
+        "target_token": 31,
+        "context_position": 19223,
+        "KL": 26.655523398939895,
+        "paired_NLL_delta": -9.861160666784098
+      },
+      {
+        "input_index": 281185,
+        "target_token": 31,
+        "context_position": 19041,
+        "KL": 26.553032966761755,
+        "paired_NLL_delta": -3.125679573259772
+      },
+      {
+        "input_index": 281196,
+        "target_token": 16,
+        "context_position": 19052,
+        "KL": 25.888510773238988,
+        "paired_NLL_delta": -3.1490236687424673
+      },
+      {
+        "input_index": 169035,
+        "target_token": 278,
+        "context_position": 37963,
+        "KL": 25.57270853337715,
+        "paired_NLL_delta": -10.386348845035641
+      },
+      {
+        "input_index": 158772,
+        "target_token": 16,
+        "context_position": 27700,
+        "KL": 25.42090936672215,
+        "paired_NLL_delta": -5.441805456240385
+      },
+      {
+        "input_index": 248216,
+        "target_token": 15,
+        "context_position": 51608,
+        "KL": 25.349426308858348,
+        "paired_NLL_delta": -13.951385561065852
+      },
+      {
+        "input_index": 230865,
+        "target_token": 15,
+        "context_position": 34257,
+        "KL": 24.961295507689552,
+        "paired_NLL_delta": -7.774052002226306
+      },
+      {
+        "input_index": 40060,
+        "target_token": 17,
+        "context_position": 40060,
+        "KL": 24.271946196509468,
+        "paired_NLL_delta": -3.2809763533915715
+      },
+      {
+        "input_index": 240615,
+        "target_token": 15,
+        "context_position": 44007,
+        "KL": 24.056211424880964,
+        "paired_NLL_delta": 4.044464141981258
+      },
+      {
+        "input_index": 281099,
+        "target_token": 31,
+        "context_position": 18955,
+        "KL": 23.873921108657058,
+        "paired_NLL_delta": -7.857926316468013
+      },
+      {
+        "input_index": 255138,
+        "target_token": 6433,
+        "context_position": 58530,
+        "KL": 23.55177718733142,
+        "paired_NLL_delta": 8.33302990488841
+      },
+      {
+        "input_index": 266923,
+        "target_token": 17,
+        "context_position": 4779,
+        "KL": 23.334945367533084,
+        "paired_NLL_delta": -6.611643945415506
+      },
+      {
+        "input_index": 68282,
+        "target_token": 595,
+        "context_position": 2746,
+        "KL": 23.1017338424889,
+        "paired_NLL_delta": -12.747615240331902
+      },
+      {
+        "input_index": 234558,
+        "target_token": 24,
+        "context_position": 37950,
+        "KL": 23.041172348625484,
+        "paired_NLL_delta": -4.834474506740061
+      }
+    ],
+    "worst_NLL_regressions": [
+      {
+        "input_index": 227406,
+        "target_token": 2874,
+        "context_position": 30798,
+        "KL": 17.386098175895764,
+        "paired_NLL_delta": 19.23502629727785
+      },
+      {
+        "input_index": 228710,
+        "target_token": 6368,
+        "context_position": 32102,
+        "KL": 18.77611251629861,
+        "paired_NLL_delta": 18.77673406623046
+      },
+      {
+        "input_index": 182217,
+        "target_token": 15,
+        "context_position": 51145,
+        "KL": 23.009837892382347,
+        "paired_NLL_delta": 18.009528803642237
+      },
+      {
+        "input_index": 231174,
+        "target_token": 573,
+        "context_position": 34566,
+        "KL": 17.05473685744464,
+        "paired_NLL_delta": 17.345496788588584
+      },
+      {
+        "input_index": 226810,
+        "target_token": 17,
+        "context_position": 30202,
+        "KL": 17.27880826733117,
+        "paired_NLL_delta": 17.283564071250467
+      },
+      {
+        "input_index": 40164,
+        "target_token": 81400,
+        "context_position": 40164,
+        "KL": 19.41415718442085,
+        "paired_NLL_delta": 16.133195081121173
+      },
+      {
+        "input_index": 220938,
+        "target_token": 1367,
+        "context_position": 24330,
+        "KL": 16.055680148053366,
+        "paired_NLL_delta": 16.05791883272212
+      },
+      {
+        "input_index": 8282,
+        "target_token": 15,
+        "context_position": 8282,
+        "KL": 13.894757761270418,
+        "paired_NLL_delta": 15.104619232838619
+      },
+      {
+        "input_index": 221950,
+        "target_token": 12754,
+        "context_position": 25342,
+        "KL": 13.412788609083565,
+        "paired_NLL_delta": 14.862872130270642
+      },
+      {
+        "input_index": 228018,
+        "target_token": 31,
+        "context_position": 31410,
+        "KL": 8.693559941097355,
+        "paired_NLL_delta": 14.768412083556429
+      },
+      {
+        "input_index": 226725,
+        "target_token": 16,
+        "context_position": 30117,
+        "KL": 14.690963729725418,
+        "paired_NLL_delta": 14.693054816649964
+      },
+      {
+        "input_index": 89928,
+        "target_token": 1788,
+        "context_position": 24392,
+        "KL": 9.376375521414783,
+        "paired_NLL_delta": 14.567849534567205
+      },
+      {
+        "input_index": 261577,
+        "target_token": 24,
+        "context_position": 64969,
+        "KL": 14.50904737271408,
+        "paired_NLL_delta": 14.51055794852858
+      },
+      {
+        "input_index": 132303,
+        "target_token": 15,
+        "context_position": 1231,
+        "KL": 8.782662532456788,
+        "paired_NLL_delta": 14.38928693500231
+      },
+      {
+        "input_index": 271298,
+        "target_token": 16,
+        "context_position": 9154,
+        "KL": 14.096835197009407,
+        "paired_NLL_delta": 14.101982728748661
+      },
+      {
+        "input_index": 71215,
+        "target_token": 31,
+        "context_position": 5679,
+        "KL": 10.037430830976806,
+        "paired_NLL_delta": 13.76804416840953
+      },
+      {
+        "input_index": 198815,
+        "target_token": 8086,
+        "context_position": 2207,
+        "KL": 13.690362824322259,
+        "paired_NLL_delta": 13.692423933642491
+      },
+      {
+        "input_index": 69048,
+        "target_token": 3396,
+        "context_position": 3512,
+        "KL": 13.257807837584469,
+        "paired_NLL_delta": 13.430419652873002
+      },
+      {
+        "input_index": 228751,
+        "target_token": 308,
+        "context_position": 32143,
+        "KL": 13.313343648742231,
+        "paired_NLL_delta": 13.31379237078745
+      },
+      {
+        "input_index": 119853,
+        "target_token": 4090,
+        "context_position": 54317,
+        "KL": 13.011412211537435,
+        "paired_NLL_delta": 13.095795526370466
+      }
+    ]
+  }
+}

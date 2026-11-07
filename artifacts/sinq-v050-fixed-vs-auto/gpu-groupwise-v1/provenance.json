@@ -1,0 +1,43 @@
+{
+  "status": "PASS",
+  "captured_utc": "2026-11-07T07:12:18.421698+00:00",
+  "branch": "v0.5.0",
+  "baseline_head": "cba08b5d3457c16638697a77e615cce483035e89",
+  "implementation_sha256": "f15c64efc5019fec3a321b6c4a39968ac2fb5831ec90f4a432763c14e9a8063b",
+  "source_files": {
+    "tools/sinq/optimizer/kl.py": "5d26eb358f411bc60cd208e9ec7e4ad1d4edd7206f588405f20417b9ef3f951c",
+    "tools/sinq/optimizer/schemas.py": "4481dc3194d3c06800c9d1f2150df774f58372c3fea46a542092910fc2737d88",
+    "tools/sinq/optimizer/stages.py": "60dc8c137d9bf78e4e7cf6ce81aadc46d5631956c58dc6416aada546856487d7",
+    "tools/perplexity/perplexity.cpp": "9f88da1d1bbaa2ae037d6d8e54854d41d080cc2488a6b6f6a8861dc4bdb8eaf4",
+    "tests/test-sinq-kl-execution.py": "24269052bd0a3fcfd49c7fcd5d7d21a5e088ed10791b498142d17e764fa17db4",
+    "tests/test-sinq-kl-provenance.py": "4e019d5d71f7edba263b4f0f16df85835c986e8f9667e0e0b507e9173c047f14",
+    "tests/test-perplexity-full.cpp": "8e15c56b0d9e622ad2db17007aba0dbab75d408437c75429f44c225de8e4276d",
+    "tests/test-sinq-optimizer-integrity.py": "9abafc62d439b294483a4fbbc0697516c4d511c43119bca93cffb38e2149e1c6",
+    "tests/CMakeLists.txt": "88584dda816fe6b64d0f3045ca12e771b46ac5a0de8266eae2b1d2db3540bf54",
+    "tools/sinq/README.md": "2e7f5f09957c899f252c99b04e2bba04a671b8b977dbe61555d9031d718d45db",
+    "artifacts\\sinq-v050-fixed-vs-auto\\create_selection_reference.py": "3e76803c7cb67b876fa912a8f40d13fac7d1fa2b43064b345156f62f981f427b",
+    "artifacts\\sinq-v050-fixed-vs-auto\\run_measured_selection.py": "cf0eb126b1a9fd8ca2e2b41c20ff58a6fab346bf72a2256c661f0c982be09b84",
+    "artifacts\\sinq-v050-fixed-vs-auto\\verify_evaluator_parity.py": "92fba2714f9c3d007b449aa2c2cc303543b39f29f2a69e4c3aefd034691ef456",
+    "artifacts\\sinq-v050-fixed-vs-auto\\run_final_wikitext.py": "4e27e86955f397fe3bd025a0040d8e9771b9f3aedf3d3d133045ec938fc336fe",
+    "artifacts\\sinq-v050-fixed-vs-auto\\run_final_ptb.py": "17828e84c25ed633bea7186b923c22117c5e6f1f11bfa8746f19b28ffc1f2796"
+  },
+  "executables": {
+    "llama-perplexity": "50d96fe6dd501cba9a7b92a7238d3f0b68c9494357ac887909d684925d832eb2",
+    "llama-sinq-model": "157049127f722fc2059daadba97cb314b1c7619a7e590ce96458fafbc52594ae",
+    "llama-sinq-native": "f7454721975ac04aa5669a5ee90371329d3a1aac818fc049c1974943e7262af8",
+    "llama-quantize": "ff20875b0ee4216a5a4b2d87a692d8860365e0e08e4c2adaffe32eb9996afd46",
+    "llama-completion": "ad341a0ba711ffc7c244f5107fd0c1f799282e2689697b7efa1824c3865e8a5a"
+  },
+  "cmake_cache": {
+    "CMAKE_BUILD_TYPE": "Release",
+    "CMAKE_CUDA_ARCHITECTURES": "86",
+    "CMAKE_CUDA_COMPILER": "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.3/bin/nvcc.exe",
+    "GGML_BLAS": "OFF",
+    "GGML_CUDA": "ON",
+    "GGML_CUDA_FA": "ON",
+    "GGML_CUDA_FORCE_CUBLAS": "OFF",
+    "GGML_CUDA_FORCE_MMQ": "OFF",
+    "GGML_NATIVE": "OFF"
+  },
+  "tracked_diff_sha256": "2c1780293f102abaf5652f7ea69d06c69872574a82e4643aabad772bc77832db"
+}

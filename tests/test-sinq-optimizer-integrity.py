@@ -149,7 +149,8 @@ class RepairTests(unittest.TestCase):
         partitions={role:[dict(source='master',start=start,end=end)] for role,start,end in
             [('calibration',0,2),('selection',2,5),('final_test',5,7)]}
         lock_corpora({'master':master},partitions,self.d/'corpus-partitions.json',max_tokens=32,max_output_bytes=1<<20,max_files=100)
-        reference.with_suffix('.bin.json').write_bytes(canonical_json({'source_sha256':self.source_hash}))
+        reference.with_suffix('.bin.json').write_bytes(canonical_json({'source_sha256':self.source_hash,
+            'policy':{'binary_sha256':file_digest(executable),'threads':24,'device':'cpu'}}))
         corpus=self.d/'corpus.txt';corpus.write_bytes(b'abc')
         selection=self.d/'selection.json';selection.write_bytes(canonical_json(dict(schema_version=2,split='selection',
             corpus_sha256=file_digest(corpus),reference_sha256=file_digest(reference))))

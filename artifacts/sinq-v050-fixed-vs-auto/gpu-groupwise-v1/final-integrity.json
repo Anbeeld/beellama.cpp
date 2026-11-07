@@ -1,0 +1,158 @@
+{
+  "status": "PASS",
+  "historical_models": [
+    {
+      "path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\fixed\\T340\\T340-W032-S050\\model.gguf",
+      "sha256": "c11ef4dce5f4ad6662b66f59075ebdd06406f0e8c1b75c5cef3feedc4f61bf30"
+    },
+    {
+      "path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\fixed\\T340\\T340-W032-S075\\model.gguf",
+      "sha256": "f606f0163c2facc8d975c936eb4eca5819a053f6842e85d555e6a0070c9b29a6"
+    },
+    {
+      "path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\fixed\\T340\\T340-W032-S100\\model.gguf",
+      "sha256": "a62da9ec162be1355a7b812f751af20b2ea5ee588a10444ecd3e416cfc7c0bca"
+    },
+    {
+      "path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\fixed\\T340\\T340-W064-S050\\model.gguf",
+      "sha256": "e52a053a8b81427e4aab24523ef775e1062aa317c6e6c2fc484396cf635d493b"
+    },
+    {
+      "path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\fixed\\T340\\T340-W064-S075\\model.gguf",
+      "sha256": "3a2c509429af715c1bc3ccc467069d0b7dc96b39e3e07fbb806b6843c26a6a1a"
+    },
+    {
+      "path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\fixed\\T340\\T340-W064-S100\\model.gguf",
+      "sha256": "0e52cf93a361f3fd982c2b4c0e91e95d7daae091f7d14293f44b04e3cae5916c"
+    },
+    {
+      "path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\fixed\\T340\\T340-W128-S050\\model.gguf",
+      "sha256": "a91511cdec4217d02e86ca3195270d9d071f82084bca56cf52b60e9fb5eb965e"
+    },
+    {
+      "path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\fixed\\T340\\T340-W128-S075\\model.gguf",
+      "sha256": "cf06e0109c7ee6217df5c6be60da9ae67800ceb7809025d5307fd6fd4ae3a942"
+    },
+    {
+      "path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\fixed\\T340\\T340-W128-S100\\model.gguf",
+      "sha256": "9c23848879505d1699a039459f72c7899b9f5fe75c4c8fda7cf28fba69aeba70"
+    },
+    {
+      "path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\fixed\\T340\\T340-W256-S050\\model.gguf",
+      "sha256": "17ca84c1736fe659e3ee0b5e0cee07ad63457d1c73d3f360b0531f59797f15af"
+    },
+    {
+      "path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\fixed\\T340\\T340-W256-S075\\model.gguf",
+      "sha256": "ed3ee16e73d4be0cb31e4a08049b8457ae3dc5ae9b63f0d009be5aa6ae72d44e"
+    },
+    {
+      "path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\fixed\\T340\\T340-W256-S100\\model.gguf",
+      "sha256": "e342f4d056b45d1bc2da3249704cd35aaaf6b81d05d898b96e636ddebd381950"
+    },
+    {
+      "path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\fixed\\T425\\T425-W032-S050\\model.gguf",
+      "sha256": "f874a9cff314415bf5672c78017e11c7b28295134e5be2389034b755e7b7f598"
+    },
+    {
+      "path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\fixed\\T425\\T425-W032-S075\\model.gguf",
+      "sha256": "d60b46aea0122c2b3d94e85980931518c9c616cc768474fac8154030d264ff1f"
+    },
+    {
+      "path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\fixed\\T425\\T425-W032-S100\\model.gguf",
+      "sha256": "723a7320d5c4acd1bc61f0c6c1f2b093231bdac4c167514f252e0e967f813c6d"
+    },
+    {
+      "path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\fixed\\T425\\T425-W064-S050\\model.gguf",
+      "sha256": "ca88481fdc5e9b009af3d69593af2a9bdcc881075408f4aca33f93416a8d5153"
+    },
+    {
+      "path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\fixed\\T425\\T425-W064-S075\\model.gguf",
+      "sha256": "3d32724a22a3a6b42735a7427bc3ea8a9616ac2ce48783411ed87f6e196797f8"
+    },
+    {
+      "path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\fixed\\T425\\T425-W064-S100\\model.gguf",
+      "sha256": "78dc468456e829d4f86b657e0f6baf48329f611b6ef8f1bd9c215f69cbd30db6"
+    },
+    {
+      "path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\fixed\\T425\\T425-W128-S050\\model.gguf",
+      "sha256": "ab9bcc1bf886068b8d926402484bd1c9ed4fbeec35a89462f6ef03d70036f53b"
+    },
+    {
+      "path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\fixed\\T425\\T425-W128-S075\\model.gguf",
+      "sha256": "4918c4686b2f4005f5ddee8a8c9b69016d900a1630bf0a0dc9d2e1c45ede445d"
+    },
+    {
+      "path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\fixed\\T425\\T425-W128-S100\\model.gguf",
+      "sha256": "e4841a732b19583f222cf5601274a6718195253bfcfc9acdf5fcf200a242924c"
+    },
+    {
+      "path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\fixed\\T425\\T425-W256-S050\\model.gguf",
+      "sha256": "7f8e5bad2311f88b1a878802c4fcddfe608828770567de5bc70c33f9a753f216"
+    },
+    {
+      "path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\fixed\\T425\\T425-W256-S075\\model.gguf",
+      "sha256": "d7e635922369c2dd3343471b2deae21e2676ba60e4a76810f0dba34a9c0ca0c7"
+    },
+    {
+      "path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\fixed\\T425\\T425-W256-S100\\model.gguf",
+      "sha256": "415df052894776f8718f7da0cf1dd52010a018e1404133ac675e4bd83977647e"
+    },
+    {
+      "path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\selected\\T340\\AUTO-LOCAL-L1\\best.gguf",
+      "sha256": "516a5651f989994dc9b2df11083f2412477ca7a7317afcdff7a0a0cd1cad54d0"
+    },
+    {
+      "path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\selected\\T340\\AUTO-LOCAL-MSE\\best.gguf",
+      "sha256": "4cd971047391e4bf48f01c29a75b7c08381b9ae8dd29300a86c886c2a3cfc2aa"
+    },
+    {
+      "path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\selected\\T340\\AUTO-BLOCK-MSE\\best.gguf",
+      "sha256": "fa17f0da1ca0087f89150b4bf2bd5cbedfe6ae51ad4abf0a7b05ce30ddda79a6"
+    },
+    {
+      "path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\selected\\T340\\AUTO-FISHER\\best.gguf",
+      "sha256": "d6aec12fb06712bd4b236e620ccad96eedcbf1060cdfa34bebb7e677a6e76b38"
+    },
+    {
+      "path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\selected\\T340\\AUTO-GROUP-KLD-BUDGETED\\best.gguf",
+      "sha256": "3364bb34a9b58dbff0653317fb7ece1a55f0093701c9f8ec5d6710fc4f612bb0"
+    },
+    {
+      "path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\selected\\T425\\AUTO-LOCAL-L1\\best.gguf",
+      "sha256": "6a3ae17e23112d8082c14c01e505beb24ed2dcbb370638cfd0cec954e1c8054b"
+    },
+    {
+      "path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\selected\\T425\\AUTO-LOCAL-MSE\\best.gguf",
+      "sha256": "6ce0c292949dae9746cd65f677099748ba8eb776a4ed1610ae6421c4765f7e70"
+    },
+    {
+      "path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\selected\\T425\\AUTO-BLOCK-MSE\\best.gguf",
+      "sha256": "5309898e1163c292b1a788d616d4c832c538b402f7d4eeae691ff944e5ed04e6"
+    },
+    {
+      "path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\selected\\T425\\AUTO-FISHER\\best.gguf",
+      "sha256": "83e523cc2199bcd87c18b04ad9dab8854b8c0e79928f3300ed9d9ed0a295e046"
+    },
+    {
+      "path": "C:\\Users\\anbee\\projects\\beellama-v050-sinq\\artifacts\\sinq-v050-fixed-vs-auto\\selected\\T425\\AUTO-GROUP-KLD-BUDGETED\\best.gguf",
+      "sha256": "82fc79a0ed3d63d51f5b171d5a88b670500ec0d21e9c7f97406c80e22bdcc62a"
+    }
+  ],
+  "candidate_closures": [
+    {
+      "recipe": "T340",
+      "manifest_sha256": "b13c23622c54e14992ba3a8caa69e2fb108b1af0f2bf467c599daebc1f00ae2c",
+      "tensors": 248,
+      "conditioned_candidates": 2976,
+      "source_sha256": "da9df48e961a191aafca383628f983da4552a0a61c1257b93e1d678966f1c4af"
+    },
+    {
+      "recipe": "T425",
+      "manifest_sha256": "75e86b85f88c1a76911b9833edf72385125341177b1eb1d4d6ed9807a82ca1f9",
+      "tensors": 248,
+      "conditioned_candidates": 2976,
+      "source_sha256": "da9df48e961a191aafca383628f983da4552a0a61c1257b93e1d678966f1c4af"
+    }
+  ],
+  "elapsed_seconds": 264.5971692999592
+}

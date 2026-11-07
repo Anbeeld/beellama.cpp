@@ -1,0 +1,4 @@
+[1/4] Building CXX object tools\perplexity\CMakeFiles\llama-perplexity-impl.dir\perplexity.cpp.obj
+[2/4] Linking CXX static library tools\perplexity\llama-perplexity-impl.lib
+[3/4] Linking CXX executable bin\test-perplexity-full.exe
+[4/4] Linking CXX executable bin\llama-perplexity.exe
