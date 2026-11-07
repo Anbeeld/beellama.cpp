@@ -1670,7 +1670,14 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
+#if defined(GGML_USE_HIP)
+    // RDNA3 runs whole-tile non-Stream-K at ub=512, so KV_max clamping has no
+    // load-imbalance downside; enable the all-INF tile skip at the serving
+    // ubatch size. Skipped tiles contribute expf(-INF) = 0, so bit-identical.
+    const bool scan_mask = !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 256 || Q->ne[3] > 1);
+#else
     const bool scan_mask = !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1);
+#endif
     if (scan_mask) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
