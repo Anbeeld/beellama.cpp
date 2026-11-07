@@ -6,25 +6,10 @@ for exact names, environment variables, defaults, and validation ranges.
 
 ## SINQ offline quantization optimizer
 
-Use `llama-quantize --sinq-config FILE` for uniform or manual per-tensor/layer
-normalization. Use `python -m tools.sinq.optimizer.cli` for bounded ordinary
-SINQ parameter candidates, optional activation-bound AWQ alternatives, local,
-blockwise or Fisher score selection, full-model KLD coordinate descent, and
-explicit filter-then-select pipelines. Locked tensors remain fixed.
-
-The v2 GGUF format permits different widths, iterations and strengths in one
-model. Each conditioned native IQ/Q weight stores `W/u` plus its exact positive
-finite F16 input-channel companion `u`. Existing matrix kernels consume `u*x`;
-LoRA continues to receive original inputs. Producer widths require no new
-inference kernels. Unselected tensors retain the verified stock allocation.
-
-**Conditioned GGUFs require BeeLlama.** Other engines may recognize the codec
-but ignore compensation. V1 conditioned metadata and old unreleased optimizer
-artifacts are rejected. CPU and qualified CUDA placements preserve existing
-runtime restrictions; no new backend qualification or quality improvement is
-implied. See [settings and schemas](sinq-settings.md),
-[execution policies](sinq-tier-c-execution.md), and the
-[argument reference](beellama-args.md#sinq-derived-native-iqq-preconditioning).
+SINQ preconditions Qwen3.5 weights before standard IQ/Q quantization, using
+fixed settings or an offline per-tensor optimizer. **Conditioned GGUFs require
+BeeLlama.** See the [SINQ feature guide](sinq.md) for the mechanism, supported
+codecs, arguments, configuration schemas, activation export and execution limits.
 
 ## KVarN target KV cache
 

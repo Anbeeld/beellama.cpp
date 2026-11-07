@@ -1,9 +1,0 @@
-{
-  "status": "PASS",
-  "recipe": "T425",
-  "method": "T425",
-  "selection_total_time_sec": 2250.49299519998,
-  "assembly_time_sec": 39.39711299992632,
-  "evaluations": 2977,
-  "best_model_sha256": "8586a243a7d75ae38e1793f6da99e07fb55f1baa7dd4e3ac5a16551d8cbff854"
-}

@@ -1,6 +1,0 @@
-{
-  "status": "PASS",
-  "full_wikitext_reference_sha256_after_all_evaluations": "b0963bb182cfb65b9f317aab36203718d5730c21f82eb57ca401bdb89969d89b",
-  "original_cpu_selection_reference_sha256_after_all_evaluations": "4172910d566b2a4ddbe908d773f87f6689b5d9f77e1b7e9e7b690ffc520c1b0a",
-  "source_sha256_after_all_evaluations": "da9df48e961a191aafca383628f983da4552a0a61c1257b93e1d678966f1c4af"
-}

@@ -1,9 +1,0 @@
-{
-  "status": "PASS",
-  "recipe": "T340",
-  "method": "legacy13-audited",
-  "selection_total_time_sec": 2256.794959699968,
-  "assembly_time_sec": 1911.9824345002417,
-  "evaluations": 13,
-  "best_model_sha256": "3364bb34a9b58dbff0653317fb7ece1a55f0093701c9f8ec5d6710fc4f612bb0"
-}

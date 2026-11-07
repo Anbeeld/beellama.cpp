@@ -12,7 +12,7 @@ from tools.sinq.optimizer.resources import digest,file_digest
 @unittest.skipUnless(os.name=='nt','mandatory Windows file guard')
 class StockBaselineControl(unittest.TestCase):
     def setUp(self):
-        spec=importlib.util.spec_from_file_location('control_validation',REPO/'artifacts/sinq-v050-fixed-vs-auto/final_control_validation.py')
+        spec=importlib.util.spec_from_file_location('control_validation',REPO/'tests/sinq-reference/experiment/final_control_validation.py')
         self.module=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.module)
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
         self.path=Path(self.tmp.name)/'baseline.json'

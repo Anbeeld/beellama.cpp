@@ -1,8 +1,0 @@
-# Preserve hash-bound research evidence and exact orchestration source bytes.
-.gitattributes -text
-gpu-groupwise-v1/** -text
-create_selection_reference.py -text
-run_measured_selection.py -text
-verify_evaluator_parity.py -text
-run_final_wikitext.py -text
-run_final_ptb.py -text

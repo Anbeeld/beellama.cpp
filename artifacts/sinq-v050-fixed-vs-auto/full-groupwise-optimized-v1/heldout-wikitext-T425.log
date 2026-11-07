@@ -1,5 +1,0 @@
-usage: run_final_wikitext.py [-h] [--models-manifest MODELS_MANIFEST]
-                             [--output-directory OUTPUT_DIRECTORY]
-                             [--execution-lock EXECUTION_LOCK]
-                             {T340,T425} {0,1}
-run_final_wikitext.py: error: unrecognized arguments: --executable build-sinq-clean/bin/llama-perplexity.exe

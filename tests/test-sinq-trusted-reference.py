@@ -196,7 +196,7 @@ class RunnerTripwireTests(unittest.TestCase):
                 'models_manifest_sha256': resources.file_digest(manifest), 'executable_sha256': resources.file_digest(executable),
                 'source_sha256': source_sha, 'wikitext_input_lock_sha256': resources.file_digest(input_lock),
                 'gpus': {'0': {'pci_bus_id': '0000:test'}}})
-            spec = importlib.util.spec_from_file_location('final_wikitext_test', REPO / 'artifacts/sinq-v050-fixed-vs-auto/run_final_wikitext.py')
+            spec = importlib.util.spec_from_file_location('final_wikitext_test', REPO / 'tests/sinq-reference/experiment/run_final_wikitext.py')
             runner = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(runner)
             runner.ROOT, runner.REPO = root, root

@@ -1,6 +1,0 @@
-{
-  "status": "EXPECTED_REFUSAL",
-  "returncode": 1,
-  "stderr": "ValueError: full-248 selection missing: T340\n",
-  "scope": "Refuses freeze before either complete full-248 selection exists; no final-test inference invoked."
-}

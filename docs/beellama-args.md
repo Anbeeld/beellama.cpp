@@ -7,34 +7,9 @@ limits, and measurement guidance.
 
 ## SINQ-derived native IQ/Q preconditioning
 
-`llama-quantize --sinq-config FILE` applies strict v2 per-tensor/layer settings
-before the unchanged selected native codec. Without the config, stock
-quantization is unchanged. Conditioned GGUFs require BeeLlama at inference.
-
-| Option | Default | Behavior |
-| --- | --- | --- |
-| `--sinq-config FILE` | Off | JSON defaults, targets and disjoint selector overrides; resolves before encoding |
-| `--sinq-diagnostics-json FILE` | Off | Shared external per-tensor report; does not supply settings |
-| `--tensor-type tensor_name=ggml_type` | Unused | Existing exact/regex codec allocation selector |
-| `--tensor-type-file FILE` | Unused | Existing codec allocation selectors from a file |
-| `--pure` | Off | Disables conventional K-quant mixture heuristics |
-| `--keep-split` | Off | Keeps each companion with its base matrix's input shard |
-
-```sh
-llama-quantize --pure --sinq-config direct.json source-bf16.gguf model.beellama-qk-sinq.gguf Q3_K
-llama-quantize --pure source-bf16.gguf stock.gguf Q3_K
-python -m tools.sinq.optimizer.cli plan --config generate.json
-python -m tools.sinq.optimizer.cli generate --config generate.json
-```
-
-See [SINQ settings](sinq-settings.md) for the complete supported schema, manual,
-automatic and locked-hybrid examples, v2 metadata and resource limits. Old
-unreleased SINQ switches/artifacts are unsupported, with no compatibility aliases.
-Only original floating Qwen3.5 supported projections can be conditioned;
-embeddings/output heads and other tensors keep the ordinary exact codec recipe.
-CPU and qualified CUDA placements retain base-only compensation and original
-LoRA inputs. Hadamard and row/tensor split combinations remain unsupported.
-This refactor makes no quality-improvement claim.
+See the [SINQ feature guide](sinq.md#quantizer-arguments) for all SINQ quantizer
+arguments, defaults, JSON schemas and offline optimizer controls. Conditioned
+GGUFs require BeeLlama at inference.
 
 ## KVarN cache types and SWA overrides
 

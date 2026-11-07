@@ -118,8 +118,8 @@ Key binaries are `llama-server`, `llama-cli`, `llama-bench`, and
 - `docs/beellama-features.md` - fork feature and compatibility matrix.
 - `docs/beellama-args.md` - Bee arguments, aliases, and removals.
 - `docs/preset.md` - INI preset format.
-- `../beellama.doc/docs/explanation/sinq-format.md` - standard-Q_K conditioning
-  contract, companion manifest, CPU/CUDA limits and portability warning.
+- `docs/sinq.md` - SINQ conditioning, optimizer and activation-export options,
+  v2 companion format, CPU/CUDA limits and portability warning.
 
 ### Invariants
 

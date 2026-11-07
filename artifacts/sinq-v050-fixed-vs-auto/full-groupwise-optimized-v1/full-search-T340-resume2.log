@@ -1,9 +1,0 @@
-{
-  "status": "PASS",
-  "recipe": "T340",
-  "method": "T340",
-  "selection_total_time_sec": 2237.241286400007,
-  "assembly_time_sec": 33.010677900048904,
-  "evaluations": 2977,
-  "best_model_sha256": "912de0e6e4c375a07382f08ccd91662b59cfbad3c2ef2629fad153c8ea35cf20"
-}
