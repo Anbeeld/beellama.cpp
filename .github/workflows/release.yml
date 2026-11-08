@@ -276,7 +276,7 @@ jobs:
     name: macOS arm64 Metal
     needs: release-meta
     if: ${{ needs.release-meta.outputs.build_packages == 'true' }}
-    runs-on: macos-14
+    runs-on: macos-26
     steps:
       - name: Reserve cache save time
         shell: bash
@@ -305,6 +305,7 @@ jobs:
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DGGML_METAL_EMBED_LIBRARY=ON \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 \
             -DCMAKE_INSTALL_RPATH='@loader_path' \
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
             -DLLAMA_FATAL_WARNINGS=ON \
