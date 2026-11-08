@@ -154,6 +154,10 @@ static void process_logits(
 }
 
 // Full-reference numeric helpers have external linkage for deterministic no-model tests.
+bool perplexity_full_compare_batch(int n_vocab, const float * logits, const uint16_t * encoded,
+                                  const int * targets, int count, int threads, std::array<double,4> * metrics);
+bool perplexity_full_nll_batch(int n_vocab, const float * logits, const int * targets,
+                              int count, int threads, double * nll);
 int perplexity_full_top1(int n_vocab, const float * logits);
 int perplexity_full_top1(int n_vocab, const float * logits) {
     return int(std::max_element(logits, logits + n_vocab) - logits);
@@ -2163,6 +2167,7 @@ static bool kl_divergence(llama_context * ctx, const common_params & params) {
 // model/tokenizer settings, context, batch and microbatch flags. The header checks
 // context/vocabulary/tokens, not model runtime settings. Compact rows approximate
 // reference probabilities; measure their floor with a same-model BF16 comparison.
+bool perplexity_full_same_file(const std::string & a, const std::string & b);
 bool perplexity_full_same_file(const std::string & a, const std::string & b) {
     if (a.empty() || b.empty()) { return false; }
 #ifdef _WIN32
