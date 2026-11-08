@@ -192,7 +192,12 @@ static void run_lookup_and_head(ggml_backend_t backend, ggml_type type, int k) {
                 const float expected = decoded[i*k+columns[j]];
                 // One-hot inputs isolate an encoded weight coordinate. Native
                 // CUDA Q8_1 activation scales round to F16, unlike CPU Q8_K.
-                check(std::isfinite(logits[j*rows+i]) && std::abs(logits[j*rows+i]-expected)<=.001f*std::max(1.f,std::abs(expected)),"head differs from decoded one-hot reference");
+                const float tolerance=.001f*std::max(1.f,std::abs(expected));
+                if(!(std::isfinite(logits[j*rows+i]) && std::abs(logits[j*rows+i]-expected)<=tolerance)) {
+                    std::fprintf(stderr,"head codec=%s K=%d row=%d column=%d replay=%d actual=%.9g expected=%.9g tolerance=%g\n",
+                                 ggml_type_name(type),k,i,columns[j],repeat,logits[j*rows+i],expected,tolerance);
+                    check(false,"head differs from decoded one-hot reference");
+                }
             }
         }
     }
