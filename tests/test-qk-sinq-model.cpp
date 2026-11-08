@@ -198,6 +198,8 @@ static void full_coverage_pairs(const std::string & source, const std::filesyste
 
 static void native_codec_pairs(const std::string & source, const std::filesystem::path & dir) {
     const std::pair<llama_ftype,ggml_type> codecs[] = {
+        {LLAMA_FTYPE_MOSTLY_Q2_K,GGML_TYPE_Q2_K}, {LLAMA_FTYPE_MOSTLY_Q5_K_M,GGML_TYPE_Q5_K},
+        {LLAMA_FTYPE_MOSTLY_Q4_0,GGML_TYPE_Q4_0}, {LLAMA_FTYPE_MOSTLY_Q4_1,GGML_TYPE_Q4_1},
         {LLAMA_FTYPE_MOSTLY_IQ4_XS,GGML_TYPE_IQ4_XS}, {LLAMA_FTYPE_MOSTLY_IQ1_S,GGML_TYPE_IQ1_S},
         {LLAMA_FTYPE_MOSTLY_IQ1_M,GGML_TYPE_IQ1_M}, {LLAMA_FTYPE_MOSTLY_IQ2_XXS,GGML_TYPE_IQ2_XXS},
         {LLAMA_FTYPE_MOSTLY_IQ2_XS,GGML_TYPE_IQ2_XS}, {LLAMA_FTYPE_MOSTLY_IQ2_S,GGML_TYPE_IQ2_S},
@@ -508,13 +510,33 @@ int main(int argc, char ** argv) try {
     settings_controls(source,dir);
     full_coverage_pairs(source,dir);
     native_codec_pairs(source,dir);
-    // Conditioning must preserve the existing S/M/L allocator, including
-    // conventional types that do not receive a channel companion.
-    for (auto format : {LLAMA_FTYPE_MOSTLY_Q3_K_S,LLAMA_FTYPE_MOSTLY_Q3_K_M,
-                        LLAMA_FTYPE_MOSTLY_Q3_K_L,LLAMA_FTYPE_MOSTLY_Q4_K_S,LLAMA_FTYPE_MOSTLY_Q4_K_M}) {
+    // Conditioning must preserve mixed preset allocations, including IQ
+    // presets whose names differ from their native tensor codecs.
+    ggml_context * preset_data=nullptr;
+    auto * preset_meta=gguf_init_from_file(source.c_str(),{false,&preset_data});
+    check(preset_meta && preset_data,"mixed preset source read");
+    std::vector<std::vector<float>> preset_importance(size_t(gguf_get_n_tensors(preset_meta)));
+    std::vector<llama_model_imatrix_data> preset_entries;
+    for(int64_t i=0;i<gguf_get_n_tensors(preset_meta);++i) {
+        const char * name=gguf_get_tensor_name(preset_meta,i);
+        auto * tensor=ggml_get_tensor(preset_data,name);
+        if(tensor->ne[1]<=1)continue;
+        preset_importance[i].assign(size_t(tensor->ne[0]),1.f);
+        preset_entries.push_back({name,preset_importance[i].data(),preset_importance[i].size()});
+    }
+    preset_entries.push_back({nullptr,nullptr,0});
+    for (auto format : {LLAMA_FTYPE_MOSTLY_Q2_K,LLAMA_FTYPE_MOSTLY_Q2_K_S,
+                        LLAMA_FTYPE_MOSTLY_Q3_K_S,LLAMA_FTYPE_MOSTLY_Q3_K_M,LLAMA_FTYPE_MOSTLY_Q3_K_L,
+                        LLAMA_FTYPE_MOSTLY_Q4_0,LLAMA_FTYPE_MOSTLY_Q4_1,
+                        LLAMA_FTYPE_MOSTLY_Q4_K_S,LLAMA_FTYPE_MOSTLY_Q4_K_M,
+                        LLAMA_FTYPE_MOSTLY_Q5_K_S,LLAMA_FTYPE_MOSTLY_Q5_K_M,
+                        LLAMA_FTYPE_MOSTLY_Q6_K,LLAMA_FTYPE_MOSTLY_Q8_0,
+                        LLAMA_FTYPE_MOSTLY_IQ2_S,LLAMA_FTYPE_MOSTLY_IQ2_M,
+                        LLAMA_FTYPE_MOSTLY_IQ3_XXS,LLAMA_FTYPE_MOSTLY_IQ3_XS,LLAMA_FTYPE_MOSTLY_IQ3_S,LLAMA_FTYPE_MOSTLY_IQ3_M,
+                        LLAMA_FTYPE_MOSTLY_IQ4_NL,LLAMA_FTYPE_MOSTLY_IQ4_XS}) {
         const auto standard = (dir/("preset-standard-"+std::to_string(format)+".gguf")).string();
         const auto normalized = (dir/("preset-normalized-"+std::to_string(format)+".gguf")).string();
-        auto p = llama_model_quantize_default_params(); p.ftype = format; p.nthread = 2;
+        auto p = llama_model_quantize_default_params(); p.ftype = format; p.nthread = 2; p.imatrix=preset_entries.data();
         check(!p.pure,"mixed preset unexpectedly defaults to pure");
         check(llama_model_quantize(source.c_str(),standard.c_str(),&p)==0,"ordinary mixed preset quantize");
         const auto config=write_config(dir); p.sinq_config=config.c_str();
@@ -531,9 +553,9 @@ int main(int argc, char ** argv) try {
             const int64_t j = gguf_find_tensor(conditioned,name);
             check(j>=0 && gguf_get_tensor_type(base,i)==gguf_get_tensor_type(conditioned,j),"conditioning changed mixed preset type allocation");
             const auto type = gguf_get_tensor_type(base,i);
-            const bool eligible = std::strncmp(name,"blk.",4)==0 && (type==GGML_TYPE_Q3_K || type==GGML_TYPE_Q4_K || type==GGML_TYPE_Q6_K);
+            const bool eligible = std::strncmp(name,"blk.",4)==0 && llama_sinq_supported_type(type);
             const bool has_scale = gguf_find_tensor(conditioned,(std::string(name)+".sinq_scale2").c_str())>=0;
-            check(has_scale==eligible,"mixed preset companion coverage does not match audited Q3/Q4/Q6 allocation");
+            check(has_scale==eligible,"mixed preset companion coverage does not match native codec allocation");
             if (!eligible) {
                 auto * a = ggml_get_tensor(base_data,name);
                 auto * b = ggml_get_tensor(conditioned_data,name);
@@ -542,7 +564,7 @@ int main(int argc, char ** argv) try {
             }
             companions += has_scale;
         }
-        check(companions>0,"mixed preset fixture did not exercise conditioning");
+        check(companions==7,"mixed preset fixture must condition all seven projections");
         gguf_free(base); gguf_free(conditioned);
         ggml_free(base_data); ggml_free(conditioned_data);
         auto * model = load(normalized);
@@ -550,6 +572,7 @@ int main(int argc, char ** argv) try {
         llama_model_free(model);
         std::printf("mixed preset type allocation/companion/reload format=%d OK\n",format);
     }
+    gguf_free(preset_meta);ggml_free(preset_data);
     const auto mixed = (dir/"mixed-standard-types.gguf").string();
     auto mixed_params = llama_model_quantize_default_params();
     mixed_params.ftype = LLAMA_FTYPE_MOSTLY_Q3_K_M;

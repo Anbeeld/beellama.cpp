@@ -137,7 +137,7 @@ def main():
             if name in declared:
                 if int(tensor.shape[0]) % settings[name]['strip_width']:
                     raise ValueError(f'{path}: input dimension is not strip aligned')
-                if kind not in ('Q3_K', 'Q4_K', 'Q6_K', 'Q5_0', 'Q5_1', 'Q8_0', 'IQ1_S', 'IQ1_M',
+                if kind not in ('Q2_K', 'Q3_K', 'Q4_K', 'Q5_K', 'Q4_0', 'Q4_1', 'Q6_K', 'Q5_0', 'Q5_1', 'Q8_0', 'IQ1_S', 'IQ1_M',
                                 'IQ2_XXS', 'IQ2_XS', 'IQ2_S', 'IQ3_XXS', 'IQ3_S', 'IQ4_NL', 'IQ4_XS'):
                     raise ValueError(f'{path}: transformed base has unsupported native codec')
                 side_name = name + '.sinq_scale2'

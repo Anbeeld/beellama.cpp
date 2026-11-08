@@ -13,7 +13,8 @@ static void require(bool condition, const char * message) {
 
 // Metadata-only characterization: scaling belongs to the base matmul, not LoRA.
 int main() {
-    for (const auto type : { GGML_TYPE_Q3_K, GGML_TYPE_Q4_K }) {
+    for (const auto type : { GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K,
+                             GGML_TYPE_Q5_K, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1 }) {
       for (const int k : { 256, 512 }) {
         llm_graph_result result(128);
         llm_graph_params params = {};

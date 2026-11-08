@@ -327,7 +327,8 @@ int main(int argc, char ** argv) try {
     }
     for (auto type : {GGML_TYPE_IQ1_S,GGML_TYPE_IQ1_M,GGML_TYPE_IQ2_XXS,GGML_TYPE_IQ2_XS,
                       GGML_TYPE_IQ2_S,GGML_TYPE_IQ3_XXS,GGML_TYPE_IQ3_S,GGML_TYPE_IQ4_XS,
-                      GGML_TYPE_IQ4_NL,GGML_TYPE_Q5_0,GGML_TYPE_Q5_1,GGML_TYPE_Q6_K,GGML_TYPE_Q8_0}) {
+                      GGML_TYPE_IQ4_NL,GGML_TYPE_Q2_K,GGML_TYPE_Q5_K,GGML_TYPE_Q4_0,GGML_TYPE_Q4_1,
+                      GGML_TYPE_Q5_0,GGML_TYPE_Q5_1,GGML_TYPE_Q6_K,GGML_TYPE_Q8_0}) {
         for (int k : {256,4096}) { run_lookup_and_head(backend,type,k); }
         for (int k : {4096,12288}) { run_case(backend,name,type,k,64,4,2,false,true,false); }
         for (bool identity : {false,true}) {
@@ -336,7 +337,8 @@ int main(int argc, char ** argv) try {
     }
     // Characterize fused input scaling against independently precomputed F32
     // activations, including tail padding, batched shapes and CUDA graph replay.
-    for (auto type : {GGML_TYPE_Q3_K,GGML_TYPE_Q4_K,GGML_TYPE_Q6_K,GGML_TYPE_Q8_0,
+    for (auto type : {GGML_TYPE_Q2_K,GGML_TYPE_Q5_K,GGML_TYPE_Q4_0,GGML_TYPE_Q4_1,
+                      GGML_TYPE_Q3_K,GGML_TYPE_Q4_K,GGML_TYPE_Q6_K,GGML_TYPE_Q8_0,
                       GGML_TYPE_IQ1_S,GGML_TYPE_IQ2_XXS,GGML_TYPE_IQ4_XS}) {
         for (int tokens : {1,4,17,128}) {
             for (int batches : {1,4}) {
@@ -344,7 +346,8 @@ int main(int argc, char ** argv) try {
             }
         }
     }
-    for (auto type : {GGML_TYPE_Q3_K,GGML_TYPE_Q4_K,GGML_TYPE_Q6_K,GGML_TYPE_IQ1_S,GGML_TYPE_IQ2_XXS,GGML_TYPE_IQ4_XS}) {
+    for (auto type : {GGML_TYPE_Q2_K,GGML_TYPE_Q5_K,GGML_TYPE_Q4_0,GGML_TYPE_Q4_1,
+                      GGML_TYPE_Q3_K,GGML_TYPE_Q4_K,GGML_TYPE_Q6_K,GGML_TYPE_IQ1_S,GGML_TYPE_IQ2_XXS,GGML_TYPE_IQ4_XS}) {
         run_scaled_glu(backend,type,false);
         run_scaled_glu(backend,type,true);
     }

@@ -8,7 +8,7 @@ import unittest
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from gguf import GGUFWriter, GGMLQuantizationType
+from gguf import GGUFWriter, GGMLQuantizationType, GGML_QUANT_SIZES
 from gguf.quants import dequantize
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -21,8 +21,8 @@ def write(path, kind=None, scales=None, manifest=True, version=2, metadata=None,
     if kind is None:
         w.add_tensor(name, np.zeros((2, columns), dtype=np.float32))
     else:
-        block = 110 if kind == GGMLQuantizationType.Q3_K else 144
-        packed = np.zeros((2, block * (columns // 256)), dtype=np.uint8)
+        block, size = GGML_QUANT_SIZES[kind]
+        packed = np.zeros((2, size * (columns // block)), dtype=np.uint8)
         decoded = dequantize(packed, kind)
         assert decoded.shape == (2, columns) and np.all(decoded == 0)
         w.add_tensor(name, packed, raw_dtype=kind)
@@ -60,7 +60,16 @@ class TestQKSidecar(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             d = Path(directory)
             write(d/'source.gguf')
-            for kind in [GGMLQuantizationType.Q3_K, GGMLQuantizationType.Q4_K]:
+            for kind in [GGMLQuantizationType.Q2_K, GGMLQuantizationType.Q3_K,
+                         GGMLQuantizationType.Q4_K, GGMLQuantizationType.Q5_K,
+                         GGMLQuantizationType.Q4_0, GGMLQuantizationType.Q4_1,
+                         GGMLQuantizationType.Q5_0, GGMLQuantizationType.Q5_1,
+                         GGMLQuantizationType.Q6_K, GGMLQuantizationType.Q8_0,
+                         GGMLQuantizationType.IQ1_S, GGMLQuantizationType.IQ1_M,
+                         GGMLQuantizationType.IQ2_XXS, GGMLQuantizationType.IQ2_XS,
+                         GGMLQuantizationType.IQ2_S, GGMLQuantizationType.IQ3_XXS,
+                         GGMLQuantizationType.IQ3_S, GGMLQuantizationType.IQ4_NL,
+                         GGMLQuantizationType.IQ4_XS]:
                 write(d/'model.gguf', kind, np.ones(256))
                 result = self.inspect(d/'source.gguf', d/'model.gguf', d/'out.json')
                 self.assertEqual(result.returncode, 0, result.stderr)

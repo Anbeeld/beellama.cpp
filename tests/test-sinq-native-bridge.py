@@ -121,7 +121,7 @@ class Bridge(unittest.TestCase):
             request(cfg,d,raw=text.replace('"strength": 0.0','"strength": 1e999',1),ok=False)
 
     def test_actual_codecs_and_rescore(self):
-        codecs=('iq1_s','iq1_m','iq2_xxs','iq2_xs','iq2_s','iq3_xxs','iq3_s','iq4_nl','iq4_xs','q3_k','q4_k','q5_0','q5_1','q6_k','q8_0')
+        codecs=('iq1_s','iq1_m','iq2_xxs','iq2_xs','iq2_s','iq3_xxs','iq3_s','iq4_nl','iq4_xs','q2_k','q3_k','q4_k','q5_k','q4_0','q4_1','q5_0','q5_1','q6_k','q8_0')
         with tempfile.TemporaryDirectory(prefix='sinq-bridge-') as tmp:
             d=Path(tmp);n,k,samples=3,256,4
             w=np.sin(np.arange(n*k,dtype=np.float32)*.17).reshape(n,k)

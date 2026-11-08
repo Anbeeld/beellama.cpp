@@ -7,7 +7,7 @@ import os
 import re
 from pathlib import Path
 
-NATIVE_QTYPES=frozenset(('Q3_K','Q4_K','IQ1_S','IQ1_M','IQ2_XXS','IQ2_XS','IQ2_S',
+NATIVE_QTYPES=frozenset(('Q2_K','Q3_K','Q4_K','Q5_K','Q4_0','Q4_1','IQ1_S','IQ1_M','IQ2_XXS','IQ2_XS','IQ2_S',
     'IQ3_XXS','IQ3_S','IQ4_XS','IQ4_NL','Q5_0','Q5_1','Q6_K','Q8_0'))
 STAGES=('plan','generate','score','select','assemble','validate')
 SCORERS={'local_output_l1':('local','output_l1'),'local_output_mse':('local','output_mse'),

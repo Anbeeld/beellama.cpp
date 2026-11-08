@@ -49,12 +49,19 @@ MTP projections are outside the conditioning set. They retain the ordinary
 quantization allocation; excluding them from conditioning does not mean retaining
 all of them as floating-point weights.
 
-Supported destination codecs are `Q3_K`, `Q4_K`, `Q5_0`, `Q5_1`, `Q6_K`, `Q8_0`,
+Supported destination codecs are `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q4_0`, `Q4_1`,
+`Q5_0`, `Q5_1`, `Q6_K`, `Q8_0`,
 `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL` and
 `IQ4_XS`. Selected matrices must be contiguous, have at least two output rows,
 and have input dimensions divisible by both the native codec block size and the
 chosen normalization width. Explicit incompatible assignments fail; they do not
 silently switch width or codec.
+
+Preset names such as `IQ2_M`, `IQ3_XS` and `IQ3_M` describe mixed native-codec
+allocations, not additional tensor codecs. Direct quantization preserves the
+ordinary preset allocation and conditions eligible projections using their actual
+codec. Optimizer `quantization.recipe` entries require exact tensor codec names,
+not preset names. Retained F32/F16/BF16 tensors remain unconditioned.
 
 CPU and qualified CUDA inference use existing matrix kernels. Row and tensor
 split modes are rejected; use `--split-mode none` for single-device serving.
