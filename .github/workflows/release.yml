@@ -1485,16 +1485,13 @@ jobs:
           }
           & $clangPath.FullName --version
 
-      - name: Install Ninja
-        run: choco install ninja -y
-
       - name: Build
         id: build
         run: |
           $ErrorActionPreference = "Stop"
           $env:HIP_PATH=$(Resolve-Path 'C:\Program Files\AMD\ROCm\*\bin\clang.exe' | Split-Path | Split-Path)
           $env:CMAKE_PREFIX_PATH="${env:HIP_PATH}"
-          cmake -G Ninja -B build -S . `
+          cmake -G "Unix Makefiles" -B build -S . `
             -DCMAKE_C_COMPILER="${env:HIP_PATH}\bin\clang.exe" `
             -DCMAKE_CXX_COMPILER="${env:HIP_PATH}\bin\clang++.exe" `
             -DCMAKE_CXX_FLAGS="-I$($PWD.Path.Replace('\', '/'))/opt/rocm-7.2.1/include/ -Wno-ignored-attributes -Wno-nested-anon-types" `
@@ -1510,8 +1507,7 @@ jobs:
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `
             -DCMAKE_HIP_COMPILER_LAUNCHER=ccache `
             -DLLAMA_BUILD_BORINGSSL=ON
-          # Bound peak memory across the multi-architecture HIP compiler processes.
-          $buildJobs = [Math]::Min(2, [int]$env:NUMBER_OF_PROCESSORS)
+          $buildJobs = [int]$env:NUMBER_OF_PROCESSORS
           python .github/scripts/cache-build-deadline.py -- cmake --build build --target ggml-hip -j $buildJobs
           if ($LASTEXITCODE -eq 75) { exit 0 }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
