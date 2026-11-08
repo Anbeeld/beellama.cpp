@@ -1315,8 +1315,16 @@ jobs:
           restore-keys: release-${{ needs.release-meta.outputs.cache_parent_channel }}-windows-cuda-${{ matrix.cuda }}
           sloppiness: time_macros
 
+      - name: Clone workflow-owned CUDA setup
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-workflow
+          sparse-checkout: .github/actions/windows-setup-cuda
+          persist-credentials: false
+
       - name: Install CUDA Toolkit
-        uses: ./.github/actions/windows-setup-cuda
+        uses: ./.ci-workflow/.github/actions/windows-setup-cuda
         with:
           cuda_version: ${{ matrix.cuda }}
 
