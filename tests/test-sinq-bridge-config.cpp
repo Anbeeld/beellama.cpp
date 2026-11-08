@@ -8,7 +8,7 @@ int main()try{
     json spec={{"generator","sinq"},{"strip_width",64},{"iterations",16},{"strength",1.}};
     json j={{"schema_version",2},{"operation","generate"},{"rows",3},{"columns",512},{"codec","q5_0"},{"weights","w"},{"output","out"},{"candidates",json::array({spec})}};
     auto r=sinq::parse_bridge_request(j);check(r.samples==0&&r.search.candidates.size()==1,"ordinary capture independent");
-    for(int width:{32,64,128,256,512})for(int it:{4,8,16})for(double strength:{0.,.5,1.}){auto s=spec;s["strip_width"]=width;s["iterations"]=it;s["strength"]=strength;j["candidates"]=json::array({s});auto a=sinq::parse_bridge_request(j);check(sinq::candidate_spec_json(a.search.candidates[0])==s,"complete spec roundtrip");}
+    for(int width:{8,16,32,64,128,256,512})for(int it:{4,8,16})for(double strength:{0.,.5,1.}){auto s=spec;s["strip_width"]=width;s["iterations"]=it;s["strength"]=strength;j["candidates"]=json::array({s});auto a=sinq::parse_bridge_request(j);check(sinq::candidate_spec_json(a.search.candidates[0])==s,"complete spec roundtrip");}
     j["candidates"]=json::array({spec});
     auto fails=[&](json bad){bool failed=false;try{sinq::parse_bridge_request(bad);}catch(...){failed=true;}check(failed,"invalid request accepted");};
     for(auto key:{"strip_width","iterations","strength","max_shortlist","refine_step","tolerance","family"}){auto bad=j;bad[key]=1;fails(bad);}

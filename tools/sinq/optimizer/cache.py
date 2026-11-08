@@ -56,7 +56,7 @@ def validate_provenance(p):
     if s is not None:
         if set(s) != {'strip_width','iterations','strength','algorithm','numerics'}:
             raise ValueError('invalid SINQ provenance')
-        if s['strip_width'] not in (32,64,128,256,512) or shape[1] % s['strip_width'] or s['iterations'] not in (4,8,16):
+        if s['strip_width'] not in (8,16,32,64,128,256,512) or shape[1] % s['strip_width'] or s['iterations'] not in (4,8,16):
             raise ValueError('invalid SINQ width/iterations')
         if not np.isfinite(s['strength']) or not 0 <= s['strength'] <= 1 or s['algorithm'] != 'sinkhorn_log' or not s['numerics']:
             raise ValueError('invalid SINQ semantics')

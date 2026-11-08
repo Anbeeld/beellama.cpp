@@ -31,6 +31,14 @@ class ConfigTests(unittest.TestCase):
         self.assertNotIn('activation_manifest',c)
         self.assertEqual({x['generator'] for x in c['resolved_candidates']},{'sinq'})
 
+    def test_small_strip_widths(self):
+        for width in (8,16):
+            with self.subTest(width=width):
+                c=self.config()
+                c['candidate_generators'][0]['parameters']['strip_width']=[width]
+                result=validate_config(c,'generate')
+                self.assertEqual({x['strip_width'] for x in result['resolved_candidates']},{width})
+
     def test_native_workspace_limit_is_checked_before_execution(self):
         c=self.config();c['limits']['workspace_bytes']=1<<30
         validate_config(c,'generate')

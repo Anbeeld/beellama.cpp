@@ -85,13 +85,13 @@ class Bridge(unittest.TestCase):
             d=Path(tmp);n,k=3,512
             w=np.sin(np.arange(n*k,dtype=np.float32)*.17).reshape(n,k)
             w.tofile(d/'w.bin')
-            candidates=[spec(width,it,s) for width in (32,64,128,256,512) for it in (4,8,16) for s in (0.,.5,1.)]
+            candidates=[spec(width,it,s) for width in (8,16,32,64,128,256,512) for it in (4,8,16) for s in (0.,.5,1.)]
             cfg=dict(schema_version=2,operation='generate',weights=str(d/'w.bin'),rows=n,columns=k,
                      codec='q5_0',output=str(d/'out'),threads=1,candidates=candidates,workspace_bytes=8<<20,max_output_bytes=8<<20)
             result=request(cfg,d)
-            self.assertEqual(result['encode_count'],45)
+            self.assertEqual(result['encode_count'],63)
             self.assertEqual([c['parameters'] for c in result['candidates']],candidates)
-            self.assertEqual(len({c['payload'] for c in result['candidates']}),45)
+            self.assertEqual(len({c['payload'] for c in result['candidates']}),63)
             for item in result['candidates']:
                 self.assertIsNone(item['train_score'])
                 self.assertIsNone(item['validation_score'])

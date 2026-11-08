@@ -107,11 +107,11 @@ int main()try {
     auto encode=[&](const float*in,void*out,int64_t,int64_t rows,const float*im){return ggml_quantize_chunk(GGML_TYPE_Q5_0,in,out,0,rows,k,im);};
     auto compute=[&](const sinq::candidate_spec&s){llama_sinq_options o;o.strip_width=s.strip_width;o.iterations=s.iterations;o.strength=float(s.strength);std::vector<ggml_fp16_t>u;std::vector<float>raw;llama_sinq_statistics stats;check(llama_sinq_compute_scales(w.data(),GGML_TYPE_F32,n,k,o,1,u,stats,&raw),"canonical scales");return raw;};
     sinq::search_options opt;opt.threads=1;opt.max_candidates=128;
-    for(int width:{32,64,128,256,512})for(int it:{4,8,16})for(double strength:{0.,.5,1.}){sinq::candidate_spec s;s.strip_width=width;s.iterations=it;s.strength=strength;opt.candidates.push_back(s);}
+    for(int width:{8,16,32,64,128,256,512})for(int it:{4,8,16})for(double strength:{0.,.5,1.}){sinq::candidate_spec s;s.strip_width=width;s.iterations=it;s.strength=strength;opt.candidates.push_back(s);}
     std::vector<std::vector<uint8_t>>bytes(opt.candidates.size());
     auto emit=[&](size_t id,const std::vector<ggml_fp16_t>&,int64_t,int64_t rows,const uint8_t*p,size_t count){check(count==size_t(rows)*ggml_row_size(GGML_TYPE_Q5_0,k),"native bytes");bytes[id].insert(bytes[id].end(),p,p+count);};
     auto a=sinq::materialize_candidates(GGML_TYPE_Q5_0,n,k,{},0,{},0,importance.data(),4<<20,read,encode,emit,compute,opt);
-    check(a.candidates.size()==45&&a.encode_count==45,"exact explicit parameter grid");
+    check(a.candidates.size()==63&&a.encode_count==63,"exact explicit parameter grid");
     for(size_t i=0;i<a.candidates.size();++i){check(!a.candidates[i].has_score,"ordinary without captures");const auto raw=compute(opt.candidates[i]);for(int j=0;j<k;++j)check(a.candidates[i].scales[j]==ggml_fp32_to_fp16(raw[j]),"native normalization oracle");}
     opt.candidates.resize(2);opt.candidates[1]=opt.candidates[0];
     auto b=sinq::materialize_candidates(GGML_TYPE_Q5_0,n,k,{},0,{},0,nullptr,4<<20,read,encode,emit,compute,opt);

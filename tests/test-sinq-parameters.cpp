@@ -35,7 +35,7 @@ int main() {
     rejects([&] { validate_metadata({names[1],names[0]},recipes,"test"); });
     rejects([&] { validate_metadata(names,{recipes[0]},"test"); });
     rejects([&] { validate_metadata(names,recipes,""); });
-    for (int width : {32,64,128,256,512}) for (int iterations : {4,8,16}) for (double strength : {0.,0.5,1.}) {
+    for (int width : {8,16,32,64,128,256,512}) for (int iterations : {4,8,16}) for (double strength : {0.,0.5,1.}) {
         parameters p; p.strip_width=width; p.iterations=iterations; p.strength=strength;
         assert(validate_recipe(parameters_json(p).dump()).strip_width==width);
     }

@@ -21,6 +21,14 @@ class CacheTest(unittest.TestCase):
             self.assertEqual(s.put(provenance(),p,scales),key)
             s.get(key).payload.write_bytes(b'bad')
             with self.assertRaises(ValueError): s.get(key)
+    def test_small_strip_widths(self):
+        with tempfile.TemporaryDirectory() as d:
+            store=CandidateStore(d)
+            for width in (8,16):
+                with self.subTest(width=width):
+                    key=store.put(provenance(width=width),bytes(352),np.ones(256,dtype='<f2').tobytes())
+                    self.assertEqual(store.get(key).provenance['sinq']['strip_width'],width)
+
     def test_native_identity_and_file_ingestion(self):
         with tempfile.TemporaryDirectory() as d:
             d=Path(d); s=CandidateStore(d/'cache'); payload=d/'packed'; scales=d/'scales'

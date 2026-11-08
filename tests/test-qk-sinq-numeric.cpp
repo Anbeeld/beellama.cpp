@@ -189,11 +189,11 @@ static void width_edges() {
     llama_sinq_options o; llama_sinq_statistics s;
     std::vector<ggml_fp16_t> scales;
     float dummy=1;
-    for(int bad:{-512,-1,0,16,31,48,96,1024,std::numeric_limits<int>::max()}) {
+    for(int bad:{-512,-1,0,4,7,15,31,48,96,1024,std::numeric_limits<int>::max()}) {
         CHECK(!llama_sinq_valid_strip_width(bad)); o.strip_width=bad;
         CHECK(!llama_sinq_compute_scales(&dummy,GGML_TYPE_F32,2,512,o,1,scales,s));
     }
-    for(int width:{32,64,128,256,512}) {
+    for(int width:{8,16,32,64,128,256,512}) {
         CHECK(llama_sinq_valid_strip_width(width)); o.strip_width=width;
         CHECK(!llama_sinq_compute_scales(&dummy,GGML_TYPE_F32,0,width,o,1,scales,s));
         CHECK(!llama_sinq_compute_scales(&dummy,GGML_TYPE_F32,-2,width,o,1,scales,s));
@@ -267,7 +267,7 @@ static void synthetic() {
             rounded[i]=half(src[i]);
         }
         const void * input=type==GGML_TYPE_F32?static_cast<const void *>(w.data()):type==GGML_TYPE_F16?static_cast<const void *>(h.data()):static_cast<const void *>(b.data());
-        for (int width:{32,64,128,256,512}) { for (int it:{4,8,16}) {
+        for (int width:{8,16,32,64,128,256,512}) { for (int it:{4,8,16}) {
             llama_sinq_options o; o.strip_width=width; o.iterations=it;
             llama_sinq_statistics s,rs; std::vector<ggml_fp16_t> t,t4,t32,rt;
             std::vector<float> raw,raw32;
@@ -335,7 +335,7 @@ static void synthetic() {
             for(auto v:t) { CHECK(ggml_fp16_to_fp32(v)==1); }
         } }
     }
-    for(int width:{32,64,128,256,512}) {
+    for(int width:{8,16,32,64,128,256,512}) {
         llama_sinq_options o; o.strip_width=width; llama_sinq_statistics s; std::vector<ggml_fp16_t> t;
         std::fill(w.begin(),w.end(),.125f);
         CHECK(llama_sinq_compute_scales(w.data(),GGML_TYPE_F32,n,k,o,4,t,s)); CHECK(!s.identity);
@@ -352,7 +352,7 @@ static void synthetic() {
             for (int j=0;j<width;++j) { CHECK(t[start+j]==ggml_fp32_to_fp16(columns[j])); }
         }
     }
-    std::puts("synthetic: source F32/F16/BF16, widths 32/64/128/256/512, iterations 4/8/16, threads 1/4/32, exact raw/scales, native Q3_K/Q4_K, exact serialized compensation");
+    std::puts("synthetic: source F32/F16/BF16, widths 8/16/32/64/128/256/512, iterations 4/8/16, threads 1/4/32, exact raw/scales, native Q3_K/Q4_K, exact serialized compensation");
 }
 // Independent scalar two-pass FP64 sample moments audit the initial Welford
 // reductions without repeating their lane/tree algorithm. Best-iterate parity
@@ -371,7 +371,7 @@ static double scalar_imbalance(const std::vector<float> & tile, int n, int g) {
     return hi/std::max(1.e-12,lo);
 }
 static void row_shapes() {
-    for(int n:{2,3,7,16,17,33,128,257,1025}) { for(int g:{32,64,128,256,512}) {
+    for(int n:{2,3,7,16,17,33,128,257,1025}) { for(int g:{8,16,32,64,128,256,512}) {
         const int k=4*g;
         std::vector<float> w(n*k),tile(n*g),columns(g),rows(n),ec,er;
         for(int i=0;i<n;++i) { for(int j=0;j<k;++j) {
@@ -406,7 +406,7 @@ static void strength_and_diagnostics() {
     constexpr int n=33,k=512;
     std::vector<float> w(n*k);
     for (int i=0;i<n*k;++i) { w[i]=half(float(std::sin(i*.73)*(1+(i%23)*.2))); }
-    for (int width:{32,64,128,256,512}) { for (int iterations:{4,8,16}) {
+    for (int width:{8,16,32,64,128,256,512}) { for (int iterations:{4,8,16}) {
         llama_sinq_options o;o.strip_width=width;o.iterations=iterations;
         std::vector<ggml_fp16_t> legacy,actual,identity;
         llama_sinq_statistics ls,s;

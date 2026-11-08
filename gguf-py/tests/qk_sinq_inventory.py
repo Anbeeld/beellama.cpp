@@ -68,7 +68,7 @@ def validate_sinq_metadata(reader, path):
             keys |= {'correction', 'alpha', 'lambda'}
         if generator not in ('sinq', 'awq') or set(p) != keys:
             raise ValueError(f'{path}: incomplete/unknown SINQ recipe fields')
-        if type(p['strip_width']) is not int or p['strip_width'] not in (32, 64, 128, 256, 512):
+        if type(p['strip_width']) is not int or p['strip_width'] not in (8, 16, 32, 64, 128, 256, 512):
             raise ValueError(f'{path}: invalid SINQ strip width')
         if type(p['iterations']) is not int or p['iterations'] not in (4, 8, 16):
             raise ValueError(f'{path}: invalid SINQ iterations')

@@ -75,7 +75,7 @@ class TestQKSidecar(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             d = Path(directory)
             write(d/'source.gguf', columns=512)
-            for width in (32, 64, 128, 256, 512):
+            for width in (8, 16, 32, 64, 128, 256, 512):
                 write(d/'model.gguf', GGMLQuantizationType.Q3_K, np.ones(512), columns=512,
                       recipe={**DEFAULT, 'strip_width': width})
                 result = self.inspect(d/'source.gguf', d/'model.gguf', d/'out.json')

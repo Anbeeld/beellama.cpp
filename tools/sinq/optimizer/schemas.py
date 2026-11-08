@@ -63,7 +63,7 @@ def parameters(value,*,partial=False):
     _fields(value,required,('generator','strip_width','iterations','strength','correction','alpha','lambda'),'parameters')
     p=copy.deepcopy(value)
     if 'generator' in p:_choice(p['generator'],('sinq','awq'),'generator')
-    for key,allowed in [('strip_width',(32,64,128,256,512)),('iterations',(4,8,16))]:
+    for key,allowed in [('strip_width',(8,16,32,64,128,256,512)),('iterations',(4,8,16))]:
         if key in p and (type(p[key]) is not int or p[key] not in allowed):raise ValueError('unsupported '+key)
     for key in ('strength','alpha','lambda'):
         if key in p:p[key]=_number(p[key],key)

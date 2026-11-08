@@ -33,7 +33,7 @@ inline bool llama_sinq_supported_metadata_key(const std::string & key) {
 }
 
 inline bool llama_sinq_valid_strip_width(int64_t width) {
-    return width == 32 || width == 64 || width == 128 || width == 256 || width == 512;
+    return width == 8 || width == 16 || width == 32 || width == 64 || width == 128 || width == 256 || width == 512;
 }
 
 // Offline normalization only. Weight storage and matmul remain ordinary GGML types.
