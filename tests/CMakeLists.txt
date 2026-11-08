@@ -320,6 +320,8 @@ function(llama_build_and_test source)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS ${LLAMA_TEST_LABEL})
 endfunction()
 
+llama_build_and_test(test-io-write-host.cpp LINK ggml)
+
 # build test-tokenizer-0 target once and add many tests
 llama_build(test-tokenizer-0.cpp)
 

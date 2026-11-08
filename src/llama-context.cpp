@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-io-write-host.h"
 #include "llama-kv-cache-kvarn.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-tail.h"
@@ -3501,78 +3502,6 @@ private:
     const bool skip_tensors;
 
     size_t size_written = 0;
-};
-
-class llama_io_write_host : public llama_io_write_i {
-public:
-    llama_io_write_host(
-            uint8_t * p, size_t len) : ptr(p), base_ptr(p), buf_size(len) {}
-
-    ~llama_io_write_host() {
-        if (winfos.empty()) {
-            return;
-        }
-
-        std::vector<ggml_tensor *> tensors;
-        std::vector<size_t> offsets;
-        std::vector<size_t> sizes;
-        std::vector<size_t> data_offsets;
-        tensors.reserve(winfos.size());
-        offsets.reserve(winfos.size());
-        sizes.reserve(winfos.size());
-        data_offsets.reserve(winfos.size());
-
-        for (const auto & winfo : winfos) {
-            tensors.push_back(winfo.tensor);
-            offsets.push_back(winfo.offset);
-            sizes.push_back(winfo.size);
-            data_offsets.push_back(winfo.data_offset);
-        }
-
-        std::vector<const ggml_tensor *> const_tensors(tensors.begin(), tensors.end());
-        ggml_backend_tensor_get_n(const_tensors.data(), base_ptr, offsets.data(), sizes.data(), data_offsets.data(), winfos.size());
-    }
-
-    void write(const void * src, size_t size) override {
-        if (size > buf_size) {
-            throw std::runtime_error("unexpectedly reached end of buffer");
-        }
-        memcpy(ptr, src, size);
-        ptr += size;
-        size_written += size;
-        buf_size -= size;
-    }
-
-    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
-        if (size > buf_size) {
-            throw std::runtime_error("unexpectedly reached end of buffer");
-        }
-
-        // save the write for later during destruction
-        winfos.push_back({tensor, (size_t) (ptr - base_ptr), size, offset});
-
-        ptr += size;
-        size_written += size;
-        buf_size -= size;
-    }
-
-    size_t n_bytes() override {
-        return size_written;
-    }
-
-private:
-    uint8_t * ptr;
-    uint8_t * base_ptr;
-    size_t buf_size = 0;
-    size_t size_written = 0;
-
-    struct write_info {
-        ggml_tensor * tensor;
-        size_t data_offset;
-        size_t size;
-        size_t offset;
-    };
-    std::vector<write_info> winfos;
 };
 
 class llama_io_read_host : public llama_io_read_i {
