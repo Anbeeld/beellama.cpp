@@ -256,7 +256,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                 const ggml_type standard_type_k = is_swa_group ? type_k : tail_type;
                 const ggml_type standard_type_v = is_swa_group ? type_v : tail_type;
                 return std::make_unique<llama_kv_cache>(
-                        model, model.no_alloc(), hparams, standard_type_k, standard_type_v,
+                        model, no_alloc, hparams, standard_type_k, standard_type_v,
                         v_trans, offload, unified, size, n_seq_max,
                         n_swa, swa_type, nullptr, layer_filter, reuse, nullptr,
                         n_ubatch, exact_tokens, tail_type, exact_requested,
@@ -306,7 +306,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
             ? (n_swa > 0 ? tail_tokens_swa_requested : tail_tokens_requested)
             : 0;
         return std::make_unique<llama_kv_cache>(
-                model, model.no_alloc(), hparams, type_k, type_v,
+                model, no_alloc, hparams, type_k, type_v,
                 v_trans, offload, unified, size, n_seq_max,
                 n_swa, swa_type, cache_mem_other, layer_filter, reuse, cache_share,
                 n_ubatch, exact_tokens, tail_type, exact_requested,
