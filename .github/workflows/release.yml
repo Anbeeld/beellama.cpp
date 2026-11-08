@@ -820,11 +820,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - cuda: "12.4"
-            cuda_container: "12.4.1-devel-ubuntu22.04"
+          - cuda: "12.8"
+            cuda_container: "12.8.2-devel-ubuntu22.04"
             cuda_cmake_args: "-DGGML_CUDA_CUB_3DOT2=ON"
-          - cuda: "13.3"
-            cuda_container: "13.3.0-devel-ubuntu24.04"
+          - cuda: "13.5"
+            cuda_container: "13.5.0-devel-ubuntu24.04"
             cuda_cmake_args: "-DGGML_CUDA_CUB_3DOT2=OFF"
     steps:
       - name: Dependencies
@@ -1288,9 +1288,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - cuda: "12.4"
+          - cuda: "12.8"
             cuda_cmake_args: "-DGGML_CUDA_CUB_3DOT2=ON"
-          - cuda: "13.3"
+          - cuda: "13.5"
             cuda_cmake_args: "-DGGML_CUDA_CUB_3DOT2=OFF"
     steps:
       - name: Reserve cache save time
@@ -1649,7 +1649,7 @@ jobs:
             --require-name "libomp.dll" \
             --forbid-name "libomp140.x86_64.dll" \
             release/beellama-${TAG_NAME}-bin-win-*.zip
-          for cuda_version in 12.4 13.3; do
+          for cuda_version in 12.8 13.5; do
             package_zip="release/beellama-${TAG_NAME}-bin-win-cuda-${cuda_version}-x64.zip"
             runtime_zip="release/beellama-${TAG_NAME}-cudart-win-cuda-${cuda_version}-x64.zip"
             if [[ -f "${package_zip}" && -f "${runtime_zip}" ]]; then
@@ -1751,23 +1751,23 @@ jobs:
             runtime_packages: ca-certificates curl ffmpeg libgomp1
             runs_on: ubuntu-24.04-arm
           - name: cuda12
-            display: CUDA 12.4
+            display: CUDA 12.8
             group: cuda12
             arch: amd64
             platform: linux/amd64
-            artifact: beellama-bin-ubuntu-cuda-12.4-x64.tar.gz
+            artifact: beellama-bin-ubuntu-cuda-12.8-x64.tar.gz
             dockerfile: .devops/runtime-server.Dockerfile
-            base_image: nvidia/cuda:12.4.1-runtime-ubuntu22.04
+            base_image: nvidia/cuda:12.8.2-runtime-ubuntu22.04
             runtime_packages: ca-certificates curl ffmpeg libgomp1
             runs_on: ubuntu-24.04
           - name: cuda13
-            display: CUDA 13.3
+            display: CUDA 13.5
             group: cuda13
             arch: amd64
             platform: linux/amd64
-            artifact: beellama-bin-ubuntu-cuda-13.3-x64.tar.gz
+            artifact: beellama-bin-ubuntu-cuda-13.5-x64.tar.gz
             dockerfile: .devops/runtime-server.Dockerfile
-            base_image: nvidia/cuda:13.3.0-runtime-ubuntu24.04
+            base_image: nvidia/cuda:13.5.0-runtime-ubuntu24.04
             runtime_packages: ca-certificates curl ffmpeg libgomp1
             runs_on: ubuntu-24.04
           - name: rocm
@@ -1911,11 +1911,11 @@ jobs:
             platforms: linux/amd64 linux/arm64
             tag_suffixes: none -cpu
           - group: cuda12
-            display: CUDA 12.4
+            display: CUDA 12.8
             platforms: linux/amd64
             tag_suffixes: -cuda -cuda12
           - group: cuda13
-            display: CUDA 13.3
+            display: CUDA 13.5
             platforms: linux/amd64
             tag_suffixes: -cuda13
           - group: rocm
