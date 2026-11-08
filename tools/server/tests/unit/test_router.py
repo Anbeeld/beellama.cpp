@@ -23,6 +23,7 @@ def test_router_props():
     assert res.body["role"] == "router"
     assert res.body["max_instances"] == 2
     assert res.body["models_autoload"] is False
+    assert res.body["preset_reload"] == "POST /models/reload"
     assert res.body["build_info"].startswith("b")
 
 

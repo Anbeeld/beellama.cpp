@@ -2183,6 +2183,9 @@ To rescan model sources, use `POST /models/reload`. This may unload a running
 model whose source was updated or removed and add or update unloaded models.
 The route goes through normal API-key authentication; configure `--api-key` for
 a protected router and send `Authorization: Bearer TOKEN` (or `X-Api-Key`).
+In router mode, the main `GET /props` response advertises this route as
+`"preset_reload": "POST /models/reload"`, so clients can discover the correct
+method and path instead of assuming upstream's `GET /models?reload=1` behavior.
 
 Each object in `data` has the same `architecture` object as [`GET /v1/models`](#get-v1models-openai-compatible-model-info-api) of a direct server. The server computes both arrays offline. It does not load the model, download files, or run inference. `output_modalities` comes from the GGUF metadata, plus `audio` when the projector file can generate speech. `input_modalities` comes from the projector file. A native decision model shows `decisions` before its first load, after unload, and while it sleeps:
 
