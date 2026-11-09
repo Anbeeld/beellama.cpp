@@ -3,6 +3,7 @@
 #include "sinq-parallel.h"
 #include <cmath>
 #include <algorithm>
+#include <limits>
 
 void sinq::precondition_weights(const float * weights, float * output, int64_t rows,
         int64_t columns, const ggml_fp16_t * scales, int threads) {
@@ -19,14 +20,90 @@ void sinq::precondition_weights(const float * weights, float * output, int64_t r
 }
 
 void sinq::transform_importance(const float * importance, float * output,
-        int64_t columns, const ggml_fp16_t * scales) {
+        int64_t columns, const ggml_fp16_t * scales, double exponent) {
     require(importance && output && scales && columns > 0, "invalid importance buffers/shape");
+    require(std::isfinite(exponent), "invalid importance exponent");
     for (int64_t j = 0; j < columns; ++j) {
         const float u = ggml_fp16_to_fp32(scales[j]);
         require(std::isfinite(u) && u > 0 && std::isfinite(importance[j]) && importance[j] >= 0, "invalid importance/compensation");
-        output[j] = importance[j]*u*u;
+        // Keep the historical FP32 multiplication order exactly at p=2.
+        output[j] = exponent == 2.0 ? importance[j]*u*u :
+            float(double(importance[j])*std::pow(double(u), exponent));
         require(std::isfinite(output[j]) && output[j] >= 0, "transformed importance overflow");
     }
+}
+
+sinq::scale_refinement::scale_refinement(int64_t columns) : columns_(columns) {
+    require(columns > 0 && uint64_t(columns) <= std::numeric_limits<size_t>::max()/sizeof(double) &&
+        uint64_t(columns) <= numerators_.max_size() &&
+        uint64_t(columns) <= denominators_.max_size(), "invalid refinement columns/allocation size");
+    numerators_.assign(size_t(columns), 0.0);
+    denominators_.assign(size_t(columns), 0.0);
+}
+
+void sinq::scale_refinement::accumulate(const float * original_weights,
+        const void * native_payload, ggml_type codec, int64_t rows) {
+    require(original_weights && native_payload && rows > 0, "invalid refinement buffers/rows");
+    require(codec >= 0 && codec < GGML_TYPE_COUNT, "invalid refinement codec");
+    const auto * traits = ggml_get_type_traits(codec);
+    require(traits && traits->to_float && traits->blck_size > 0 &&
+        columns_%traits->blck_size == 0, "invalid refinement codec/columns");
+    const size_t max_size = std::numeric_limits<size_t>::max();
+    require(uint64_t(rows) <= max_size/sizeof(float)/uint64_t(columns_) &&
+        uint64_t(rows) <= uint64_t(std::numeric_limits<int64_t>::max())/uint64_t(columns_),
+        "refinement weight shape overflow");
+    require(traits->type_size > 0 && uint64_t(columns_) <= max_size/traits->type_size,
+        "refinement row size overflow");
+    const size_t row_bytes = ggml_row_size(codec, columns_);
+    require(row_bytes > 0 && uint64_t(rows) <= max_size/row_bytes,
+        "refinement payload shape overflow");
+    std::vector<float> decoded(size_t(columns_), 0.f);
+    for (int64_t r = 0; r < rows; ++r) {
+        traits->to_float(static_cast<const char *>(native_payload) + size_t(r)*row_bytes,
+            decoded.data(), columns_);
+        for (int64_t j = 0; j < columns_; ++j) {
+            const float w = original_weights[r*columns_ + j], b = decoded[j];
+            require(std::isfinite(w) && std::isfinite(b), "nonfinite refinement weight/decoded value");
+            numerators_[j] += double(w)*double(b);
+            denominators_[j] += double(b)*double(b);
+        }
+    }
+}
+
+sinq::refinement_statistics sinq::scale_refinement::apply(ggml_fp16_t * scales, double lambda) const {
+    require(scales && std::isfinite(lambda) && lambda >= 0 && lambda <= 1,
+        "invalid refinement scales/lambda");
+    refinement_statistics stats;
+    for (int64_t j = 0; j < columns_; ++j) {
+        const float u0 = ggml_fp16_to_fp32(scales[j]);
+        require(std::isfinite(u0) && u0 > 0, "invalid serialized compensation");
+    }
+    if (lambda == 0) { return stats; }
+    for (int64_t j = 0; j < columns_; ++j) {
+        const float u0 = ggml_fp16_to_fp32(scales[j]);
+        if (!std::isfinite(numerators_[j]) || !std::isfinite(denominators_[j]) || denominators_[j] <= 0) {
+            ++stats.invalid_ls_count;
+            continue;
+        }
+        const double ls = numerators_[j]/denominators_[j];
+        // Test F16 representability without rounding the value used in blending.
+        const auto representable = [](double value) {
+            if (!std::isfinite(value) || value <= 0 || value > 65504.0) { return false; }
+            const float serialized = ggml_fp16_to_fp32(ggml_fp32_to_fp16(float(value)));
+            return std::isfinite(serialized) && serialized > 0;
+        };
+        if (!representable(ls)) {
+            ++stats.invalid_ls_count;
+            continue;
+        }
+        const double blended = (1.0 - lambda)*double(u0) + lambda*ls;
+        if (!representable(blended)) {
+            ++stats.invalid_blend_count;
+            continue;
+        }
+        scales[j] = ggml_fp32_to_fp16(float(blended));
+    }
+    return stats;
 }
 
 #include <mutex>

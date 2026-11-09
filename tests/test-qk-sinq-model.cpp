@@ -20,16 +20,19 @@
 
 static void check(bool ok, const char * message) { if (!ok) { throw std::runtime_error(message); } }
 static std::string write_config(const std::filesystem::path & dir, double strength=1.0, int width=64,
-                                const nlohmann::json & include="eligible", const nlohmann::json & overrides=nlohmann::json::array()) {
+                                const nlohmann::json & include="eligible", const nlohmann::json & overrides=nlohmann::json::array(),
+                                const nlohmann::json & encoding=nullptr) {
     const auto path=(dir/"direct-config.json").string();
     std::ofstream out(path,std::ios::binary);
-    out << nlohmann::json{{"schema_version",2},{"defaults",{{"generator","sinq"},{"strip_width",width},{"iterations",16},{"strength",strength}}},
-                         {"targets",{{"include",include}}},{"overrides",overrides}}.dump();
+    nlohmann::json config={{"schema_version",2},{"defaults",{{"generator","sinq"},{"strip_width",width},{"iterations",16},{"strength",strength}}},
+                           {"targets",{{"include",include}}},{"overrides",overrides}};
+    if (!encoding.is_null()) { config["encoding"]=encoding; }
+    out << config.dump();
     out.close(); check(bool(out),"direct config write"); return path;
 }
 static std::string logs;
 static void logger(ggml_log_level, const char * text, void *) { logs += text; }
-static void make_model(const std::string & path, const std::string & mode, bool incompatible_shape = false, int strip_width = 64) {
+static void make_model(const std::string & path, const std::string & mode, bool incompatible_shape = false, int strip_width = 64, bool anisotropic = false) {
     ggml_context * ctx = ggml_init({64*ggml_tensor_overhead(),nullptr,true});
     gguf_context * file = gguf_init_empty();
     gguf_set_val_str(file,"general.architecture","qwen35");
@@ -87,7 +90,12 @@ static void make_model(const std::string & path, const std::string & mode, bool 
         ggml_set_name(w,name);
         payloads.emplace_back(ggml_nbytes(w)); auto & data = payloads.back();
         std::vector<float> f(k*n);
-        for (size_t i = 0; i < f.size(); ++i) { f[i] = norm ? 1.f : .02f*std::sin(float(i)*.71f); }
+        for (size_t i = 0; i < f.size(); ++i) {
+            f[i] = norm ? 1.f : .02f*std::sin(float(i)*.71f);
+            if (anisotropic && std::strcmp(name,"blk.0.ffn_up.weight")==0) {
+                f[i] *= 1.f+float((i%size_t(k))%19)*.21f;
+            }
+        }
         std::vector<ggml_fp16_t> scales(k,ggml_fp32_to_fp16(1.f));
         if (mode == "valid" && selected) { scales[0]=ggml_fp32_to_fp16(2.f); }
         if (type == GGML_TYPE_F32) { std::memcpy(data.data(),f.data(),data.size()); }
@@ -423,6 +431,122 @@ static void settings_controls(const std::string & source, const std::filesystem:
     check(llama_model_quantize(malformed.c_str(),rejected.c_str(),&p)!=0,"explicit strip-incompatible shape accepted");
 }
 
+static void encoding_controls(const std::filesystem::path & dir) {
+    const char * selected="blk.0.ffn_up.weight";
+    const std::string companion=std::string(selected)+".sinq_scale2";
+    const auto source=(dir/"encoding-source.gguf").string();
+    make_model(source,"source",false,64,true);
+    ggml_context * original=nullptr;
+    auto * source_meta=gguf_init_from_file(source.c_str(),{false,&original});
+    check(source_meta && original,"encoding source read");
+    std::vector<std::vector<float>> importance(size_t(gguf_get_n_tensors(source_meta)));
+    std::vector<llama_model_imatrix_data> entries;
+    for (int64_t i=0;i<gguf_get_n_tensors(source_meta);++i) {
+        const char * name=gguf_get_tensor_name(source_meta,i);
+        auto * tensor=ggml_get_tensor(original,name);
+        if (tensor->ne[1]<=1) { continue; }
+        importance[i].resize(size_t(tensor->ne[0]));
+        for (size_t j=0;j<importance[i].size();++j) { importance[i][j]=.1f+float((j*37)%29)*.11f; }
+        entries.push_back({name,importance[i].data(),importance[i].size()});
+    }
+    entries.push_back({nullptr,nullptr,0});
+    auto * w=ggml_get_tensor(original,selected);
+    const auto * weights=static_cast<const float *>(w->data);
+    const int64_t columns=w->ne[0],rows=w->ne[1];
+    const float * channel_importance=nullptr;
+    for (const auto & entry:entries) if (entry.name && std::strcmp(entry.name,selected)==0) { channel_importance=entry.data; }
+    check(channel_importance!=nullptr,"selected importance missing");
+    const std::pair<llama_ftype,ggml_type> codecs[]={
+        {LLAMA_FTYPE_MOSTLY_IQ2_XS,GGML_TYPE_IQ2_XS},{LLAMA_FTYPE_MOSTLY_IQ2_S,GGML_TYPE_IQ2_S},
+        {LLAMA_FTYPE_MOSTLY_IQ3_S,GGML_TYPE_IQ3_S},{LLAMA_FTYPE_MOSTLY_Q4_K_M,GGML_TYPE_Q4_K},
+        {LLAMA_FTYPE_MOSTLY_Q6_K,GGML_TYPE_Q6_K}};
+    for (const auto & codec:codecs) {
+        auto p=llama_model_quantize_default_params();p.ftype=codec.first;p.pure=true;p.nthread=1;p.imatrix=entries.data();
+        const llama_model_tensor_override overrides[]={{".*",codec.second},{nullptr,GGML_TYPE_COUNT}};
+        p.tt_overrides=overrides;p.output_tensor_type=codec.second;p.token_embedding_type=codec.second;
+        const auto base=(dir/("encoding-"+std::to_string(codec.second)+"-default.gguf")).string();
+        auto config=write_config(dir,1.,64,nlohmann::json::array({selected}));p.sinq_config=config.c_str();
+        check(llama_model_quantize(source.c_str(),base.c_str(),&p)==0,"encoding default quantization");
+        ggml_context * base_data=nullptr;
+        auto * base_meta=gguf_init_from_file(base.c_str(),{false,&base_data});
+        check(base_meta && base_data,"encoding default read");
+        check(gguf_find_key(base_meta,"quantize.sinq.imatrix_exponent")<0,"default producer metadata changed");
+        auto * u_tensor=ggml_get_tensor(base_data,companion.c_str());
+        const auto * u0=static_cast<const ggml_fp16_t *>(u_tensor->data);
+        std::vector<float> divided(size_t(rows*columns));
+        for (int64_t i=0;i<rows*columns;++i) { divided[i]=weights[i]/ggml_fp16_to_fp32(u0[i%columns]); }
+        // Continuous parameters, not only the historical experiment grid.
+        for (const auto & setting:std::vector<std::pair<double,double>>{{0.,2.},{0.,1.73},{.63,2.},{.17,1.73}}) {
+            const double lambda=setting.first,exponent=setting.second;
+            const auto output=base+".l"+std::to_string(lambda)+".p"+std::to_string(exponent)+".gguf";
+            config=write_config(dir,1.,64,nlohmann::json::array({selected}),nlohmann::json::array(),
+                {{"scale_refinement_lambda",lambda},{"imatrix_exponent",exponent}});
+            p.sinq_config=config.c_str();p.nthread=1;p.max_buf_size=0;
+            check(llama_model_quantize(source.c_str(),output.c_str(),&p)==0,"encoding controls quantization");
+            if (lambda==0 && exponent==2) {
+                std::ifstream a(base,std::ios::binary),b(output,std::ios::binary);
+                check(std::vector<char>((std::istreambuf_iterator<char>(a)),{})==
+                      std::vector<char>((std::istreambuf_iterator<char>(b)),{}),"explicit defaults changed GGUF bytes");
+            }
+            ggml_context * data=nullptr;
+            auto * meta=gguf_init_from_file(output.c_str(),{false,&data});check(meta && data,"encoding output read");
+            auto * payload=ggml_get_tensor(data,selected);auto * scale=ggml_get_tensor(data,companion.c_str());
+            check(payload && scale && payload->type==codec.second,"encoding changed allocation");
+            std::vector<float> transformed(size_t(columns),0.f),decoded(size_t(rows*columns));
+            for (int64_t j=0;j<columns;++j) {
+                const float u=ggml_fp16_to_fp32(u0[j]);
+                transformed[j]=exponent==2 ? channel_importance[j]*u*u :
+                    float(double(channel_importance[j])*std::pow(double(u),exponent));
+            }
+            std::vector<uint8_t> expected(ggml_nbytes(payload));
+            check(ggml_quantize_chunk(codec.second,divided.data(),expected.data(),0,rows,columns,transformed.data())==expected.size(),"encoding native oracle size");
+            check(std::memcmp(expected.data(),payload->data,expected.size())==0,"encoding differs from native exponent oracle");
+            ggml_get_type_traits(codec.second)->to_float(payload->data,decoded.data(),rows*columns);
+            const auto * actual=static_cast<const ggml_fp16_t *>(scale->data);
+            bool changed=false;
+            for (int64_t j=0;j<columns;++j) {
+                double numerator=0,denominator=0;
+                for (int64_t i=0;i<rows;++i) {
+                    numerator+=double(weights[i*columns+j])*decoded[i*columns+j];
+                    denominator+=double(decoded[i*columns+j])*decoded[i*columns+j];
+                }
+                ggml_fp16_t wanted=u0[j];const double ls=numerator/denominator;
+                if (lambda>0 && denominator>0 && std::isfinite(ls) && ls>0 && ls<=65504.) {
+                    const float half=ggml_fp16_to_fp32(ggml_fp32_to_fp16(float(ls)));
+                    if (std::isfinite(half) && half>0) {
+                        wanted=ggml_fp32_to_fp16(float((1-lambda)*ggml_fp16_to_fp32(u0[j])+lambda*ls));
+                    }
+                }
+                check(actual[j]==wanted,"encoding scale differs from fixed-payload LS oracle");
+                changed=changed || actual[j]!=u0[j];
+            }
+            if (lambda>0) { check(changed,"refinement fixture did not change sidecars"); }
+            for (int64_t i=0;i<gguf_get_n_tensors(base_meta);++i) {
+                const char * name=gguf_get_tensor_name(base_meta,i);
+                auto * a=ggml_get_tensor(base_data,name);auto * b=ggml_get_tensor(data,name);
+                check(a && b && a->type==b->type && ggml_nbytes(a)==ggml_nbytes(b),"encoding changed tensor inventory");
+                if (std::strcmp(name,selected)!=0 && companion!=name) {
+                    check(std::memcmp(a->data,b->data,ggml_nbytes(a))==0,"encoding changed unselected tensor");
+                }
+            }
+            if (lambda!=0 || exponent!=2) {
+                check(gguf_get_val_f64(meta,gguf_find_key(meta,"quantize.sinq.scale_refinement_lambda"))==lambda &&
+                      gguf_get_val_f64(meta,gguf_find_key(meta,"quantize.sinq.imatrix_exponent"))==exponent,"encoding provenance missing");
+            }
+            gguf_free(meta);ggml_free(data);
+            auto * model=load(output);check(model!=nullptr,"encoding model load");llama_model_free(model);
+            const auto slabbed=output+".slabs.gguf";p.nthread=4;p.max_buf_size=4096;
+            check(llama_model_quantize(source.c_str(),slabbed.c_str(),&p)==0,"encoding slab quantization");
+            std::ifstream a(output,std::ios::binary),b(slabbed,std::ios::binary);
+            check(std::vector<char>((std::istreambuf_iterator<char>(a)),{})==
+                  std::vector<char>((std::istreambuf_iterator<char>(b)),{}),"encoding slab/thread bytes changed");
+        }
+        gguf_free(base_meta);ggml_free(base_data);
+    }
+    gguf_free(source_meta);ggml_free(original);
+    std::puts("direct SINQ encoding: defaults, arbitrary float controls, native/LS oracles and slab/load parity");
+}
+
 static void width_roundtrips(const std::string & source, const std::filesystem::path & dir) {
     for(int width:{8,16,32,64,128,256,512}) {
         const auto manual=(dir/("width-manual-"+std::to_string(width)+".gguf")).string();
@@ -507,6 +631,7 @@ int main(int argc, char ** argv) try {
         std::printf("standard QK quantize/reload/slab identity format=%d OK\n",format);
     }
     width_roundtrips(source,dir);
+    encoding_controls(dir);
     settings_controls(source,dir);
     full_coverage_pairs(source,dir);
     native_codec_pairs(source,dir);

@@ -137,6 +137,8 @@ static void usage(const char * executable) {
     printf("  --sinq-config PATH                   strict v2 JSON defaults, targets and disjoint tensor/layer/role overrides\n");
     printf("                                      original floating Qwen3.5 projections; companions REQUIRE BeeLlama\n");
     printf("                                      settings never change the stock qtype allocation; no codec fallback\n");
+    printf("                                      optional encoding.scale_refinement_lambda [0,1] (default 0),\n");
+    printf("                                      encoding.imatrix_exponent finite float (default 2)\n");
     printf("  --sinq-diagnostics-json PATH          default absent; external deterministic JSON, valid with stock too\n");
     printf("                                      not compatible with --dry-run or COPY; write failures are fatal\n");
     printf("  --pure\n");

@@ -30,15 +30,23 @@ struct tensor_descriptor {
     ggml_type qtype = GGML_TYPE_F32;
     bool eligible = false;
 };
+// Global direct-quantization controls; not normalization/AWQ recipe fields.
+struct encoding_options {
+    double scale_refinement_lambda = 0.0;
+    double imatrix_exponent = 2.0;
+    bool is_default() const { return scale_refinement_lambda == 0.0 && imatrix_exponent == 2.0; }
+};
 struct resolved_tensor {
     tensor_descriptor tensor;
     parameters settings;
     bool locked = true;
 };
 std::vector<resolved_tensor> resolve_direct(const nlohmann::json & config,
-                                           const std::vector<tensor_descriptor> & tensors);
+                                           const std::vector<tensor_descriptor> & tensors,
+                                           encoding_options * encoding = nullptr);
 std::vector<resolved_tensor> resolve_direct_file(const std::string & path,
-                                                const std::vector<tensor_descriptor> & tensors);
+                                                const std::vector<tensor_descriptor> & tensors,
+                                                encoding_options * encoding = nullptr);
 // Shared runtime/bridge writer validation. Names and recipes must be aligned.
 std::vector<parameters> validate_metadata(const std::vector<std::string> & names,
                                          const std::vector<std::string> & recipes,

@@ -77,6 +77,14 @@ class Bridge(unittest.TestCase):
             self.assertEqual(entries[0]['parameters'],spec())
             self.assertEqual(entries[1]['parameters'],spec(128,strength=.5))
             self.assertEqual(entries[0]['shape'],[512,3]);self.assertTrue(all(e['locked'] for e in entries))
+            cfg['encoding']={'scale_refinement_lambda':.17,'imatrix_exponent':1.73}
+            config.write_text(json.dumps(cfg),encoding='utf-8')
+            proc=subprocess.run([BINARY,'--plan-config',str(config),str(inv)],capture_output=True,text=True)
+            self.assertEqual(proc.returncode,0,proc.stderr)
+            planned=json.loads(proc.stdout)
+            self.assertEqual(planned['encoding'],cfg['encoding'])
+            self.assertEqual(planned['tensors'],entries)
+            cfg.pop('encoding')
             cfg['overrides']*=2;config.write_text(json.dumps(cfg),encoding='utf-8')
             self.assertNotEqual(subprocess.run([BINARY,'--plan-config',str(config),str(inv)],capture_output=True).returncode,0)
 

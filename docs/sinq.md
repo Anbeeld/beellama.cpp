@@ -98,8 +98,9 @@ layout and type IDs remain unchanged. An importance matrix `I` is transformed to
 `u*u*I` for encoding; this does not recapture activations through a quantized model.
 
 Normalization widths are 8, 16, 32, 64, 128, 256 or 512; iteration counts are 4, 8 or 16.
-Strength is finite in `[0,1]`. Strength zero produces an identity diagonal but
-remains a conditioned candidate, distinct from a stock candidate. Normalizer
+Strength is finite in `[0,1]`. Strength zero produces an identity normalization diagonal but remains a
+conditioned candidate, distinct from a stock candidate. Optional post-encoding
+scale refinement can still change that diagonal when explicitly enabled. Normalizer
 worker buffers have an aggregate 128 MiB bound. A strip that cannot fit fails
 instead of being resized.
 
@@ -177,8 +178,8 @@ the exit status before treating the output as complete.
 
 ### Direct JSON schema
 
-Only `schema_version`, `defaults`, `targets` and optional `overrides` are
-accepted at the root. `schema_version`, `defaults` and `targets` are required.
+Only `schema_version`, `defaults`, `targets`, optional `overrides` and optional
+`encoding` are accepted at the root. `schema_version`, `defaults` and `targets` are required.
 Unknown/duplicate keys and nonfinite numbers fail.
 
 | Object | Fields and rules |
@@ -195,6 +196,51 @@ must be disjoint even when they assign the same value. No selected tensors is an
 error. For example, to override only down projections, replace the layer rule
 with `{"selector":{"role":"ffn_down"},"parameters":{"strip_width":128}}`.
 Do not combine it with an overlapping layer rule.
+
+### Optional encoding controls
+
+The existing `--sinq-config` file can additionally contain a global `encoding`
+object. These controls affect direct quantization only, not inference or offline
+optimizer candidates. They do not belong inside normalization `defaults` or
+per-tensor `overrides`:
+
+```json
+{
+  "schema_version": 2,
+  "defaults": {"generator": "sinq", "strip_width": 64, "iterations": 16, "strength": 1.0},
+  "targets": {"include": "eligible"},
+  "encoding": {
+    "scale_refinement_lambda": 0.17,
+    "imatrix_exponent": 1.73
+  }
+}
+```
+
+- `scale_refinement_lambda` is any finite floating-point value in `[0,1]`,
+  default **0** (disabled). After encoding all rows with the original serialized
+  diagonal `u0`, positive per-column least squares fits the original weights
+  against the fixed native decoded payload `B`. Only the companion changes:
+  `F16((1-lambda)*u0 + lambda*sum(W*B)/sum(B*B))`. Row slabs contribute to one
+  whole-tensor fit; no re-encoding or alternating optimization occurs. This is
+  distinct from normalization strength and AWQ's `lambda`, and is not
+  activation-aware calibration. Zero/nonfinite denominators, nonpositive or
+  nonrepresentable F16 solutions retain `u0`, with counts in logs/diagnostics.
+- `imatrix_exponent` is any finite floating-point value, default **2**. Conditioned
+  tensors with importance entries use `I_prime = I * u0^p`. At `p=2` the original
+  FP32 multiplication order is preserved exactly. Missing optional entries remain
+  unaffected; required low-bit entries still fail closed. Invalid/overflowed
+  transformed values fail rather than falling back. Without an imatrix, changing
+  this exponent has no effect and produces a warning.
+
+Neither control is restricted to the historical experimental grid: `0.17`,
+`0.63`, `1.73`, and `2.12` are ordinary valid values in their respective domains.
+Omitting `encoding`, or explicitly using lambda 0 and exponent 2, preserves the
+previous payloads, companions and metadata. Non-default controls are recorded as
+F64 producer provenance in `quantize.sinq.scale_refinement_lambda` and
+`quantize.sinq.imatrix_exponent`, outside the closed inference namespace. The v2
+companion layout, normalization recipes, codec allocations, and runtime math are
+unchanged. Non-default refinement may change model quality adversely even when
+weight-reconstruction error improves; opt in only after matched evaluation.
 
 The public API exposes `llama_model_quantize_params.sinq_config` and
 `sinq_diagnostics_json`. Initialize the structure with

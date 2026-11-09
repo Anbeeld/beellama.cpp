@@ -19,6 +19,7 @@ extern "C" {
 #include <fstream>
 #include <mutex>
 #include <map>
+#include <memory>
 #include <regex>
 #include <set>
 #include <filesystem>
@@ -1151,6 +1152,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     std::vector<sinq::tensor_descriptor> sinq_inventory;
     std::vector<bool> sinq_fallback(tensors.size(),false);
     std::map<std::string,sinq::parameters> sinq_settings;
+    sinq::encoding_options sinq_encoding;
 
     // flag for --dry-run
     bool will_require_imatrix = false;
@@ -1210,7 +1212,18 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     }
 
     if (sinq_enabled) {
-        const auto plan=sinq::resolve_direct_file(params->sinq_config,sinq_inventory);
+        const auto plan=sinq::resolve_direct_file(params->sinq_config,sinq_inventory,&sinq_encoding);
+        if (!sinq_encoding.is_default()) {
+            LLAMA_LOG_INFO("SINQ encoding: scale_refinement_lambda=%.9g imatrix_exponent=%.9g\n",
+                sinq_encoding.scale_refinement_lambda,sinq_encoding.imatrix_exponent);
+            if (diagnostics) {
+                sinq_report["encoding"]={{"scale_refinement_lambda",sinq_encoding.scale_refinement_lambda},
+                                         {"imatrix_exponent",sinq_encoding.imatrix_exponent}};
+            }
+            if (sinq_encoding.imatrix_exponent!=2.0 && !params->imatrix) {
+                LLAMA_LOG_WARN("SINQ imatrix_exponent has no effect without an importance matrix\n");
+            }
+        }
         std::vector<std::string> recipes;
         for (const auto & item:plan) { sinq_settings.emplace(item.tensor.name,item.settings); }
         for (size_t i=0;i<tensors.size();++i) {
@@ -1237,6 +1250,12 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             gguf_set_arr_str(out.get(),"beellama.qk_sinq.tensors",names.data(),names.size());
             gguf_set_arr_str(out.get(),"beellama.qk_sinq.recipes",records.data(),records.size());
             gguf_set_val_str(out.get(),"beellama.qk_sinq.producer",LLAMA_COMMIT);
+            // Producer provenance only: do not extend the closed inference namespace
+            // or add any metadata at the historical default endpoints.
+            if (!sinq_encoding.is_default()) {
+                gguf_set_val_f64(out.get(),"quantize.sinq.scale_refinement_lambda",sinq_encoding.scale_refinement_lambda);
+                gguf_set_val_f64(out.get(),"quantize.sinq.imatrix_exponent",sinq_encoding.imatrix_exponent);
+            }
         }
     }
 
@@ -1485,7 +1504,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 std::vector<float> sinq_imatrix;
                 if (tm.sinq_preconditioned && imatrix) {
                     sinq_imatrix.resize(n_per_row);
-                    sinq::transform_importance(imatrix, sinq_imatrix.data(), n_per_row, sinq_values.data());
+                    sinq::transform_importance(imatrix, sinq_imatrix.data(), n_per_row, sinq_values.data(),sinq_encoding.imatrix_exponent);
                     imatrix = sinq_imatrix.data();
                     if (diagnostic) { (*diagnostic)["imatrix_transformed"] = true; }
                 }
@@ -1495,6 +1514,12 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     (tensor->type == GGML_TYPE_F32 ? 0 : n_per_row*sizeof(float)) +
                     (tm.sinq_preconditioned ? n_per_row*sizeof(float) : 0);
                 const int64_t nrows_slab = std::max<int64_t>(1, std::min<int64_t>(nrows_total, max_buf_size/bytes_per_row));
+                // Refinement retains two F64 sums per input column and one decoded
+                // row, not a second tensor. All slabs must finish before changing u0.
+                std::unique_ptr<sinq::scale_refinement> refinement;
+                if (tm.sinq_preconditioned && sinq_encoding.scale_refinement_lambda>0) {
+                    refinement=std::make_unique<sinq::scale_refinement>(n_per_row);
+                }
 
                 // process rows across all experts in one pass to keep all threads busy
                 new_size = 0;
@@ -1515,6 +1540,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                         f32_data = (const float *) f32_conv_buf.data();
                     }
 
+                    const float * original_f32_data=f32_data;
                     if (tm.sinq_preconditioned) {
                         sinq_preconditioned.resize(nelements_cur);
                         sinq::precondition_weights(f32_data, sinq_preconditioned.data(), nrows_cur, n_per_row, sinq_values.data(), nthread);
@@ -1529,8 +1555,30 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
                     const size_t size_cur = sinq::native_encode(new_type, f32_data, work.data(), chunk_size, ir, nrows_cur, nrows_per_expert, n_per_row, imatrix, workers, nthread_use);
 
+                    if (refinement) {
+                        refinement->accumulate(original_f32_data,work.data(),new_type,nrows_cur);
+                    }
                     fout.write((const char *) work.data(), size_cur);
                     new_size += size_cur;
+                }
+                if (refinement) {
+                    const auto original_digest=diagnostic ? sinq_digest(sinq_values.data(),sinq_values.size()*sizeof(ggml_fp16_t)) : std::string();
+                    const auto stats=refinement->apply(sinq_values.data(),sinq_encoding.scale_refinement_lambda);
+                    LLAMA_LOG_INFO("SINQ scale refinement invalid_ls=%zu invalid_blend=%zu; ",stats.invalid_ls_count,stats.invalid_blend_count);
+                    if (diagnostic) {
+                        (*diagnostic)["original_scales_sha256"]=original_digest;
+                        (*diagnostic)["scales_sha256"]=sinq_digest(sinq_values.data(),sinq_values.size()*sizeof(ggml_fp16_t));
+                        (*diagnostic)["invalid_ls_count"]=stats.invalid_ls_count;
+                        (*diagnostic)["invalid_blend_count"]=stats.invalid_blend_count;
+                        std::vector<float> values;
+                        for (auto value:sinq_values) { values.push_back(ggml_fp16_to_fp32(value)); }
+                        std::sort(values.begin(),values.end());
+                        (*diagnostic)["scale_min"]=values.front();
+                        (*diagnostic)["scale_median"]=values.size()%2 ? values[values.size()/2] :
+                            (values[values.size()/2-1]+values[values.size()/2])*0.5f;
+                        (*diagnostic)["scale_max"]=values.back();
+                        (*diagnostic)["identity"]=values.front()==1.f && values.back()==1.f;
+                    }
                 }
                 LLAMA_LOG_INFO("size = %8.2f MiB -> %8.2f MiB\n", tensor_size/1024.0/1024.0, new_size/1024.0/1024.0);
             }

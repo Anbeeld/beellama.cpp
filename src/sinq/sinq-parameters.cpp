@@ -88,8 +88,22 @@ static std::set<std::string> names(const nlohmann::json & j) {
     }
     return result;
 }
-std::vector<resolved_tensor> resolve_direct(const nlohmann::json & config, const std::vector<tensor_descriptor> & tensors) {
-    fields(config,{"schema_version","defaults","targets","overrides"});
+std::vector<resolved_tensor> resolve_direct(const nlohmann::json & config, const std::vector<tensor_descriptor> & tensors,
+                                          encoding_options * encoding) {
+    fields(config,{"schema_version","defaults","targets","overrides","encoding"});
+    encoding_options options;
+    if (config.contains("encoding")) {
+        const auto & value=config.at("encoding");
+        fields(value,{"scale_refinement_lambda","imatrix_exponent"});
+        if (value.contains("scale_refinement_lambda")) {
+            options.scale_refinement_lambda=unit(value.at("scale_refinement_lambda"),"scale_refinement_lambda");
+        }
+        if (value.contains("imatrix_exponent")) {
+            check(value.at("imatrix_exponent").is_number(),"imatrix_exponent must be numeric");
+            options.imatrix_exponent=value.at("imatrix_exponent").get<double>();
+            check(std::isfinite(options.imatrix_exponent),"imatrix_exponent must be finite");
+        }
+    }
     check(config.contains("schema_version") && config.at("schema_version").is_number_integer() && config.at("schema_version")==2,"unsupported config schema version");
     const auto defaults=parse_parameters(config.at("defaults"),false);
     check(defaults.generator=="sinq","direct configuration supports ordinary SINQ only");
@@ -147,12 +161,14 @@ std::vector<resolved_tensor> resolve_direct(const nlohmann::json & config, const
         check(item.settings.strength==0 || llama_sinq_workspace_size(t.rows,item.settings.strip_width,workspace),"selected tensor exceeds workspace: "+t.name);
     }
     std::sort(result.begin(),result.end(),[](const resolved_tensor & a,const resolved_tensor & b){return a.tensor.name<b.tensor.name;});
+    if (encoding) { *encoding=options; }
     return result;
 }
-std::vector<resolved_tensor> resolve_direct_file(const std::string & path,const std::vector<tensor_descriptor> & tensors) {
+std::vector<resolved_tensor> resolve_direct_file(const std::string & path,const std::vector<tensor_descriptor> & tensors,
+                                               encoding_options * encoding) {
     std::ifstream stream(path,std::ios::binary); check(bool(stream),"cannot open configuration: "+path);
     const std::string text((std::istreambuf_iterator<char>(stream)),std::istreambuf_iterator<char>());
-    return resolve_direct(parse_json_strict(text),tensors);
+    return resolve_direct(parse_json_strict(text),tensors,encoding);
 }
 std::vector<parameters> validate_metadata(const std::vector<std::string> & names,const std::vector<std::string> & recipes,const std::string & producer) {
     check(!names.empty() && names.size()<=100000 && names.size()==recipes.size(),"invalid metadata coverage");

@@ -49,8 +49,11 @@ int main(int argc,char**argv) try {
             tensors.push_back(std::move(d));
         }
         json entries=json::array();
-        for(const auto&entry:sinq::resolve_direct(config_json,tensors))entries.push_back({{"name",entry.tensor.name},{"parameters",sinq::parameters_json(entry.settings)},{"shape",{entry.tensor.columns,entry.tensor.rows}},{"qtype",ggml_type_name(entry.tensor.qtype)},{"locked",entry.locked}});
-        std::cout<<json({{"tensors",entries}}).dump()<<"\n";return 0;
+        sinq::encoding_options encoding;
+        for(const auto&entry:sinq::resolve_direct(config_json,tensors,&encoding))entries.push_back({{"name",entry.tensor.name},{"parameters",sinq::parameters_json(entry.settings)},{"shape",{entry.tensor.columns,entry.tensor.rows}},{"qtype",ggml_type_name(entry.tensor.qtype)},{"locked",entry.locked}});
+        json output={{"tensors",entries}};
+        if(!encoding.is_default())output["encoding"]={{"scale_refinement_lambda",encoding.scale_refinement_lambda},{"imatrix_exponent",encoding.imatrix_exponent}};
+        std::cout<<output.dump()<<"\n";return 0;
     }
     if((argc==4 || argc==5) && std::string(argv[1])=="--validate-activations") {
         int threads=int(std::max(1u,std::thread::hardware_concurrency()));

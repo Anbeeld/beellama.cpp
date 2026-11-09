@@ -868,6 +868,12 @@ target_compile_features(test-sinq-parameters PRIVATE cxx_std_17)
 target_link_libraries(test-sinq-parameters PRIVATE llama-sinq-optimizer)
 add_test(NAME test-sinq-parameters COMMAND test-sinq-parameters)
 
+add_executable(test-sinq-encoding test-sinq-encoding.cpp)
+target_include_directories(test-sinq-encoding PRIVATE ../src)
+target_compile_features(test-sinq-encoding PRIVATE cxx_std_17)
+target_link_libraries(test-sinq-encoding PRIVATE llama-sinq-optimizer)
+add_test(NAME test-sinq-encoding COMMAND test-sinq-encoding)
+
 add_executable(test-qk-sinq-model test-qk-sinq-model.cpp)
 target_compile_features(test-qk-sinq-model PRIVATE cxx_std_17)
 target_include_directories(test-qk-sinq-model PRIVATE ../src ../vendor/nlohmann)
