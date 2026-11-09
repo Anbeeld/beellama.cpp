@@ -1471,7 +1471,7 @@ private:
     }
 
     void detach() {
-        if (!storage.unique()) {
+        if (storage.use_count() != 1) {
             storage = std::make_shared<std::vector<uint8_t>>(*storage);
         }
     }
