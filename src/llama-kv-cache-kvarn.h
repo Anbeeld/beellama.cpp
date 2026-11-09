@@ -394,7 +394,6 @@ private:
     bool indexer_mirror = false;   // set when an index-aware QSA cache mirrors this one
     const uint32_t n_groups_per_stream;
     const uint32_t exact_tail_tokens;
-    const uint32_t metadata_n_pad;
     const uint32_t metadata_n_swa;
     const llama_swa_type metadata_swa_type;
     const uint32_t metadata_n_ubatch;
