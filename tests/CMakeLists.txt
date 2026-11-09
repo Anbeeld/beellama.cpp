@@ -871,7 +871,7 @@ add_test(NAME test-sinq-parameters COMMAND test-sinq-parameters)
 add_executable(test-qk-sinq-model test-qk-sinq-model.cpp)
 target_compile_features(test-qk-sinq-model PRIVATE cxx_std_17)
 target_include_directories(test-qk-sinq-model PRIVATE ../src ../vendor/nlohmann)
-target_link_libraries(test-qk-sinq-model PRIVATE llama ggml)
+target_link_libraries(test-qk-sinq-model PRIVATE llama ggml llama-sinq-optimizer)
 add_test(NAME test-qk-sinq-model COMMAND test-qk-sinq-model ${CMAKE_CURRENT_BINARY_DIR}/qk-sinq-model-fixtures)
 
 add_executable(test-qk-sinq-graph test-qk-sinq-graph.cpp)
