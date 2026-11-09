@@ -13,6 +13,10 @@ namespace fs = std::filesystem;
 using json = nlohmann::ordered_json;
 namespace {
 void require(bool ok, const std::string & message) { if (!ok) { throw std::runtime_error(message); } }
+std::string path_to_utf8(const fs::path & path) {
+    const auto value = path.u8string();
+    return std::string(value.begin(), value.end());
+}
 std::string digest(const std::string & bytes) {
     unsigned char out[32]; sha256_hash(out, reinterpret_cast<const unsigned char *>(bytes.data()), bytes.size());
     std::string result; const char * hex = "0123456789abcdef";
@@ -26,8 +30,8 @@ struct fixture {
     fs::path dir;
     json root;
     const std::string bytes = std::string("\0\0\x80\x3f\0\0\0\xc0", 8);
-    fixture() {
-        dir = fs::temp_directory_path() / ("sinq-activation-" + std::to_string(std::chrono::high_resolution_clock::now().time_since_epoch().count()));
+    fixture(const std::string & suffix = "") {
+        dir = fs::temp_directory_path() / fs::u8path("sinq-activation-" + std::to_string(std::chrono::high_resolution_clock::now().time_since_epoch().count()) + suffix);
         require(fs::create_directory(dir), "fixture directory creation failed");
         put(dir / "source.gguf", "abc"); put(dir / "samples.bin", bytes);
         const std::string abc = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
@@ -44,7 +48,7 @@ struct fixture {
     ~fixture() { std::error_code ec; fs::remove_all(dir,ec); }
     llama_sinq_activation_manifest load(const json & value, int threads = 1) {
         put(dir / "activations.json",value.dump());
-        return llama_sinq_load_activations(dir.string(),(dir / "source.gguf").string(),threads);
+        return llama_sinq_load_activations(path_to_utf8(dir),path_to_utf8(dir / "source.gguf"),threads);
     }
     void reject(const json & value, const std::string & label) {
         bool threw = false; try { load(value); } catch (const std::exception &) { threw = true; }
@@ -82,7 +86,20 @@ int main() {
         require(m.manifest_sha256==digest(f.root.dump()),"manifest digest mismatch");
         auto x = llama_sinq_load_activation_samples(m.tensors.at("blk.0.attn_q.weight"));
         require(x.size()==2 && x[0]==1.0f && x[1]==-2.0f,"little-endian decode mismatch");
-        require(fs::path(m.tensors.begin()->second.data_file).is_absolute(),"data path not absolute");
+        require(fs::u8path(m.tensors.begin()->second.data_file).is_absolute(),"data path not absolute");
+        {
+            // Exercise both a Unicode manifest directory and a Unicode sample filename.
+            // Escapes keep the fixture independent of the compiler's source encoding.
+            fixture unicode("-\xe6\xb5\x8b\xe8\xaf\x95");
+            const std::string name = "samples-\xe6\xb5\x8b\xe8\xaf\x95.bin";
+            fs::rename(unicode.dir / "samples.bin", unicode.dir / fs::u8path(name));
+            for (auto & tensor : unicode.root["tensors"]) { tensor["data_file"] = name; }
+            const auto manifest = unicode.load(unicode.root);
+            const auto & entry = manifest.tensors.at("blk.0.attn_q.weight");
+            require(entry.data_file == path_to_utf8(fs::canonical(unicode.dir / fs::u8path(name))),
+                    "Unicode sample path did not remain UTF-8");
+            require(llama_sinq_load_activation_samples(entry) == x,"Unicode sample reload mismatch");
+        }
         const auto reject_root = [&](const char * key, const json & value) { auto j=f.root; j[key]=value; f.reject(j,key); };
         reject_root("source_sha256",std::string(64,'0')); reject_root("architecture","wrong");
         reject_root("schema_version",2); reject_root("source_revision",""); reject_root("extra",0);
@@ -105,7 +122,7 @@ int main() {
         reject_tensor("input_dim",uint64_t(-1)); reject_tensor("input_dim",int64_t(1)<<62);
         reject_tensor("output_dim",0); reject_tensor("output_dim",uint64_t(-1));
         reject_tensor("count",0); reject_tensor("count",3); reject_tensor("count",1.0);
-        reject_tensor("data_file","../outside.bin"); reject_tensor("data_file",(f.dir / "samples.bin").string());
+        reject_tensor("data_file","../outside.bin"); reject_tensor("data_file",path_to_utf8(f.dir / "samples.bin"));
         reject_tensor("sha256",std::string(64,'0')); reject_tensor("sha256",std::string(64,'A')); reject_tensor("extra",0);
         auto duplicate=f.root; duplicate["tensors"].push_back(duplicate["tensors"][0]); f.reject(duplicate,"duplicate tensor name");
         for (const auto & pair : {std::make_pair("max_rows",json(257)),std::make_pair("seed",json(-1)),
@@ -124,8 +141,8 @@ int main() {
         f.reject(too_many,"tensor count limit");
         auto provenance=f.root; provenance["provenance"]={{"tool","fixture"}}; f.load(provenance);
         f.load(f.root);
-        require(llama_sinq_load_activations((f.dir / "activations.json").string(),
-            (f.dir / "source.gguf").string()).tensors.size()==2,"explicit manifest path rejected");
+        require(llama_sinq_load_activations(path_to_utf8(f.dir / "activations.json"),
+            path_to_utf8(f.dir / "source.gguf")).tensors.size()==2,"explicit manifest path rejected");
         put(f.dir / "samples.bin",f.bytes+"x");
         bool reload_threw=false;
         try { llama_sinq_load_activation_samples(m.tensors.begin()->second); }
@@ -133,11 +150,11 @@ int main() {
         require(reload_threw,"sample reload failed to revalidate length");
         put(f.dir / "samples.bin",f.bytes);
         put(f.dir / "activations.json","{\"schema_version\":1,"+f.root.dump().substr(1));
-        bool threw=false; try { llama_sinq_load_activations((f.dir / "activations.json").string(),(f.dir / "source.gguf").string()); }
+        bool threw=false; try { llama_sinq_load_activations(path_to_utf8(f.dir / "activations.json"),path_to_utf8(f.dir / "source.gguf")); }
         catch (const std::exception &) { threw=true; } require(threw,"duplicate JSON key accepted");
         put(f.dir / "activations.json",std::string(8*1024*1024+1,' '));
         threw=false;
-        try { llama_sinq_load_activations(f.dir.string(),(f.dir / "source.gguf").string()); }
+        try { llama_sinq_load_activations(path_to_utf8(f.dir),path_to_utf8(f.dir / "source.gguf")); }
         catch (const std::exception &) { threw=true; } require(threw,"oversize manifest accepted");
         fixture outside;
         std::error_code ec;

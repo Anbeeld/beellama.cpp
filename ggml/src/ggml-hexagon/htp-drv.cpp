@@ -345,7 +345,9 @@ int htpdrv_init() {
     fs::path path{ drv_path.c_str() };
     dl_handle_ptr handle { dl_load_library(path) };
     if (!handle) {
-        GGML_LOG_ERROR("ggml-hex: failed to load %s: %s\n", path.u8string().c_str(), dl_error());
+        const auto path_u8 = path.u8string();
+        const std::string path_utf8(path_u8.begin(), path_u8.end());
+        GGML_LOG_ERROR("ggml-hex: failed to load %s: %s\n", path_utf8.c_str(), dl_error());
         return AEE_EUNABLETOLOAD;
     }
 

@@ -24,6 +24,10 @@ extern "C" {
 namespace {
 namespace fs = std::filesystem;
 using json = nlohmann::ordered_json;
+std::string path_to_utf8(const fs::path & path) {
+    const auto value = path.u8string();
+    return std::string(value.begin(), value.end());
+}
 constexpr uint64_t manifest_limit = 8ull*1024*1024;
 constexpr uint64_t sample_limit = 256ull*1024*1024;
 [[noreturn]] void invalid(const std::string & why) { throw std::runtime_error("SINQ activation manifest: " + why); }
@@ -246,7 +250,7 @@ llama_sinq_activation_manifest llama_sinq_load_activations(const std::string & p
         entry.count = int(integer(tensor,"count",1,max_rows));
         sample_bytes(entry);
         entry.sha256 = hash_text(tensor,"sha256");
-        entry.data_file = contained_file(manifest_path.parent_path(),text(tensor,"data_file")).string();
+        entry.data_file = path_to_utf8(contained_file(manifest_path.parent_path(),text(tensor,"data_file")));
         if (out.tensors.count(entry.name)) { invalid("duplicate tensor " + entry.name); }
         out.tensors.emplace(entry.name,std::move(entry));
     }
