@@ -44,7 +44,7 @@ struct fixture {
     ~fixture() { std::error_code ec; fs::remove_all(dir,ec); }
     llama_sinq_activation_manifest load(const json & value, int threads = 1) {
         put(dir / "activations.json",value.dump());
-        return llama_sinq_load_activations(dir.u8string(),(dir / "source.gguf").u8string(),threads);
+        return llama_sinq_load_activations(dir.string(),(dir / "source.gguf").string(),threads);
     }
     void reject(const json & value, const std::string & label) {
         bool threw = false; try { load(value); } catch (const std::exception &) { threw = true; }
@@ -105,7 +105,7 @@ int main() {
         reject_tensor("input_dim",uint64_t(-1)); reject_tensor("input_dim",int64_t(1)<<62);
         reject_tensor("output_dim",0); reject_tensor("output_dim",uint64_t(-1));
         reject_tensor("count",0); reject_tensor("count",3); reject_tensor("count",1.0);
-        reject_tensor("data_file","../outside.bin"); reject_tensor("data_file",(f.dir / "samples.bin").u8string());
+        reject_tensor("data_file","../outside.bin"); reject_tensor("data_file",(f.dir / "samples.bin").string());
         reject_tensor("sha256",std::string(64,'0')); reject_tensor("sha256",std::string(64,'A')); reject_tensor("extra",0);
         auto duplicate=f.root; duplicate["tensors"].push_back(duplicate["tensors"][0]); f.reject(duplicate,"duplicate tensor name");
         for (const auto & pair : {std::make_pair("max_rows",json(257)),std::make_pair("seed",json(-1)),
@@ -124,8 +124,8 @@ int main() {
         f.reject(too_many,"tensor count limit");
         auto provenance=f.root; provenance["provenance"]={{"tool","fixture"}}; f.load(provenance);
         f.load(f.root);
-        require(llama_sinq_load_activations((f.dir / "activations.json").u8string(),
-            (f.dir / "source.gguf").u8string()).tensors.size()==2,"explicit manifest path rejected");
+        require(llama_sinq_load_activations((f.dir / "activations.json").string(),
+            (f.dir / "source.gguf").string()).tensors.size()==2,"explicit manifest path rejected");
         put(f.dir / "samples.bin",f.bytes+"x");
         bool reload_threw=false;
         try { llama_sinq_load_activation_samples(m.tensors.begin()->second); }
@@ -133,11 +133,11 @@ int main() {
         require(reload_threw,"sample reload failed to revalidate length");
         put(f.dir / "samples.bin",f.bytes);
         put(f.dir / "activations.json","{\"schema_version\":1,"+f.root.dump().substr(1));
-        bool threw=false; try { llama_sinq_load_activations((f.dir / "activations.json").u8string(),(f.dir / "source.gguf").u8string()); }
+        bool threw=false; try { llama_sinq_load_activations((f.dir / "activations.json").string(),(f.dir / "source.gguf").string()); }
         catch (const std::exception &) { threw=true; } require(threw,"duplicate JSON key accepted");
         put(f.dir / "activations.json",std::string(8*1024*1024+1,' '));
         threw=false;
-        try { llama_sinq_load_activations(f.dir.u8string(),(f.dir / "source.gguf").u8string()); }
+        try { llama_sinq_load_activations(f.dir.string(),(f.dir / "source.gguf").string()); }
         catch (const std::exception &) { threw=true; } require(threw,"oversize manifest accepted");
         fixture outside;
         std::error_code ec;

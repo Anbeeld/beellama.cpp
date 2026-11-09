@@ -246,7 +246,7 @@ llama_sinq_activation_manifest llama_sinq_load_activations(const std::string & p
         entry.count = int(integer(tensor,"count",1,max_rows));
         sample_bytes(entry);
         entry.sha256 = hash_text(tensor,"sha256");
-        entry.data_file = contained_file(manifest_path.parent_path(),text(tensor,"data_file")).u8string();
+        entry.data_file = contained_file(manifest_path.parent_path(),text(tensor,"data_file")).string();
         if (out.tensors.count(entry.name)) { invalid("duplicate tensor " + entry.name); }
         out.tensors.emplace(entry.name,std::move(entry));
     }
