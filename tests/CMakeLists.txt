@@ -880,6 +880,22 @@ target_include_directories(test-qk-sinq-model PRIVATE ../src ../vendor/nlohmann)
 target_link_libraries(test-qk-sinq-model PRIVATE llama ggml llama-sinq-optimizer)
 add_test(NAME test-qk-sinq-model COMMAND test-qk-sinq-model ${CMAKE_CURRENT_BINARY_DIR}/qk-sinq-model-fixtures)
 
+# Uses the real model split callback, which is not exported by Windows DLLs.
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    add_executable(test-qk-sinq-tensor-split test-qk-sinq-tensor-split.cpp)
+    target_include_directories(test-qk-sinq-tensor-split PRIVATE ../src ../ggml/src)
+    target_compile_features(test-qk-sinq-tensor-split PRIVATE cxx_std_17)
+    target_link_libraries(test-qk-sinq-tensor-split PRIVATE llama ggml)
+    add_test(NAME test-qk-sinq-tensor-split COMMAND test-qk-sinq-tensor-split)
+    if (GGML_CUDA)
+        add_test(NAME test-qk-sinq-tensor-split-cuda COMMAND test-qk-sinq-tensor-split cuda)
+        # Compare sharding math with an unsplit F32 oracle, without the optional
+        # lossy BF16 communication round-trip used by default CUDA AllReduce.
+        set_tests_properties(test-qk-sinq-tensor-split-cuda PROPERTIES SKIP_RETURN_CODE 77 LABELS cuda
+            ENVIRONMENT "GGML_CUDA_AR_BF16_THRESHOLD=0")
+    endif()
+endif()
+
 add_executable(test-qk-sinq-graph test-qk-sinq-graph.cpp)
 target_include_directories(test-qk-sinq-graph PRIVATE ../src)
 target_compile_features(test-qk-sinq-graph PRIVATE cxx_std_17)

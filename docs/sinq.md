@@ -63,8 +63,21 @@ ordinary preset allocation and conditions eligible projections using their actua
 codec. Optimizer `quantization.recipe` entries require exact tensor codec names,
 not preset names. Retained F32/F16/BF16 tensors remain unconditioned.
 
-CPU and qualified CUDA inference use existing matrix kernels. Row and tensor
-split modes are rejected; use `--split-mode none` for single-device serving.
+CPU and qualified CUDA inference use existing matrix kernels. CUDA tensor
+parallel inference supports `--split-mode tensor --device CUDA0,CUDA1
+--tensor-split 1,1`, including owned Qwen3.5 MTP draft contexts. Input-channel
+scales follow the base matrix's exact partition; output-channel projections
+replicate their input scales. Unequal split ratios use the same codec and head
+alignment as ordinary weights, including ranks with no assigned channels. Row
+split remains unsupported; use tensor, layer or none instead.
+
+Tensor mode retains the backend's ordinary numerical policies, not bit-exact
+single-device results. The CUDA internal AllReduce defaults to BF16 wire
+rounding for F32 tensors. For tight numerical comparisons, set
+`GGML_CUDA_AR_BF16_THRESHOLD=0` to retain F32 communication. This is an existing
+backend control, not a SINQ requirement; the serving configuration needs no new
+SINQ option.
+
 Do not infer support for other backends or placements from the standard weight
 IDs. Each companion must be placed with its base matrix. Offline Torch scoring
 on multiple CUDA devices is a separate capability from native model serving.
@@ -853,7 +866,9 @@ detailed evidence belong in external manifests.
 
 The loader checks companion values even when optional general tensor checking is
 disabled. It promotes them once into placement-matched F32 runtime buffers,
-shares equal vectors and omits exact all-one diagonals from the activation graph.
+shares equal vectors outside tensor mode and omits exact all-one diagonals from
+the activation graph. Tensor mode keeps separate runtime vectors per base matrix
+so equal values cannot accidentally reuse a different channel partition.
 Identical input/scale products can be reused before ordinary matrix multiplication.
 The serialized companion costs `2*K` bytes per matrix, or `16/N` idealized bits
 per original weight, excluding metadata and alignment.
@@ -960,7 +975,7 @@ sums must be finite/nonnegative and counts finite/positive.
 | Workspace, file or memory bound exceeded | Adjust declared budgets with physical headroom, or reduce the explicit workload |
 | Existing output or resume identity mismatch | Resume only unchanged supported stages; changed inputs require a new directory |
 | Missing/orphan companion, wrong shard or unknown metadata key | Recreate the model from original floats with a supported producer |
-| Base/companion placement mismatch | Apply matching placement overrides; do not split rows/tensors |
+| Base/companion placement mismatch | Apply matching placement overrides; row split is unsupported |
 | Native CUDA offload evidence missing | Check build, device selection and capacity; CPU fallback is not accepted as CUDA evaluation |
 
 Run targeted regressions with

@@ -1314,11 +1314,24 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
+        auto sinq_device_supported = [](ggml_backend_dev_t dev) {
+            if (!dev) { return false; }
+            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) { return true; }
+            const auto reg = ggml_backend_dev_backend_reg(dev);
+            return reg && strcmp(ggml_backend_reg_name(reg), "CUDA") == 0;
+        };
         auto check_sinq_device = [&](ggml_backend_dev_t dev) {
-            if (!dev || (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU &&
-                         strcmp(ggml_backend_dev_name(dev), "CUDA0") != 0)) {
+            bool supported = sinq_device_supported(dev);
+            if (dev && ggml_backend_dev_is_meta(dev)) {
+                const size_t count = ggml_backend_meta_device_count(dev);
+                supported = count > 0;
+                for (size_t i = 0; i < count; ++i) {
+                    supported = supported && sinq_device_supported(ggml_backend_meta_device_get(dev,i));
+                }
+            }
+            if (!supported) {
                 throw std::runtime_error(format(
-                    "SINQ tensor '%s' requires CUDA0 or explicit CPU placement; backend '%s' is unsupported (multi-GPU is not validated)",
+                    "SINQ tensor '%s' requires CPU or CUDA placement (including CPU/CUDA tensor parallel devices); backend '%s' is unsupported",
                     tn.str().c_str(), dev ? ggml_backend_dev_name(dev) : "unknown"));
             }
         };
@@ -1823,7 +1836,10 @@ bool llama_model_loader::load_all_data(
         } else {
             const auto & file = files.at(weight->idx);
 
-            if (ggml_backend_buffer_is_host(cur->buffer)) {
+            // Even all-CPU Meta buffers expose virtual addresses, not a
+            // contiguous host allocation. Scatter through tensor_set below.
+            const auto dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(cur->buffer));
+            if (ggml_backend_buffer_is_host(cur->buffer) && (!dev || !ggml_backend_dev_is_meta(dev))) {
                 file->seek(weight->offs, SEEK_SET);
                 file->read_raw(cur->data, n_size);
                 if (check_tensors) {

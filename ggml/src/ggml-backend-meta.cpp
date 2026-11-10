@@ -603,6 +603,27 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return true;
     };
 
+    // Singleton-head reshapes can move whole-rank ownership to a different
+    // logical axis. Those layouts are equivalent only if both inputs are
+    // complete on the same rank and empty everywhere else, never for shards.
+    auto same_whole_owner = [&](size_t a, size_t b, const std::vector<ggml_backend_meta_split_state> & states) {
+        const auto & sa = states[a];
+        const auto & sb = states[b];
+        if (sa.axis < 0 || sa.axis >= GGML_MAX_DIMS || sb.axis < 0 || sb.axis >= GGML_MAX_DIMS) {
+            return false;
+        }
+        for (size_t j = 0; j < n_bufs; ++j) {
+            int64_t na = 0, nb = 0;
+            for (size_t s = 0; s < sa.n_segments; ++s) { na += sa.ne[s*n_bufs+j] * sa.nr[s]; }
+            for (size_t s = 0; s < sb.n_segments; ++s) { nb += sb.ne[s*n_bufs+j] * sb.nr[s]; }
+            if ((na != 0 && na != tensor->src[a]->ne[sa.axis]) ||
+                (nb != 0 && nb != tensor->src[b]->ne[sb.axis]) || ((na == 0) != (nb == 0))) {
+                return false;
+            }
+        }
+        return true;
+    };
+
     auto handle_generic = [&](const std::vector<ggml_backend_meta_split_state> & src_ss, bool scalar_only) -> ggml_backend_meta_split_state {
         ggml_backend_meta_split_state ret = {GGML_BACKEND_SPLIT_AXIS_NONE, {0}, {1}, 1};
         for (size_t i = 0; i < GGML_MAX_SRC; i++) {
@@ -646,6 +667,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
 
     // Some ops broadcast the src1 data across src0:
     auto handle_bin_bcast = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        if (tensor->src[2] == nullptr && same_whole_owner(0,1,src_ss)) {
+            return {src_ss[0].axis, {0}, {1}, 1};
+        }
         if (src_ss[0].axis >= 0 && src_ss[0].axis < GGML_MAX_DIMS &&
                 tensor->src[1]->ne[src_ss[0].axis] == 1 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return src_ss[0];
@@ -660,6 +684,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
 
     auto handle_concat = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         const ggml_backend_meta_split_axis concat_axis = ggml_backend_meta_split_axis(ggml_get_op_params_i32(tensor, 0));
+        if (same_whole_owner(0,1,src_ss)) {
+            return {src_ss[0].axis, {0}, {1}, 1};
+        }
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis >= 0 && src_ss[1].axis < GGML_MAX_DIMS) {
             GGML_ASSERT(concat_axis != src_ss[1].axis);
             return src_ss[1];
@@ -912,8 +939,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_set_rows = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
-        GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_1);
         GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        if (same_whole_owner(0,2,src_ss)) {
+            // A singleton-token reshape can put complete K/V rows on axis 1.
+            // Indices remain replicated and the destination has the same sole
+            // owner, so preserve the cache layout rather than the source axis.
+            return {src_ss[2].axis, {0}, {1}, 1};
+        }
+        GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_1);
         if (!split_states_equal(src_ss[0], src_ss[2])) {
             GGML_ABORT("set_rows split mismatch: src0=%s axis=%d segments=%u nr=%u ne={%lld,%lld}; src2=%s axis=%d segments=%u nr=%u ne={%lld,%lld}",
                     tensor->src[0]->name, (int) src_ss[0].axis, src_ss[0].n_segments, src_ss[0].nr[0],
@@ -1471,7 +1504,10 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(
                 ne[split_dim] += split_state.ne[s*n_simple_bufs + j] * split_state.nr[s];
             }
             for (int i = 0; i < GGML_MAX_DIMS; i++) {
-                if (tensor->nb[i] > tensor->nb[split_dim]) {
+                // A contiguous one-block quantized row has nb[1] == nb[0].
+                // Its outer strides must still shrink, especially on an empty
+                // rank; otherwise uploads treat that rank as holding one block.
+                if (tensor->nb[i] > tensor->nb[split_dim] || (i > split_dim && ggml_is_contiguous(tensor))) {
                     nb[i] = tensor->nb[i] * ne[split_dim]/tensor->ne[split_dim];
                 }
             }

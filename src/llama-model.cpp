@@ -411,6 +411,25 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
     const std::string tensor_name = tensor->name;
+    // SINQ is an input-channel diagonal. Reuse the base matrix's exact
+    // partition (including codec granularity, head groups and layer rotation),
+    // not an independently rounded partition of the F16/F32 vector.
+    for (const char * suffix : {".sinq_scale2", ".sinq_scale2.runtime_f32"}) {
+        const size_t suffix_len = std::strlen(suffix);
+        if (tensor_name.size() > suffix_len &&
+                tensor_name.compare(tensor_name.size() - suffix_len, suffix_len, suffix) == 0) {
+            const std::string base_name = tensor_name.substr(0, tensor_name.size() - suffix_len);
+            const auto * base = ud->model->get_tensor(base_name.c_str());
+            GGML_ASSERT(base != nullptr && tensor->ne[0] == base->ne[0]);
+            const auto base_split = llama_meta_device_get_split_state(base, userdata);
+            if (base_split.axis == GGML_BACKEND_SPLIT_AXIS_0) {
+                return base_split;
+            }
+            GGML_ASSERT(base_split.axis == GGML_BACKEND_SPLIT_AXIS_1 ||
+                        base_split.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+        }
+    }
     const llama_kv_cache_component cache_component =
             llama_kv_cache_component_from_name(tensor_name);
     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 || ud->model->arch == LLM_ARCH_DEEPSEEK41 ||
@@ -1748,8 +1767,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
     const size_t n_sinq_weights = sinq_declared.size();
     if (n_sinq_weights) {
-        if (split_mode == LLAMA_SPLIT_MODE_ROW || split_mode == LLAMA_SPLIT_MODE_TENSOR) {
-            throw std::runtime_error("QK SINQ does not support row/tensor split modes; use --split-mode none with CUDA0 or CPU placement");
+        if (split_mode == LLAMA_SPLIT_MODE_ROW) {
+            throw std::runtime_error("QK SINQ does not support row split mode; use --split-mode tensor, layer or none");
         }
         for (int64_t i = 0; i < gguf_get_n_kv(ml.metadata); ++i) {
             if (std::string(gguf_get_key(ml.metadata, i)).find("prism.hadamard.") == 0) {
@@ -2209,7 +2228,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // by placement and share equal vectors; all-one diagonals are exact no-ops.
     struct sinq_cache_group {
         ggml_context_ptr ctx;
-        std::map<std::vector<ggml_fp16_t>,ggml_tensor *> tensors;
+        std::map<std::pair<std::string,std::vector<ggml_fp16_t>>,ggml_tensor *> tensors;
         std::vector<std::pair<ggml_tensor *,std::vector<float>>> values;
     };
     std::map<ggml_backend_buffer_type_t,sinq_cache_group> sinq_cache;
@@ -2257,12 +2276,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             group.ctx.reset(ggml_init({ggml_tensor_overhead()*(n_sinq_weights+1),nullptr,true}));
             if (!group.ctx) { throw std::runtime_error("cannot allocate QK SINQ runtime scale context"); }
         }
-        auto found = group.tensors.find(values);
+        // Equal diagonals can have different channel ownership in tensor mode.
+        // Keep a per-base cache there; other placements still share equal values.
+        const std::string owner = split_mode == LLAMA_SPLIT_MODE_TENSOR ? it->first->name : "";
+        auto key = std::make_pair(owner,std::move(values));
+        auto found = group.tensors.find(key);
         if (found == group.tensors.end()) {
             auto * cached = ggml_new_tensor_1d(group.ctx.get(),GGML_TYPE_F32,scale->ne[0]);
             ggml_format_name(cached,"%s.runtime_f32",scale->name);
             group.values.emplace_back(cached,std::move(promoted));
-            found = group.tensors.emplace(std::move(values),cached).first;
+            found = group.tensors.emplace(std::move(key),cached).first;
         }
         it->second = found->second;
         ++it;

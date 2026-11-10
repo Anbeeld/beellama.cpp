@@ -113,7 +113,9 @@ static void test_single_head_rotation(ggml_backend_dev_t simple, ggml_backend_de
     auto host = ggml_backend_dev_init(cpu, nullptr);
     CHECK(backend && host);
     const int64_t features = 64;
-    for (bool projection : {false, true}) {
+    for (int path : {0, 1, 2}) {
+    const bool projection = path == 1;
+    const bool reshape_store = path == 2;
     for (int64_t rotation : {int64_t(32), features}) {
     for (int64_t tokens : {int64_t(1), int64_t(3)}) {
         ggml_init_params params = {4*1024*1024, nullptr, true};
@@ -149,7 +151,10 @@ static void test_single_head_rotation(ggml_backend_dev_t simple, ggml_backend_de
         auto chunks = ggml_reshape_2d(ctx, activation, rotation, features*tokens/rotation);
         auto rotated = ggml_mul_mat(ctx, matrix, chunks);
         auto heads = ggml_reshape_3d(ctx, rotated, features, 1, tokens);
-        auto flat = ggml_view_2d(ctx, heads, features, tokens, heads->nb[2], 0);
+        // Single-token MTP K stores may arrive as a reshape with whole-rank
+        // ownership on axis 1, while the cache retains feature-axis 0.
+        auto flat = reshape_store ? ggml_reshape_2d(ctx, heads, features, tokens) :
+                                    ggml_view_2d(ctx, heads, features, tokens, heads->nb[2], 0);
         auto out = projection ? ggml_reshape_2d(ctx, heads, features, tokens) : ggml_set_rows(ctx, cache, flat, indices);
         auto graph = ggml_new_graph(ctx);
         ggml_build_forward_expand(graph, out);

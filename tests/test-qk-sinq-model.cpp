@@ -32,7 +32,7 @@ static std::string write_config(const std::filesystem::path & dir, double streng
 }
 static std::string logs;
 static void logger(ggml_log_level, const char * text, void *) { logs += text; }
-static void make_model(const std::string & path, const std::string & mode, bool incompatible_shape = false, int strip_width = 64, bool anisotropic = false) {
+static void make_model(const std::string & path, const std::string & mode, bool incompatible_shape = false, int strip_width = 64, bool anisotropic = false, bool hybrid = false) {
     ggml_context * ctx = ggml_init({64*ggml_tensor_overhead(),nullptr,true});
     gguf_context * file = gguf_init_empty();
     gguf_set_val_str(file,"general.architecture","qwen35");
@@ -43,6 +43,14 @@ static void make_model(const std::string & path, const std::string & mode, bool 
         {"full_attention_interval",1},{"ssm.conv_kernel",4},{"ssm.inner_size",128},{"ssm.state_size",128},{"ssm.time_step_rank",1},{"ssm.group_count",1},
     };
     for (const auto & kv : ints) { gguf_set_val_u32(file,(std::string("qwen35.")+kv.first).c_str(),kv.second); }
+    if (hybrid) {
+        gguf_set_val_u32(file,"qwen35.block_count",2);
+        gguf_set_val_u32(file,"qwen35.ssm.time_step_rank",8);
+        gguf_set_val_u32(file,"qwen35.ssm.group_count",4);
+        gguf_set_val_u32(file,"qwen35.ssm.inner_size",1024);
+        const bool recurrent[] = {false,true};
+        gguf_set_arr_data(file,"qwen35.attention.recurrent_layers",GGUF_TYPE_BOOL,recurrent,2);
+    }
     gguf_set_val_f32(file,"qwen35.attention.layer_norm_rms_epsilon",1.e-6f);
     uint32_t sections[] = {16,16,16,16};
     gguf_set_arr_data(file,"qwen35.rope.dimension_sections",GGUF_TYPE_UINT32,sections,4);
@@ -118,12 +126,133 @@ static void make_model(const std::string & path, const std::string & mode, bool 
     add("blk.0.attn_q.weight",256,512); add("blk.0.attn_k.weight",256,128); add("blk.0.attn_v.weight",256,128); add("blk.0.attn_output.weight",256,256);
     add("blk.0.attn_q_norm.weight",128,1,true); add("blk.0.attn_k_norm.weight",128,1,true);
     add("blk.0.ffn_gate.weight",256,512); add("blk.0.ffn_up.weight",incompatible_shape ? 96 : 256,512); add("blk.0.ffn_down.weight",512,256);
+    if (hybrid) {
+        add("blk.1.attn_norm.weight",256,1,true);
+        add("blk.1.post_attention_norm.weight",256,1,true);
+        add("blk.1.attn_qkv.weight",256,2048);
+        add("blk.1.attn_gate.weight",256,1024);
+        add("blk.1.ssm_conv1d.weight",4,2048);
+        add("blk.1.ssm_dt.bias",8,1);
+        add("blk.1.ssm_a",8,1);
+        add("blk.1.ssm_beta.weight",256,8);
+        add("blk.1.ssm_alpha.weight",256,8);
+        add("blk.1.ssm_norm.weight",128,1,true);
+        add("blk.1.ssm_out.weight",1024,256);
+        add("blk.1.ffn_gate.weight",256,512);
+        add("blk.1.ffn_up.weight",256,512);
+        add("blk.1.ffn_down.weight",512,256);
+    }
     check(gguf_write_to_file(file,path.c_str(),false),"fixture write");
     gguf_free(file); ggml_free(ctx);
 }
 static llama_model * load(const std::string & path, llama_split_mode split = LLAMA_SPLIT_MODE_NONE, bool check_tensors = true) {
     auto p = llama_model_default_params(); p.n_gpu_layers = 0; p.split_mode = split; p.check_tensors = check_tensors;
     logs.clear(); return llama_model_load_from_file(path.c_str(),p);
+}
+// Exercise real loading, runtime F32 caches and model graphs, not just a
+// synthetic scale split. CPU Meta ranks make this regression GPU-independent.
+static std::vector<float> forward_split(const std::string & path, ggml_backend_dev_t first,
+                                        ggml_backend_dev_t second, float a, float b) {
+    auto p = llama_model_default_params();
+    ggml_backend_dev_t devices[] = {first,second,nullptr};
+    std::vector<float> proportions(llama_max_devices(),0.f);
+    proportions[0] = a; proportions[1] = b;
+    p.devices = devices; p.n_gpu_layers = 99; p.load_mode = LLAMA_LOAD_MODE_NONE;
+    // Use the same native CPU codec path in the reference and Meta ranks;
+    // CPU_REPACK can choose different activation quantizers for small matrices.
+    p.use_extra_bufts = false;
+    p.split_mode = second ? LLAMA_SPLIT_MODE_TENSOR : LLAMA_SPLIT_MODE_NONE;
+    p.tensor_split = proportions.data();
+    std::fprintf(stderr,"SINQ forward: %s ranks=%d ratio=%g,%g\n",path.c_str(),second ? 2 : 1,a,b);
+    logs.clear();
+    auto * model = llama_model_load_from_file(path.c_str(),p);
+    if (!model) { std::fprintf(stderr,"%s",logs.c_str()); }
+    check(model != nullptr,"tensor split fixture load");
+    auto cp = llama_context_default_params();
+    cp.n_ctx = 128; cp.n_batch = 8; cp.n_ubatch = 8;
+    cp.n_threads = 2; cp.n_threads_batch = 2;
+    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    auto * ctx = llama_init_from_model(model,cp);
+    if (!ctx) { std::fprintf(stderr,"%s",logs.c_str()); }
+    check(ctx != nullptr,"tensor split fixture context");
+    std::vector<float> result;
+    auto batch = llama_batch_init(8,0,1);
+    const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    // Prefill followed by two decode steps and a second request after reset.
+    for (int request = 0; request < 2; ++request) {
+        llama_memory_clear(llama_get_memory(ctx),true);
+        int pos = 0;
+        for (int step = 0; step < 3; ++step) {
+            batch.n_tokens = step == 0 ? 4 : 1;
+            for (int i = 0; i < batch.n_tokens; ++i) {
+                batch.token[i] = 3 + (pos+i+request)%20;
+                batch.pos[i] = pos+i;
+                batch.n_seq_id[i] = 1; batch.seq_id[i][0] = 0;
+                batch.logits[i] = true;
+            }
+            check(llama_decode(ctx,batch) == 0,"tensor split fixture decode");
+            for (int i = 0; i < batch.n_tokens; ++i) {
+                const auto * logits = llama_get_logits_ith(ctx,i);
+                check(logits != nullptr,"tensor split fixture logits");
+                for (int j = 0; j < vocab; ++j) {
+                    check(std::isfinite(logits[j]),"nonfinite tensor split logits");
+                    result.push_back(logits[j]);
+                }
+            }
+            pos += batch.n_tokens;
+        }
+    }
+    llama_batch_free(batch); llama_free(ctx); llama_model_free(model);
+    return result;
+}
+static std::string equal_diagonal_fixture(const std::string & source) {
+    ggml_context * data = nullptr;
+    auto * file = gguf_init_from_file(source.c_str(),{false,&data});
+    check(file && data,"equal-diagonal fixture read");
+    auto * output = gguf_init_empty();
+    gguf_set_kv(output,file);
+    int changed = 0;
+    for (int64_t i = 0; i < gguf_get_n_tensors(file); ++i) {
+        const std::string name = gguf_get_tensor_name(file,i);
+        auto * tensor = ggml_get_tensor(data,name.c_str());
+        check(tensor && tensor->data,"equal-diagonal fixture tensor data");
+        gguf_add_tensor(output,tensor);
+        if (name.find(".sinq_scale2") == std::string::npos || tensor->ne[0] != 256) { continue; }
+        auto * values = static_cast<ggml_fp16_t *>(tensor->data);
+        for (int64_t j = 0; j < tensor->ne[0]; ++j) {
+            values[j] = ggml_fp32_to_fp16(.5f + float(j%7)/16.f);
+        }
+        ++changed;
+    }
+    check(changed >= 2,"equal-diagonal fixture must cover different projection layouts");
+    const auto path = source+".equal-diagonals.gguf";
+    check(gguf_write_to_file(output,path.c_str(),false),"equal-diagonal fixture write");
+    gguf_free(output); gguf_free(file); ggml_free(data);
+    return path;
+}
+static void tensor_split_roundtrip(const std::string & path) {
+    auto * cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    check(cpu != nullptr,"CPU tensor split test device");
+    const auto reference = forward_split(path,cpu,nullptr,1,0);
+    for (auto ratio : {std::make_pair(1.f,1.f),std::make_pair(3.f,1.f),
+                       std::make_pair(1.f,0.f),std::make_pair(0.f,1.f)}) {
+        const auto actual = forward_split(path,cpu,cpu,ratio.first,ratio.second);
+        check(actual.size() == reference.size(),"tensor split logits count");
+        // Native low-bit kernels need not be bit-exact across matrix shapes.
+        // The unconditioned stock controls exercise the same rounding. Use the
+        // model-level NMSE contract from llama-context/cases-rs.cpp; separate
+        // tensor-split projection tests check the tighter per-matmul contract.
+        double error = 0, norm = 0;
+        for (size_t i = 0; i < actual.size(); ++i) {
+            const double delta = double(actual[i])-reference[i];
+            error += delta*delta;
+            norm += double(reference[i])*reference[i];
+        }
+        check(norm > 0,"tensor split reference logits are degenerate");
+        std::printf("tensor split model logits NMSE=%g ratio=%g,%g\n",error/norm,ratio.first,ratio.second);
+        check(error/norm <= 1e-4,"tensor split model logits differ from unsplit CPU");
+    }
+    std::puts("SINQ model tensor split: prefill/decode/reset logits match unsplit CPU");
 }
 static std::string split_source(const std::string & source, const std::filesystem::path & dir, bool misplace_scale = false, bool unsupported_metadata = false) {
     ggml_context * data = nullptr;
@@ -606,6 +735,8 @@ int main(int argc, char ** argv) try {
     const auto source = (dir/"source.gguf").string(); make_model(source,"source");
     auto * ordinary = load(source); if (!ordinary) { std::fprintf(stderr,"%s",logs.c_str()); }
     check(ordinary != nullptr,"ordinary fixture load"); llama_model_free(ordinary);
+    const auto hybrid_source = (dir/"hybrid-source.gguf").string();
+    make_model(hybrid_source,"source",false,64,false,true);
     const llama_ftype formats[] = {LLAMA_FTYPE_MOSTLY_Q3_K_M,LLAMA_FTYPE_MOSTLY_Q4_K_M};
     for (auto format : formats) {
         const auto output = (dir/("quantized-"+std::to_string(format)+".gguf")).string();
@@ -621,6 +752,18 @@ int main(int argc, char ** argv) try {
         gguf_free(metadata);
         auto * model = load(output); if (!model) { std::fprintf(stderr,"%s",logs.c_str()); }
         check(model != nullptr,"QK companion fixture load"); llama_model_free(model);
+        const auto hybrid_output = output+".hybrid.gguf";
+        check(llama_model_quantize(hybrid_source.c_str(),hybrid_output.c_str(),&p) == 0,
+              "hybrid SINQ fixture quantization");
+        const auto hybrid_stock = output+".hybrid-stock.gguf";
+        p.sinq_config = nullptr;
+        check(llama_model_quantize(hybrid_source.c_str(),hybrid_stock.c_str(),&p) == 0,"hybrid stock quantization");
+        tensor_split_roundtrip(hybrid_stock);
+        p.sinq_config = config.c_str();
+        tensor_split_roundtrip(hybrid_output);
+        // Deliberately equal scales on input- and output-channel projections
+        // must not be deduplicated into one differently sharded runtime vector.
+        tensor_split_roundtrip(equal_diagonal_fixture(hybrid_output));
         const auto chunked = output+".chunked.gguf";
         p.max_buf_size = 4096;
         check(llama_model_quantize(source.c_str(),chunked.c_str(),&p) == 0,"small-slab quantization");
@@ -789,7 +932,7 @@ int main(int argc, char ** argv) try {
     check(!misplaced_model && logs.find("same GGUF shard") != std::string::npos,"cross-shard companion must fail closed");
     auto * split = load(valid,LLAMA_SPLIT_MODE_ROW);
     if (split) { llama_model_free(split); }
-    check(!split && logs.find("QK SINQ does not support row/tensor split") != std::string::npos,"row split must fail closed");
+    check(!split && logs.find("QK SINQ does not support row split") != std::string::npos,"row split must fail closed");
     if (auto * cuda = ggml_backend_dev_by_name("CUDA0")) {
         auto override_params = llama_model_default_params();
         override_params.n_gpu_layers = 99;
