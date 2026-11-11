@@ -235,7 +235,7 @@ static __device__ __forceinline__ void ggml_cuda_fattn_kvarn_decode_unpack2(
 // стоит только лишнего аккумулятора. Порядок суммирования внутри каждой
 // строки не меняется, поэтому результат побитово тот же.
 template<int D, int MAX_GQA, int SPLIT_TOKENS, int NWARPS, int K_BITS, int V_BITS, int Q_TILE = 1>
-__launch_bounds__(NWARPS * 32, ggml_cuda_fattn_kvarn_decode_min_blocks<D, NWARPS>())
+__launch_bounds__(NWARPS * 32, (ggml_cuda_fattn_kvarn_decode_min_blocks<D, NWARPS>()))
 static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
         const char * Q,
         const ggml_cuda_fattn_kvarn_desc * k_descs,
