@@ -619,9 +619,18 @@ static bool ggml_cuda_flash_attn_ext_kvarn_vec_d(
     const int gqa_ratio = n_q_heads / plan.n_kv_heads;
     constexpr int gqa_per_block = ggml_cuda_fattn_kvarn_vec_max_gqa<D>();
     const int n_gqa_blocks = (gqa_ratio + gqa_per_block - 1) / gqa_per_block;
-    const int split_tokens = ggml_cuda_fattn_kvarn_vec_tokens_per_split();
-    ggml_cuda_kvarn_record_geometry(split_tokens, 1,
-        UINT64_C(0x2)); // bit 1 represents the retained 16-token geometry
+    int split_tokens = 0;
+#define GGML_CUDA_FATTN_KVARN_VEC_SELECT(K_BITS, V_BITS) \
+    split_tokens = ggml_cuda_fattn_kvarn_vec_select<D, K_BITS, V_BITS>( \
+        ctx.device, plan.n_kv, plan.n_kv_heads * n_gqa_blocks, plan.n_stream)
+    GGML_CUDA_FATTN_KVARN_FAST_DECODE_DISPATCH_K(GGML_CUDA_FATTN_KVARN_VEC_SELECT);
+#undef GGML_CUDA_FATTN_KVARN_VEC_SELECT
+    if (split_tokens == 0) {
+        return false;
+    }
+    const bool forced = ggml_cuda_fattn_kvarn_vec_tokens_per_split() != 0;
+    ggml_cuda_kvarn_record_geometry(split_tokens, forced ? 1 : 3,
+        forced ? (UINT64_C(1) << (split_tokens == 8 ? 0 : split_tokens == 16 ? 1 : 2)) : UINT64_C(0x7));
     const int n_splits = (plan.n_kv + split_tokens - 1) / split_tokens;
     float scale = 1.0f;
     float logit_softcap = 0.0f;

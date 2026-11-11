@@ -4,28 +4,27 @@
 #include "fattn-common.cuh"
 #include "fattn-mma-kvarn-load.cuh"
 #include "mma.cuh"
+#include "fattn-mma-f16.cuh"
+#include "fattn-kvarn-geometry-policy.h"
 
 using namespace ggml_cuda_mma;
 
 static constexpr int GGML_CUDA_FATTN_KVARN_DECODE_THREADS = 256;
 
-// Сколько блоков на мультипроцессор требовать от компилятора. Ядро упирается в
-// регистры, а не в shared и не в нити: замер на sm_86 (cuobjdump) для нашей
-// формы D=256, MAX_GQA=6, NWARPS=8, k5/v5 даёт REG:80 SHARED:12864 при 256
-// нитях, то есть 65536/(80*256) = 3 блока против 7 по shared и 6 по нитям.
-// Три блока по восемь варпов — 24 варпа из 48, ровно половина занятости.
-//
-// Авторы оригинальной KVarN пришли к тому же диагнозу (упор в пропускную
-// способность L1/TEX при занятости, ограниченной регистрами) и лечили его не
-// конвейеризацией, а наоборот — потолком на регистры ради большего числа
-// резидентных блоков: у них это дало -27% времени ядра и +7..8% сквозной
-// скорости. Здесь тот же приём: 4 блока требуют уложиться в 64 регистра.
-//
-// На численный результат не влияет: распределение регистров не меняет ни
-// набор операций, ни их порядок. Возможные спиллы в локальную память точны.
-#ifndef GGML_CUDA_FATTN_KVARN_DECODE_MIN_BLOCKS
-#define GGML_CUDA_FATTN_KVARN_DECODE_MIN_BLOCKS 4
+// Preserve the measured sm86 compiler policy only on that architecture.
+// Other targets inherit the upstream MMA occupancy target for this head width;
+// runtime selection still queries occupancy of the actual KVarN specialization.
+template<int D, int NWARPS>
+static constexpr __device__ int ggml_cuda_fattn_kvarn_decode_min_blocks() {
+#ifdef GGML_CUDA_FATTN_KVARN_DECODE_MIN_BLOCKS
+    return GGML_CUDA_FATTN_KVARN_DECODE_MIN_BLOCKS;
+#elif defined(__CUDA_ARCH__)
+    return ggml_cuda_kvarn_min_blocks(__CUDA_ARCH__, NWARPS * 32,
+        ggml_cuda_fattn_mma_get_config(D, D, 8).occupancy);
+#else
+    return ggml_cuda_fattn_mma_get_config(D, D, 8).occupancy;
 #endif
+}
 static constexpr int GGML_CUDA_FATTN_KVARN_DECODE_CHUNK   = 16;
 
 static __device__ __forceinline__ bool ggml_cuda_fattn_kvarn_decode_group_from_record(
@@ -236,12 +235,7 @@ static __device__ __forceinline__ void ggml_cuda_fattn_kvarn_decode_unpack2(
 // стоит только лишнего аккумулятора. Порядок суммирования внутри каждой
 // строки не меняется, поэтому результат побитово тот же.
 template<int D, int MAX_GQA, int SPLIT_TOKENS, int NWARPS, int K_BITS, int V_BITS, int Q_TILE = 1>
-// Потолок нитей на мультипроцессор у sm_86 равен 1536, поэтому требовать четыре
-// блока можно только пока NWARPS*32*4 в него укладывается. При NWARPS=16 это 2048,
-// и ptxas молча игнорирует указание целиком — берём максимум допустимого.
-__launch_bounds__(NWARPS * 32,
-    (1536 / (NWARPS * 32)) < GGML_CUDA_FATTN_KVARN_DECODE_MIN_BLOCKS ?
-        (1536 / (NWARPS * 32)) : GGML_CUDA_FATTN_KVARN_DECODE_MIN_BLOCKS)
+__launch_bounds__(NWARPS * 32, ggml_cuda_fattn_kvarn_decode_min_blocks<D, NWARPS>())
 static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
         const char * Q,
         const ggml_cuda_fattn_kvarn_desc * k_descs,
@@ -962,18 +956,6 @@ static void ggml_cuda_fattn_kvarn_decode_consider(
             MAX_GQA != only_gqa)) {
         return;
     }
-    // On RTX 3090, split-64 is 1.8% faster at 16K for a single query, while
-    // split-128 is 0.6% faster at 32K and 4.5% faster at 64K. Multi-query
-    // verification keeps split-128 at shorter depths because it enables query
-    // tiling and avoids duplicated partial-output traffic.
-    if constexpr (SPLIT_TOKENS == 128) {
-        // A D128 CTA can assign its eight warps to both halves of the record;
-        // wider heads keep the measured deep-context crossover.
-        if (n_q == 1 && ((D == 128 && n_kv < 4096) ||
-                (D != 128 && n_kv < 32768))) {
-            return;
-        }
-    }
     const int gqa_ratio = n_q_heads / n_kv_heads;
     const int n_splits = ggml_cuda_fattn_kvarn_decode_div_up_i64(n_kv, SPLIT_TOKENS);
     const int n_gqa_blocks = ggml_cuda_fattn_kvarn_decode_div_up_i64(gqa_ratio, MAX_GQA);
@@ -997,89 +979,20 @@ static void ggml_cuda_fattn_kvarn_decode_consider(
     const int wave_efficiency_percent =
         ggml_cuda_fattn_kvarn_decode_wave_efficiency_percent(blocks_total, blocks_per_wave, &n_waves);
 
-    // Upstream queries actual occupancy, then scores wave efficiency inside one kernel family.
-    // KVarN is choosing between different CTA shapes; when split/combine work is equal, the
-    // occupancy result is the architectural signal, and wave efficiency is secondary.
-    // Вес эффективности волны зависит от того, сколько волн вообще будет.
-    //
-    // Прежняя постоянная 10000 делала четыре процентных пункта эффективности
-    // дороже, чем двукратное сокращение числа сплитов, и геометрия на 64 токена
-    // выигрывала всегда:
-    //
-    //   n_kv=65024: split=64  волн=25 эффективность=99% оценка=4987984
-    //               split=128 волн=13 эффективность=95% оценка=4948492
-    //
-    // Замер показывает обратное: принудительный сплит 128 даёт 29.70 против
-    // 28.36 tok/s на одном слоте, то есть +4.7% при побитово том же выводе.
-    // Причина в том, что у блока есть постоянная цена — загрузка Q, осей,
-    // последовательный расчёт zq, барьеры подготовки, — и она не зависит от
-    // длины сплита. Вдвое меньше блоков означает вдвое меньше этой цены.
-    //
-    // Потеря на хвосте последней волны стоит своего веса только когда волн
-    // мало: при десятке волн недогруз последней размазан по всем и почти ничего
-    // не стоит. Порог в четыре волны отделяет «параллелизма с запасом» от «его в
-    // обрез».
-    //
-    // Вес подобран по ЗАМЕРЕННЫМ значениям, а не по предполагаемым. Отладка
-    // маршрутов на реальной нагрузке (n_kv=65024, один слот, D=256, k5/v5):
-    //
-    //   сплит  64: сплитов 1016, блоков на SM 4, эффективность 95%, волн 13
-    //   сплит 128: сплитов  508, блоков на SM 4, эффективность 88%, волн  7
-    //
-    // Разрыв по эффективности семь пунктов, поэтому при весе 100 выигрывал
-    // сплит 64 с перевесом 192 — а замер показывает обратное: 32.51 против
-    // 31.00 tok/s в пользу 128. То есть эффективность волны была переоценена
-    // как минимум в этом отношении. При весе 10 сплит 128 побеждает на всех
-    // глубинах от 40 тысяч до 130 тысяч и при одном и при двух слотах, с
-    // перевесом не меньше 312.
-    //
-    // Осторожно: 100 давало верный ответ почти везде и ошибалось лишь в узком
-    // окне около n_kv=65024 при одном слоте. Проверять такие пороги надо
-    // отладкой маршрутов на реальной нагрузке, а не подстановкой в формулу:
-    // именно подстановка предполагаемого числа блоков (8 вместо истинных 4)
-    // и увела оценку.
-    // ОЦЕНКА КАНДИДАТА. Прежняя ставила первым слагаемым число резидентных
-    // блоков с весом миллион, а эффективность волны и число сплитов — мелкими
-    // поправками. Это оказалось неверной моделью, и вот на каких замерах она
-    // сломалась (глубина 60000, D=256, kvarn5, MTP n_max 2):
-    //
-    //   тайл 1, сплит 128: блоков на SM 4, волн 18 -> 46.90 tok/s
-    //   тайл 2, сплит 128: блоков на SM 4, волн 12 -> 49.84
-    //   тайл 3, сплит 128: блоков на SM 3, волн  8 -> 53.42
-    //
-    // Тайл на три строки ЛУЧШИЙ, хотя резидентных блоков у него меньше. Прежняя
-    // оценка отвергла бы его: штраф за блок (миллион) перевешивал любую премию.
-    //
-    // Верная величина — число волн. Оно уже содержит в себе и занятость, и
-    // число блоков: waves = blocks_total / (nsm * blocks_per_sm), а blocks_total
-    // падает вместе с шириной тайла. Время ядра пропорционально волнам, и это
-    // подтверждается: 18 / 12 / 8 волн против 46.90 / 49.84 / 53.42 tok/s при
-    // доле внимания около четверти шага.
-    //
-    // Одних волн, однако, мало. Буфер частичных сумм имеет размер
-    // n_splits * n_q * n_q_heads * D, то есть пропорционален числу сплитов, и
-    // его запись плюс чтение объединяющим ядром — настоящий трафик памяти.
-    // Замер при РАВНЫХ волнах (12 против 12, n_q = 2): сплит 128 даёт 46.14,
-    // сплит 64 при том же числе волн — 27.58. Разница целиком в этом буфере.
-    // Поэтому число сплитов входит отдельным штрафом.
-    //
-    // Вес штрафа выбран осторожно: 4000 за сплит означает, что удвоение числа
-    // сплитов при n_kv=60000 стоит примерно двух волн. Замер говорит, что стоит
-    // больше, но направление важнее величины, а заниженный вес безопаснее.
-    //
-    // Проверка формулы на всех имеющихся замерах:
-    //   n_q=1: сплит 64 (волн 13, сплитов 1016) против 128 (волн 7, сплитов 508)
-    //          -> 128 выигрывает; замер: 32.51 против 31.00 в пользу 128. Верно.
-    //   n_q=2: тайл1/128 (волн 12, сплитов 470) против тайл2/64 (волн 12, 938)
-    //          -> 128 выигрывает; замер: 46.14 против 27.58. Верно.
-    //   n_q=3: тайл3 (волн 8) > тайл2 (волн 12) > тайл1 (волн 18). Верно.
-    const int64_t score =
-        - (int64_t) n_waves * 1000000
-        - (int64_t) n_splits * 4000
-        + (int64_t) wave_efficiency_percent * 100
-        - (int64_t) n_gqa_blocks * 10;
-
-    if (score > best_score) {
+    // Unlike upstream's same-kernel split search, candidates here have
+    // different tile loops. Rank their structural work using actual resident
+    // capacity, then prefer less partial-output/combine traffic on ties.
+    const int64_t score = -ggml_cuda_kvarn_geometry_work(
+        n_waves, SPLIT_TOKENS, D, NWARPS, n_gqa_blocks);
+    const int64_t best_blocks_total = best.use_split ?
+        (int64_t) best.n_splits * n_kv_heads * best.n_gqa_blocks *
+            ggml_cuda_fattn_kvarn_decode_div_up_i64(n_q, best.q_tile) * n_stream : 0;
+    const bool populated = blocks_total >= 2LL * blocks_per_wave;
+    const bool best_populated = best_blocks_total >= 2LL * nsm * best.max_blocks_per_sm;
+    if (!best.use_split || ggml_cuda_kvarn_geometry_better(
+            -score, -best_score, n_splits, best.n_splits,
+            wave_efficiency_percent, best.wave_efficiency_percent,
+            populated, best_populated)) {
         best_score = score;
         best.use_split = true;
         best.split_tokens = SPLIT_TOKENS;

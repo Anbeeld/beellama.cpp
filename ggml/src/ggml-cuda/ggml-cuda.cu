@@ -5205,19 +5205,6 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
-            // HIP-only: skip the graph path (incl. the update_required probe) for
-            // multi-token (prefill) graphs. Final-tree A/B (27B Q5_K_S, kvarn6,
-            // pp512, gfx1100: gate on 466.5 vs gate off 465.4-467.5) shows no
-            // measurable difference, so this is currently perf-neutral; the
-            // earlier ~6.7% dev-tree reading did not reproduce and is scheduled
-            // for investigation. Decode (ne[1]==1, stable shape) keeps replay.
-#if defined(GGML_USE_HIP)
-            if (cgraph->n_nodes > 0 && cgraph->nodes[0]->ne[1] > 1) {
-                use_cuda_graph = false;
-            } else {
-#else
-            {
-#endif
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
             if (!graph->warmup_complete) {
@@ -5244,7 +5231,6 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     cuda_graph_update_required = graph->instances.empty();
                 }
             }
-            } // else: not prefill
         }
     }
 #endif // USE_CUDA_GRAPH

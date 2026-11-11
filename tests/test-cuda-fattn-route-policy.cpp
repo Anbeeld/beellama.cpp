@@ -324,8 +324,10 @@ int main(int argc, char ** argv) {
     ok &= expect(d128_decode.find("decode_consider<D, 2, 128, 8") != std::string::npos &&
                  d128_decode.find("decode_consider<D, 4, 128, 8") != std::string::npos,
         "D128 split decode must offer parallel split-128 CTA shapes");
-    ok &= expect(kvarn_decode.find("D == 128 && n_kv < 4096") != std::string::npos,
-        "D128 split-128 must retain split-64 for the measured shallow-context crossover");
+    ok &= expect(kvarn_decode.find("n_kv < 4096") == std::string::npos &&
+                 kvarn_decode.find("n_kv < 32768") == std::string::npos &&
+                 kvarn_decode.find("ggml_cuda_kvarn_geometry_work") != std::string::npos,
+        "split candidates must use device occupancy and structural work instead of fixed context gates");
     ok &= expect(kvarn_decode.find("D == 128 && SPLIT_TOKENS == 128") != std::string::npos &&
                  count_occurrences(kvarn_decode, "STAGE_PAYLOAD ?") >= 3,
         "D128 split-128 must cooperatively stage packed K/V records");
@@ -337,6 +339,14 @@ int main(int argc, char ** argv) {
                  kvarn_dispatch.find("ggml_cuda_fattn_kvarn_device_capabilities") != std::string::npos &&
                  kvarn_dispatch.find("GGML_KVARN_TEST_FORCE_PORTABLE_FATTN") != std::string::npos,
         "HIP and CUDA must share capability-driven KVarN routing with a forced-portable override");
+    const std::string graph_compute = slice_between(cuda_backend,
+            "static enum ggml_status ggml_backend_cuda_graph_compute(",
+            "if (use_cuda_graph && cuda_graph_update_required)");
+    ok &= expect(graph_compute.find("cgraph->nodes[0]->ne[1] > 1") == std::string::npos &&
+                 graph_compute.find("ggml_cuda_graph_check_compability(cgraph)") != std::string::npos &&
+                 graph_compute.find("ggml_cuda_graph_update_required(cuda_ctx, cgraph)") != std::string::npos &&
+                 graph_compute.find("graph->warmup_complete = false") != std::string::npos,
+        "HIP prefill must use compatibility and stable-property warmup, not a blanket query-count bypass");
     const std::string cuda_native_ops = slice_between(cuda_backend,
             "static bool ggml_backend_cuda_kvarn_native_ops(",
             "static bool ggml_backend_cuda_kvarn_native_original_v(");
