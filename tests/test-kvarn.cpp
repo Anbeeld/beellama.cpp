@@ -6184,6 +6184,10 @@ static void test_headwide_multistream_store() {
                     }
                     const std::vector<uint8_t> hinted = test_headwide_multistream_store_snapshot(
                             backend, head_dim, value, swa, cases[c], interleaved, true, decode);
+                    if (hinted != serial) {
+                        std::fprintf(stderr, "headwide parity: D=%d value=%d swa=%d decode=%d case=%zu interleaved=%d\n",
+                                head_dim, int(value), int(swa), int(decode), c, int(interleaved));
+                    }
                     require(hinted == serial,
                             "hinted multistream headwide store stage/record bytes differ from serial route");
                     if (cuda) {

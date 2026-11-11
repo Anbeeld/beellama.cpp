@@ -7660,13 +7660,17 @@ static void ggml_vk_kvarn_wht(
         GGML_ASSERT(src->type == GGML_TYPE_F32);
     }
 
-    vk_pipeline pipeline = ggml_vk_device_bee_pipelines(ctx->device).pipeline_kvarn_wht;
-    if (head_width == 256 &&
+    const bool prefer_full_head = ggml_vk_kvarn_wht_full_head_preferred(
+        ctx->device->vendor_id == VK_VENDOR_ID_NVIDIA,
+        uint32_t(head_width), ctx->device->subgroup_size);
+    const auto & pipelines = ggml_vk_device_bee_pipelines(ctx->device);
+    vk_pipeline pipeline = pipelines.pipeline_kvarn_wht;
+    if (prefer_full_head && head_width == 256 &&
             ctx->device->properties.limits.maxComputeWorkGroupInvocations >= 256) {
-        pipeline = ggml_vk_device_bee_pipelines(ctx->device).pipeline_kvarn_wht_d256;
-    } else if (head_width == 512 &&
+        pipeline = pipelines.pipeline_kvarn_wht_d256;
+    } else if (prefer_full_head && head_width == 512 &&
             ctx->device->properties.limits.maxComputeWorkGroupInvocations >= 512) {
-        pipeline = ggml_vk_device_bee_pipelines(ctx->device).pipeline_kvarn_wht_d512;
+        pipeline = pipelines.pipeline_kvarn_wht_d512;
     }
     GGML_ASSERT(pipeline != nullptr);
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
@@ -7690,6 +7694,7 @@ struct ggml_vk_kvarn_store_workspace_plan {
 };
 
 static ggml_vk_kvarn_store_workspace_plan ggml_vk_kvarn_store_workspace_plan_for(
+        const vk_device & device,
         const ggml_tensor * dst,
         size_t alignment,
         bool reserve_worst_case = false) {
@@ -7720,9 +7725,13 @@ static ggml_vk_kvarn_store_workspace_plan ggml_vk_kvarn_store_workspace_plan_for
     const int active_streams =
         hint_well_formed ? n_tokens / tokens_per_stream_hint : 0;
     const bool runtime_workspace =
-        hint_well_formed &&
-        tokens_per_stream_hint >= 3 * KVAR_N_GROUP &&
+        hint_well_formed && tokens_per_stream_hint > KVAR_N_GROUP &&
         active_streams > 0 && active_streams <= n_stream &&
+        ggml_vk_kvarn_store_parallel_preferred(
+            uint32_t(tokens_per_stream_hint), uint32_t(current->ne[1] / head_slices),
+            uint32_t(active_streams), ggml_vk_kvarn_shader_core_count(
+                device->shader_core_count, device->vendor_id == VK_VENDOR_ID_INTEL,
+                device->architecture == INTEL_XE2)) &&
         (!swa || (n_stream == 1 &&
                   tokens_per_stream_hint <= groups_per_stream * KVAR_N_GROUP));
     // Synthetic reserve graphs do not carry real cache slot indices, so their
@@ -7732,7 +7741,7 @@ static ggml_vk_kvarn_store_workspace_plan ggml_vk_kvarn_store_workspace_plan_for
     // remains shared with the runtime planner below.
     const bool reserve_workspace =
         reserve_worst_case &&
-        n_tokens >= 3 * KVAR_N_GROUP &&
+        n_tokens > KVAR_N_GROUP &&
         (!swa || (n_stream == 1 &&
                   n_tokens <= groups_per_stream * KVAR_N_GROUP));
     const bool use_workspace = runtime_workspace || reserve_workspace;
@@ -7792,7 +7801,7 @@ static void ggml_vk_kvarn_store(ggml_backend_vk_context * ctx, vk_context& subct
     GGML_ASSERT(records->ne[2] % n_stream == 0);
     const int groups_per_stream = (int) (records->ne[2] / n_stream);
     const auto workspace = ggml_vk_kvarn_store_workspace_plan_for(
-        dst, size_t(ctx->device->properties.limits.minStorageBufferOffsetAlignment));
+        ctx->device, dst, size_t(ctx->device->properties.limits.minStorageBufferOffsetAlignment));
 
     vk_op_kvarn_store_push_constants pc = {
         (uint32_t) current->ne[1],
@@ -9170,7 +9179,9 @@ static size_t ggml_vk_kvarn_attention_split_workspace_size(
         uint32_t(q->ne[2]),
         uint32_t(dst->src[1]->ne[2]),
         uint32_t(q->ne[3]),
-        device->shader_core_count ? device->shader_core_count : 16u,
+        ggml_vk_kvarn_shader_core_count(
+            device->shader_core_count, device->vendor_id == VK_VENDOR_ID_INTEL,
+            device->architecture == INTEL_XE2),
     });
     if (route.split_k <= 1) {
         return 0;
@@ -9286,7 +9297,9 @@ static bool ggml_vk_flash_attn_kvarn(
         n_query_heads,
         n_kv_heads,
         uint32_t(q->ne[3]),
-        ctx->device->shader_core_count ? ctx->device->shader_core_count : 16u,
+        ggml_vk_kvarn_shader_core_count(
+            ctx->device->shader_core_count, ctx->device->vendor_id == VK_VENDOR_ID_INTEL,
+            ctx->device->architecture == INTEL_XE2),
     });
 
     const vk_subbuffer q_buf = ggml_vk_tensor_subbuffer(ctx, q);
@@ -18267,7 +18280,7 @@ static size_t ggml_backend_vk_kvarn_workspace_y_size(
     switch (op->op) {
         case GGML_OP_KVARN_STORE:
             return ggml_vk_kvarn_store_workspace_plan_for(
-                op, size_t(device->properties.limits.minStorageBufferOffsetAlignment), true).size;
+                device, op, size_t(device->properties.limits.minStorageBufferOffsetAlignment), true).size;
         case GGML_OP_KVARN_MATERIALIZE:
             return ggml_vk_kvarn_materialize_workspace_size(op);
         default:
