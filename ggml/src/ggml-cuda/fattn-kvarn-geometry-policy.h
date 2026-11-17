@@ -43,11 +43,23 @@ inline bool ggml_cuda_kvarn_geometry_better(
 }
 
 // Launch bounds are a compiler resource policy, not measured occupancy. Keep
-// the qualified sm_86 register target there; elsewhere use the upstream MMA
-// configuration's architecture-specific target instead of assuming 1536 threads.
+// the sm_86/sm_120 four-block register target on architectures with the same
+// 1536-thread SM ceiling and 64K-register budget (CUDA Programming Guide,
+// compute-capability tables). Cap it for wider CTAs; other architectures keep
+// the upstream MMA configuration's target. See docs/gpu-dispatch.md.
 #if defined(__CUDACC__) || defined(__HIPCC__)
 __host__ __device__
 #endif
 constexpr int ggml_cuda_kvarn_min_blocks(int cc, int nthreads, int upstream_target) {
-    return cc == 860 ? (1536 / nthreads < 4 ? 1536 / nthreads : 4) : upstream_target;
+    switch (cc) {
+        case 860:
+        case 870:
+        case 890:
+        case 1100:
+        case 1200:
+        case 1210:
+            return 1536 / nthreads < 4 ? 1536 / nthreads : 4;
+        default:
+            return upstream_target;
+    }
 }

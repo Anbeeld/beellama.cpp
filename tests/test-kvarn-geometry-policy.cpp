@@ -1,16 +1,27 @@
 #include "../ggml/src/ggml-cuda/fattn-kvarn-geometry-policy.h"
 #include <cstdio>
 #include <cstdlib>
+#include <initializer_list>
 
 static void require(bool ok, const char * message) {
     if (!ok) { std::fprintf(stderr, "%s\n", message); std::exit(1); }
 }
 
 int main() {
-    require(ggml_cuda_kvarn_min_blocks(860, 256, 2) == 4, "preserve qualified sm86 register target");
-    require(ggml_cuda_kvarn_min_blocks(860, 512, 2) == 3, "sm86 512-thread bound must be feasible");
-    require(ggml_cuda_kvarn_min_blocks(800, 256, 2) == 2, "sm80 uses upstream target");
-    require(ggml_cuda_kvarn_min_blocks(890, 256, 2) == 2, "Ada uses upstream target, not sm86 target");
+    for (int cc : { 860, 870, 890, 1100, 1200, 1210 }) {
+        require(ggml_cuda_kvarn_min_blocks(cc, 256, 2) == 4,
+                "1536-thread SMs preserve the four-block register target");
+        require(ggml_cuda_kvarn_min_blocks(cc, 512, 2) == 3,
+                "512-thread bound must fit the 1536-thread ceiling");
+        require(ggml_cuda_kvarn_min_blocks(cc, 1024, 2) == 1,
+                "1024-thread bound must fit the 1536-thread ceiling");
+    }
+    for (int cc : { 750, 800, 880, 900, 1000, 1030, 0, 1300, 1000000 }) {
+        require(ggml_cuda_kvarn_min_blocks(cc, 256, 2) == 2,
+                "other and unknown architectures retain the upstream target");
+        require(ggml_cuda_kvarn_min_blocks(cc, 512, 1) == 1,
+                "fallback preserves the head-specific upstream target");
+    }
     require(ggml_cuda_kvarn_geometry_work(1, 64, 256, 8, 1) <
             ggml_cuda_kvarn_geometry_work(1, 128, 256, 8, 1), "equal waves favor less work");
     require(ggml_cuda_kvarn_geometry_work(8, 64, 256, 8, 1) >

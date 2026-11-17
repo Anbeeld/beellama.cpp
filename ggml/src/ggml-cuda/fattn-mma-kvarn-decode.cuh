@@ -11,7 +11,7 @@ using namespace ggml_cuda_mma;
 
 static constexpr int GGML_CUDA_FATTN_KVARN_DECODE_THREADS = 256;
 
-// Preserve the measured sm86 compiler policy only on that architecture.
+// Preserve the sm86/sm120 compiler policy on the matching 1536-thread SMs.
 // Other targets inherit the upstream MMA occupancy target for this head width;
 // runtime selection still queries occupancy of the actual KVarN specialization.
 template<int D, int NWARPS>

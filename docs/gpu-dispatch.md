@@ -34,11 +34,18 @@ not change this path's KV partition/summation order.
 
 ## Compiler resource policy
 
-The qualified sm_86 four-block register target, capped by its 1536-thread limit,
-is scoped to code compiled for sm_86. Other compiled architectures use the
-upstream MMA configuration's occupancy target for the head width rather than
-inheriting that thread budget. Runtime selection still queries occupancy of the
-actual KVarN kernel; the compiler target is not a promise of resident occupancy.
+The four-block register target applies to code compiled for sm_86, sm_87,
+sm_89, sm_110, sm_120 and sm_121. These architectures share a 1536-thread SM
+ceiling and 64K 32-bit registers per SM, per NVIDIA's
+[CUDA 13.3.1 compute-capability tables 30 and 31](https://docs.nvidia.com/cuda/archive/13.3.1/cuda-programming-guide/05-appendices/compute-capabilities.html#features-and-technical-specifications).
+The target is capped at `1536 / threads_per_block`: four blocks for 256-thread
+CTAs, three for 512-thread CTAs. The sm_86 policy and
+[reported sm_120 regression and retest](https://github.com/Anbeeld/beellama.cpp/issues/183#issuecomment-6882953769)
+support this choice; extending it to the resource-matched architectures is not
+a measured performance claim for those devices. Other compiled architectures,
+including unknown capabilities, retain the upstream MMA configuration's target
+for the head width. Runtime selection still queries occupancy of the actual
+KVarN kernel; the compiler target is not a promise of resident occupancy.
 A binary compiled only for sm_86 retains that compiled policy when JIT-compatible
 on another GPU, so native/multi-architecture builds remain preferable for tuning.
 
