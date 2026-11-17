@@ -1,0 +1,81 @@
+name: Build with ccache checkpoints
+description: Run up to three compilation slices, saving rolling ccache only after compiler processes stop.
+inputs:
+  command:
+    description: Shell script ending in cache-build-deadline.py and the original incremental build command.
+    required: true
+  verify-command:
+    description: Optional build validation or runtime staging, run only after completed compilation and before the final save.
+    required: false
+    default: ""
+  shell:
+    description: Shell for the build command (bash, cmd, or pwsh).
+    required: true
+  key:
+    description: Exact rolling ccache key to replace.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Compilation slice 1
+      id: slice1
+      shell: ${{ inputs.shell }}
+      run: ${{ inputs.command }}
+
+    - name: Verify completed build 1
+      if: ${{ inputs.verify-command != '' && steps.slice1.outputs.checkpoint == 'false' }}
+      shell: ${{ inputs.shell }}
+      run: ${{ inputs.verify-command }}
+
+    - name: Save ccache 1
+      if: ${{ success() && !cancelled() }}
+      uses: ./.ci-workflow/.github/actions/save-rolling-ccache
+      with:
+        key: ${{ inputs.key }}
+        ref: refs/heads/main
+        evict-old-files: 1d
+
+    - name: Compilation slice 2
+      id: slice2
+      if: ${{ steps.slice1.outputs.checkpoint == 'true' }}
+      shell: ${{ inputs.shell }}
+      run: ${{ inputs.command }}
+
+    - name: Verify completed build 2
+      if: ${{ inputs.verify-command != '' && steps.slice2.outputs.checkpoint == 'false' }}
+      shell: ${{ inputs.shell }}
+      run: ${{ inputs.verify-command }}
+
+    - name: Save ccache 2
+      if: ${{ success() && !cancelled() && steps.slice1.outputs.checkpoint == 'true' }}
+      uses: ./.ci-workflow/.github/actions/save-rolling-ccache
+      with:
+        key: ${{ inputs.key }}
+        ref: refs/heads/main
+        evict-old-files: 1d
+
+    - name: Compilation slice 3
+      id: slice3
+      if: ${{ steps.slice2.outputs.checkpoint == 'true' }}
+      shell: ${{ inputs.shell }}
+      run: ${{ inputs.command }}
+
+    - name: Verify completed build 3
+      if: ${{ inputs.verify-command != '' && steps.slice3.outputs.checkpoint == 'false' }}
+      shell: ${{ inputs.shell }}
+      run: ${{ inputs.verify-command }}
+
+    - name: Save ccache 3
+      if: ${{ success() && !cancelled() && steps.slice2.outputs.checkpoint == 'true' }}
+      uses: ./.ci-workflow/.github/actions/save-rolling-ccache
+      with:
+        key: ${{ inputs.key }}
+        ref: refs/heads/main
+        evict-old-files: 1d
+
+    - name: Report incomplete build
+      if: ${{ steps.slice3.outputs.checkpoint == 'true' }}
+      shell: bash
+      run: |
+        echo "::error title=Incomplete build::BEELLAMA_BUILD_INCOMPLETE: three compilation checkpoints saved; build not finished."
+        exit 1

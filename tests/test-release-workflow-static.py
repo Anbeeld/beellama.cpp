@@ -112,13 +112,13 @@ def main() -> None:
         "release metadata must bind the v* version to CMakeLists.txt at source_sha",
     )
     require(
-        release.count('cuda: "13.3"') == 2 and "13.1" not in release,
-        "release CUDA 13 lanes must use CUDA 13.3",
+        release.count('cuda: "13.5"') == 2 and release.count('cuda: "12.8"') == 2,
+        "release CUDA lanes must retain CUDA 12.8 and 13.5",
     )
     require(
         release.count('cuda_cmake_args: "-DGGML_CUDA_CUB_3DOT2=ON"') == 2
         and release.count("${{ matrix.cuda_cmake_args }}") == 2,
-        "only the CUDA 12.4 Linux and Windows matrix entries must request fetched CCCL",
+        "only the CUDA 12.8 Linux and Windows matrix entries must request fetched CCCL",
     )
     for runtime in ("amdhip64_7.dll", "amd_comgr_3.dll"):
         require(
@@ -180,31 +180,67 @@ def main() -> None:
         "the dormant Vulkan setup action should remain aligned with the prior Bee release tree",
     )
 
-    save_count = release.count("- name: Save ccache")
-    require(save_count == 11, f"expected 11 rolling-cache save steps, found {save_count}")
-    setup_count = release.count("uses: ./.github/actions/setup-ccache")
-    require(setup_count == save_count, "every rolling cache must have one setup and one save step")
-    require(
-        release.count(
-            "restore-keys: release-${{ needs.release-meta.outputs.cache_parent_channel }}-"
-        )
-        == setup_count,
-        "every release cache must fall back to the same backend/toolchain key in the parent channel",
-    )
-    require(
-        release.count("if: ${{ success() && !cancelled() }}")
-        == save_count,
-        "every rolling-cache save must run only after a successful, non-cancelled build "
-        "so failed or interrupted builds cannot evict healthy entries",
-    )
-    require(
-        "always() && needs.release-meta.outputs.preview == 'true'" not in release,
-        "rolling-cache saves must not be limited to preview builds",
-    )
-    require(
-        release.count("ref: refs/heads/main") == save_count,
-        "every rolling cache must be replaced in main cache scope",
-    )
+    checkpoint_build = (ACTIONS / "build-with-ccache/action.yml").read_text(encoding="utf-8")
+    setup_count = release.count("uses: ./.ci-workflow/.github/actions/setup-ccache")
+    build_count = release.count("uses: ./.ci-workflow/.github/actions/build-with-ccache")
+    require(setup_count == build_count == 11,
+            "all 11 compilation job definitions must restore and checkpoint ccache")
+    require(release.count("- name: Clone workflow-owned build helpers") == 11,
+            "every build must load its CI helpers independently of the source revision")
+    require(release.count("restore-keys: release-${{ needs.release-meta.outputs.cache_parent_channel }}-") == setup_count,
+            "every backend/toolchain cache must retain the parent-channel fallback")
+    require("CACHE_SAVE_DEADLINE" not in release and "330 * 60" not in release,
+            "the old job-start deadline must be removed")
+    require(release.count("cache-build-deadline.py -- cmake --build") == build_count,
+            "all compilation commands must use the bounded slice helper")
+    for number in (1, 2, 3):
+        require(f"id: slice{number}" in checkpoint_build,
+                f"compilation slice {number} is missing")
+        require(f"- name: Save ccache {number}" in checkpoint_build,
+                f"compilation slice {number} must save its progress")
+        require(checkpoint_build.index(f"- name: Verify completed build {number}")
+                < checkpoint_build.index(f"- name: Save ccache {number}"),
+                "completed-build checks must still pass before the final cache save")
+        require(f"steps.slice{number}.outputs.checkpoint == 'false'" in checkpoint_build,
+                "unfinished builds must not run completion-only checks")
+    require(release.count("          verify-command: |") == 8,
+            "all seven application job definitions and HIP runtime staging must retain their build checks")
+    require(checkpoint_build.count("uses: ./.ci-workflow/.github/actions/save-rolling-ccache") == 3,
+            "all checkpoints must reuse the original rolling-cache replacement action")
+    require(checkpoint_build.count("success() && !cancelled()") == 3,
+            "every save must exclude failed/cancelled compilation")
+    for previous in (1, 2):
+        require(checkpoint_build.count(f"steps.slice{previous}.outputs.checkpoint == 'true'") == 2,
+                "later slices and their saves must run only after a controlled interruption")
+    require(checkpoint_build.count("ref: refs/heads/main") == 3,
+            "all checkpoints must retain main cache scope")
+    require(checkpoint_build.count("evict-old-files: 1d") == 3,
+            "all checkpoints must retain existing eviction policy")
+    require("steps.slice3.outputs.checkpoint == 'true'" in checkpoint_build
+            and "BEELLAMA_BUILD_INCOMPLETE:" in checkpoint_build,
+            "the third interrupted slice must explicitly report incomplete")
+    require("always() && needs.release-meta.outputs.preview == 'true'" not in release,
+            "rolling-cache saves must not be limited to preview builds")
+
+    gate = release.split("\n  retry-builds:\n", 1)[1].split("\n  package-assets:\n", 1)[0]
+    require("if: ${{ always() }}" in gate,
+            "retry evaluation must not be skipped after a failed/cancelled build")
+    for job in ("release-meta", "macos-arm64", "ubuntu-cpu", "ubuntu-vulkan", "ubuntu-rocm",
+                "ubuntu-sycl", "ubuntu-cuda", "windows-cpu", "windows-sycl", "windows-vulkan",
+                "windows-cuda", "windows-hip"):
+        require(f"      - {job}\n" in gate, f"retry evaluation must wait for {job}")
+    require("      - package-assets\n" not in gate and "      - docker-build\n" not in gate,
+            "retry evaluation must precede downstream packaging and publication")
+    require("checks: read" in gate and "retry-release.cjs" in gate,
+            "retry evaluation must be able to inspect runner-loss check annotations")
+    require("RELEASE_INPUTS: ${{ toJSON(inputs) }}" in gate and "BUILD_RESULTS: ${{ toJSON(needs) }}" in gate,
+            "the controller must receive original dispatch inputs and dependency results")
+    for downstream, following in (("package-assets", "docker-build"), ("docker-build", "docker-merge")):
+        block = release.split(f"\n  {downstream}:\n", 1)[1].split(f"\n  {following}:\n", 1)[0]
+        require("      - retry-builds\n" in block and "needs.retry-builds.outputs.proceed == 'true'" in block,
+                f"{downstream} must wait for the successful-build decision")
+    require('options: ["0", "1", "2"]' in release and "inputs.retry_root || github.run_id" in release,
+            "automatic retries must have a bounded attempt and stable chain identity")
     require(
         "needs.release-meta.outputs.cache_channel" in release,
         "release cache keys must use the branch cache channel",
