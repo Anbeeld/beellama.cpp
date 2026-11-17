@@ -241,6 +241,7 @@ llama-server --models-preset presets.ini
 - [BeeLlama features and public repo diff](docs/beellama-features.md)
 - [BeeLlama args reference](docs/beellama-args.md)
 - [Build docs](docs/build.md)
+- [BeeLlama release process](docs/release.md)
 - [Server docs](tools/server/README.md)
 - [Docker docs](docs/docker.md)
 - [Performance troubleshooting](docs/development/token_generation_performance_tips.md)

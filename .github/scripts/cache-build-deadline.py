@@ -1,39 +1,39 @@
 #!/usr/bin/env python3
-"""Run a build until the job's cache-save deadline, then stop its process tree."""
+"""Run one compilation slice, stopping all writers before a ccache checkpoint."""
 
+import argparse
+import math
 import os
 from pathlib import Path
 import signal
 import subprocess
 import sys
-import time
 
 
-TIMED_OUT_EXIT = 75
+CHECKPOINT_SECONDS = 90 * 60
 
 
-def mark_timed_out() -> int:
+def set_checkpoint(value: bool) -> None:
     with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
-        output.write("timed_out=true\n")
-    print("Build deadline reached; compiler processes stopped before saving ccache.", flush=True)
-    return TIMED_OUT_EXIT
+        output.write(f"checkpoint={'true' if value else 'false'}\n")
 
 
 def stop_tree(process: subprocess.Popen[bytes]) -> None:
     if os.name == "nt":
-        # cmd / cmake / ninja / compiler children must all exit before cache archiving.
-        # taskkill can report failure when children exit while it walks the tree.
-        # Wait for the build leader instead of treating that race as a build error.
-        result = subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], check=False)
-        if result.returncode != 0:
-            process.wait(timeout=30)
+        # /T includes cmake, ninja/make, compiler and ccache descendants. Fail
+        # closed if Windows cannot confirm that the tree was terminated.
+        subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], check=True)
     else:
-        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
         try:
             process.wait(timeout=30)
         except subprocess.TimeoutExpired:
             pass
-        # The leader can exit before its compiler children; stop the whole group.
+        # The leader may exit before compiler children, including children that
+        # ignore SIGTERM. Always terminate the remaining process group as well.
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
@@ -42,23 +42,36 @@ def stop_tree(process: subprocess.Popen[bytes]) -> None:
 
 
 def main() -> int:
-    command = sys.argv[1:]
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--seconds", type=float, default=CHECKPOINT_SECONDS)
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+    command = args.command
     if command and command[0] == "--":
         command = command[1:]
     if not command:
-        raise ValueError("Expected a build command")
-    deadline = int(os.environ["CACHE_SAVE_DEADLINE"])
-    remaining = deadline - time.time()
-    if remaining <= 0:
-        return mark_timed_out()
+        parser.error("expected a build command after --")
+    if not math.isfinite(args.seconds) or args.seconds <= 0:
+        parser.error("--seconds must be finite and positive")
 
     options = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
     process = subprocess.Popen(command, **options)
     try:
-        return process.wait(timeout=remaining)
+        result = process.wait(timeout=args.seconds)
     except subprocess.TimeoutExpired:
+        # A naturally failing build at the interval boundary is still a failure,
+        # not permission to replace a healthy cache.
+        result = process.poll()
+        if result is None:
+            stop_tree(process)
+            set_checkpoint(True)
+            print("Compilation slice ended; compiler tree stopped for ccache checkpoint.", flush=True)
+            return 0
+    except BaseException:
         stop_tree(process)
-        return mark_timed_out()
+        raise
+    set_checkpoint(False)
+    return result
 
 
 if __name__ == "__main__":
