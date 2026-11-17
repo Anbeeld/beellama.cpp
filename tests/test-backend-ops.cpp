@@ -5891,6 +5891,43 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// Exercise the Vulkan expert prepass with no skips, a skip owned by a late
+// invocation, and no active experts. Keep the ID view offset and output tail.
+struct test_mul_mat_id_skip_pattern : public test_mul_mat_id {
+    const int skip_pattern; // 0: none, 1: last slot only, 2: all slots
+
+    test_mul_mat_id_skip_pattern(ggml_type type_a, int n_mats, int skip_pattern)
+        : test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, 4, false, 257, 129, 32,
+                          -1, 0, 0, true), skip_pattern(skip_pattern) {}
+
+    std::string vars() override {
+        return test_mul_mat_id::vars() + ",skip_pattern=" + std::to_string(skip_pattern);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_mul_mat_id::initialize_tensors(ctx);
+        reinit_perf_iter(ctx);
+    }
+
+    void reinit_perf_iter(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_MUL_MAT_ID) {
+                continue;
+            }
+            ggml_tensor * ids = t->src[2];
+            for (int64_t r = 0; r < n; ++r) {
+                std::vector<int32_t> data(n_used);
+                for (int i = 0; i < n_used; ++i) {
+                    // Include experts from the second 1024-expert chunk.
+                    data[i] = skip_pattern == 2 || (skip_pattern == 1 && r == n - 1 && i == n_used - 1)
+                        ? -1 : n_mats - 1 - i;
+                }
+                ggml_backend_tensor_set(ids, data.data(), r * ids->nb[1], data.size() * sizeof(int32_t));
+            }
+        }
+    }
+};
+
 // MUL_MAT_ID with expert ids repeated within a token's row
 struct test_mul_mat_id_dup : public test_mul_mat_id {
     using test_mul_mat_id::test_mul_mat_id;
@@ -12142,6 +12179,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_Q4_0}) {
+        for (int n_mats : {8, 1025}) {
+            for (int skip_pattern : {0, 1, 2}) {
+                test_cases.emplace_back(new test_mul_mat_id_skip_pattern(type_a, n_mats, skip_pattern));
             }
         }
     }
