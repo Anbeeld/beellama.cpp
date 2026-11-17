@@ -24,7 +24,7 @@ class CacheTest(unittest.TestCase):
     def test_small_strip_widths(self):
         with tempfile.TemporaryDirectory() as d:
             store=CandidateStore(d)
-            for width in (8,16):
+            for width in (4,8,16):
                 with self.subTest(width=width):
                     key=store.put(provenance(width=width),bytes(352),np.ones(256,dtype='<f2').tobytes())
                     self.assertEqual(store.get(key).provenance['sinq']['strip_width'],width)

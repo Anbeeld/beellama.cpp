@@ -74,7 +74,7 @@ static void make_model(const std::string & path, const std::string & mode, bool 
     if (mode != "source" && mode != "metadata_only") {
         gguf_set_val_str(file,"beellama.qk_sinq.transform","f16_input_diagonal");
         gguf_set_val_str(file,"beellama.qk_sinq.producer","native-test");
-        nlohmann::json recipe={{"generator","sinq"},{"strip_width",mode == "bad_width" ? 4 : mode == "strip_misaligned" ? 512 : strip_width},
+        nlohmann::json recipe={{"generator","sinq"},{"strip_width",mode == "bad_width" ? 2 : mode == "strip_misaligned" ? 512 : strip_width},
                                {"iterations",mode == "bad_iterations" ? 3 : 16},{"strength",1.0}};
         const auto text=recipe.dump(); const char * records[]={text.c_str(),text.c_str()};
         gguf_set_arr_str(file,"beellama.qk_sinq.recipes",records,mode == "duplicate_manifest" ? 2 : 1);
@@ -543,7 +543,7 @@ static void settings_controls(const std::string & source, const std::filesystem:
     const llama_model_tensor_override unsupported[]={{".*",GGML_TYPE_F32},{nullptr,GGML_TYPE_COUNT}};
     p.tt_overrides=unsupported; reject("explicit unsupported codec accepted"); p.tt_overrides=nullptr;
     p.sinq_config=uniform_config.c_str();
-    for(int width:{-1,0,4,7,15,48,96,1024}) { write_config(dir,1.0,width); reject("bad strip width accepted"); }
+    for(int width:{-1,0,2,7,15,48,96,1024}) { write_config(dir,1.0,width); reject("bad strip width accepted"); }
     write_config(dir);
     { std::ofstream out(uniform_config); out << R"({"schema_version":2,"defaults":{"iterations":3},"targets":{"include":"eligible"}})"; }
     reject("bad iterations accepted"); write_config(dir);
@@ -677,7 +677,7 @@ static void encoding_controls(const std::filesystem::path & dir) {
 }
 
 static void width_roundtrips(const std::string & source, const std::filesystem::path & dir) {
-    for(int width:{8,16,32,64,128,256,512}) {
+    for(int width:{4,8,16,32,64,128,256,512}) {
         const auto manual=(dir/("width-manual-"+std::to_string(width)+".gguf")).string();
         make_model(manual,"valid",false,width);
         auto * direct=load(manual); check(direct!=nullptr,"valid width metadata rejected"); llama_model_free(direct);
@@ -719,7 +719,7 @@ static void width_roundtrips(const std::string & source, const std::filesystem::
             }
         }
     }
-    std::puts("widths 8/16/32/64/128/256/512: explicit FFN-down quantize/reload, F16 sidecars and thread/slab bytes");
+    std::puts("widths 4/8/16/32/64/128/256/512: explicit FFN-down quantize/reload, F16 sidecars and thread/slab bytes");
 }
 
 int main(int argc, char ** argv) try {

@@ -32,7 +32,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual({x['generator'] for x in c['resolved_candidates']},{'sinq'})
 
     def test_small_strip_widths(self):
-        for width in (8,16):
+        for width in (4,8,16):
             with self.subTest(width=width):
                 c=self.config()
                 c['candidate_generators'][0]['parameters']['strip_width']=[width]

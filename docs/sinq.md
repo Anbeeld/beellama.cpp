@@ -110,7 +110,7 @@ changing the weight distribution changes codec error. The native encoder, block
 layout and type IDs remain unchanged. An importance matrix `I` is transformed to
 `u*u*I` for encoding; this does not recapture activations through a quantized model.
 
-Normalization widths are 8, 16, 32, 64, 128, 256 or 512; iteration counts are 4, 8 or 16.
+Normalization widths are 4, 8, 16, 32, 64, 128, 256 or 512; iteration counts are 4, 8 or 16.
 Strength is finite in `[0,1]`. Strength zero produces an identity normalization diagonal but remains a
 conditioned candidate, distinct from a stock candidate. Optional post-encoding
 scale refinement can still change that diagonal when explicitly enabled. Normalizer
@@ -331,7 +331,7 @@ Ordinary candidates require `generator: "sinq"`, `strip_width`, `iterations`
 and `strength`. AWQ candidates additionally require `generator: "awq"`,
 `correction` (`weight_activation` or `activation_only`), `alpha` and `lambda`.
 All three floating parameters are finite in `[0,1]`. Widths are
-8/16/32/64/128/256/512; iterations are 4/8/16. AWQ requires verified activations via
+4/8/16/32/64/128/256/512; iterations are 4/8/16. AWQ requires verified activations via
 `inputs.activation_manifest`; ordinary SINQ needs neither activations nor local
 scores. There is no implicit ordinary candidate or AWQ alpha grid.
 
