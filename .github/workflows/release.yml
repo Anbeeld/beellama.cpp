@@ -744,6 +744,7 @@ jobs:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-ubuntu-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
           shell: bash
           command: |
+              source "${ONEAPI_ROOT}/setvars.sh"
               python3 .ci-workflow/.github/scripts/cache-build-deadline.py -- cmake --build build --config Release -j "$(nproc)"
           verify-command: |
             test -s build/tools/ui/dist/index.html

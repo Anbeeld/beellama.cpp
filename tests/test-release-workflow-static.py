@@ -203,6 +203,14 @@ def main() -> None:
             "the old job-start deadline must be removed")
     require(release.count("cache-build-deadline.py -- cmake --build") == build_count,
             "all compilation commands must use the bounded slice helper")
+    sycl = release.split("\n  ubuntu-sycl:\n", 1)[1].split("\n  ubuntu-cuda:\n", 1)[0]
+    sycl_command = sycl.split("          command: |\n", 1)[1].split("          verify-command:", 1)[0]
+    oneapi_init = 'source "${ONEAPI_ROOT}/setvars.sh"'
+    require(oneapi_init in sycl_command
+            and sycl_command.index(oneapi_init) < sycl_command.index("python3 "),
+            "every Ubuntu SYCL compilation slice must initialize oneAPI in its own shell")
+    require(checkpoint_build.count("run: ${{ inputs.command }}") == 3,
+            "all three slices must reuse the command including its toolchain environment setup")
     for number in (1, 2, 3):
         require(f"id: slice{number}" in checkpoint_build,
                 f"compilation slice {number} is missing")
