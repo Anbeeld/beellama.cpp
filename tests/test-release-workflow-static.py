@@ -166,6 +166,10 @@ def main() -> None:
             "Windows CPU must use the VS 2022 runner with the compatible Clang toolchain")
     require(windows_cpu.count('-version "[17.0,18.0)"') == 2,
             "configuration and every Windows CPU compilation slice must select VS 2022, not newer STL headers")
+    require(windows_cpu.count('set "PATH=%ProgramFiles%\\LLVM\\bin;%PATH%"') == 2,
+            "configuration and every slice must prefer standalone LLVM over VS bundled Clang")
+    require(windows_cpu.count('"%ProgramFiles%\\LLVM\\bin\\clang.exe" --version || exit /b 1') == 2,
+            "missing standalone LLVM must fail before configuration or compilation")
     require("_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH" not in windows_cpu,
             "Windows CPU must not bypass the compiler/STL compatibility check")
 

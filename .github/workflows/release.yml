@@ -919,6 +919,9 @@ jobs:
             exit /b 1
           )
           call "%VS_INSTALL_DIR%\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
+          rem vcvarsall prepends bundled Clang 19; use standalone LLVM 20 for fetched libomp.
+          set "PATH=%ProgramFiles%\LLVM\bin;%PATH%"
+          "%ProgramFiles%\LLVM\bin\clang.exe" --version || exit /b 1
           cmake -S . -B build -G "Ninja Multi-Config" ^
             -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
             -DLLAMA_BUILD_BORINGSSL=ON ^
@@ -944,6 +947,9 @@ jobs:
                 exit /b 1
               )
               call "%VS_INSTALL_DIR%\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
+              rem vcvarsall prepends bundled Clang 19; use standalone LLVM 20 for fetched libomp.
+              set "PATH=%ProgramFiles%\LLVM\bin;%PATH%"
+              "%ProgramFiles%\LLVM\bin\clang.exe" --version || exit /b 1
               python .ci-workflow\.github\scripts\cache-build-deadline.py -- cmake --build build --config Release -j %NUMBER_OF_PROCESSORS%
               if errorlevel 1 exit /b %errorlevel%
           verify-command: |

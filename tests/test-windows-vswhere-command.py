@@ -41,6 +41,51 @@ class VswhereCommandTests(unittest.TestCase):
                     self.assertIn("FOUND=C:\\Program Files\\VS 2022", result.stdout)
                     self.assertEqual(result.stderr, "")
 
+    def test_configure_and_slice_override_bundled_clang_after_vcvars(self):
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        cpu = workflow.split("\n  windows-cpu:\n", 1)[1].split("\n  windows-sycl:\n", 1)[0]
+        configure = cpu.split("      - name: Configure\n", 1)[1].split("        run: |\n", 1)[1]
+        configure = configure.split("          cmake -S", 1)[0]
+        compile_command = cpu.split("          command: |\n", 1)[1].split("              python ", 1)[0]
+        with tempfile.TemporaryDirectory(prefix="LLVM selection (test) ") as directory:
+            root = Path(directory)
+            vs = root / "VS 2022"
+            vcvars = vs / "VC/Auxiliary/Build"
+            vcvars.mkdir(parents=True)
+            old = root / "bundled clang"
+            standalone = root / "LLVM/bin"
+            old.mkdir()
+            standalone.mkdir(parents=True)
+            (vcvars / "vcvarsall.bat").write_text(f'@set "PATH={old};%PATH%"\n')
+            for tool in ("clang", "clang++"):
+                (old / f"{tool}.cmd").write_text('@echo Clang 19\n')
+                (standalone / f"{tool}.cmd").write_text('@echo Clang 20.1.8\n')
+            installer = root / "Microsoft Visual Studio/Installer"
+            installer.mkdir(parents=True)
+            (installer / "vswhere.cmd").write_text(f'@echo off\necho {vs}\n')
+            for index, command in enumerate((configure, compile_command)):
+                with self.subTest(invocation=index):
+                    command = "\n".join(line.strip() for line in command.splitlines())
+                    command = command.replace("vswhere.exe", "vswhere.cmd")
+                    # A .cmd fixture needs CALL to return, unlike the real .exe.
+                    command = command.replace('"%ProgramFiles%\\LLVM\\bin\\clang.exe"',
+                                              'call "%ProgramFiles%\\LLVM\\bin\\clang.cmd"')
+                    # CMD restores ProgramFiles from Windows on this host; use
+                    # a fixture variable without changing the path-prepend logic.
+                    command = command.replace("%ProgramFiles%", "%TEST_PROGRAMFILES%")
+                    command = command.replace("%ProgramFiles(x86)%", "%TEST_PROGRAMFILES%")
+                    batch = root / f"toolchain-{index}.cmd"
+                    batch.write_text('@echo off\n' + command + '\ncall clang.cmd\ncall clang++.cmd\n')
+                    result = subprocess.run(
+                        [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", str(batch)],
+                        env={**os.environ, "TEST_PROGRAMFILES": str(root)},
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertNotIn("Clang 19", result.stdout)
+                    self.assertEqual(result.stdout.count("Clang 20.1.8"), 3, result.stdout)
+                    self.assertEqual(result.stderr, "")
+
 
 if __name__ == "__main__":
     unittest.main()
