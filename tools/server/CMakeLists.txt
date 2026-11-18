@@ -19,6 +19,8 @@ add_library(${TARGET} STATIC
     server-context.h
     server-loop-guard.cpp
     server-loop-guard.h
+    server-realtime.cpp
+    server-realtime.h
     server-stream.cpp
     server-stream.h
     server-tools.cpp
@@ -49,6 +51,8 @@ add_library(${TARGET}
     server-http.h
     server-models.cpp
     server-models.h
+    server-models-sched.cpp
+    server-models-sched.h
 )
 set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 

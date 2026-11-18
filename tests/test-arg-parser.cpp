@@ -81,6 +81,20 @@ static void unset_test_env(const char * name) {
 
 static void test(void) {
     common_params params;
+    const int math_threads = common_cpu_get_num_math();
+#ifdef _WIN32
+    assert(math_threads == common_cpu_get_num_physical_cores());
+#endif
+    common_cpu_params automatic;
+    postprocess_cpu_params(automatic, nullptr);
+    assert(automatic.n_threads == math_threads);
+    common_cpu_params explicit_threads;
+    explicit_threads.n_threads = 2;
+    postprocess_cpu_params(explicit_threads, nullptr);
+    assert(explicit_threads.n_threads == 2);
+    const auto thread_defaults = llama_context_default_params();
+    assert(thread_defaults.n_threads == GGML_DEFAULT_N_THREADS);
+    assert(thread_defaults.n_threads_batch == GGML_DEFAULT_N_THREADS);
 
     auto assert_output_limits = [](int32_t n_batch, int32_t n_parallel, int32_t n_draft,
                                    int32_t total, int32_t per_seq) {

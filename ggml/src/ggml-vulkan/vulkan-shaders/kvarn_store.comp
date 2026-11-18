@@ -574,6 +574,18 @@ void validate_workspace(uint lane) {
             const uint first_pos = first_idx % KVAR_N_DIM;
             const uint start_local = first_group * KVAR_N_DIM + first_pos;
             const uint end_local = start_local + p.tokens_per_stream;
+            // Parallel flush/commit workgroups must own disjoint stream state.
+            // Two dense chunks may each be valid but target the same stream;
+            // their record and stage writes would race. Keep serial ordering
+            // through MODE_FALLBACK for that layout.
+            for (uint previous = 0u; previous < active_stream; ++previous) {
+                const uint previous_idx = read_index_low(previous * p.tokens_per_stream);
+                const uint previous_stream = p.swa != 0u ? 0u :
+                    previous_idx / KVAR_N_DIM / p.groups_per_stream;
+                if (previous_stream == stream) {
+                    sh_workspace_valid = 0u;
+                }
+            }
             if (stream >= p.n_stream ||
                     (p.swa == 0u && first_group >= p.groups_per_stream) ||
                     (p.swa == 0u &&

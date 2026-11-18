@@ -455,7 +455,9 @@ static FILE * get_handcrafted_file(const unsigned int seed, const enum handcraft
         }
 
         {
-            const int32_t type32 = hft == HANDCRAFTED_TENSORS_BAD_TYPE ? GGML_TYPE_COUNT : int32_t(type);
+            const int32_t wire_type = type == GGML_TYPE_F8_E4M3 ? 43 : type == GGML_TYPE_Q6_0 ? 144 : int32_t(type);
+            // GGML_TYPE_COUNT (144) is a valid private Q6_0 wire ID.
+            const int32_t type32 = hft == HANDCRAFTED_TENSORS_BAD_TYPE ? INT32_MAX : wire_type;
             helper_write(file, type32);
         }
 
@@ -1436,6 +1438,98 @@ static std::pair<int, int> test_gguf_set_kv(ggml_backend_dev_t dev, const unsign
     return std::make_pair(npass, ntest);
 }
 
+static bool test_tensor_wire_types() {
+    static_assert(GGML_TYPE_Q6_0  == 43, "Bee Q6_0 ABI changed");
+    static_assert(GGML_TYPE_Q6_1  == 44, "Bee Q6_1 ABI changed");
+    static_assert(GGML_TYPE_Q3_0  == 45, "Bee Q3_0 ABI changed");
+    static_assert(GGML_TYPE_Q3_1  == 46, "Bee Q3_1 ABI changed");
+    static_assert(GGML_TYPE_Q2_0S == 47, "Bee Q2_0S ABI changed");
+    static_assert(GGML_TYPE_Q2_1  == 48, "Bee Q2_1 ABI changed");
+    static_assert(GGML_TYPE_F8_E4M3 == 49, "FP8 internal type changed");
+
+    // Independently encode an upstream GGUF, not a file produced by our writer.
+    // E4M3 bytes represent 0, 1, -2, 0.5, and the largest finite value, 448.
+    const uint8_t fp8_data[] = { 0x00, 0x38, 0xc0, 0x30, 0x7e };
+    const float expected[] = { 0.0f, 1.0f, -2.0f, 0.5f, 448.0f };
+    FILE * file = tmpfile();
+    GGML_ASSERT(file);
+    helper_write(file, "GGUF", 4);
+    helper_write(file, uint32_t(3));
+    helper_write(file, uint64_t(1)); // tensors
+    helper_write(file, uint64_t(0)); // metadata
+    helper_write(file, uint64_t(3));
+    helper_write(file, "fp8", 3);
+    helper_write(file, uint32_t(1)); // dimensions
+    helper_write(file, uint64_t(sizeof(fp8_data)));
+    const long type_offset = ftell(file);
+    helper_write(file, uint32_t(43)); // upstream wire ID, NOT Bee's Q6_0 enum
+    helper_write(file, uint64_t(0));
+    while (ftell(file) % GGUF_DEFAULT_ALIGNMENT != 0) {
+        helper_write(file, uint8_t(0));
+    }
+    helper_write(file, fp8_data, sizeof(fp8_data));
+    while (ftell(file) % GGUF_DEFAULT_ALIGNMENT != 0) {
+        helper_write(file, uint8_t(0));
+    }
+    rewind(file);
+
+    ggml_context * data_ctx = nullptr;
+    gguf_context * external = gguf_init_from_file_ptr(file, { false, &data_ctx });
+    fclose(file);
+    GGML_ASSERT(external && data_ctx);
+    GGML_ASSERT(gguf_get_tensor_type(external, 0) == GGML_TYPE_F8_E4M3);
+    ggml_tensor * fp8 = ggml_get_tensor(data_ctx, "fp8");
+    GGML_ASSERT(fp8 && fp8->type == GGML_TYPE_F8_E4M3);
+    GGML_ASSERT(memcmp(fp8->data, fp8_data, sizeof(fp8_data)) == 0);
+    float decoded[5];
+    ggml_get_type_traits(fp8->type)->to_float(fp8->data, decoded, 5);
+    for (size_t i = 0; i < 5; ++i) {
+        GGML_ASSERT(decoded[i] == expected[i]);
+    }
+
+    // Exercise both directions explicitly, including raw writer wire IDs.
+    for (ggml_type type : { GGML_TYPE_F8_E4M3, GGML_TYPE_Q6_0 }) {
+        ggml_context * original = ggml_init({ 4096, nullptr, false });
+        GGML_ASSERT(original);
+        ggml_tensor * tensor = ggml_new_tensor_1d(original, type,
+            type == GGML_TYPE_F8_E4M3 ? sizeof(fp8_data) : ggml_blck_size(type));
+        ggml_set_name(tensor, "fp8"); // same descriptor length as the external fixture
+        std::vector<uint8_t> bytes(ggml_nbytes(tensor));
+        if (type == GGML_TYPE_F8_E4M3) {
+            memcpy(bytes.data(), fp8_data, sizeof(fp8_data));
+        } else {
+            for (size_t i = 0; i < bytes.size(); ++i) {
+                bytes[i] = uint8_t(i);
+            }
+        }
+        memcpy(tensor->data, bytes.data(), bytes.size());
+        gguf_context * output = gguf_init_empty();
+        gguf_add_tensor(output, tensor);
+        file = tmpfile();
+        GGML_ASSERT(file && gguf_write_to_file_ptr(output, file, false));
+        GGML_ASSERT(fseek(file, type_offset, SEEK_SET) == 0);
+        uint32_t wire_type = 0;
+        GGML_ASSERT(fread(&wire_type, sizeof(wire_type), 1, file) == 1);
+        GGML_ASSERT(wire_type == (type == GGML_TYPE_F8_E4M3 ? 43u : 144u));
+        rewind(file);
+        ggml_context * restored = nullptr;
+        gguf_context * input = gguf_init_from_file_ptr(file, { false, &restored });
+        GGML_ASSERT(input && restored);
+        GGML_ASSERT(gguf_get_tensor_type(input, 0) == type);
+        ggml_tensor * read = ggml_get_tensor(restored, "fp8");
+        GGML_ASSERT(read && read->type == type && ggml_nbytes(read) == bytes.size());
+        GGML_ASSERT(memcmp(read->data, bytes.data(), bytes.size()) == 0);
+        gguf_free(input);
+        ggml_free(restored);
+        fclose(file);
+        gguf_free(output);
+        ggml_free(original);
+    }
+    gguf_free(external);
+    ggml_free(data_ctx);
+    return true;
+}
+
 static void print_usage() {
     printf("usage: test-gguf [seed]\n");
     printf("  if no seed is unspecified then a random seed is used\n");
@@ -1454,8 +1548,8 @@ int main(int argc, char ** argv) {
     ggml_backend_dev_count();
     fprintf(stderr, "\n");
 
-    int npass = 0;
-    int ntest = 0;
+    int npass = test_tensor_wire_types() ? 1 : 0;
+    int ntest = 1;
     {
         std::pair<int, int> result = test_handcrafted_file(seed);
         npass += result.first;

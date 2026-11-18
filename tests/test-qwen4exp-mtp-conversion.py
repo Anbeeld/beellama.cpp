@@ -36,6 +36,7 @@ def make_model(*, mtp_only: bool, ple_layers: list[int]) -> Qwen4ExpTextModel:
         "ple_conv_kernel_size": 4,
         "eos_token_id": 99,
     }
+    model.block_count = 3  # two trunk layers plus one MTP layer
     model._ple_row_dim = 4
     model.model_tensors = {
         "model.ple_embedding.layer_multipliers": lambda: torch.tensor([1, 2, 3], dtype=torch.int64),
@@ -58,12 +59,18 @@ def test_mtp_only_filters_ple_but_preserves_hyper_connection_mixer() -> None:
         assert Qwen4ExpTextModel.filter_tensors(
             ("model.ple_embedding.layer_multipliers", lambda: torch.zeros(1))
         ) is None
-        for suffix in ("hc_norm", "input_mix_weight_down", "input_mix_weight_up"):
-            filtered = Qwen4ExpTextModel.filter_tensors(
-                (f"model.mtp.hyper_connection_mixer.{suffix}.weight", lambda: torch.zeros(1))
-            )
-            assert filtered is not None
-            assert filtered[0] == f"model.layers.2.hyper_connection_mixer.{suffix}.weight"
+        for prefix in ("mtp", "model.mtp"):
+            for suffix in ("hc_norm", "input_mix_weight_down", "input_mix_weight_up"):
+                filtered = Qwen4ExpTextModel.filter_tensors(
+                    (f"{prefix}.hyper_connection_mixer.{suffix}.weight", lambda: torch.zeros(1))
+                )
+                assert filtered is not None
+                assert filtered[0] == f"model.layers.2.nextn_hc_head.{suffix}.weight"
+                tensor_map = gguf.get_tensor_name_map(gguf.MODEL_ARCH.QWEN4EXP, 3)
+                assert tensor_map.get_name(filtered[0], try_suffixes=(".weight",)) == \
+                    {"hc_norm": "blk.2.nextn.hc_head_norm",
+                     "input_mix_weight_down": "blk.2.nextn.hc_head_down",
+                     "input_mix_weight_up": "blk.2.nextn.hc_head_up"}[suffix] + ".weight"
 
         tensor_map = gguf.get_tensor_name_map(gguf.MODEL_ARCH.QWEN4EXP, 3)
         assert tensor_map.get_name("model.layers.2.hyper_connection_mixer.hc_norm") == \

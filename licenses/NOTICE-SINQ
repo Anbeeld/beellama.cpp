@@ -1,0 +1,13 @@
+SINQ-derived offline normalization and reference fixtures
+
+The normalization in src/llama-sinq.cpp is a C++ adaptation of the
+numerical procedure in huawei-csl/SINQ, revision
+42ca83edf8fe1afc48c40fca6acc973c5d2bb59f.
+
+Copyright 2025 Huawei Technologies Switzerland AG.
+Licensed under the Apache License, Version 2.0. See LICENSE-SINQ.
+
+BeeLlama adaptations include offline column preconditioning for unchanged
+standard Q3_K/Q4_K encoders, separate input-channel scale tensors, cached
+activation compensation and independent tests.
+The implementation is not the original Python serving implementation.

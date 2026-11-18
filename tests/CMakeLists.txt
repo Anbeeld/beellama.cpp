@@ -320,6 +320,8 @@ function(llama_build_and_test source)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS ${LLAMA_TEST_LABEL})
 endfunction()
 
+llama_build_and_test(test-io-write-host.cpp LINK ggml)
+
 # build test-tokenizer-0 target once and add many tests
 llama_build(test-tokenizer-0.cpp)
 
@@ -369,7 +371,12 @@ llama_build(${LLAMA_CONTEXT_TEST_SRC})
 llama_build(test-save-load-state.cpp)
 llama_build(test-recurrent-state-rollback.cpp)
 
+llama_build(test-llama-archs.cpp)
+set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
+file(MAKE_DIRECTORY "${MODEL_DIR}")
+
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    target_compile_definitions(test-llama-archs PRIVATE TEST_LLAMA_ARCHS_INTERNAL)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-kv-tail-input.cpp)
     target_include_directories(test-kv-tail-input PRIVATE ${PROJECT_SOURCE_DIR}/src)
@@ -386,7 +393,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)
     target_link_libraries(test-chat PRIVATE server-context)
     llama_build_and_test(test-server-component.cpp  LABEL behavior)
-    target_include_directories(test-server-component PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_include_directories(test-server-component PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)
     target_link_libraries(test-server-component PRIVATE server-context)
     llama_build_and_test(test-json-schema-to-grammar.cpp  LABEL behavior)
 
@@ -417,9 +424,6 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
-    # TODO: after `test-llama-archs` is refactored to not link internal symbols, we can move all related tests out of
-    #       this branch and run them on all platforms
-    llama_build(test-llama-archs.cpp)
     llama_test(test-llama-archs NAME test-lilicorr-state ARGS --test-lilicorr-state)
     llama_test(
         test-llama-archs
@@ -450,51 +454,6 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         NAME test-qsa-exact-tail
         LABEL main
         ARGS --test-qsa-exact-tail -s 12345
-    )
-
-    set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
-    file(MAKE_DIRECTORY "${MODEL_DIR}")
-
-    llama_test(
-        test-llama-archs
-        NAME test-generate-models
-        LABEL "main behavior backend"
-        ARGS -o "${MODEL_DIR}"
-    )
-    set_tests_properties(test-generate-models PROPERTIES
-        FIXTURES_SETUP generate-models
-    )
-
-    # Target model for test-speculative-rejection-sampling
-    set(SPEC_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-speculative-models/target")
-    file(MAKE_DIRECTORY "${SPEC_TARGET_DIR}")
-    llama_test(
-        test-llama-archs
-        NAME test-generate-speculative-target
-        LABEL main
-        ARGS -a llama -s 999 -o "${SPEC_TARGET_DIR}"
-    )
-    set_tests_properties(
-        test-generate-speculative-target
-        PROPERTIES FIXTURES_SETUP speculative-model
-    )
-
-    # To avoid recreating the model use the fixture exclude any option:
-    # -FA "^speculative-model$"
-    llama_build_and_test(test-speculative-rejection-sampling.cpp ARGS
-        -m "${SPEC_TARGET_DIR}/llama-dense.gguf")
-    set_tests_properties(test-speculative-rejection-sampling PROPERTIES FIXTURES_REQUIRED speculative-model)
-
-    # Test context state handling across all architectures, using the generated dummy models
-    llama_test(
-        test-llama-context
-        LABEL "main behavior backend"
-        ARGS --models "${MODEL_DIR}"
-    )
-    # abort on graph reallocations that the initial reserve should have covered
-    set_tests_properties(test-llama-context PROPERTIES
-        FIXTURES_REQUIRED generate-models
-        ENVIRONMENT "GGML_SCHED_DEBUG_REALLOC=1"
     )
 
     # Retain the full legacy recurrent architecture sweep alongside the consolidated suite.
@@ -556,12 +515,73 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-save-load-state-archs PROPERTIES FIXTURES_REQUIRED generate-models)
 
-    llama_build(test-fusion.cpp)
 endif()
+
+if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
+    llama_build(test-fp8.cpp)
+    set(FP8_MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models-fp8")
+    file(MAKE_DIRECTORY "${FP8_MODEL_DIR}")
+    llama_test(test-llama-archs NAME test-generate-fp8-models LABEL "main behavior backend"
+        ARGS -a llama -s 1 -o "${FP8_MODEL_DIR}")
+    set_tests_properties(test-generate-fp8-models PROPERTIES FIXTURES_SETUP fp8-models)
+    llama_test(test-fp8 NAME test-fp8-requantize LABEL "main behavior backend"
+        ARGS --models "${FP8_MODEL_DIR}")
+    set_tests_properties(test-fp8-requantize PROPERTIES FIXTURES_REQUIRED fp8-models)
+endif()
+
+llama_test(
+    test-llama-archs
+    NAME test-generate-models
+    LABEL "main behavior backend"
+    ARGS -o "${MODEL_DIR}"
+)
+set_tests_properties(test-generate-models PROPERTIES
+    FIXTURES_SETUP generate-models
+)
+
+# Target model for test-speculative-rejection-sampling
+set(SPEC_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-speculative-models/target")
+file(MAKE_DIRECTORY "${SPEC_TARGET_DIR}")
+llama_test(
+    test-llama-archs
+    NAME test-generate-speculative-target
+    LABEL main
+    ARGS -a llama -s 999 -o "${SPEC_TARGET_DIR}"
+)
+set_tests_properties(
+    test-generate-speculative-target
+    PROPERTIES FIXTURES_SETUP speculative-model
+)
+
+# To avoid recreating the model use the fixture exclude any option:
+# -FA "^speculative-model$"
+llama_build_and_test(test-speculative-rejection-sampling.cpp ARGS
+    -m "${SPEC_TARGET_DIR}/llama-dense.gguf")
+set_tests_properties(test-speculative-rejection-sampling PROPERTIES FIXTURES_REQUIRED speculative-model)
+
+# Test context state handling across all architectures, using the generated dummy models
+llama_test(
+    test-llama-context
+    LABEL "main behavior backend"
+    ARGS --models "${MODEL_DIR}"
+)
+# abort on graph reallocations that the initial reserve should have covered
+set_tests_properties(test-llama-context PROPERTIES
+    FIXTURES_REQUIRED generate-models
+    ENVIRONMENT "GGML_SCHED_DEBUG_REALLOC=1"
+)
+
+llama_build(test-fusion.cpp)
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp  LABEL behavior)
 llama_build_and_test(test-jinja.cpp  LABEL behavior)
 llama_test(test-jinja  NAME test-jinja-py  ARGS -py  LABEL "python behavior")
+llama_test_cmd(python3
+    NAME test-conversion-fp8
+    LABEL "python behavior"
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+    ARGS -m unittest discover -s tests -p test_conversion_fp8.py -v
+)
 llama_build_and_test(test-json-schema.cpp  LABEL behavior)
 llama_build_and_test(test-chat-auto-parser.cpp  LABEL behavior  WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-chat-template.cpp  LABEL behavior)
@@ -638,6 +658,8 @@ set_property(TEST test-kvarn PROPERTY LABELS main)
 
 llama_build_and_test(test-adaptive-dm.cpp)
 llama_build_and_test(test-perplexity-plumbing.cpp ARGS ${PROJECT_SOURCE_DIR})
+llama_build_and_test(test-kvarn-geometry-policy.cpp)
+llama_build_and_test(test-vulkan-kvarn-policy.cpp)
 llama_build_and_test(test-cuda-fattn-route-policy.cpp ARGS ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-cuda-fattn-vec-policy.cpp ARGS ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-cuda-zero-dim-gemm.cpp ARGS ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda/ggml-cuda.cu)
@@ -689,6 +711,8 @@ endif()
 
 # Bee backend coverage uses the canonical cache-type registry from common/arg.cpp.
 llama_build(test-backend-ops.cpp LINK llama-common)
+
+llama_build_and_test(test-backend-tensor.cpp LINK ggml)
 
 llama_build_and_test(test-tiled-mulmat.cpp  LABEL "main behavior backend"  LINK ggml)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model behavior")
@@ -801,3 +825,152 @@ target_include_directories(test-ggml-op-coverage PRIVATE ${PROJECT_SOURCE_DIR}/g
 target_link_libraries(test-ggml-op-coverage PRIVATE ggml)
 add_test(NAME test-ggml-op-coverage COMMAND $<TARGET_FILE:test-ggml-op-coverage>)
 set_property(TEST test-ggml-op-coverage PROPERTY LABELS main)
+
+if (LLAMA_BUILD_TOOLS)
+    add_executable(test-perplexity-full test-perplexity-full.cpp)
+    target_compile_features(test-perplexity-full PRIVATE cxx_std_17)
+    target_link_libraries(test-perplexity-full PRIVATE llama-perplexity-impl)
+    add_test(NAME test-perplexity-full COMMAND test-perplexity-full)
+endif()
+
+add_executable(test-qk-sinq-numeric test-qk-sinq-numeric.cpp)
+target_include_directories(test-qk-sinq-numeric PRIVATE ../src)
+target_compile_features(test-qk-sinq-numeric PRIVATE cxx_std_17)
+target_link_libraries(test-qk-sinq-numeric PRIVATE llama-sinq-optimizer)
+file(GLOB QK_SINQ_FIXTURES "${CMAKE_CURRENT_SOURCE_DIR}/sinq-reference/fixtures/*.pre.bin")
+list(LENGTH QK_SINQ_FIXTURES QK_SINQ_FIXTURE_COUNT)
+if (NOT QK_SINQ_FIXTURE_COUNT EQUAL 36)
+    message(FATAL_ERROR "Expected all 36 locked Q_K SINQ normalization fixtures, found ${QK_SINQ_FIXTURE_COUNT}")
+endif()
+add_test(NAME test-qk-sinq-numeric COMMAND test-qk-sinq-numeric ${QK_SINQ_FIXTURES})
+
+add_executable(test-sinq-activation test-sinq-activation.cpp)
+target_compile_features(test-sinq-activation PRIVATE cxx_std_17)
+target_link_libraries(test-sinq-activation PRIVATE llama-sinq-optimizer)
+add_test(NAME test-sinq-activation COMMAND test-sinq-activation)
+
+# Offline HF/native parity uses a tiny locally initialized Qwen3.5, never a downloaded model.
+if (GGML_CPU)
+    llama_build(test-sinq-activation-parity.cpp LINK llama ggml ggml-cpu)
+    if (Python3_Interpreter_FOUND)
+        add_test(NAME test-sinq-activation-parity COMMAND ${Python3_EXECUTABLE}
+            ${PROJECT_SOURCE_DIR}/tests/test-sinq-activation-parity.py
+            --runner $<TARGET_FILE:test-sinq-activation-parity>
+            --output ${CMAKE_CURRENT_BINARY_DIR}/sinq-activation-parity
+            --storage-smoke)
+        set_tests_properties(test-sinq-activation-parity PROPERTIES
+            SKIP_RETURN_CODE 77 LABELS "python behavior cpu"
+            ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1;HF_HUB_OFFLINE=1;TRANSFORMERS_OFFLINE=1")
+    endif()
+endif()
+
+add_executable(test-sinq-parameters test-sinq-parameters.cpp)
+target_include_directories(test-sinq-parameters PRIVATE ../src ../vendor/nlohmann)
+target_compile_features(test-sinq-parameters PRIVATE cxx_std_17)
+target_link_libraries(test-sinq-parameters PRIVATE llama-sinq-optimizer)
+add_test(NAME test-sinq-parameters COMMAND test-sinq-parameters)
+
+add_executable(test-sinq-encoding test-sinq-encoding.cpp)
+target_include_directories(test-sinq-encoding PRIVATE ../src)
+target_compile_features(test-sinq-encoding PRIVATE cxx_std_17)
+target_link_libraries(test-sinq-encoding PRIVATE llama-sinq-optimizer)
+add_test(NAME test-sinq-encoding COMMAND test-sinq-encoding)
+
+add_executable(test-qk-sinq-model test-qk-sinq-model.cpp)
+target_compile_features(test-qk-sinq-model PRIVATE cxx_std_17)
+target_include_directories(test-qk-sinq-model PRIVATE ../src ../vendor/nlohmann)
+target_link_libraries(test-qk-sinq-model PRIVATE llama ggml llama-sinq-optimizer)
+add_test(NAME test-qk-sinq-model COMMAND test-qk-sinq-model ${CMAKE_CURRENT_BINARY_DIR}/qk-sinq-model-fixtures)
+
+# Uses the real model split callback, which is not exported by Windows DLLs.
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    add_executable(test-qk-sinq-tensor-split test-qk-sinq-tensor-split.cpp)
+    target_include_directories(test-qk-sinq-tensor-split PRIVATE ../src ../ggml/src)
+    target_compile_features(test-qk-sinq-tensor-split PRIVATE cxx_std_17)
+    target_link_libraries(test-qk-sinq-tensor-split PRIVATE llama ggml)
+    add_test(NAME test-qk-sinq-tensor-split COMMAND test-qk-sinq-tensor-split)
+    if (GGML_CUDA)
+        add_test(NAME test-qk-sinq-tensor-split-cuda COMMAND test-qk-sinq-tensor-split cuda)
+        # Compare sharding math with an unsplit F32 oracle, without the optional
+        # lossy BF16 communication round-trip used by default CUDA AllReduce.
+        set_tests_properties(test-qk-sinq-tensor-split-cuda PROPERTIES SKIP_RETURN_CODE 77 LABELS cuda
+            ENVIRONMENT "GGML_CUDA_AR_BF16_THRESHOLD=0")
+    endif()
+endif()
+
+add_executable(test-qk-sinq-graph test-qk-sinq-graph.cpp)
+target_include_directories(test-qk-sinq-graph PRIVATE ../src)
+target_compile_features(test-qk-sinq-graph PRIVATE cxx_std_17)
+target_link_libraries(test-qk-sinq-graph PRIVATE llama)
+add_test(NAME test-qk-sinq-graph COMMAND test-qk-sinq-graph)
+add_executable(test-qk-sinq-backend test-qk-sinq-backend.cpp)
+target_include_directories(test-qk-sinq-backend PRIVATE ../src ../ggml/src)
+target_compile_features(test-qk-sinq-backend PRIVATE cxx_std_17)
+target_link_libraries(test-qk-sinq-backend PRIVATE llama-sinq-optimizer)
+add_test(NAME test-qk-sinq-cpu COMMAND test-qk-sinq-backend CPU)
+if (GGML_CUDA)
+    add_test(NAME test-qk-sinq-cuda COMMAND test-qk-sinq-backend CUDA0)
+    # CUDA0 is logical: inherit the caller's physical-device visibility mask.
+endif()
+
+if (Python3_Interpreter_FOUND)
+    add_test(NAME test-sinq-reference-identity COMMAND ${Python3_EXECUTABLE}
+        ${PROJECT_SOURCE_DIR}/tests/test-sinq-reference-identity.py)
+    set_tests_properties(test-sinq-reference-identity PROPERTIES SKIP_RETURN_CODE 77
+        LABELS "python behavior cpu" ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1;HF_HUB_OFFLINE=1;TRANSFORMERS_OFFLINE=1")
+    if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS)
+        set_tests_properties(test-qk-sinq-model PROPERTIES FIXTURES_SETUP sinq-synthetic-source)
+        add_test(NAME test-sinq-direct-config-e2e COMMAND ${Python3_EXECUTABLE}
+            ${PROJECT_SOURCE_DIR}/tests/test-sinq-direct-config-e2e.py
+            --source ${CMAKE_CURRENT_BINARY_DIR}/qk-sinq-model-fixtures/source.gguf
+            --quantize $<TARGET_FILE:llama-quantize>)
+        set_tests_properties(test-sinq-direct-config-e2e PROPERTIES FIXTURES_REQUIRED sinq-synthetic-source SKIP_RETURN_CODE 77)
+    endif()
+    add_test(NAME test-sinq-exporter COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-sinq-exporter.py)
+    set_tests_properties(test-sinq-exporter PROPERTIES WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+    add_test(NAME test-qk-sinq-python-storage
+        COMMAND ${Python3_EXECUTABLE} -m unittest discover -s ${PROJECT_SOURCE_DIR}/gguf-py/tests -p test_qk_sinq.py)
+    set_tests_properties(test-qk-sinq-python-storage PROPERTIES WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+endif()
+
+add_executable(test-sinq-awq-methods test-sinq-awq-methods.cpp)
+target_include_directories(test-sinq-awq-methods PRIVATE ../src)
+target_compile_features(test-sinq-awq-methods PRIVATE cxx_std_17)
+target_link_libraries(test-sinq-awq-methods PRIVATE llama-sinq-optimizer)
+add_test(NAME test-sinq-awq-methods COMMAND test-sinq-awq-methods)
+add_executable(test-sinq-candidates test-sinq-candidates.cpp)
+target_include_directories(test-sinq-candidates PRIVATE ../src)
+target_compile_features(test-sinq-candidates PRIVATE cxx_std_17)
+target_link_libraries(test-sinq-candidates PRIVATE llama-sinq-optimizer)
+add_test(NAME test-sinq-candidates COMMAND test-sinq-candidates)
+add_executable(test-sinq-threading test-sinq-threading.cpp)
+target_include_directories(test-sinq-threading PRIVATE ../src)
+target_compile_features(test-sinq-threading PRIVATE cxx_std_17)
+target_include_directories(test-sinq-threading PRIVATE ../vendor/nlohmann)
+target_link_libraries(test-sinq-threading PRIVATE llama-sinq-optimizer)
+add_test(NAME test-sinq-threading COMMAND test-sinq-threading)
+# Standalone measurement tool: performance is evidence, not a timing-based CTest gate.
+add_executable(bench-sinq bench-sinq.cpp)
+target_include_directories(bench-sinq PRIVATE ../src ../vendor/nlohmann ../ggml/src)
+target_compile_features(bench-sinq PRIVATE cxx_std_17)
+target_link_libraries(bench-sinq PRIVATE llama-sinq-optimizer)
+add_executable(test-sinq-bridge-config test-sinq-bridge-config.cpp ../src/sinq/sinq-bridge-config.cpp)
+target_include_directories(test-sinq-bridge-config PRIVATE ../src ../vendor/nlohmann)
+target_compile_features(test-sinq-bridge-config PRIVATE cxx_std_17)
+target_link_libraries(test-sinq-bridge-config PRIVATE llama-sinq-optimizer)
+add_test(NAME test-sinq-bridge-config COMMAND test-sinq-bridge-config)
+if (Python3_Interpreter_FOUND)
+    foreach(optimizer_test blockwise fisher optimizer-config optimizer-contract optimizer-selection candidate-cache assembly groupwise-kl kl-execution kl-provenance stock-baseline optimizer-integrity score-context observation implementation corpora generation-resume threading backend-scoring reference-loader execution-policy final-stock-control trusted-reference prepared-assembly prepared-kl groupwise-progress summary-inventory generation-input-session)
+        add_test(NAME test-sinq-optimizer-${optimizer_test} COMMAND ${Python3_EXECUTABLE}
+            ${PROJECT_SOURCE_DIR}/tests/test-sinq-${optimizer_test}.py)
+        set_tests_properties(test-sinq-optimizer-${optimizer_test} PROPERTIES
+            SKIP_RETURN_CODE 77
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+            ENVIRONMENT "OMP_NUM_THREADS=32;MKL_NUM_THREADS=32;HF_HUB_OFFLINE=1;TRANSFORMERS_OFFLINE=1")
+    endforeach()
+endif()
+
+if (Python3_Interpreter_FOUND AND LLAMA_BUILD_TOOLS AND LLAMA_BUILD_SINQ_OPTIMIZER)
+    set_tests_properties(test-sinq-optimizer-assembly test-sinq-optimizer-groupwise-kl test-sinq-optimizer-stock-baseline test-sinq-optimizer-generation-resume test-sinq-optimizer-generation-input-session PROPERTIES
+        ENVIRONMENT "OMP_NUM_THREADS=32;MKL_NUM_THREADS=32;HF_HUB_OFFLINE=1;TRANSFORMERS_OFFLINE=1;SINQ_NATIVE_BIN=$<TARGET_FILE_DIR:llama-quantize>")
+endif()

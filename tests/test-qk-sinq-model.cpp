@@ -1,0 +1,962 @@
+#include "llama.h"
+#include "ggml.h"
+#include "gguf.h"
+#include "ggml-backend.h"
+#include "../src/llama-sinq.h"
+#include "../src/sinq/sinq-parameters.h"
+#include "../vendor/nlohmann/json.hpp"
+
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+static void check(bool ok, const char * message) { if (!ok) { throw std::runtime_error(message); } }
+static std::string write_config(const std::filesystem::path & dir, double strength=1.0, int width=64,
+                                const nlohmann::json & include="eligible", const nlohmann::json & overrides=nlohmann::json::array(),
+                                const nlohmann::json & encoding=nullptr) {
+    const auto path=(dir/"direct-config.json").string();
+    std::ofstream out(path,std::ios::binary);
+    nlohmann::json config={{"schema_version",2},{"defaults",{{"generator","sinq"},{"strip_width",width},{"iterations",16},{"strength",strength}}},
+                           {"targets",{{"include",include}}},{"overrides",overrides}};
+    if (!encoding.is_null()) { config["encoding"]=encoding; }
+    out << config.dump();
+    out.close(); check(bool(out),"direct config write"); return path;
+}
+static std::string logs;
+static void logger(ggml_log_level, const char * text, void *) { logs += text; }
+static void make_model(const std::string & path, const std::string & mode, bool incompatible_shape = false, int strip_width = 64, bool anisotropic = false, bool hybrid = false) {
+    ggml_context * ctx = ggml_init({64*ggml_tensor_overhead(),nullptr,true});
+    gguf_context * file = gguf_init_empty();
+    gguf_set_val_str(file,"general.architecture","qwen35");
+    gguf_set_val_str(file,"general.name","SINQ integration fixture");
+    const std::pair<const char *,uint32_t> ints[] = {
+        {"context_length",256},{"embedding_length",256},{"block_count",1},{"feed_forward_length",512},
+        {"attention.head_count",2},{"attention.head_count_kv",1},{"attention.key_length",128},{"attention.value_length",128},
+        {"full_attention_interval",1},{"ssm.conv_kernel",4},{"ssm.inner_size",128},{"ssm.state_size",128},{"ssm.time_step_rank",1},{"ssm.group_count",1},
+    };
+    for (const auto & kv : ints) { gguf_set_val_u32(file,(std::string("qwen35.")+kv.first).c_str(),kv.second); }
+    if (hybrid) {
+        gguf_set_val_u32(file,"qwen35.block_count",2);
+        gguf_set_val_u32(file,"qwen35.ssm.time_step_rank",8);
+        gguf_set_val_u32(file,"qwen35.ssm.group_count",4);
+        gguf_set_val_u32(file,"qwen35.ssm.inner_size",1024);
+        const bool recurrent[] = {false,true};
+        gguf_set_arr_data(file,"qwen35.attention.recurrent_layers",GGUF_TYPE_BOOL,recurrent,2);
+    }
+    gguf_set_val_f32(file,"qwen35.attention.layer_norm_rms_epsilon",1.e-6f);
+    uint32_t sections[] = {16,16,16,16};
+    gguf_set_arr_data(file,"qwen35.rope.dimension_sections",GGUF_TYPE_UINT32,sections,4);
+    const char * tokens[] = {"<unk>","<s>","</s>","a","b","c","d","e","f","g","h","i","j","k","l","m","n","o","p","q","r","s","t","u","v","w","x","y","z"," ",".","!"};
+    float scores[32] = {}; int32_t token_types[32];
+    for (int i = 0; i < 32; ++i) { token_types[i] = i == 0 ? 2 : i < 3 ? 3 : 1; }
+    gguf_set_val_str(file,"tokenizer.ggml.model","llama");
+    gguf_set_arr_str(file,"tokenizer.ggml.tokens",tokens,32);
+    gguf_set_arr_data(file,"tokenizer.ggml.scores",GGUF_TYPE_FLOAT32,scores,32);
+    gguf_set_arr_data(file,"tokenizer.ggml.token_type",GGUF_TYPE_INT32,token_types,32);
+    gguf_set_val_u32(file,"tokenizer.ggml.unknown_token_id",0);
+    gguf_set_val_u32(file,"tokenizer.ggml.bos_token_id",1);
+    gguf_set_val_u32(file,"tokenizer.ggml.eos_token_id",2);
+    const bool sinq = mode != "source" && mode != "metadata_only" && mode != "orphan";
+    const char * selected_tensor = mode == "unsupported" ? "output.weight" :
+        strip_width == 512 ? "blk.0.ffn_down.weight" : "blk.0.ffn_up.weight";
+    if ((sinq || mode == "orphan") && mode != "missing_version") {
+        if (mode == "version_dtype") { gguf_set_val_str(file,"beellama.qk_sinq.version","1"); }
+        else { gguf_set_val_u32(file,"beellama.qk_sinq.version",mode == "version_value" ? 1 : 2); }
+    }
+    if (mode != "source" && mode != "metadata_only") {
+        gguf_set_val_str(file,"beellama.qk_sinq.transform","f16_input_diagonal");
+        gguf_set_val_str(file,"beellama.qk_sinq.producer","native-test");
+        nlohmann::json recipe={{"generator","sinq"},{"strip_width",mode == "bad_width" ? 2 : mode == "strip_misaligned" ? 512 : strip_width},
+                               {"iterations",mode == "bad_iterations" ? 3 : 16},{"strength",1.0}};
+        const auto text=recipe.dump(); const char * records[]={text.c_str(),text.c_str()};
+        gguf_set_arr_str(file,"beellama.qk_sinq.recipes",records,mode == "duplicate_manifest" ? 2 : 1);
+        const char * targets[] = {selected_tensor,selected_tensor};
+        if (mode != "missing_manifest") {
+            gguf_set_arr_str(file,"beellama.qk_sinq.tensors",targets,mode == "duplicate_manifest" ? 2 : 1);
+        }
+    }
+    if (mode == "legacy_enabled" || mode == "legacy_disabled") {
+        gguf_set_val_bool(file,"beellama.qk_sinq.kurtosis_gate",mode == "legacy_enabled");
+    }
+    if (mode == "metadata_only") { gguf_set_val_bool(file,"beellama.qk_sinq.kurtosis_gate",false); }
+    if (mode == "legacy_mistyped") { gguf_set_val_str(file,"beellama.qk_sinq.kurtosis_gate","off"); }
+    if (mode == "unknown_metadata") { gguf_set_val_bool(file,"beellama.qk_sinq.unknown_control",false); }
+    if (mode == "hadamard") { gguf_set_val_bool(file,"prism.hadamard.test",true); }
+    std::vector<std::vector<uint8_t>> payloads;
+    auto add = [&](const char * name, int k, int n, bool norm = false) {
+        const bool selected = std::strcmp(name,selected_tensor) == 0;
+        const ggml_type type = sinq && selected ? GGML_TYPE_Q3_K : GGML_TYPE_F32;
+        ggml_tensor * w = n == 1 ? ggml_new_tensor_1d(ctx,type,k) : ggml_new_tensor_2d(ctx,type,k,n);
+        ggml_set_name(w,name);
+        payloads.emplace_back(ggml_nbytes(w)); auto & data = payloads.back();
+        std::vector<float> f(k*n);
+        for (size_t i = 0; i < f.size(); ++i) {
+            f[i] = norm ? 1.f : .02f*std::sin(float(i)*.71f);
+            if (anisotropic && std::strcmp(name,"blk.0.ffn_up.weight")==0) {
+                f[i] *= 1.f+float((i%size_t(k))%19)*.21f;
+            }
+        }
+        std::vector<ggml_fp16_t> scales(k,ggml_fp32_to_fp16(1.f));
+        if (mode == "valid" && selected) { scales[0]=ggml_fp32_to_fp16(2.f); }
+        if (type == GGML_TYPE_F32) { std::memcpy(data.data(),f.data(),data.size()); }
+        else { check(ggml_quantize_chunk(type,f.data(),data.data(),0,n,k,nullptr)==data.size(),"ordinary Q3_K fixture encode"); }
+        w->data = data.data(); gguf_add_tensor(file,w);
+        if (selected && (sinq || mode == "orphan") && mode != "missing_scale") {
+            const int size = mode == "scale_shape" ? k-1 : k;
+            const auto scale_type = mode == "scale_dtype" ? GGML_TYPE_BF16 : GGML_TYPE_F16;
+            auto * t = ggml_new_tensor_1d(ctx,scale_type,size);
+            ggml_set_name(t,(std::string(name)+".sinq_scale2").c_str());
+            if (mode == "scale_nan") { scales[0] = ggml_fp32_to_fp16(NAN); }
+            if (mode == "scale_zero") { scales[0] = ggml_fp32_to_fp16(0); }
+            if (mode == "scale_negative") { scales[0] = ggml_fp32_to_fp16(-1); }
+            payloads.emplace_back(ggml_nbytes(t)); auto & aux = payloads.back();
+            std::memcpy(aux.data(),scales.data(),aux.size()); t->data = aux.data(); gguf_add_tensor(file,t);
+        }
+    };
+    add("token_embd.weight",256,32); add("output_norm.weight",256,1,true); add("output.weight",256,32);
+    add("blk.0.attn_norm.weight",256,1,true); add("blk.0.post_attention_norm.weight",256,1,true);
+    add("blk.0.attn_q.weight",256,512); add("blk.0.attn_k.weight",256,128); add("blk.0.attn_v.weight",256,128); add("blk.0.attn_output.weight",256,256);
+    add("blk.0.attn_q_norm.weight",128,1,true); add("blk.0.attn_k_norm.weight",128,1,true);
+    add("blk.0.ffn_gate.weight",256,512); add("blk.0.ffn_up.weight",incompatible_shape ? 96 : 256,512); add("blk.0.ffn_down.weight",512,256);
+    if (hybrid) {
+        add("blk.1.attn_norm.weight",256,1,true);
+        add("blk.1.post_attention_norm.weight",256,1,true);
+        add("blk.1.attn_qkv.weight",256,2048);
+        add("blk.1.attn_gate.weight",256,1024);
+        add("blk.1.ssm_conv1d.weight",4,2048);
+        add("blk.1.ssm_dt.bias",8,1);
+        add("blk.1.ssm_a",8,1);
+        add("blk.1.ssm_beta.weight",256,8);
+        add("blk.1.ssm_alpha.weight",256,8);
+        add("blk.1.ssm_norm.weight",128,1,true);
+        add("blk.1.ssm_out.weight",1024,256);
+        add("blk.1.ffn_gate.weight",256,512);
+        add("blk.1.ffn_up.weight",256,512);
+        add("blk.1.ffn_down.weight",512,256);
+    }
+    check(gguf_write_to_file(file,path.c_str(),false),"fixture write");
+    gguf_free(file); ggml_free(ctx);
+}
+static llama_model * load(const std::string & path, llama_split_mode split = LLAMA_SPLIT_MODE_NONE, bool check_tensors = true) {
+    auto p = llama_model_default_params(); p.n_gpu_layers = 0; p.split_mode = split; p.check_tensors = check_tensors;
+    logs.clear(); return llama_model_load_from_file(path.c_str(),p);
+}
+// Exercise real loading, runtime F32 caches and model graphs, not just a
+// synthetic scale split. CPU Meta ranks make this regression GPU-independent.
+static std::vector<float> forward_split(const std::string & path, ggml_backend_dev_t first,
+                                        ggml_backend_dev_t second, float a, float b) {
+    auto p = llama_model_default_params();
+    ggml_backend_dev_t devices[] = {first,second,nullptr};
+    std::vector<float> proportions(llama_max_devices(),0.f);
+    proportions[0] = a; proportions[1] = b;
+    p.devices = devices; p.n_gpu_layers = 99; p.load_mode = LLAMA_LOAD_MODE_NONE;
+    // Use the same native CPU codec path in the reference and Meta ranks;
+    // CPU_REPACK can choose different activation quantizers for small matrices.
+    p.use_extra_bufts = false;
+    p.split_mode = second ? LLAMA_SPLIT_MODE_TENSOR : LLAMA_SPLIT_MODE_NONE;
+    p.tensor_split = proportions.data();
+    std::fprintf(stderr,"SINQ forward: %s ranks=%d ratio=%g,%g\n",path.c_str(),second ? 2 : 1,a,b);
+    logs.clear();
+    auto * model = llama_model_load_from_file(path.c_str(),p);
+    if (!model) { std::fprintf(stderr,"%s",logs.c_str()); }
+    check(model != nullptr,"tensor split fixture load");
+    auto cp = llama_context_default_params();
+    cp.n_ctx = 128; cp.n_batch = 8; cp.n_ubatch = 8;
+    cp.n_threads = 2; cp.n_threads_batch = 2;
+    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    auto * ctx = llama_init_from_model(model,cp);
+    if (!ctx) { std::fprintf(stderr,"%s",logs.c_str()); }
+    check(ctx != nullptr,"tensor split fixture context");
+    std::vector<float> result;
+    auto batch = llama_batch_init(8,0,1);
+    const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    // Prefill followed by two decode steps and a second request after reset.
+    for (int request = 0; request < 2; ++request) {
+        llama_memory_clear(llama_get_memory(ctx),true);
+        int pos = 0;
+        for (int step = 0; step < 3; ++step) {
+            batch.n_tokens = step == 0 ? 4 : 1;
+            for (int i = 0; i < batch.n_tokens; ++i) {
+                batch.token[i] = 3 + (pos+i+request)%20;
+                batch.pos[i] = pos+i;
+                batch.n_seq_id[i] = 1; batch.seq_id[i][0] = 0;
+                batch.logits[i] = true;
+            }
+            check(llama_decode(ctx,batch) == 0,"tensor split fixture decode");
+            for (int i = 0; i < batch.n_tokens; ++i) {
+                const auto * logits = llama_get_logits_ith(ctx,i);
+                check(logits != nullptr,"tensor split fixture logits");
+                for (int j = 0; j < vocab; ++j) {
+                    check(std::isfinite(logits[j]),"nonfinite tensor split logits");
+                    result.push_back(logits[j]);
+                }
+            }
+            pos += batch.n_tokens;
+        }
+    }
+    llama_batch_free(batch); llama_free(ctx); llama_model_free(model);
+    return result;
+}
+static std::string equal_diagonal_fixture(const std::string & source) {
+    ggml_context * data = nullptr;
+    auto * file = gguf_init_from_file(source.c_str(),{false,&data});
+    check(file && data,"equal-diagonal fixture read");
+    auto * output = gguf_init_empty();
+    gguf_set_kv(output,file);
+    int changed = 0;
+    for (int64_t i = 0; i < gguf_get_n_tensors(file); ++i) {
+        const std::string name = gguf_get_tensor_name(file,i);
+        auto * tensor = ggml_get_tensor(data,name.c_str());
+        check(tensor && tensor->data,"equal-diagonal fixture tensor data");
+        gguf_add_tensor(output,tensor);
+        if (name.find(".sinq_scale2") == std::string::npos || tensor->ne[0] != 256) { continue; }
+        auto * values = static_cast<ggml_fp16_t *>(tensor->data);
+        for (int64_t j = 0; j < tensor->ne[0]; ++j) {
+            values[j] = ggml_fp32_to_fp16(.5f + float(j%7)/16.f);
+        }
+        ++changed;
+    }
+    check(changed >= 2,"equal-diagonal fixture must cover different projection layouts");
+    const auto path = source+".equal-diagonals.gguf";
+    check(gguf_write_to_file(output,path.c_str(),false),"equal-diagonal fixture write");
+    gguf_free(output); gguf_free(file); ggml_free(data);
+    return path;
+}
+static void tensor_split_roundtrip(const std::string & path) {
+    auto * cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    check(cpu != nullptr,"CPU tensor split test device");
+    const auto reference = forward_split(path,cpu,nullptr,1,0);
+    for (auto ratio : {std::make_pair(1.f,1.f),std::make_pair(3.f,1.f),
+                       std::make_pair(1.f,0.f),std::make_pair(0.f,1.f)}) {
+        const auto actual = forward_split(path,cpu,cpu,ratio.first,ratio.second);
+        check(actual.size() == reference.size(),"tensor split logits count");
+        // Native low-bit kernels need not be bit-exact across matrix shapes.
+        // The unconditioned stock controls exercise the same rounding. Use the
+        // model-level NMSE contract from llama-context/cases-rs.cpp; separate
+        // tensor-split projection tests check the tighter per-matmul contract.
+        double error = 0, norm = 0;
+        for (size_t i = 0; i < actual.size(); ++i) {
+            const double delta = double(actual[i])-reference[i];
+            error += delta*delta;
+            norm += double(reference[i])*reference[i];
+        }
+        check(norm > 0,"tensor split reference logits are degenerate");
+        std::printf("tensor split model logits NMSE=%g ratio=%g,%g\n",error/norm,ratio.first,ratio.second);
+        check(error/norm <= 1e-4,"tensor split model logits differ from unsplit CPU");
+    }
+    std::puts("SINQ model tensor split: prefill/decode/reset logits match unsplit CPU");
+}
+static std::string split_source(const std::string & source, const std::filesystem::path & dir, bool misplace_scale = false, bool unsupported_metadata = false) {
+    ggml_context * data = nullptr;
+    gguf_init_params init = {false,&data};
+    auto * input = gguf_init_from_file(source.c_str(),init);
+    check(input != nullptr && data != nullptr,"split source read");
+    const int count = int(gguf_get_n_tensors(input)), parts = (count+3)/4;
+    std::string first;
+    for (int part = 0; part < parts; ++part) {
+        auto * output = gguf_init_empty(); gguf_set_kv(output,input);
+        gguf_set_val_u16(output,"split.no",uint16_t(part));
+        gguf_set_val_u16(output,"split.count",uint16_t(parts));
+        gguf_set_val_i32(output,"split.tensors.count",count);
+        if (unsupported_metadata && part == 1) { gguf_set_val_bool(output,"beellama.qk_sinq.kurtosis_gate",false); }
+        for (int i = 0; i < count; ++i) {
+            const char * name = gguf_get_tensor_name(input,i);
+            const int destination = misplace_scale && std::strstr(name,".sinq_scale2") ? 0 : i/4;
+            if (destination == part) { gguf_add_tensor(output,ggml_get_tensor(data,name)); }
+        }
+        char filename[80]; std::snprintf(filename,sizeof(filename),"%s-%05d-of-%05d.gguf",unsupported_metadata ? "unsupported-source" : misplace_scale ? "misplaced-source" : "split-source",part+1,parts);
+        const auto path = (dir/filename).string();
+        check(gguf_write_to_file(output,path.c_str(),false),"split fixture write");
+        if (part == 0) { first = path; }
+        gguf_free(output);
+    }
+    gguf_free(input); ggml_free(data); return first;
+}
+static void full_coverage_pairs(const std::string & source, const std::filesystem::path & dir) {
+    for (auto format : {LLAMA_FTYPE_MOSTLY_Q3_K_M,LLAMA_FTYPE_MOSTLY_Q4_K_M}) {
+        const auto type = format==LLAMA_FTYPE_MOSTLY_Q3_K_M ? GGML_TYPE_Q3_K : GGML_TYPE_Q4_K;
+        auto p = llama_model_quantize_default_params();
+        p.ftype = format; p.pure = true; p.nthread = 2;
+        p.output_tensor_type = type; p.token_embedding_type = type;
+        const auto stock = (dir/("full-stock-"+std::to_string(format)+".gguf")).string();
+        check(llama_model_quantize(source.c_str(),stock.c_str(),&p)==0,"full pure stock quantization");
+        ggml_context * base_data = nullptr;
+        auto * base = gguf_init_from_file(stock.c_str(),{false,&base_data});
+        check(base && base_data,"full pure stock metadata/data read");
+        const auto identity = stock+".identity.gguf";
+        const auto treatment = stock+".conditioned.gguf";
+        for (double strength : {0.0,1.0}) {
+            const auto config=write_config(dir,strength); p.sinq_config=config.c_str();
+            const auto & path = strength==0 ? identity : treatment;
+            check(llama_model_quantize(source.c_str(),path.c_str(),&p)==0,"full pure sidecar quantization");
+            ggml_context * data = nullptr;
+            auto * metadata = gguf_init_from_file(path.c_str(),{false,&data});
+            check(metadata && data,"full pure sidecar metadata/data read");
+            int matrices = 0, scales = 0;
+            for (int64_t i = 0; i < gguf_get_n_tensors(base); ++i) {
+                const char * name = gguf_get_tensor_name(base,i);
+                const auto j = gguf_find_tensor(metadata,name);
+                check(j>=0,"full pure sidecar lost base tensor");
+                const bool matrix = gguf_get_tensor_ne(base,i)[1]>1;
+                const bool conditioned = matrix && std::strncmp(name,"blk.",4)==0;
+                if (matrix) {
+                    ++matrices;
+                    if (gguf_get_tensor_type(metadata,j)!=type) {
+                        std::fprintf(stderr,"full coverage %s requested=%s actual=%s\n",name,ggml_type_name(type),ggml_type_name(gguf_get_tensor_type(metadata,j)));
+                    }
+                    check(gguf_get_tensor_type(base,i)==type && gguf_get_tensor_type(metadata,j)==type,
+                          "full pure mode retained/promoted an embedding, output or projection");
+                }
+                const bool has_scale = gguf_find_tensor(metadata,(std::string(name)+".sinq_scale2").c_str())>=0;
+                check(has_scale==conditioned,"full quantization must not extend conditioning to embedding/output");
+                scales += has_scale;
+                if (strength==0 || !conditioned) {
+                    auto * a = ggml_get_tensor(base_data,name); auto * b = ggml_get_tensor(data,name);
+                    check(a && b && ggml_nbytes(a)==ggml_nbytes(b) &&
+                          std::memcmp(a->data,b->data,ggml_nbytes(a))==0,"full pure unconditioned/identity payload changed");
+                }
+            }
+            check(matrices==9 && scales==7,"full fixture must quantize both heads and seven projections");
+            gguf_free(metadata); ggml_free(data);
+            auto * model = load(path); check(model!=nullptr,"full pure sidecar reload"); llama_model_free(model);
+        }
+        check(std::filesystem::file_size(identity)==std::filesystem::file_size(treatment),"full identity/treatment byte budget differs");
+        gguf_free(base); ggml_free(base_data);
+    }
+}
+
+static void native_codec_pairs(const std::string & source, const std::filesystem::path & dir) {
+    const std::pair<llama_ftype,ggml_type> codecs[] = {
+        {LLAMA_FTYPE_MOSTLY_Q2_K,GGML_TYPE_Q2_K}, {LLAMA_FTYPE_MOSTLY_Q5_K_M,GGML_TYPE_Q5_K},
+        {LLAMA_FTYPE_MOSTLY_Q4_0,GGML_TYPE_Q4_0}, {LLAMA_FTYPE_MOSTLY_Q4_1,GGML_TYPE_Q4_1},
+        {LLAMA_FTYPE_MOSTLY_IQ4_XS,GGML_TYPE_IQ4_XS}, {LLAMA_FTYPE_MOSTLY_IQ1_S,GGML_TYPE_IQ1_S},
+        {LLAMA_FTYPE_MOSTLY_IQ1_M,GGML_TYPE_IQ1_M}, {LLAMA_FTYPE_MOSTLY_IQ2_XXS,GGML_TYPE_IQ2_XXS},
+        {LLAMA_FTYPE_MOSTLY_IQ2_XS,GGML_TYPE_IQ2_XS}, {LLAMA_FTYPE_MOSTLY_IQ2_S,GGML_TYPE_IQ2_S},
+        {LLAMA_FTYPE_MOSTLY_IQ3_XXS,GGML_TYPE_IQ3_XXS}, {LLAMA_FTYPE_MOSTLY_IQ3_S,GGML_TYPE_IQ3_S},
+        {LLAMA_FTYPE_MOSTLY_IQ4_NL,GGML_TYPE_IQ4_NL}, {LLAMA_FTYPE_MOSTLY_Q5_0,GGML_TYPE_Q5_0},
+        {LLAMA_FTYPE_MOSTLY_Q5_1,GGML_TYPE_Q5_1}, {LLAMA_FTYPE_MOSTLY_Q6_K,GGML_TYPE_Q6_K},
+        {LLAMA_FTYPE_MOSTLY_Q8_0,GGML_TYPE_Q8_0},
+    };
+    const char * names[] = {"token_embd.weight","output.weight","blk.0.attn_q.weight","blk.0.attn_k.weight",
+        "blk.0.attn_v.weight","blk.0.attn_output.weight","blk.0.ffn_gate.weight","blk.0.ffn_up.weight","blk.0.ffn_down.weight"};
+    ggml_context * original_data=nullptr;auto * original_meta=gguf_init_from_file(source.c_str(),{false,&original_data});
+    check(original_meta && original_data,"native codec original data read");
+    std::vector<std::vector<float>> importance(9);
+    std::vector<llama_model_imatrix_data> entries;
+    for (int i=0;i<9;++i) {
+        importance[i].resize(i==8 ? 512 : 256);
+        for (size_t j=0;j<importance[i].size();++j) { importance[i][j]=1.f+.01f*float(j%13); }
+        entries.push_back({names[i],importance[i].data(),importance[i].size()});
+    }
+    entries.push_back({nullptr,nullptr,0});
+    for (const auto & codec : codecs) {
+        auto p=llama_model_quantize_default_params();p.ftype=codec.first;p.pure=true;p.nthread=2;
+        const llama_model_tensor_override overrides[]={{".*",codec.second},{nullptr,GGML_TYPE_COUNT}};
+        p.tt_overrides=overrides;
+        p.output_tensor_type=codec.second;p.token_embedding_type=codec.second;p.imatrix=entries.data();
+        const auto stock=(dir/("codec-"+std::to_string(codec.second)+"-stock.gguf")).string();
+        check(llama_model_quantize(source.c_str(),stock.c_str(),&p)==0,"native codec stock production");
+        ggml_context * stock_data=nullptr;auto * stock_meta=gguf_init_from_file(stock.c_str(),{false,&stock_data});
+        check(stock_meta && stock_data,"native codec stock read");
+        std::string identity,treatment;
+        for (double strength : {0.0,1.0}) {
+            const auto config=write_config(dir,strength); p.sinq_config=config.c_str();
+            const auto path=stock+(strength==0 ? ".identity.gguf" : ".sinq.gguf");
+            if(strength==0)identity=path;else treatment=path;
+            if(llama_model_quantize(source.c_str(),path.c_str(),&p)!=0) {
+                std::fprintf(stderr,"native codec companion failed: %s\n",ggml_type_name(codec.second));
+                check(false,"native codec identity/treatment producer unsupported");
+            }
+            ggml_context * data=nullptr;auto * meta=gguf_init_from_file(path.c_str(),{false,&data});
+            check(meta && data,"native codec companion read");int scales=0;
+            for(int64_t i=0;i<gguf_get_n_tensors(stock_meta);++i) {
+                const char * name=gguf_get_tensor_name(stock_meta,i);auto * a=ggml_get_tensor(stock_data,name);auto * b=ggml_get_tensor(data,name);
+                check(a && b && a->type==b->type,"native codec changed base type map");
+                const bool matrix=a->ne[1]>1;const bool conditioned=matrix && std::strncmp(name,"blk.",4)==0;
+                if(matrix && a->type!=codec.second) {
+                    std::fprintf(stderr,"native codec requested=%s tensor=%s actual=%s\n",ggml_type_name(codec.second),name,ggml_type_name(a->type));
+                    check(false,"native codec type promotion");
+                }
+                const bool companion=gguf_find_tensor(meta,(std::string(name)+".sinq_scale2").c_str())>=0;
+                check(companion==conditioned,"native codec projection association mismatch");scales+=companion;
+                if(strength==0 || !conditioned)check(ggml_nbytes(a)==ggml_nbytes(b) && std::memcmp(a->data,b->data,ggml_nbytes(a))==0,"native codec identity/unconditioned payload changed");
+                if(strength==1 && conditioned) {
+                    auto * original=ggml_get_tensor(original_data,name);
+                    auto * diagonal=ggml_get_tensor(data,(std::string(name)+".sinq_scale2").c_str());
+                    check(original && original->type==GGML_TYPE_F32 && diagonal,"native codec independent input source");
+                    const int64_t k=original->ne[0],n=original->ne[1];size_t index=0;
+                    while(index<9 && std::strcmp(names[index],name)!=0)++index;
+                    check(index<9,"native codec independent importance mapping");
+                    const auto * t=static_cast<const ggml_fp16_t *>(diagonal->data);
+                    const auto * w=static_cast<const float *>(original->data);
+                    std::vector<float> divided(size_t(k*n)),transformed(size_t(k),0.f);
+                    for(int64_t j=0;j<k;++j) {
+                        const float factor=ggml_fp16_to_fp32(t[j]);
+                        transformed[j]=importance[index][j]*factor*factor;
+                        for(int64_t i=0;i<n;++i)divided[size_t(i*k+j)]=w[i*k+j]/factor;
+                    }
+                    std::vector<uint8_t> expected(ggml_nbytes(b));
+                    check(ggml_quantize_chunk(codec.second,divided.data(),expected.data(),0,n,k,transformed.data())==expected.size(),"independent native encoder size");
+                    check(std::memcmp(expected.data(),b->data,expected.size())==0,"producer differs from native codec on original W/t and transformed t^2 I");
+                }
+            }
+            check(scales==7,"native codec missing projection scales");gguf_free(meta);ggml_free(data);
+            auto * model=load(path);check(model!=nullptr,"native codec companion loader unsupported");llama_model_free(model);
+        }
+        check(std::filesystem::file_size(identity)==std::filesystem::file_size(treatment),"native codec identity/treatment byte budget differs");
+        gguf_free(stock_meta);ggml_free(stock_data);
+        if(codec.second==GGML_TYPE_IQ2_XS) {
+            // A lookup has no linear activation-channel moment. Its required
+            // native weighting adapter must equal explicit uniform weights.
+            std::vector<float> uniform(256,1.f);
+            auto explicit_entries=entries;explicit_entries[0].data=uniform.data();
+            p.sinq_config=nullptr;p.imatrix=explicit_entries.data();
+            const auto expected=stock+".lookup-uniform.gguf";
+            const auto observed=stock+".lookup-no-linear-moment.gguf";
+            check(llama_model_quantize(source.c_str(),expected.c_str(),&p)==0,"explicit lookup weights");
+            p.imatrix=entries.data()+1;
+            check(llama_model_quantize(source.c_str(),observed.c_str(),&p)==0,"native lookup requires codec-neutral uniform importance fallback");
+            std::ifstream a(expected,std::ios::binary),b(observed,std::ios::binary);
+            const std::vector<char> first((std::istreambuf_iterator<char>(a)),{}),second((std::istreambuf_iterator<char>(b)),{});
+            check(first==second,"lookup importance fallback differs from explicit uniform native encoding");
+        }
+    }
+    gguf_free(original_meta);ggml_free(original_data);
+}
+
+static std::vector<char> file_bytes(const std::string & path) {
+    std::ifstream file(path,std::ios::binary);
+    check(bool(file),"open output for byte comparison");
+    return std::vector<char>((std::istreambuf_iterator<char>(file)),{});
+}
+
+static void settings_controls(const std::string & source, const std::filesystem::path & dir) {
+    const std::vector<std::string> ffn = {"blk.0.ffn_down.weight","blk.0.ffn_gate.weight","blk.0.ffn_up.weight"};
+    const std::vector<std::string> attention = {"blk.0.attn_k.weight","blk.0.attn_output.weight","blk.0.attn_q.weight","blk.0.attn_v.weight"};
+    auto all = ffn; all.insert(all.end(),attention.begin(),attention.end());
+    auto write_list = [&](const std::string & name, const std::vector<std::string> & names) {
+        const auto path=(dir/name).string(); std::ofstream out(path,std::ios::binary);
+        if (names==std::vector<std::string>{"\xff"}) {
+            out << "{\"schema_version\":2,\"defaults\":{},\"targets\":{\"include\":[\"\xff\"]}}";
+        } else {
+            out << nlohmann::json{{"schema_version",2},{"defaults",{{"generator","sinq"}}},{"targets",{{"include",names}}}}.dump();
+        }
+        out.close(); check(bool(out),"config fixture write"); return path;
+    };
+    const auto ffn_path=write_list("ffn.txt",ffn), attention_path=write_list("attention.txt",attention), all_path=write_list("all.txt",all);
+    auto p=llama_model_quantize_default_params(); p.ftype=LLAMA_FTYPE_MOSTLY_Q3_K_M; p.pure=true; p.nthread=2;
+    check(!p.sinq_config && !p.sinq_diagnostics_json,"new API defaults");
+    const auto stock=(dir/"settings-stock.gguf").string();
+    const auto stock_json=(dir/"settings-stock.json").string(); p.sinq_diagnostics_json=stock_json.c_str();
+    check(llama_model_quantize(source.c_str(),stock.c_str(),&p)==0,"stock diagnostics quantization");
+    check(!file_bytes(stock_json).empty(),"stock diagnostics missing"); p.sinq_diagnostics_json=nullptr;
+    const auto stock_plain=stock+".plain.gguf";
+    check(llama_model_quantize(source.c_str(),stock_plain.c_str(),&p)==0 && file_bytes(stock)==file_bytes(stock_plain),"diagnostics changed stock GGUF");
+    ggml_context * stock_data=nullptr; auto * stock_meta=gguf_init_from_file(stock.c_str(),{false,&stock_data});
+    check(stock_meta && stock_data,"settings stock read");
+    check(gguf_find_key(stock_meta,"beellama.qk_sinq.version")<0,"stock gained SINQ metadata");
+    const auto uniform_config=write_config(dir); p.sinq_config=uniform_config.c_str();
+    const auto legacy=(dir/"settings-uniform.gguf").string();
+    check(llama_model_quantize(source.c_str(),legacy.c_str(),&p)==0,"legacy defaults production");
+    const auto explicit_full=legacy+".full.gguf"; p.sinq_config=all_path.c_str();
+    check(llama_model_quantize(source.c_str(),explicit_full.c_str(),&p)==0,"explicit full mask strength one");
+    check(file_bytes(legacy)==file_bytes(explicit_full),"full exact mask strength one changed legacy bytes");
+    for (int partition=0;partition<2;++partition) {
+        const auto & names=partition==0 ? ffn : attention;
+        p.sinq_config=partition==0 ? ffn_path.c_str() : attention_path.c_str();
+        const auto output=(dir/("settings-mask-"+std::to_string(partition)+".gguf")).string();
+        const auto report=output+".json"; p.sinq_diagnostics_json=report.c_str();
+        check(llama_model_quantize(source.c_str(),output.c_str(),&p)==0,"exact-name mask quantization");
+        const auto first_report=file_bytes(report);
+        const auto diagnostic=nlohmann::json::parse(first_report.begin(),first_report.end());
+        check(diagnostic.at("totals").at("eligible_tensors")==7 && diagnostic.at("totals").at("included_tensors")==names.size(),"diagnostic mask totals");
+        check(diagnostic.at("schema_version")==2,"diagnostic schema version");
+        std::string previous;
+        for (const auto & record : diagnostic.at("tensors")) {
+            const auto name=record.at("name").get<std::string>();
+            check(previous.empty() || previous<name,"diagnostics not sorted by exact name"); previous=name;
+            const bool selected=std::find(names.begin(),names.end(),name)!=names.end();
+            check(record.at("included")==selected && record.at("qtype")==ggml_type_name(GGML_TYPE_Q3_K),"diagnostics selection or actual codec");
+            if (selected) {
+                check(record.at("statistics_status")=="computed" && record.at("strips").is_array() &&
+                      record.at("scales_sha256").get<std::string>().size()==64 && record.at("companion_bytes").get<size_t>()>0,"included diagnostics incomplete");
+            } else {
+                check(record.at("reason")=="not_selected" && record.at("statistics_status")=="not_computed" &&
+                      record.at("strips").is_null() && record.at("scales_sha256").is_null() && record.at("companion_bytes")==0,"excluded diagnostics invented statistics");
+            }
+        }
+        auto reversed=names; std::reverse(reversed.begin(),reversed.end());
+        const auto reversed_path=write_list("reversed-mask.txt",reversed); p.sinq_config=reversed_path.c_str();
+        check(llama_model_quantize(source.c_str(),output.c_str(),&p)==0 && first_report==file_bytes(report),"diagnostics not deterministic");
+        ggml_context * data=nullptr; auto * meta=gguf_init_from_file(output.c_str(),{false,&data});
+        check(meta && data,"mask output read"); int companions=0;
+        for (int64_t i=0;i<gguf_get_n_tensors(stock_meta);++i) {
+            const char * name=gguf_get_tensor_name(stock_meta,i);
+            auto * a=ggml_get_tensor(stock_data,name); auto * b=ggml_get_tensor(data,name);
+            check(a && b && a->type==b->type,"mask changed stock allocation");
+            const bool selected=std::find(names.begin(),names.end(),name)!=names.end();
+            const bool has_scale=gguf_find_tensor(meta,(std::string(name)+".sinq_scale2").c_str())>=0;
+            check(has_scale==selected,"mask selection not exact"); companions+=has_scale;
+            if (!selected) { check(ggml_nbytes(a)==ggml_nbytes(b) && std::memcmp(a->data,b->data,ggml_nbytes(a))==0,"mask excluded payload differs from stock"); }
+        }
+        check(companions==int(names.size()),"mask complement companion count");
+        gguf_free(meta); ggml_free(data);
+    }
+    const auto zero_config=write_config(dir,0.0); p.sinq_config=zero_config.c_str(); p.sinq_diagnostics_json=nullptr;
+    const auto zero=legacy+".zero.gguf", identity=legacy+".repeated-zero.gguf";
+    check(llama_model_quantize(source.c_str(),zero.c_str(),&p)==0,"strength zero production");
+    check(llama_model_quantize(source.c_str(),identity.c_str(),&p)==0,"repeated strength zero production");
+    ggml_context * zero_data=nullptr, * identity_data=nullptr;
+    auto * zero_meta=gguf_init_from_file(zero.c_str(),{false,&zero_data});
+    auto * identity_meta=gguf_init_from_file(identity.c_str(),{false,&identity_data});
+    check(zero_meta && identity_meta && zero_data && identity_data,"identity output read");
+    for (int64_t i=0;i<gguf_get_n_tensors(zero_meta);++i) {
+        const char * name=gguf_get_tensor_name(zero_meta,i);
+        auto * a=ggml_get_tensor(zero_data,name); auto * b=ggml_get_tensor(identity_data,name);
+        check(a && b && a->type==b->type && ggml_nbytes(a)==ggml_nbytes(b) && std::memcmp(a->data,b->data,ggml_nbytes(a))==0,"strength zero differs from identity payload");
+        if (auto * stock_tensor=ggml_get_tensor(stock_data,name)) {
+            check(ggml_nbytes(a)==ggml_nbytes(stock_tensor) && std::memcmp(a->data,stock_tensor->data,ggml_nbytes(a))==0,"strength zero differs from stock payload");
+        }
+    }
+    gguf_free(zero_meta); gguf_free(identity_meta); ggml_free(zero_data); ggml_free(identity_data);
+    gguf_free(stock_meta); ggml_free(stock_data);
+    p.sinq_config=uniform_config.c_str(); write_config(dir);
+    const auto rejected=(dir/"settings-rejected.gguf").string();
+    auto reject=[&](const char * message) { check(llama_model_quantize(source.c_str(),rejected.c_str(),&p)!=0,message); };
+    for (double value : {-1.0,1.01,double(NAN),double(INFINITY)}) { write_config(dir,value); reject("bad config strength accepted"); }
+    write_config(dir);
+    const std::vector<std::vector<std::string>> invalid_lists={ {}, {""}, {ffn[0],ffn[0]}, {"blk.99.ffn_up.weight"},
+        {"output.weight"}, {"token_embd.weight"}, {"blk.0.attn_norm.weight"}, {"blk.*.ffn_up.weight"}, {" blk.0.ffn_up.weight"}, {"\xff"} };
+    for (size_t i=0;i<invalid_lists.size();++i) {
+        const auto path=write_list("bad-mask-"+std::to_string(i)+".txt",invalid_lists[i]); p.sinq_config=path.c_str(); reject("bad config targets accepted");
+    }
+    const auto missing=(dir/"nonexistent-config.json").string(); p.sinq_config=missing.c_str(); reject("missing config accepted");
+    p.sinq_config=ffn_path.c_str();
+    const llama_model_tensor_override unsupported[]={{".*",GGML_TYPE_F32},{nullptr,GGML_TYPE_COUNT}};
+    p.tt_overrides=unsupported; reject("explicit unsupported codec accepted"); p.tt_overrides=nullptr;
+    p.sinq_config=uniform_config.c_str();
+    for(int width:{-1,0,2,7,15,48,96,1024}) { write_config(dir,1.0,width); reject("bad strip width accepted"); }
+    write_config(dir);
+    { std::ofstream out(uniform_config); out << R"({"schema_version":2,"defaults":{"iterations":3},"targets":{"include":"eligible"}})"; }
+    reject("bad iterations accepted"); write_config(dir);
+    p.only_copy=true; reject("conditioning copy accepted"); p.only_copy=false;
+    const auto bad_report=(dir/"missing-report-directory"/"report.json").string();
+    p.sinq_diagnostics_json=bad_report.c_str(); reject("diagnostics write error ignored");
+    p.sinq_diagnostics_json=source.c_str(); reject("diagnostics overwrite of source accepted");
+    p.sinq_diagnostics_json=stock_json.c_str(); p.dry_run=true; reject("dry-run diagnostics accepted");
+    p.dry_run=false; p.sinq_diagnostics_json=nullptr;
+    const auto malformed=(dir/"settings-incompatible-shape.gguf").string(); make_model(malformed,"source",true);
+    const auto up_only=write_list("up-only.txt",{"blk.0.ffn_up.weight"}); p.sinq_config=up_only.c_str();
+    check(llama_model_quantize(malformed.c_str(),rejected.c_str(),&p)!=0,"explicit selection silently changed codec for incompatible shape");
+    p.ftype=LLAMA_FTYPE_MOSTLY_Q8_0;
+    check(llama_model_quantize(malformed.c_str(),rejected.c_str(),&p)!=0,"explicit strip-incompatible shape accepted");
+}
+
+static void encoding_controls(const std::filesystem::path & dir) {
+    const char * selected="blk.0.ffn_up.weight";
+    const std::string companion=std::string(selected)+".sinq_scale2";
+    const auto source=(dir/"encoding-source.gguf").string();
+    make_model(source,"source",false,64,true);
+    ggml_context * original=nullptr;
+    auto * source_meta=gguf_init_from_file(source.c_str(),{false,&original});
+    check(source_meta && original,"encoding source read");
+    std::vector<std::vector<float>> importance(size_t(gguf_get_n_tensors(source_meta)));
+    std::vector<llama_model_imatrix_data> entries;
+    for (int64_t i=0;i<gguf_get_n_tensors(source_meta);++i) {
+        const char * name=gguf_get_tensor_name(source_meta,i);
+        auto * tensor=ggml_get_tensor(original,name);
+        if (tensor->ne[1]<=1) { continue; }
+        importance[i].resize(size_t(tensor->ne[0]));
+        for (size_t j=0;j<importance[i].size();++j) { importance[i][j]=.1f+float((j*37)%29)*.11f; }
+        entries.push_back({name,importance[i].data(),importance[i].size()});
+    }
+    entries.push_back({nullptr,nullptr,0});
+    auto * w=ggml_get_tensor(original,selected);
+    const auto * weights=static_cast<const float *>(w->data);
+    const int64_t columns=w->ne[0],rows=w->ne[1];
+    const float * channel_importance=nullptr;
+    for (const auto & entry:entries) if (entry.name && std::strcmp(entry.name,selected)==0) { channel_importance=entry.data; }
+    check(channel_importance!=nullptr,"selected importance missing");
+    const std::pair<llama_ftype,ggml_type> codecs[]={
+        {LLAMA_FTYPE_MOSTLY_IQ2_XS,GGML_TYPE_IQ2_XS},{LLAMA_FTYPE_MOSTLY_IQ2_S,GGML_TYPE_IQ2_S},
+        {LLAMA_FTYPE_MOSTLY_IQ3_S,GGML_TYPE_IQ3_S},{LLAMA_FTYPE_MOSTLY_Q4_K_M,GGML_TYPE_Q4_K},
+        {LLAMA_FTYPE_MOSTLY_Q6_K,GGML_TYPE_Q6_K}};
+    for (const auto & codec:codecs) {
+        auto p=llama_model_quantize_default_params();p.ftype=codec.first;p.pure=true;p.nthread=1;p.imatrix=entries.data();
+        const llama_model_tensor_override overrides[]={{".*",codec.second},{nullptr,GGML_TYPE_COUNT}};
+        p.tt_overrides=overrides;p.output_tensor_type=codec.second;p.token_embedding_type=codec.second;
+        const auto base=(dir/("encoding-"+std::to_string(codec.second)+"-default.gguf")).string();
+        auto config=write_config(dir,1.,64,nlohmann::json::array({selected}));p.sinq_config=config.c_str();
+        check(llama_model_quantize(source.c_str(),base.c_str(),&p)==0,"encoding default quantization");
+        ggml_context * base_data=nullptr;
+        auto * base_meta=gguf_init_from_file(base.c_str(),{false,&base_data});
+        check(base_meta && base_data,"encoding default read");
+        check(gguf_find_key(base_meta,"quantize.sinq.imatrix_exponent")<0,"default producer metadata changed");
+        auto * u_tensor=ggml_get_tensor(base_data,companion.c_str());
+        const auto * u0=static_cast<const ggml_fp16_t *>(u_tensor->data);
+        std::vector<float> divided(size_t(rows*columns));
+        for (int64_t i=0;i<rows*columns;++i) { divided[i]=weights[i]/ggml_fp16_to_fp32(u0[i%columns]); }
+        // Continuous parameters, not only the historical experiment grid.
+        for (const auto & setting:std::vector<std::pair<double,double>>{{0.,2.},{0.,1.73},{.63,2.},{.17,1.73}}) {
+            const double lambda=setting.first,exponent=setting.second;
+            const auto output=base+".l"+std::to_string(lambda)+".p"+std::to_string(exponent)+".gguf";
+            config=write_config(dir,1.,64,nlohmann::json::array({selected}),nlohmann::json::array(),
+                {{"scale_refinement_lambda",lambda},{"imatrix_exponent",exponent}});
+            p.sinq_config=config.c_str();p.nthread=1;p.max_buf_size=0;
+            check(llama_model_quantize(source.c_str(),output.c_str(),&p)==0,"encoding controls quantization");
+            if (lambda==0 && exponent==2) {
+                std::ifstream a(base,std::ios::binary),b(output,std::ios::binary);
+                check(std::vector<char>((std::istreambuf_iterator<char>(a)),{})==
+                      std::vector<char>((std::istreambuf_iterator<char>(b)),{}),"explicit defaults changed GGUF bytes");
+            }
+            ggml_context * data=nullptr;
+            auto * meta=gguf_init_from_file(output.c_str(),{false,&data});check(meta && data,"encoding output read");
+            auto * payload=ggml_get_tensor(data,selected);auto * scale=ggml_get_tensor(data,companion.c_str());
+            check(payload && scale && payload->type==codec.second,"encoding changed allocation");
+            std::vector<float> transformed(size_t(columns),0.f),decoded(size_t(rows*columns));
+            for (int64_t j=0;j<columns;++j) {
+                const float u=ggml_fp16_to_fp32(u0[j]);
+                transformed[j]=exponent==2 ? channel_importance[j]*u*u :
+                    float(double(channel_importance[j])*std::pow(double(u),exponent));
+            }
+            std::vector<uint8_t> expected(ggml_nbytes(payload));
+            check(ggml_quantize_chunk(codec.second,divided.data(),expected.data(),0,rows,columns,transformed.data())==expected.size(),"encoding native oracle size");
+            check(std::memcmp(expected.data(),payload->data,expected.size())==0,"encoding differs from native exponent oracle");
+            ggml_get_type_traits(codec.second)->to_float(payload->data,decoded.data(),rows*columns);
+            const auto * actual=static_cast<const ggml_fp16_t *>(scale->data);
+            bool changed=false;
+            for (int64_t j=0;j<columns;++j) {
+                double numerator=0,denominator=0;
+                for (int64_t i=0;i<rows;++i) {
+                    numerator+=double(weights[i*columns+j])*decoded[i*columns+j];
+                    denominator+=double(decoded[i*columns+j])*decoded[i*columns+j];
+                }
+                ggml_fp16_t wanted=u0[j];const double ls=numerator/denominator;
+                if (lambda>0 && denominator>0 && std::isfinite(ls) && ls>0 && ls<=65504.) {
+                    const float half=ggml_fp16_to_fp32(ggml_fp32_to_fp16(float(ls)));
+                    if (std::isfinite(half) && half>0) {
+                        wanted=ggml_fp32_to_fp16(float((1-lambda)*ggml_fp16_to_fp32(u0[j])+lambda*ls));
+                    }
+                }
+                check(actual[j]==wanted,"encoding scale differs from fixed-payload LS oracle");
+                changed=changed || actual[j]!=u0[j];
+            }
+            if (lambda>0) { check(changed,"refinement fixture did not change sidecars"); }
+            for (int64_t i=0;i<gguf_get_n_tensors(base_meta);++i) {
+                const char * name=gguf_get_tensor_name(base_meta,i);
+                auto * a=ggml_get_tensor(base_data,name);auto * b=ggml_get_tensor(data,name);
+                check(a && b && a->type==b->type && ggml_nbytes(a)==ggml_nbytes(b),"encoding changed tensor inventory");
+                if (std::strcmp(name,selected)!=0 && companion!=name) {
+                    check(std::memcmp(a->data,b->data,ggml_nbytes(a))==0,"encoding changed unselected tensor");
+                }
+            }
+            if (lambda!=0 || exponent!=2) {
+                check(gguf_get_val_f64(meta,gguf_find_key(meta,"quantize.sinq.scale_refinement_lambda"))==lambda &&
+                      gguf_get_val_f64(meta,gguf_find_key(meta,"quantize.sinq.imatrix_exponent"))==exponent,"encoding provenance missing");
+            }
+            gguf_free(meta);ggml_free(data);
+            auto * model=load(output);check(model!=nullptr,"encoding model load");llama_model_free(model);
+            const auto slabbed=output+".slabs.gguf";p.nthread=4;p.max_buf_size=4096;
+            check(llama_model_quantize(source.c_str(),slabbed.c_str(),&p)==0,"encoding slab quantization");
+            std::ifstream a(output,std::ios::binary),b(slabbed,std::ios::binary);
+            check(std::vector<char>((std::istreambuf_iterator<char>(a)),{})==
+                  std::vector<char>((std::istreambuf_iterator<char>(b)),{}),"encoding slab/thread bytes changed");
+        }
+        gguf_free(base_meta);ggml_free(base_data);
+    }
+    gguf_free(source_meta);ggml_free(original);
+    std::puts("direct SINQ encoding: defaults, arbitrary float controls, native/LS oracles and slab/load parity");
+}
+
+static void width_roundtrips(const std::string & source, const std::filesystem::path & dir) {
+    for(int width:{4,8,16,32,64,128,256,512}) {
+        const auto manual=(dir/("width-manual-"+std::to_string(width)+".gguf")).string();
+        make_model(manual,"valid",false,width);
+        auto * direct=load(manual); check(direct!=nullptr,"valid width metadata rejected"); llama_model_free(direct);
+        for(auto format:{LLAMA_FTYPE_MOSTLY_Q3_K_M,LLAMA_FTYPE_MOSTLY_Q4_K_M}) {
+            auto p=llama_model_quantize_default_params(); p.ftype=format; p.pure=true; p.nthread=1;
+            const auto config=write_config(dir,1.0,width,nlohmann::json::array({"blk.0.ffn_down.weight"}));
+            p.sinq_config=config.c_str();
+            // Only FFN down has K=512 in this fixture. Explicitly selecting it
+            // preserves the requested width rather than shrinking other strips.
+            const auto output=(dir/("width-"+std::to_string(width)+"-"+std::to_string(format)+".gguf")).string();
+            check(llama_model_quantize(source.c_str(),output.c_str(),&p)==0,"width quantization");
+            ggml_context * data=nullptr;
+            auto * metadata=gguf_init_from_file(output.c_str(),{false,&data});
+            check(metadata && data,"width output read");
+            const auto recipe=sinq::validate_recipe(gguf_get_arr_str(metadata,gguf_find_key(metadata,"beellama.qk_sinq.recipes"),0));
+            check(recipe.strip_width==width,"requested width changed");
+            auto * scale=ggml_get_tensor(data,"blk.0.ffn_down.weight.sinq_scale2");
+            check(scale && scale->type==GGML_TYPE_F16 && scale->ne[0]==512 && ggml_nbytes(scale)==1024,"width changed sidecar layout");
+            for(int i=0;i<512;++i) {
+                const float value=ggml_fp16_to_fp32(static_cast<const ggml_fp16_t *>(scale->data)[i]);
+                check(std::isfinite(value) && value>0,"width scale not finite positive");
+            }
+            check(gguf_get_arr_n(metadata,gguf_find_key(metadata,"beellama.qk_sinq.tensors"))==1,"width selection expanded");
+            check(gguf_get_tensor_type(metadata,gguf_find_tensor(metadata,"blk.0.ffn_down.weight"))==
+                (format==LLAMA_FTYPE_MOSTLY_Q3_K_M?GGML_TYPE_Q3_K:GGML_TYPE_Q4_K),"width changed native weight codec");
+            check(gguf_find_tensor(metadata,"blk.0.ffn_up.weight.sinq_scale2")<0,"width added an unselected companion");
+            gguf_free(metadata); ggml_free(data);
+            auto * model=load(output); check(model!=nullptr,"width quantized model reload"); llama_model_free(model);
+            p.nthread=4; p.max_buf_size=4096;
+            const auto parallel=output+".parallel.gguf";
+            check(llama_model_quantize(source.c_str(),parallel.c_str(),&p)==0,"parallel width quantization");
+            std::ifstream one(output,std::ios::binary),four(parallel,std::ios::binary);
+            const std::vector<char> a((std::istreambuf_iterator<char>(one)),{}),b((std::istreambuf_iterator<char>(four)),{});
+            check(one.good() && four.good() && a==b,"width threads/slabs changed GGUF bytes");
+            if(width==512) {
+                write_config(dir,1.0,width);
+                const auto rejected=output+".misaligned.gguf";
+                check(llama_model_quantize(source.c_str(),rejected.c_str(),&p)!=0,"width512 silently shrank a K256 strip");
+            }
+        }
+    }
+    std::puts("widths 4/8/16/32/64/128/256/512: explicit FFN-down quantize/reload, F16 sidecars and thread/slab bytes");
+}
+
+int main(int argc, char ** argv) try {
+    if (argc == 3 && std::strcmp(argv[1],"--load-only") == 0) {
+        llama_log_set(logger,nullptr); llama_backend_init();
+        auto * model = load(argv[2]); if (!model) { std::fprintf(stderr,"%s",logs.c_str()); }
+        check(model != nullptr,"external fixture load"); llama_model_free(model); llama_backend_free();
+        std::puts("SINQ external fixture load passed"); return 0;
+    }
+    check(argc == 2,"provide a dedicated temporary directory");
+    const auto dir = std::filesystem::path(argv[1]); std::filesystem::create_directories(dir);
+    llama_log_set(logger,nullptr); llama_backend_init();
+    const auto source = (dir/"source.gguf").string(); make_model(source,"source");
+    auto * ordinary = load(source); if (!ordinary) { std::fprintf(stderr,"%s",logs.c_str()); }
+    check(ordinary != nullptr,"ordinary fixture load"); llama_model_free(ordinary);
+    const auto hybrid_source = (dir/"hybrid-source.gguf").string();
+    make_model(hybrid_source,"source",false,64,false,true);
+    const llama_ftype formats[] = {LLAMA_FTYPE_MOSTLY_Q3_K_M,LLAMA_FTYPE_MOSTLY_Q4_K_M};
+    for (auto format : formats) {
+        const auto output = (dir/("quantized-"+std::to_string(format)+".gguf")).string();
+        auto p = llama_model_quantize_default_params(); p.ftype = format; p.pure = true; p.nthread = 2;
+        const auto config=write_config(dir); p.sinq_config=config.c_str();
+        check(llama_model_quantize(source.c_str(),output.c_str(),&p) == 0,"standard QK model precondition/quantize");
+        auto * metadata = gguf_init_from_file(output.c_str(),{true,nullptr});
+        check(metadata != nullptr,"read quantized metadata");
+        const auto scale = gguf_find_tensor(metadata,"blk.0.ffn_up.weight.sinq_scale2");
+        check(scale >= 0,"quantizer did not produce required QK companion");
+        check(gguf_get_tensor_type(metadata,gguf_find_tensor(metadata,"blk.0.ffn_up.weight")) == (format==LLAMA_FTYPE_MOSTLY_Q3_K_M ? GGML_TYPE_Q3_K : GGML_TYPE_Q4_K),"not an ordinary QK wire type");
+        check(gguf_find_key(metadata,"beellama.qk_sinq.version")>=0,"new version namespace missing");
+        gguf_free(metadata);
+        auto * model = load(output); if (!model) { std::fprintf(stderr,"%s",logs.c_str()); }
+        check(model != nullptr,"QK companion fixture load"); llama_model_free(model);
+        const auto hybrid_output = output+".hybrid.gguf";
+        check(llama_model_quantize(hybrid_source.c_str(),hybrid_output.c_str(),&p) == 0,
+              "hybrid SINQ fixture quantization");
+        const auto hybrid_stock = output+".hybrid-stock.gguf";
+        p.sinq_config = nullptr;
+        check(llama_model_quantize(hybrid_source.c_str(),hybrid_stock.c_str(),&p) == 0,"hybrid stock quantization");
+        tensor_split_roundtrip(hybrid_stock);
+        p.sinq_config = config.c_str();
+        tensor_split_roundtrip(hybrid_output);
+        // Deliberately equal scales on input- and output-channel projections
+        // must not be deduplicated into one differently sharded runtime vector.
+        tensor_split_roundtrip(equal_diagonal_fixture(hybrid_output));
+        const auto chunked = output+".chunked.gguf";
+        p.max_buf_size = 4096;
+        check(llama_model_quantize(source.c_str(),chunked.c_str(),&p) == 0,"small-slab quantization");
+        std::ifstream full(output,std::ios::binary), slabs(chunked,std::ios::binary);
+        const std::vector<char> full_bytes((std::istreambuf_iterator<char>(full)),{});
+        const std::vector<char> slab_bytes((std::istreambuf_iterator<char>(slabs)),{});
+        check(full_bytes == slab_bytes,"slab boundaries changed normalization, native encoding or GGUF bytes");
+        std::printf("standard QK quantize/reload/slab identity format=%d OK\n",format);
+    }
+    width_roundtrips(source,dir);
+    encoding_controls(dir);
+    settings_controls(source,dir);
+    full_coverage_pairs(source,dir);
+    native_codec_pairs(source,dir);
+    // Conditioning must preserve mixed preset allocations, including IQ
+    // presets whose names differ from their native tensor codecs.
+    ggml_context * preset_data=nullptr;
+    auto * preset_meta=gguf_init_from_file(source.c_str(),{false,&preset_data});
+    check(preset_meta && preset_data,"mixed preset source read");
+    std::vector<std::vector<float>> preset_importance(size_t(gguf_get_n_tensors(preset_meta)));
+    std::vector<llama_model_imatrix_data> preset_entries;
+    for(int64_t i=0;i<gguf_get_n_tensors(preset_meta);++i) {
+        const char * name=gguf_get_tensor_name(preset_meta,i);
+        auto * tensor=ggml_get_tensor(preset_data,name);
+        if(tensor->ne[1]<=1)continue;
+        preset_importance[i].assign(size_t(tensor->ne[0]),1.f);
+        preset_entries.push_back({name,preset_importance[i].data(),preset_importance[i].size()});
+    }
+    preset_entries.push_back({nullptr,nullptr,0});
+    for (auto format : {LLAMA_FTYPE_MOSTLY_Q2_K,LLAMA_FTYPE_MOSTLY_Q2_K_S,
+                        LLAMA_FTYPE_MOSTLY_Q3_K_S,LLAMA_FTYPE_MOSTLY_Q3_K_M,LLAMA_FTYPE_MOSTLY_Q3_K_L,
+                        LLAMA_FTYPE_MOSTLY_Q4_0,LLAMA_FTYPE_MOSTLY_Q4_1,
+                        LLAMA_FTYPE_MOSTLY_Q4_K_S,LLAMA_FTYPE_MOSTLY_Q4_K_M,
+                        LLAMA_FTYPE_MOSTLY_Q5_K_S,LLAMA_FTYPE_MOSTLY_Q5_K_M,
+                        LLAMA_FTYPE_MOSTLY_Q6_K,LLAMA_FTYPE_MOSTLY_Q8_0,
+                        LLAMA_FTYPE_MOSTLY_IQ2_S,LLAMA_FTYPE_MOSTLY_IQ2_M,
+                        LLAMA_FTYPE_MOSTLY_IQ3_XXS,LLAMA_FTYPE_MOSTLY_IQ3_XS,LLAMA_FTYPE_MOSTLY_IQ3_S,LLAMA_FTYPE_MOSTLY_IQ3_M,
+                        LLAMA_FTYPE_MOSTLY_IQ4_NL,LLAMA_FTYPE_MOSTLY_IQ4_XS}) {
+        const auto standard = (dir/("preset-standard-"+std::to_string(format)+".gguf")).string();
+        const auto normalized = (dir/("preset-normalized-"+std::to_string(format)+".gguf")).string();
+        auto p = llama_model_quantize_default_params(); p.ftype = format; p.nthread = 2; p.imatrix=preset_entries.data();
+        check(!p.pure,"mixed preset unexpectedly defaults to pure");
+        check(llama_model_quantize(source.c_str(),standard.c_str(),&p)==0,"ordinary mixed preset quantize");
+        const auto config=write_config(dir); p.sinq_config=config.c_str();
+        check(llama_model_quantize(source.c_str(),normalized.c_str(),&p)==0,"conditioned mixed preset quantize");
+        ggml_context * base_data = nullptr, * conditioned_data = nullptr;
+        auto * base = gguf_init_from_file(standard.c_str(),{false,&base_data});
+        auto * conditioned = gguf_init_from_file(normalized.c_str(),{false,&conditioned_data});
+        check(base && conditioned && base_data && conditioned_data,"mixed preset metadata/data read");
+        check(gguf_get_val_u32(base,gguf_find_key(base,"general.file_type")) ==
+              gguf_get_val_u32(conditioned,gguf_find_key(conditioned,"general.file_type")),"conditioning changed conventional ftype");
+        int companions = 0;
+        for (int64_t i = 0; i < gguf_get_n_tensors(base); ++i) {
+            const char * name = gguf_get_tensor_name(base,i);
+            const int64_t j = gguf_find_tensor(conditioned,name);
+            check(j>=0 && gguf_get_tensor_type(base,i)==gguf_get_tensor_type(conditioned,j),"conditioning changed mixed preset type allocation");
+            const auto type = gguf_get_tensor_type(base,i);
+            const bool eligible = std::strncmp(name,"blk.",4)==0 && llama_sinq_supported_type(type);
+            const bool has_scale = gguf_find_tensor(conditioned,(std::string(name)+".sinq_scale2").c_str())>=0;
+            check(has_scale==eligible,"mixed preset companion coverage does not match native codec allocation");
+            if (!eligible) {
+                auto * a = ggml_get_tensor(base_data,name);
+                auto * b = ggml_get_tensor(conditioned_data,name);
+                check(a && b && ggml_nbytes(a)==ggml_nbytes(b) &&
+                      std::memcmp(a->data,b->data,ggml_nbytes(a))==0,"conditioning changed an unassociated mixed-preset payload");
+            }
+            companions += has_scale;
+        }
+        check(companions==7,"mixed preset fixture must condition all seven projections");
+        gguf_free(base); gguf_free(conditioned);
+        ggml_free(base_data); ggml_free(conditioned_data);
+        auto * model = load(normalized);
+        check(model!=nullptr,"conditioned mixed preset reload");
+        llama_model_free(model);
+        std::printf("mixed preset type allocation/companion/reload format=%d OK\n",format);
+    }
+    gguf_free(preset_meta);ggml_free(preset_data);
+    const auto mixed = (dir/"mixed-standard-types.gguf").string();
+    auto mixed_params = llama_model_quantize_default_params();
+    mixed_params.ftype = LLAMA_FTYPE_MOSTLY_Q3_K_M;
+    mixed_params.pure = true;
+    const auto mixed_config=write_config(dir,1.0,64,"eligible",nlohmann::json::array({
+        {{"selector",{{"tensor","blk.0.attn_q.weight"}}},{"parameters",{{"strip_width",32},{"iterations",4},{"strength",0.5}}}},
+        {{"selector",{{"tensor","blk.0.ffn_down.weight"}}},{"parameters",{{"strip_width",128},{"iterations",8},{"strength",0.0}}}}
+    }));
+    mixed_params.sinq_config = mixed_config.c_str();
+    mixed_params.nthread = 2;
+    const llama_model_tensor_override overrides[] = {
+        {"blk\\.0\\.ffn_up\\.weight",GGML_TYPE_F32},
+        {"blk\\.0\\.ffn_gate\\.weight",GGML_TYPE_Q4_K},
+        {nullptr,GGML_TYPE_COUNT},
+    };
+    mixed_params.tt_overrides = overrides;
+    check(llama_model_quantize(source.c_str(),mixed.c_str(),&mixed_params)==0,"mixed QK and floating tensor selection");
+    auto * mixed_metadata=gguf_init_from_file(mixed.c_str(),{true,nullptr});
+    check(mixed_metadata!=nullptr,"mixed metadata read");
+    check(gguf_get_tensor_type(mixed_metadata,gguf_find_tensor(mixed_metadata,"blk.0.ffn_up.weight"))==GGML_TYPE_F32 &&
+          gguf_find_tensor(mixed_metadata,"blk.0.ffn_up.weight.sinq_scale2")<0,"floating override gained a companion");
+    check(gguf_get_tensor_type(mixed_metadata,gguf_find_tensor(mixed_metadata,"blk.0.ffn_gate.weight"))==GGML_TYPE_Q4_K &&
+          gguf_find_tensor(mixed_metadata,"blk.0.ffn_gate.weight.sinq_scale2")>=0,"Q4 override lost its companion");
+    gguf_free(mixed_metadata);
+    auto * mixed_model=load(mixed);
+    check(mixed_model!=nullptr,"mixed standard-type model reload");
+    llama_model_free(mixed_model);
+    const auto first_split = split_source(source,dir);
+    const auto split_prefix = (dir/"split-quantized").string();
+    auto split_params = llama_model_quantize_default_params();
+    const auto split_config=write_config(dir);
+    split_params.ftype = LLAMA_FTYPE_MOSTLY_Q3_K_M; split_params.sinq_config=split_config.c_str(); split_params.pure = true; split_params.keep_split = true; split_params.nthread = 2;
+    check(llama_model_quantize(first_split.c_str(),split_prefix.c_str(),&split_params) == 0,"keep-split quantization");
+    const auto split_output = split_prefix+"-00001-of-00004.gguf";
+    auto * split_model = load(split_output); if (!split_model) { std::fprintf(stderr,"%s",logs.c_str()); }
+    check(split_model != nullptr,"keep-split model reload"); llama_model_free(split_model);
+    std::puts("four-shard quantize/companion/reload OK");
+    const std::pair<const char *,const char *> bad[] = {
+        {"missing_version","qk_sinq"},{"version_dtype","qk_sinq"},{"version_value","qk_sinq"},
+        {"missing_manifest","v2 metadata"},{"duplicate_manifest","strictly sorted"},
+        {"bad_width","strip_width"},{"bad_iterations","iterations"},
+        {"strip_misaligned","strip-aligned"},
+        {"missing_scale","companion"},{"orphan","companion"},{"scale_shape","FP16"},{"scale_dtype","FP16"},
+        {"scale_nan","non-finite or non-positive"},{"scale_zero","non-finite or non-positive"},{"scale_negative","non-finite or non-positive"},
+        {"unsupported","unsupported tensor"},{"hadamard","Hadamard"},
+        {"legacy_enabled","unsupported SINQ metadata"},{"legacy_disabled","unsupported SINQ metadata"},
+        {"legacy_mistyped","unsupported SINQ metadata"},{"unknown_metadata","unsupported SINQ metadata"},
+        {"metadata_only","unsupported SINQ metadata"},
+    };
+    for (const auto & entry : bad) {
+        const auto path = (dir/(std::string(entry.first)+".gguf")).string(); make_model(path,entry.first);
+        auto * model = load(path); if (model) { llama_model_free(model); }
+        if (model || logs.find(entry.second) == std::string::npos) { std::fprintf(stderr,"%s",logs.c_str()); }
+        check(!model && logs.find(entry.second) != std::string::npos,"malformed fixture accepted or wrong error");
+        std::printf("malformed %s rejected OK\n",entry.first);
+    }
+    // Unknown transform metadata must not leak through stock COPY or quantization.
+    for (bool copy : {false,true}) {
+        auto p=llama_model_quantize_default_params(); p.only_copy=copy;
+        check(llama_model_quantize((dir/"metadata_only.gguf").string().c_str(),
+            (dir/"metadata-rejected.gguf").string().c_str(),&p)!=0,"unsupported metadata accepted without version");
+    }
+    // Required companion validation also runs without the optional general
+    // tensor checker, which catches NaN earlier when it is enabled above.
+    auto * nan_without_check = load((dir/"scale_nan.gguf").string(),LLAMA_SPLIT_MODE_NONE,false);
+    if (nan_without_check) { llama_model_free(nan_without_check); }
+    check(!nan_without_check && logs.find("non-finite or non-positive") != std::string::npos,"NaN side scale must fail without optional tensor checks");
+    const auto valid = (dir/"valid.gguf").string(); make_model(valid,"valid");
+    const auto unsupported_split = split_source(valid,dir,false,true);
+    auto * unsupported_model = load(unsupported_split);
+    if (unsupported_model) { llama_model_free(unsupported_model); }
+    check(!unsupported_model && logs.find("unsupported SINQ metadata") != std::string::npos,"unsupported metadata accepted in secondary shard");
+    auto reject_copy=llama_model_quantize_default_params(); reject_copy.only_copy=true;
+    check(llama_model_quantize(unsupported_split.c_str(),(dir/"rejected-split.gguf").string().c_str(),&reject_copy)!=0,
+          "COPY accepted unsupported metadata from secondary shard");
+    llama_model_kv_override obsolete_override[2] = {};
+    std::strcpy(obsolete_override[0].key,"beellama.qk_sinq.kurtosis_gate");
+    obsolete_override[0].tag=LLAMA_KV_OVERRIDE_TYPE_BOOL; obsolete_override[0].val_bool=false;
+    auto override_source=llama_model_default_params(); override_source.n_gpu_layers=0; override_source.kv_overrides=obsolete_override;
+    auto * overridden=llama_model_load_from_file(source.c_str(),override_source);
+    if (overridden) { llama_model_free(overridden); }
+    check(!overridden,"unsupported metadata override accepted by loader");
+    reject_copy.kv_overrides=obsolete_override;
+    check(llama_model_quantize(source.c_str(),(dir/"rejected-override.gguf").string().c_str(),&reject_copy)!=0,
+          "COPY accepted unsupported metadata override");
+    const auto misplaced = split_source(valid,dir,true);
+    auto * misplaced_model = load(misplaced);
+    if (misplaced_model) { llama_model_free(misplaced_model); }
+    check(!misplaced_model && logs.find("same GGUF shard") != std::string::npos,"cross-shard companion must fail closed");
+    auto * split = load(valid,LLAMA_SPLIT_MODE_ROW);
+    if (split) { llama_model_free(split); }
+    check(!split && logs.find("QK SINQ does not support row split") != std::string::npos,"row split must fail closed");
+    if (auto * cuda = ggml_backend_dev_by_name("CUDA0")) {
+        auto override_params = llama_model_default_params();
+        override_params.n_gpu_layers = 99;
+        override_params.split_mode = LLAMA_SPLIT_MODE_NONE;
+        ggml_backend_dev_t devices[] = {cuda,nullptr};
+        override_params.devices = devices;
+        const llama_model_tensor_buft_override placements[] = {
+            {"^blk\\.0\\.ffn_up\\.weight$",ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU))},
+            {nullptr,nullptr},
+        };
+        override_params.tensor_buft_overrides = placements;
+        logs.clear();
+        auto * conflict = llama_model_load_from_file(valid.c_str(),override_params);
+        if (conflict) { llama_model_free(conflict); }
+        check(!conflict && logs.find("scale placement must match") != std::string::npos,
+              "companion/base placement mismatch was not rejected");
+        std::puts("CUDA companion/base placement mismatch rejected");
+    }
+    auto no_alloc_params = llama_model_default_params();
+    no_alloc_params.n_gpu_layers = 0;
+    no_alloc_params.no_alloc = true;
+    no_alloc_params.load_mode = LLAMA_LOAD_MODE_NONE;
+    auto * probe = llama_model_load_from_file(valid.c_str(),no_alloc_params);
+    check(probe != nullptr,"no-allocation fit probe with validated companions");
+    llama_model_free(probe);
+    llama_backend_free(); std::puts("SINQ model tests passed"); return 0;
+} catch (const std::exception & e) { std::fprintf(stderr,"%s\n",e.what()); return 1; }

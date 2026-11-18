@@ -1,1 +1,7 @@
 vendor/**/*.patch -whitespace
+# Preserve byte-bound experiment evidence; JSON/log digests must survive checkout.
+artifacts/sinq-v050-fixed-vs-auto/full-groupwise-optimized-v1/** -text
+artifacts/sinq-v050-fixed-vs-auto/final_control_validation.py -text
+artifacts/sinq-v050-fixed-vs-auto/run_final_wikitext.py -text
+artifacts/sinq-v050-fixed-vs-auto/run_final_ptb.py -text
+artifacts/sinq-v050-fixed-vs-auto/run_measured_selection.py -text

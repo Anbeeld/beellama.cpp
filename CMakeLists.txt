@@ -4,14 +4,14 @@ include(CheckIncludeFileCXX)
 
 ### llama.cpp version
 set(LLAMA_VERSION_MAJOR 0)
-set(LLAMA_VERSION_MINOR 4)
-set(LLAMA_VERSION_PATCH 9)
+set(LLAMA_VERSION_MINOR 5)
+set(LLAMA_VERSION_PATCH 0)
 set(LLAMA_VERSION_BASE "${LLAMA_VERSION_MAJOR}.${LLAMA_VERSION_MINOR}.${LLAMA_VERSION_PATCH}")
 
 # whether this is a development/nightly build
 # set this to OFF when making a release from a release tag (vX.Y.Z)
 # ref: https://github.com/ggml-org/ggml/discussions/1579
-option(LLAMA_BUILD_IS_DEV "llama: dev build" ON)
+option(LLAMA_BUILD_IS_DEV "llama: dev build" OFF)
 
 if (LLAMA_BUILD_IS_DEV)
     set(LLAMA_VERSION "${LLAMA_VERSION_BASE}-dev")
@@ -116,7 +116,7 @@ endif()
 
 # subprocess spawning isn't a supported/sandbox-friendly operation on mobile OSes or in WASM
 if (CMAKE_SYSTEM_NAME STREQUAL "iOS" OR CMAKE_SYSTEM_NAME STREQUAL "Android" OR ANDROID
-        OR CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
+        OR CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN OR CMAKE_SYSTEM_NAME STREQUAL "WASI")
     set(LLAMA_SUBPROCESS_DEFAULT OFF)
 else()
     set(LLAMA_SUBPROCESS_DEFAULT ON)
@@ -213,6 +213,9 @@ llama_option_depr(WARNING     LLAMA_CURL)
 
 include("cmake/license.cmake")
 license_add_file("llama.cpp" "LICENSE")
+license_add_file("SINQ reference and native normalization port" "licenses/LICENSE-SINQ")
+install(FILES "licenses/LICENSE-SINQ" "licenses/NOTICE-SINQ"
+    DESTINATION "share/licenses/beellama.cpp" COMPONENT Licenses)
 
 #
 # compile options

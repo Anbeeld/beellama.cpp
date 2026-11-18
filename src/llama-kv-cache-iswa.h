@@ -15,6 +15,7 @@ class llama_kv_cache_iswa : public llama_memory_i {
 public:
     llama_kv_cache_iswa(
             const llama_model & model,
+                         bool   no_alloc,
                     ggml_type   type_k,
                     ggml_type   type_v,
                          bool   v_trans,
@@ -25,7 +26,6 @@ public:
                      uint32_t   n_seq_max,
                      uint32_t   n_batch,
                      uint32_t   n_ubatch,
-                     uint32_t   n_pad,
                llama_memory_t   mem_other,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
@@ -43,7 +43,8 @@ public:
     // explicit overload so KVarN support does not erase that upstream need.
     llama_kv_cache_iswa(
             const llama_model & model,
-            const llama_hparams & hparams,
+                         bool   no_alloc,
+          const llama_hparams & hparams,
                     ggml_type   type_k,
                     ggml_type   type_v,
                          bool   v_trans,
@@ -54,7 +55,6 @@ public:
                      uint32_t   n_seq_max,
                      uint32_t   n_batch,
                      uint32_t   n_ubatch,
-                     uint32_t   n_pad,
                llama_memory_t   mem_other,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,

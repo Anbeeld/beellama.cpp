@@ -330,11 +330,26 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
     const ggml_tensor * sinks = dst->src[4];
     float2 * const dst_meta = dst->src[8] != nullptr ? (float2 *) dst->src[8]->data : nullptr;
     const enum ggml_flash_attn_ext_kvarn_domain domain = ggml_cuda_fattn_kvarn_domain(dst);
+#if defined(GGML_USE_HIP)
+    // HIP stays in the rotated domain: Q arrives WHT-rotated from the graph
+    // and the output is inverse-rotated after FA, so the same unpack-once
+    // windowed path applies with no inverse-WHT (the dequant kernel skips it
+    // when original_domain==0). Threshold nq>=64 keeps small MTP verify
+    // batches on direct-record MMA. GGML_KVARN_WINDOW=0 reverts to direct.
+    const bool hip_rotated_window =
+        domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED && Q->ne[1] >= 64;
+    if (!ggml_cuda_fattn_kvarn_window_enabled() ||
+            Q->ne[1] <= 1 || sinks != nullptr ||
+            (domain != GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V && !hip_rotated_window)) {
+        return false;
+    }
+#else
     if (!ggml_cuda_fattn_kvarn_window_enabled() ||
             Q->ne[1] <= 1 || sinks != nullptr ||
             domain != GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V) {
         return false;
     }
+#endif
 
 #if !defined(GGML_USE_MUSA)
     // The partial kernel does not share the FlashAttention signature, so it is

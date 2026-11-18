@@ -10,7 +10,7 @@ static inline int ggml_cuda_fattn_kvarn_vec_tokens_per_split() {
             return tokens;
         }
     }
-    return 16;
+    return 0; // automatic: actual kernel occupancy and workload
 }
 
 // Bounded GQA sharing for the proven D256 SWA low-parallelism decode path.
@@ -21,8 +21,12 @@ constexpr int ggml_cuda_fattn_kvarn_vec_max_gqa() {
 }
 
 template<int D, int K_BITS, int V_BITS>
+int ggml_cuda_fattn_kvarn_vec_select(int device, int n_kv, int head_blocks, int n_stream);
+
+template<int D, int K_BITS, int V_BITS>
 void ggml_cuda_fattn_kvarn_vec_launch(const ggml_cuda_fattn_kvarn_decode_args & args);
 
 #define DECL_FATTN_KVARN_VEC_CASE(D, K_BITS, V_BITS) \
+    template int ggml_cuda_fattn_kvarn_vec_select<D, K_BITS, V_BITS>(int, int, int, int); \
     template void ggml_cuda_fattn_kvarn_vec_launch<D, K_BITS, V_BITS>( \
         const ggml_cuda_fattn_kvarn_decode_args & args)

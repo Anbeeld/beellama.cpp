@@ -3,6 +3,14 @@
 #include "llama-model-loader.h"
 #include "llama-ext.h"
 #include "llama.h"
+#include "llama-sinq.h"
+#include "sinq/sinq-parameters.h"
+#include "sinq/sinq-native-codec.h"
+#include "llama-version.h"
+#include "../vendor/nlohmann/json.hpp"
+extern "C" {
+#include "../vendor/hash/sha256/sha256.h"
+}
 
 #include <algorithm>
 #include <cmath>
@@ -10,7 +18,11 @@
 #include <cinttypes>
 #include <fstream>
 #include <mutex>
+#include <map>
+#include <memory>
 #include <regex>
+#include <set>
+#include <filesystem>
 #include <thread>
 #include <unordered_map>
 
@@ -125,7 +137,8 @@ static tensor_category tensor_get_category(const std::string & tensor_name) {
     if (tensor_name_match_token_embd(tensor_name.c_str())) {
         return tensor_category::TOKEN_EMBD;
     }
-    if (tensor_name.find("attn_qkv.weight") != std::string::npos) {
+    // attn_qkv_gate is [attn_qkv | attn_gate] in one weight, the qkv rows decide its type
+    if (tensor_name.find("attn_qkv.weight") != std::string::npos || tensor_name.find("attn_qkv_gate.weight") != std::string::npos) {
         return tensor_category::ATTENTION_QKV;
     }
     if (tensor_name.find("attn_kv_b.weight") != std::string::npos) {
@@ -159,6 +172,12 @@ static tensor_category tensor_get_category(const std::string & tensor_name) {
         return tensor_category::FFN_DOWN;
     }
     return tensor_category::OTHER;
+}
+
+// check if tensor is a MoE expert tensor (used by GGML_OP_MUL_MAT_ID)
+static bool tensor_is_expert(const std::string & tensor_name) {
+    return tensor_name.find("_exps.")   != std::string::npos ||
+           tensor_name.find("_chexps.") != std::string::npos;
 }
 
 // check if category is for attention-v-like tensors (more sensitive to quantization)
@@ -215,6 +234,7 @@ struct tensor_metadata {
     std::string     remapped_imatrix_name;
     bool            allows_quantization;
     bool            requires_imatrix;
+    bool            sinq_preconditioned = false;
 };
 
 //
@@ -226,7 +246,7 @@ static void llama_tensor_dequantize_impl(
     const size_t nelements, const int nthread
 ) {
     const ggml_type_traits * qtype = ggml_get_type_traits(type);
-    if (ggml_is_quantized(type)) {
+    if (ggml_is_quantized(type) || type == GGML_TYPE_F8_E4M3) {
         if (qtype->to_float == NULL) {
             throw std::runtime_error(format("type %s unsupported for integer quantization: no dequantization available", ggml_type_name(type)));
         }
@@ -240,7 +260,7 @@ static void llama_tensor_dequantize_impl(
             ggml_fp16_to_fp32_row((const ggml_fp16_t *)data, f32_output, nelements);
         } else if (type == GGML_TYPE_BF16) {
             ggml_bf16_to_fp32_row((const ggml_bf16_t *)data, f32_output, nelements);
-        } else if (ggml_is_quantized(type)) {
+        } else if (ggml_is_quantized(type) || type == GGML_TYPE_F8_E4M3) {
             qtype->to_float(data, f32_output, nelements);
         } else {
             GGML_ABORT("fatal error"); // unreachable
@@ -292,11 +312,19 @@ static void llama_tensor_dequantize_impl(
 // do we allow this tensor to be quantized?
 //
 
+static bool sinq_tensor_eligible(const ggml_tensor * tensor, const llama_model & model) {
+    if (model.arch != LLM_ARCH_QWEN35 || ggml_n_dims(tensor) != 2 || tensor->ne[1] < 2) { return false; }
+    static const std::regex pattern("^blk\\.([0-9]+)\\.(attn_q|attn_k|attn_v|attn_qkv|attn_gate|attn_output|ssm_beta|ssm_alpha|ssm_out|ffn_gate|ffn_up|ffn_down)\\.weight$");
+    std::cmatch match;
+    return std::regex_match(tensor->name, match, pattern) &&
+        std::stoul(match[1].str()) < model.hparams.n_layer();
+}
+
 static bool tensor_allows_quantization(const llama_model_quantize_params * params, llm_arch arch, const ggml_tensor * tensor) {
     // trivial checks first -- no string ops needed
     if (params->only_copy)       return false;
 
-    // quantize only 2D and 3D tensors (experts)
+    // quantize only 2D+ tensors (matrices, experts, conv kernels)
     if (ggml_n_dims(tensor) < 2) return false;
 
     const std::string name = ggml_get_name(tensor);
@@ -316,12 +344,22 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     // do not quantize the i32 token-id -> expert-id routing table (DeepSeek-V4)
     quantize &= name.find("ffn_gate_tid2eid.weight") == std::string::npos;
 
+    // Engram gate is an elementwise weight (ggml_mul), not a matmul operand
+    quantize &= name.find("engram_gate.weight") == std::string::npos;
+
     // these are very small (e.g. 4x4)
     quantize &= name.find("altup")  == std::string::npos;
     quantize &= name.find("laurel") == std::string::npos;
 
     // these are not too big so keep them as it is
     quantize &= name.find("per_layer_model_proj") == std::string::npos;
+
+    // limite: very small gates and dense connection mixers
+    if (arch == LLM_ARCH_LIMITE) {
+        quantize &= name.find("attn_gate.weight")    == std::string::npos;
+        quantize &= name.find("attn_ve_gate.weight") == std::string::npos;
+        quantize &= name.find("mudd_")               == std::string::npos;
+    }
 
     // do not quantize positional embeddings and token types (BERT)
     quantize &= name != LLM_TN(arch)(LLM_TENSOR_POS_EMBD,    "weight");
@@ -331,6 +369,14 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     // NOTE: can't use LLM_TN here because the layer number is not known
     quantize &= name.find("ssm_conv1d") == std::string::npos;
     quantize &= name.find("shortconv.conv.weight") == std::string::npos;
+
+    // do not quantize LFM3-VL's depthwise conv kernels, CONV_2D_DW takes F32 kernels
+    quantize &= name.find("conv2d_spatial.weight") == std::string::npos;
+
+    // do not quantize LFM3-Audio's encoder convs and codec, the codec output does not survive quantization
+    quantize &= name.rfind("a.conv1d.", 0) != 0;
+    quantize &= name.find("conv_dw") == std::string::npos;
+    quantize &= name.rfind("a.gen.wav.", 0) != 0;
 
     // do not quantize MiniMax's indexer projection weights, they are tiny
     quantize &= name.find("indexer.k_proj.weight") == std::string::npos;
@@ -540,12 +586,7 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
     } else if (ftype == LLAMA_FTYPE_MOSTLY_MXFP4_MOE) {
         // MoE   tensors -> MXFP4
         // other tensors -> Q8_0
-        // MLA projection tensors are also 3D, so match expert tensor roles explicitly.
-        const bool is_bailingmoe3_expert = arch == LLM_ARCH_BAILINGMOE3 &&
-            (category == tensor_category::FFN_UP ||
-             category == tensor_category::FFN_GATE ||
-             category == tensor_category::FFN_DOWN);
-        if (tensor->ne[2] > 1 && (arch != LLM_ARCH_BAILINGMOE3 || is_bailingmoe3_expert)) {
+        if (tensor_is_expert(name)) {
             new_type = GGML_TYPE_MXFP4;
         } else {
             new_type = GGML_TYPE_Q8_0;
@@ -806,76 +847,6 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
 
 // quantize rows [first_row, first_row + nrows), indexed globally across all expert matrices
 // note: chunks never cross an expert boundary since each expert has its own imatrix slice
-static size_t llama_tensor_quantize_impl(enum ggml_type new_type, const float * f32_data, void * new_data, const int64_t chunk_size, int64_t first_row, int64_t nrows, int64_t nrows_per_expert, int64_t n_per_row, const float * imatrix, std::vector<std::thread> & workers, const int nthread) {
-    const size_t row_size = ggml_row_size(new_type, n_per_row);
-
-    auto imatrix_for_row = [=](int64_t row_global) {
-        return imatrix ? imatrix + (row_global / nrows_per_expert) * n_per_row : nullptr;
-    };
-
-    if (nthread < 2) {
-        // single-thread
-        size_t new_size = 0;
-        for (int64_t row = 0; row < nrows;) {
-            const int64_t row_global = first_row + row;
-            const int64_t this_nrow  = std::min(nrows - row, nrows_per_expert - row_global % nrows_per_expert);
-            void * this_data = (char *) new_data + row * row_size;
-            size_t this_size = ggml_quantize_chunk(new_type, f32_data + row * n_per_row, this_data, 0, this_nrow, n_per_row, imatrix_for_row(row_global));
-            if (!ggml_validate_row_data(new_type, this_data, this_size)) {
-                throw std::runtime_error("quantized data validation failed");
-            }
-            new_size += this_size;
-            row += this_nrow;
-        }
-        return new_size;
-    }
-
-    std::mutex mutex;
-    int64_t counter = 0;
-    size_t new_size = 0;
-    bool valid = true;
-    auto compute = [&mutex, &counter, &new_size, &valid, new_type, f32_data, new_data, chunk_size,
-            first_row, nrows, nrows_per_expert, n_per_row, row_size, imatrix_for_row]() {
-        const int64_t nrows_per_chunk = chunk_size / n_per_row;
-        size_t local_size = 0;
-        while (true) {
-            std::unique_lock<std::mutex> lock(mutex);
-            if (counter >= nrows) {
-                if (local_size > 0) {
-                    new_size += local_size;
-                }
-                break;
-            }
-            const int64_t row        = counter;
-            const int64_t row_global = first_row + row;
-            // stop at the expert boundary
-            const int64_t this_nrow  = std::min(std::min(nrows - row, nrows_per_chunk), nrows_per_expert - row_global % nrows_per_expert);
-            counter += this_nrow;
-            lock.unlock();
-
-            void * this_data = (char *) new_data + row * row_size;
-            size_t this_size = ggml_quantize_chunk(new_type, f32_data + row * n_per_row, this_data, 0, this_nrow, n_per_row, imatrix_for_row(row_global));
-            local_size += this_size;
-
-            // validate the quantized data
-            if (!ggml_validate_row_data(new_type, this_data, this_size)) {
-                std::unique_lock<std::mutex> lock(mutex);
-                valid = false;
-                break;
-            }
-        }
-    };
-    for (int it = 0; it < nthread - 1; ++it) {
-        workers.emplace_back(compute);
-    }
-    compute();
-    for (auto & w : workers) { w.join(); }
-    workers.clear();
-    if (!valid) {
-        throw std::runtime_error("quantized data validation failed");
-    }
-    return new_size;
-}
 
 //
 // imatrix requirement check
@@ -974,13 +945,42 @@ static void init_quantize_state_counters(quantize_state_impl & qs, std::vector<t
 // main quantization driver
 //
 
+static std::string sinq_digest(const void * data, size_t size) {
+    unsigned char digest[SHA256_DIGEST_SIZE];
+    sha256_hash(digest, static_cast<const unsigned char *>(data), size);
+    static const char hex[] = "0123456789abcdef";
+    std::string result;
+    for (unsigned char byte : digest) { result += hex[byte >> 4]; result += hex[byte & 15]; }
+    return result;
+}
+
 static void llama_model_quantize_impl(const std::string & fname_inp, const std::string & fname_out, const llama_model_quantize_params * params) {
     llama_ftype ftype = params->ftype;
+    const bool diagnostics = params->sinq_diagnostics_json != nullptr;
+    const bool sinq_enabled = params->sinq_config != nullptr;
+    if (sinq_enabled && (!*params->sinq_config || params->only_copy)) {
+        throw std::runtime_error("SINQ requires a nonempty config path and actual quantization");
+    }
+    if (diagnostics && (params->dry_run || params->only_copy || !*params->sinq_diagnostics_json)) {
+        throw std::runtime_error("SINQ diagnostics require actual quantization and a nonempty external path");
+    }
+    if (diagnostics) {
+        const auto path = std::filesystem::weakly_canonical(std::filesystem::u8path(params->sinq_diagnostics_json));
+        auto aliases = [&](const std::string & other) {
+            const auto target = std::filesystem::u8path(other);
+            return path == std::filesystem::weakly_canonical(target) ||
+                (std::filesystem::exists(path) && std::filesystem::exists(target) && std::filesystem::equivalent(path, target));
+        };
+        if (aliases(fname_inp) || aliases(fname_out) || (params->sinq_config && aliases(params->sinq_config))) {
+            throw std::runtime_error("SINQ diagnostics must not overwrite model or configuration files");
+        }
+    }
+    nlohmann::json sinq_report = {{"schema_version", 2}, {"tensors", nlohmann::json::array()}};
 
     int nthread = params->nthread;
 
     if (nthread <= 0) {
-        nthread = std::thread::hardware_concurrency();
+        nthread = int(std::max(1u, std::thread::hardware_concurrency()));
     }
 
     ggml_type default_type = llama_ftype_get_default_type(ftype);
@@ -999,8 +999,19 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     const llama_model_kv_override * kv_overrides = params->kv_overrides;
     std::vector<std::string> splits = {};
     llama_model_loader ml(/*metadata*/ nullptr, /*set_tensor_data*/ nullptr, /*set_tensor_data_ud*/ nullptr,
-        fname_inp, splits, /*file*/ nullptr, /*load_mode*/ load_mode, /*check_tensors*/ true, /*no_alloc*/ false, /*load_mtp*/ true, kv_overrides, nullptr);
+        fname_inp, splits, /*file*/ nullptr, /*load_mode*/ sinq_enabled ? LLAMA_LOAD_MODE_MMAP : load_mode, /*check_tensors*/ true, /*no_alloc*/ false, /*load_mtp*/ true, kv_overrides, nullptr);
     ml.init_mappings(false); // no prefetching
+    if (gguf_find_key(ml.metadata, "beellama.qk_sinq.version") >= 0) {
+        throw std::runtime_error("SINQ source copy/requantization requires the original floating model, not a transformed artifact");
+    }
+    if (sinq_enabled) {
+        for (int64_t i = 0; i < gguf_get_n_kv(ml.metadata); ++i) {
+            if (std::string(gguf_get_key(ml.metadata,i)).find("prism.hadamard.") == 0) {
+                throw std::runtime_error("QK SINQ cannot be combined with Hadamard metadata");
+            }
+        }
+        LLAMA_LOG_WARN("QK SINQ companions REQUIRE BeeLlama, standard GGUF engines can silently produce wrong output. Use a .beellama-qk-sinq.gguf filename.\n");
+    }
 
     auto mparams = llama_model_default_params();
     std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, mparams));
@@ -1131,6 +1142,18 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     std::vector<gguf_context_ptr> ctx_outs(n_split);
     ctx_outs[0] = std::move(ctx_out);
 
+    ggml_context_ptr sinq_ctx;
+    if (sinq_enabled) {
+        sinq_ctx.reset(ggml_init({ggml_tensor_overhead()*(tensors.size()+1),nullptr,true}));
+        if (!sinq_ctx) { throw std::runtime_error("cannot allocate QK SINQ companion metadata"); }
+    }
+    std::vector<ggml_tensor *> sinq_aux(tensors.size(),nullptr);
+    std::vector<std::string> sinq_names;
+    std::vector<sinq::tensor_descriptor> sinq_inventory;
+    std::vector<bool> sinq_fallback(tensors.size(),false);
+    std::map<std::string,sinq::parameters> sinq_settings;
+    sinq::encoding_options sinq_encoding;
+
     // flag for --dry-run
     bool will_require_imatrix = false;
 
@@ -1146,16 +1169,29 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         if (!ctx_outs[i_split]) {
             ctx_outs[i_split].reset(gguf_init_empty());
         }
-        gguf_add_tensor(ctx_outs[i_split].get(), tensor);
-
         metadata[i].allows_quantization = tensor_allows_quantization(params, model->arch, tensor);
 
+        const int prior_fallbacks = qs.n_fallback;
         if (metadata[i].allows_quantization) {
             metadata[i].target_type = llama_tensor_get_type(qs, params, tensor, default_type, metadata[i]);
         } else {
             metadata[i].target_type = tensor->type;
         }
 
+        if (sinq_enabled) {
+            sinq::tensor_descriptor descriptor;
+            descriptor.name=tensor->name;
+            descriptor.columns=tensor->ne[0]; descriptor.rows=tensor->ne[1];
+            descriptor.qtype=metadata[i].target_type;
+            descriptor.eligible=sinq_tensor_eligible(tensor,*model) && llama_sinq_supported_type(descriptor.qtype) &&
+                (tensor->type==GGML_TYPE_F32 || tensor->type==GGML_TYPE_F16 || tensor->type==GGML_TYPE_BF16);
+            std::smatch match;
+            if (std::regex_match(descriptor.name,match,std::regex("blk\\.([0-9]+)\\.(.*)\\.weight"))) {
+                descriptor.layer=std::stoi(match[1]); descriptor.role=match[2];
+            }
+            sinq_inventory.push_back(descriptor);
+            sinq_fallback[i]=qs.n_fallback!=prior_fallbacks;
+        }
         metadata[i].requires_imatrix = tensor_requires_imatrix(tensor->name, metadata[i].target_type, ftype);
 
         if (params->imatrix) {
@@ -1175,12 +1211,67 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         }
     }
 
+    if (sinq_enabled) {
+        const auto plan=sinq::resolve_direct_file(params->sinq_config,sinq_inventory,&sinq_encoding);
+        if (!sinq_encoding.is_default()) {
+            LLAMA_LOG_INFO("SINQ encoding: scale_refinement_lambda=%.9g imatrix_exponent=%.9g\n",
+                sinq_encoding.scale_refinement_lambda,sinq_encoding.imatrix_exponent);
+            if (diagnostics) {
+                sinq_report["encoding"]={{"scale_refinement_lambda",sinq_encoding.scale_refinement_lambda},
+                                         {"imatrix_exponent",sinq_encoding.imatrix_exponent}};
+            }
+            if (sinq_encoding.imatrix_exponent!=2.0 && !params->imatrix) {
+                LLAMA_LOG_WARN("SINQ imatrix_exponent has no effect without an importance matrix\n");
+            }
+        }
+        std::vector<std::string> recipes;
+        for (const auto & item:plan) { sinq_settings.emplace(item.tensor.name,item.settings); }
+        for (size_t i=0;i<tensors.size();++i) {
+            const auto found=sinq_settings.find(tensors[i]->tensor->name);
+            if (found==sinq_settings.end()) { continue; }
+            if (sinq_fallback[i]) { throw std::runtime_error("SINQ selected tensor requires codec fallback: "+found->first); }
+            metadata[i].sinq_preconditioned=true;
+            auto * aux=ggml_new_tensor_1d(sinq_ctx.get(),GGML_TYPE_F16,tensors[i]->tensor->ne[0]);
+            ggml_set_name(aux,(metadata[i].name+".sinq_scale2").c_str());
+            sinq_aux[i]=aux;
+        }
+        std::map<std::string,std::string> serialized;
+        for (size_t i=0;i<tensors.size();++i) if (metadata[i].sinq_preconditioned) {
+            serialized.emplace(metadata[i].name,sinq::parameters_json(sinq_settings.at(tensors[i]->tensor->name)).dump());
+        }
+        for (const auto & item:serialized) { sinq_names.push_back(item.first); recipes.push_back(item.second); }
+        sinq::validate_metadata(sinq_names,recipes,LLAMA_COMMIT);
+        std::vector<const char *> names,records;
+        for (const auto & name:sinq_names) { names.push_back(name.c_str()); }
+        for (const auto & recipe:recipes) { records.push_back(recipe.c_str()); }
+        for (auto & out:ctx_outs) {
+            gguf_set_val_u32(out.get(),"beellama.qk_sinq.version",2);
+            gguf_set_val_str(out.get(),"beellama.qk_sinq.transform","f16_input_diagonal");
+            gguf_set_arr_str(out.get(),"beellama.qk_sinq.tensors",names.data(),names.size());
+            gguf_set_arr_str(out.get(),"beellama.qk_sinq.recipes",records.data(),records.size());
+            gguf_set_val_str(out.get(),"beellama.qk_sinq.producer",LLAMA_COMMIT);
+            // Producer provenance only: do not extend the closed inference namespace
+            // or add any metadata at the historical default endpoints.
+            if (!sinq_encoding.is_default()) {
+                gguf_set_val_f64(out.get(),"quantize.sinq.scale_refinement_lambda",sinq_encoding.scale_refinement_lambda);
+                gguf_set_val_f64(out.get(),"quantize.sinq.imatrix_exponent",sinq_encoding.imatrix_exponent);
+            }
+        }
+    }
+
+    // Match the streaming payload order: each base is immediately followed by its companion.
+    for (size_t i=0;i<tensors.size();++i) {
+        const uint16_t split=params->keep_split ? tensors[i]->idx : 0;
+        gguf_add_tensor(ctx_outs[split].get(),tensors[i]->tensor);
+        if (sinq_aux[i]) { gguf_add_tensor(ctx_outs[split].get(),sinq_aux[i]); }
+    }
+
     // Set split info if needed
     if (n_split > 1) {
         for (size_t i = 0; i < ctx_outs.size(); ++i) {
             gguf_set_val_u16(ctx_outs[i].get(), ml.llm_kv(LLM_KV_SPLIT_NO).c_str(), i);
             gguf_set_val_u16(ctx_outs[i].get(), ml.llm_kv(LLM_KV_SPLIT_COUNT).c_str(), n_split);
-            gguf_set_val_i32(ctx_outs[i].get(), ml.llm_kv(LLM_KV_SPLIT_TENSORS_COUNT).c_str(), (int32_t)tensors.size());
+            gguf_set_val_i32(ctx_outs[i].get(), ml.llm_kv(LLM_KV_SPLIT_TENSORS_COUNT).c_str(), (int32_t)(tensors.size()+sinq_names.size()));
         }
     }
 
@@ -1268,6 +1359,58 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         bool quantize = cur_type != new_type;
 
         size_t new_size;
+        std::vector<ggml_fp16_t> sinq_values;
+        nlohmann::json * diagnostic = nullptr;
+        if (diagnostics && sinq_tensor_eligible(tensor, *model)) {
+            const char * reason = tm.sinq_preconditioned ? "included" : !sinq_enabled ? "stock" :
+                !llama_sinq_supported_type(new_type) ? "unsupported_codec" : "not_selected";
+            sinq_report["tensors"].push_back({
+                {"name", tensor->name}, {"qtype", ggml_type_name(new_type)},
+                {"shape", {tensor->ne[0], tensor->ne[1]}}, {"parameters", ggml_nelements(tensor)},
+                {"included", tm.sinq_preconditioned}, {"reason", reason},
+                {"recipe", tm.sinq_preconditioned ? sinq::parameters_json(sinq_settings.at(tensor->name)) : nlohmann::json(nullptr)},
+                {"mode", tm.sinq_preconditioned ? "sidecar" : "none"},
+                {"statistics_status", "not_computed"}, {"identity", nullptr}, {"strips", nullptr}, {"chosen_iteration_distribution", nullptr},
+                {"scale_min", nullptr}, {"scale_median", nullptr}, {"scale_max", nullptr},
+                {"scales_sha256", nullptr}, {"selected_identity_count", nullptr},
+                {"companion_bytes", 0}, {"imatrix_present", false}, {"imatrix_transformed", false}});
+            diagnostic = &sinq_report["tensors"].back();
+            if (imatrix_data) {
+                const auto entry = imatrix_data->find(tm.remapped_imatrix_name);
+                (*diagnostic)["imatrix_present"] = entry != imatrix_data->end() &&
+                    entry->second.size() == size_t(tensor->ne[0]*tensor->ne[2]*tensor->ne[3]);
+            }
+        }
+        if (tm.sinq_preconditioned && !params->dry_run) {
+            const auto options=sinq_settings.at(tensor->name).normalization();
+            llama_sinq_statistics stats;
+            if (!llama_sinq_compute_scales(load_range(0,tensor_size),cur_type,tensor->ne[1],tensor->ne[0],
+                                           options,nthread,sinq_values,stats)) {
+                throw std::runtime_error(format("QK SINQ statistics failed for '%s'",tensor->name));
+            }
+            if (diagnostic) {
+                (*diagnostic)["statistics_status"] = "computed";
+                (*diagnostic)["identity"] = stats.identity;
+                (*diagnostic)["scale_min"] = stats.min_scale;
+                (*diagnostic)["scale_median"] = stats.median_scale;
+                (*diagnostic)["scale_max"] = stats.max_scale;
+                (*diagnostic)["selected_identity_count"] = stats.selected_identity_count;
+                (*diagnostic)["companion_bytes"] = sinq_values.size()*sizeof(ggml_fp16_t);
+                (*diagnostic)["scales_sha256"] = sinq_digest(sinq_values.data(), sinq_values.size()*sizeof(ggml_fp16_t));
+                (*diagnostic)["strips"] = nlohmann::json::array();
+                nlohmann::json histogram = nlohmann::json::object();
+                for (const auto & strip : stats.strips) {
+                    (*diagnostic)["strips"].push_back({{"chosen_iteration", strip.chosen_iteration},
+                        {"initial_imbalance", strip.initial_imbalance}, {"best_imbalance", strip.best_imbalance},
+                        {"terminal_imbalance", strip.terminal_imbalance}});
+                    const auto key = std::to_string(strip.chosen_iteration);
+                    histogram[key] = histogram.value(key, size_t(0)) + 1;
+                }
+                (*diagnostic)["chosen_iteration_distribution"] = histogram;
+            }
+            LLAMA_LOG_INFO("QK SINQ tensor=%s mode=%s t_min=%.9g t_max=%.9g aux_bytes=%zu; ",
+                tensor->name,stats.identity ? "identity" : "normalized",stats.min_scale,stats.max_scale,sinq_values.size()*sizeof(ggml_fp16_t));
+        }
 
         if (params->dry_run) {
             // the --dry-run option calculates the final quantization size without quantizing
@@ -1308,11 +1451,11 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     if (it == imatrix_data->end()) {
                         LLAMA_LOG_INFO("\n====== %s: did not find weights for %s\n", __func__, tensor->name);
                     } else {
-                        if (it->second.size() == (size_t)tensor->ne[0]*tensor->ne[2]) {
+                        if (it->second.size() == (size_t)tensor->ne[0]*tensor->ne[2]*tensor->ne[3]) {
                             imatrix = it->second.data();
                         } else {
                             LLAMA_LOG_INFO("\n====== %s: imatrix size %d is different from tensor size %d for %s\n", __func__,
-                                    int(it->second.size()), int(tensor->ne[0]*tensor->ne[2]), tensor->name);
+                                    int(it->second.size()), int(tensor->ne[0]*tensor->ne[2]*tensor->ne[3]), tensor->name);
 
                             // this can happen when quantizing an old mixtral model with split tensors with a new incompatible imatrix
                             // this is a significant error and it may be good idea to abort the process if this happens,
@@ -1320,10 +1463,19 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                             // tok_embd should be ignored in this case, since it always causes this warning
                             if (!tensor_name_match_token_embd(tensor->name)) {
                                 throw std::runtime_error(format("imatrix size %d is different from tensor size %d for %s",
-                                        int(it->second.size()), int(tensor->ne[0]*tensor->ne[2]), tensor->name));
+                                        int(it->second.size()), int(tensor->ne[0]*tensor->ne[2]*tensor->ne[3]), tensor->name));
                             }
                         }
                     }
+                }
+                std::vector<float> lookup_importance;
+                if (!imatrix && tensor_name_match_token_embd(tensor->name) && ggml_quantize_requires_imatrix(new_type)) {
+                    // Lookup has no linear input-channel activation moments.
+                    // Equal channel weights implement ordinary reconstruction
+                    // error using the unchanged importance-aware native codec.
+                    lookup_importance.assign(size_t(tensor->ne[0])*tensor->ne[2]*tensor->ne[3],1.f);
+                    imatrix=lookup_importance.data();
+                    LLAMA_LOG_INFO("using uniform channel importance for embedding lookup (not calibrated linear moments); ");
                 }
                 if (!imatrix && tm.requires_imatrix) {
                     LLAMA_LOG_ERROR("\n\n============================================================\n");
@@ -1342,17 +1494,32 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
                 const int64_t n_per_row = tensor->ne[0];
                 const int64_t nrows_per_expert = tensor->ne[1];
-                const int64_t nrows_total = tensor->ne[1] * tensor->ne[2];
+                const int64_t nrows_total = ggml_nrows(tensor);
 
                 const size_t row_size_src = ggml_row_size(tensor->type, n_per_row);
                 const size_t row_size_dst = ggml_row_size(new_type,     n_per_row);
 
-                // process the rows in slabs, so that the buffers stay below max_buf_size
-                const size_t bytes_per_row = row_size_src + row_size_dst + (tensor->type == GGML_TYPE_F32 ? 0 : n_per_row*sizeof(float));
-                const int64_t nrows_slab = std::max<int64_t>(1, std::min<int64_t>(nrows_total, max_buf_size/bytes_per_row));
-
                 static const int64_t min_chunk_size = 32 * 512;
                 const int64_t chunk_size = (n_per_row >= min_chunk_size ? n_per_row : n_per_row * ((min_chunk_size + n_per_row - 1)/n_per_row));
+                std::vector<float> sinq_imatrix;
+                if (tm.sinq_preconditioned && imatrix) {
+                    sinq_imatrix.resize(n_per_row);
+                    sinq::transform_importance(imatrix, sinq_imatrix.data(), n_per_row, sinq_values.data(),sinq_encoding.imatrix_exponent);
+                    imatrix = sinq_imatrix.data();
+                    if (diagnostic) { (*diagnostic)["imatrix_transformed"] = true; }
+                }
+                std::vector<float> sinq_preconditioned;
+                // The extra W/t slab is included in the configured memory budget.
+                const size_t bytes_per_row = row_size_src + row_size_dst +
+                    (tensor->type == GGML_TYPE_F32 ? 0 : n_per_row*sizeof(float)) +
+                    (tm.sinq_preconditioned ? n_per_row*sizeof(float) : 0);
+                const int64_t nrows_slab = std::max<int64_t>(1, std::min<int64_t>(nrows_total, max_buf_size/bytes_per_row));
+                // Refinement retains two F64 sums per input column and one decoded
+                // row, not a second tensor. All slabs must finish before changing u0.
+                std::unique_ptr<sinq::scale_refinement> refinement;
+                if (tm.sinq_preconditioned && sinq_encoding.scale_refinement_lambda>0) {
+                    refinement=std::make_unique<sinq::scale_refinement>(n_per_row);
+                }
 
                 // process rows across all experts in one pass to keep all threads busy
                 new_size = 0;
@@ -1373,6 +1540,12 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                         f32_data = (const float *) f32_conv_buf.data();
                     }
 
+                    const float * original_f32_data=f32_data;
+                    if (tm.sinq_preconditioned) {
+                        sinq_preconditioned.resize(nelements_cur);
+                        sinq::precondition_weights(f32_data, sinq_preconditioned.data(), nrows_cur, n_per_row, sinq_values.data(), nthread);
+                        f32_data = sinq_preconditioned.data();
+                    }
                     if (work.size() < nrows_cur*row_size_dst) {
                         work.resize(nrows_cur*row_size_dst);
                     }
@@ -1380,10 +1553,32 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     const int64_t nchunk = (nelements_cur + chunk_size - 1)/chunk_size;
                     const int64_t nthread_use = nthread > 1 ? std::max((int64_t)1, std::min((int64_t)nthread, nchunk)) : 1;
 
-                    const size_t size_cur = llama_tensor_quantize_impl(new_type, f32_data, work.data(), chunk_size, ir, nrows_cur, nrows_per_expert, n_per_row, imatrix, workers, nthread_use);
+                    const size_t size_cur = sinq::native_encode(new_type, f32_data, work.data(), chunk_size, ir, nrows_cur, nrows_per_expert, n_per_row, imatrix, workers, nthread_use);
 
+                    if (refinement) {
+                        refinement->accumulate(original_f32_data,work.data(),new_type,nrows_cur);
+                    }
                     fout.write((const char *) work.data(), size_cur);
                     new_size += size_cur;
+                }
+                if (refinement) {
+                    const auto original_digest=diagnostic ? sinq_digest(sinq_values.data(),sinq_values.size()*sizeof(ggml_fp16_t)) : std::string();
+                    const auto stats=refinement->apply(sinq_values.data(),sinq_encoding.scale_refinement_lambda);
+                    LLAMA_LOG_INFO("SINQ scale refinement invalid_ls=%zu invalid_blend=%zu; ",stats.invalid_ls_count,stats.invalid_blend_count);
+                    if (diagnostic) {
+                        (*diagnostic)["original_scales_sha256"]=original_digest;
+                        (*diagnostic)["scales_sha256"]=sinq_digest(sinq_values.data(),sinq_values.size()*sizeof(ggml_fp16_t));
+                        (*diagnostic)["invalid_ls_count"]=stats.invalid_ls_count;
+                        (*diagnostic)["invalid_blend_count"]=stats.invalid_blend_count;
+                        std::vector<float> values;
+                        for (auto value:sinq_values) { values.push_back(ggml_fp16_to_fp32(value)); }
+                        std::sort(values.begin(),values.end());
+                        (*diagnostic)["scale_min"]=values.front();
+                        (*diagnostic)["scale_median"]=values.size()%2 ? values[values.size()/2] :
+                            (values[values.size()/2-1]+values[values.size()/2])*0.5f;
+                        (*diagnostic)["scale_max"]=values.back();
+                        (*diagnostic)["identity"]=values.front()==1.f && values.back()==1.f;
+                    }
                 }
                 LLAMA_LOG_INFO("size = %8.2f MiB -> %8.2f MiB\n", tensor_size/1024.0/1024.0, new_size/1024.0/1024.0);
             }
@@ -1397,6 +1592,13 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             // tensor data is already written, add the padding
             zeros(fout, GGML_PAD(new_size, align) - new_size);
 
+            if (sinq_aux[i]) {
+                const size_t aux_bytes = sinq_values.size()*sizeof(ggml_fp16_t);
+                fout.write(reinterpret_cast<const char *>(sinq_values.data()),aux_bytes);
+                zeros(fout,GGML_PAD(aux_bytes,align)-aux_bytes);
+                total_size_new += aux_bytes;
+            }
+
             // unmap the tensor to free memory
             if (ml.use_mmap) { ml.unmap_weight(weight); }
 
@@ -1405,6 +1607,33 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
     if (!params->dry_run) {
         close_ofstream();
+    }
+
+    if (diagnostics) {
+        auto & records = sinq_report["tensors"];
+        std::sort(records.begin(), records.end(), [](const nlohmann::json & a, const nlohmann::json & b) {
+            return a.at("name").get<std::string>() < b.at("name").get<std::string>();
+        });
+        size_t included = 0, parameters = 0, included_parameters = 0, companion_bytes = 0;
+        nlohmann::json reasons = nlohmann::json::object();
+        for (const auto & record : records) {
+            parameters += record.at("parameters").get<size_t>();
+            if (record.at("included").get<bool>()) {
+                ++included; included_parameters += record.at("parameters").get<size_t>();
+            }
+            companion_bytes += record.at("companion_bytes").get<size_t>();
+            const auto reason = record.at("reason").get<std::string>();
+            reasons[reason] = reasons.value(reason, size_t(0)) + 1;
+        }
+        sinq_report["totals"] = {{"model_tensors", tensors.size()}, {"model_parameters", ml.n_elements},
+            {"eligible_tensors", records.size()}, {"eligible_parameters", parameters},
+            {"included_tensors", included}, {"included_parameters", included_parameters},
+            {"companion_bytes", companion_bytes}, {"reason_counts", reasons},
+            {"source_payload_bytes", total_size_org}, {"output_payload_bytes", total_size_new}};
+        std::ofstream output(std::filesystem::u8path(params->sinq_diagnostics_json), std::ios::binary);
+        output.exceptions(std::ios::failbit | std::ios::badbit);
+        output << sinq_report.dump(2) << '\n';
+        output.close();
     }
 
     LLAMA_LOG_INFO("%s: model size  = %8.2f MiB (%.2f BPW)\n", __func__, total_size_org/1024.0/1024.0, total_size_org*8.0/ml.n_elements);
@@ -1442,7 +1671,9 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.kv_overrides                =*/ nullptr,
         /*.tensor_type                 =*/ nullptr,
         /*.prune_layers                =*/ nullptr,
-        /*.max_buf_size                =*/ LLAMA_QUANT_MAX_BUF_SIZE
+        /*.max_buf_size                =*/ LLAMA_QUANT_MAX_BUF_SIZE,
+        /*.sinq_config                  =*/ nullptr,
+        /*.sinq_diagnostics_json        =*/ nullptr
     };
 
     return result;

@@ -35,7 +35,6 @@
 #include <set>
 #include <string>
 #include <system_error>
-#include <thread> // for hardware_concurrency
 #include <vector>
 
 #ifndef __EMSCRIPTEN__
@@ -1078,7 +1077,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         // TODO @ngxson : maybe show a list of available models in CLI in this case
         bool can_skip_model = params.usage || params.completion || !params.server_base.empty();
         if (!can_skip_model && params.model.path.empty()) {
-            throw std::invalid_argument("error: --model is required\n");
+            throw std::invalid_argument("error: --model or -hf is required\n");
         }
     }
 
@@ -1806,7 +1805,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.cpuparams.n_threads = value;
             if (params.cpuparams.n_threads <= 0) {
-                params.cpuparams.n_threads = std::thread::hardware_concurrency();
+                params.cpuparams.n_threads = common_cpu_get_num_math();
             }
         }
     ).set_env("LLAMA_ARG_THREADS"));
@@ -1816,7 +1815,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.cpuparams_batch.n_threads = value;
             if (params.cpuparams_batch.n_threads <= 0) {
-                params.cpuparams_batch.n_threads = std::thread::hardware_concurrency();
+                params.cpuparams_batch.n_threads = common_cpu_get_num_math();
             }
         }
     ));
@@ -2037,6 +2036,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("max number of chunks to process (default: %d, -1 = all)", params.n_chunks),
         [](common_params & params, int value) {
             params.n_chunks = value;
+            params.ppl_subset_option = true;
         }
     ).set_examples({LLAMA_EXAMPLE_IMATRIX, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_RETRIEVAL}));
     add_opt(common_arg({ "-fa", "--flash-attn" }, "[on|off|auto]",
@@ -2851,10 +2851,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
+        {"--ppl-full"},
+        "score all next-token predictions, resetting state every context (requires a logits file; no chunks or stride)",
+        [](common_params & params) {
+            params.ppl_full = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_PERPLEXITY}));
+    add_opt(common_arg(
+        {"--kld-token-output"}, "FILE",
+        "write ordered per-token TSV for --ppl-full",
+        [](common_params & params, const std::string & value) {
+            params.kld_token_output = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_PERPLEXITY}));
+    add_opt(common_arg(
         {"--ppl-stride"}, "N",
         string_format("stride for perplexity calculation (default: %d)", params.ppl_stride),
         [](common_params & params, int value) {
             params.ppl_stride = value;
+            params.ppl_subset_option = true;
         }
     ).set_examples({LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
@@ -4049,6 +4064,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_MAX"));
     add_opt(common_arg(
+        {"--models-memory-margin"}, "N",
+        string_format("for router server, MiB of device memory to keep free per device, unload LRU models until a new one fits (default: %d, 0 = disabled)", params.models_memory_margin),
+        [](common_params & params, int value) {
+            params.models_memory_margin = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_MEMORY_MARGIN"));
+    add_opt(common_arg(
         {"--models-autoload"},
         {"--no-models-autoload"},
         string_format("for router server, whether to automatically load models (default: %s)", params.models_autoload ? "enabled" : "disabled"),
@@ -4435,7 +4457,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.speculative.draft.cpuparams.n_threads = value;
             if (params.speculative.draft.cpuparams.n_threads <= 0) {
-                params.speculative.draft.cpuparams.n_threads = std::thread::hardware_concurrency();
+                params.speculative.draft.cpuparams.n_threads = common_cpu_get_num_math();
             }
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
@@ -4445,7 +4467,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.speculative.draft.cpuparams_batch.n_threads = value;
             if (params.speculative.draft.cpuparams_batch.n_threads <= 0) {
-                params.speculative.draft.cpuparams_batch.n_threads = std::thread::hardware_concurrency();
+                params.speculative.draft.cpuparams_batch.n_threads = common_cpu_get_num_math();
             }
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
@@ -5018,6 +5040,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "see tts/README.md for per-model usage notes",
         [](common_params & params, const std::string & value) {
             params.tts_lang = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_TTS}));
+    add_opt(common_arg(
+        {"--tts-voice"}, "VOICE",
+        "voice for audio generation (model-dependent)\n"
+        "see tts/README.md for per-model usage notes",
+        [](common_params & params, const std::string & value) {
+            params.tts_voice = value;
         }
     ).set_examples({LLAMA_EXAMPLE_TTS}));
     add_opt(common_arg(

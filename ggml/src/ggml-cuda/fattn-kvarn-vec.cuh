@@ -3,6 +3,8 @@
 #include "fattn-kvarn-vec-decl.cuh"
 #include "fattn-mma-kvarn-decode.cuh"
 
+#include <atomic>
+
 enum {
     GGML_CUDA_FATTN_KVARN_VEC_INVALID = 0,
     GGML_CUDA_FATTN_KVARN_VEC_STAGE   = 1,
@@ -321,6 +323,55 @@ static void ggml_cuda_fattn_kvarn_vec_launch_tps(
             args.n_q_heads, args.n_kv_heads, args.gqa_ratio, args.n_gqa_blocks,
             args.n_splits);
     CUDA_CHECK(cudaGetLastError());
+}
+
+template<int D, int TOKENS, int K_BITS, int V_BITS>
+static int ggml_cuda_fattn_kvarn_vec_active_blocks(int device) {
+    static std::atomic<int> cache[GGML_CUDA_MAX_DEVICES] = {};
+    int occupancy = cache[device].load(std::memory_order_relaxed);
+    if (occupancy == 0) {
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occupancy,
+            ggml_cuda_fattn_kvarn_vec_kernel<D, TOKENS,
+                ggml_cuda_fattn_kvarn_vec_max_gqa<D>(), K_BITS, V_BITS>,
+            128, 0));
+        cache[device].store(occupancy, std::memory_order_relaxed);
+    }
+    return occupancy;
+}
+
+template<int D, int K_BITS, int V_BITS>
+int ggml_cuda_fattn_kvarn_vec_select(int device, int n_kv, int head_blocks, int n_stream) {
+    const int forced = ggml_cuda_fattn_kvarn_vec_tokens_per_split();
+    if (forced != 0) {
+        return forced;
+    }
+    const int occupancy[] = {
+        ggml_cuda_fattn_kvarn_vec_active_blocks<D, 8, K_BITS, V_BITS>(device),
+        ggml_cuda_fattn_kvarn_vec_active_blocks<D, 16, K_BITS, V_BITS>(device),
+        ggml_cuda_fattn_kvarn_vec_active_blocks<D, 32, K_BITS, V_BITS>(device),
+    };
+    int best_tokens = 0;
+    int64_t best_work = INT64_MAX;
+    for (int i = 0; i < 3; ++i) {
+        if (occupancy[i] <= 0) {
+            continue;
+        }
+        const int tokens = 8 << i;
+        const int splits = (n_kv + tokens - 1) / tokens;
+        const int64_t blocks = int64_t(splits) * head_blocks * n_stream;
+        const int capacity = ggml_cuda_info().devices[device].nsm * occupancy[i];
+        const int64_t waves = (blocks + capacity - 1) / capacity;
+        // Token-dependent work normalized to the smallest (8-token)
+        // partition, plus a fixed query/descriptor preparation phase.
+        // On equal work prefer fewer partials and a cheaper combine reduction.
+        const int64_t work = waves * (tokens / 8 + 1);
+        if (work < best_work || (work == best_work && tokens > best_tokens)) {
+            best_work = work;
+            best_tokens = tokens;
+        }
+    }
+    return best_tokens;
 }
 
 template<int D, int K_BITS, int V_BITS>

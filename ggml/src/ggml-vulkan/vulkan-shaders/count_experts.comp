@@ -40,6 +40,7 @@ layout (binding = 2) writeonly buffer DST {float data_dst[];};
 shared uint vals[EXPERTS_PER_CHUNK];
 shared uint offsets[EXPERTS_PER_CHUNK];
 shared uint cursors[EXPERTS_PER_CHUNK];
+shared uint has_skipped_slots;
 
 // data_d[0] is the tile count. Each tile has (expert, valid rows).
 // Packed (token << 16) | slot row ids start at p.row_ids_offset, with each expert on a tile boundary.
@@ -81,6 +82,10 @@ void main() {
     const bool prefix_subgroup = subgroupAny(tid == 0);
 #endif
 
+    if (tid == 0) {
+        has_skipped_slots = 0;
+    }
+
     for (uint expert_base = 0; expert_base < p.n_experts;) {
         const uint n_experts = min(EXPERTS_PER_CHUNK, p.n_experts - expert_base);
         for (uint e = tid; e < n_experts; e += BLOCK_SIZE) {
@@ -88,14 +93,21 @@ void main() {
         }
         barrier();
 
+        bool skipped = false;
         for (uint idx = tid; idx < num_elements; idx += BLOCK_SIZE) {
             const uint i01 = fastdiv(idx, p.ne00mp, p.ne00L);
             const uint i00 = idx - i01 * p.ne00;
-            const uint expert = data_a[p.a_offset + i01 * p.nb01 + i00 * p.nb00] - expert_base;
+            const uint expert_id = data_a[p.a_offset + i01 * p.nb01 + i00 * p.nb00];
+            const uint expert = expert_id - expert_base;
+            skipped = skipped || (expert_base == 0 && int(expert_id) == -1);
             if (expert < n_experts) {
                 atomicAdd(vals[expert], 1);
             }
         }
+        if (skipped) {
+            atomicOr(has_skipped_slots, 1);
+        }
+        // Also publishes the first chunk's skipped-slot flag to all invocations.
         barrier();
 
 #ifdef USE_SUBGROUPS
@@ -148,5 +160,8 @@ void main() {
         data_d[0] = total_tiles;
     }
 
-    zero_skipped_rows();
+    // Ordinary top-k routing has no skipped slots: avoid the serial ID rescan.
+    if (has_skipped_slots != 0) {
+        zero_skipped_rows();
+    }
 }

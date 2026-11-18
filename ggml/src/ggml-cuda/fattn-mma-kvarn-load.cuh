@@ -15,11 +15,26 @@ static __device__ __forceinline__ uint8_t ggml_cuda_fattn_kvarn_unpack_record(
         const uint8_t packed = record[index >> 2];
         return (packed >> ((index & 3) << 1)) & 0x03u;
     }
+#if defined(GGML_USE_HIP)
+    // One aligned 64-bit window covers any bit_offset: shift <= 31 and
+    // shift + bits <= 31 + 6 < 64, so (w0, w1) always suffices. For trailing
+    // elements the window may overlap the following scale axis; those bytes
+    // are in-bounds and unused. Bit-exact integer extraction.
+    const int bit_offset = index * bits;
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(record) + (bit_offset >> 3);
+    const int shift = (int) ((addr & 3u) << 3) + (bit_offset & 7);
+    const uint32_t * w = reinterpret_cast<const uint32_t *>(addr & ~uintptr_t(3));
+    const uint32_t w0 = w[0];
+    const uint32_t w1 = w[1];
+    const uint32_t window = (w0 >> shift) | (shift == 0 ? 0u : (w1 << (32 - shift)));
+    return window & ((1u << bits) - 1u);
+#else
     const int bit_offset = index * bits;
     const int byte_offset = bit_offset >> 3;
     const int bit_in_byte = bit_offset & 7;
     const uint16_t packed = (uint16_t) record[byte_offset] | ((uint16_t) record[byte_offset + 1] << 8);
     return (packed >> bit_in_byte) & ((1u << bits) - 1u);
+#endif
 }
 
 // Decode two consecutive values at an even element index. KVarN value records
@@ -40,6 +55,20 @@ static __device__ __forceinline__ uint16_t ggml_cuda_fattn_kvarn_unpack_record_p
         return (uint16_t) ((packed >> shift) & 0x03u) |
             ((uint16_t) ((packed >> (shift + 2)) & 0x03u) << 8);
     }
+#if defined(GGML_USE_HIP)
+    // Same aligned-window extraction as unpack_record; shift + 2*bits <=
+    // 31 + 12 < 64, so one window serves both lanes. Bit-exact.
+    const int bit_offset = index * bits;
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(record) + (bit_offset >> 3);
+    const int shift = (int) ((addr & 3u) << 3) + (bit_offset & 7);
+    const uint32_t * w = reinterpret_cast<const uint32_t *>(addr & ~uintptr_t(3));
+    const uint32_t w0 = w[0];
+    const uint32_t w1 = w[1];
+    const uint32_t window = (w0 >> shift) | (shift == 0 ? 0u : (w1 << (32 - shift)));
+    const uint16_t mask = (1u << bits) - 1u;
+    return (uint16_t) (window & mask) |
+        (uint16_t) (((window >> bits) & mask) << 8);
+#else
     const int bit_offset = index * bits;
     const int byte_offset = bit_offset >> 3;
     const int bit_in_byte = bit_offset & 7;
@@ -47,6 +76,7 @@ static __device__ __forceinline__ uint16_t ggml_cuda_fattn_kvarn_unpack_record_p
     const uint16_t mask = (1u << bits) - 1u;
     return (uint16_t) ((packed >> bit_in_byte) & mask) |
         (uint16_t) (((packed >> (bit_in_byte + bits)) & mask) << 8);
+#endif
 }
 
 static __device__ __forceinline__ float ggml_cuda_fattn_kvarn_load_stage_rotated(

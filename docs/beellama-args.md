@@ -1,9 +1,15 @@
-# BeeLlama v0.4.7 argument reference
+# BeeLlama v0.5.0 argument reference
 
 This page covers Bee-owned arguments and the upstream arguments whose behavior
 BeeLlama extends. Run `llama-server --help` or `llama-cli --help` for the full
 upstream surface. See [BeeLlama features](beellama-features.md) for use cases,
 limits, and measurement guidance.
+
+## SINQ-derived native IQ/Q preconditioning
+
+See the [SINQ feature guide](sinq.md#quantizer-arguments) for all SINQ quantizer
+arguments, defaults, JSON schemas and offline optimizer controls. Conditioned
+GGUFs require BeeLlama at inference.
 
 ## KVarN cache types and SWA overrides
 
@@ -312,8 +318,18 @@ configuration example.
 |---|---|---|---|
 | `--save-all-logits FNAME`, `--kl-divergence-base FNAME` | — | Unused | Without `--kl-divergence`, writes the base run's compressed log probabilities to `FNAME`. |
 | `--kl-divergence` | — | Off | Compares the current run with the file supplied by `--kl-divergence-base` and returns a nonzero exit code on read or evaluation failure. |
+| `--ppl-full` | N/A | Off | Scores all N-1 next-token targets, including remainder and context-boundary targets. Requires `-f` and a logits file; incompatible with `--chunks`, `--ppl-stride`, and task scoring. |
+| `--kld-token-output FILE` | N/A | Unused | Writes ordered per-token TSV for `--ppl-full`: input index, context position, target token, KLD, base/candidate NLL, and top-1 agreement. Reference-writing runs mark unavailable comparison fields `NA`. |
 
 Use the same corpus, context, logical batch, and physical ubatch for both KLD legs.
+Full-corpus mode tokenizes once with special tokens, resets state every context,
+and uses no overlap or per-context BOS replacement. Its compact reference
+retains the full vocabulary log-probability range and uses a separate format
+from legacy KLD files. With a BF16 baseline, the comparison direction is
+`KL(P_BF16 || P_candidate)` over the full vocabulary. Run a matched BF16
+self-comparison to measure the compact-reference floor; the reference is not
+lossless. Header validation checks context, vocabulary, and tokens, not all
+runtime settings, so keep tokenizer/model settings matched as well.
 
 ## CUDA FlashAttention build policy
 

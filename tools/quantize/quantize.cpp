@@ -125,6 +125,7 @@ static void usage(const char * executable) {
     printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--include-weights]\n", executable);
     printf("       [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--tensor-type] [--tensor-type-file]\n");
     printf("       [--prune-layers] [--keep-split] [--override-kv] [--dry-run] [--max-buffer-size]\n");
+    printf("       [--sinq-config PATH] [--sinq-diagnostics-json PATH]\n");
     printf("       model-f32.gguf [model-quant.gguf] type [nthreads]\n\n");
     printf("  --allow-requantize\n");
     printf("                                      allow requantizing tensors that have already been quantized\n");
@@ -133,6 +134,13 @@ static void usage(const char * executable) {
     printf("  --leave-output-tensor\n");
     printf("                                      leave output.weight un(re)quantized\n");
     printf("                                      increases model size but may also increase quality, especially when requantizing\n");
+    printf("  --sinq-config PATH                   strict v2 JSON defaults, targets and disjoint tensor/layer/role overrides\n");
+    printf("                                      original floating Qwen3.5 projections; companions REQUIRE BeeLlama\n");
+    printf("                                      settings never change the stock qtype allocation; no codec fallback\n");
+    printf("                                      optional encoding.scale_refinement_lambda [0,1] (default 0),\n");
+    printf("                                      encoding.imatrix_exponent finite float (default 2)\n");
+    printf("  --sinq-diagnostics-json PATH          default absent; external deterministic JSON, valid with stock too\n");
+    printf("                                      not compatible with --dry-run or COPY; write failures are fatal\n");
     printf("  --pure\n");
     printf("                                      disable k-quant mixtures and quantize all tensors to the same type\n");
     printf("  --imatrix file_name\n");
@@ -395,6 +403,19 @@ static bool parse_layer_prune(const char * data, std::vector<int> & prune_layers
 int llama_quantize(int argc, char ** argv);
 
 int llama_quantize(int argc, char ** argv) {
+    // Accept both --sinq-option=value and --sinq-option value without changing
+    // the legacy positional/native-format parser.
+    std::vector<std::string> normalized;
+    for (int i = 0; i < argc; ++i) {
+        const std::string arg(argv[i]);
+        const auto eq = arg.find('=');
+        if (arg.rfind("--sinq-",0) == 0 && eq != std::string::npos) {
+            normalized.push_back(arg.substr(0,eq)); normalized.push_back(arg.substr(eq+1));
+        } else { normalized.push_back(arg); }
+    }
+    std::vector<char *> arguments;
+    for (auto & arg : normalized) { arguments.push_back(arg.data()); }
+    argc = int(arguments.size()); argv = arguments.data();
     std::setlocale(LC_NUMERIC, "C");
     if (argc < 3) {
         usage(argv[0]);
@@ -450,6 +471,13 @@ int llama_quantize(int argc, char ** argv) {
             params.dry_run = true;
         } else if (strcmp(argv[arg_idx], "--allow-requantize") == 0) {
             params.allow_requantize = true;
+        } else if (strcmp(argv[arg_idx], "--sinq-config") == 0) {
+            if (++arg_idx >= argc || !*argv[arg_idx]) { usage(argv[0]); }
+            params.sinq_config = argv[arg_idx];
+        } else if (strcmp(argv[arg_idx], "--sinq-diagnostics-json") == 0) {
+            if (++arg_idx >= argc || !*argv[arg_idx]) { usage(argv[0]); }
+            params.sinq_diagnostics_json = argv[arg_idx];
+
         } else if (strcmp(argv[arg_idx], "--pure") == 0) {
             params.pure = true;
         } else if (strcmp(argv[arg_idx], "--imatrix") == 0) {
