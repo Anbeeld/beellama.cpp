@@ -161,7 +161,19 @@ def main() -> None:
         "stable release updates must reconcile stale assets as well as previews",
     )
 
+    windows_cpu = release.split("\n  windows-cpu:\n", 1)[1].split("\n  windows-sycl:\n", 1)[0]
+    require("runs-on: windows-2022" in windows_cpu,
+            "Windows CPU must use the VS 2022 runner with the compatible Clang toolchain")
+    require(windows_cpu.count('-version "[17.0,18.0)"') == 2,
+            "configuration and every Windows CPU compilation slice must select VS 2022, not newer STL headers")
+    require("_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH" not in windows_cpu,
+            "Windows CPU must not bypass the compiler/STL compatibility check")
+
     setup_cuda = (ACTIONS / "windows-setup-cuda/action.yml").read_text(encoding="utf-8")
+    require("choco install unzip" not in setup_cuda and "unzip '*.zip'" not in setup_cuda,
+            "CUDA installation must not depend on Chocolatey unzip or wildcard extraction")
+    require(setup_cuda.count("install-cuda-archives.ps1") == 5,
+            "every supported CUDA installer must use checked per-archive extraction")
     require("cuda_arch:" not in setup_cuda, "x64-only CUDA setup must not require cuda_arch")
     require(
         "Install Cuda Toolkit 13.4 for x64" in setup_cuda
