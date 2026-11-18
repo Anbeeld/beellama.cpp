@@ -49,8 +49,9 @@ SHA. The workflow validation is part of the release contract.
 The compilation matrix has 14 lanes across 11 job definitions. Checkpointing does
 not change their toolkits, matrix entries, compiler flags, or packaging steps.
 Each lane configures once, then uses the workflow-owned
-`.github/actions/build-with-ccache` composite for up to three 90-minute active
-compilation slices. Setup and cache upload time do not count toward a slice.
+`.github/actions/build-with-ccache` composite for up to three 110-minute active
+compilation slices (1h50 each, up to 5h30 total). Setup and cache upload time do
+not count toward a slice.
 
 At a slice deadline, the helper stops the compiler process tree before saving
 ccache. After either of the first two deadlines, it resumes the existing build

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the compilation-slice CLI with real, short-lived process trees."""
 
+import importlib.util
 import os
 from pathlib import Path
 import subprocess
@@ -29,6 +30,12 @@ class CompilationSliceTests(unittest.TestCase):
         )
         outputs = self.output.read_text() if self.output.exists() else ""
         return result, outputs
+
+    def test_default_interval_is_110_minutes(self):
+        spec = importlib.util.spec_from_file_location("cache_build_deadline", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertEqual(module.CHECKPOINT_SECONDS, 110 * 60)
 
     def test_success_is_complete(self):
         result, outputs = self.run_slice("print('compiled')")
