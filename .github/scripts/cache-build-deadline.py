@@ -10,7 +10,7 @@ import subprocess
 import sys
 
 
-CHECKPOINT_SECONDS = 90 * 60
+CHECKPOINT_SECONDS = 110 * 60
 
 
 def set_checkpoint(value: bool) -> None:
