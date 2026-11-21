@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.5.1
+
+- Updated the llama.cpp base to `b001d7bb2`, retaining Bee's cache, checkpoint and speculative decoding extensions.
+
 ## v0.5.0
 
 - Updated the llama.cpp base from `d327bf1f0` to `3c809f443` and ggml to 0.28.0. Inherited changes include DeepSeek V4.1, LiquidAI LFM3/d1 multimodal models, Limite 1B, Mistral Large 4 and MiniCPM-OCR-Jev; FP8 weights, batched tensor transfers, no-allocation memory measurement, realtime conversations/tool calls, deferred tools, router memory scheduling, conversation compaction and search. Also includes CUDA fusion, CDNA sparse attention, SYCL quantized-cache FlashAttention, OpenCL quant/indexer support, Metal/Hexagon updates, parser/DRY limits, and conversion/server/Web UI fixes.

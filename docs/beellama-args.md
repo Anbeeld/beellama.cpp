@@ -1,4 +1,4 @@
-# BeeLlama v0.5.0 argument reference
+# BeeLlama v0.5.1 argument reference
 
 This page covers Bee-owned arguments and the upstream arguments whose behavior
 BeeLlama extends. Run `llama-server --help` or `llama-cli --help` for the full

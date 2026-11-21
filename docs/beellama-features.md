@@ -1,6 +1,6 @@
-# BeeLlama v0.5.0 features
+# BeeLlama v0.5.1 features
 
-BeeLlama v0.5.0 keeps a small fork surface on top of upstream llama.cpp. Use
+BeeLlama v0.5.1 keeps a small fork surface on top of upstream llama.cpp. Use
 this page to choose a feature; use the [argument reference](beellama-args.md)
 for exact names, environment variables, defaults, and validation ranges.
 
