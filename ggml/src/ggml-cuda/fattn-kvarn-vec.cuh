@@ -206,7 +206,7 @@ static __global__ void ggml_cuda_fattn_kvarn_vec_kernel(
     for (int offset = WARP_SIZE / 2; offset >= TOKENS_PER_SPLIT; offset >>= 1) {
 #pragma unroll
         for (int h = 0; h < MAX_GQA; ++h) {
-            dot[h] += __shfl_down_sync(0xFFFFFFFFu, dot[h], offset);
+            dot[h] += __shfl_down_sync(GGML_CUDA_FULL_THREAD_MASK, dot[h], offset);
         }
     }
 #pragma unroll
@@ -246,18 +246,18 @@ static __global__ void ggml_cuda_fattn_kvarn_vec_kernel(
             float m = score + FATTN_KQ_MAX_OFFSET;
 #pragma unroll
             for (int offset = 16; offset > 0; offset >>= 1) {
-                m = fmaxf(m, __shfl_down_sync(0xFFFFFFFFu, m, offset));
+                m = fmaxf(m, __shfl_down_sync(GGML_CUDA_FULL_THREAD_MASK, m, offset));
             }
-            m = __shfl_sync(0xFFFFFFFFu, m, 0);
+            m = __shfl_sync(GGML_CUDA_FULL_THREAD_MASK, m, 0);
 
             const float diff = score - m;
             const float weight = diff >= SOFTMAX_FTZ_THRESHOLD ? expf(diff) : 0.0f;
             float denom = weight;
 #pragma unroll
             for (int offset = 16; offset > 0; offset >>= 1) {
-                denom += __shfl_down_sync(0xFFFFFFFFu, denom, offset);
+                denom += __shfl_down_sync(GGML_CUDA_FULL_THREAD_MASK, denom, offset);
             }
-            denom = __shfl_sync(0xFFFFFFFFu, denom, 0);
+            denom = __shfl_sync(GGML_CUDA_FULL_THREAD_MASK, denom, 0);
             if (lane < TOKENS_PER_SPLIT) {
                 weights[h][lane] = weight;
             }

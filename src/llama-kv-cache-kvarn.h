@@ -170,8 +170,6 @@ public:
     ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const override;
     ggml_tensor * build_input_tail_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const override;
     ggml_tensor * build_input_tail_body_idxs(ggml_context * ctx) const override;
-    ggml_tensor * build_input_k_rot(ggml_context * ctx) const override;
-    ggml_tensor * build_input_v_rot(ggml_context * ctx) const override;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const override;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const override;
@@ -180,6 +178,13 @@ public:
     void set_input_k_idxs_backend(ggml_tensor * dst, const llama_ubatch * ubatch) const override;
     void set_input_v_idxs_backend(ggml_tensor * dst, const llama_ubatch * ubatch) const override;
     void set_input_k_shift(ggml_tensor * dst) const override;
+    uint32_t get_n_kv_rows() const override { return 0; }
+    ggml_tensor * get_k_scale(int32_t) const override { return nullptr; }
+    ggml_tensor * get_v_scale(int32_t) const override { return nullptr; }
+    void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const override;
+    std::vector<ggml_tensor *> get_k_rot() const override;
+    std::vector<ggml_tensor *> get_v_rot() const override;
+    void set_input_attn_mask(const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const override;
     void set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const override;
     void set_input_kq_mask_tail(
             ggml_tensor * body, ggml_tensor * exact,
@@ -189,10 +194,6 @@ public:
             ggml_tensor * query_order, ggml_tensor * run_desc,
             ggml_tensor * body_mask, const llama_ubatch * ubatch, bool causal_attn) const override;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const override;
-    void set_input_k_rot(ggml_tensor * dst) const override;
-    void set_input_v_rot(ggml_tensor * dst) const override;
-    void set_input_k_rot_backend(ggml_tensor * dst) const override;
-    void set_input_v_rot_backend(ggml_tensor * dst) const override;
 
 private:
     llama_kv_cache_context * base() const;

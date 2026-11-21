@@ -1541,6 +1541,18 @@ static bool ggml_metal_set_rows_shapes_supported(
         ggml_is_contiguous_rows(dst) && ggml_is_contiguous_rows(src);
 }
 
+static bool ggml_metal_supports_mul_mat_src1_prec(const struct ggml_tensor * op, bool has_tensor) {
+    const enum ggml_prec prec = ggml_prec_get_src(op, 1);
+
+    if (prec == GGML_PREC_F32) {
+        return false;
+    }
+    if (prec == GGML_PREC_BF16) {
+        return has_tensor && op->op == GGML_OP_MUL_MAT && op->src[0]->type != GGML_TYPE_F32;
+    }
+    return true;
+}
+
 static bool ggml_metal_supports_mul_mat_op(
         bool has_simdgroup_reduction,
         const struct ggml_tensor * op,
@@ -1717,9 +1729,13 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 op->src[0] != NULL && op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(op->src[0]) &&
                 (op->src[1] == NULL || op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_F32) &&
                 (op->src[2] == NULL || op->src[2]->type == GGML_TYPE_F32);
-        case GGML_OP_GROUP_NORM:
         case GGML_OP_L2_NORM:
             return has_simdgroup_reduction && ggml_is_contiguous_rows(op->src[0]);
+        case GGML_OP_GROUP_NORM:
+            return has_simdgroup_reduction &&
+                op->src[0]->type == GGML_TYPE_F32 &&
+                op->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_COUNT_EQUAL:
             return has_simdgroup_reduction &&
                 op->src[0]->type == GGML_TYPE_I32 &&
@@ -1728,11 +1744,12 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_ARGMAX:
             return has_simdgroup_reduction;
         case GGML_OP_NORM:
-        case GGML_OP_RMS_NORM:
             return has_simdgroup_reduction && (ggml_is_contiguous_rows(op->src[0]));
+        case GGML_OP_RMS_NORM:
+            return has_simdgroup_reduction && op->src[0]->type == GGML_TYPE_F32 && (ggml_is_contiguous_rows(op->src[0]));
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK:
-            return true;
+            return ggml_rope_get_truncate(op);
         case GGML_OP_IM2COL:
             return ggml_is_contiguous(op->src[1]) && op->src[1]->type == GGML_TYPE_F32 && (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32);
         case GGML_OP_CONV_2D:
@@ -1763,8 +1780,45 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_ROLL:
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_FLASH_ATTN_EXT:
+            // K/V row lists (ggml_flash_attn_ext_rows): one list of cache rows per q slice
             if (op->src[5] != NULL) {
-                return false;
+                const struct ggml_tensor * kv_rows = op->src[5];
+
+                if (kv_rows->type != GGML_TYPE_I32 ||
+                    !ggml_is_contiguous(kv_rows) ||
+                    kv_rows->ne[2] != 1 || kv_rows->ne[3] != 1 ||
+                    kv_rows->ne[1] != op->src[0]->ne[3] ||
+                    !op->src[3] || op->src[1]->ne[3] != 1 || op->src[2]->ne[3] != 1) {
+                    return false;
+                }
+
+                // the non-vec kernels attend over a contiguous F16 copy of the referenced rows:
+                // - F16 K/V is gathered directly
+                // - quantized K/V is first dequantized with kernel_flash_attn_ext_kv_*_f16
+                // - other types keep attending to the whole cache (dense mask)
+                switch (op->src[1]->type) {
+                    case GGML_TYPE_F16:
+                    case GGML_TYPE_Q4_0:
+                    case GGML_TYPE_Q4_1:
+                    case GGML_TYPE_Q5_0:
+                    case GGML_TYPE_Q5_1:
+                    case GGML_TYPE_Q8_0:
+                        break;
+                    default:
+                        return false;
+                }
+
+                // the row gather copies F16 values in groups of 4
+                if (op->src[2]->ne[0] % 4 != 0) {
+                    return false;
+                }
+                // Bee exact tails use F16/BF16 in src[5] and remain unsupported;
+                // only the qualified I32 row-list representation reaches this route.
+                for (int i = 6; i < GGML_MAX_SRC; ++i) {
+                    if (op->src[i] != NULL) {
+                        return false;
+                    }
+                }
             }
             // for new head sizes, add checks here
             if (op->src[0]->ne[0] != 32 &&
@@ -1896,6 +1950,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_SOLVE_TRI:
             return has_simdgroup_reduction && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_MUL_MAT:
+            if (!ggml_metal_supports_mul_mat_src1_prec(op, dev->props.has_tensor)) {
+                return false;
+            }
             // the FWHT kernels read an F16 source directly; every other F16 src1 path
             // still goes through ggml_metal_supports_mul_mat_op
             if (op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F16 &&
@@ -1906,6 +1963,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     has_simdgroup_reduction, op, true,
                     ggml_metal_op_mul_mat_use_mm(op, has_simdgroup_mm));
         case GGML_OP_MUL_MAT_ID:
+            if (!ggml_metal_supports_mul_mat_src1_prec(op, dev->props.has_tensor)) {
+                return false;
+            }
             return ggml_metal_supports_mul_mat_op(
                     has_simdgroup_reduction, op, false,
                     ggml_metal_op_mul_mat_id_use_mm(op, has_simdgroup_mm));
@@ -2034,7 +2094,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 op->src[1]->ne[3] == op->ne[3] && op->src[0]->ne[1] == op->src[1]->ne[1] &&
                 op->ne[2] % op->src[0]->ne[2] == 0 && op->ne[3] % op->src[0]->ne[3] == 0;
         case GGML_OP_DIAG:
-            return true;
+            return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
             return has_simdgroup_reduction;
@@ -2173,19 +2233,11 @@ static void ggml_metal_buffer_rset_free(ggml_metal_buffer_t buf) {
 static void * ggml_metal_host_malloc(size_t n) {
     void * data = NULL;
 
-#if TARGET_OS_OSX
     kern_return_t err = vm_allocate((vm_map_t) mach_task_self(), (void *) &data, n, VM_FLAGS_ANYWHERE);
     if (err != KERN_SUCCESS) {
         GGML_LOG_ERROR("%s: error: vm_allocate failed\n", __func__);
         return NULL;
     }
-#else
-    const int result = posix_memalign((void **) &data, sysconf(_SC_PAGESIZE), n);
-    if (result != 0) {
-        GGML_LOG_ERROR("%s: error: posix_memalign failed\n", __func__);
-        return NULL;
-    }
-#endif
 
     return data;
 }
@@ -2367,11 +2419,7 @@ void ggml_metal_buffer_free(ggml_metal_buffer_t buf) {
     }
 
     if (buf->is_shared && buf->owned) {
-#if TARGET_OS_OSX
         vm_deallocate((vm_map_t)mach_task_self(), (vm_address_t)buf->all_data, buf->all_size);
-#else
-        free(buf->all_data);
-#endif
     }
 
     free(buf);

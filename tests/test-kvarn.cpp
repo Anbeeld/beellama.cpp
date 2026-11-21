@@ -2449,7 +2449,7 @@ static std::vector<float> test_native_flash_attention_output(
     if (native_view && non_causal_mask) {
         out->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_NON_CAUSAL_MASK] = 1;
     }
-    ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+    ggml_prec_set_acc(out, GGML_PREC_F32);
     if (use_output_rot) {
         out = apply_kvarn_wht_head(ctx, out, head_dim);
     }
@@ -2820,7 +2820,7 @@ static std::vector<float> test_native_flash_attention_segmented_output(
         body_meta = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, n_q_heads, n_q, n_stream);
         out->src[8] = body_meta;
     }
-    ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+    ggml_prec_set_acc(out, GGML_PREC_F32);
 
     ggml_cgraph * store_graph = nullptr;
     if (!native_view) {
@@ -4818,8 +4818,8 @@ static void test_flash_attn_kvarn_domain_isolated_gpu(int n_kv) {
     ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, 4, 1, 1);
     ggml_tensor * plain = ggml_flash_attn_ext(ctx, q, k, v, mask, 0.0625f, 0.0f, 0.0f);
     ggml_tensor * tagged = ggml_flash_attn_ext(ctx, q, k, v, mask, 0.0625f, 0.0f, 0.0f);
-    ggml_flash_attn_ext_set_prec(plain, GGML_PREC_F32);
-    ggml_flash_attn_ext_set_prec(tagged, GGML_PREC_F32);
+    ggml_prec_set_acc(plain, GGML_PREC_F32);
+    ggml_prec_set_acc(tagged, GGML_PREC_F32);
     ggml_flash_attn_ext_set_n_kv_max(tagged, 0);
     tagged->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN] =
             GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V;

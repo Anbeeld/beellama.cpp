@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from pathlib import Path
 root=Path(__file__).resolve().parents[1]
-dflash=(root/"src/models/dflash.cpp").read_text(encoding="utf-8")
+dflash=(root/"src/models/dflash2.cpp").read_text(encoding="utf-8")
 context=(root/"src/llama-context.cpp").read_text(encoding="utf-8")
 assert "output_is_split || graph_is_split" in dflash
 assert '"dflash2_logits_global" : "dflash2_logits_local"' in dflash

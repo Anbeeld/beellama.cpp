@@ -8,7 +8,8 @@ assert headroom is not None and int(headroom.group(1)) >= 32, (
     "meta rotating contexts need at least 32x view headroom; 16x is exhausted by "
     "tensor-parallel speculative decode before the first prompt"
 )
-assert "compute_headroom * n_tensors * ggml_tensor_overhead() + ggml_tensor_overhead()" in src, (
+assert "constexpr size_t compute_headroom_min = 256;" in src, "small meta buffers must retain the upstream minimum"
+assert "std::max(compute_headroom * n_tensors, compute_headroom_min) * ggml_tensor_overhead() + ggml_tensor_overhead()" in src, (
     "rotating tensor containers must reserve compute views plus alignment headroom"
 )
 assert "for (size_t i = 0; i < backend_ctx->max_subgraphs; i++)" in src, (

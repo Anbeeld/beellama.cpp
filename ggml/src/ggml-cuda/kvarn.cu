@@ -589,14 +589,14 @@ static __device__ float kvarn_std_row(
 
 static __device__ __forceinline__ float kvarn_warp_min(float value) {
     for (int offset = 16; offset > 0; offset >>= 1) {
-        value = fminf(value, __shfl_down_sync(0xffffffffu, value, offset));
+        value = fminf(value, __shfl_down_sync(GGML_CUDA_FULL_THREAD_MASK, value, offset));
     }
     return value;
 }
 
 static __device__ __forceinline__ float kvarn_warp_max(float value) {
     for (int offset = 16; offset > 0; offset >>= 1) {
-        value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, offset));
+        value = fmaxf(value, __shfl_down_sync(GGML_CUDA_FULL_THREAD_MASK, value, offset));
     }
     return value;
 }

@@ -173,8 +173,22 @@ def main() -> int:
             exact_prompt = current + [int(seed[1])] * 64
             exact = complete(url, exact_prompt, args.timeout)
             result["responses"]["exact"] = exact
-            assert exact["timings"]["cache_source"] == "live", exact["timings"]
-            assert exact["client_elapsed_ms"] < 1500, exact["client_elapsed_ms"]
+            exact_timings = exact["timings"]
+            if args.spec == "mtp":
+                # MTP restores target, owned draft and pending hidden carry together,
+                # including when the new request extends the complete cached prompt.
+                assert exact_timings["cache_source"] == "checkpoint", exact_timings
+                assert exact_timings["cache_reason"] == "committed", exact_timings
+                assert exact_timings["cache_n"] > 0, exact_timings
+                assert exact_timings["cache_checkpoint_prepare_ms"] > 0, exact_timings
+                assert exact_timings["cache_checkpoint_commit_ms"] > 0, exact_timings
+                # This append includes the same mandatory joint restore as a nearby
+                # rollback, not the live-only work covered by the 1500 ms budget.
+                exact_limit_ms = args.rollback_128_ms
+            else:
+                assert exact_timings["cache_source"] == "live", exact_timings
+                exact_limit_ms = 1500
+            assert exact["client_elapsed_ms"] < exact_limit_ms, exact["client_elapsed_ms"]
             current = continuation(exact_prompt, exact)
 
             branch_128_prompt: list[int] | None = None

@@ -67,6 +67,8 @@ add_library(${TARGET}
     chat-diff-analyzer.cpp
     chat-peg-parser.cpp
     chat-peg-parser.h
+    chat-tts-norm.cpp
+    chat-tts-norm.h
     chat.cpp
     chat.h
     common.cpp

@@ -23,7 +23,11 @@ def main() -> None:
         raise AssertionError("argument parsing must preserve the automatic KV-tail type sentinel")
     registry = arg.split("const std::vector<ggml_type> kv_cache_types = {", 1)[1].split("};", 1)[0]
     registered = set(re.findall(r"GGML_TYPE_[A-Z0-9_]+", registry))
-    non_quantized = {"GGML_TYPE_F32", "GGML_TYPE_F16", "GGML_TYPE_BF16"}
+    # FP8 is scalar floating-point storage, not a block-quantized cache type.
+    traits = (ROOT / "ggml/src/ggml.c").read_text(encoding="utf-8")
+    fp8_traits = traits.split("[GGML_TYPE_F8_E4M3] = {", 1)[1].split("},", 1)[0]
+    assert re.search(r"\.is_quantized\s*=\s*false", fp8_traits)
+    non_quantized = {"GGML_TYPE_F32", "GGML_TYPE_F16", "GGML_TYPE_BF16", "GGML_TYPE_F8_E4M3"}
     quantized = registered - non_quantized
 
     cuda_out_prod = (ROOT / "ggml/src/ggml-cuda/out-prod.cu").read_text(encoding="utf-8")

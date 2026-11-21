@@ -112,12 +112,12 @@ static void test_split(ggml_backend_dev_t first, ggml_backend_dev_t second, ggml
     auto scale_up = runtime ? up_scale : ggml_cast(ctx, up_scale, GGML_TYPE_F32);
     auto scale_down = runtime ? down_scale : ggml_cast(ctx, down_scale, GGML_TYPE_F32);
     auto hidden = ggml_mul_mat(ctx, up, ggml_mul(ctx, input, scale_up));
-    ggml_mul_mat_set_prec(hidden, GGML_PREC_F32);
+    ggml_prec_set_acc(hidden, GGML_PREC_F32);
     ggml_set_output(hidden);
     // The up projection produces the feature-sharded activation consumed by
     // down. Mirroring a synthetic down input would not model this contract.
     auto result = ggml_mul_mat(ctx, down, ggml_mul(ctx, hidden, scale_down));
-    ggml_mul_mat_set_prec(result, GGML_PREC_F32);
+    ggml_prec_set_acc(result, GGML_PREC_F32);
     // A consumer observes the synchronized result, not the partial matmul
     // representation retained in each device's reduction buffer.
     result = ggml_scale(ctx, result, 1.0f);
@@ -131,10 +131,10 @@ static void test_split(ggml_backend_dev_t first, ggml_backend_dev_t second, ggml
     auto control_scale = ggml_new_tensor_1d(control_ctx, GGML_TYPE_F32, width);
     auto control_input = ggml_new_tensor_2d(control_ctx, GGML_TYPE_F32, width, tokens);
     auto control_hidden = ggml_mul_mat(control_ctx, control_up, ggml_mul(control_ctx, control_input, control_scale));
-    ggml_mul_mat_set_prec(control_hidden, GGML_PREC_F32);
+    ggml_prec_set_acc(control_hidden, GGML_PREC_F32);
     ggml_set_output(control_hidden);
     auto control_result = ggml_mul_mat(control_ctx, control_down, ggml_mul(control_ctx, control_hidden, control_scale));
-    ggml_mul_mat_set_prec(control_result, GGML_PREC_F32);
+    ggml_prec_set_acc(control_result, GGML_PREC_F32);
     auto control_graph = ggml_new_graph(control_ctx);
     ggml_build_forward_expand(control_graph, control_result);
     control_graph->uid = ggml_graph_next_uid();

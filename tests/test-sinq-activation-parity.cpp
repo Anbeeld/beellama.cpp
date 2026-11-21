@@ -1,5 +1,6 @@
 // Test-only CPU projection-input capture. No inference API or product hooks.
 #include "llama.h"
+#include "test-model-load-mode.h"
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -88,7 +89,7 @@ int main(int argc, char ** argv) {
         mp.devices = devices;
         mp.tensor_buft_overrides = overrides;
         mp.load_mode = LLAMA_LOAD_MODE_NONE;
-        model = llama_model_load_from_file(argv[1], mp);
+        model = llama_model_load_from_file(argv[1], test_model_load_params(mp));
         if (!model) {
             throw std::runtime_error("model load failed");
         }

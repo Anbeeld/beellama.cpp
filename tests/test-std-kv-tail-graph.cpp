@@ -543,7 +543,7 @@ static std::vector<float> run_attached_tail_attention(
         out = ggml_kv_tail_attention_merge(
                 ctx, out, kt, vt, tail_mask, query_order, run_desc);
     }
-    ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+    ggml_prec_set_acc(out, GGML_PREC_F32);
 
     if (!ggml_backend_supports_op(backend, out)) {
         fail("backend rejected bounded standard quantized body-plus-tail attention");

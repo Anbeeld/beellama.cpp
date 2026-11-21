@@ -3,7 +3,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-COMMON = (ROOT / "ggml/src/ggml-cuda/common.cuh").read_text(encoding="utf-8")
+COMMON = (ROOT / "ggml/src/ggml-cuda/graph.cuh").read_text(encoding="utf-8")
 CUDA = (ROOT / "ggml/src/ggml-cuda/ggml-cuda.cu").read_text(encoding="utf-8")
 
 

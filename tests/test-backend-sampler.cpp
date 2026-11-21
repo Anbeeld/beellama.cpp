@@ -1,5 +1,6 @@
 #include "ggml.h"
 #include "llama.h"
+#include "test-model-load-mode.h"
 #include "llama-cpp.h"
 #include "common.h"
 #include "sampling.h"
@@ -62,7 +63,7 @@ static llama_model_ptr load_model(const test_args & args) {
 
     llama_model_ptr res;
 
-    res.reset(llama_model_load_from_file(args.model.c_str(), mparams));
+    res.reset(llama_model_load_from_file(args.model.c_str(), test_model_load_params(mparams)));
 
     if (!res) {
         fprintf(stderr, "Warning: failed to load model '%s', skipping test\n", args.model.c_str());

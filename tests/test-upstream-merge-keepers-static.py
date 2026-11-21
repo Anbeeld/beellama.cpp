@@ -313,7 +313,7 @@ def main() -> None:
     )
     require(
         draft_init,
-        "llama_model_load_from_file(model_path.c_str(), mparams)",
+        "common_model_load(params.speculative.draft.mparams.get_paths(), mparams)",
         "standalone draft loading must open the configured draft GGUF rather than the target GGUF",
     )
 
@@ -330,7 +330,9 @@ def main() -> None:
     require(release, "name: Build / Release", "the Bee release workflow was replaced by upstream's generic workflow")
     require(release, "beellama-${{", "Bee release assets must retain fork-specific names")
     windows_cuda = release.split("  windows-cuda:", 1)[1].split("  windows-hip:", 1)[0]
-    require(windows_cuda, 'cuda: "13.3"', "Bee's Windows release matrix must retain the CUDA 13.3 lane")
+    for cuda_version in ("12.8", "13.5"):
+        require(windows_cuda, f'cuda: "{cuda_version}"',
+                f"Bee's Windows release matrix must retain the CUDA {cuda_version} lane")
     if "TurboQuant" in release or "TCQ cache" in release:
         raise AssertionError("release metadata still advertises removed TurboQuant/TCQ support")
 
@@ -348,7 +350,7 @@ def main() -> None:
         require(container, "upstream DFlash and KVarN", f"{dockerfile} advertises a stale feature set")
 
     agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
-    require(agents, "50 standard vector pairs", "AGENTS.md does not describe the v0.4.0 CUDA policy")
+    require(agents, "51 standard vector pairs", "AGENTS.md does not describe the current CUDA policy")
     require(agents, "draft-dflash", "AGENTS.md does not describe upstream DFlash")
     if "GPU ring" in agents or "profit and fringe" in agents:
         raise AssertionError("AGENTS.md still describes removed speculative systems")

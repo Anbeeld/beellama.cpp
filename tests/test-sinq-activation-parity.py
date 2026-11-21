@@ -24,7 +24,8 @@ def report(message):
     sys.stdout.flush()
 
 
-def fixture(directory, dtype_name, key_heads=2, value_heads=4, fp32_norms=False):
+def fixture(directory, dtype_name, key_heads=2, value_heads=4, fp32_norms=False,
+            merge_shared_inputs=False):
     import numpy as np
     import torch
     import gguf
@@ -73,6 +74,11 @@ def fixture(directory, dtype_name, key_heads=2, value_heads=4, fp32_norms=False)
     model.save_pretrained(directory, safe_serialization=True)
     converter = Converter(directory, gguf.LlamaFileType.ALL_F32,
                           directory / "model.gguf", eager=True, hparams=hparams)
+    # These captures describe the supported, separate SINQ projection sites.
+    # Upstream now merges shared-input projections by default; retain an actual
+    # unfused source fixture, and separately exercise rejection of fused sources.
+    if not merge_shared_inputs:
+        converter._SHARED_INPUT_MERGES = ()
     converter.set_gguf_parameters()
     writer = converter.gguf_writer
     # Token IDs are supplied directly; this deliberately tiny vocab needs no tokenizer.

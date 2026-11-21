@@ -1,5 +1,4 @@
 #include "llama.h"
-#include "../src/llama-ext.h"
 
 #include "arg.h"
 #include "common.h"
@@ -46,7 +45,7 @@ int llama_fit_params(int argc, char ** argv) {
     }
 
     if (!params.fit_params_print) {
-        const common_params_fit_status status = common_fit_params(params.model.path.c_str(), &mparams, &cparams,
+        const common_params_fit_status status = common_fit_params(params.model.get_paths(), &mparams, &cparams,
                 params.tensor_split, params.tensor_buft_overrides.data(), params.fit_params_target.data(), params.fit_params_min_ctx,
                 nullptr,
                 params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
@@ -86,7 +85,7 @@ int llama_fit_params(int argc, char ** argv) {
         LOG_INF("%s: printing estimated memory in MiB to stdout (device, model, context, compute) ...\n", __func__);
         common_log_flush(common_log_main());
 
-        common_fit_print(params.model.path.c_str(), &mparams, &cparams);
+        common_fit_print(params.model.get_paths(), &mparams, &cparams);
     }
 
     return 0;

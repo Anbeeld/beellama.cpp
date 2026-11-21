@@ -116,7 +116,7 @@ static __global__ void ggml_cuda_fattn_kvarn_window_f16_partial_kernel(
         (Q_f2, K_h2, V_h2, mask_h, nullptr, sinks_f, dstk, partial_ptr, nullptr, scale, slope, logit_softcap,
          ne01, ne02, gqa_ratio, ne11, nb01 / (int32_t) sizeof(float2), nb02 / (int32_t) sizeof(float2),
          nb11 / (int32_t) sizeof(half2), nb21 / (int32_t) sizeof(half2), nb31 / (int32_t) sizeof(half),
-         jt, zt_gqa, 0, iter_k);
+         jt, zt_gqa, 0, iter_k, iter_k);
 #else
     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, partial_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
@@ -183,7 +183,7 @@ static __global__ void ggml_cuda_fattn_kvarn_window_f16_direct_kernel(
         (Q_f2, K_h2, V_h2, mask_h, nullptr, sinks_f, dstk, nullptr, nullptr, scale, slope, logit_softcap,
          ne01, ne02, gqa_ratio, ne11, nb01 / (int32_t) sizeof(float2), nb02 / (int32_t) sizeof(float2),
          nb11 / (int32_t) sizeof(half2), nb21 / (int32_t) sizeof(half2), nb31 / (int32_t) sizeof(half),
-         jt, zt_gqa, 0, iter_k);
+         jt, zt_gqa, 0, iter_k, iter_k);
 #else
     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, dst_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
@@ -469,7 +469,8 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
             v_win.nb[2] = chunk_len * DV * (int64_t) sizeof(half);
             v_win.nb[3] = (int64_t) plan.n_kv_heads * chunk_len * DV * (int64_t) sizeof(half);
 
-            fattn_kernel_t f16_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, false>;
+            fattn_kernel_t f16_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, false, false,
+                GGML_TYPE_F16, GGML_TYPE_F16, false>;
 #if !defined(GGML_USE_MUSA)
             CUDA_CHECK(cudaFuncSetAttribute(
                 reinterpret_cast<ggml_cuda_fattn_kernel_attr_ptr_t>(f16_kernel),

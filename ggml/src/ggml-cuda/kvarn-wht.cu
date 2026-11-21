@@ -152,8 +152,8 @@ static __global__ void kvarn_wht_wave_kernel(
     for (int h = 1; h < PHYSICAL_WAVE_SIZE; h *= 2) {
 #pragma unroll
         for (int slice = 0; slice < SLICES; ++slice) {
-            const float partner = __shfl_xor_sync(
-                0xFFFFFFFFULL, x[slice], h, PHYSICAL_WAVE_SIZE);
+            const float partner = ggml_cuda_shfl_xor(
+                x[slice], h, PHYSICAL_WAVE_SIZE);
             x[slice] = (lane & h) != 0 ? partner - x[slice] : x[slice] + partner;
         }
     }

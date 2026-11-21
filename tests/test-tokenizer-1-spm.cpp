@@ -1,4 +1,5 @@
 #include "llama.h"
+#include "test-model-load-mode.h"
 #include "common.h"
 #include "console.h"
 
@@ -35,7 +36,7 @@ int main(int argc, char ** argv) {
 
         mparams.vocab_only = true;
 
-        model = llama_model_load_from_file(fname.c_str(), mparams);
+        model = llama_model_load_from_file(fname.c_str(), test_model_load_params(mparams));
 
         if (model == NULL) {
             fprintf(stderr, "%s: error: failed to load vocab '%s'\n", __func__, fname.c_str());

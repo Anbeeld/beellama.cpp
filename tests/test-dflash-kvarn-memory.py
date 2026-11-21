@@ -27,9 +27,9 @@ def run(args, cache):
     stem = args.output / cache.replace(":", "-")
     key, value = cache.split(":") if ":" in cache else (cache, cache)
     command = [str(args.server.resolve()), "-m", str(args.target.resolve()),
-               "--spec-draft-model", str(args.draft.resolve()), "--spec-type", "draft-dflash",
-               "--device", "CUDA0,CUDA1", "--spec-draft-device", "CUDA0,CUDA1",
-               "--split-mode", args.split_mode, "--tensor-split", "51,49", "--main-gpu", "1",
+               "--spec-draft-model", str(args.draft.resolve()), "--spec-type", args.spec_type,
+               "--device", args.devices, "--spec-draft-device", args.devices,
+               "--split-mode", args.split_mode, "--tensor-split", "51,49", "--main-gpu", str(args.main_gpu),
                "-ngl", "all", "--spec-draft-ngl", "all", "--load-mode", "dio", "--fit", "off",
                "-c", str(args.context), "-b", "2048", "-ub", "512", "-fa", "on",
                "--cache-type-k", "kvarn6", "--cache-type-v", "kvarn6", "--kv-tail-tokens", "1024",
@@ -42,12 +42,13 @@ def run(args, cache):
         command += ["--swa-full"]
     result = {"command": command, "cache": cache,
               "cuda_launch_blocking": os.getenv("CUDA_LAUNCH_BLOCKING"),
+              "cuda_visible_devices": os.getenv("CUDA_VISIBLE_DEVICES", "0,1"),
               "expected_kvarn_route": args.expect_kvarn_route,
               "version": subprocess.check_output([str(args.server.resolve()), "--version"],
                                                  text=True, stderr=subprocess.STDOUT)}
     with stem.with_suffix(".log").open("w", encoding="utf-8") as log:
         proc = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
-                                env={**os.environ, "CUDA_VISIBLE_DEVICES": "0,1"})
+                                env={**os.environ, "CUDA_VISIBLE_DEVICES": os.getenv("CUDA_VISIBLE_DEVICES", "0,1")})
         try:
             for _ in range(240):
                 if proc.poll() is not None:
@@ -130,6 +131,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("server", "target", "draft"):
         parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--spec-type", choices=["draft-dflash", "draft-dflash2", "draft-dspark"],
+                        default="draft-dflash", help="explicit speculative implementation to exercise")
+    parser.add_argument("--devices", default="CUDA0,CUDA1", help="target and owned-draft CUDA devices")
+    parser.add_argument("--main-gpu", type=int, default=1)
     parser.add_argument("--mmproj", type=Path)
     parser.add_argument("--image", type=Path, help="PNG image; exercises image-first and text-first requests")
     parser.add_argument("--image-min-tokens", type=int, default=1024)

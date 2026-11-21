@@ -3,8 +3,8 @@ cmake_minimum_required(VERSION 3.14...3.28) # for add_link_options and implicit 
 project("ggml" C CXX ASM)
 
 ### GGML Version
-set(GGML_VERSION_MAJOR 0)
-set(GGML_VERSION_MINOR 28)
+set(GGML_VERSION_MAJOR 1)
+set(GGML_VERSION_MINOR 0)
 set(GGML_VERSION_PATCH 0)
 set(GGML_VERSION_BASE "${GGML_VERSION_MAJOR}.${GGML_VERSION_MINOR}.${GGML_VERSION_PATCH}")
 
@@ -285,8 +285,8 @@ function(ggml_cuda_get_fattn_vec_default_pairs OUT_VAR)
     set(_types_3 q3_1 q3_0)
     set(_types_2 q2_1 q2_0s)
 
-    # Homogeneous F16/BF16 pairs cover KVarN and standard precision tails.
-    set(_pairs f16:f16 bf16:bf16)
+    # Exact tails and upstream FP8 caches keep their homogeneous pairs.
+    set(_pairs f16:f16 bf16:bf16 f8_e4m3:f8_e4m3)
     foreach(PAIR ${GGML_CUDA_KVARN_DEFAULT_PAIRS})
         if (NOT PAIR MATCHES "^k([0-9]+)-v([0-9]+)$")
             message(FATAL_ERROR "Invalid KVarN default pair: ${PAIR}")
@@ -315,8 +315,8 @@ function(ggml_cuda_get_fattn_vec_default_pairs OUT_VAR)
     endforeach()
 
     list(LENGTH _pairs _pair_count)
-    if (NOT _pair_count EQUAL 50)
-        message(FATAL_ERROR "Default CUDA FA vec policy expected 50 pairs, got ${_pair_count}")
+    if (NOT _pair_count EQUAL 51)
+        message(FATAL_ERROR "Default CUDA FA vec policy expected 51 pairs, got ${_pair_count}")
     endif()
 
     set(${OUT_VAR} ${_pairs} PARENT_SCOPE)
@@ -337,6 +337,7 @@ option(GGML_VULKAN_MEMORY_DEBUG             "ggml: enable Vulkan memory debug ou
 option(GGML_VULKAN_SHADER_DEBUG_INFO        "ggml: enable Vulkan shader debug info"           OFF)
 option(GGML_VULKAN_VALIDATE                 "ggml: enable Vulkan validation"                  OFF)
 option(GGML_VULKAN_RUN_TESTS                "ggml: run Vulkan tests"                          OFF)
+set   (GGML_VULKAN_SPIRV_INCLUDE_DIR "" CACHE PATH "ggml: override the SPIRV-Headers include directory")
 option(GGML_WEBGPU                          "ggml: use WebGPU"                                OFF)
 option(GGML_WEBGPU_DEBUG                    "ggml: enable WebGPU debug output"                OFF)
 option(GGML_WEBGPU_CPU_PROFILE              "ggml: enable WebGPU profiling (CPU)"             OFF)

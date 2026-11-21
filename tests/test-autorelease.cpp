@@ -3,6 +3,7 @@
 #include <thread>
 
 #include "llama.h"
+#include "test-model-load-mode.h"
 #include "common.h"
 
 // This creates a new context inside a pthread and then tries to exit cleanly.
@@ -11,7 +12,7 @@ int main(int argc, char ** argv) {
 
     std::thread([&model_path]() {
         llama_backend_init();
-        auto * model = llama_model_load_from_file(model_path, llama_model_default_params());
+        auto * model = llama_model_load_from_file(model_path, test_model_load_params(llama_model_default_params()));
         auto * ctx = llama_init_from_model(model, llama_context_default_params());
         llama_free(ctx);
         llama_model_free(model);

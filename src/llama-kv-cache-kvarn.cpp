@@ -1055,14 +1055,6 @@ ggml_tensor * llama_kv_cache_kvarn_context::build_input_tail_body_idxs(ggml_cont
     return base()->build_input_tail_body_idxs(ctx);
 }
 
-ggml_tensor * llama_kv_cache_kvarn_context::build_input_k_rot(ggml_context * ctx) const {
-    return base()->build_input_k_rot(ctx);
-}
-
-ggml_tensor * llama_kv_cache_kvarn_context::build_input_v_rot(ggml_context * ctx) const {
-    return base()->build_input_v_rot(ctx);
-}
-
 ggml_tensor * llama_kv_cache_kvarn_context::build_input_kvarn_mat_idxs(ggml_context * ctx) const {
     // SWA and compact reads use one index per output cache cell. Shared
     // multi-stream reads need one high-watermark index per target stream so
@@ -1271,6 +1263,29 @@ void llama_kv_cache_kvarn_context::set_input_k_shift(ggml_tensor * dst) const {
     base()->set_input_k_shift(dst);
 }
 
+std::vector<ggml_tensor *> llama_kv_cache_kvarn_context::get_k_rot() const {
+    auto result = base()->get_k_rot();
+    std::fill(result.begin(), result.end(), nullptr);
+    return result;
+}
+
+std::vector<ggml_tensor *> llama_kv_cache_kvarn_context::get_v_rot() const {
+    auto result = base()->get_v_rot();
+    std::fill(result.begin(), result.end(), nullptr);
+    return result;
+}
+
+void llama_kv_cache_kvarn_context::set_input_attn_mask(
+        const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const {
+    GGML_ASSERT(!attn_mask.rows);
+    if (uses_compact_read_indices()) {
+        cache->get_metadata_cache()->set_input_attn_mask_mapped(
+                attn_mask, ubatch, causal_attn, compact_read_plan());
+    } else {
+        base()->set_input_attn_mask(attn_mask, ubatch, causal_attn);
+    }
+}
+
 void llama_kv_cache_kvarn_context::set_input_kq_mask(
         ggml_tensor * dst,
         const llama_ubatch * ubatch,
@@ -1307,20 +1322,13 @@ void llama_kv_cache_kvarn_context::set_input_pos_bucket(ggml_tensor * dst, const
     base()->set_input_pos_bucket(dst, ubatch);
 }
 
-void llama_kv_cache_kvarn_context::set_input_k_rot(ggml_tensor * dst) const {
-    base()->set_input_k_rot(dst);
-}
-
-void llama_kv_cache_kvarn_context::set_input_v_rot(ggml_tensor * dst) const {
-    base()->set_input_v_rot(dst);
-}
-
-void llama_kv_cache_kvarn_context::set_input_k_rot_backend(ggml_tensor * dst) const {
-    base()->set_input_k_rot_backend(dst);
-}
-
-void llama_kv_cache_kvarn_context::set_input_v_rot_backend(ggml_tensor * dst) const {
-    base()->set_input_v_rot_backend(dst);
+void llama_kv_cache_kvarn_context::set_input_relative_pos(
+        ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
+    if (uses_compact_read_indices()) {
+        cache->get_metadata_cache()->set_input_relative_pos_mapped(dst, ubatch, extent, compact_read_plan());
+    } else {
+        base()->set_input_relative_pos(dst, ubatch, extent);
+    }
 }
 
 void llama_kv_cache_kvarn_context::set_input_kvarn_rot(ggml_tensor * dst) const {

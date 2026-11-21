@@ -4,6 +4,11 @@
 #include <sstream>
 #include <string>
 
+#ifdef TEST_CUDA_COMPILED_PAIRS
+#include "ggml.h"
+bool ggml_cuda_fa_pair_compiled(ggml_type type_k, ggml_type type_v);
+#endif
+
 static std::string read_file(const std::string & path) {
     std::ifstream file(path);
     if (!file.good()) {
@@ -62,18 +67,18 @@ int main(int argc, char ** argv) {
     const std::string dispatch = slice_between(fattn,
             "static fattn_vec_case_t ggml_cuda_get_fattn_vec_case",
             "static ggml_type ggml_cuda_fattn_canonical_kv_type");
-    ok &= expect(!dispatch.empty() && count_occurrences(dispatch, "FATTN_VEC_CASES_ALL_D(") == 169,
-        "the runtime vector dispatch must enumerate all 169 ordered pairs of the 13 retained types");
+    ok &= expect(!dispatch.empty() && count_occurrences(dispatch, "FATTN_VEC_CASES_ALL_D(") == 196,
+        "the runtime vector dispatch must enumerate all 196 ordered pairs of the 14 retained types");
     ok &= expect(dispatch.find("FATTN_VEC_CASES_ALL_D(F16   , F16)") != std::string::npos &&
                  dispatch.find("FATTN_VEC_CASES_ALL_D(BF16  , BF16)") != std::string::npos,
         "the full runtime vector dispatch must retain homogeneous F16 and BF16 instances");
     ok &= expect(dispatch.find("Q2_0S") != std::string::npos && dispatch.find("GGML_TYPE_Q2_0,") == std::string::npos,
         "the fork low-bit vector type must be Q2_0S, distinct from upstream Q2_0");
     ok &= expect(cmake.find("list(LENGTH _pairs _pair_count)") != std::string::npos &&
-                 cmake.find("Default CUDA FA vec policy expected 50 pairs") != std::string::npos &&
+                 cmake.find("Default CUDA FA vec policy expected 51 pairs") != std::string::npos &&
                  cmake.find("foreach(PAIR ${GGML_CUDA_KVARN_DEFAULT_PAIRS})") != std::string::npos,
-        "CMake must derive and enforce the 50-pair default policy from KVarN default pairs");
-    ok &= expect(cmake.find("set(_pairs f16:f16 bf16:bf16)") != std::string::npos &&
+        "CMake must derive and enforce the 51-pair default policy from KVarN default pairs plus FP8");
+    ok &= expect(cmake.find("set(_pairs f16:f16 bf16:bf16 f8_e4m3:f8_e4m3)") != std::string::npos &&
                  instances.find("ggml_cuda_get_fattn_vec_default_pairs(DEFAULT_PAIRS)") != std::string::npos &&
                  instances.find("if (GGML_CUDA_FA_ALL_QUANTS)") != std::string::npos &&
                  instances.find("foreach (TYPE_V IN LISTS FA_TYPES)") != std::string::npos,
@@ -136,5 +141,55 @@ int main(int argc, char ** argv) {
                  vec.find("GGML_TYPE_Q6_1") != std::string::npos,
         "the vector kernel must retain declarations for the fork low-bit cache types");
 
+#ifdef TEST_CUDA_COMPILED_PAIRS
+    struct cache_type { ggml_type type; int bits; int variant; };
+    const cache_type types[] = {
+        {GGML_TYPE_F16, 0, 0}, {GGML_TYPE_BF16, 0, 0}, {GGML_TYPE_F8_E4M3, 0, 0},
+        {GGML_TYPE_Q8_0, 8, 0}, {GGML_TYPE_Q6_1, 6, 0}, {GGML_TYPE_Q6_0, 6, 1},
+        {GGML_TYPE_Q5_1, 5, 0}, {GGML_TYPE_Q5_0, 5, 1},
+        {GGML_TYPE_Q4_1, 4, 0}, {GGML_TYPE_Q4_0, 4, 1},
+        {GGML_TYPE_Q3_1, 3, 0}, {GGML_TYPE_Q3_0, 3, 1},
+        {GGML_TYPE_Q2_1, 2, 0}, {GGML_TYPE_Q2_0S, 2, 1},
+    };
+    const int allowed_bits[][2] = {
+        {8, 8}, {8, 6}, {8, 5}, {6, 6}, {6, 5}, {6, 4},
+        {5, 5}, {5, 4}, {5, 3}, {4, 4}, {4, 3}, {4, 2},
+        {3, 3}, {3, 2}, {2, 2},
+    };
+    size_t n_compiled = 0;
+    for (const auto & k : types) {
+        for (const auto & v : types) {
+            bool expected = false;
+#ifdef TEST_CUDA_ALL_PAIRS
+            expected = true;
+#else
+            if (k.bits == 0 || v.bits == 0) {
+                expected = k.type == v.type;
+            } else {
+                for (const auto & pair : allowed_bits) {
+                    expected |= pair[0] == k.bits && pair[1] == v.bits &&
+                        (k.bits != v.bits || k.variant <= v.variant);
+                }
+            }
+#endif
+            const bool actual = ggml_cuda_fa_pair_compiled(k.type, v.type);
+            n_compiled += actual;
+            if (actual != expected) {
+                std::fprintf(stderr, "compiled pair mismatch: %s/%s expected=%d actual=%d\n",
+                        ggml_type_name(k.type), ggml_type_name(v.type), expected, actual);
+                ok = false;
+            }
+        }
+    }
+#ifdef TEST_CUDA_ALL_PAIRS
+    ok &= expect(n_compiled == 196, "expanded build must advertise exactly its 196 compiled pairs");
+#else
+    ok &= expect(n_compiled == 51, "default build must advertise exactly its 51 compiled pairs");
+#endif
+    ok &= expect(ggml_cuda_fa_pair_compiled(GGML_TYPE_F32, GGML_TYPE_F32),
+        "F32 must retain its F16 vector-conversion alias");
+    ok &= expect(!ggml_cuda_fa_pair_compiled(GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_NL),
+        "uninstantiated IQ4_NL must not be advertised as a compiled vector pair");
+#endif
     return ok ? 0 : 1;
 }

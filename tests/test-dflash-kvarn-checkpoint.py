@@ -20,18 +20,19 @@ def run(args, cache):
                "--spec-draft-type-k", cache, "--spec-draft-type-v", cache,
                "--cache-type-k", args.target_cache, "--cache-type-v", args.target_cache, "--kv-tail-tokens", "0",
                "-c", "64000", "-b", "2048", "-ub", "512", "-ngl", "all", "--spec-draft-ngl", "all",
-               "--device", "CUDA0,CUDA1", "--spec-draft-device", "CUDA0,CUDA1", "--tensor-split", "51,49",
+               "--device", args.devices, "--spec-draft-device", args.devices, "--tensor-split", "51,49",
                "--load-mode", "dio", "--fit", "off", "--parallel", str(args.parallel),
                "--ctx-checkpoints", "32", "--checkpoint-min-step", "512",
                "--host", "127.0.0.1", "--port", str(args.port), "--no-warmup", "-lv", "5"]
     result = {"command": command, "responses": [],
               "cuda_launch_blocking": os.getenv("CUDA_LAUNCH_BLOCKING"),
+              "cuda_visible_devices": os.getenv("CUDA_VISIBLE_DEVICES", "0,1"),
               "version": subprocess.check_output([str(args.server.resolve()), "--version"],
                                                  text=True, stderr=subprocess.STDOUT)}
     url = f"http://127.0.0.1:{args.port}"
     with (output / "server.log").open("w", encoding="utf-8") as log:
         process = subprocess.Popen(command, stdout=log, stderr=log,
-                                   env={**os.environ, "CUDA_VISIBLE_DEVICES": "0,1"})
+                                   env={**os.environ, "CUDA_VISIBLE_DEVICES": os.getenv("CUDA_VISIBLE_DEVICES", "0,1")})
         try:
             for _ in range(240):
                 if process.poll() is not None:
@@ -105,6 +106,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("server", "target", "draft"):
         parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--devices", default="CUDA0,CUDA1", help="target and owned-draft CUDA devices")
     parser.add_argument("--output", type=Path, default=Path("tmp/dflash-kvarn-checkpoint"))
     parser.add_argument("--profiles", nargs="+", default=["q8_0", "kvarn2", "kvarn3", "kvarn4", "kvarn5", "kvarn6", "kvarn8"])
     parser.add_argument("--target-cache", choices=["q8_0", "f16"], default="q8_0")

@@ -450,7 +450,7 @@ int main(int argc, char ** argv) {
                   kvarn_decode.find("load_ldmatrix(q_b") != std::string::npos &&
                   kvarn_decode.find("load_ldmatrix(p_b") != std::string::npos,
         "NVIDIA-fragment KVarN split decode must fail closed on HIP and MUSA");
-    ok &= expect(kvarn_wht.find("__shfl_xor_sync") != std::string::npos &&
+    ok &= expect(kvarn_wht.find("ggml_cuda_shfl_xor") != std::string::npos &&
                  kvarn_wht.find("ggml_cuda_get_physical_warp_size()") != std::string::npos &&
                  kvarn_wht.find("GGML_KVARN_TEST_FORCE_SHARED_WHT") != std::string::npos,
         "KVarN WHT must use physical-wave butterflies with a shared-memory oracle");

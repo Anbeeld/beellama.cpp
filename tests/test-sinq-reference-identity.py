@@ -106,6 +106,30 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(result['verified_tensor_count'], len(tensors))
         self.assertGreater(result['verified_tensor_count'], 20)
 
+    def test_real_converter_fused_source_is_not_silently_attested(self):
+        try:
+            from transformers import Qwen3_5TextModel
+        except ImportError:
+            self.skipTest('optional Qwen3.5 Transformers implementation unavailable')
+        from gguf import GGUFReader
+        spec = importlib.util.spec_from_file_location('identity_fused_fixture', ROOT / 'tests/test-sinq-activation-parity.py')
+        parity = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(parity)
+        directory = Path(self.temp.name) / 'fused-qwen35'
+        parity.fixture(directory, 'f32', merge_shared_inputs=True)
+        text = Qwen3_5TextModel.from_pretrained(directory, local_files_only=True).cpu().eval()
+        wrapper = self.torch.nn.Module()
+        wrapper.model = self.torch.nn.Module()
+        wrapper.model.language_model = text
+        reader = GGUFReader(str(directory / 'model.gguf'))
+        self.addCleanup(reader.data._mmap.close)
+        tensors = {t.name: t for t in reader.tensors}
+        self.assertIn('blk.0.attn_qkv_gate.weight', tensors)
+        self.assertIn('blk.0.ssm_beta_alpha.weight', tensors)
+        self.assertNotIn('blk.0.attn_qkv.weight', tensors)
+        with self.assertRaisesRegex(ValueError, 'missing source tensor: blk.0.attn_qkv.weight'):
+            exporter.verify_reference_identity(wrapper, text.config, tensors)
+
     def test_strict_execution_rejects_storage_rounded_only_norm(self):
         from gguf import GGMLQuantizationType
         from gguf.quants import quantize

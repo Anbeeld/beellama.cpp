@@ -21,6 +21,7 @@
 //   gpt-oss-template-file:   defaults to models/templates/openai-gpt-oss-120b.jinja
 
 #include "llama.h"
+#include "test-model-load-mode.h"
 #include "common.h"
 #include "chat.h"
 #include "chat-auto-parser.h"
@@ -596,7 +597,7 @@ int main(int argc, char ** argv) {
     {
         auto mparams = llama_model_default_params();
         mparams.vocab_only = true;
-        c.model = llama_model_load_from_file(vocab_path.c_str(), mparams);
+        c.model = llama_model_load_from_file(vocab_path.c_str(), test_model_load_params(mparams));
         if (c.model == nullptr) {
             fprintf(stderr, "error: failed to load vocab '%s'\n", vocab_path.c_str());
             return 1;

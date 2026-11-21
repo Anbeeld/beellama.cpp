@@ -10,6 +10,7 @@ HEAD_SIZES_V_OVERRIDE = {576: 512, 320: 256, 192: 128}
 
 TYPES_KV = [
     "GGML_TYPE_F16",
+    "GGML_TYPE_F8_E4M3",
     "GGML_TYPE_BF16",
     "GGML_TYPE_Q8_0",
     "GGML_TYPE_Q6_1",
@@ -165,10 +166,6 @@ for ncols in [8, 16, 32, 64]:
             f.write(SOURCE_FATTN_MMA_START)
 
             for head_size_kq in HEAD_SIZES_KQ:
-                if head_size_kq == 40:
-                    continue
-                if head_size_kq == 72:
-                    continue
                 # Skip compilation of unused ncols2 values for niche head sizes:
                 if head_size_kq == 192 and ncols2 not in (8, 16): # MiMo-V2.5
                     continue
@@ -228,7 +225,11 @@ for bits_k in KVARN_DECODE_BITS:
 
 for type in TYPES_MMQ:
     with open(f"mmq-instance-{get_short_name(type)}.cu", "w") as f:
-        f.write(SOURCE_MMQ.format(type=type))
+        source = SOURCE_MMQ.format(type=type)
+        if type == "GGML_TYPE_PTQ1_0":
+            source = source.replace("DECL_MMQ_CASE(GGML_TYPE_PTQ1_0);",
+                                    "#if !defined(GGML_USE_HIP)\nDECL_MMQ_CASE(GGML_TYPE_PTQ1_0);\n#endif")
+        f.write(source)
         if type in TYPES_MMQ_W4A4:
             f.write(SOURCE_MMQ_W4A4.format(type=type))
 

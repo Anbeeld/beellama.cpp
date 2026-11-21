@@ -706,7 +706,7 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
         }
 #pragma unroll
         for (int offset = 8; offset > 0; offset >>= 1) {
-            m = fmaxf(m, __shfl_xor_sync(0xFFFFFFFFu, m, offset, 16));
+            m = fmaxf(m, __shfl_xor_sync(GGML_CUDA_FULL_THREAD_MASK, m, offset, 16));
         }
 
         float denom = 0.0f;
@@ -720,7 +720,7 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
         }
 #pragma unroll
         for (int offset = 8; offset > 0; offset >>= 1) {
-            denom += __shfl_xor_sync(0xFFFFFFFFu, denom, offset, 16);
+            denom += __shfl_xor_sync(GGML_CUDA_FULL_THREAD_MASK, denom, offset, 16);
         }
         if (h < MAX_GQA && lane_h == 0) {
             m_sh[qt][h] = m;

@@ -1,4 +1,5 @@
 #include "llama.h"
+#include "test-model-load-mode.h"
 #include "ggml.h"
 #include "gguf.h"
 #include "ggml-backend.h"
@@ -147,7 +148,7 @@ static void make_model(const std::string & path, const std::string & mode, bool 
 }
 static llama_model * load(const std::string & path, llama_split_mode split = LLAMA_SPLIT_MODE_NONE, bool check_tensors = true) {
     auto p = llama_model_default_params(); p.n_gpu_layers = 0; p.split_mode = split; p.check_tensors = check_tensors;
-    logs.clear(); return llama_model_load_from_file(path.c_str(),p);
+    logs.clear(); return llama_model_load_from_file(path.c_str(),test_model_load_params(p));
 }
 // Exercise real loading, runtime F32 caches and model graphs, not just a
 // synthetic scale split. CPU Meta ranks make this regression GPU-independent.
@@ -165,7 +166,7 @@ static std::vector<float> forward_split(const std::string & path, ggml_backend_d
     p.tensor_split = proportions.data();
     std::fprintf(stderr,"SINQ forward: %s ranks=%d ratio=%g,%g\n",path.c_str(),second ? 2 : 1,a,b);
     logs.clear();
-    auto * model = llama_model_load_from_file(path.c_str(),p);
+    auto * model = llama_model_load_from_file(path.c_str(),test_model_load_params(p));
     if (!model) { std::fprintf(stderr,"%s",logs.c_str()); }
     check(model != nullptr,"tensor split fixture load");
     auto cp = llama_context_default_params();
@@ -920,7 +921,7 @@ int main(int argc, char ** argv) try {
     std::strcpy(obsolete_override[0].key,"beellama.qk_sinq.kurtosis_gate");
     obsolete_override[0].tag=LLAMA_KV_OVERRIDE_TYPE_BOOL; obsolete_override[0].val_bool=false;
     auto override_source=llama_model_default_params(); override_source.n_gpu_layers=0; override_source.kv_overrides=obsolete_override;
-    auto * overridden=llama_model_load_from_file(source.c_str(),override_source);
+    auto * overridden=llama_model_load_from_file(source.c_str(),test_model_load_params(override_source));
     if (overridden) { llama_model_free(overridden); }
     check(!overridden,"unsupported metadata override accepted by loader");
     reject_copy.kv_overrides=obsolete_override;
@@ -945,8 +946,11 @@ int main(int argc, char ** argv) try {
         };
         override_params.tensor_buft_overrides = placements;
         logs.clear();
-        auto * conflict = llama_model_load_from_file(valid.c_str(),override_params);
+        auto * conflict = llama_model_load_from_file(valid.c_str(),test_model_load_params(override_params));
         if (conflict) { llama_model_free(conflict); }
+        if (conflict || logs.find("scale placement must match") == std::string::npos) {
+            std::fprintf(stderr,"unexpected placement result (loaded=%d):\n%s\n",conflict != nullptr,logs.c_str());
+        }
         check(!conflict && logs.find("scale placement must match") != std::string::npos,
               "companion/base placement mismatch was not rejected");
         std::puts("CUDA companion/base placement mismatch rejected");
@@ -955,7 +959,7 @@ int main(int argc, char ** argv) try {
     no_alloc_params.n_gpu_layers = 0;
     no_alloc_params.no_alloc = true;
     no_alloc_params.load_mode = LLAMA_LOAD_MODE_NONE;
-    auto * probe = llama_model_load_from_file(valid.c_str(),no_alloc_params);
+    auto * probe = llama_model_load_from_file(valid.c_str(),test_model_load_params(no_alloc_params));
     check(probe != nullptr,"no-allocation fit probe with validated companions");
     llama_model_free(probe);
     llama_backend_free(); std::puts("SINQ model tests passed"); return 0;

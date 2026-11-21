@@ -1,4 +1,5 @@
 #include "../tools/server/server-task.h"
+#include "../tools/server/server-slot-sched.h"
 
 #undef NDEBUG
 #include <cassert>
@@ -75,7 +76,9 @@ static void prompt_cache_load_target_success_draft_failure_is_atomic() {
     cache.states.push_back(std::move(saved));
 
     server_prompt current = make_prompt({9});
-    current.checkpoints.emplace_back().data_tgt.resize(4);
+    auto initial_checkpoint = std::make_shared<common_prompt_checkpoint>();
+    initial_checkpoint->data_tgt.resize(4);
+    current.checkpoints.push_back(std::move(initial_checkpoint));
     server_tokens requested(llama_tokens {1, 2, 4}, false);
 
     bool restored_main = false;
@@ -225,10 +228,10 @@ static void prompt_cache_respects_native_rollback_limit() {
             saved.prompt = make_prompt({1, 2, 3, 4, 5});
             saved.data.main = {0x2a};
             if (checkpoint) {
-                common_prompt_checkpoint anchor;
-                anchor.n_tokens = 1;
-                anchor.pos_min = 0;
-                anchor.pos_max = 0;
+                auto anchor = std::make_shared<common_prompt_checkpoint>();
+                anchor->n_tokens = 1;
+                anchor->pos_min = 0;
+                anchor->pos_max = 0;
                 saved.prompt.checkpoints.push_back(std::move(anchor));
             }
             cache.states.push_back(std::move(saved));
@@ -496,9 +499,10 @@ static void prompt_cache_snapshot_restore_evict_stress() {
 
     for (int i = 0; i < 10000; ++i) {
         server_prompt source = make_prompt({i + 1, i + 20001});
-        auto & checkpoint = source.checkpoints.emplace_back();
-        checkpoint.n_tokens = 2;
-        checkpoint.data_tgt.resize(4*KIB);
+        auto checkpoint = std::make_shared<common_prompt_checkpoint>();
+        checkpoint->n_tokens = 2;
+        checkpoint->data_tgt.resize(4*KIB);
+        source.checkpoints.push_back(std::move(checkpoint));
 
         auto * admitted = cache.alloc(source, 32*KIB, 0);
         assert(admitted != nullptr);
@@ -556,27 +560,30 @@ int main() {
 
     {
         server_prompt prompt = make_prompt({1, 2, 3});
-        auto & ckpt = prompt.checkpoints.emplace_back();
-        ckpt.n_tokens = 3;
-        ckpt.data_tgt.resize(16);
-        ckpt.data_dft.resize(8);
+        auto ckpt = std::make_shared<common_prompt_checkpoint>();
+        ckpt->n_tokens = 3;
+        ckpt->data_tgt.resize(16);
+        ckpt->data_dft.resize(8);
+        prompt.checkpoints.push_back(std::move(ckpt));
 
         const server_prompt clone = prompt.clone();
         assert(clone.n_tokens() == 3);
         assert(clone.checkpoints.size() == 1);
-        assert(clone.checkpoints.front().data_tgt.storage_id() ==
-                prompt.checkpoints.front().data_tgt.storage_id());
+        assert(clone.checkpoints.front()->data_tgt.storage_id() ==
+                prompt.checkpoints.front()->data_tgt.storage_id());
 
-        const void * shared_storage = clone.checkpoints.front().data_tgt.storage_id();
-        prompt.checkpoints.front().data_tgt.resize(24);
-        assert(prompt.checkpoints.front().data_tgt.storage_id() != shared_storage);
-        assert(clone.checkpoints.front().data_tgt.size() == 16);
+        const void * shared_storage = clone.checkpoints.front()->data_tgt.storage_id();
+        auto detached_checkpoint = std::make_shared<common_prompt_checkpoint>(*prompt.checkpoints.front());
+        detached_checkpoint->data_tgt.resize(24);
+        prompt.checkpoints.front() = std::move(detached_checkpoint);
+        assert(prompt.checkpoints.front()->data_tgt.storage_id() != shared_storage);
+        assert(clone.checkpoints.front()->data_tgt.size() == 16);
 
         server_prompt_cache_state state {
             /*.prompt =*/ std::move(prompt),
             /*.data =*/ {
-                /*.main =*/ std::vector<uint8_t>(64),
-                /*.drft =*/ std::vector<uint8_t>(32),
+                /*.main =*/ common_state_data(64),
+                /*.drft =*/ common_state_data(32),
                 /*.spec =*/ { },
             },
         };
@@ -602,9 +609,10 @@ int main() {
     {
         server_prompt_cache cache(1, 0);
         server_prompt current = make_prompt({3, 4});
-        auto & ckpt = current.checkpoints.emplace_back();
-        ckpt.n_tokens = 4;
-        ckpt.data_tgt.resize(200*KIB);
+        auto ckpt = std::make_shared<common_prompt_checkpoint>();
+        ckpt->n_tokens = 4;
+        ckpt->data_tgt.resize(200*KIB);
+        current.checkpoints.push_back(std::move(ckpt));
 
         auto * saved = cache.alloc(current, 800*KIB, 0);
         assert(saved != nullptr);
@@ -621,9 +629,10 @@ int main() {
         cache.states.push_back(std::move(existing));
 
         server_prompt current = make_prompt({3, 4});
-        auto & ckpt = current.checkpoints.emplace_back();
-        ckpt.n_tokens = 4;
-        ckpt.data_tgt.resize(200*KIB);
+        auto ckpt = std::make_shared<common_prompt_checkpoint>();
+        ckpt->n_tokens = 4;
+        ckpt->data_tgt.resize(200*KIB);
+        current.checkpoints.push_back(std::move(ckpt));
 
         assert(cache.alloc(current, 900*KIB, 0) == nullptr);
         assert(cache.states.size() == 1);
@@ -640,7 +649,9 @@ int main() {
 
     {
         server_prompt source = make_prompt({7, 8, 9});
-        source.checkpoints.emplace_back().data_tgt.resize(200*KIB);
+        auto checkpoint = std::make_shared<common_prompt_checkpoint>();
+        checkpoint->data_tgt.resize(200*KIB);
+        source.checkpoints.push_back(std::move(checkpoint));
         server_prompt_cache cache(0, 0);
         server_prompt_cache_state first;
         first.prompt = source.clone();

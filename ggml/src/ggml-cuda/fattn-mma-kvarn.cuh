@@ -272,6 +272,10 @@ static inline bool ggml_cuda_fattn_kvarn_view_supported(
         const ggml_tensor * dst,
         ggml_cuda_fattn_kvarn_plan * out = nullptr) {
     GGML_UNUSED(device);
+    // Row-list indirection is qualified only for ordinary dense K/V.
+    if (dst && dst->src[5] && dst->src[5]->type == GGML_TYPE_I32) {
+        return false;
+    }
     if (dst == nullptr || dst->op != GGML_OP_FLASH_ATTN_EXT || dst->src[0] == nullptr ||
             dst->src[1] == nullptr || dst->src[2] == nullptr) {
         return false;

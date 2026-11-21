@@ -263,7 +263,7 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
         if constexpr (D == 64) {
 #pragma unroll
             for (int stride = 16; stride > 0; stride >>= 1) {
-                partial += __shfl_down_sync(0xffffffffu, partial, stride);
+                partial += __shfl_down_sync(GGML_CUDA_FULL_THREAD_MASK, partial, stride);
             }
             if (tid == 0) {
                 reduction[0] = partial;
@@ -385,7 +385,7 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
             if constexpr (D == 64) {
 #pragma unroll
                 for (int stride = 16; stride > 0; stride >>= 1) {
-                    partial += __shfl_down_sync(0xffffffffu, partial, stride);
+                    partial += __shfl_down_sync(GGML_CUDA_FULL_THREAD_MASK, partial, stride);
                 }
                 if (tid == 0) {
                     reduction[0] = partial;
@@ -651,7 +651,7 @@ static __global__ void ggml_cuda_fattn_kvarn_d64_gqa_kernel(
             float dot = q[2 * tid] * k_values[0] + q[2 * tid + 1] * k_values[1];
 #pragma unroll
             for (int stride = 16; stride > 0; stride >>= 1) {
-                dot += __shfl_down_sync(0xffffffffu, dot, stride);
+                dot += __shfl_down_sync(GGML_CUDA_FULL_THREAD_MASK, dot, stride);
             }
             scores[h] = dot;
         }
