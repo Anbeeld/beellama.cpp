@@ -112,8 +112,8 @@ def main() -> None:
         "release jobs must build the UI from the checked-out source",
     )
     require(
-        release.count("build/tools/ui/dist/index.html") == 6
-        and release.count(r"build\tools\ui\dist\index.html") == 1,
+        release.count("python3 .ci-workflow/.github/scripts/verify-source-ui.py") == 6
+        and release.count(r"python .ci-workflow\.github\scripts\verify-source-ui.py") == 1,
         "all seven application builds must require source-built UI output",
     )
     require(
@@ -173,7 +173,27 @@ def main() -> None:
     require("_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH" not in windows_cpu,
             "Windows CPU must not bypass the compiler/STL compatibility check")
 
+    setup_llvm = (ACTIONS / "windows-setup-llvm/action.yml").read_text(encoding="utf-8")
+    require(release.count("uses: ./.ci-workflow/.github/actions/windows-setup-llvm") == 2,
+            "Windows CPU and Vulkan must select compatible LLVM toolchains")
+    require('match_openmp: "true"' in windows_cpu
+            and "GGML_OPENMP_LLVM_VERSION" in setup_llvm
+            and "GGML_OPENMP_INSTALLER_SHA256" in setup_llvm,
+            "CPU LLVM must match the selected source OpenMP version and x64 installer hash")
+    require('$version = "22.1.8"' in setup_llvm and "Get-FileHash" in setup_llvm,
+            "Vulkan LLVM must support the current STL and verify installer integrity")
+    vulkan = release.split("\n  windows-vulkan:\n", 1)[1].split("\n  windows-cuda:\n", 1)[0]
+    require(vulkan.count(r'set "PATH=%ProgramFiles%\LLVM\bin;%PATH%"') == 2
+            and vulkan.count(r'"%ProgramFiles%\LLVM\bin\clang.exe" --version || exit /b 1') == 2,
+            "Vulkan configuration and each build slice must prefer the installed LLVM")
+    require("_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH" not in vulkan,
+            "Vulkan must not bypass the STL compiler compatibility check")
+
     setup_cuda = (ACTIONS / "windows-setup-cuda/action.yml").read_text(encoding="utf-8")
+    for toolkit, component in (("12.8", "12.8.90"), ("13.5", "13.5.37")):
+        lane = setup_cuda.split(f"- name: Install Cuda Toolkit {toolkit}\n", 1)[1].split("\n    - name:", 1)[0]
+        require(f"cuda_nvml_dev-windows-x86_64-{component}-archive.zip" in lane,
+                f"CUDA {toolkit} must install the NVML development header required by ggml-cuda")
     require("choco install unzip" not in setup_cuda and "unzip '*.zip'" not in setup_cuda,
             "CUDA installation must not depend on Chocolatey unzip or wildcard extraction")
     require(setup_cuda.count("install-cuda-archives.ps1") == 5,

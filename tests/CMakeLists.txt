@@ -16,6 +16,12 @@ if (Python3_Interpreter_FOUND)
     set_property(TEST test-release-workflow-static PROPERTY LABELS main)
 
     add_test(
+        NAME test-release-ui-output
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-release-ui-output.py)
+    set_property(TEST test-release-ui-output PROPERTY LABELS main)
+
+    add_test(
         NAME test-release-cache-parent
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-release-cache-parent.py)
