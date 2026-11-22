@@ -214,14 +214,14 @@ static __device__ __forceinline__ float * ggml_cuda_fattn_kvarn_inverse_wht_128_
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     float * src = buf0;
     float * dst = buf1;
-    __syncwarp();
+    ggml_cuda_fattn_kvarn_mma_syncwarp();
     for (int stride = 1; stride < GGML_CUDA_FATTN_KVARN_DIM; stride *= 2) {
         for (int d = lane; d < GGML_CUDA_FATTN_KVARN_DIM; d += warp_size) {
             const float a = src[d];
             const float b = src[d ^ stride];
             dst[d] = (d & stride) ? (b - a) : (a + b);
         }
-        __syncwarp();
+        ggml_cuda_fattn_kvarn_mma_syncwarp();
         float * tmp = src;
         src = dst;
         dst = tmp;
@@ -229,7 +229,7 @@ static __device__ __forceinline__ float * ggml_cuda_fattn_kvarn_inverse_wht_128_
     for (int d = lane; d < GGML_CUDA_FATTN_KVARN_DIM; d += warp_size) {
         src[d] *= 0.08838834764831845f; // 1/sqrt(128)
     }
-    __syncwarp();
+    ggml_cuda_fattn_kvarn_mma_syncwarp();
     return src;
 }
 
@@ -354,7 +354,7 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
                 for (int d = lane; d < GGML_CUDA_FATTN_KVARN_DIM; d += warp_size) {
                     row0[d] = 0.0f;
                 }
-                __syncwarp();
+                ggml_cuda_fattn_kvarn_mma_syncwarp();
 
                 for (int src_slice = 0; src_slice < slices; ++src_slice) {
                     const int record_head = desc.head_base + src_slice;
@@ -363,17 +363,17 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
                     for (int d = lane; d < GGML_CUDA_FATTN_KVARN_DIM; d += warp_size) {
                         row1[d] = valid_row ? __half2float(desc.stage[base + d]) : 0.0f;
                     }
-                    __syncwarp();
+                    ggml_cuda_fattn_kvarn_mma_syncwarp();
                     const float sign = ggml_cuda_fattn_kvarn_hslice_sign(slice, src_slice);
                     for (int d = lane; d < GGML_CUDA_FATTN_KVARN_DIM; d += warp_size) {
                         row0[d] += sign*row1[d];
                     }
-                    __syncwarp();
+                    ggml_cuda_fattn_kvarn_mma_syncwarp();
                 }
                 for (int d = lane; d < GGML_CUDA_FATTN_KVARN_DIM; d += warp_size) {
                     row0[d] *= slice_scale;
                 }
-                __syncwarp();
+                ggml_cuda_fattn_kvarn_mma_syncwarp();
                 float * orig = ggml_cuda_fattn_kvarn_inverse_wht_128_warp(row0, row1, lane);
                 for (int global_b = out_dim2_start + lane;
                         global_b < out_dim2_end; global_b += warp_size) {
@@ -381,7 +381,7 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
                     tile_KV[row*stride_tile + global_b - dim2_start] =
                         make_half2(orig[dim], orig[dim + 1]);
                 }
-                __syncwarp();
+                ggml_cuda_fattn_kvarn_mma_syncwarp();
             }
             continue;
         }
@@ -405,30 +405,30 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
                     for (int d = lane; d < GGML_CUDA_FATTN_KVARN_DIM; d += warp_size) {
                         row0[d] = 0.0f;
                     }
-                    __syncwarp();
+                    ggml_cuda_fattn_kvarn_mma_syncwarp();
 
                     for (int src_slice = 0; src_slice < desc.head_slices; ++src_slice) {
                         ggml_cuda_fattn_kvarn_load_rotated_slice_warp(
                                 desc, k_start + row, src_slice, valid_row, row1, lane);
-                        __syncwarp();
+                        ggml_cuda_fattn_kvarn_mma_syncwarp();
                         const float sign = ggml_cuda_fattn_kvarn_hslice_sign(slice, src_slice);
                         for (int d = lane; d < GGML_CUDA_FATTN_KVARN_DIM; d += warp_size) {
                             row0[d] += sign * row1[d];
                         }
-                        __syncwarp();
+                        ggml_cuda_fattn_kvarn_mma_syncwarp();
                     }
 
                     for (int d = lane; d < GGML_CUDA_FATTN_KVARN_DIM; d += warp_size) {
                         row0[d] *= inv_sqrt_slices;
                     }
-                    __syncwarp();
+                    ggml_cuda_fattn_kvarn_mma_syncwarp();
 
                     float * orig = ggml_cuda_fattn_kvarn_inverse_wht_128_warp(row0, row1, lane);
                     for (int global_b = out_dim2_start + lane; global_b < out_dim2_end; global_b += warp_size) {
                         const int dim = 2 * (global_b - slice_dim2_start);
                         tile_KV[row * stride_tile + global_b - dim2_start] = make_half2(orig[dim], orig[dim + 1]);
                     }
-                    __syncwarp();
+                    ggml_cuda_fattn_kvarn_mma_syncwarp();
                 }
                 continue;
             }
@@ -464,7 +464,7 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
                     const int dim = 2 * (global_b - slice_dim2_start);
                     tile_KV[row * stride_tile + global_b - dim2_start] = make_half2(orig[dim], orig[dim + 1]);
                 }
-                __syncwarp();
+                ggml_cuda_fattn_kvarn_mma_syncwarp();
             }
             if (fast_record) {
                 __syncthreads();

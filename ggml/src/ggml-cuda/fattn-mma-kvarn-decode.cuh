@@ -856,7 +856,7 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
                 }
             }
         }
-        __syncwarp();
+        ggml_cuda_fattn_kvarn_mma_syncwarp();
     }
     __syncthreads();
 

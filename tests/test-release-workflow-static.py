@@ -247,6 +247,16 @@ def main() -> None:
     require(oneapi_init in sycl_command
             and sycl_command.index(oneapi_init) < sycl_command.index("python3 "),
             "every Ubuntu SYCL compilation slice must initialize oneAPI in its own shell")
+    sycl_configure = sycl.split("      - name: Configure\n", 1)[1].split("      - name: Build with checkpoints\n", 1)[0]
+    for shell_block in (sycl_configure, sycl_command):
+        capture_node = 'ui_node_bin="$(dirname "$(command -v node)")"'
+        restore_node = 'export PATH="${ui_node_bin}:${PATH}"'
+        require(capture_node in shell_block and restore_node in shell_block
+                and shell_block.index(capture_node) < shell_block.index(oneapi_init)
+                < shell_block.index(restore_node),
+                "SYCL configure and build must preserve setup-node ahead of oneAPI's bundled npm")
+        require("node --version" in shell_block and "npm --version" in shell_block,
+                "the effective SYCL UI toolchain must be visible in configure and build logs")
     require(checkpoint_build.count("run: ${{ inputs.command }}") == 3,
             "all three slices must reuse the command including its toolchain environment setup")
     for number in (1, 2, 3):

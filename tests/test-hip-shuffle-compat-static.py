@@ -70,6 +70,26 @@ def main() -> None:
     require(len(re.findall(r"\bggml_cuda_fattn_kvarn_portable_sync_32\s*\(\s*\)\s*;", portable_calls)) == 9,
             "all nine portable KVarN shared-state synchronization sites must use the helper")
 
+    loader = read("ggml/src/ggml-cuda/fattn-mma-kvarn-load.cuh")
+    mma_sync = re.search(
+        r"static __device__ __forceinline__ void ggml_cuda_fattn_kvarn_mma_syncwarp\(\)\s*\{(.*?)\n\}",
+        loader, re.S,
+    )
+    require(mma_sync is not None, "MMA KVarN must define a warp-local synchronization helper")
+    hip_sync, cuda_sync = mma_sync.group(1).split("#else", 1)
+    require("#if defined(GGML_USE_HIP)" in hip_sync
+            and hip_sync.index("__ATOMIC_RELEASE") < hip_sync.index("__builtin_amdgcn_wave_barrier")
+            < hip_sync.index("__ATOMIC_ACQUIRE"),
+            "HIP MMA scratch publication must use release/wave-barrier/acquire ordering")
+    require("__syncthreads" not in hip_sync and "__syncwarp();" in cuda_sync,
+            "per-warp MMA loops must not acquire a whole-block barrier or change CUDA sync")
+    for name, count in (("fattn-mma-kvarn-impl.cuh", 14), ("fattn-mma-kvarn-decode.cuh", 1)):
+        body = read("ggml/src/ggml-cuda/" + name)
+        require(re.search(r"\b__syncwarp\s*\(", body) is None,
+                f"{name} must not reference HIP-disabled CUDA warp-sync builtins")
+        require(body.count("ggml_cuda_fattn_kvarn_mma_syncwarp();") == count,
+                f"all {count} warp-local synchronization sites in {name} must use the helper")
+
 
 if __name__ == "__main__":
     main()

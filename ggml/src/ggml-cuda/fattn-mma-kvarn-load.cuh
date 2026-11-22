@@ -2,6 +2,19 @@
 
 #include "fattn-mma-kvarn.cuh"
 
+// These scratch-buffer loops synchronize individual physical warps, not whole
+// blocks. Match HIP's wavefront release/barrier/acquire sequence even when its
+// CUDA-compatible warp-sync builtins are disabled by the legacy shuffle shim.
+static __device__ __forceinline__ void ggml_cuda_fattn_kvarn_mma_syncwarp() {
+#if defined(GGML_USE_HIP)
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+    __builtin_amdgcn_wave_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+#else
+    __syncwarp();
+#endif
+}
+
 static __device__ __forceinline__ uint8_t ggml_cuda_fattn_kvarn_unpack_record(
         const uint8_t * record, const int index, const int bits) {
     if (bits == 8) {
