@@ -722,7 +722,11 @@ jobs:
 
       - name: Configure
         run: |
+          ui_node_bin="$(dirname "$(command -v node)")"
           source "${ONEAPI_ROOT}/setvars.sh"
+          export PATH="${ui_node_bin}:${PATH}"
+          node --version
+          npm --version
           cmake -B build -G "Ninja" \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_RPATH='$ORIGIN' \
@@ -744,7 +748,11 @@ jobs:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-ubuntu-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
           shell: bash
           command: |
+              ui_node_bin="$(dirname "$(command -v node)")"
               source "${ONEAPI_ROOT}/setvars.sh"
+              export PATH="${ui_node_bin}:${PATH}"
+              node --version
+              npm --version
               python3 .ci-workflow/.github/scripts/cache-build-deadline.py -- cmake --build build --config Release -j "$(nproc)"
           verify-command: |
             python3 .ci-workflow/.github/scripts/verify-source-ui.py

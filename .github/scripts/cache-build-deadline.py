@@ -18,11 +18,9 @@ def set_checkpoint(value: bool) -> None:
         output.write(f"checkpoint={'true' if value else 'false'}\n")
 
 
-def stop_tree(process: subprocess.Popen[bytes]) -> None:
+def stop_tree(process) -> None:
     if os.name == "nt":
-        # /T includes cmake, ninja/make, compiler and ccache descendants. Fail
-        # closed if Windows cannot confirm that the tree was terminated.
-        subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], check=True)
+        process.stop_tree()
     else:
         try:
             os.killpg(process.pid, signal.SIGTERM)
@@ -54,23 +52,34 @@ def main() -> int:
     if not math.isfinite(args.seconds) or args.seconds <= 0:
         parser.error("--seconds must be finite and positive")
 
-    options = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
-    process = subprocess.Popen(command, **options)
+    if os.name == "nt":
+        from windows_build_process import WindowsBuildProcess
+        process = WindowsBuildProcess(command)
+    else:
+        process = subprocess.Popen(command, start_new_session=True)
+    checkpoint = False
     try:
-        result = process.wait(timeout=args.seconds)
-    except subprocess.TimeoutExpired:
-        # A naturally failing build at the interval boundary is still a failure,
-        # not permission to replace a healthy cache.
-        result = process.poll()
-        if result is None:
+        try:
+            result = process.wait(timeout=args.seconds)
+        except subprocess.TimeoutExpired:
+            # A naturally failing build at the interval boundary is still a failure,
+            # not permission to replace a healthy cache.
+            result = process.poll()
+            if result is None:
+                stop_tree(process)
+                checkpoint = True
+                result = 0
+        except BaseException:
             stop_tree(process)
-            set_checkpoint(True)
-            print("Compilation slice ended; compiler tree stopped for ccache checkpoint.", flush=True)
-            return 0
-    except BaseException:
-        stop_tree(process)
-        raise
-    set_checkpoint(False)
+            raise
+    finally:
+        if os.name == "nt":
+            process.close()
+    # Windows close also confirms that normal/failed builds left no writers.
+    # No output is published when shutdown or handle cleanup fails.
+    set_checkpoint(checkpoint)
+    if checkpoint:
+        print("Compilation slice ended; compiler tree stopped for ccache checkpoint.", flush=True)
     return result
 
 
