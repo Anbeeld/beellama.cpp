@@ -1,0 +1,44 @@
+name: "Windows - Setup LLVM"
+description: "Install a pinned LLVM toolchain compatible with the selected source"
+inputs:
+  match_openmp:
+    description: "Use the x64 LLVM version and installer hash pinned by source OpenMP"
+    required: false
+    default: "false"
+runs:
+  using: "composite"
+  steps:
+    - name: Install matching LLVM
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = "Stop"
+        $version = "22.1.8"
+        $sha256 = "16e5709785fef73c854646241c4a92c5cd574318d1b33c63330dd7721903e55c"
+        if ("${{ inputs.match_openmp }}" -eq "true") {
+          $cmake = Get-Content "ggml/src/CMakeLists.txt" -Raw
+          $versionMatch = [regex]::Match($cmake, 'set\(GGML_OPENMP_LLVM_VERSION "([0-9]+\.[0-9]+\.[0-9]+)"\)')
+          $x64 = [regex]::Match($cmake, '(?s)if\s*\(GGML_OPENMP_SYSTEM_PROCESSOR MATCHES "\^\(amd64\|x86_64\)\$"\)(.*?)elseif')
+          $hashMatch = [regex]::Match($x64.Groups[1].Value, 'set\(GGML_OPENMP_INSTALLER_SHA256 "([0-9a-f]{64})"\)')
+          if (-not $versionMatch.Success -or -not $hashMatch.Success) {
+            throw "Cannot resolve the source-pinned x64 LLVM OpenMP installer"
+          }
+          $version = $versionMatch.Groups[1].Value
+          $sha256 = $hashMatch.Groups[1].Value
+        }
+        $installer = Join-Path $env:RUNNER_TEMP "LLVM-$version-win64.exe"
+        $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/LLVM-$version-win64.exe"
+        curl.exe --fail --location --retry 3 --output $installer $url
+        if ($LASTEXITCODE -ne 0) { throw "LLVM installer download failed" }
+        if ((Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant() -ne $sha256) {
+          throw "LLVM installer SHA256 mismatch"
+        }
+        $root = Join-Path $env:ProgramFiles "LLVM"
+        $process = Start-Process -FilePath $installer -ArgumentList "/S /D=$root" -Wait -PassThru
+        if ($process.ExitCode -ne 0) { throw "LLVM installer failed: $($process.ExitCode)" }
+        $compiler = Join-Path $root "bin/clang.exe"
+        $reported = (& $compiler --version 2>&1 | Out-String)
+        if ($LASTEXITCODE -ne 0 -or $reported -notmatch "clang version $([regex]::Escape($version))\b") {
+          throw "Installed LLVM does not report the requested version $version"
+        }
+        Write-Host $reported
+        (Join-Path $root "bin") | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append

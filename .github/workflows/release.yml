@@ -334,7 +334,7 @@ jobs:
           command: |
               python3 .ci-workflow/.github/scripts/cache-build-deadline.py -- cmake --build build --config Release -j "$(sysctl -n hw.logicalcpu)"
           verify-command: |
-            test -s build/tools/ui/dist/index.html
+            python3 .ci-workflow/.github/scripts/verify-source-ui.py
 
       - name: ccache stats
         if: always()
@@ -431,7 +431,7 @@ jobs:
           command: |
               python3 .ci-workflow/.github/scripts/cache-build-deadline.py -- cmake --build build --config Release -j "$(nproc)"
           verify-command: |
-            test -s build/tools/ui/dist/index.html
+            python3 .ci-workflow/.github/scripts/verify-source-ui.py
 
       - name: ccache stats
         if: always()
@@ -517,7 +517,7 @@ jobs:
           command: |
               python3 .ci-workflow/.github/scripts/cache-build-deadline.py -- cmake --build build --config Release -j "$(nproc)"
           verify-command: |
-            test -s build/tools/ui/dist/index.html
+            python3 .ci-workflow/.github/scripts/verify-source-ui.py
 
       - name: ccache stats
         if: always()
@@ -629,7 +629,7 @@ jobs:
           command: |
               python3 .ci-workflow/.github/scripts/cache-build-deadline.py -- cmake --build build --config Release -j "$(nproc)"
           verify-command: |
-            test -s build/tools/ui/dist/index.html
+            python3 .ci-workflow/.github/scripts/verify-source-ui.py
 
       - name: ccache stats
         if: always()
@@ -747,7 +747,7 @@ jobs:
               source "${ONEAPI_ROOT}/setvars.sh"
               python3 .ci-workflow/.github/scripts/cache-build-deadline.py -- cmake --build build --config Release -j "$(nproc)"
           verify-command: |
-            test -s build/tools/ui/dist/index.html
+            python3 .ci-workflow/.github/scripts/verify-source-ui.py
 
       - name: ccache stats
         if: always()
@@ -851,7 +851,7 @@ jobs:
           command: |
               python3 .ci-workflow/.github/scripts/cache-build-deadline.py -- cmake --build build --config Release -j "$(nproc)"
           verify-command: |
-            test -s build/tools/ui/dist/index.html
+            python3 .ci-workflow/.github/scripts/verify-source-ui.py
 
       - name: ccache stats
         if: always()
@@ -907,6 +907,11 @@ jobs:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-cpu-x64
           restore-keys: release-${{ needs.release-meta.outputs.cache_parent_channel }}-windows-cpu-x64
 
+      - name: Setup LLVM
+        uses: ./.ci-workflow/.github/actions/windows-setup-llvm
+        with:
+          match_openmp: "true"
+
       - name: Install Ninja
         run: choco install ninja -y
 
@@ -919,7 +924,7 @@ jobs:
             exit /b 1
           )
           call "%VS_INSTALL_DIR%\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
-          rem vcvarsall prepends bundled Clang 19; use standalone LLVM 20 for fetched libomp.
+          rem Prefer the standalone LLVM matched to the source-pinned OpenMP runtime.
           set "PATH=%ProgramFiles%\LLVM\bin;%PATH%"
           "%ProgramFiles%\LLVM\bin\clang.exe" --version || exit /b 1
           cmake -S . -B build -G "Ninja Multi-Config" ^
@@ -947,16 +952,14 @@ jobs:
                 exit /b 1
               )
               call "%VS_INSTALL_DIR%\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
-              rem vcvarsall prepends bundled Clang 19; use standalone LLVM 20 for fetched libomp.
+              rem Prefer the standalone LLVM matched to the source-pinned OpenMP runtime.
               set "PATH=%ProgramFiles%\LLVM\bin;%PATH%"
               "%ProgramFiles%\LLVM\bin\clang.exe" --version || exit /b 1
               python .ci-workflow\.github\scripts\cache-build-deadline.py -- cmake --build build --config Release -j %NUMBER_OF_PROCESSORS%
               if errorlevel 1 exit /b %errorlevel%
           verify-command: |
-            if not exist build\tools\ui\dist\index.html (
-              echo Source-built UI output is missing
-              exit /b 1
-            )
+            python .ci-workflow\.github\scripts\verify-source-ui.py
+            if errorlevel 1 exit /b %errorlevel%
             findstr /c:"GGML_OPENMP_ENABLED:INTERNAL=ON" build\CMakeCache.txt >nul || (
               echo GGML_OPENMP=ON was requested but OpenMP was not found; the CPU backend would ship without it
               exit /b 1
@@ -1188,6 +1191,9 @@ jobs:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-vulkan-${{ env.VULKAN_VERSION }}-x64
           restore-keys: release-${{ needs.release-meta.outputs.cache_parent_channel }}-windows-vulkan-${{ env.VULKAN_VERSION }}-x64
 
+      - name: Setup LLVM
+        uses: ./.ci-workflow/.github/actions/windows-setup-llvm
+
       - name: Install Ninja
         run: choco install ninja -y
 
@@ -1200,6 +1206,8 @@ jobs:
             exit /b 1
           )
           call "%VS_INSTALL_DIR%\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
+          set "PATH=%ProgramFiles%\LLVM\bin;%PATH%"
+          "%ProgramFiles%\LLVM\bin\clang.exe" --version || exit /b 1
           cmake -S . -B build -G "Ninja Multi-Config" ^
             -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
             -DGGML_BACKEND_DL=ON ^
@@ -1223,6 +1231,8 @@ jobs:
                 exit /b 1
               )
               call "%VS_INSTALL_DIR%\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
+              set "PATH=%ProgramFiles%\LLVM\bin;%PATH%"
+              "%ProgramFiles%\LLVM\bin\clang.exe" --version || exit /b 1
               python .ci-workflow\.github\scripts\cache-build-deadline.py -- cmake --build build --config Release -j %NUMBER_OF_PROCESSORS% --target ggml-vulkan
               if errorlevel 1 exit /b %errorlevel%
 

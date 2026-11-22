@@ -3,6 +3,16 @@
 #include "fattn-mma-kvarn-case-decl.cuh"
 #include "fattn-mma-kvarn-load.cuh"
 
+// All 32 threads of a whole block must call this uniformly to publish shared state.
+// HIP may use wave64, so use a block barrier rather than a warp-sync builtin.
+static __device__ __forceinline__ void ggml_cuda_fattn_kvarn_portable_sync_32() {
+#if defined(GGML_USE_HIP)
+    __syncthreads();
+#else
+    __syncwarp();
+#endif
+}
+
 // Portable direct-record KVarN attention. It deliberately uses only ordinary
 // CUDA/HIP block primitives, so RDNA/CDNA do not depend on NVIDIA MMA. The
 // kernel stays in the rotated KVarN domain; the graph applies one inverse WHT
@@ -308,7 +318,7 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
             }
         }
         if constexpr (D == 64) {
-            __syncwarp();
+            ggml_cuda_fattn_kvarn_portable_sync_32();
         } else {
             __syncthreads();
         }
@@ -361,7 +371,7 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
                 v_values[i] * weight_shared;
         }
         if constexpr (D == 64) {
-            __syncwarp();
+            ggml_cuda_fattn_kvarn_portable_sync_32();
         } else {
             __syncthreads();
         }
@@ -426,7 +436,7 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
                 }
             }
             if constexpr (D == 64) {
-                __syncwarp();
+                ggml_cuda_fattn_kvarn_portable_sync_32();
             } else {
                 __syncthreads();
             }
@@ -443,7 +453,7 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
                     accumulator[i] * old_scale_shared + vval * weight_shared;
             }
             if constexpr (D == 64) {
-                __syncwarp();
+                ggml_cuda_fattn_kvarn_portable_sync_32();
             } else {
                 __syncthreads();
             }
@@ -470,7 +480,7 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
         weight_shared = n_splits == 1 && denominator > 0.0f ? 1.0f / denominator : 1.0f;
     }
     if constexpr (D == 64) {
-        __syncwarp();
+        ggml_cuda_fattn_kvarn_portable_sync_32();
     } else {
         __syncthreads();
     }
@@ -562,7 +572,7 @@ static __global__ void ggml_cuda_fattn_kvarn_d64_gqa_kernel(
                 powf(m0, float(query_head + 1)) :
                 powf(m1, float(2 * (query_head - (int) n_head_log2) + 1))) : 1.0f;
     }
-    __syncwarp();
+    ggml_cuda_fattn_kvarn_portable_sync_32();
 
     float accumulator[GQA][2] = {};
     int cached_k_group = -1;
@@ -686,7 +696,7 @@ static __global__ void ggml_cuda_fattn_kvarn_d64_gqa_kernel(
                 }
             }
         }
-        __syncwarp();
+        ggml_cuda_fattn_kvarn_portable_sync_32();
 #pragma unroll
         for (int h = 0; h < GQA; ++h) {
 #pragma unroll
@@ -695,7 +705,7 @@ static __global__ void ggml_cuda_fattn_kvarn_d64_gqa_kernel(
                     v_values[i] * weight[h];
             }
         }
-        __syncwarp();
+        ggml_cuda_fattn_kvarn_portable_sync_32();
     }
 
     if (tid == 0) {
@@ -722,7 +732,7 @@ static __global__ void ggml_cuda_fattn_kvarn_d64_gqa_kernel(
             }
         }
     }
-    __syncwarp();
+    ggml_cuda_fattn_kvarn_portable_sync_32();
 
 #pragma unroll
     for (int h = 0; h < GQA; ++h) {

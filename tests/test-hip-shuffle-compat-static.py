@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 from pathlib import Path
+import re
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -53,6 +54,21 @@ def main() -> None:
     require("__shfl_down(var, delta, width)" in hip, "4-argument __shfl_down_sync must preserve explicit width")
     require("__shfl_xor(var, laneMask)" in hip, "3-argument __shfl_xor_sync must map to legacy HIP default width")
     require("__shfl_xor(var, laneMask, width)" in hip, "4-argument __shfl_xor_sync must preserve explicit width")
+
+    portable = read("ggml/src/ggml-cuda/fattn-kvarn-portable.cuh")
+    sync_helper = re.search(
+        r"static __device__ __forceinline__ void ggml_cuda_fattn_kvarn_portable_sync_32\(\)\s*\{\s*"
+        r"#if defined\(GGML_USE_HIP\)\s*__syncthreads\(\);\s*"
+        r"#else\s*__syncwarp\(\);\s*#endif\s*\}",
+        portable,
+    )
+    require(sync_helper is not None,
+            "portable KVarN sync helper must use a HIP block barrier and a CUDA warp barrier")
+    portable_calls = portable[:sync_helper.start()] + portable[sync_helper.end():]
+    require(re.search(r"\b__syncwarp\s*\(", portable_calls) is None,
+            "portable KVarN must not call raw __syncwarp outside the CUDA-only helper branch")
+    require(len(re.findall(r"\bggml_cuda_fattn_kvarn_portable_sync_32\s*\(\s*\)\s*;", portable_calls)) == 9,
+            "all nine portable KVarN shared-state synchronization sites must use the helper")
 
 
 if __name__ == "__main__":
