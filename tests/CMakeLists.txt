@@ -24,6 +24,12 @@ if (Python3_Interpreter_FOUND)
     set_property(TEST test-release-ui-output PROPERTY LABELS main)
 
     add_test(
+        NAME test-ui-assets
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-ui-assets.py)
+    set_property(TEST test-ui-assets PROPERTY LABELS main)
+
+    add_test(
         NAME test-cache-build-deadline
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-cache-build-deadline.py)
