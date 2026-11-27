@@ -564,15 +564,16 @@ jobs:
           sparse-checkout: .github
           persist-credentials: false
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: "24"
-
       - name: Free up disk space
         uses: ggml-org/free-disk-space@v1.3.1
         with:
           tool-cache: true
+
+      # Cleanup removes the hosted tool cache, including any installed Node.js.
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
 
       - name: ccache
         uses: ./.ci-workflow/.github/actions/setup-ccache
@@ -680,15 +681,16 @@ jobs:
           sparse-checkout: .github
           persist-credentials: false
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: "24"
-
       - name: Free up disk space
         uses: ggml-org/free-disk-space@v1.3.1
         with:
           tool-cache: true
+
+      # Cleanup removes the hosted tool cache, including any installed Node.js.
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
 
       - name: Prepare oneAPI cache path
         run: |
