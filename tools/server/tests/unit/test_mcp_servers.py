@@ -25,6 +25,9 @@ from utils import *
 FIXTURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "fixtures")
 MCP_ECHO_SERVER = os.path.join(FIXTURES_DIR, "mcp_echo_server.py")
 
+# These router-only tests do not require inference models.
+NO_PRELOAD_SERVER_PRESETS = True
+
 server: ServerProcess
 
 
@@ -113,6 +116,35 @@ def test_mcp_tool_invocation():
         assert res.status_code == 200, res.body
         body = res.body
         assert "error" not in body, body
+    finally:
+        server.stop()
+
+
+@pytest.mark.parametrize("poll_stdin", [False, True])
+@pytest.mark.parametrize("message_size", [4096, 8192, 80 * 1024])
+def test_mcp_large_request_preserves_connection(message_size, poll_stdin):
+    """Requests larger than the stdin pipe buffer must not stall later calls."""
+    global server
+    mcp_json = _mcp_config_json({
+        "echo": {
+            "command": sys.executable,
+            "args": [MCP_ECHO_SERVER] + (["--poll-stdin"] if poll_stdin else []),
+            "timeout_ms": 5000,
+        }
+    })
+    server = _start_server_with_mcp(mcp_json)
+
+    try:
+        # Include JSON escapes so framing and exact content survive chunk boundaries.
+        pattern = 'line "quoted" \\ path\n'
+        message = (pattern * (message_size // len(pattern) + 1))[:message_size]
+        for text in ["before", message, "after"]:
+            res = server.make_request("POST", "/tools", data={
+                "tool": "echo_echo",
+                "params": {"message": text},
+            })
+            assert res.status_code == 200, res.body
+            assert res.body == {"plain_text_response": "echo: " + text}, res.body
     finally:
         server.stop()
 
@@ -499,7 +531,7 @@ def test_mcp_config_file_errors():
     server.no_ui = True
     server.mcp_servers_json = "not valid json"
     try:
-        server.start()
+        server.start(timeout_seconds=5)
         assert False, "Server should not have started with invalid MCP JSON config"
     except RuntimeError:
         pass  # Expected: server process dies due to bad config
@@ -510,7 +542,7 @@ def test_mcp_config_file_errors():
     server.no_ui = True
     server.mcp_servers_config = "/nonexistent/path.json"
     try:
-        server.start()
+        server.start(timeout_seconds=5)
         assert False, "Server should not have started with missing config file"
     except RuntimeError:
         pass  # Expected: server process dies due to missing config

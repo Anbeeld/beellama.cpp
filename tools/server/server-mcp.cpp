@@ -3,6 +3,7 @@
 #include "common.h"
 #include "subproc.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -533,8 +534,11 @@ static bool mcp_write_all(FILE * f, const std::string & data, std::atomic<bool> 
     DWORD  nowait = PIPE_NOWAIT;
     SetNamedPipeHandleState(h, &nowait, NULL, NULL);
     while (total < data.size() && running.load()) {
-        DWORD written = 0;
-        BOOL  ok      = WriteFile(h, data.data() + total, (DWORD) (data.size() - total), &written, NULL);
+        // An oversized PIPE_NOWAIT write can succeed with zero bytes even on
+        // an empty pipe. Stay within the default anonymous-pipe buffer size.
+        DWORD to_write = (DWORD) std::min<size_t>(data.size() - total, 4096);
+        DWORD written  = 0;
+        BOOL  ok       = WriteFile(h, data.data() + total, to_write, &written, NULL);
         if (ok && written > 0) {
             total += written;
             continue;

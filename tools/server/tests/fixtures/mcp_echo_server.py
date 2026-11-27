@@ -125,12 +125,51 @@ HANDLERS = {
     "ping": handle_ping,
 }
 
+def read_lines():
+    if sys.platform != "win32" or "--poll-stdin" not in sys.argv:
+        yield from sys.stdin
+        return
+
+    # A pending blocking ReadFile can let an oversized PIPE_NOWAIT write make
+    # progress. Poll instead, so the transport must fit writes in the pipe buffer.
+    import ctypes
+    import msvcrt
+    import time
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    peek = kernel32.PeekNamedPipe
+    peek.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+                     ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+    peek.restype = wintypes.BOOL
+    fd = sys.stdin.fileno()
+    msvcrt.setmode(fd, os.O_BINARY)
+    handle = msvcrt.get_osfhandle(fd)
+    pending = b""
+    while True:
+        available = wintypes.DWORD()
+        if not peek(handle, None, 0, None, ctypes.byref(available), None):
+            if ctypes.get_last_error() == 109:  # ERROR_BROKEN_PIPE
+                return
+            raise ctypes.WinError(ctypes.get_last_error())
+        if available.value == 0:
+            time.sleep(0.001)
+            continue
+        chunk = os.read(fd, min(available.value, 4096))
+        if not chunk:
+            return
+        pending += chunk
+        while b"\n" in pending:
+            line, pending = pending.split(b"\n", 1)
+            yield line.decode("utf-8")
+
+
 def main():
     # Use unbuffered output
     sys.stdout = os.fdopen(sys.stdout.fileno(), "w", buffering=1)
     sys.stderr = os.fdopen(sys.stderr.fileno(), "w", buffering=1)
 
-    for line in sys.stdin:
+    for line in read_lines():
         line = line.strip()
         if not line:
             continue
