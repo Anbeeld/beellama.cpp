@@ -15,6 +15,7 @@
 #include "../src/llama-kv-cache-kvarn.h"
 #include "../src/llama-memory-hybrid.h"
 #include "../src/llama-memory-hybrid-idx.h"
+#include "../src/llama-memory-hybrid-iswa.h"
 #include "../src/llama-model.h"
 #endif
 
@@ -192,6 +193,7 @@ static void usage(char ** argv) {
     LOG("      --test-mtp-request-reset Run the Bee MTP request reset regression\n");
     LOG("      --test-mtp-kvarn-routing Run the Bee MTP KVarN routing regression\n");
     LOG("      --test-kvarn-state-restore Run the Bee KVarN self-contained state restore regression\n");
+    LOG("      --test-hybrid-iswa-kvarn Run the Bee hybrid iSWA KVarN regression\n");
     LOG("      --test-qsa-exact-tail Run the QSA body/exact mask regression\n");
 #endif
     LOG("  --kv-shift               Check K-shift against a decode at the shifted positions (CPU only)\n");
@@ -1432,6 +1434,73 @@ static std::vector<float> kvarn_restore_decode(
     return result;
 }
 
+// Hybrid iSWA must initialize KVarN rotations and SWA ring read indices, just
+// like ordinary iSWA. Exercise reservation, prefill, decode and ring rollover.
+static int test_hybrid_iswa_kvarn(const size_t seed, const char * target_backend) {
+    init_normal_pool(seed, 1.0e-2f);
+    auto * dev = target_backend ? ggml_backend_dev_by_name(target_backend) :
+            ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (!dev) {
+        throw std::runtime_error("hybrid iSWA KVarN backend is unavailable");
+    }
+    ggml_backend_dev_t devices[] = { dev, nullptr };
+    const bool offload = ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
+    for (const llm_arch arch : { LLM_ARCH_INKLING2, LLM_ARCH_LFM3 }) {
+        auto gguf_ctx = get_gguf_ctx(arch, arch == LLM_ARCH_INKLING2);
+        kv_writer ms(arch, gguf_ctx.get());
+        // The ordinary Inkling2 fixture has D32 heads, outside KVarN's contract.
+        const uint32_t head_dim = arch == LLM_ARCH_INKLING2 ? 64 : 128;
+        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH, head_dim);
+        ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH, head_dim);
+        ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT, head_dim);
+        ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW, uint32_t(160));
+        auto mp = llama_model_default_params();
+        mp.devices = devices;
+        mp.n_gpu_layers = offload ? 99 : 0;
+        mp.progress_callback = silent_model_load_progress;
+        tensor_data_params data = { seed, 1.0e-2f };
+        llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &data, mp));
+        if (!model) {
+            throw std::runtime_error("failed to create hybrid iSWA KVarN fixture");
+        }
+        auto cp = llama_context_default_params();
+        cp.n_ctx = 1024;
+        cp.n_batch = cp.n_ubatch = 32;
+        cp.n_threads = cp.n_threads_batch = 2;
+        cp.offload_kqv = offload;
+        cp.swa_full = false;
+        cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        cp.kvarn = llama_kvarn_params_for_type(LLAMA_KVARN_K4V4_G128);
+        llama_context_ptr ctx(llama_init_from_model(model.get(), cp));
+        if (!ctx) {
+            throw std::runtime_error("failed to create hybrid iSWA KVarN context");
+        }
+        auto * mem = dynamic_cast<llama_memory_hybrid_iswa *>(llama_get_memory(ctx.get()));
+        if (!mem) {
+            throw std::runtime_error("fixture did not construct hybrid iSWA memory");
+        }
+        auto full = mem->init_full();
+        const auto * hybrid = dynamic_cast<const llama_memory_hybrid_iswa_context *>(full.get());
+        if (!hybrid ||
+                !dynamic_cast<const llama_kv_cache_kvarn_context *>(hybrid->get_attn()->get_base()) ||
+                !dynamic_cast<const llama_kv_cache_kvarn_context *>(hybrid->get_attn()->get_swa())) {
+            throw std::runtime_error("fixture did not retain KVarN in both attention groups");
+        }
+        const auto tokens = get_tokens(640, llama_vocab_n_tokens(llama_model_get_vocab(model.get())), seed + 1);
+        for (size_t pos = 0; pos < tokens.size();) {
+            const size_t count = pos < 512 ? 32 : 1;
+            const std::vector<llama_token> batch(tokens.begin() + pos, tokens.begin() + pos + count);
+            const auto logits = kvarn_restore_decode(ctx.get(), batch, llama_pos(pos), 0);
+            if (logits.empty() || !std::all_of(logits.begin(), logits.end(), [](float x) { return std::isfinite(x); })) {
+                throw std::runtime_error("hybrid iSWA KVarN produced non-finite logits");
+            }
+            pos += count;
+        }
+        printf("%s: hybrid iSWA KVarN reservation, prefill and ring decode passed\n", llama_arch_name(arch));
+    }
+    return 0;
+}
+
 // QSA can elide the ordinary mask, but exact-tail planning still needs it.
 static int test_qsa_exact_tail(const size_t seed) {
     auto gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
@@ -2650,6 +2719,7 @@ int main(int argc, char ** argv) {
     bool test_mtp_reset = false;
     bool test_mtp_kvarn = false;
     bool test_kvarn_restore = false;
+    bool test_hybrid_kvarn = false;
     bool test_qsa_tail = false;
 #endif
     bool kv_shift = false;
@@ -2731,6 +2801,8 @@ int main(int argc, char ** argv) {
             test_mtp_kvarn = true;
         } else if (strcmp(argv[i], "--test-kvarn-state-restore") == 0) {
             test_kvarn_restore = true;
+        } else if (strcmp(argv[i], "--test-hybrid-iswa-kvarn") == 0) {
+            test_hybrid_kvarn = true;
         } else if (strcmp(argv[i], "--test-qsa-exact-tail") == 0) {
             test_qsa_tail = true;
 #endif
@@ -2766,6 +2838,9 @@ int main(int argc, char ** argv) {
         }
         if (test_kvarn_restore) {
             return test_kvarn_state_restore(seed);
+        }
+        if (test_hybrid_kvarn) {
+            return test_hybrid_iswa_kvarn(seed, target_backend);
         }
         if (test_qsa_tail) {
             return test_qsa_exact_tail(seed);

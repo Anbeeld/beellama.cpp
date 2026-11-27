@@ -5683,6 +5683,28 @@ llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa()
     inp_attn->self_k_rot_swa = attn_ctx->get_swa()->get_k_rot();
     inp_attn->self_v_rot_swa = attn_ctx->get_swa()->get_v_rot();
 
+    if (const auto * kvarn_base = dynamic_cast<const llama_kv_cache_kvarn_context *>(attn_ctx->get_base())) {
+        inp_attn->self_kvarn_rot_64  = kvarn_base->build_input_kvarn_rot(ctx0, 64);
+        inp_attn->self_kvarn_rot_128 = kvarn_base->build_input_kvarn_rot(ctx0, 128);
+        inp_attn->self_kvarn_rot_256 = kvarn_base->build_input_kvarn_rot(ctx0, 256);
+        inp_attn->self_kvarn_rot_512 = kvarn_base->build_input_kvarn_rot(ctx0, 512);
+        if (kvarn_base->uses_materialization_indices()) {
+            inp_attn->self_kvarn_mat_idxs = kvarn_base->build_input_kvarn_mat_idxs(ctx0);
+            kvarn_base->set_mat_idxs(inp_attn->self_kvarn_mat_idxs);
+        }
+    }
+    if (const auto * kvarn_swa = dynamic_cast<const llama_kv_cache_kvarn_context *>(attn_ctx->get_swa())) {
+        if (inp_attn->self_kvarn_rot_64 == nullptr) {
+            inp_attn->self_kvarn_rot_64  = kvarn_swa->build_input_kvarn_rot(ctx0, 64);
+            inp_attn->self_kvarn_rot_128 = kvarn_swa->build_input_kvarn_rot(ctx0, 128);
+            inp_attn->self_kvarn_rot_256 = kvarn_swa->build_input_kvarn_rot(ctx0, 256);
+            inp_attn->self_kvarn_rot_512 = kvarn_swa->build_input_kvarn_rot(ctx0, 512);
+        }
+        inp_attn->self_kvarn_mat_idxs_swa = kvarn_swa->build_input_kvarn_mat_idxs(ctx0);
+        // Native K/V views are built before set_input() populates the tensor.
+        kvarn_swa->set_mat_idxs(inp_attn->self_kvarn_mat_idxs_swa);
+    }
+
     auto inp = std::make_unique<llm_graph_input_mem_hybrid_iswa>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 
     return (llm_graph_input_mem_hybrid_iswa *) res->add_input(std::move(inp));

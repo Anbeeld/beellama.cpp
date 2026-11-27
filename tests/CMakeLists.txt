@@ -473,6 +473,12 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     llama_test(
         test-llama-archs
+        NAME test-hybrid-iswa-kvarn
+        LABEL main
+        ARGS --test-hybrid-iswa-kvarn -s 12345
+    )
+    llama_test(
+        test-llama-archs
         NAME test-qsa-exact-tail
         LABEL main
         ARGS --test-qsa-exact-tail -s 12345
