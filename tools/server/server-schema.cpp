@@ -573,8 +573,8 @@ task_params eval_llama_cmpl_schema(
     }
 
     common_validate_reasoning_loop_guard_params(params.reasoning_loop_guard);
-    params.sampling.reasoning_budget_tracking =
-        params.reasoning_loop_guard.mode != COMMON_REASONING_LOOP_GUARD_OFF;
+    // Usage accounting observes reasoning state independently of loop detection.
+    params.sampling.reasoning_budget_tracking = true;
 
     // debugging
     {

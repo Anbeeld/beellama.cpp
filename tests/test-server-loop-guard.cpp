@@ -70,6 +70,64 @@ int main() {
     }
 
     {
+        // Two copies of one long block are insufficient evidence of a loop.
+        common_reasoning_loop_guard_params params;
+        params.window_tokens = 1024;
+        params.min_repeated_coverage = 256;
+        server_loop_guard guard(params);
+        std::vector<llama_token> block;
+        for (int i = 0; i < 256; ++i) {
+            block.push_back(10000 + i);
+        }
+        std::vector<llama_token> tokens = block;
+        for (int i = 0; i < 512; ++i) {
+            tokens.push_back(20000 + i);
+        }
+        tokens.insert(tokens.end(), block.begin(), block.end());
+        accept_many(guard, tokens, SERVER_LOOP_REGION_REASONING);
+        assert_not_triggered(guard.check(SERVER_LOOP_REGION_REASONING));
+    }
+
+    {
+        // The same two-copy pattern must not trigger in a larger window either.
+        common_reasoning_loop_guard_params params = test_params();
+        params.min_reasoning_tokens = 2048;
+        params.window_tokens = 2048;
+        params.min_repeated_coverage = 1024;
+        server_loop_guard guard(params);
+        std::vector<llama_token> block;
+        for (int i = 0; i < 512; ++i) {
+            block.push_back(30000 + i);
+        }
+        std::vector<llama_token> tokens = block;
+        for (int i = 0; i < 1024; ++i) {
+            tokens.push_back(40000 + i);
+        }
+        tokens.insert(tokens.end(), block.begin(), block.end());
+        accept_many(guard, tokens, SERVER_LOOP_REGION_REASONING);
+        assert_not_triggered(guard.check(SERVER_LOOP_REGION_REASONING));
+    }
+
+    {
+        // Three separated, non-periodic copies remain detectable by n-gram dominance.
+        server_loop_guard guard(test_params());
+        std::vector<llama_token> block;
+        for (int i = 0; i < 256; ++i) {
+            block.push_back(60000 + i);
+        }
+        std::vector<llama_token> tokens;
+        for (int copy = 0; copy < 3; ++copy) {
+            tokens.insert(tokens.end(), block.begin(), block.end());
+            for (int i = 0; i < 128; ++i) {
+                tokens.push_back(70000 + copy * 128 + i);
+            }
+        }
+        accept_many(guard, tokens, SERVER_LOOP_REGION_REASONING);
+        const auto result = guard.check(SERVER_LOOP_REGION_REASONING);
+        assert_triggered(result, "ngram_dominance");
+    }
+
+    {
         server_loop_guard guard(test_params());
         std::vector<llama_token> tokens;
         tokens.reserve(1200);

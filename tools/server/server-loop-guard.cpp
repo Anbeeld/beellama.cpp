@@ -164,20 +164,44 @@ server_loop_guard_result server_loop_guard::check_ngram_dominance(const std::vec
             continue;
         }
 
-        std::unordered_map<uint64_t, std::vector<int>> starts_by_hash;
+        // One restatement is not a loop. Only count exact n-grams with at least
+        // three non-overlapping occurrences, including their original occurrence.
+        struct ngram_group {
+            int representative;
+            int last_start;
+            int occurrences;
+            std::vector<int> starts;
+        };
+        std::unordered_map<uint64_t, std::vector<ngram_group>> groups_by_hash;
         std::vector<std::pair<int, int>> intervals;
 
         for (int start = 0; start + ngram <= n; ++start) {
             const uint64_t hash = server_loop_guard_hash_ngram(tokens, start, ngram);
-            auto & starts = starts_by_hash[hash];
-            for (int previous : starts) {
-                if (server_loop_guard_equal_ngram(tokens, previous, start, ngram)) {
-                    intervals.emplace_back(previous, previous + ngram);
-                    intervals.emplace_back(start, start + ngram);
+            auto & groups = groups_by_hash[hash];
+            ngram_group * matching = nullptr;
+            for (auto & group : groups) {
+                if (server_loop_guard_equal_ngram(tokens, group.representative, start, ngram)) {
+                    matching = &group;
                     break;
                 }
             }
-            starts.push_back(start);
+            if (matching == nullptr) {
+                groups.push_back({start, start, 1, {start}});
+                continue;
+            }
+            if (start - matching->last_start < ngram) {
+                continue;
+            }
+            matching->last_start = start;
+            matching->starts.push_back(start);
+            matching->occurrences++;
+            if (matching->occurrences == 3) {
+                for (int occurrence : matching->starts) {
+                    intervals.emplace_back(occurrence, occurrence + ngram);
+                }
+            } else if (matching->occurrences > 3) {
+                intervals.emplace_back(start, start + ngram);
+            }
         }
 
         if (intervals.empty()) {

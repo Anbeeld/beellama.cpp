@@ -414,6 +414,45 @@ static void test_reasoning_budget_force_end_api() {
     }
 
     {
+        // Loop intervention closes reasoning without claiming the budget expired.
+        const llama_tokens start = {100};
+        const llama_tokens end = {101, 103};
+        const llama_tokens forced = {102, 101, 103};
+        auto * sampler = common_reasoning_budget_init(nullptr, {start}, {end}, forced, 1);
+
+        GGML_ASSERT(common_reasoning_budget_force_end(sampler, /* include_message = */ false));
+        GGML_ASSERT(get_forced_token(sampler, 103) == 101);
+        llama_sampler_accept(sampler, 101);
+        auto * clone = llama_sampler_clone(sampler);
+        GGML_ASSERT(get_forced_token(clone, 103) == 103);
+        llama_sampler_accept(clone, 103);
+        GGML_ASSERT(common_reasoning_budget_get_state(clone) == REASONING_BUDGET_DONE);
+        GGML_ASSERT(*common_reasoning_budget_get_end_match(clone) == end);
+        llama_sampler_free(clone);
+        llama_sampler_accept(sampler, 103);
+        GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_DONE);
+
+        // A later real budget expiry must still include the budget message.
+        llama_sampler_accept(sampler, 100);
+        llama_sampler_accept(sampler, 50);
+        GGML_ASSERT(get_forced_token(sampler, 103) == 102);
+        llama_sampler_reset(sampler);
+        GGML_ASSERT(common_reasoning_budget_force_end(sampler));
+        GGML_ASSERT(get_forced_token(sampler, 103) == 102);
+        llama_sampler_free(sampler);
+    }
+
+    {
+        const llama_tokens start = {100};
+        const llama_tokens end = {101};
+        const llama_tokens forced = {102};
+        auto * sampler = common_reasoning_budget_init(nullptr, {start}, {end}, forced, 64);
+        GGML_ASSERT(!common_reasoning_budget_force_end(sampler, /* include_message = */ false));
+        GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_IDLE);
+        llama_sampler_free(sampler);
+    }
+
+    {
         const std::vector<llama_token> start = {100};
         const std::vector<llama_token> end = {101};
         const std::vector<llama_token> forced = {};

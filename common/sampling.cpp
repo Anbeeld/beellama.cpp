@@ -684,12 +684,12 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
-bool common_sampler_force_reasoning_end(struct common_sampler * gsmpl) {
+bool common_sampler_force_reasoning_end(struct common_sampler * gsmpl, bool include_message) {
     if (!gsmpl) {
         return false;
     }
 
-    return common_reasoning_budget_force_end(gsmpl->rbudget);
+    return common_reasoning_budget_force_end(gsmpl->rbudget, include_message);
 }
 
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {

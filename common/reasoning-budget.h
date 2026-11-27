@@ -49,8 +49,9 @@ common_reasoning_budget_state common_reasoning_budget_get_state(const struct lla
 const llama_tokens * common_reasoning_budget_get_end_match(const struct llama_sampler * smpl);
 
 // Manually transition the sampler into FORCING so the forced sequence is
-// emitted next. Returns false when no forced sequence is configured.
-bool common_reasoning_budget_force_end(struct llama_sampler * smpl);
+// emitted next. With include_message=false, emit only the end-tag suffix of
+// that sequence. Returns false if the requested sequence is not configured.
+bool common_reasoning_budget_force_end(struct llama_sampler * smpl, bool include_message = true);
 
 size_t common_reasoning_budget_forced_token_count(const struct llama_sampler * smpl);
 

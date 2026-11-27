@@ -719,6 +719,10 @@ if (LLAMA_BUILD_SERVER)
     target_include_directories(test-server-loop-guard PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-server-loop-guard PRIVATE server-context)
 
+    llama_build_and_test(test-server-loop-guard-response.cpp)
+    target_include_directories(test-server-loop-guard-response PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)
+    target_link_libraries(test-server-loop-guard-response PRIVATE server-context)
+
     llama_build_and_test(test-server-prompt-checkpoint.cpp)
     target_include_directories(test-server-prompt-checkpoint PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)
     target_link_libraries(test-server-prompt-checkpoint PRIVATE server-context)

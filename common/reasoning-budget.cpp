@@ -289,7 +289,7 @@ const llama_tokens * common_reasoning_budget_get_end_match(const struct llama_sa
     return &ctx->end_matcher.seqs[ctx->end_match];
 }
 
-bool common_reasoning_budget_force_end(struct llama_sampler * smpl) {
+bool common_reasoning_budget_force_end(struct llama_sampler * smpl, bool include_message) {
     if (!smpl) {
         return false;
     }
@@ -299,8 +299,24 @@ bool common_reasoning_budget_force_end(struct llama_sampler * smpl) {
         return false;
     }
 
+    size_t force_pos = 0;
+    if (!include_message) {
+        bool found = false;
+        for (const auto & end : ctx->end_matcher.seqs) {
+            if (!end.empty() && end.size() <= ctx->forced_tokens.size() &&
+                    std::equal(end.rbegin(), end.rend(), ctx->forced_tokens.rbegin())) {
+                force_pos = ctx->forced_tokens.size() - end.size();
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            return false;
+        }
+    }
+
     ctx->state = REASONING_BUDGET_FORCING;
-    ctx->force_pos = 0;
+    ctx->force_pos = force_pos;
     ctx->end_matcher.reset();
     return true;
 }

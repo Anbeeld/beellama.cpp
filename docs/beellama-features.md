@@ -660,6 +660,16 @@ The loop guard detects periodic repetition in hidden reasoning. Its default
 ends generation. Separately, an opted-in streaming chat completion can receive
 a `reasoning_end` action through `/v1/chat/completions/control`.
 
+N-gram dominance requires at least three non-overlapping occurrences of a
+matching n-gram before counting its coverage. A guard force-close emits the
+reasoning end tag without the budget-exhaustion message. Reasoning-token usage
+remains available with the guard set to `off`.
+
+When the guard intervenes, native completions and OpenAI-compatible chat
+completions include a `loop_guard` event with the detector, coverage, action,
+and intervention count. Streaming chat responses attach it to the final
+finish-reason chunk, independently of `stream_options.include_usage`.
+
 ### When to use them
 
 Use the guard for models that can become trapped in long repeated reasoning.

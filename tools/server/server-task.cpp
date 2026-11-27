@@ -344,6 +344,23 @@ json server_task_result_cmpl_final::to_json() {
     }
 }
 
+static json loop_guard_to_json(const server_loop_guard_telemetry & event) {
+    return json {
+        {"triggered", true},
+        {"region", event.region},
+        {"detector", event.detector},
+        {"period", event.period},
+        {"coverage", event.coverage},
+        {"score", event.score},
+        {"interventions", event.interventions},
+        {"action", event.action},
+        {"decoded_token_index", event.decoded_token_index},
+        {"token", event.token},
+        {"token_piece", event.token_piece},
+        {"reason", event.reason},
+    };
+}
+
 json server_task_result_cmpl_final::to_json_non_oaicompat() {
     json res = json {
         {"index",               index},
@@ -367,20 +384,7 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
         {"timings",             stats.to_json()},
     };
     if (loop_guard_event.triggered) {
-        res["loop_guard"] = json {
-            {"triggered", true},
-            {"region", loop_guard_event.region},
-            {"detector", loop_guard_event.detector},
-            {"period", loop_guard_event.period},
-            {"coverage", loop_guard_event.coverage},
-            {"score", loop_guard_event.score},
-            {"interventions", loop_guard_event.interventions},
-            {"action", loop_guard_event.action},
-            {"decoded_token_index", loop_guard_event.decoded_token_index},
-            {"token", loop_guard_event.token},
-            {"token_piece", loop_guard_event.token_piece},
-            {"reason", loop_guard_event.reason},
-        };
+        res["loop_guard"] = loop_guard_to_json(loop_guard_event);
     }
     if (!stream && !probs_output.empty()) {
         res["completion_probabilities"] = completion_token_output::probs_vector_to_json(probs_output, post_sampling_probs);
@@ -479,6 +483,10 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
         {"id", oaicompat_cmpl_id}
     };
 
+    if (loop_guard_event.triggered) {
+        res["loop_guard"] = loop_guard_to_json(loop_guard_event);
+    }
+
     // extra fields for debugging purposes
     if (verbose) {
         res["__verbose"] = to_json_non_oaicompat();
@@ -529,6 +537,10 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
         {"system_fingerprint", std::string(llama_build_info())},
         {"object",             "chat.completion.chunk"},
     });
+
+    if (loop_guard_event.triggered) {
+        deltas.back()["loop_guard"] = loop_guard_to_json(loop_guard_event);
+    }
 
     if (include_usage) {
         // OpenAI API spec for chat.completion.chunks specifies an empty `choices` array for the last chunk when including usage

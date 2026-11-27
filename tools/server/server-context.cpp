@@ -2328,7 +2328,6 @@ private:
     bool loop_guard_accept_enabled(const server_slot & slot) const {
         return slot.task &&
                slot.smpl &&
-               slot.task->params.reasoning_loop_guard.mode != COMMON_REASONING_LOOP_GUARD_OFF &&
                slot.task->params.sampling.reasoning_budget_tracking;
     }
 
@@ -2344,6 +2343,11 @@ private:
             slot.reasoning_output_tokens++;
         } else {
             slot.visible_output_tokens++;
+        }
+
+        // Accounting must remain active even when loop detection is disabled.
+        if (slot.task->params.reasoning_loop_guard.mode == COMMON_REASONING_LOOP_GUARD_OFF) {
+            return true;
         }
 
         const bool forcing_reasoning_end = in_reasoning &&
@@ -2378,7 +2382,7 @@ private:
         if (region == SERVER_LOOP_REGION_REASONING &&
                 params.mode == COMMON_REASONING_LOOP_GUARD_FORCE_CLOSE &&
                 slot.loop_guard_interventions < params.interventions_max &&
-                common_sampler_force_reasoning_end(slot.smpl.get())) {
+                common_sampler_force_reasoning_end(slot.smpl.get(), /* include_message = */ false)) {
             slot.loop_guard_interventions++;
             event.interventions = slot.loop_guard_interventions;
             event.action = "force-close";
@@ -6441,8 +6445,7 @@ static json get_res_props(const server_context_meta & meta, const common_params 
     task_params tparams;
     tparams.sampling = params.sampling;
     tparams.reasoning_loop_guard = params.reasoning_loop_guard;
-    tparams.sampling.reasoning_budget_tracking =
-        tparams.reasoning_loop_guard.mode != COMMON_REASONING_LOOP_GUARD_OFF;
+    tparams.sampling.reasoning_budget_tracking = true;
     json default_generation_settings_for_props = json {
         { "params", tparams.to_json(true) },
         { "n_ctx",  meta.slot_n_ctx },

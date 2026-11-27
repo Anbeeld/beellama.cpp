@@ -136,7 +136,7 @@ std::string common_sampler_print(const struct common_sampler * gsmpl);
 // get a string representation of the last accepted tokens
 std::string common_sampler_prev_str(common_sampler * gsmpl, llama_context * ctx, int n);
 
-bool common_sampler_force_reasoning_end(struct common_sampler * gsmpl);
+bool common_sampler_force_reasoning_end(struct common_sampler * gsmpl, bool include_message = true);
 
 char        common_sampler_type_to_chr(enum common_sampler_type cnstr);
 std::string common_sampler_type_to_str(enum common_sampler_type cnstr);
