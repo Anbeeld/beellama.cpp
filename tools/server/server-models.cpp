@@ -2047,6 +2047,7 @@ void server_models_routes::init_routes() {
                 {"role",                 "router"},
                 {"max_instances",        params.models_max},
                 {"models_autoload",      params.models_autoload},
+                {"preset_reload",        "POST /models/reload"},
                 // this is a dummy response to make sure the UI doesn't break
                 {"model_alias", "llama-server"},
                 {"model_path",  "none"},
