@@ -1389,7 +1389,7 @@ struct test_case {
     }
 
     virtual bool run_whole_graph() { return false; }
-    virtual bool requires_backend_support() { return false; }
+    virtual bool requires_backend_support(ggml_backend_t) { return false; }
     // the output must be the same in each run on the same backend
     virtual bool deterministic(ggml_backend_t backend) {
         GGML_UNUSED(backend);
@@ -1526,11 +1526,13 @@ struct test_case {
 
         // check if the backends support the ops
         bool supported = true;
+        bool missing_required_support = false;
         std::string unsupported_str;
         for (ggml_backend_t backend : {backend1, backend2}) {
             for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != NULL; t = ggml_get_next_tensor(ctx.get(), t)) {
                 if (!ggml_backend_supports_op(backend, t)) {
                     supported = false;
+                    missing_required_support = missing_required_support || requires_backend_support(backend);
                     if (unsupported_str.empty()) {
                         unsupported_str = std::string(ggml_backend_name(backend));
                     } else {
@@ -1546,7 +1548,7 @@ struct test_case {
 
             print_test_result_locked(output_printer, result);
 
-            return requires_backend_support() ? test_status_t::FAIL : test_status_t::NOT_SUPPORTED;
+            return missing_required_support ? test_status_t::FAIL : test_status_t::NOT_SUPPORTED;
         }
 
         // post-graph sentinel
@@ -9315,12 +9317,15 @@ struct test_flash_attn_ext : public test_case {
         return full_coverage_equivalence || split_equivalence || segmented_equivalence;
     }
 
-    bool requires_backend_support() override {
+    bool requires_backend_support(ggml_backend_t backend) override {
         // This is the exact mixed Gemma global-layer regression.  It is not
         // optional coverage: planning advertises the composite as executable,
         // so silently reporting NOT_SUPPORTED would recreate a scheduler CPU
         // fallback in the model graph.
-        return hsk == 512 && hsv == 512 && nr23[0] == 8 &&
+        // The BLAS backend does not implement flash attention.
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        return strcmp(ggml_backend_reg_name(reg), "BLAS") != 0 &&
+            hsk == 512 && hsv == 512 && nr23[0] == 8 &&
             type_K == GGML_TYPE_Q4_0 && type_V == GGML_TYPE_Q4_0 &&
             canonical_body && n_tail_current > 0;
     }
